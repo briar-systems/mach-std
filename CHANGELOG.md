@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- chrono: `format_duration` — renders a `Duration` into a caller-supplied buffer
+  as a human string (`0ms`, `<1ms`, `Nus`, `Nms`, `N.Ns`, `NmNs`; minutes is the
+  top band, negatives carry a leading `-`), returning the null-terminated `str`
+  aliasing the buffer or `nil` when capacity is short. A 24-byte buffer holds
+  every i64 duration; ASCII-only, no allocation (mach#1774).
+- format: `{:<N}` left-align spec flag — a `<` immediately after `:` writes the
+  value then space-pads on the right; the zero flag is ignored for left-align.
+  Right-align specs (`{:N}`, `{:0N}`, `{:08x}`) are byte-identical (mach#1774).
+- runtime/linux: static-PIE self-relocation — a no-libc `mach build --pie` image
+  applies its own ELF `R_*_RELATIVE` relocations before `main`. `_rt_relocate`
+  recovers the load bias from the kernel auxv (`AT_PHDR` vs the link-time
+  `PT_PHDR`) and slides every `.rela.dyn` entry; it is position-independent by
+  construction, runs from `_rt_init`, and is gated on `$mach.build.pie` so a
+  non-PIE build links none of it (mach#1727).
+- runtime/linux: `PT_GNU_RELRO` re-protection — after applying the RELATIVE
+  relocations, `_rt_relocate` `mprotect`s the linker's `PT_GNU_RELRO` region
+  (relocated constants in `.rodata`, mapped writable for self-relocation) back to
+  `PROT_READ`, so those constants are read-only before `main`. Page-exact and
+  reloc-independent: it captures `AT_PAGESZ`, gates on the region being a whole
+  number of runtime pages, and skips (leaving it writable) on a kernel page
+  larger than the image's 4 KiB segment alignment (mach#1778).
 - process: `exec.spawn_redirected` — spawn without waiting, with stdout and/or
   stderr bound to caller-supplied descriptors (stdin stays inherited); and
   `exec.wait_any` — block until any child exits, returning the reaped child's
