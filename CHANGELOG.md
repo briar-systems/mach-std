@@ -19,6 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   darwin reads `hw.ncpu` via `__sysctl`, windows uses
   `GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)`. Never less than 1 (#331).
 
+### Fixed
+
+- system: `os.page_size` on linux now returns the runtime `AT_PAGESZ` the
+  entrypoint captures from the auxiliary vector at startup, instead of a
+  hardcoded 4096 — correct on aarch64 kernels configured for 16 KiB or 64 KiB
+  pages. The runtime publishes the auxv page size into the OS layer
+  (`capture_pagesz`) right after `_envp`, post-relocation, giving page_size() one
+  source of truth; `std.runtime.linux.reloc` keeps its own pre-relocation read
+  for the RELRO mprotect (#336).
+
 ## [0.16.2] - 2026-06-28
 
 Enter aarch64 darwin executables through the `LC_MAIN` register convention and
