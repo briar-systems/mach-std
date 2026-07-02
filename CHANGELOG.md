@@ -39,6 +39,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   popcounts the `sched_getaffinity` mask (honouring taskset/cgroup cpusets),
   darwin reads `hw.ncpu` via `__sysctl`, windows uses
   `GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)`. Never less than 1 (#331).
+- data/json: streaming NDJSON emitter — `Object`/`Array` with `object_begin`/
+  `object_end`, the nesting primitives `object_end_value`/`field_object_begin`/
+  `field_array_begin`/`array_end`/`array_object_begin`, and the members
+  `field_str`/`field_str_or_null`/`field_null`/`field_i64`/`field_bool` write
+  one-object-per-line JSON (objects nest onto a single line) through a
+  caller-owned `io.Writer`, plus `write_json_string` for a lone escaped string
+  literal. `mach.cli.json` moves into std as the one JSON emission home; the
+  tree `emit` and the streaming surface now share a single escape core
+  (`escape_unit`) with an explicit policy: `ESCAPE_VERBATIM` (structural, UTF-8
+  verbatim) for `emit`, and `ESCAPE_ENSURE_ASCII` (RFC 3629 decode to `\uXXXX`,
+  astral surrogate pairs, U+FFFD on invalid input) for the stream. Both surfaces
+  are byte-identical to their pre-unification output (#338).
 
 ### Fixed
 
