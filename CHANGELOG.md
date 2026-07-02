@@ -27,7 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pages. The runtime publishes the auxv page size into the OS layer
   (`capture_pagesz`) right after `_envp`, post-relocation, giving page_size() one
   source of truth; `std.runtime.linux.reloc` keeps its own pre-relocation read
-  for the RELRO mprotect (#336).
+  for the RELRO mprotect. `AT_PAGESZ` is mandatory on linux, so page_size()
+  panics when it is unavailable rather than fabricating a default (#336).
 
 ## [0.16.2] - 2026-06-28
 
