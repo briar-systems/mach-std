@@ -28,12 +28,16 @@
 #     streaming emitter uses this so a machine consumer reads a stable, valid
 #     stream regardless of the bytes a test label or path carries.
 #
-# WARNING: parse and emit disagree on what a string's bytes mean. parse yields
-# raw wire bytes with escapes intact; emit treats str_val as logical bytes and
-# re-escapes '"', '\', and control bytes. so emitting a tree that came from
-# parse double-escapes any wire escapes it contained (parse "a\nb" -> str_val
-# a\nb -> emit "a\\nb"). build trees with make_string for emission; do not
-# round-trip parse -> emit for strings holding escapes. tracked in mach-std#340.
+# string bytes have two representations. parse stores the RAW on-wire bytes
+# between the quotes with escapes intact (value_string returns these, zero-copy);
+# emit treats str_val as LOGICAL bytes and escapes '"', '\', and control bytes.
+# the two meanings are bridged by value_string_decode, which resolves the wire
+# escapes of a parsed string into logical bytes at the point of consumption --
+# the inverse of the emit escaper, so decode(parse(emit(v))) recovers v's logical
+# bytes. a parsed tree must therefore be decoded before its strings are treated
+# as logical text: emitting a parsed str_val verbatim double-escapes any wire
+# escapes it held (parse "a\nb" -> raw a\nb -> emit "a\\nb"), so build trees with
+# make_string from already-logical bytes for emission. see mach-std#340.
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -50,6 +54,7 @@ use std.memory.raw_copy;
 use allo:   std.allocator;
 use writer: std.io.writer;
 use fmt:    std.format;
+use utf8:   std.text.utf8;
 
 pub def Kind: u8;
 pub val NULL:   Kind = 0;
@@ -68,7 +73,8 @@ val USIZE_SIZE: usize = $size_of(usize);
 # kind:     type discriminator (NULL, BOOL, NUMBER, STRING, ARRAY, OBJECT)
 # bool_val: boolean value (1 = true, 0 = false) when kind == BOOL
 # num_val:  integer value when kind == NUMBER
-# str_val:  pointer into original input when kind == STRING
+# str_val:  pointer into original input when kind == STRING; the RAW on-wire
+#           bytes with escapes intact (use value_string_decode for logical bytes)
 # str_len:  byte length of string (not null-terminated)
 # children: heap-allocated array of child Values (ARRAY or OBJECT)
 # keys:     heap-allocated array of key strings (OBJECT only, parallel with children;
@@ -172,13 +178,49 @@ pub fun value_number(v: *Value) i64 {
     ret v.num_val;
 }
 
-# value_string: get the string pointer and length.
+# value_string: get the raw string pointer and length.
+#
+# for a parsed value these are the RAW on-wire bytes between the quotes, escapes
+# intact and zero-copy into the input (parse "a\nb" yields the 4 bytes a \ n b);
+# use value_string_decode to resolve the escapes into logical bytes.
 # ---
 # len: receives the byte length of the string
-# ret: pointer to the first byte of the string content
+# ret: pointer to the first byte of the raw string content
 pub fun value_string(v: *Value, len: *usize) *u8 {
     @len = v.str_len;
     ret v.str_val::*u8;
+}
+
+# value_string_decode: decode the raw wire bytes of a string value into logical
+# bytes, resolving JSON escapes into a caller buffer.
+#
+# the inverse of the emit escaper: '\"' '\\' '\/' become '"' '\' '/', '\b' '\f'
+# '\n' '\r' '\t' become their control bytes, and '\uXXXX' decodes to UTF-8 (a
+# high+low surrogate pair combines into one astral code point). unescaped bytes,
+# including raw UTF-8, pass through verbatim. the parser stores raw wire bytes
+# (see value_string), so this is where a parsed string becomes logical text.
+#
+# bytes are written into `buf` up to `len`; the full decoded length is always
+# returned, so a caller can size the buffer by passing len 0 (or a short buffer)
+# and calling again once `buf` is large enough (as with emit).
+# ---
+# v:   the value whose raw string bytes to decode (str_val/str_len)
+# buf: destination buffer for the decoded bytes
+# len: capacity of buf in bytes
+# ret: the decoded byte length on success (may exceed len), or an error message
+#      if the bytes hold a malformed escape (unknown escape, a '\u' without four
+#      hex digits, or an ill-formed surrogate pair)
+pub fun value_string_decode(v: *Value, buf: *u8, len: usize) Result[usize, str] {
+    var b: BufWriter;
+    b.data = buf;
+    b.cap  = len;
+    b.pos  = 0;
+    var w: writer.Writer;
+    w.ctx      = (?b)::ptr;
+    w.fn_write = bufw_write;
+    val dr: Result[bool, str] = decode_bytes(?w, v.str_val::*u8, v.str_len);
+    if (is_err[bool, str](dr)) { ret err[usize, str](unwrap_err[bool, str](dr)); }
+    ret ok[usize, str](b.pos);
 }
 
 # value_count: get the number of children (array elements or object entries).
@@ -761,6 +803,137 @@ fun write_u_hex(w: *writer.Writer, code: u32) {
 fun hex_digit(n: u32) u8 {
     if (n < 10) { ret n::u8 + '0'; }
     ret n::u8 - 10 + 'a';
+}
+
+# decode s[0..slen) -- the raw wire bytes of a JSON string body, escapes intact
+# -- into logical bytes written through w. See value_string_decode for the
+# escape matrix and the malformed-escape error contract.
+# ---
+# w:    the writer to emit decoded bytes through
+# s:    the raw string bytes
+# slen: the byte length of s
+# ret:  true on success, or an error message on a malformed escape
+fun decode_bytes(w: *writer.Writer, s: *u8, slen: usize) Result[bool, str] {
+    var i: usize = 0;
+    for (i < slen) {
+        val ir: Result[usize, str] = decode_unit(w, s, i, slen);
+        if (is_err[usize, str](ir)) { ret err[bool, str](unwrap_err[usize, str](ir)); }
+        i = unwrap_ok[usize, str](ir);
+    }
+    ret ok[bool, str](true);
+}
+
+# decode one unit of `s` starting at `i` -- a verbatim byte or an escape sequence
+# -- writing the logical bytes through w and returning the next byte index.
+# ---
+# w:    the writer to emit through
+# s:    the raw string bytes
+# i:    the byte index to decode
+# slen: the byte length of s
+# ret:  the index of the next byte, or an error message on a malformed escape
+fun decode_unit(w: *writer.Writer, s: *u8, i: usize, slen: usize) Result[usize, str] {
+    val c: u8 = s[i];
+    if (c != '\\') {
+        fmt.write_byte(w, c);
+        ret ok[usize, str](i + 1);
+    }
+    if (i + 1 >= slen) {
+        ret err[usize, str]("trailing backslash in string");
+    }
+    val e: u8 = s[i + 1];
+    if (e == '"')  { fmt.write_byte(w, '"');  ret ok[usize, str](i + 2); }
+    if (e == '\\') { fmt.write_byte(w, '\\'); ret ok[usize, str](i + 2); }
+    if (e == '/')  { fmt.write_byte(w, '/');  ret ok[usize, str](i + 2); }
+    if (e == 'b')  { fmt.write_byte(w, 0x08); ret ok[usize, str](i + 2); }
+    if (e == 'f')  { fmt.write_byte(w, 0x0c); ret ok[usize, str](i + 2); }
+    if (e == 'n')  { fmt.write_byte(w, 0x0a); ret ok[usize, str](i + 2); }
+    if (e == 'r')  { fmt.write_byte(w, 0x0d); ret ok[usize, str](i + 2); }
+    if (e == 't')  { fmt.write_byte(w, 0x09); ret ok[usize, str](i + 2); }
+    if (e == 'u')  { ret decode_u_escape(w, s, i, slen); }
+    ret err[usize, str]("invalid escape sequence");
+}
+
+# decode a '\uXXXX' escape at `i` (the backslash) into UTF-8 written through w,
+# combining a high+low surrogate pair into one astral code point. Returns the
+# index past the escape (or the pair), or an error on truncated/non-hex digits or
+# an ill-formed surrogate pair.
+# ---
+# w:    the writer to emit through
+# s:    the raw string bytes
+# i:    the index of the escape's backslash
+# slen: the byte length of s
+# ret:  the index of the next byte, or an error message
+fun decode_u_escape(w: *writer.Writer, s: *u8, i: usize, slen: usize) Result[usize, str] {
+    val hr: Result[u32, str] = read_hex4(s, i + 2, slen);
+    if (is_err[u32, str](hr)) { ret err[usize, str](unwrap_err[u32, str](hr)); }
+    val u: u32 = unwrap_ok[u32, str](hr);
+
+    if (u >= 0xD800 && u <= 0xDBFF) {
+        val j: usize = i + 6;
+        if (j + 1 >= slen || s[j] != '\\' || s[j + 1] != 'u') {
+            ret err[usize, str]("unpaired high surrogate");
+        }
+        val lr: Result[u32, str] = read_hex4(s, j + 2, slen);
+        if (is_err[u32, str](lr)) { ret err[usize, str](unwrap_err[u32, str](lr)); }
+        val lo: u32 = unwrap_ok[u32, str](lr);
+        if (lo < 0xDC00 || lo > 0xDFFF) {
+            ret err[usize, str]("invalid low surrogate");
+        }
+        val cp: u32 = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00);
+        write_utf8_bytes(w, cp);
+        ret ok[usize, str](j + 6);
+    }
+
+    if (u >= 0xDC00 && u <= 0xDFFF) {
+        ret err[usize, str]("unexpected low surrogate");
+    }
+
+    write_utf8_bytes(w, u);
+    ret ok[usize, str](i + 6);
+}
+
+# read the four hex digits of a '\uXXXX' escape starting at `i` (the first digit),
+# returning the 16-bit value.
+# ---
+# s:    the raw string bytes
+# i:    the index of the first hex digit
+# slen: the byte length of s
+# ret:  the decoded 16-bit value, or an error if truncated or non-hex
+fun read_hex4(s: *u8, i: usize, slen: usize) Result[u32, str] {
+    if (i + 4 > slen) {
+        ret err[u32, str]("truncated unicode escape");
+    }
+    var v: u32 = 0;
+    var k: usize = 0;
+    for (k < 4) {
+        val d: u32 = hex_nibble(s[i + k]);
+        if (d > 0xF) { ret err[u32, str]("invalid unicode escape hex"); }
+        v = (v << 4) | d;
+        k = k + 1;
+    }
+    ret ok[u32, str](v);
+}
+
+# map a hex ASCII digit to its 0-15 value, or 0x100 if the byte is not hex.
+# ---
+# c:   the candidate hex digit byte
+# ret: the nibble value, or 0x100 for a non-hex byte
+fun hex_nibble(c: u8) u32 {
+    if (c >= '0' && c <= '9') { ret (c - '0')::u32; }
+    if (c >= 'a' && c <= 'f') { ret (c - 'a' + 10)::u32; }
+    if (c >= 'A' && c <= 'F') { ret (c - 'A' + 10)::u32; }
+    ret 0x100;
+}
+
+# encode a validated scalar (never a surrogate, <= U+10FFFF) as UTF-8 bytes
+# written through w.
+# ---
+# w:  the writer to emit through
+# cp: the Unicode scalar value
+fun write_utf8_bytes(w: *writer.Writer, cp: u32) {
+    var tmp: [4]u8;
+    val n: usize = utf8.encode(cp::utf8.Codepoint, ?tmp[0], 4);
+    fmt.write_bytes(w, ?tmp[0], n);
 }
 
 fun emit_value(w: *writer.Writer, v: *Value) {
