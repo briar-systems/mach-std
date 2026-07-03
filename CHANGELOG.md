@@ -54,6 +54,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- runtime/linux: RELRO re-protection is now fatal on any failure. `_rt_relocate`'s
+  `PT_GNU_RELRO` re-protection was best-effort — it skipped a region not congruent
+  with the runtime page and ignored the `mprotect` result. Now that the ELF writer
+  aligns every segment to the target's max page (≥ any supported kernel page,
+  mach#1845), the region is always a whole number of runtime pages, so an absent
+  `AT_PAGESZ`, a congruence mismatch, or a failed `mprotect` is a broken
+  environment or a violated layout contract. The extracted `relro_reprotect`
+  panics naming the violated invariant in each case — the glibc stance, matching
+  `os.page_size`'s `AT_PAGESZ` precedent (#336) — so a `--pie` binary either runs
+  fully hardened or dies loudly; no silent-unhardened path remains (#347).
 - system: `os.page_size` on linux now returns the runtime `AT_PAGESZ` the
   entrypoint captures from the auxiliary vector at startup, instead of a
   hardcoded 4096 — correct on aarch64 kernels configured for 16 KiB or 64 KiB

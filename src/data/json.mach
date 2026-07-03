@@ -1,4 +1,4 @@
-# JSON parser and emitter (integer numbers only).
+# JSON parser and emitter.
 #
 # this module hosts two emission surfaces over one escape core:
 #
@@ -28,12 +28,16 @@
 #     streaming emitter uses this so a machine consumer reads a stable, valid
 #     stream regardless of the bytes a test label or path carries.
 #
-# WARNING: parse and emit disagree on what a string's bytes mean. parse yields
-# raw wire bytes with escapes intact; emit treats str_val as logical bytes and
-# re-escapes '"', '\', and control bytes. so emitting a tree that came from
-# parse double-escapes any wire escapes it contained (parse "a\nb" -> str_val
-# a\nb -> emit "a\\nb"). build trees with make_string for emission; do not
-# round-trip parse -> emit for strings holding escapes. tracked in mach-std#340.
+# string bytes have two representations. parse stores the RAW on-wire bytes
+# between the quotes with escapes intact (value_string returns these, zero-copy);
+# emit treats str_val as LOGICAL bytes and escapes '"', '\', and control bytes.
+# the two meanings are bridged by value_string_decode, which resolves the wire
+# escapes of a parsed string into logical bytes at the point of consumption --
+# the inverse of the emit escaper, so decode(parse(emit(v))) recovers v's logical
+# bytes. a parsed tree must therefore be decoded before its strings are treated
+# as logical text: emitting a parsed str_val verbatim double-escapes any wire
+# escapes it held (parse "a\nb" -> raw a\nb -> emit "a\\nb"), so build trees with
+# make_string from already-logical bytes for emission. see mach-std#340.
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -50,6 +54,8 @@ use std.memory.raw_copy;
 use allo:   std.allocator;
 use writer: std.io.writer;
 use fmt:    std.format;
+use utf8:   std.text.utf8;
+use std.text.parse.parse_f64_len;
 
 pub def Kind: u8;
 pub val NULL:   Kind = 0;
@@ -65,28 +71,34 @@ val USIZE_SIZE: usize = $size_of(usize);
 
 # a parsed JSON value.
 # ---
-# kind:     type discriminator (NULL, BOOL, NUMBER, STRING, ARRAY, OBJECT)
-# bool_val: boolean value (1 = true, 0 = false) when kind == BOOL
-# num_val:  integer value when kind == NUMBER
-# str_val:  pointer into original input when kind == STRING
-# str_len:  byte length of string (not null-terminated)
-# children: heap-allocated array of child Values (ARRAY or OBJECT)
-# keys:     heap-allocated array of key strings (OBJECT only, parallel with children;
-#           pointers into the original input, not null-terminated)
-# keys_len: heap-allocated array of key byte lengths (parallel with keys)
-# count:    number of children/keys
-# cap:      allocated capacity of children/keys arrays
+# kind:      type discriminator (NULL, BOOL, NUMBER, STRING, ARRAY, OBJECT)
+# bool_val:  boolean value (1 = true, 0 = false) when kind == BOOL
+# is_float:  for a NUMBER, 1 if parsed as a float (had a fraction or exponent),
+#            else 0 (an integer); selects num_val vs float_val
+# num_val:   integer value when kind == NUMBER and is_float == 0
+# float_val: float value when kind == NUMBER and is_float == 1
+# str_val:   pointer into original input when kind == STRING; the RAW on-wire
+#            bytes with escapes intact (use value_string_decode for logical bytes)
+# str_len:   byte length of string (not null-terminated)
+# children:  heap-allocated array of child Values (ARRAY or OBJECT)
+# keys:      heap-allocated array of key strings (OBJECT only, parallel with children;
+#            pointers into the original input, not null-terminated)
+# keys_len:  heap-allocated array of key byte lengths (parallel with keys)
+# count:     number of children/keys
+# cap:       allocated capacity of children/keys arrays
 pub rec Value {
-    kind:     Kind;
-    bool_val: u8;
-    num_val:  i64;
-    str_val:  str;
-    str_len:  usize;
-    children: *Value;
-    keys:     *str;
-    keys_len: *usize;
-    count:    usize;
-    cap:      usize;
+    kind:      Kind;
+    bool_val:  u8;
+    is_float:  u8;
+    num_val:   i64;
+    float_val: f64;
+    str_val:   str;
+    str_len:   usize;
+    children:  *Value;
+    keys:      *str;
+    keys_len:  *usize;
+    count:     usize;
+    cap:       usize;
 }
 
 rec Parser {
@@ -167,18 +179,74 @@ pub fun value_bool(v: *Value) bool {
     ret v.bool_val != 0;
 }
 
-# value_number: get the integer value.
+# value_is_float: whether a NUMBER value was parsed as a float.
+#
+# true for a number with a fraction or exponent, false for an integer-looking
+# number; selects whether to read it with value_float or value_number.
+pub fun value_is_float(v: *Value) bool {
+    ret v.kind == NUMBER && v.is_float != 0;
+}
+
+# value_number: get the integer value of an integer NUMBER.
+#
+# meaningful when the number was parsed as an integer (value_is_float is false);
+# read a float number with value_float.
 pub fun value_number(v: *Value) i64 {
     ret v.num_val;
 }
 
-# value_string: get the string pointer and length.
+# value_float: get the value of a NUMBER as a 64-bit float.
+#
+# returns the float value for a number parsed as a float, or the integer value
+# widened to f64 for an integer number, so it is defined for any NUMBER.
+pub fun value_float(v: *Value) f64 {
+    if (v.is_float != 0) { ret v.float_val; }
+    ret v.num_val::f64;
+}
+
+# value_string: get the raw string pointer and length.
+#
+# for a parsed value these are the RAW on-wire bytes between the quotes, escapes
+# intact and zero-copy into the input (parse "a\nb" yields the 4 bytes a \ n b);
+# use value_string_decode to resolve the escapes into logical bytes.
 # ---
 # len: receives the byte length of the string
-# ret: pointer to the first byte of the string content
+# ret: pointer to the first byte of the raw string content
 pub fun value_string(v: *Value, len: *usize) *u8 {
     @len = v.str_len;
     ret v.str_val::*u8;
+}
+
+# value_string_decode: decode the raw wire bytes of a string value into logical
+# bytes, resolving JSON escapes into a caller buffer.
+#
+# the inverse of the emit escaper: '\"' '\\' '\/' become '"' '\' '/', '\b' '\f'
+# '\n' '\r' '\t' become their control bytes, and '\uXXXX' decodes to UTF-8 (a
+# high+low surrogate pair combines into one astral code point). unescaped bytes,
+# including raw UTF-8, pass through verbatim. the parser stores raw wire bytes
+# (see value_string), so this is where a parsed string becomes logical text.
+#
+# bytes are written into `buf` up to `len`; the full decoded length is always
+# returned, so a caller can size the buffer by passing len 0 (or a short buffer)
+# and calling again once `buf` is large enough (as with emit).
+# ---
+# v:   the value whose raw string bytes to decode (str_val/str_len)
+# buf: destination buffer for the decoded bytes
+# len: capacity of buf in bytes
+# ret: the decoded byte length on success (may exceed len), or an error message
+#      if the bytes hold a malformed escape (unknown escape, a '\u' without four
+#      hex digits, or an ill-formed surrogate pair)
+pub fun value_string_decode(v: *Value, buf: *u8, len: usize) Result[usize, str] {
+    var b: BufWriter;
+    b.data = buf;
+    b.cap  = len;
+    b.pos  = 0;
+    var w: writer.Writer;
+    w.ctx      = (?b)::ptr;
+    w.fn_write = bufw_write;
+    val dr: Result[bool, str] = decode_bytes(?w, v.str_val::*u8, v.str_len);
+    if (is_err[bool, str](dr)) { ret err[usize, str](unwrap_err[bool, str](dr)); }
+    ret ok[usize, str](b.pos);
 }
 
 # value_count: get the number of children (array elements or object entries).
@@ -271,7 +339,9 @@ fun make_null() Value {
     var v: Value;
     v.kind = NULL;
     v.bool_val = 0;
+    v.is_float = 0;
     v.num_val = 0;
+    v.float_val = 0.0;
     v.str_val = nil;
     v.str_len = 0;
     v.children = nil;
@@ -293,6 +363,14 @@ fun make_number(n: i64) Value {
     var v: Value = make_null();
     v.kind = NUMBER;
     v.num_val = n;
+    ret v;
+}
+
+fun make_float(f: f64) Value {
+    var v: Value = make_null();
+    v.kind = NUMBER;
+    v.is_float = 1;
+    v.float_val = f;
     ret v;
 }
 
@@ -398,8 +476,15 @@ fun parse_bool(p: *Parser) Result[Value, str] {
     ret ok[Value, str](make_bool(0));
 }
 
+# parse a JSON number (RFC 8259): optional minus, integer part, optional fraction
+# and optional exponent. a number with a fraction or exponent yields a float
+# value (parsed with correct rounding via parse_f64_len over the zero-copy span);
+# an integer-looking number keeps yielding an i64, unchanged.
 fun parse_number(p: *Parser) Result[Value, str] {
+    val start: usize = p.pos;
     var neg: bool = false;
+    var is_float: bool = false;
+
     if (p.src[p.pos] == '-') {
         neg = true;
         p.pos = p.pos + 1;
@@ -418,6 +503,44 @@ fun parse_number(p: *Parser) Result[Value, str] {
 
     if (!has_digit) {
         ret err[Value, str]("invalid number: no digits");
+    }
+
+    if (p.pos < p.len && p.src[p.pos] == '.') {
+        is_float = true;
+        p.pos = p.pos + 1;
+        var frac_digit: bool = false;
+        for (p.pos < p.len && p.src[p.pos] >= '0' && p.src[p.pos] <= '9') {
+            frac_digit = true;
+            p.pos = p.pos + 1;
+        }
+        if (!frac_digit) {
+            ret err[Value, str]("invalid number: no fraction digits");
+        }
+    }
+
+    if (p.pos < p.len && (p.src[p.pos] == 'e' || p.src[p.pos] == 'E')) {
+        is_float = true;
+        p.pos = p.pos + 1;
+        if (p.pos < p.len && (p.src[p.pos] == '+' || p.src[p.pos] == '-')) {
+            p.pos = p.pos + 1;
+        }
+        var exp_digit: bool = false;
+        for (p.pos < p.len && p.src[p.pos] >= '0' && p.src[p.pos] <= '9') {
+            exp_digit = true;
+            p.pos = p.pos + 1;
+        }
+        if (!exp_digit) {
+            ret err[Value, str]("invalid number: no exponent digits");
+        }
+    }
+
+    if (is_float) {
+        val span: str = (p.src::usize + start)::str;
+        val fr: Result[f64, str] = parse_f64_len(span, p.pos - start);
+        if (is_err[f64, str](fr)) {
+            ret err[Value, str](unwrap_err[f64, str](fr));
+        }
+        ret ok[Value, str](make_float(unwrap_ok[f64, str](fr)));
     }
 
     if (neg) { n = 0 - n; }
@@ -763,6 +886,137 @@ fun hex_digit(n: u32) u8 {
     ret n::u8 - 10 + 'a';
 }
 
+# decode s[0..slen) -- the raw wire bytes of a JSON string body, escapes intact
+# -- into logical bytes written through w. See value_string_decode for the
+# escape matrix and the malformed-escape error contract.
+# ---
+# w:    the writer to emit decoded bytes through
+# s:    the raw string bytes
+# slen: the byte length of s
+# ret:  true on success, or an error message on a malformed escape
+fun decode_bytes(w: *writer.Writer, s: *u8, slen: usize) Result[bool, str] {
+    var i: usize = 0;
+    for (i < slen) {
+        val ir: Result[usize, str] = decode_unit(w, s, i, slen);
+        if (is_err[usize, str](ir)) { ret err[bool, str](unwrap_err[usize, str](ir)); }
+        i = unwrap_ok[usize, str](ir);
+    }
+    ret ok[bool, str](true);
+}
+
+# decode one unit of `s` starting at `i` -- a verbatim byte or an escape sequence
+# -- writing the logical bytes through w and returning the next byte index.
+# ---
+# w:    the writer to emit through
+# s:    the raw string bytes
+# i:    the byte index to decode
+# slen: the byte length of s
+# ret:  the index of the next byte, or an error message on a malformed escape
+fun decode_unit(w: *writer.Writer, s: *u8, i: usize, slen: usize) Result[usize, str] {
+    val c: u8 = s[i];
+    if (c != '\\') {
+        fmt.write_byte(w, c);
+        ret ok[usize, str](i + 1);
+    }
+    if (i + 1 >= slen) {
+        ret err[usize, str]("trailing backslash in string");
+    }
+    val e: u8 = s[i + 1];
+    if (e == '"')  { fmt.write_byte(w, '"');  ret ok[usize, str](i + 2); }
+    if (e == '\\') { fmt.write_byte(w, '\\'); ret ok[usize, str](i + 2); }
+    if (e == '/')  { fmt.write_byte(w, '/');  ret ok[usize, str](i + 2); }
+    if (e == 'b')  { fmt.write_byte(w, 0x08); ret ok[usize, str](i + 2); }
+    if (e == 'f')  { fmt.write_byte(w, 0x0c); ret ok[usize, str](i + 2); }
+    if (e == 'n')  { fmt.write_byte(w, 0x0a); ret ok[usize, str](i + 2); }
+    if (e == 'r')  { fmt.write_byte(w, 0x0d); ret ok[usize, str](i + 2); }
+    if (e == 't')  { fmt.write_byte(w, 0x09); ret ok[usize, str](i + 2); }
+    if (e == 'u')  { ret decode_u_escape(w, s, i, slen); }
+    ret err[usize, str]("invalid escape sequence");
+}
+
+# decode a '\uXXXX' escape at `i` (the backslash) into UTF-8 written through w,
+# combining a high+low surrogate pair into one astral code point. Returns the
+# index past the escape (or the pair), or an error on truncated/non-hex digits or
+# an ill-formed surrogate pair.
+# ---
+# w:    the writer to emit through
+# s:    the raw string bytes
+# i:    the index of the escape's backslash
+# slen: the byte length of s
+# ret:  the index of the next byte, or an error message
+fun decode_u_escape(w: *writer.Writer, s: *u8, i: usize, slen: usize) Result[usize, str] {
+    val hr: Result[u32, str] = read_hex4(s, i + 2, slen);
+    if (is_err[u32, str](hr)) { ret err[usize, str](unwrap_err[u32, str](hr)); }
+    val u: u32 = unwrap_ok[u32, str](hr);
+
+    if (u >= 0xD800 && u <= 0xDBFF) {
+        val j: usize = i + 6;
+        if (j + 1 >= slen || s[j] != '\\' || s[j + 1] != 'u') {
+            ret err[usize, str]("unpaired high surrogate");
+        }
+        val lr: Result[u32, str] = read_hex4(s, j + 2, slen);
+        if (is_err[u32, str](lr)) { ret err[usize, str](unwrap_err[u32, str](lr)); }
+        val lo: u32 = unwrap_ok[u32, str](lr);
+        if (lo < 0xDC00 || lo > 0xDFFF) {
+            ret err[usize, str]("invalid low surrogate");
+        }
+        val cp: u32 = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00);
+        write_utf8_bytes(w, cp);
+        ret ok[usize, str](j + 6);
+    }
+
+    if (u >= 0xDC00 && u <= 0xDFFF) {
+        ret err[usize, str]("unexpected low surrogate");
+    }
+
+    write_utf8_bytes(w, u);
+    ret ok[usize, str](i + 6);
+}
+
+# read the four hex digits of a '\uXXXX' escape starting at `i` (the first digit),
+# returning the 16-bit value.
+# ---
+# s:    the raw string bytes
+# i:    the index of the first hex digit
+# slen: the byte length of s
+# ret:  the decoded 16-bit value, or an error if truncated or non-hex
+fun read_hex4(s: *u8, i: usize, slen: usize) Result[u32, str] {
+    if (i + 4 > slen) {
+        ret err[u32, str]("truncated unicode escape");
+    }
+    var v: u32 = 0;
+    var k: usize = 0;
+    for (k < 4) {
+        val d: u32 = hex_nibble(s[i + k]);
+        if (d > 0xF) { ret err[u32, str]("invalid unicode escape hex"); }
+        v = (v << 4) | d;
+        k = k + 1;
+    }
+    ret ok[u32, str](v);
+}
+
+# map a hex ASCII digit to its 0-15 value, or 0x100 if the byte is not hex.
+# ---
+# c:   the candidate hex digit byte
+# ret: the nibble value, or 0x100 for a non-hex byte
+fun hex_nibble(c: u8) u32 {
+    if (c >= '0' && c <= '9') { ret (c - '0')::u32; }
+    if (c >= 'a' && c <= 'f') { ret (c - 'a' + 10)::u32; }
+    if (c >= 'A' && c <= 'F') { ret (c - 'A' + 10)::u32; }
+    ret 0x100;
+}
+
+# encode a validated scalar (never a surrogate, <= U+10FFFF) as UTF-8 bytes
+# written through w.
+# ---
+# w:  the writer to emit through
+# cp: the Unicode scalar value
+fun write_utf8_bytes(w: *writer.Writer, cp: u32) {
+    var tmp: [4]u8;
+    val n: usize = utf8.encode(cp::utf8.Codepoint, ?tmp[0], 4);
+    fmt.write_bytes(w, ?tmp[0], n);
+}
+
 fun emit_value(w: *writer.Writer, v: *Value) {
     if (v.kind == NULL) {
         fmt.write_str(w, "null");
@@ -779,7 +1033,11 @@ fun emit_value(w: *writer.Writer, v: *Value) {
     }
 
     if (v.kind == NUMBER) {
-        fmt.write_i64(w, v.num_val);
+        if (v.is_float != 0) {
+            fmt.write_f64(w, v.float_val);
+        } or {
+            fmt.write_i64(w, v.num_val);
+        }
         ret;
     }
 
@@ -1690,5 +1948,405 @@ test "json: ndjson empty array" {
     var wl: usize = 0;
     for (want[wl] != 0) { wl = wl + 1; }
     if (!sink_is(?sink, want, wl)) { ret 1; }
+    ret 0;
+}
+
+# decode a raw string body through value_string_decode and compare the result to
+# `want`.
+fun decode_check(raw: *u8, rawlen: usize, want: *u8, wantlen: usize) bool {
+    val v: Value = make_string((raw::usize)::str, rawlen);
+    var buf: [64]u8;
+    val dr: Result[usize, str] = value_string_decode(?v, ?buf[0], 64);
+    if (is_err[usize, str](dr)) { ret false; }
+    val n: usize = unwrap_ok[usize, str](dr);
+    if (n != wantlen) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (buf[i] != want[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether value_string_decode rejects the given raw string body.
+fun decode_rejects(raw: *u8, rawlen: usize) bool {
+    val v: Value = make_string((raw::usize)::str, rawlen);
+    var buf: [64]u8;
+    val dr: Result[usize, str] = value_string_decode(?v, ?buf[0], 64);
+    ret is_err[usize, str](dr);
+}
+
+# a body with no escapes decodes to itself, raw UTF-8 included.
+test "json: decode verbatim" {
+    var raw:  [5]u8 = [5]u8{'a', 0xC3, 0xA9, 'z', '!'};
+    var want: [5]u8 = [5]u8{'a', 0xC3, 0xA9, 'z', '!'};
+    if (!decode_check(?raw[0], 5, ?want[0], 5)) { ret 1; }
+    ret 0;
+}
+
+# the short escapes decode to their literal bytes.
+test "json: decode short escapes" {
+    # \" \\ \/ \b \f \n \r \t
+    var raw:  [16]u8 = [16]u8{'\\', '"', '\\', '\\', '\\', '/', '\\', 'b', '\\', 'f', '\\', 'n', '\\', 'r', '\\', 't'};
+    var want: [8]u8 = [8]u8{'"', '\\', '/', 0x08, 0x0c, 0x0a, 0x0d, 0x09};
+    if (!decode_check(?raw[0], 16, ?want[0], 8)) { ret 1; }
+    ret 0;
+}
+
+# a \uXXXX BMP escape decodes to its UTF-8 bytes.
+test "json: decode unicode bmp" {
+    # é -> U+00E9 -> 0xC3 0xA9
+    var raw:  [6]u8 = [6]u8{'\\', 'u', '0', '0', 'e', '9'};
+    var want: [2]u8 = [2]u8{0xC3, 0xA9};
+    if (!decode_check(?raw[0], 6, ?want[0], 2)) { ret 1; }
+    ret 0;
+}
+
+# a \uXXXX escape in the ASCII range decodes to one byte.
+test "json: decode unicode ascii" {
+    # A -> 'A'
+    var raw:  [6]u8 = [6]u8{'\\', 'u', '0', '0', '4', '1'};
+    var want: [1]u8 = [1]u8{'A'};
+    if (!decode_check(?raw[0], 6, ?want[0], 1)) { ret 1; }
+    ret 0;
+}
+
+# uppercase hex digits decode identically to lowercase.
+test "json: decode unicode uppercase hex" {
+    # é -> U+00E9 -> 0xC3 0xA9
+    var raw:  [6]u8 = [6]u8{'\\', 'u', '0', '0', 'E', '9'};
+    var want: [2]u8 = [2]u8{0xC3, 0xA9};
+    if (!decode_check(?raw[0], 6, ?want[0], 2)) { ret 1; }
+    ret 0;
+}
+
+# a high+low surrogate pair decodes to one astral code point in UTF-8.
+test "json: decode surrogate pair" {
+    # 😀 -> U+1F600 -> 0xF0 0x9F 0x98 0x80
+    var raw:  [12]u8 = [12]u8{'\\', 'u', 'd', '8', '3', 'd', '\\', 'u', 'd', 'e', '0', '0'};
+    var want: [4]u8 = [4]u8{0xF0, 0x9F, 0x98, 0x80};
+    if (!decode_check(?raw[0], 12, ?want[0], 4)) { ret 1; }
+    ret 0;
+}
+
+# value_string_decode reports the full decoded length even when the buffer is too
+# small, so a caller can size then fill (as with emit).
+test "json: decode buffer sizing" {
+    # 😀 decodes to 4 bytes
+    var raw: [12]u8 = [12]u8{'\\', 'u', 'd', '8', '3', 'd', '\\', 'u', 'd', 'e', '0', '0'};
+    val v: Value = make_string(((?raw[0])::usize)::str, 12);
+
+    var probe: [1]u8;
+    val sr: Result[usize, str] = value_string_decode(?v, ?probe[0], 0);
+    if (is_err[usize, str](sr)) { ret 1; }
+    if (unwrap_ok[usize, str](sr) != 4) { ret 1; }
+
+    var buf: [4]u8;
+    val dr: Result[usize, str] = value_string_decode(?v, ?buf[0], 4);
+    if (is_err[usize, str](dr)) { ret 1; }
+    if (unwrap_ok[usize, str](dr) != 4) { ret 1; }
+    if (buf[0] != 0xF0 || buf[1] != 0x9F || buf[2] != 0x98 || buf[3] != 0x80) { ret 1; }
+    ret 0;
+}
+
+# an unknown escape character is rejected.
+test "json: decode rejects bad escape" {
+    var raw: [2]u8 = [2]u8{'\\', 'x'};
+    if (!decode_rejects(?raw[0], 2)) { ret 1; }
+    ret 0;
+}
+
+# a \u escape without four hex digits is rejected.
+test "json: decode rejects truncated unicode" {
+    var raw: [4]u8 = [4]u8{'\\', 'u', '1', '2'};
+    if (!decode_rejects(?raw[0], 4)) { ret 1; }
+    ret 0;
+}
+
+# a non-hex digit in a \u escape is rejected.
+test "json: decode rejects non-hex unicode" {
+    var raw: [6]u8 = [6]u8{'\\', 'u', '1', '2', 'g', '4'};
+    if (!decode_rejects(?raw[0], 6)) { ret 1; }
+    ret 0;
+}
+
+# a high surrogate with no following escape is rejected.
+test "json: decode rejects unpaired high surrogate" {
+    var raw: [6]u8 = [6]u8{'\\', 'u', 'd', '8', '3', 'd'};
+    if (!decode_rejects(?raw[0], 6)) { ret 1; }
+    ret 0;
+}
+
+# a high surrogate followed by a non-low-surrogate escape is rejected.
+test "json: decode rejects bad surrogate pair" {
+    # \ud83dA
+    var raw: [12]u8 = [12]u8{'\\', 'u', 'd', '8', '3', 'd', '\\', 'u', '0', '0', '4', '1'};
+    if (!decode_rejects(?raw[0], 12)) { ret 1; }
+    ret 0;
+}
+
+# a lone low surrogate is rejected.
+test "json: decode rejects lone low surrogate" {
+    var raw: [6]u8 = [6]u8{'\\', 'u', 'd', 'c', '0', '0'};
+    if (!decode_rejects(?raw[0], 6)) { ret 1; }
+    ret 0;
+}
+
+# a trailing backslash is rejected.
+test "json: decode rejects trailing backslash" {
+    var raw: [1]u8 = [1]u8{'\\'};
+    if (!decode_rejects(?raw[0], 1)) { ret 1; }
+    ret 0;
+}
+
+# the reframed round-trip: emit escapes logical bytes to wire, parse stores the
+# wire bytes raw, and value_string_decode recovers the original logical bytes.
+test "json: decode roundtrip emit then parse" {
+    var a: allo.Allocator;
+    page.make(?a);
+
+    # logical bytes: a <newline> " \ b
+    var logical: [5]u8 = [5]u8{'a', 0x0a, '"', '\\', 'b'};
+    val src: Value = make_string(((?logical[0])::usize)::str, 5);
+
+    var wire: [32]u8;
+    val wn: usize = emit(?src, ?wire[0], 32);
+
+    val r: Result[Value, str] = parse(?wire[0], wn, ?a);
+    if (is_err[Value, str](r)) { ret 1; }
+    val pv: Value = unwrap_ok[Value, str](r);
+    if (pv.kind != STRING) { ret 1; }
+
+    var buf: [16]u8;
+    val dr: Result[usize, str] = value_string_decode(?pv, ?buf[0], 16);
+    if (is_err[usize, str](dr)) { ret 1; }
+    if (unwrap_ok[usize, str](dr) != 5) { ret 1; }
+    var i: usize = 0;
+    for (i < 5) {
+        if (buf[i] != logical[i]) { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# a string parsed straight from source text decodes its wire escapes to logical
+# bytes (the hazard the raw representation posed for consumers).
+test "json: decode parsed string" {
+    var a: allo.Allocator;
+    page.make(?a);
+    # source document "a\nb" (a backslash-n between a and b)
+    val src: str = "\"a\\nb\"";
+    val r: Result[Value, str] = parse(src::*u8, 6, ?a);
+    if (is_err[Value, str](r)) { ret 1; }
+    val v: Value = unwrap_ok[Value, str](r);
+    if (v.kind != STRING) { ret 1; }
+    # raw bytes are a \ n b (4); decoded are a <newline> b (3)
+    if (v.str_len != 4) { ret 1; }
+    var buf: [8]u8;
+    val dr: Result[usize, str] = value_string_decode(?v, ?buf[0], 8);
+    if (is_err[usize, str](dr)) { ret 1; }
+    if (unwrap_ok[usize, str](dr) != 3) { ret 1; }
+    if (buf[0] != 'a' || buf[1] != 0x0a || buf[2] != 'b') { ret 1; }
+    ret 0;
+}
+
+# a fraction makes the number a float, read with value_float.
+test "json: parse float" {
+    var a: allo.Allocator;
+    page.make(?a);
+    val src: str = "3.14";
+    val r: Result[Value, str] = parse(src::*u8, 4, ?a);
+    if (is_err[Value, str](r)) { ret 1; }
+    val v: Value = unwrap_ok[Value, str](r);
+    if (v.kind != NUMBER) { ret 1; }
+    if (!value_is_float(?v)) { ret 1; }
+    val f: f64 = value_float(?v);
+    if (f < 3.139 || f > 3.141) { ret 1; }
+    ret 0;
+}
+
+# a negative float carries its sign.
+test "json: parse negative float" {
+    var a: allo.Allocator;
+    page.make(?a);
+    val src: str = "-2.5";
+    val r: Result[Value, str] = parse(src::*u8, 4, ?a);
+    if (is_err[Value, str](r)) { ret 1; }
+    val v: Value = unwrap_ok[Value, str](r);
+    if (!value_is_float(?v)) { ret 1; }
+    val f: f64 = value_float(?v);
+    if (f < -2.51 || f > -2.49) { ret 1; }
+    ret 0;
+}
+
+# an exponent with no fraction still makes the number a float.
+test "json: parse float exponent" {
+    var a: allo.Allocator;
+    page.make(?a);
+    val src: str = "1e3";
+    val r: Result[Value, str] = parse(src::*u8, 3, ?a);
+    if (is_err[Value, str](r)) { ret 1; }
+    val v: Value = unwrap_ok[Value, str](r);
+    if (!value_is_float(?v)) { ret 1; }
+    val f: f64 = value_float(?v);
+    if (f < 999.0 || f > 1001.0) { ret 1; }
+    ret 0;
+}
+
+# fraction and a signed uppercase exponent together.
+test "json: parse float frac and exponent" {
+    var a: allo.Allocator;
+    page.make(?a);
+    val src: str = "6.022E2";
+    val r: Result[Value, str] = parse(src::*u8, 7, ?a);
+    if (is_err[Value, str](r)) { ret 1; }
+    val v: Value = unwrap_ok[Value, str](r);
+    if (!value_is_float(?v)) { ret 1; }
+    val f: f64 = value_float(?v);
+    if (f < 602.1 || f > 602.3) { ret 1; }
+    ret 0;
+}
+
+# a negative exponent.
+test "json: parse float negative exponent" {
+    var a: allo.Allocator;
+    page.make(?a);
+    val src: str = "5e-2";
+    val r: Result[Value, str] = parse(src::*u8, 4, ?a);
+    if (is_err[Value, str](r)) { ret 1; }
+    val v: Value = unwrap_ok[Value, str](r);
+    if (!value_is_float(?v)) { ret 1; }
+    val f: f64 = value_float(?v);
+    if (f < 0.049 || f > 0.051) { ret 1; }
+    ret 0;
+}
+
+# an integer-looking number stays an integer: value_number works, value_is_float
+# is false, and value_float widens it.
+test "json: parse integer unchanged" {
+    var a: allo.Allocator;
+    page.make(?a);
+    val src: str = "42";
+    val r: Result[Value, str] = parse(src::*u8, 2, ?a);
+    if (is_err[Value, str](r)) { ret 1; }
+    val v: Value = unwrap_ok[Value, str](r);
+    if (value_is_float(?v)) { ret 1; }
+    if (value_number(?v) != 42) { ret 1; }
+    val f: f64 = value_float(?v);
+    if (f < 41.9 || f > 42.1) { ret 1; }
+    ret 0;
+}
+
+# a mixed array keeps integers as integers and floats as floats.
+test "json: parse mixed number array" {
+    var a: allo.Allocator;
+    page.make(?a);
+    val src: str = "[1,2.5,3]";
+    val r: Result[Value, str] = parse(src::*u8, 9, ?a);
+    if (is_err[Value, str](r)) { ret 1; }
+    val v: Value = unwrap_ok[Value, str](r);
+    if (v.kind != ARRAY || v.count != 3) { ret 1; }
+    if (value_is_float(?v.children[0])) { ret 1; }
+    if (value_number(?v.children[0]) != 1) { ret 1; }
+    if (!value_is_float(?v.children[1])) { ret 1; }
+    val f: f64 = value_float(?v.children[1]);
+    if (f < 2.49 || f > 2.51) { ret 1; }
+    if (value_is_float(?v.children[2])) { ret 1; }
+    if (value_number(?v.children[2]) != 3) { ret 1; }
+    ret 0;
+}
+
+# a float value inside an object.
+test "json: parse float in object" {
+    var a: allo.Allocator;
+    page.make(?a);
+    val src: str = "{\"x\":1.5}";
+    val r: Result[Value, str] = parse(src::*u8, 9, ?a);
+    if (is_err[Value, str](r)) { ret 1; }
+    val v: Value = unwrap_ok[Value, str](r);
+    val x: *Value = value_find(?v, "x");
+    if (x == nil) { ret 1; }
+    if (!value_is_float(x)) { ret 1; }
+    val f: f64 = value_float(x);
+    if (f < 1.49 || f > 1.51) { ret 1; }
+    ret 0;
+}
+
+# a bare decimal point with no fraction digits is rejected.
+test "json: parse float rejects empty fraction" {
+    var a: allo.Allocator;
+    page.make(?a);
+    val src: str = "1.";
+    val r: Result[Value, str] = parse(src::*u8, 2, ?a);
+    if (!is_err[Value, str](r)) { ret 1; }
+    ret 0;
+}
+
+# an exponent marker with no digits is rejected.
+test "json: parse float rejects empty exponent" {
+    var a: allo.Allocator;
+    page.make(?a);
+    val src: str = "1e";
+    val r: Result[Value, str] = parse(src::*u8, 2, ?a);
+    if (!is_err[Value, str](r)) { ret 1; }
+    ret 0;
+}
+
+# a fraction followed by an empty exponent is rejected.
+test "json: parse float rejects frac empty exponent" {
+    var a: allo.Allocator;
+    page.make(?a);
+    val src: str = "1.5e";
+    val r: Result[Value, str] = parse(src::*u8, 4, ?a);
+    if (!is_err[Value, str](r)) { ret 1; }
+    ret 0;
+}
+
+# a float emits in shortest round-trippable form.
+test "json: emit float" {
+    var a: allo.Allocator;
+    page.make(?a);
+    val src: str = "1.5";
+    val r: Result[Value, str] = parse(src::*u8, 3, ?a);
+    if (is_err[Value, str](r)) { ret 1; }
+    val v: Value = unwrap_ok[Value, str](r);
+    var buf: [16]u8;
+    val n: usize = emit(?v, ?buf[0], 16);
+    if (n != 3) { ret 1; }
+    if (buf[0] != '1' || buf[1] != '.' || buf[2] != '5') { ret 1; }
+    ret 0;
+}
+
+# a programmatically built float emits and re-parses as a float.
+test "json: emit built float" {
+    var a: allo.Allocator;
+    page.make(?a);
+    val v: Value = make_float(2.5);
+    var buf: [16]u8;
+    val n: usize = emit(?v, ?buf[0], 16);
+    if (buf[0] != '2' || buf[1] != '.' || buf[2] != '5') { ret 1; }
+    val r: Result[Value, str] = parse(?buf[0], n, ?a);
+    if (is_err[Value, str](r)) { ret 1; }
+    val rv: Value = unwrap_ok[Value, str](r);
+    if (!value_is_float(?rv)) { ret 1; }
+    ret 0;
+}
+
+# a parsed float round-trips through emit and parse back to the same value.
+test "json: float roundtrip parse emit parse" {
+    var a: allo.Allocator;
+    page.make(?a);
+    val src: str = "3.14159";
+    val r: Result[Value, str] = parse(src::*u8, 7, ?a);
+    if (is_err[Value, str](r)) { ret 1; }
+    val v: Value = unwrap_ok[Value, str](r);
+    var buf: [32]u8;
+    val n: usize = emit(?v, ?buf[0], 32);
+    val r2: Result[Value, str] = parse(?buf[0], n, ?a);
+    if (is_err[Value, str](r2)) { ret 1; }
+    val v2: Value = unwrap_ok[Value, str](r2);
+    if (!value_is_float(?v2)) { ret 1; }
+    val f: f64 = value_float(?v2);
+    if (f < 3.14158 || f > 3.14160) { ret 1; }
     ret 0;
 }
