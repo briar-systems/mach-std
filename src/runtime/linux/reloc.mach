@@ -155,33 +155,51 @@ pub fun _rt_relocate(envp: *u64) {
     # relocated constants (`.data.rel.ro`) mapped writable for the pass above; now that
     # they are slid, restore them read-only before `main`. done only when the image
     # actually carries a RELRO region - a `--pie` binary with no reloc-bearing constants
-    # emits none, and re-protecting nothing is correct. `relro_reprotect` enforces the
-    # page-congruence and mprotect invariants fatally.
+    # emits none, and re-protecting nothing is correct.
+    #
+    # the extent to re-protect is the RELRO segment's ACTUAL mapped size, taken from its
+    # backing PT_LOAD - NOT the PT_GNU_RELRO p_memsz. the writer rounds that p_memsz up to
+    # the IMAGE max-page (64 KiB on aarch64, briar-systems/mach#1845), but the kernel maps
+    # the segment rounded to the RUNTIME page; on a runtime page smaller than the image
+    # max-page (a 4 KiB/16 KiB-page aarch64 kernel) the rounded-up p_memsz overshoots the
+    # mapping, and mprotect over the unmapped tail fails ENOMEM (briar-systems/mach#1885).
+    # PT_GNU_RELRO covers exactly the `.data.rel.ro` load segment in mach's layout, so that
+    # segment's p_memsz is the authoritative region size; relro_reprotect rounds it up to
+    # the runtime page - the pages the kernel actually mapped.
     if (relro_va != 0 && relro_sz != 0) {
-        relro_reprotect(bias + relro_va, relro_sz, at_pagesz);
+        var relro_load_sz: u64 = 0;
+        var q: u64 = 0;
+        for (q < at_phnum) {
+            val qh: usize = (at_phdr + q * at_phent)::usize;
+            if (load32(qh) == 1 && load64(qh + 16) == relro_va) { relro_load_sz = load64(qh + 40); }
+            q = q + 1;
+        }
+        relro_reprotect(bias + relro_va, relro_load_sz, at_pagesz);
     }
 }
 
-# re-protect the PT_GNU_RELRO region read-only, or abort naming the violated invariant
+# re-protect the RELRO region read-only, or abort naming the violated invariant
 #
 # The region holds the relocated constants (`.data.rel.ro`: vtables, `val` pointer
 # globals, `str` literals) mapped writable for the relocation pass; once the RELATIVE
-# slots are slid it must be restored read-only before `main`. This was best-effort - it
-# skipped a region not congruent with the runtime page and ignored the mprotect result -
-# the documented large-page degradation while the writer aligned segments to a fixed 4 KiB
-# (briar-systems/mach-std#336). Now that the ELF writer aligns every segment to the
-# target's max page (>= any supported kernel page, briar-systems/mach#1845), the region is
-# always a whole number of runtime pages, so neither escape is legitimate: an absent
-# AT_PAGESZ, a congruence mismatch, or an mprotect failure is a broken environment or a
-# violated layout contract, and running unhardened would silently mask it. Each aborts
-# naming the invariant - the glibc stance, matching `std.system.os.page_size`'s AT_PAGESZ
-# precedent (#336/#343).
+# slots are slid it must be restored read-only before `main`. `relro_sz` is the region's
+# actual mapped extent (its `.data.rel.ro` load segment's p_memsz); this function rounds it
+# UP to the runtime page - the pages the kernel mapped - and mprotects exactly those. The
+# rounding lives here, against AT_PAGESZ, rather than at the writer against the image
+# max-page: a build-time max-page larger than the runtime page would otherwise overshoot
+# the mapping and fault ENOMEM (briar-systems/mach#1885).
+#
+# Re-protection is fatal on any failure (the glibc stance, matching
+# `std.system.os.page_size`'s AT_PAGESZ precedent, #336/#343): an absent AT_PAGESZ, a
+# region with no mapped extent, a non-page-aligned start, or an mprotect failure is a
+# broken environment or a violated layout contract, and running unhardened would silently
+# mask it. No silent-unhardened path remains.
 #
 # Reached only after relocation (it uses panic + the syscall path), so its message
 # pointers are already slid; `_rt_relocate` invokes it once the RELATIVE slots are applied.
 # ---
 # relro_start: the runtime start address of the region (load bias + PT_GNU_RELRO p_vaddr)
-# relro_sz:    the region size (PT_GNU_RELRO p_memsz, page-rounded by the writer)
+# relro_sz:    the region's mapped extent (the `.data.rel.ro` load segment's p_memsz)
 # at_pagesz:   the runtime page size from AT_PAGESZ (0 when the auxv lacked it)
 pub fun relro_reprotect(relro_start: u64, relro_sz: u64, at_pagesz: u64) {
     # AT_PAGESZ is a mandatory linux auxv entry; a 0 under a live RELRO region means a
@@ -189,15 +207,23 @@ pub fun relro_reprotect(relro_start: u64, relro_sz: u64, at_pagesz: u64) {
     if (at_pagesz == 0) {
         panic("std.runtime.linux.reloc: AT_PAGESZ absent with a PT_GNU_RELRO region (mandatory linux auxv entry missing)\n");
     }
-    # the writer max-page-aligns segments (mach#1845), so p_vaddr and the page-rounded
-    # p_memsz are always whole runtime pages; a mismatch means the loaded image violated
-    # that layout contract (or ran on a kernel page larger than the build's max page).
-    if (relro_start % at_pagesz != 0 || relro_sz % at_pagesz != 0) {
-        panic("std.runtime.linux.reloc: PT_GNU_RELRO region not congruent with the runtime page (violated max-page layout contract; see mach#1845)\n");
+    # a PT_GNU_RELRO region with no backing load segment (zero mapped extent) is a broken
+    # image - the writer emits RELRO only over the `.data.rel.ro` segment it laid out.
+    if (relro_sz == 0) {
+        panic("std.runtime.linux.reloc: PT_GNU_RELRO region has no backing load segment (broken image)\n");
     }
+    # the writer starts the segment on a max-page boundary, so the start is aligned to any
+    # runtime page <= the image max-page; a misaligned start is a violated layout contract
+    # (or a kernel page larger than the build's max page, which cannot map the image).
+    if (relro_start % at_pagesz != 0) {
+        panic("std.runtime.linux.reloc: PT_GNU_RELRO region start not aligned to the runtime page (violated max-page layout contract; see mach#1845)\n");
+    }
+    # round the region up to whole runtime pages - exactly what the kernel mapped for the
+    # segment - and re-protect them.
+    val protect_sz: usize = ((relro_sz + at_pagesz - 1) & ~(at_pagesz - 1))::usize;
     # a failed re-protect leaves the relocated constants writable through `main`; refuse to
     # run silently unhardened.
-    if (sys.protect(relro_start::usize::ptr, relro_sz::usize, sys.PROT_READ::u32) != 0) {
+    if (sys.protect(relro_start::usize::ptr, protect_sz, sys.PROT_READ::u32) != 0) {
         panic("std.runtime.linux.reloc: mprotect of the PT_GNU_RELRO region failed (cannot restore read-only hardening)\n");
     }
 }
