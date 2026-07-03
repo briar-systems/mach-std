@@ -3,11 +3,11 @@
 # post-#347 re-protection contract:
 #   * happy   - a --pie binary with a relocated constant pointer runs fully hardened and
 #               returns 42 (self-relocation + re-protection succeeded, no panic).
-#   * fault   - forcing relro_reprotect down its congruence-invariant branch aborts loudly:
+#   * fault   - forcing relro_reprotect down a fatal-invariant branch aborts loudly:
 #               the panic message reaches stderr and the process dies by signal.
 #
-# the fault path is compiler-independent (it calls relro_reprotect with forced incongruent
-# args), so it exercises the fatal branch even under a mach seed whose writer predates the
+# the fault path is compiler-independent (it calls relro_reprotect with a forced misaligned
+# start), so it exercises the fatal branch even under a mach seed whose writer predates the
 # max-page layout - see the PR's CI-seed note.
 #
 # usage: verify.sh [path-to-mach] [target] [runner]
@@ -56,8 +56,8 @@ code=$?
 set -e
 # death by signal surfaces as exit 128+signo both natively and under qemu-user.
 [ "$code" -ge 128 ] || fail "fault path exit $code, expected death by signal (>=128)"
-echo "$err" | grep -q "not congruent with the runtime page" \
-    || fail "fault path missing the congruence panic message; got: $err"
+echo "$err" | grep -q "start not aligned to the runtime page" \
+    || fail "fault path missing the invariant panic message; got: $err"
 echo "  OK: died by signal (exit $code), panic named the invariant"
 
 echo "OK: RELRO re-protection is fatal on invariant breach and hardened on the happy path"
