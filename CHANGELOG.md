@@ -5,7 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.17.0] - 2026-07-04
+
+Harden no-libc `--pie` linux binaries with static-PIE self-relocation and fatal
+`PT_GNU_RELRO` re-protection, add process-parallelism primitives, and grow a
+unified JSON stack — streaming NDJSON emit, float parsing, and RFC 8259
+escaping. Makes `[target.linux-arm64]` permanent behind a qemu CI lane, and
+fixes the critical arm64 `--pie` startup crash and windows mixed-DLL link
+correctness. Built with mach 2.14.1.
 
 ### Added
 
@@ -51,6 +58,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verbatim) for `emit`, and `ESCAPE_ENSURE_ASCII` (RFC 3629 decode to `\uXXXX`,
   astral surrogate pairs, U+FFFD on invalid input) for the stream. Both surfaces
   are byte-identical to their pre-unification output (#338).
+- data/json: float number parsing — numbers now accept the full RFC 8259 grammar
+  (`int frac? exp?`); a number carrying a fraction or exponent parses as a float
+  (correctly rounded through `std.text.parse`'s bignum decimal→f64 machinery over
+  the zero-copy source span), while integer-looking numbers still yield an `i64`
+  on the byte-identical path. `Value` gains `value_is_float` and `value_float`
+  (an integer widens to `f64`); `value_number` is unchanged, and `emit` writes
+  floats in shortest round-trippable form (#349).
+- data/json: `value_string_decode(v, buf, len) -> Result[usize, str]` — resolves a
+  string value's raw on-wire escapes into logical bytes in a caller buffer, the
+  inverse of the emit escaper. Handles `\" \\ \/ \b \f \n \r \t` and `\uXXXX` (a
+  high+low surrogate pair combines into one astral code point via the validated
+  `std.text.utf8` encoder), and errors on malformed escapes. The parser keeps its
+  zero-copy raw-bytes representation; decoding is paid only at the consumption
+  point, resolving the parse-vs-emit representation asymmetry (#340).
+- build/ci: a permanent `[target.linux-arm64]` (aarch64/linux/aapcs64) makes std
+  cross-buildable to aarch64 out of the box, and a `cross-arm64` CI lane
+  cross-builds the unit suite and runs it under `qemu-aarch64` for an automatic
+  aarch64 regression signal over the full suite (#280).
 
 ### Fixed
 
@@ -64,6 +89,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   panics naming the violated invariant in each case — the glibc stance, matching
   `os.page_size`'s `AT_PAGESZ` precedent (#336) — so a `--pie` binary either runs
   fully hardened or dies loudly; no silent-unhardened path remains (#347).
+- runtime/linux: `_rt_relocate` now re-protects the RELRO segment's actual mapped
+  extent — taken from its backing `PT_LOAD` and rounded up to `AT_PAGESZ` — rather
+  than the ELF writer's page-padded `p_memsz`. On a 4 KiB-page aarch64 kernel the
+  padded `PT_GNU_RELRO` `p_memsz` (64 KiB, mach#1845) spanned an unmapped gap, so
+  the `mprotect` failed with `ENOMEM` and, being fatal (#347), crashed every
+  `--pie` binary at startup. Std half of the arm64 startup fix (mach#1885).
 - system: `os.page_size` on linux now returns the runtime `AT_PAGESZ` the
   entrypoint captures from the auxiliary vector at startup, instead of a
   hardcoded 4096 — correct on aarch64 kernels configured for 16 KiB or 64 KiB
@@ -72,6 +103,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source of truth; `std.runtime.linux.reloc` keeps its own pre-relocation read
   for the RELRO mprotect. `AT_PAGESZ` is mandatory on linux, so page_size()
   panics when it is unavailable rather than fabricating a default (#336).
+- data/json: `emit` now escapes string values and object keys per RFC 8259 —
+  `"` → `\"`, `\` → `\\`, control bytes (0x00–0x1F) via the short escapes
+  `\b \t \n \f \r` or else `\u00xx`, all other bytes (including valid UTF-8)
+  verbatim. Values or keys holding a quote, backslash, or control byte previously
+  emitted invalid JSON (#337).
+- system/os/windows: every `ext fun` (61 kernel32 imports plus the windows
+  runtime entrypoint) now carries an explicit `#[library]` decorator naming its
+  providing DLL. The unattributed imports previously relied on the COFF fallback
+  binding them to dependency 0 — correct only while `kernel32.dll` sorted first —
+  so the first mixed-DLL link (e.g. also linking `glfw3.dll`) mis-bound whole DLL
+  sets and hit `STATUS_ENTRYPOINT_NOT_FOUND` at load. Purely additive (#334).
 
 ## [0.16.2] - 2026-06-28
 
