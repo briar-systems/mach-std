@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] - 2026-07-07
+
+Overhauls the build manifest and test manifests to comply with the v2 build system schema.
+
+### Changed
+- manifest: Migrated self-manifest and test manifests to v2 schema (`[artifact.*]`).
+
 ## [0.17.0] - 2026-07-04
 
 Harden no-libc `--pie` linux binaries with static-PIE self-relocation and fatal
