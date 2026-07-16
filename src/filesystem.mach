@@ -1,1035 +1,367 @@
-# file and directory operations
+# filesystem access over the platform namespace
 #
-# provides File handles, FileInfo metadata, temp files, and path-based
-# queries. all syscall interaction goes through std.system.os, this
-# module contains no platform-specific logic.
+# three layers: handle operations on an open File; whole-file convenience that
+# composes std.io (a File adapts to a Reader/Writer, so reads and writes flow
+# through io.read_all/read_exact/write_all rather than hand-rolled loops);
+# and namespace operations on a Path. paths are std.types.path Path values so
+# they read distinctly from arbitrary bytes and compose with the path helpers.
+#
+# errors are str messages, matching std.io: producers return R.Result[T, str],
+# effects return O.Option[str] (none = success). predicates are total and
+# answer false for a nil or missing path.
+
+use A: std.allocator;
+use R: std.types.result;
+use O: std.types.option;
+
+use std.system.os;
+use m_reader: std.io.reader;
+use m_writer: std.io.writer;
+
+use std.types.path.Path;
+use std.chrono.time;
+use std.chrono.time.Time;
+use std.collections.vector;
+use std.collections.vector.Vector;
 
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
-use std.types.result.Result;
-use std.types.result.ok;
-use std.types.result.err;
-use std.types.result.is_ok;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
-use std.types.result.unwrap_err;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.string.str_len;
-use std.types.string.str_starts_with;
 
-use allocator: std.allocator;
-use mem:       std.memory;
-use os:        std.system.os;
-use page:      std.allocator.page;
-use path:      std.types.path;
-use writer:    std.io.writer;
-use reader:    std.io.reader;
-use rand:      std.crypto.rand;
+# an open file, identified by its descriptor
+pub def File: i32;
 
-# wrapper around a file descriptor
-# ---
-# fd: underlying file descriptor
-pub rec File {
-    fd: i32;
-}
+# what a path resolves to
+pub def Kind: u8;
+pub val KIND_OTHER:   Kind = 0;
+pub val KIND_FILE:    Kind = 1;
+pub val KIND_DIR:     Kind = 2;
+pub val KIND_SYMLINK: Kind = 3;
 
 # portable file metadata
 # ---
-# size:     file size in bytes
-# mode:     raw permission/type bits
-# modified: last modification time (unix seconds)
-# accessed: last access time (unix seconds)
-# created:  creation time (unix seconds, 0 if unavailable)
-pub rec FileInfo {
+# kind:     file, directory, symlink, or other
+# size:     size in bytes
+# mode:     raw permission/type bits (POSIX; synthesized elsewhere)
+# modified: last modification time
+# accessed: last access time
+# created:  birth time when the platform provides it, else none
+pub rec Metadata {
+    kind:     Kind;
     size:     usize;
     mode:     u32;
-    modified: i64;
-    accessed: i64;
-    created:  i64;
+    modified: Time;
+    accessed: Time;
+    created:  O.Option[Time];
 }
 
-# temporary file with an allocated path for cleanup
-# ---
-# file: underlying File handle
-# path: allocated path string (caller must free)
-pub rec TempFile {
-    file: File;
-    path: path.Path;
-}
+# the standard streams, as already-open files
+pub val STDIN:  File = 0;
+pub val STDOUT: File = 1;
+pub val STDERR: File = 2;
 
-# a length-counted byte buffer returned by length-aware file reads
-# unlike a `str`, a Buffer carries its true byte length, so it correctly
-# describes binary content that may embed NUL bytes. the buffer is
-# over-allocated by one NUL terminator (so it may also be read as a `str`),
-# but `len` names only the file's real byte count.
-# ---
-# data: pointer to the allocated bytes (caller must free `len + 1` bytes)
-# len:  number of valid bytes (the file's size)
-pub rec Buffer {
-    data: *u8;
-    len:  usize;
-}
-
-pub val stdin:  File = File{fd: 0};
-pub val stdout: File = File{fd: 1};
-pub val stderr: File = File{fd: 2};
-
-val TEMP_MAX_ATTEMPTS: usize = 100;
-val HEX_CHARS:         str   = "0123456789abcdef";
+# re-exported seek anchors for `seek`
+fwd os.SEEK_SET;
+fwd os.SEEK_CUR;
+fwd os.SEEK_END;
 
 # open a file for reading
 # ---
 # p:   file path
-# ret: the opened File, or an error message
-pub fun open(p: str) Result[File, str] {
+# ret: the open file, or an error
+pub fun open(p: Path) R.Result[File, str] {
+    if (p == nil) { ret R.err[File, str]("path is nil"); }
     val raw: i64 = os.open(os.AT_FDCWD, p, os.O_RDONLY, 0);
-    if (raw < 0) { ret err[File, str](os.message(raw)); }
-    ret ok[File, str](File{fd: raw::i32});
-}
-
-# open a file with explicit flags and mode
-# ---
-# p:     file path
-# flags: open flags (O_RDONLY, O_WRONLY, O_CREAT, etc.)
-# mode:  permission bits for creation
-# ret:   the opened File, or an error message
-pub fun open_with(p: str, flags: i32, mode: i32) Result[File, str] {
-    val raw: i64 = os.open(os.AT_FDCWD, p, flags, mode);
-    if (raw < 0) { ret err[File, str](os.message(raw)); }
-    ret ok[File, str](File{fd: raw::i32});
+    if (raw < 0) { ret R.err[File, str](os.message(raw)); }
+    ret R.ok[File, str](raw::File);
 }
 
 # create or truncate a file for writing
 # ---
 # p:    file path
-# mode: permission bits
-# ret:  the created File, or an error message
-pub fun create(p: str, mode: i32) Result[File, str] {
+# mode: permission bits for a newly created file
+# ret:  the open file, or an error
+pub fun create(p: Path, mode: i32) R.Result[File, str] {
+    if (p == nil) { ret R.err[File, str]("path is nil"); }
     val flags: i32 = os.O_CREAT | os.O_TRUNC | os.O_WRONLY;
     val raw: i64 = os.open(os.AT_FDCWD, p, flags, mode);
-    if (raw < 0) { ret err[File, str](os.message(raw)); }
-    ret ok[File, str](File{fd: raw::i32});
+    if (raw < 0) { ret R.err[File, str](os.message(raw)); }
+    ret R.ok[File, str](raw::File);
 }
 
-# close a file descriptor
+# close an open file
 # ---
-# f:   file to close
-# ret: true on success, or an error message
-pub fun close(f: *File) Result[bool, str] {
-    if (f == nil) { ret ok[bool, str](true); }
-    val raw: i64 = os.close(f.fd);
-    if (raw < 0) { ret err[bool, str](os.message(raw)); }
-    ret ok[bool, str](true);
+# f:   the file to close
+# ret: none on success, or an error
+pub fun close(f: File) O.Option[str] {
+    val raw: i64 = os.close(f);
+    if (raw < 0) { ret O.some[str](os.message(raw)); }
+    ret O.none[str]();
 }
 
 # read up to len bytes into buf
 # ---
-# f:   file to read from
+# f:   the file to read from
 # buf: destination buffer
 # len: maximum bytes to read
-# ret: number of bytes read, or an error message
-pub fun read(f: *File, buf: *u8, len: usize) Result[usize, str] {
-    if (f == nil) { ret err[usize, str]("file is nil"); }
-    val raw: i64 = os.read(f.fd, buf, len);
-    if (raw < 0) { ret err[usize, str](os.message(raw)); }
-    ret ok[usize, str](raw::usize);
+# ret: bytes read (0 at end of file), or an error
+pub fun read(f: File, buf: *u8, len: usize) R.Result[usize, str] {
+    val n: i64 = os.read(f, buf, len);
+    if (n < 0) { ret R.err[usize, str](os.message(n)); }
+    ret R.ok[usize, str](n::usize);
 }
 
 # write up to len bytes from buf
 # ---
-# f:   file to write to
+# f:   the file to write to
 # buf: source buffer
 # len: bytes to write
-# ret: number of bytes written, or an error message
-pub fun write(f: *File, buf: *u8, len: usize) Result[usize, str] {
-    if (f == nil) { ret err[usize, str]("file is nil"); }
-    val raw: i64 = os.write(f.fd, buf, len);
-    if (raw < 0) { ret err[usize, str](os.message(raw)); }
-    ret ok[usize, str](raw::usize);
+# ret: bytes written, or an error
+pub fun write(f: File, buf: *u8, len: usize) R.Result[usize, str] {
+    val n: i64 = os.write(f, buf, len);
+    if (n < 0) { ret R.err[usize, str](os.message(n)); }
+    ret R.ok[usize, str](n::usize);
 }
 
-# reposition file offset
+# reposition the file offset
 # ---
-# f:       file to seek
-# offset:  byte offset
-# whence:  SEEK_SET, SEEK_CUR, or SEEK_END
-# ret:     the new offset, or an error message
-pub fun seek(f: *File, offset: i64, whence: i32) Result[i64, str] {
-    if (f == nil) { ret err[i64, str]("file is nil"); }
-    val raw: i64 = os.seek(f.fd, offset, whence);
-    if (raw < 0) { ret err[i64, str](os.message(raw)); }
-    ret ok[i64, str](raw);
+# f:      the file to seek
+# offset: byte offset relative to whence
+# whence: SEEK_SET, SEEK_CUR, or SEEK_END
+# ret:    the resulting absolute offset, or an error
+pub fun seek(f: File, offset: i64, whence: i32) R.Result[i64, str] {
+    val n: i64 = os.seek(f, offset, whence);
+    if (n < 0) { ret R.err[i64, str](os.message(n)); }
+    ret R.ok[i64, str](n);
 }
 
-# get metadata for an open file
+# the file's fd is carried in the io ctx slot, so a File adapts to a Reader or
+# Writer with no separate allocation or lifetime coupling
+fun file_read_cb(ctx: ptr, buf: *u8, len: usize) R.Result[usize, str] {
+    ret read((ctx::usize)::i32, buf, len);
+}
+
+fun file_write_cb(ctx: ptr, buf: *u8, len: usize) R.Result[usize, str] {
+    ret write((ctx::usize)::i32, buf, len);
+}
+
+# adapt a file to an io.Reader (the file must outlive the reader)
 # ---
-# f:   file to query
-# ret: file metadata, or an error message
-pub fun info(f: *File) Result[FileInfo, str] {
-    if (f == nil) { ret err[FileInfo, str]("file is nil"); }
+# f:   the file to read from
+# ret: a Reader drawing from f
+pub fun reader(f: File) m_reader.Reader {
+    var r: m_reader.Reader;
+    r.ctx    = (f::usize)::ptr;
+    r.f_read = file_read_cb;
+    ret r;
+}
+
+# adapt a file to an io.Writer (the file must outlive the writer)
+# ---
+# f:   the file to write to
+# ret: a Writer feeding f
+pub fun writer(f: File) m_writer.Writer {
+    var w: m_writer.Writer;
+    w.ctx     = (f::usize)::ptr;
+    w.f_write = file_write_cb;
+    ret w;
+}
+
+# read an entire file into an allocated byte buffer
+#
+# composes io.read_all over the file's Reader; grows as it reads, so it needs
+# no size assumption. the caller owns the returned vector.
+# ---
+# a:   allocator for the result
+# p:   file path
+# ret: the file contents, or an error
+pub fun read_bytes(a: *A.Allocator, p: Path) R.Result[Vector[u8], str] {
+    val ro: R.Result[File, str] = open(p);
+    if (R.is_err[File, str](ro)) { ret R.err[Vector[u8], str](R.unwrap_err[File, str](ro)); }
+    val f: File = R.unwrap_ok[File, str](ro);
+
+    var rd: m_reader.Reader = reader(f);
+    val res: R.Result[Vector[u8], str] = m_reader.read_all(a, ?rd);
+    close(f);
+    ret res;
+}
+
+# read an entire file into an allocated, null-terminated string
+#
+# stats the file for its size and composes io.read_exact into an exact buffer,
+# so it allocates once with no growth. for text; binary content with embedded
+# NUL bytes loses its length to the first NUL when read through str_len.
+# ---
+# a:   allocator for the result
+# p:   file path
+# ret: the file contents, or an error
+pub fun read_string(a: *A.Allocator, p: Path) R.Result[str, str] {
+    val ro: R.Result[File, str] = open(p);
+    if (R.is_err[File, str](ro)) { ret R.err[str, str](R.unwrap_err[File, str](ro)); }
+    val f: File = R.unwrap_ok[File, str](ro);
+
     var st: os.stat_t;
-    val raw: i64 = os.stat(f.fd, ?st);
-    if (raw < 0) { ret err[FileInfo, str](os.message(raw)); }
-    ret ok[FileInfo, str](info_from_stat(?st));
+    val sr: i64 = os.stat(f, ?st);
+    if (sr < 0) { close(f); ret R.err[str, str](os.message(sr)); }
+    val size: usize = st.st_size::usize;
+
+    val ar: R.Result[*u8, *u8] = A.allocate[u8](a, size + 1);
+    if (R.is_err[*u8, *u8](ar)) { close(f); ret R.err[str, str]("out of memory"); }
+    val buf: *u8 = R.unwrap_ok[*u8, *u8](ar);
+
+    var rd: m_reader.Reader = reader(f);
+    val e: O.Option[str] = m_reader.read_exact(?rd, buf, size);
+    close(f);
+    if (O.is_some[str](e)) { ret R.err[str, str](O.unwrap[str](e)); }
+
+    buf[size] = 0;
+    ret R.ok[str, str](buf::str);
 }
 
-# initialize a Writer backed by a file
-# ---
-# f: file to write to (must outlive the Writer)
-# w: Writer to initialize
-pub fun get_writer(f: *File, w: *writer.Writer) {
-    w.ctx      = f::ptr;
-    w.fn_write = file_write_cb;
-}
-
-# initialize a Reader backed by a file
-# ---
-# f: file to read from (must outlive the Reader)
-# r: Reader to initialize
-pub fun get_reader(f: *File, r: *reader.Reader) {
-    r.ctx     = f::ptr;
-    r.fn_read = file_read_cb;
-}
-
-# read an entire file into a length-counted Buffer
+# write bytes to a file, creating or truncating it
 #
-# the result carries the file's true byte length, so binary content with
-# embedded NUL bytes is described correctly (a plain `str` would lose its
-# length to the first NUL). the buffer is over-allocated by one NUL byte so
-# it can also be read as a `str`; the caller frees `buf.len + 1` bytes.
-# ---
-# a:   allocator for the result buffer
-# p:   file path
-# ret: the file's contents and byte length, or an error message
-pub fun read_all_sized(a: *allocator.Allocator, p: str) Result[Buffer, str] {
-    val open_res: Result[File, str] = open(p);
-    if (is_err[File, str](open_res)) {
-        ret err[Buffer, str](unwrap_err[File, str](open_res));
-    }
-    var f: File = unwrap_ok[File, str](open_res);
-
-    val info_res: Result[FileInfo, str] = info(?f);
-    if (is_err[FileInfo, str](info_res)) {
-        close(?f);
-        ret err[Buffer, str](unwrap_err[FileInfo, str](info_res));
-    }
-    val fi: FileInfo = unwrap_ok[FileInfo, str](info_res);
-
-    val alloc_res: Result[*u8, str] = allocator.allocate[u8](a, fi.size + 1);
-    if (is_err[*u8, str](alloc_res)) {
-        close(?f);
-        ret err[Buffer, str](unwrap_err[*u8, str](alloc_res));
-    }
-    val buf: *u8 = unwrap_ok[*u8, str](alloc_res);
-
-    val size: usize = fi.size;
-    var total: usize = 0;
-    for (total < size) {
-        val n: i64 = os.read(f.fd, (buf::usize + total)::*u8, size - total);
-        if (n < 0) {
-            close(?f);
-            ret err[Buffer, str]("read error");
-        }
-        if (n == 0) { brk; }
-        total = total + n::usize;
-    }
-    close(?f);
-
-    buf[total] = 0;
-    ret ok[Buffer, str](Buffer{data: buf, len: total});
-}
-
-# read an entire file into an allocated, NUL-terminated string
-#
-# for text files only; binary content with embedded NUL bytes loses its
-# length to the first NUL when accessed through `str_len`, use
-# `read_all_sized` for binary data.
-# ---
-# a:   allocator for the result buffer
-# p:   file path
-# ret: file contents as a string, or an error message
-pub fun read_all(a: *allocator.Allocator, p: str) Result[str, str] {
-    val rb: Result[Buffer, str] = read_all_sized(a, p);
-    if (is_err[Buffer, str](rb)) {
-        ret err[str, str](unwrap_err[Buffer, str](rb));
-    }
-    ret ok[str, str](unwrap_ok[Buffer, str](rb).data::str);
-}
-
-# write data to a file at path, creating or truncating it
+# composes io.write_all over the file's Writer.
 # ---
 # p:    file path
 # data: bytes to write
 # len:  number of bytes
-# mode: permission bits
-# ret:  true on success, or an error message
-pub fun write_file(p: str, data: *u8, len: usize, mode: i32) Result[bool, str] {
-    val cr: Result[File, str] = create(p, mode);
-    if (is_err[File, str](cr)) {
-        ret err[bool, str](unwrap_err[File, str](cr));
-    }
-    var f: File = unwrap_ok[File, str](cr);
+# mode: permission bits for a newly created file
+# ret:  none on success, or an error
+pub fun write_bytes(p: Path, data: *u8, len: usize, mode: i32) O.Option[str] {
+    val co: R.Result[File, str] = create(p, mode);
+    if (R.is_err[File, str](co)) { ret O.some[str](R.unwrap_err[File, str](co)); }
+    val f: File = R.unwrap_ok[File, str](co);
 
-    var total: usize = 0;
-    for (total < len) {
-        val n: i64 = os.write(f.fd, (data::usize + total)::*u8, len - total);
-        if (n < 0) {
-            close(?f);
-            ret err[bool, str](os.message(n));
-        }
-        total = total + n::usize;
-    }
-    close(?f);
-    ret ok[bool, str](true);
+    var w: m_writer.Writer = writer(f);
+    val e: O.Option[str] = m_writer.write_all(?w, data, len);
+    close(f);
+    ret e;
 }
 
-# check whether FileInfo describes a directory
-pub fun info_is_dir(fi: *FileInfo) bool {
-    ret (fi.mode & os.S_IFMT) == os.S_IFDIR;
+# classify a raw stat mode into a Kind
+fun kind_from_mode(mode: u32) Kind {
+    val t: u32 = mode & os.S_IFMT;
+    if (t == os.S_IFDIR) { ret KIND_DIR; }
+    if (t == os.S_IFREG) { ret KIND_FILE; }
+    if (t == os.S_IFLNK) { ret KIND_SYMLINK; }
+    ret KIND_OTHER;
 }
 
-# check whether FileInfo describes a regular file
-pub fun info_is_file(fi: *FileInfo) bool {
-    ret (fi.mode & os.S_IFMT) == os.S_IFREG;
-}
-
-# check whether FileInfo describes a symbolic link
-pub fun info_is_symlink(fi: *FileInfo) bool {
-    ret (fi.mode & os.S_IFMT) == os.S_IFLNK;
-}
-
-# get metadata for a path
-# ---
-# p:   path to query
-# ret: file metadata, or an error message
-pub fun info_path(p: str) Result[FileInfo, str] {
-    if (p == nil) { ret err[FileInfo, str]("path is nil"); }
-    var st: os.stat_t;
-    val raw: i64 = os.stat_path(os.AT_FDCWD, p, ?st, 0);
-    if (raw < 0) { ret err[FileInfo, str](os.message(raw)); }
-    ret ok[FileInfo, str](info_from_stat(?st));
-}
-
-# get metadata for a path without following a final symbolic link
-#
-# the lstat counterpart to info_path: a symbolic link reports its own metadata
-# (info_is_symlink is true) rather than the target's. use it to detect links
-# without resolving them.
-# ---
-# p:   path to query
-# ret: file metadata, or an error message
-pub fun info_link(p: str) Result[FileInfo, str] {
-    if (p == nil) { ret err[FileInfo, str]("path is nil"); }
-    var st: os.stat_t;
-    val raw: i64 = os.stat_path(os.AT_FDCWD, p, ?st, os.AT_SYMLINK_NOFOLLOW);
-    if (raw < 0) { ret err[FileInfo, str](os.message(raw)); }
-    ret ok[FileInfo, str](info_from_stat(?st));
-}
-
-# check whether a path is an existing directory
-pub fun is_dir(p: str) bool {
-    val r: Result[FileInfo, str] = info_path(p);
-    if (is_err[FileInfo, str](r)) { ret false; }
-    val fi: FileInfo = unwrap_ok[FileInfo, str](r);
-    ret info_is_dir(?fi);
-}
-
-# check whether a path is an existing regular file
-pub fun is_file(p: str) bool {
-    val r: Result[FileInfo, str] = info_path(p);
-    if (is_err[FileInfo, str](r)) { ret false; }
-    val fi: FileInfo = unwrap_ok[FileInfo, str](r);
-    ret info_is_file(?fi);
-}
-
-# check whether a path exists
-pub fun exists(p: str) bool {
-    ret is_ok[FileInfo, str](info_path(p));
-}
-
-# remove a file
-# ---
-# p:   path to remove
-# ret: true on success, or an error message
-pub fun unlink(p: str) Result[bool, str] {
-    val raw: i64 = os.unlink(os.AT_FDCWD, p, 0);
-    if (raw < 0) { ret err[bool, str](os.message(raw)); }
-    ret ok[bool, str](true);
-}
-
-# rename a file or directory
-# ---
-# from: source path
-# to:   destination path
-# ret:  true on success, or an error message
-pub fun rename(from: str, to: str) Result[bool, str] {
-    val raw: i64 = os.rename(os.AT_FDCWD, from, os.AT_FDCWD, to);
-    if (raw < 0) { ret err[bool, str](os.message(raw)); }
-    ret ok[bool, str](true);
-}
-
-# create a symbolic link at linkpath pointing to target
-#
-# the target is stored verbatim: a relative target is preserved as given, with
-# no resolution or normalization, so the link keeps resolving correctly after
-# its containing tree is moved. on posix this is symlink(2); on windows it is
-# CreateSymbolicLinkA requesting unprivileged creation, and a refusal for lack
-# of privilege surfaces as "operation not permitted".
-# ---
-# target:   path the link points to (preserved verbatim)
-# linkpath: path of the link to create
-# ret:      true on success, or an error message
-pub fun symlink(target: str, linkpath: str) Result[bool, str] {
-    if (target == nil)   { ret err[bool, str]("target is nil"); }
-    if (linkpath == nil) { ret err[bool, str]("linkpath is nil"); }
-    val raw: i64 = os.symlink(target, linkpath);
-    if (raw < 0) { ret err[bool, str](os.message(raw)); }
-    ret ok[bool, str](true);
-}
-
-# create a directory
-# ---
-# p:    directory path
-# mode: permission bits
-# ret:  true on success, or an error message
-pub fun create_dir(p: str, mode: i32) Result[bool, str] {
-    if (p == nil) { ret err[bool, str]("path is nil"); }
-    val raw: i64 = os.make_dir(os.AT_FDCWD, p, mode);
-    if (raw < 0) { ret err[bool, str](os.message(raw)); }
-    ret ok[bool, str](true);
-}
-
-# create a directory and all missing parents
-# ---
-# a:    allocator for intermediate path operations
-# p:    directory path
-# mode: permission bits
-# ret:  true on success, or an error message
-pub fun create_dir_all(a: *allocator.Allocator, p: str, mode: i32) Result[bool, str] {
-    if (p == nil)         { ret err[bool, str]("path is nil"); }
-    if (path.is_empty(p)) { ret err[bool, str]("path is empty"); }
-    if (path.is_root(p))  { ret ok[bool, str](true); }
-    if (is_dir(p))        { ret ok[bool, str](true); }
-
-    val first: Result[bool, str] = create_dir(p, mode);
-    if (is_ok[bool, str](first)) { ret first; }
-
-    val parent_res: Result[path.Path, str] = path.parent(a, p);
-    if (is_err[path.Path, str](parent_res)) {
-        ret err[bool, str](unwrap_err[path.Path, str](parent_res));
-    }
-
-    val parent_path: path.Path = unwrap_ok[path.Path, str](parent_res);
-    val parent_create: Result[bool, str] = create_dir_all(a, parent_path, mode);
-
-    val parent_len: usize = str_len(parent_path);
-    allocator.deallocate[u8](a, parent_path::ptr::*u8, parent_len + 1);
-
-    if (is_err[bool, str](parent_create)) { ret parent_create; }
-
-    val final_res: Result[bool, str] = create_dir(p, mode);
-    if (is_ok[bool, str](final_res)) { ret final_res; }
-    if (is_dir(p)) { ret ok[bool, str](true); }
-    ret final_res;
-}
-
-# bound on recursion depth for remove_all, guarding against unbounded
-# directory nesting (and any cyclic structure a symlink walk could never
-# create, since symlinks are removed rather than followed).
-val REMOVE_MAX_DEPTH: usize = 1024;
-
-# size of the stack buffer used per directory level to read raw directory
-# entries; large enough to hold several entries per read_dir call.
-val DIRENT_BUF_SIZE: usize = 8192;
-
-# recursively remove a file, directory, or symbolic link
-#
-# directories are removed depth-first, their contents first, then the
-# directory itself. symbolic links are removed as links and never followed:
-# a link inside the tree that points outside it leaves the target untouched.
-# this is the safety property a recursive delete must hold, and it relies on
-# an lstat-equivalent type check (info_is_symlink) rather than following the
-# link. removing a path that does not exist succeeds, so the operation is
-# idempotent like `rm -rf`.
-# ---
-# a:   allocator for transient child-path strings
-# p:   path to remove
-# ret: true on success, or an error message
-pub fun remove_all(a: *allocator.Allocator, p: str) Result[bool, str] {
-    if (a == nil) { ret err[bool, str]("allocator is nil"); }
-    if (p == nil) { ret err[bool, str]("path is nil"); }
-    ret remove_all_at(a, p, 0);
-}
-
-fun remove_all_at(a: *allocator.Allocator, p: str, depth: usize) Result[bool, str] {
-    if (depth >= REMOVE_MAX_DEPTH) {
-        ret err[bool, str]("remove_all: directory tree too deep");
-    }
-
-    # lstat (AT_SYMLINK_NOFOLLOW) so a symlink reports as a link, not its
-    # target, the walk must remove the link itself, never descend through it.
-    var st: os.stat_t;
-    val sr: i64 = os.stat_path(os.AT_FDCWD, p, ?st, os.AT_SYMLINK_NOFOLLOW);
-    if (sr < 0) {
-        if (sr == os.ENOENT) { ret ok[bool, str](true); }
-        ret err[bool, str](os.message(sr));
-    }
-    val fi: FileInfo = info_from_stat(?st);
-
-    # only a real directory is descended into; a symlink (even to a directory)
-    # is unlinked as a link
-    if (!info_is_dir(?fi) || info_is_symlink(?fi)) {
-        ret unlink(p);
-    }
-
-    val contents: Result[bool, str] = remove_dir_contents(a, p, depth);
-    if (is_err[bool, str](contents)) { ret contents; }
-
-    val rr: i64 = os.unlink(os.AT_FDCWD, p, os.AT_REMOVEDIR);
-    if (rr < 0) { ret err[bool, str](os.message(rr)); }
-    ret ok[bool, str](true);
-}
-
-# remove every entry inside directory p, then leave p empty for the caller to
-# remove. the full set of child names is collected before any removal so the
-# directory is never modified while it is being enumerated.
-fun remove_dir_contents(a: *allocator.Allocator, p: str, depth: usize) Result[bool, str] {
-    val open_res: i64 = os.open(os.AT_FDCWD, p, os.O_RDONLY | os.O_DIRECTORY, 0);
-    if (open_res < 0) { ret err[bool, str](os.message(open_res)); }
-    val dfd: i32 = open_res::i32;
-
-    var names: *u8 = nil;
-    var names_len: usize = 0;
-    var names_cap: usize = 0;
-    val read_res: Result[bool, str] = read_dir_names(a, dfd, ?names, ?names_len, ?names_cap);
-    os.close(dfd);
-    if (is_err[bool, str](read_res)) { ret read_res; }
-
-    var result: Result[bool, str] = ok[bool, str](true);
-    var off: usize = 0;
-    for (off < names_len) {
-        val name: str = (names::usize + off)::str;
-        off = off + str_len(name) + 1;
-
-        val join_res: Result[path.Path, str] = path.join(a, p, name);
-        if (is_err[path.Path, str](join_res)) {
-            result = err[bool, str](unwrap_err[path.Path, str](join_res));
-            brk;
-        }
-        val child: path.Path = unwrap_ok[path.Path, str](join_res);
-        val rr: Result[bool, str] = remove_all_at(a, child, depth + 1);
-        allocator.deallocate[u8](a, child::ptr::*u8, str_len(child) + 1);
-        if (is_err[bool, str](rr)) { result = rr; brk; }
-    }
-
-    if (names != nil) { allocator.deallocate[u8](a, names, names_cap); }
-    ret result;
-}
-
-# read all child names of an open directory fd into a single allocated buffer
-# of NUL-terminated strings, skipping "." and "..". on success the buffer,
-# its used length, and its capacity are returned through the out-pointers
-# (nil/0/0 for an empty directory); on error the buffer is freed.
-fun read_dir_names(a: *allocator.Allocator, dfd: i32, out_buf: **u8, out_len: *usize, out_cap: *usize) Result[bool, str] {
-    var dbuf: [DIRENT_BUF_SIZE]u8;
-    var buf: *u8 = nil;
-    var len: usize = 0;
-    var cap: usize = 0;
-
-    for (true) {
-        val n: i64 = os.read_dir(dfd, (?dbuf[0])::*os.dirent64, DIRENT_BUF_SIZE);
-        if (n < 0) {
-            if (buf != nil) { allocator.deallocate[u8](a, buf, cap); }
-            ret err[bool, str](os.message(n));
-        }
-        if (n == 0) { brk; }
-
-        var pos: usize = 0;
-        for (pos < n::usize) {
-            val ent:    *os.dirent64 = ((?dbuf[0])::usize + pos)::*os.dirent64;
-            val reclen: usize        = ent.d_reclen::usize;
-            val name:   *u8          = ?ent.d_name[0];
-
-            if (!is_dot_name(name)) {
-                val nl:   usize = str_len(name);
-                val need: usize = len + nl + 1;
-                if (need > cap) {
-                    var newcap: usize = cap;
-                    if (newcap == 0) { newcap = 256; }
-                    for (newcap < need) { newcap = newcap * 2; }
-                    val gr: Result[*u8, str] = grow_names(a, buf, cap, newcap);
-                    if (is_err[*u8, str](gr)) {
-                        if (buf != nil) { allocator.deallocate[u8](a, buf, cap); }
-                        ret err[bool, str](unwrap_err[*u8, str](gr));
-                    }
-                    buf = unwrap_ok[*u8, str](gr);
-                    cap = newcap;
-                }
-                mem.raw_copy((buf::usize + len)::ptr, name::ptr, nl);
-                buf[len + nl] = 0;
-                len = len + nl + 1;
-            }
-
-            # a zero record length would never advance pos; guard against a
-            # malformed buffer rather than spin forever
-            if (reclen == 0) { brk; }
-            pos = pos + reclen;
-        }
-    }
-
-    @out_buf = buf;
-    @out_len = len;
-    @out_cap = cap;
-    ret ok[bool, str](true);
-}
-
-fun grow_names(a: *allocator.Allocator, buf: *u8, cap: usize, newcap: usize) Result[*u8, str] {
-    if (buf == nil) { ret allocator.allocate[u8](a, newcap); }
-    ret allocator.reallocate[u8](a, buf, cap, newcap);
-}
-
-# whether a directory entry name is "." or ".." (the self/parent links that a
-# recursive walk must skip).
-fun is_dot_name(name: *u8) bool {
-    if (name[0] != '.'::u8) { ret false; }
-    if (name[1] == 0) { ret true; }
-    if (name[1] == '.'::u8 && name[2] == 0) { ret true; }
-    ret false;
-}
-
-# create a temporary file with a unique name
-#
-# the file is created under the OS temp directory resolved at call time
-# (see os.temp_dir): $TMPDIR or "/tmp" on posix, GetTempPathA on windows.
-# ---
-# a:      allocator for the path
-# prefix: name prefix (e.g. "test" → "<tempdir>/test_<n>")
-# ret:    the created TempFile, or an error message
-pub fun temp_create(a: *allocator.Allocator, prefix: str) Result[TempFile, str] {
-    var attempt: usize = 0;
-    for (attempt < TEMP_MAX_ATTEMPTS) {
-        var rnd: [8]u8;
-        val fill_res: i64 = rand.fill(?rnd[0], 8);
-        if (fill_res < 0) {
-            ret err[TempFile, str]("temp file: entropy source failed");
-        }
-
-        val name_res: Result[path.Path, str] = temp_build_path(a, prefix, ?rnd[0]);
-        if (is_err[path.Path, str](name_res)) {
-            ret err[TempFile, str](unwrap_err[path.Path, str](name_res));
-        }
-        val p: path.Path = unwrap_ok[path.Path, str](name_res);
-
-        val flags: i32 = os.O_CREAT | os.O_EXCL | os.O_RDWR;
-        val raw: i64 = os.open(os.AT_FDCWD, p, flags, 384);
-        if (raw >= 0) {
-            ret ok[TempFile, str](TempFile{file: File{fd: raw::i32}, path: p});
-        }
-
-        val p_len: usize = str_len(p);
-        allocator.deallocate[u8](a, p::ptr::*u8, p_len + 1);
-
-        if (raw != os.EEXIST) {
-            ret err[TempFile, str](os.message(raw));
-        }
-        attempt = attempt + 1;
-    }
-    ret err[TempFile, str]("temp file: max attempts exceeded");
-}
-
-# get the path of a temp file
-pub fun temp_path(tf: *TempFile) str {
-    ret tf.path;
-}
-
-# close the temp file (does not remove it)
-pub fun temp_close(tf: *TempFile) Result[bool, str] {
-    ret close(?tf.file);
-}
-
-# remove the temp file from disk
-pub fun temp_remove(tf: *TempFile) Result[bool, str] {
-    ret unlink(tf.path);
-}
-
-# close and remove
-pub fun temp_close_and_remove(tf: *TempFile) Result[bool, str] {
-    val cr: Result[bool, str] = close(?tf.file);
-    val rr: Result[bool, str] = unlink(tf.path);
-    if (is_err[bool, str](cr)) { ret cr; }
-    ret rr;
-}
-
-fun info_from_stat(st: *os.stat_t) FileInfo {
-    ret FileInfo{
+# build Metadata from a filled stat buffer
+fun meta_from_stat(st: *os.stat_t) Metadata {
+    ret Metadata{
+        kind:     kind_from_mode(st.st_mode),
         size:     st.st_size::usize,
-        mode:     st.st_mode::u32,
-        modified: st.st_mtime,
-        accessed: st.st_atime,
-        created:  st.st_ctime
+        mode:     st.st_mode,
+        modified: time.unix(st.st_mtime, st.st_mtime_nsec),
+        accessed: time.unix(st.st_atime, st.st_atime_nsec),
+        created:  O.none[Time](),
     };
 }
 
-pub fun file_write_cb(ctx: ptr, buf: *u8, len: usize) Result[usize, str] {
-    ret write(ctx::*File, buf, len);
+# metadata for a path, following a final symbolic link
+# ---
+# p:   path to query
+# ret: the metadata, or an error
+pub fun metadata(p: Path) R.Result[Metadata, str] {
+    if (p == nil) { ret R.err[Metadata, str]("path is nil"); }
+    var st: os.stat_t;
+    val raw: i64 = os.stat_path(os.AT_FDCWD, p, ?st, 0);
+    if (raw < 0) { ret R.err[Metadata, str](os.message(raw)); }
+    ret R.ok[Metadata, str](meta_from_stat(?st));
 }
 
-fun file_read_cb(ctx: ptr, buf: *u8, len: usize) Result[usize, str] {
-    ret read(ctx::*File, buf, len);
+# metadata for a path without following a final symbolic link
+# ---
+# p:   path to query
+# ret: the metadata (a symlink reports itself), or an error
+pub fun metadata_link(p: Path) R.Result[Metadata, str] {
+    if (p == nil) { ret R.err[Metadata, str]("path is nil"); }
+    var st: os.stat_t;
+    val raw: i64 = os.stat_path(os.AT_FDCWD, p, ?st, os.AT_SYMLINK_NOFOLLOW);
+    if (raw < 0) { ret R.err[Metadata, str](os.message(raw)); }
+    ret R.ok[Metadata, str](meta_from_stat(?st));
 }
 
-fun temp_build_path(a: *allocator.Allocator, prefix: str, rnd: *u8) Result[path.Path, str] {
-    var buf: [512]u8;
+# whether metadata describes a directory
+pub fun meta_is_dir(m: *Metadata) bool { ret m.kind == KIND_DIR; }
 
-    val dir_raw: i64 = os.temp_dir(?buf[0], 512);
-    if (dir_raw < 0) {
-        ret err[path.Path, str]("temp file: temp directory unavailable");
-    }
-    if (dir_raw::usize >= 512) {
-        ret err[path.Path, str]("temp path too long");
-    }
-    var off: usize = dir_raw::usize;
+# whether metadata describes a regular file
+pub fun meta_is_file(m: *Metadata) bool { ret m.kind == KIND_FILE; }
 
-    # GetTempPathA yields a trailing separator; $TMPDIR and "/tmp" do not.
-    # insert exactly one separator between the directory and the file name.
-    if (off == 0 || !path.is_separator(buf[off - 1])) {
-        buf[off] = os.separator;
-        off = off + 1;
-    }
+# whether metadata describes a symbolic link
+pub fun meta_is_symlink(m: *Metadata) bool { ret m.kind == KIND_SYMLINK; }
 
-    var prefix_len: usize = 0;
-    if (prefix != nil) {
-        prefix_len = str_len(prefix);
-    }
-
-    val needed: usize = off + prefix_len + 1 + 16 + 1;
-    if (needed > 512) {
-        ret err[path.Path, str]("temp path too long");
-    }
-
-    if (prefix != nil) {
-        mem.raw_copy(?buf[off], prefix, prefix_len);
-        off = off + prefix_len;
-    }
-
-    buf[off] = 95;
-    off = off + 1;
-
-    val hex: *u8 = HEX_CHARS::*u8;
-    var i: usize = 0;
-    for (i < 8) {
-        buf[off] = hex[rnd[i]::usize >> 4];
-        buf[off + 1] = hex[rnd[i]::usize & 0x0F];
-        off = off + 2;
-        i = i + 1;
-    }
-
-    buf[off] = 0;
-
-    val r: Result[*u8, str] = allocator.allocate[u8](a, off + 1);
-    if (is_err[*u8, str](r)) {
-        ret err[path.Path, str](unwrap_err[*u8, str](r));
-    }
-    val out: *u8 = unwrap_ok[*u8, str](r);
-    mem.raw_copy(out::ptr, ?buf[0], off);
-    out[off] = 0;
-    ret ok[path.Path, str](out::str);
+# whether a path exists (as any kind of entry, including a broken symlink)
+pub fun exists(p: Path) bool {
+    ret R.is_ok[Metadata, str](metadata_link(p));
 }
 
-fun write_u64(off: usize, buf: *u8, cap: usize, n: u64) usize {
-    var digits: [20]u8;
-    var idx: usize = 20;
-    var x: u64 = n;
-
-    if (x == 0) {
-        idx = idx - 1;
-        digits[idx] = 48;
-    } or {
-        for (x > 0) {
-            idx = idx - 1;
-            digits[idx] = (x % 10)::u8 + 48;
-            x = x / 10;
-        }
-    }
-
-    val len: usize = 20 - idx;
-    if (off + len >= cap) { ret off; }
-
-    mem.raw_copy((buf::usize + off)::*u8, ?digits[idx], len);
-    ret off + len;
+# whether a path is an existing regular file (following symlinks)
+pub fun is_file(p: Path) bool {
+    val r: R.Result[Metadata, str] = metadata(p);
+    if (R.is_err[Metadata, str](r)) { ret false; }
+    ret R.unwrap_ok[Metadata, str](r).kind == KIND_FILE;
 }
 
-test "filesystem: open non-existent file returns error" {
-    val r: Result[File, str] = open("/tmp/this_file_should_not_exist_12345");
-    if (is_ok[File, str](r)) { ret 1; }
-    ret 0;
+# whether a path is an existing directory (following symlinks)
+pub fun is_dir(p: Path) bool {
+    val r: R.Result[Metadata, str] = metadata(p);
+    if (R.is_err[Metadata, str](r)) { ret false; }
+    ret R.unwrap_ok[Metadata, str](r).kind == KIND_DIR;
 }
 
-test "filesystem: temp_create creates file" {
-    var a: allocator.Allocator;
-    page.make(?a);
-
-    val r: Result[TempFile, str] = temp_create(?a, "test");
-    if (is_err[TempFile, str](r)) { ret 1; }
-    var tf: TempFile = unwrap_ok[TempFile, str](r);
-    if (tf.file.fd < 0) { ret 2; }
-    if (tf.path == nil) { ret 3; }
-    val cr: Result[bool, str] = temp_close_and_remove(?tf);
-    if (is_err[bool, str](cr)) { ret 4; }
-    ret 0;
+# whether a path is a symbolic link (not following it)
+pub fun is_symlink(p: Path) bool {
+    val r: R.Result[Metadata, str] = metadata_link(p);
+    if (R.is_err[Metadata, str](r)) { ret false; }
+    ret R.unwrap_ok[Metadata, str](r).kind == KIND_SYMLINK;
 }
 
-test "filesystem: temp file write and read" {
-    var a: allocator.Allocator;
-    page.make(?a);
-
-    val r: Result[TempFile, str] = temp_create(?a, "rw");
-    if (is_err[TempFile, str](r)) { ret 1; }
-    var tf: TempFile = unwrap_ok[TempFile, str](r);
-
-    val data: str = "hello temp file";
-    val wr: Result[usize, str] = write(?tf.file, data, str_len(data));
-    if (is_err[usize, str](wr)) { ret 2; }
-    if (unwrap_ok[usize, str](wr) != str_len(data)) { ret 3; }
-
-    val sr: Result[i64, str] = seek(?tf.file, 0, os.SEEK_SET);
-    if (is_err[i64, str](sr)) { ret 4; }
-
-    var buf: [64]u8;
-    val rr: Result[usize, str] = read(?tf.file, ?buf[0], 64);
-    if (is_err[usize, str](rr)) { ret 5; }
-    if (unwrap_ok[usize, str](rr) != str_len(data)) { ret 6; }
-
-    if (!str_starts_with(?buf[0], "hello temp file")) { ret 7; }
-
-    temp_close_and_remove(?tf);
-    ret 0;
+# create a single directory
+# ---
+# p:    directory path
+# mode: permission bits
+# ret:  none on success, or an error
+pub fun create_dir(p: Path, mode: i32) O.Option[str] {
+    if (p == nil) { ret O.some[str]("path is nil"); }
+    val raw: i64 = os.make_dir(os.AT_FDCWD, p, mode);
+    if (raw < 0) { ret O.some[str](os.message(raw)); }
+    ret O.none[str]();
 }
 
-test "filesystem: info returns valid metadata" {
-    var a: allocator.Allocator;
-    page.make(?a);
-
-    val cr: Result[TempFile, str] = temp_create(?a, "info");
-    if (is_err[TempFile, str](cr)) { ret 1; }
-    var tf: TempFile = unwrap_ok[TempFile, str](cr);
-
-    val data: str = "some content";
-    write(?tf.file, data, str_len(data));
-
-    val ir: Result[FileInfo, str] = info(?tf.file);
-    if (is_err[FileInfo, str](ir)) { ret 2; }
-    val fi: FileInfo = unwrap_ok[FileInfo, str](ir);
-    if (fi.size != str_len(data)) { ret 3; }
-
-    temp_close_and_remove(?tf);
-    ret 0;
+# remove a single file or symbolic link
+# ---
+# p:   path to remove
+# ret: none on success, or an error
+pub fun remove_file(p: Path) O.Option[str] {
+    if (p == nil) { ret O.some[str]("path is nil"); }
+    val raw: i64 = os.unlink(os.AT_FDCWD, p, 0);
+    if (raw < 0) { ret O.some[str](os.message(raw)); }
+    ret O.none[str]();
 }
 
-test "filesystem: create write close open read" {
-    var a: allocator.Allocator;
-    page.make(?a);
-
-    val cr: Result[TempFile, str] = temp_create(?a, "fullcycle");
-    if (is_err[TempFile, str](cr)) { ret 1; }
-    var tf: TempFile = unwrap_ok[TempFile, str](cr);
-
-    val data: str = "test data 12345";
-    val wr: Result[usize, str] = write(?tf.file, data, str_len(data));
-    if (is_err[usize, str](wr)) { ret 2; }
-
-    val clr: Result[bool, str] = temp_close(?tf);
-    if (is_err[bool, str](clr)) { ret 3; }
-
-    val open_res: Result[File, str] = open(temp_path(?tf));
-    if (is_err[File, str](open_res)) { ret 4; }
-    var f: File = unwrap_ok[File, str](open_res);
-
-    var buf: [64]u8;
-    val rr: Result[usize, str] = read(?f, ?buf[0], 64);
-    if (is_err[usize, str](rr)) { ret 5; }
-    if (unwrap_ok[usize, str](rr) != str_len(data)) { ret 6; }
-
-    close(?f);
-    temp_remove(?tf);
-    ret 0;
+# rename or move a file or directory
+# ---
+# from: source path
+# to:   destination path
+# ret:  none on success, or an error
+pub fun rename(from: Path, to: Path) O.Option[str] {
+    if (from == nil || to == nil) { ret O.some[str]("path is nil"); }
+    val raw: i64 = os.rename(os.AT_FDCWD, from, os.AT_FDCWD, to);
+    if (raw < 0) { ret O.some[str](os.message(raw)); }
+    ret O.none[str]();
 }
 
-test "filesystem: unlink removes file" {
-    var a: allocator.Allocator;
-    page.make(?a);
-
-    val cr: Result[TempFile, str] = temp_create(?a, "unlink");
-    if (is_err[TempFile, str](cr)) { ret 1; }
-    var tf: TempFile = unwrap_ok[TempFile, str](cr);
-    val p: str = temp_path(?tf);
-
-    temp_close(?tf);
-
-    val ur: Result[bool, str] = unlink(p);
-    if (is_err[bool, str](ur)) { ret 2; }
-
-    val open_res: Result[File, str] = open(p);
-    if (is_ok[File, str](open_res)) { ret 3; }
-    ret 0;
-}
-
-# allocate a unique, currently-unused path under the temp directory, built
-# from the prefix and the process id (no entropy source), and cleared of any
-# leftover from a prior interrupted run. avoiding the random temp name keeps
-# these tests off the RtlGenRandom path, which faults under wine on mach#1388;
-# the returned path string is caller-owned.
-fun temp_unique_name(a: *allocator.Allocator, prefix: str) Result[path.Path, str] {
-    var buf: [512]u8;
-
-    val dir_raw: i64 = os.temp_dir(?buf[0], 512);
-    if (dir_raw < 0 || dir_raw::usize >= 512) {
-        ret err[path.Path, str]("temp directory unavailable");
-    }
-    var off: usize = dir_raw::usize;
-    if (off == 0 || !path.is_separator(buf[off - 1])) {
-        buf[off] = os.separator;
-        off = off + 1;
-    }
-
-    off = append_str(?buf[0], 512, off, "machstd_");
-    if (prefix != nil) { off = append_str(?buf[0], 512, off, prefix); }
-    off = append_str(?buf[0], 512, off, "_");
-    off = write_u64(off, ?buf[0], 512, os.getpid()::u64);
-    if (off + 1 >= 512) { ret err[path.Path, str]("temp path too long"); }
-    buf[off] = 0;
-
-    val r: Result[*u8, str] = allocator.allocate[u8](a, off + 1);
-    if (is_err[*u8, str](r)) {
-        ret err[path.Path, str](unwrap_err[*u8, str](r));
-    }
-    val out: *u8 = unwrap_ok[*u8, str](r);
-    mem.raw_copy(out::ptr, ?buf[0], off);
-    out[off] = 0;
-
-    remove_all(a, out::str);
-    ret ok[path.Path, str](out::str);
-}
-
-# append s to buf at off, returning the new offset (unchanged if it would not
-# fit, reserving the terminator slot).
-fun append_str(buf: *u8, cap: usize, off: usize, s: str) usize {
-    val len: usize = str_len(s);
-    if (off + len + 1 > cap) { ret off; }
-    mem.raw_copy((buf::usize + off)::ptr, s::ptr, len);
-    ret off + len;
-}
-
-test "filesystem: symlink relative target survives tree move" {
-    var a: allocator.Allocator;
-    page.make(?a);
-
-    val da: Result[path.Path, str] = temp_unique_name(?a, "symmv");
-    if (is_err[path.Path, str](da)) { ret 1; }
-    val dir_a: path.Path = unwrap_ok[path.Path, str](da);
-    if (is_err[bool, str](create_dir(dir_a, 0o755))) { ret 2; }
-
-    val tgt_res: Result[path.Path, str] = path.join(?a, dir_a, "target.txt");
-    if (is_err[path.Path, str](tgt_res)) { ret 3; }
-    val tgt: path.Path = unwrap_ok[path.Path, str](tgt_res);
-    val data: str = "verbatim-survives";
-    if (is_err[bool, str](write_file(tgt, data, str_len(data), 0o644))) { ret 4; }
-
-    val link_res: Result[path.Path, str] = path.join(?a, dir_a, "link");
-    if (is_err[path.Path, str](link_res)) { ret 5; }
-    val link: path.Path = unwrap_ok[path.Path, str](link_res);
-
-    # relative target, stored verbatim
-    if (is_err[bool, str](symlink("target.txt", link))) { ret 6; }
-
-    # lstat reports the link itself, not its target
-    val li: Result[FileInfo, str] = info_link(link);
-    if (is_err[FileInfo, str](li)) { ret 7; }
-    val lfi: FileInfo = unwrap_ok[FileInfo, str](li);
-    if (!info_is_symlink(?lfi)) { ret 8; }
-
-    # the link resolves to the target's contents in place
-    val rd1: Result[str, str] = read_all(?a, link);
-    if (is_err[str, str](rd1)) { ret 9; }
-    if (!str_starts_with(unwrap_ok[str, str](rd1), "verbatim-survives")) { ret 10; }
-
-    # move the whole tree: a verbatim relative target keeps resolving, while a
-    # resolved absolute target would now dangle
-    val nb: Result[path.Path, str] = temp_unique_name(?a, "symmv2");
-    if (is_err[path.Path, str](nb)) { ret 11; }
-    val dir_b: path.Path = unwrap_ok[path.Path, str](nb);
-    if (is_err[bool, str](rename(dir_a, dir_b))) { ret 12; }
-
-    val link_b_res: Result[path.Path, str] = path.join(?a, dir_b, "link");
-    if (is_err[path.Path, str](link_b_res)) { ret 13; }
-    val link_b: path.Path = unwrap_ok[path.Path, str](link_b_res);
-    val rd2: Result[str, str] = read_all(?a, link_b);
-    if (is_err[str, str](rd2)) { ret 14; }
-    if (!str_starts_with(unwrap_ok[str, str](rd2), "verbatim-survives")) { ret 15; }
-
-    remove_all(?a, dir_b);
-    ret 0;
-}
-
-test "filesystem: remove_all clears tree without following symlinks" {
-    var a: allocator.Allocator;
-    page.make(?a);
-
-    # an outside directory holding a file that must survive intact
-    val od: Result[path.Path, str] = temp_unique_name(?a, "rmout");
-    if (is_err[path.Path, str](od)) { ret 1; }
-    val outside: path.Path = unwrap_ok[path.Path, str](od);
-    if (is_err[bool, str](create_dir(outside, 0o755))) { ret 2; }
-    val keep_res: Result[path.Path, str] = path.join(?a, outside, "keep.txt");
-    if (is_err[path.Path, str](keep_res)) { ret 3; }
-    val keep: path.Path = unwrap_ok[path.Path, str](keep_res);
-    val kdata: str = "keepme";
-    if (is_err[bool, str](write_file(keep, kdata, str_len(kdata), 0o644))) { ret 4; }
-
-    # a small nested tree to remove
-    val rt: Result[path.Path, str] = temp_unique_name(?a, "rmtree");
-    if (is_err[path.Path, str](rt)) { ret 5; }
-    val root: path.Path = unwrap_ok[path.Path, str](rt);
-    if (is_err[bool, str](create_dir(root, 0o755))) { ret 6; }
-    val sub_res: Result[path.Path, str] = path.join(?a, root, "sub");
-    if (is_err[path.Path, str](sub_res)) { ret 7; }
-    val sub: path.Path = unwrap_ok[path.Path, str](sub_res);
-    if (is_err[bool, str](create_dir(sub, 0o755))) { ret 8; }
-    val f_res: Result[path.Path, str] = path.join(?a, sub, "file.txt");
-    if (is_err[path.Path, str](f_res)) { ret 9; }
-    val f: path.Path = unwrap_ok[path.Path, str](f_res);
-    if (is_err[bool, str](write_file(f, kdata, str_len(kdata), 0o644))) { ret 10; }
-
-    # a symlink inside the tree pointing at the outside directory; remove_all
-    # must delete the link and never recurse through it into `outside`
-    val danger_res: Result[path.Path, str] = path.join(?a, sub, "danger");
-    if (is_err[path.Path, str](danger_res)) { ret 11; }
-    val danger: path.Path = unwrap_ok[path.Path, str](danger_res);
-    if (is_err[bool, str](symlink(outside, danger))) { ret 12; }
-
-    if (is_err[bool, str](remove_all(?a, root))) { ret 13; }
-    if (exists(root)) { ret 14; }
-
-    # the outside directory and its file survived: the link was removed, not
-    # followed
-    if (!is_dir(outside)) { ret 15; }
-    if (!is_file(keep)) { ret 16; }
-
-    remove_all(?a, outside);
-    ret 0;
-}
-
-test "filesystem: remove_all on a missing path succeeds" {
-    var a: allocator.Allocator;
-    page.make(?a);
-
-    val miss: Result[path.Path, str] = temp_unique_name(?a, "rmgone");
-    if (is_err[path.Path, str](miss)) { ret 1; }
-    val gone: path.Path = unwrap_ok[path.Path, str](miss);
-
-    # the placeholder was already removed, so the path does not exist
-    if (is_err[bool, str](remove_all(?a, gone))) { ret 2; }
-    ret 0;
+# create a symbolic link at linkpath pointing to target
+# ---
+# target:   path the link points to (stored verbatim)
+# linkpath: path of the link to create
+# ret:      none on success, or an error
+pub fun symlink(target: Path, linkpath: Path) O.Option[str] {
+    if (target == nil || linkpath == nil) { ret O.some[str]("path is nil"); }
+    val raw: i64 = os.symlink(target, linkpath);
+    if (raw < 0) { ret O.some[str](os.message(raw)); }
+    ret O.none[str]();
 }
