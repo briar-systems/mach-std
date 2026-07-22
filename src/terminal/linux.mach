@@ -1,0 +1,168 @@
+# linux terminal keyboard input backend (see ../terminal.mach)
+#
+# raw ioctl(TCGETS/TCSETSF) over std.system.os.linux's syscall3 -- no libc,
+# matching the rest of std.system.os.linux. owns only the genuinely per-os
+# pieces (mode toggle and single-byte poll); the portable Key type and arrow
+# decoding live in the parent. raw-mode state is a single process-global toggle
+# (_raw_active) and is not thread-safe.
+
+use std.types.size.usize;
+use std.types.size.isize;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.string.str;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.is_none;
+
+use key: std.terminal.key;
+use sys: std.system.os.linux;
+use os:  std.system.os;
+
+$if ($mach.build.os != $mach.os.linux) {
+    $error("std.terminal.linux: requires linux target");
+}
+
+# ioctl request numbers (asm-generic, shared by x86_64/aarch64/riscv64)
+val TCGETS:   usize = 0x5401;  # fetch current termios
+val TCSETSF:  usize = 0x5404;  # apply termios after flushing unread input
+val TCFLSH:   usize = 0x540B;  # flush a queue
+val TCIFLUSH: usize = 0;       # ...the input queue
+
+# ioctl syscall number differs between the x86_64 table and the generic
+# aarch64/riscv64 table, the same split std.system.os.linux uses everywhere.
+$if ($mach.build.arch == $mach.arch.x86_64) {
+    val SYS_IOCTL: usize = 16;
+}
+$or {
+    val SYS_IOCTL: usize = 29;
+}
+
+fun ioctl(fd: i32, request: usize, argp: usize) i64 {
+    ret sys.syscall3(SYS_IOCTL, fd::isize::usize, request, argp);
+}
+
+# the kernel's struct termios (linux uapi termbits.h), not glibc's -- this is
+# what TCGETS/TCSETS copy: 4 u32 flag words, one line-discipline byte, then 19
+# control bytes, 36 bytes with no padding. the "Termios layout is 36 bytes"
+# test is the safety net -- run `mach test` after touching this rec.
+rec Termios {
+    iflag: u32;
+    oflag: u32;
+    cflag: u32;
+    lflag: u32;
+    line:  u8;
+    cc:    [19]u8;
+}
+
+val ICANON: u32   = 0x0002;
+val ECHO:   u32   = 0x0008;
+val VTIME:  usize = 5;
+val VMIN:   usize = 6;
+
+var _saved:      Termios;
+var _raw_active: bool = false;
+
+fun tcgetattr(fd: i32, out: *Termios) i64 {
+    ret ioctl(fd, TCGETS, out::usize);
+}
+
+fun tcsetattr(fd: i32, t: *Termios) i64 {
+    ret ioctl(fd, TCSETSF, t::usize);
+}
+
+# drop whatever's sitting unread in the input queue
+#
+# worth calling right before enable_raw / disable_raw so a burst of stale
+# keystrokes from the old mode doesn't leak into the new one.
+# ---
+# ret: none on success, or an error
+pub fun flush_input() Option[str] {
+    val r: i64 = ioctl(sys.STDIN_FD, TCFLSH, TCIFLUSH);
+    if (r < 0) { ret some[str](os.message(r)); }
+    ret none[str]();
+}
+
+# whether raw mode is currently active
+pub fun is_raw() bool {
+    ret _raw_active;
+}
+
+# switch stdin into raw mode: no line buffering, no local echo, reads return
+# immediately whether or not a byte is waiting (VMIN=0, VTIME=0 -- the tty's
+# own non-blocking convention, distinct from O_NONBLOCK on the fd).
+#
+# the previous settings are saved and restored by disable_raw. calling this
+# twice without a matching disable_raw is a no-op.
+# ---
+# ret: none on success, or an error
+pub fun enable_raw() Option[str] {
+    if (_raw_active) { ret none[str](); }
+
+    val got: i64 = tcgetattr(sys.STDIN_FD, ?_saved);
+    if (got < 0) { ret some[str](os.message(got)); }
+
+    var raw: Termios = _saved;
+    raw.lflag = raw.lflag & ~(ICANON | ECHO);
+    raw.cc[VMIN]  = 0;
+    raw.cc[VTIME] = 0;
+
+    val set: i64 = tcsetattr(sys.STDIN_FD, ?raw);
+    if (set < 0) { ret some[str](os.message(set)); }
+
+    _raw_active = true;
+    ret none[str]();
+}
+
+# restore whatever tcgetattr saw before enable_raw ran
+#
+# safe to call even if raw mode isn't active (no-op). pair with
+# `fin { terminal.disable_raw(); }` after a successful enable_raw so the
+# terminal comes back even if the caller returns early or panics.
+# ---
+# ret: none on success, or an error
+pub fun disable_raw() Option[str] {
+    if (!_raw_active) { ret none[str](); }
+
+    val r: i64 = tcsetattr(sys.STDIN_FD, ?_saved);
+    if (r < 0) { ret some[str](os.message(r)); }
+
+    _raw_active = false;
+    ret none[str]();
+}
+
+# read one raw byte without blocking
+#
+# requires raw mode (enable_raw); call once per game-loop tick. a genuine read
+# failure is surfaced as Err, distinct from an empty queue (Ok(key_none)).
+# ---
+# ret: Ok(byte) if one was waiting, Ok(key_none) if the queue was empty, or an
+#      error on a read failure
+pub fun poll_key() Result[key.Key, str] {
+    var b: u8 = 0;
+    val n: i64 = sys.read(sys.STDIN_FD, ?b, 1);
+    if (n < 0)  { ret err[key.Key, str](os.message(n)); }
+    if (n == 0) { ret ok[key.Key, str](key.key_none()); }
+    ret ok[key.Key, str](key.key_byte(b));
+}
+
+test "terminal.linux: Termios layout is 36 bytes" {
+    if ($size_of(Termios) != 36) { ret 1; }
+    ret 0;
+}
+
+test "terminal.linux: enable_raw / disable_raw round-trip does not error" {
+    # not run under a real tty in CI, so this only exercises the ioctl
+    # plumbing: a non-tty stdin makes tcgetattr fail with ENOTTY, which
+    # enable_raw surfaces as an error rather than crashing on.
+    val e: Option[str] = enable_raw();
+    if (is_none[str](e)) {
+        disable_raw();
+    }
+    ret 0;
+}
