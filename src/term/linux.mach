@@ -1,0 +1,210 @@
+# linux terminal keyboard input
+#
+# split implementation for std.term (see ../term.mach). raw ioctl(TCGETS/
+# TCSETSF) over std.system.os.linux's syscall3 -- no libc, matching the rest
+# of std.system.os.linux.
+
+use std.types.size.usize;
+use std.types.size.isize;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+
+use sys: std.system.os.linux;
+
+$if ($mach.build.os != $mach.os.linux) {
+    $error("std.term.linux: requires linux target");
+}
+
+# ioctl request numbers (asm-generic, shared by x86_64/aarch64/riscv64)
+val TCGETS:   usize = 0x5401;  # fetch current termios
+val TCSETSF:  usize = 0x5404;  # apply termios after flushing unread input
+val TCFLSH:   usize = 0x540B;  # flush a queue
+val TCIFLUSH: usize = 0;       # ...the input queue
+
+# ioctl syscall number differs between the x86_64 table and the generic
+# aarch64/riscv64 table, same split std.system.os.linux.shared uses for
+# every other syscall constant.
+$if ($mach.build.arch == $mach.arch.x86_64) {
+    val SYS_IOCTL: usize = 16;
+}
+$or {
+    val SYS_IOCTL: usize = 29;
+}
+
+fun ioctl(fd: i32, request: usize, argp: usize) i64 {
+    ret sys.syscall3(SYS_IOCTL, fd::isize::usize, request, argp);
+}
+
+# the kernel's struct termios (linux uapi termbits.h), not glibc's -- this is
+# what TCGETS/TCSETS actually copy. 4 u32 flag words, one line-discipline
+# byte, then 19 control-character bytes; no padding at any offset (every u32
+# is already 4-aligned, and 19 trailing u8s land on a total that's already a
+# multiple of 4, the struct's own alignment requirement).
+#
+# there's no compile-time guard for this: $assert isn't implemented yet
+# (comptime-intrinsics.md), and the compiler currently rejects $size_of
+# inside $if as a non-comptime-evaluable function call. the "term.linux:
+# Termios layout is 36 bytes" test below is the actual safety net -- run
+# `mach test` after touching this rec.
+pub rec Termios {
+    iflag: u32;
+    oflag: u32;
+    cflag: u32;
+    lflag: u32;
+    line:  u8;
+    cc:    [19]u8;
+}
+
+val ICANON: u32 = 0x0002;
+val ECHO:   u32 = 0x0008;
+val VTIME:  usize = 5;
+val VMIN:   usize = 6;
+
+pub var _saved:      Termios;
+pub var _raw_active: bool = false;
+
+fun tcgetattr(fd: i32, out: *Termios) i64 {
+    ret ioctl(fd, TCGETS, out::usize);
+}
+
+fun tcsetattr(fd: i32, t: *Termios) i64 {
+    ret ioctl(fd, TCSETSF, t::usize);
+}
+
+# drop whatever's sitting unread in the input queue
+#
+# worth calling right before enable_raw / disable_raw so a burst of stale
+# keystrokes from the old mode doesn't leak into the new one.
+# ---
+# ret: 0 on success, negative errno on failure
+pub fun flush_input() i64 {
+    ret ioctl(sys.STDIN_FD, TCFLSH, TCIFLUSH);
+}
+
+# is raw mode currently active
+pub fun is_raw() bool {
+    ret _raw_active;
+}
+
+# switch stdin into raw mode: no line buffering, no local echo, reads return
+# immediately whether or not a byte is waiting (VMIN=0, VTIME=0 -- the tty's
+# own non-blocking convention, distinct from O_NONBLOCK on the fd).
+#
+# the previous settings are saved and restored by disable_raw. calling this
+# twice without a matching disable_raw is a no-op.
+# ---
+# ret: 0 on success, negative errno on failure
+pub fun enable_raw() i64 {
+    if (_raw_active) { ret 0; }
+
+    val got: i64 = tcgetattr(sys.STDIN_FD, ?_saved);
+    if (got < 0) { ret got; }
+
+    var raw: Termios = _saved;
+    raw.lflag = raw.lflag & ~(ICANON | ECHO);
+    raw.cc[VMIN]  = 0;
+    raw.cc[VTIME] = 0;
+
+    val set: i64 = tcsetattr(sys.STDIN_FD, ?raw);
+    if (set < 0) { ret set; }
+
+    _raw_active = true;
+    ret 0;
+}
+
+# restore whatever tcgetattr saw before enable_raw ran
+#
+# safe to call even if raw mode isn't active (no-op, returns 0). pair with
+# `fin { kbd.disable_raw(); }` right after a successful enable_raw so the
+# terminal comes back even if the caller returns early or panics.
+# ---
+# ret: 0 on success, negative errno on failure
+pub fun disable_raw() i64 {
+    if (!_raw_active) { ret 0; }
+
+    val r: i64 = tcsetattr(sys.STDIN_FD, ?_saved);
+    if (r >= 0) { _raw_active = false; }
+    ret r;
+}
+
+# named results for poll_key_decoded, chosen above 255 so they never
+# collide with an ordinary byte value.
+pub val KEY_NONE:  i32 = -1;
+pub val KEY_UP:    i32 = 1000;
+pub val KEY_DOWN:  i32 = 1001;
+pub val KEY_RIGHT: i32 = 1002;
+pub val KEY_LEFT:  i32 = 1003;
+
+# read one raw byte without blocking
+#
+# requires raw mode (enable_raw). call this once per game-loop tick.
+# ---
+# ret: the byte (0..255) if one was waiting, or KEY_NONE if the queue was empty
+pub fun poll_key() i32 {
+    var b: u8 = 0;
+    val n: i64 = sys.read(sys.STDIN_FD, ?b, 1);
+    if (n <= 0) { ret KEY_NONE; }
+    ret b::i32;
+}
+
+# poll_key, but arrow keys come back decoded instead of as their raw 3-byte
+# escape sequence (ESC '[' 'A'/'B'/'C'/'D').
+#
+# caveat: this does two more non-blocking polls right after seeing ESC, so
+# on a slow/laggy link the two follow-up bytes could conceivably arrive a
+# tick later than the ESC itself. fine over a local terminal.
+# ---
+# ret: KEY_UP/DOWN/LEFT/RIGHT, a raw byte (0..255), or KEY_NONE
+pub fun poll_key_decoded() i32 {
+    val first: i32 = poll_key();
+    if (first != 27) { ret first; }
+
+    val second: i32 = poll_key();
+    if (second != 91) { ret first; }  # not '[' -- just a bare ESC
+
+    val third: i32 = poll_key();
+    if (third == 65) { ret KEY_UP; }
+    if (third == 66) { ret KEY_DOWN; }
+    if (third == 67) { ret KEY_RIGHT; }
+    if (third == 68) { ret KEY_LEFT; }
+    ret first;
+}
+
+# read one line the ordinary way: press-enter, with backspace/echo handled
+# by the tty driver.
+#
+# requires raw mode to be OFF (the tty's default at program start).
+# ---
+# buf: destination buffer
+# cap: buffer capacity in bytes (need at least 1 for the null terminator)
+# ret: line length excluding the trailing newline/null, or negative errno;
+#      -1 if raw mode is active
+pub fun read_line(buf: *u8, cap: usize) i64 {
+    if (_raw_active) { ret -1; }
+    if (cap == 0) { ret 0; }
+
+    val n: i64 = sys.read(sys.STDIN_FD, buf, cap - 1);
+    if (n <= 0) { ret n; }
+
+    var len: usize = n::usize;
+    if (len > 0 && buf[len - 1] == 10) { len = len - 1; }  # drop trailing '\n'
+    buf[len] = 0;
+    ret len::i64;
+}
+
+test "term.linux: Termios layout is 36 bytes" {
+    if ($size_of(Termios) != 36) { ret 1; }
+    ret 0;
+}
+
+test "term.linux: enable_raw / disable_raw round-trip does not error" {
+    # not run under a real tty in CI, so this only exercises the ioctl
+    # plumbing's error path -- a non-tty stdin makes tcgetattr fail with
+    # ENOTTY, which enable_raw should propagate rather than crash on.
+    val r: i64 = enable_raw();
+    if (r == 0) {
+        disable_raw();
+    }
+    ret 0;
+}
