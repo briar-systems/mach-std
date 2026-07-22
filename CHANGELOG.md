@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- terminal: raw single-key keyboard input for game loops — `enable_raw`/`disable_raw`/`is_raw`/`flush_input` mode control and `poll_key`/`poll_key_decoded` per-frame polling over a tagged `Key` type, with linux, darwin, and windows backends (PR #379).
+- input: canonical stdin line input — `read_line`/`read_line_from` strip a trailing newline, null-terminate, and error on overflow rather than truncating silently (PR #379).
+
 ### Changed
 - manifest: Re-touched the self-manifest to RFC-exact totality per mach#1964/mach#1979.
 
