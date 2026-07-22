@@ -1,6 +1,7 @@
 # TCP socket operations
 
 use std.types.bool.bool;
+use std.types.bool.true;
 use std.types.size.usize;
 use std.types.result.Result;
 use std.types.result.ok;
@@ -109,9 +110,28 @@ pub fun connect(ep: ip.Endpoint) Result[Stream, str] {
 # s:   the stream to read from
 # buf: destination buffer
 # len: maximum bytes to read
-# ret: number of bytes read, or negative on error
+# ret: number of bytes read, 0 on peer close, or negative errno (os.EAGAIN once a
+#      read timeout set by stream_set_read_timeout elapses with no data)
 pub fun stream_read(s: *Stream, buf: *u8, len: usize) i64 {
     ret os.sock_recv(s.fd, buf, len);
+}
+
+# bound blocking reads on a TCP stream to a timeout
+#
+# sets SO_RCVTIMEO on the stream. after ms elapses with no data pending, a
+# stream_read returns a negative errno (os.EAGAIN on posix) rather than blocking
+# indefinitely, letting a caller act on connection silence and distinguish a
+# timeout from a peer close (0) or a real I/O error. ms == 0 restores indefinite
+# blocking.
+# ---
+# s:   the stream to bound reads on
+# ms:  timeout in milliseconds, or 0 for no timeout
+# ret: ok on success, or an error message
+pub fun stream_set_read_timeout(s: *Stream, ms: u64) Result[bool, str] {
+    if (os.sock_set_rcvtimeo(s.fd, ms) < 0) {
+        ret err[bool, str]("set read timeout failed");
+    }
+    ret ok[bool, str](true);
 }
 
 # write bytes to a TCP stream
@@ -146,6 +166,15 @@ pub fun listener_close(ln: *Listener) {
     os.sock_close(ln.fd);
 }
 
+$if ($mach.build.os == $mach.os.windows) {
+    use std.system.os.windows;
+}
+
+# fixed loopback port for the read-timeout round trip; a listen/connect/accept
+# pair needs a known port and no getsockname is exposed. SO_REUSEADDR (set by
+# listen) keeps a lingering TIME_WAIT from blocking a re-run.
+val TIMEOUT_TEST_PORT: u16 = 39271;
+
 test "tcp: create and close socket" {
     val ep: ip.Endpoint = ip.endpoint(127, 0, 0, 1, 0);
     val r: Result[Listener, str] = listen(ep, 1);
@@ -162,4 +191,60 @@ test "tcp: bind to loopback" {
     var ln: Listener = unwrap_ok[Listener, str](r);
     listener_close(?ln);
     ret 0;
+}
+
+test "tcp: read timeout bounds a blocking read" {
+    $if ($mach.build.os == $mach.os.windows) {
+        # loopback connect/accept plus SO_RCVTIMEO semantics are unreliable under
+        # wine (winsock is emulated); skip until run on genuine windows.
+        if (windows.running_under_wine()) { ret 0; }
+    }
+
+    val ep: ip.Endpoint = ip.endpoint(127, 0, 0, 1, TIMEOUT_TEST_PORT);
+    val lr: Result[Listener, str] = listen(ep, 1);
+    if (is_err[Listener, str](lr)) { ret 1; }
+    var ln: Listener = unwrap_ok[Listener, str](lr);
+
+    # loopback connect to a listening socket completes in-kernel, so a single
+    # thread can connect then accept the queued peer with no helper thread.
+    val cr: Result[Stream, str] = connect(ep);
+    if (is_err[Stream, str](cr)) { listener_close(?ln); ret 1; }
+    var client: Stream = unwrap_ok[Stream, str](cr);
+
+    val ar: Result[Stream, str] = accept(?ln);
+    if (is_err[Stream, str](ar)) { stream_close(?client); listener_close(?ln); ret 1; }
+    var server: Stream = unwrap_ok[Stream, str](ar);
+
+    var rc: i32 = 0;
+    var buf: [8]u8;
+
+    # a bounded read with nothing pending must time out, not block forever.
+    if (is_err[bool, str](stream_set_read_timeout(?server, 100))) { rc = 1; }
+    if (rc == 0) {
+        val n: i64 = stream_read(?server, ?buf[0], 8);
+        $if ($mach.build.os == $mach.os.windows) {
+            if (n >= 0) { rc = 1; }
+        }
+        $or {
+            if (n != os.EAGAIN) { rc = 1; }
+        }
+    }
+
+    # a read with data pending returns the data.
+    if (rc == 0) {
+        val payload: str = "hi";
+        if (stream_write(?client, payload::*u8, 2) != 2) { rc = 1; }
+    }
+    if (rc == 0) {
+        val n: i64 = stream_read(?server, ?buf[0], 8);
+        if (n != 2 || buf[0] != 'h' || buf[1] != 'i') { rc = 1; }
+    }
+
+    # ms == 0 restores indefinite blocking (the call must succeed).
+    if (rc == 0 && is_err[bool, str](stream_set_read_timeout(?server, 0))) { rc = 1; }
+
+    stream_close(?server);
+    stream_close(?client);
+    listener_close(?ln);
+    ret rc;
 }
