@@ -35,7 +35,10 @@ ln -sfn "$(cd ../.. && pwd)" dep/std
 
 echo "building the RELRO probes --pie with $mach (target $target)"
 rm -rf out
-"$mach" build . --target "$target" --pie --profile debug
+# the manifest declares two bins; a plain build is intentionally ambiguous, so
+# select each probe explicitly.
+"$mach" build . --bin relro_happy --target "$target" --pie --profile debug
+"$mach" build . --bin relro_fault --target "$target" --pie --profile debug
 happy="$(find out -name relro_happy -type f -print -quit)"
 fault="$(find out -name relro_fault -type f -print -quit)"
 [ -n "$happy" ] || fail "no relro_happy binary produced"
