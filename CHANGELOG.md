@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-07-26
+
+Adds the `bmos` arm — support for [ReturnInfinity's BareMetal](https://github.com/ReturnInfinity/BareMetal) exokernel, whose compiler-side target shipped in mach 4.3.0.
+
+### Added
+- system: `std.system.bmos` — the BareMetal kernel API. BareMetal exposes no syscalls; its entire interface is a table of **fixed absolute addresses** called through indirectly (`b_output` at `0x100018`, and six siblings at an 8-byte stride). This module wraps all seven as named constants rather than raw bytes, which mach 4.3.0's `call [imm]` form (mach#2398) made expressible, plus the `b_system` sub-functions: `output`, `input`, `system`, `timecounter`, `shutdown`, `nvs_read`, `nvs_write`, `net_tx`, `net_rx`. The register moves follow `libBareMetal.c`; the convention is **not** SysV (PR #400, mach#2396).
+- runtime: `std.runtime.bmos` — the `x86_64` entry point. BareMetal enters a program at the **first byte of a flat image** and expects it to `ret`, and it does two things a hosted loader would do that this kernel does not: it neither guarantees a 16-byte-aligned `RSP` nor zeroes `.bss`. `_start` is `#[naked]` (a compiler frame would sit between the alignment and the callee), parks the entry `RSP`, aligns it, calls `main(0, nil)`, restores and returns. The `.bss` half is handled in the compiler instead, by storing the flat image's zero-fill (mach#2402) (PR #400).
+- panic: a `bmos` arm — writes the message through `b_output`, then enters a **halt loop**. Deliberately neither of the obvious alternatives: a plain `ret` would make this the only panic arm on any platform that *does not terminate*, returning into the failed program and looking to an operator exactly like a clean exit; `b_system`'s `SHUTDOWN` terminates but powers the machine off, taking the message with it. The loop rather than a bare `hlt` is required because interrupts are enabled and `hlt` resumes on the next timer tick (PR #400).
+
+### Changed
+- Both new modules gate their **declarations**, not merely their imports. `mach test` compiles every module on a linux build even where nothing imports them, so an ungated `_start` is a second definition of linux's — `multiple definition of '_start'`. darwin and windows avoid this only by spelling their entry `start` / `mainCRTStartup`; `bmos` shares linux's spelling (PR #400).
+
 ## [0.19.0] - 2026-07-25
 
 Adds the constant-time crypto substrate, SHA-3, derive helpers, terminal/line input and the SIMD/float math follow-ups, and overhauls the string, io, filesystem, path and process surfaces. Panics now terminate deliberately on every supported OS instead of dying by trap.
