@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-07-25
+
+Adds the constant-time crypto substrate, SHA-3, derive helpers, terminal/line input and the SIMD/float math follow-ups, and overhauls the string, io, filesystem, path and process surfaces. Panics now terminate deliberately on every supported OS instead of dying by trap.
+
 ### Added
 - crypto: `std.crypto.ct` — constant-time primitives over `^` secrets, each `#[oblivious]`: `mask_*`/`select_*` masked branchless merge, `is_zero_*`/`eq_*`/`lt_*`/`gt_*` comparisons returning a secret 0/1 flag, `eq_bytes` whole-buffer compare with no early exit, `lookup_*` masked full-table scan replacing a secret index, `zeroize`, and `begin`/`end` for the hardware data-independent-timing mode. Comparisons use the language's own operators, which mach lowers branch-free on all three machine ISAs; the merges are masked arithmetic because no operator selects without branching. `begin` reports `false` on every target today — aarch64's `msr DIT` is not yet in mach's inline-asm surface (mach#2352), x86_64's DOITM is ring-0 only, and riscv64's Zkt has no mode bit (PR #391, mach-std#304, mach#1643).
 - math: `std.math.float` — scalar floating-point roots and transcendentals in plain Mach: `sqrt_f32`/`rsqrt_f32` (Newton refinement) and `sin_f32`/`cos_f32`/`asin_f32`/`acos_f32` (range-reduced minimax/Taylor). Each public f32 entry evaluates in f64 and narrows, so the result is accurate to under one f32 ulp; no hardware sqrt/transcendental instruction is used, pending SIMD-capable inline-asm encoders (PR #389, mach-std#376).
@@ -16,9 +20,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - terminal: raw single-key keyboard input for game loops — `enable_raw`/`disable_raw`/`is_raw`/`flush_input` mode control and `poll_key`/`poll_key_decoded` per-frame polling over a tagged `Key` type, with linux, darwin, and windows backends (PR #379).
 - input: canonical stdin line input — `read_line`/`read_line_from` strip a trailing newline, null-terminate, and error on overflow rather than truncating silently (PR #379).
 - crypto: SHA-3 family (FIPS 202) — Keccak-f[1600] permutation and byte-oriented sponge (`crypto/hash/keccak`), plus SHA3-256, SHA3-512, and the SHAKE128/SHAKE256 XOFs, each pinned to NIST known-answer vectors (PR #385).
+- filesystem: the surface completed around the `std.io` reader/writer API, including `remove_dir` and a test suite (PR #380).
+- format: `sprint` — an allocating formatter, which frees its buffer on a fill-pass error rather than leaking it (PR #380).
+- encoding: an explicit-endianness binary encoder (PR #380).
+- types: the `view` module (PR #380).
+- path: `has_separator` and `seg_count` (PR #380).
+- allocator: a fixed-buffer allocator (PR #380).
+- net: TCP read timeout via `SO_RCVTIMEO` (PR #380).
+- json: float members emitted through `field_f64` / `value_f64` (PR #380).
 
 ### Changed
 - manifest: Re-touched the self-manifest to RFC-exact totality per mach#1964/mach#1979.
+- **BREAKING** sync: thread userdata is threaded via `spawn_with`; callers passing userdata must move to the new entry point (PR #380).
+- string: the module was overhauled for performance and a cleaner surface (PR #380).
+- process: the env and exec layers are now allocating (PR #380).
+- io: consumers realigned with the reader/writer API; the entry point moved to `src/lib/libstd.mach` and `io.buffer` was dropped (PR #380).
+- memory: word-wide `raw_copy` / `raw_fill` / `raw_equal` (PR #380).
+
+### Fixed
+- panic: a panic terminated by executing `hlt`, a **privileged** instruction — in user mode that raises #GP, which the kernel delivers as SIGSEGV, so every internal error exited **139** and was indistinguishable from memory corruption at the shell. The three architectures did not even agree (aarch64 and riscv64 trapped to SIGTRAP, 133). Panics now `exit_group` with **255**, matching `std.system.os.abort()`, on linux x86_64 / aarch64 / riscv64 (PR #394, mach#2369).
+- panic: `std.system.panic` dispatched as `$if linux { ... } $or { ...darwin... }`, so **"not linux" meant "darwin"** and a Windows build compiled darwin syscall numbers into the message write — a panic there printed nothing at all. The trailing terminator block was arch-gated with **no OS gate whatsoever**, applying `hlt`/`brk`/`ebreak` to every OS. Each OS now owns an explicit arm with a real Windows path over `GetStdHandle`/`WriteFile`/`ExitProcess`, and an unknown OS is refused at compile time instead of silently inheriting another platform's syscalls (PR #398, mach-std#397).
+- os/darwin: the x86_64 `bsdthread` stack is aligned at the kernel entry point, establishing the stack-entry ABI contract (PR #377, mach#2104).
+- string: `str_region_equals` no longer measures the haystack (PR #380).
+- fs: `stat` mode width is normalized across platforms (PR #380).
 
 ## [0.18.0] - 2026-07-07
 
