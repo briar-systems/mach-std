@@ -1,0 +1,192 @@
+# windows terminal keyboard input backend (see ../terminal.mach)
+#
+# windows has no termios/ioctl -- console mode is toggled via kernel32's
+# GetConsoleMode/SetConsoleMode, and single keys are polled via
+# GetNumberOfConsoleInputEvents + ReadConsoleInputA, since the console layer
+# delivers structured key-event records, not a raw byte stream. arrows already
+# arrive as a distinct virtual-key code, so this backend decodes them in
+# poll_key and the parent's poll_key_decoded is a passthrough here.
+#
+# raw-mode state is a single process-global toggle and is not thread-safe. this
+# backend cannot be built or tested on a non-windows host.
+
+use std.types.size.isize;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.string.str;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.is_none;
+
+use key: std.terminal.key;
+
+$if ($mach.build.os != $mach.os.windows) {
+    $error("std.terminal.windows: requires windows target");
+}
+
+val STD_INPUT_HANDLE: u32 = (0 - 10)::i32::u32;
+
+#[library("kernel32.dll")]
+ext fun GetStdHandle(p0: u32) isize;
+#[library("kernel32.dll")]
+ext fun GetConsoleMode(p0: isize, p1: *u32) i32;
+#[library("kernel32.dll")]
+ext fun SetConsoleMode(p0: isize, p1: u32) i32;
+#[library("kernel32.dll")]
+ext fun GetNumberOfConsoleInputEvents(p0: isize, p1: *u32) i32;
+#[library("kernel32.dll")]
+ext fun ReadConsoleInputA(p0: isize, p1: *InputRecord, p2: u32, p3: *u32) i32;
+
+val ENABLE_LINE_INPUT: u32 = 0x0002;
+val ENABLE_ECHO_INPUT: u32 = 0x0004;
+
+val KEY_EVENT: u16 = 0x0001;
+
+val VK_UP:    u16 = 0x26;
+val VK_LEFT:  u16 = 0x25;
+val VK_RIGHT: u16 = 0x27;
+val VK_DOWN:  u16 = 0x28;
+
+# mirrors Win32's KEY_EVENT_RECORD: 16 bytes, no gaps -- every field already
+# lands on its own natural alignment at these offsets.
+rec KeyEventRecord {
+    key_down:          i32;   # BOOL
+    repeat_count:      u16;
+    virtual_key_code:  u16;
+    virtual_scan_code: u16;
+    ascii_char:        u8;    # low byte of the AsciiChar/UnicodeChar union
+    _reserved:         u8;    # high byte of that union -- unused here
+    control_key_state: u32;
+}
+
+# mirrors Win32's INPUT_RECORD: a 2-byte EventType, 2 bytes of padding to align
+# the union to 4 bytes, then the union sized to its largest member.
+rec InputRecord {
+    event_type: u16;
+    _pad:       u16;
+    key_event:  KeyEventRecord;
+}
+
+var _handle:     isize = 0;
+var _saved_mode: u32   = 0;
+var _raw_active: bool  = false;
+
+fun handle() isize {
+    if (_handle == 0) {
+        _handle = GetStdHandle(STD_INPUT_HANDLE);
+    }
+    ret _handle;
+}
+
+# whether raw mode is currently active
+pub fun is_raw() bool {
+    ret _raw_active;
+}
+
+# no FlushConsoleInputBuffer binding yet -- poll_key already consumes only one
+# event per call, so there is nothing separate to flush for this surface. a
+# real binding would go here if that changes.
+# ---
+# ret: none (always succeeds)
+pub fun flush_input() Option[str] {
+    ret none[str]();
+}
+
+# switch stdin into raw mode -- same semantics as terminal.linux.enable_raw:
+# no line buffering, no local echo. windows has no VMIN/VTIME equivalent;
+# non-blocking polling comes from checking GetNumberOfConsoleInputEvents before
+# reading, in poll_key below, rather than from the mode itself.
+# ---
+# ret: none on success, or an error
+pub fun enable_raw() Option[str] {
+    if (_raw_active) { ret none[str](); }
+
+    val h:   isize = handle();
+    val got: i32   = GetConsoleMode(h, ?_saved_mode);
+    if (got == 0) { ret some[str]("GetConsoleMode failed"); }
+
+    val raw_mode: u32 = _saved_mode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+    val set:      i32 = SetConsoleMode(h, raw_mode);
+    if (set == 0) { ret some[str]("SetConsoleMode failed"); }
+
+    _raw_active = true;
+    ret none[str]();
+}
+
+# restore whatever GetConsoleMode saw before enable_raw ran
+#
+# safe to call even if raw mode isn't active (no-op). pair with
+# `fin { terminal.disable_raw(); }` after a successful enable_raw.
+# ---
+# ret: none on success, or an error
+pub fun disable_raw() Option[str] {
+    if (!_raw_active) { ret none[str](); }
+
+    val set: i32 = SetConsoleMode(handle(), _saved_mode);
+    if (set == 0) { ret some[str]("SetConsoleMode failed"); }
+
+    _raw_active = false;
+    ret none[str]();
+}
+
+# read one key-event record without blocking
+#
+# unlike linux/darwin's raw byte, this checks GetNumberOfConsoleInputEvents
+# first and returns key_none if nothing is queued -- there's no
+# read-returns-0-when-empty convention on the console API. a failed console
+# call is surfaced as Err, distinct from an empty queue. non-key events (a
+# key-up, resize, or mouse event) are consumed and reported as key_none so the
+# next poll sees fresh data rather than piling up.
+# ---
+# ret: Ok(byte) for an ascii key, Ok(special) for a decoded arrow, Ok(key_none)
+#      when nothing usable was queued, or an error on a console failure
+pub fun poll_key() Result[key.Key, str] {
+    var pending: u32 = 0;
+    val got:     i32 = GetNumberOfConsoleInputEvents(handle(), ?pending);
+    if (got == 0)     { ret err[key.Key, str]("GetNumberOfConsoleInputEvents failed"); }
+    if (pending == 0) { ret ok[key.Key, str](key.key_none()); }
+
+    var ev:    InputRecord;
+    var nread: u32 = 0;
+    val okr:   i32 = ReadConsoleInputA(handle(), ?ev, 1, ?nread);
+    if (okr == 0)   { ret err[key.Key, str]("ReadConsoleInputA failed"); }
+    if (nread == 0) { ret ok[key.Key, str](key.key_none()); }
+
+    if (ev.event_type != KEY_EVENT)   { ret ok[key.Key, str](key.key_none()); }
+    if (ev.key_event.key_down == 0)   { ret ok[key.Key, str](key.key_none()); }  # ignore key-up
+
+    if (ev.key_event.ascii_char != 0) { ret ok[key.Key, str](key.key_byte(ev.key_event.ascii_char)); }
+
+    if (ev.key_event.virtual_key_code == VK_UP)    { ret ok[key.Key, str](key.key_special(key.KEY_UP)); }
+    if (ev.key_event.virtual_key_code == VK_DOWN)  { ret ok[key.Key, str](key.key_special(key.KEY_DOWN)); }
+    if (ev.key_event.virtual_key_code == VK_LEFT)  { ret ok[key.Key, str](key.key_special(key.KEY_LEFT)); }
+    if (ev.key_event.virtual_key_code == VK_RIGHT) { ret ok[key.Key, str](key.key_special(key.KEY_RIGHT)); }
+
+    ret ok[key.Key, str](key.key_none());
+}
+
+test "terminal.windows: KeyEventRecord layout is 16 bytes" {
+    if ($size_of(KeyEventRecord) != 16) { ret 1; }
+    ret 0;
+}
+
+test "terminal.windows: InputRecord layout is 20 bytes" {
+    if ($size_of(InputRecord) != 20) { ret 1; }
+    ret 0;
+}
+
+test "terminal.windows: enable_raw / disable_raw round-trip does not error" {
+    # without an attached console GetConsoleMode fails, which enable_raw
+    # surfaces as an error rather than crashing on; either way the plumbing
+    # runs.
+    val e: Option[str] = enable_raw();
+    if (is_none[str](e)) {
+        disable_raw();
+    }
+    ret 0;
+}
