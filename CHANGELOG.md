@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-07-27
+
+### Fixed
+- system: `std.system.os.darwin.shared.getcwd` — return string length on success instead of 0 to match the cross-platform `os.getcwd` contract (#2327).
+
 ## [0.20.0] - 2026-07-26
 
 Adds the `bmos` arm — support for [ReturnInfinity's BareMetal](https://github.com/ReturnInfinity/BareMetal) exokernel, whose compiler-side target shipped in mach 4.3.0.
