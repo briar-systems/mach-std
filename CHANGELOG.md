@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.2] - 2026-07-28
+
+### Fixed
+- system: `std.system.os.darwin.shared.getcwd` — replace the bogus `SYS___GETCWD` (304, which is actually `psynch_cvsignal` on XNU) with the correct libc-free approach: `open(".")` + `fcntl(F_GETPATH)` + `close()`. The previous implementation never worked on darwin; the buffer was never written to (#406, #2327).
+
 ## [0.20.1] - 2026-07-27
 
 ### Fixed
