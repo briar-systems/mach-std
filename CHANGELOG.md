@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-08-03
+
+### Removed
+- bmos: the `std.system.bmos` kernel API, `std.runtime.bmos` entry point, and the `std.system.panic` bmos arm (all added in 0.20.0). bmos support now lives in the external `mach-bmos` package, selected by the platform tag (`os=freestanding` + `platform="bmos"`, mach 4.4.0), so std no longer carries a parallel bmos arm. Unblocks removing `OS_BMOS` / `$mach.os.bmos` from the compiler (mach#2426).
+
 ## [0.20.2] - 2026-07-28
 
 ### Fixed
