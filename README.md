@@ -20,7 +20,7 @@ mach dep add mach-std --git https://github.com/briar-systems/mach-std --ref bran
 
 ## Documentation
 
-The documentation for the Mach Standard Library can be found in the [docs](./docs) directory.
+The documentation for the Mach Standard Library can be found in the [doc](./doc) directory.
 
 > NOTE: The documentation is currently a work in progress and the API is rapidly changing.
 > Please refer to the source code for the most up-to-date information.
