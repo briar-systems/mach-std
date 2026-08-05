@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- compress: `std.compress.inflate` — DEFLATE decompression (RFC 1951) covering stored, fixed-huffman, and dynamic-huffman blocks. The decoder is a **resumable state machine** rather than a one-pass loop: every point at which it can run out of input or output is a state, so a huffman symbol, a match, or a code-length table may straddle a chunk boundary and resume on the next call. That is what lets a caller feed PNG IDAT chunks one at a time without concatenating them first. Back-references always resolve through a 32 KiB circular window rather than through the caller's output buffer, so output can be drained in pieces of any size; the window is the only allocation and comes from the caller's allocator. `decompress` drives the stream and reports `NEED_INPUT` / `OUTPUT_FULL` / `DONE` with bytes consumed and written; `finish` distinguishes a stream that ended from one that was cut short. `decompress_into` and `decompress_alloc` are one-shot conveniences over the same core (#416).
+- compress: `std.compress.zlib` — RFC 1950 framing over the inflate core, validating the header and verifying the adler32 trailer. Preset dictionaries (`FDICT`) are rejected rather than silently ignored (#416).
+- compress: `std.compress.gzip` — RFC 1952 framing over the inflate core, parsing the optional `FEXTRA` / `FNAME` / `FCOMMENT` / `FHCRC` header fields and verifying the header checksum when present, plus the crc32 and length trailer. One member is decoded; bytes after the first member's trailer are left unconsumed (#416).
+- crypto: `std.crypto.hash.crc32` and `std.crypto.hash.adler32` — the checksums the wrappers need, both with a one-shot and an incremental surface. They sit beside `fnv1a` as non-cryptographic digests and are documented as error-detecting only. CRC-32 is a general module rather than a gzip-private helper because PNG chunk integrity needs it independently of gzip (#416).
+
+Compression (deflate encoding) is deliberately not included.
+
 ## [0.21.0] - 2026-08-03
 
 ### Removed
