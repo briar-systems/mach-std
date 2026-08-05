@@ -1,0 +1,423 @@
+# gzip stream decompression (RFC 1952)
+#
+# a gzip member is a variable-length header, a raw deflate stream, and a trailer
+# carrying a little-endian crc32 of the decompressed bytes and their length mod
+# 2^32. this wraps std.compress.inflate with that framing and verifies both, so
+# a mismatch is reported rather than silently returning corrupt output. the
+# optional FHCRC header checksum is verified too when present.
+#
+# one member is decoded. RFC 1952 permits members to be concatenated, but the
+# streaming contract here reports DONE at the end of a member and a caller
+# feeding chunks has no way to say "more members follow"; a multi-member reader
+# needs an explicit end-of-input signal and is a separate surface. bytes after
+# the first member's trailer are left unconsumed.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use R: std.types.result;
+use V: std.collections.vector;
+use I: std.compress.inflate;
+use std.allocator.page;
+use std.crypto.hash.crc32;
+
+fwd I.Progress;
+fwd I.Status;
+fwd I.NEED_INPUT;
+fwd I.OUTPUT_FULL;
+fwd I.DONE;
+
+val G_HEAD:    u8 = 0;
+val G_XLEN:    u8 = 1;
+val G_EXTRA:   u8 = 2;
+val G_NAME:    u8 = 3;
+val G_COMMENT: u8 = 4;
+val G_HCRC:    u8 = 5;
+val G_DATA:    u8 = 6;
+val G_TRAILER: u8 = 7;
+val G_DONE:    u8 = 8;
+
+val F_HCRC:    u8 = 2;
+val F_EXTRA:   u8 = 4;
+val F_NAME:    u8 = 8;
+val F_COMMENT: u8 = 16;
+
+# streaming gzip decoder state
+#
+# create with init, drive with decompress, confirm with finish, release with
+# dnit. all fields are internal; the surface is the functions below.
+pub rec Decompressor {
+    inf:   I.Inflater;
+    state: u8;
+    have:  usize;
+    skip:  usize;
+    flg:   u8;
+    hcrc:  u32;
+    crc:   u32;
+    isize: u64;
+    buf:   [10]u8;
+}
+
+fun progress(st: I.Status, consumed: usize, written: usize) R.Result[I.Progress, str] {
+    var p: I.Progress;
+    p.status   = st;
+    p.consumed = consumed;
+    p.written  = written;
+    ret R.ok[I.Progress, str](p);
+}
+
+# fold one header byte into the running header crc
+fun hdr_fold(z: *Decompressor, b: u8) {
+    var v: u8 = b;
+    z.hcrc = crc32.update(z.hcrc, ?v, 1);
+}
+
+# pick the next state after the fixed header, in the field order of RFC 1952
+fun after_comment(z: *Decompressor) {
+    if ((z.flg & F_HCRC) != 0) { z.state = G_HCRC; z.have = 0; ret; }
+    z.state = G_DATA;
+}
+
+fun after_name(z: *Decompressor) {
+    if ((z.flg & F_COMMENT) != 0) { z.state = G_COMMENT; ret; }
+    after_comment(z);
+}
+
+fun after_extra(z: *Decompressor) {
+    if ((z.flg & F_NAME) != 0) { z.state = G_NAME; ret; }
+    after_name(z);
+}
+
+fun after_head(z: *Decompressor) {
+    if ((z.flg & F_EXTRA) != 0) { z.state = G_XLEN; z.have = 0; ret; }
+    after_extra(z);
+}
+
+# reset the decoder to the start of a new stream, keeping the window allocation
+# ---
+# z: decoder to reset
+pub fun reset(z: *Decompressor) {
+    if (z == nil) { ret; }
+
+    I.reset(?z.inf);
+    z.state = G_HEAD;
+    z.have  = 0;
+    z.skip  = 0;
+    z.flg   = 0;
+    z.hcrc  = crc32.init();
+    z.crc   = crc32.init();
+    z.isize = 0;
+}
+
+# create a decoder, allocating the inflater's window from a
+# ---
+# a:   allocator used for the window and nothing else
+# ret: a ready decoder, or an error if the window could not be allocated
+pub fun init(a: *A.Allocator) R.Result[Decompressor, str] {
+    val ri: R.Result[I.Inflater, str] = I.init(a);
+    if (R.is_err[I.Inflater, str](ri)) {
+        ret R.err[Decompressor, str](R.unwrap_err[I.Inflater, str](ri));
+    }
+
+    var z: Decompressor;
+    z.inf = R.unwrap_ok[I.Inflater, str](ri);
+    reset(?z);
+
+    ret R.ok[Decompressor, str](z);
+}
+
+# release the inflater's window
+# ---
+# z:   decoder to deinitialize
+# ret: true if the window was released
+pub fun dnit(z: *Decompressor) bool {
+    if (z == nil) { ret true; }
+    ret I.dnit(?z.inf);
+}
+
+# check whether the member finished and its checksums verified
+# ---
+# z:   decoder to query
+# ret: true once the trailer has been read and matched
+pub fun is_done(z: *Decompressor) bool {
+    if (z == nil) { ret false; }
+    ret z.state == G_DONE;
+}
+
+# confirm the member ended rather than simply running out of input
+# ---
+# z:   decoder to check
+# ret: true if the member completed, or an error describing why it did not
+pub fun finish(z: *Decompressor) R.Result[bool, str] {
+    if (z == nil) { ret R.err[bool, str]("decompressor is nil"); }
+    if (z.state != G_DONE) { ret R.err[bool, str]("truncated gzip stream"); }
+    ret R.ok[bool, str](true);
+}
+
+# decode as much as src and dst allow
+#
+# returns when src runs out (NEED_INPUT), dst fills (OUTPUT_FULL), or the member
+# ends and its crc32 and length match (DONE). advance src by consumed and dst by
+# written, then call again.
+# ---
+# z:       decoder created by init
+# src:     next chunk of the gzip stream
+# src_len: length of that chunk
+# dst:     where decompressed bytes go
+# dst_len: space available at dst
+# ret:     what the call accomplished, or an error describing the malformed stream
+pub fun decompress(z: *Decompressor, src: *u8, src_len: usize, dst: *u8, dst_len: usize) R.Result[I.Progress, str] {
+    if (z == nil) { ret R.err[I.Progress, str]("decompressor is nil"); }
+
+    var consumed: usize = 0;
+    var written:  usize = 0;
+
+    if (z.state == G_HEAD) {
+        for (z.have < 10 && consumed < src_len) {
+            val b: u8 = src[consumed];
+            z.buf[z.have] = b;
+            hdr_fold(z, b);
+            z.have   = z.have + 1;
+            consumed = consumed + 1;
+        }
+        if (z.have < 10) { ret progress(I.NEED_INPUT, consumed, 0); }
+
+        if (z.buf[0] != 0x1F || z.buf[1] != 0x8B) {
+            ret R.err[I.Progress, str]("not a gzip stream");
+        }
+        if (z.buf[2] != 8) {
+            ret R.err[I.Progress, str]("gzip compression method is not deflate");
+        }
+
+        z.flg = z.buf[3];
+        if ((z.flg & 0xE0) != 0) {
+            ret R.err[I.Progress, str]("gzip reserved header flags are set");
+        }
+
+        after_head(z);
+    }
+
+    if (z.state == G_XLEN) {
+        for (z.have < 2 && consumed < src_len) {
+            val b: u8 = src[consumed];
+            z.buf[z.have] = b;
+            hdr_fold(z, b);
+            z.have   = z.have + 1;
+            consumed = consumed + 1;
+        }
+        if (z.have < 2) { ret progress(I.NEED_INPUT, consumed, 0); }
+
+        z.skip  = z.buf[0]::usize | (z.buf[1]::usize << 8);
+        z.state = G_EXTRA;
+    }
+
+    if (z.state == G_EXTRA) {
+        for (z.skip > 0 && consumed < src_len) {
+            hdr_fold(z, src[consumed]);
+            z.skip   = z.skip - 1;
+            consumed = consumed + 1;
+        }
+        if (z.skip > 0) { ret progress(I.NEED_INPUT, consumed, 0); }
+
+        after_extra(z);
+    }
+
+    if (z.state == G_NAME) {
+        var done: bool = false;
+        for (!done && consumed < src_len) {
+            val b: u8 = src[consumed];
+            hdr_fold(z, b);
+            consumed = consumed + 1;
+            if (b == 0) { done = true; }
+        }
+        if (!done) { ret progress(I.NEED_INPUT, consumed, 0); }
+
+        after_name(z);
+    }
+
+    if (z.state == G_COMMENT) {
+        var done: bool = false;
+        for (!done && consumed < src_len) {
+            val b: u8 = src[consumed];
+            hdr_fold(z, b);
+            consumed = consumed + 1;
+            if (b == 0) { done = true; }
+        }
+        if (!done) { ret progress(I.NEED_INPUT, consumed, 0); }
+
+        after_comment(z);
+    }
+
+    if (z.state == G_HCRC) {
+        # the stored value covers the header up to but not including itself
+        val want: u32 = crc32.final(z.hcrc) & 0xFFFF;
+
+        for (z.have < 2 && consumed < src_len) {
+            z.buf[z.have] = src[consumed];
+            z.have   = z.have + 1;
+            consumed = consumed + 1;
+        }
+        if (z.have < 2) { ret progress(I.NEED_INPUT, consumed, 0); }
+
+        val got: u32 = z.buf[0]::u32 | (z.buf[1]::u32 << 8);
+        if (got != want) {
+            ret R.err[I.Progress, str]("gzip header checksum mismatch");
+        }
+
+        z.state = G_DATA;
+    }
+
+    if (z.state == G_DATA) {
+        val r: R.Result[I.Progress, str] = I.decompress(?z.inf, ?src[consumed], src_len - consumed, dst, dst_len);
+        if (R.is_err[I.Progress, str](r)) { ret r; }
+
+        val p: I.Progress = R.unwrap_ok[I.Progress, str](r);
+        consumed = consumed + p.consumed;
+        written  = p.written;
+        z.crc    = crc32.update(z.crc, dst, written);
+        z.isize  = z.isize + written::u64;
+
+        if (p.status != I.DONE) { ret progress(p.status, consumed, written); }
+
+        # the trailer is byte-aligned and the inflater reads ahead, so some of
+        # it may already be sitting in its bit buffer
+        I.align_to_byte(?z.inf);
+        z.state = G_TRAILER;
+        z.have  = 0;
+    }
+
+    if (z.state == G_TRAILER) {
+        for (z.have < 8 && I.buffered_bytes(?z.inf) > 0) {
+            z.buf[z.have] = I.pop_buffered(?z.inf);
+            z.have = z.have + 1;
+        }
+        for (z.have < 8 && consumed < src_len) {
+            z.buf[z.have] = src[consumed];
+            z.have   = z.have + 1;
+            consumed = consumed + 1;
+        }
+        if (z.have < 8) { ret progress(I.NEED_INPUT, consumed, written); }
+
+        val want_crc: u32 = z.buf[0]::u32 | (z.buf[1]::u32 << 8)
+                          | (z.buf[2]::u32 << 16) | (z.buf[3]::u32 << 24);
+        if (want_crc != crc32.final(z.crc)) {
+            ret R.err[I.Progress, str]("gzip checksum mismatch");
+        }
+
+        val want_size: u32 = z.buf[4]::u32 | (z.buf[5]::u32 << 8)
+                           | (z.buf[6]::u32 << 16) | (z.buf[7]::u32 << 24);
+        if (want_size != (z.isize & 0xFFFFFFFF)::u32) {
+            ret R.err[I.Progress, str]("gzip length mismatch");
+        }
+
+        z.state = G_DONE;
+    }
+
+    ret progress(I.DONE, consumed, written);
+}
+
+fun drive(z: *Decompressor, src: *u8, src_len: usize, dst: *u8, dst_len: usize) R.Result[usize, str] {
+    var in_off:  usize = 0;
+    var out_off: usize = 0;
+
+    for (!is_done(z)) {
+        val r: R.Result[I.Progress, str] = decompress(z, ?src[in_off], src_len - in_off,
+                                                         ?dst[out_off], dst_len - out_off);
+        if (R.is_err[I.Progress, str](r)) {
+            ret R.err[usize, str](R.unwrap_err[I.Progress, str](r));
+        }
+
+        val p: I.Progress = R.unwrap_ok[I.Progress, str](r);
+        in_off  = in_off + p.consumed;
+        out_off = out_off + p.written;
+
+        if (p.status == I.OUTPUT_FULL) { ret R.err[usize, str]("output buffer too small"); }
+        if (p.status == I.NEED_INPUT && in_off >= src_len) {
+            ret R.err[usize, str]("truncated gzip stream");
+        }
+    }
+
+    ret R.ok[usize, str](out_off);
+}
+
+# decompress a whole gzip member into a caller-provided buffer
+# ---
+# a:       allocator for the decoder's window
+# src:     the complete gzip member
+# src_len: length of that member
+# dst:     where decompressed bytes go
+# dst_len: space available at dst
+# ret:     bytes written, or an error if the stream is malformed or does not fit
+pub fun decompress_into(a: *A.Allocator, src: *u8, src_len: usize, dst: *u8, dst_len: usize) R.Result[usize, str] {
+    val ri: R.Result[Decompressor, str] = init(a);
+    if (R.is_err[Decompressor, str](ri)) {
+        ret R.err[usize, str](R.unwrap_err[Decompressor, str](ri));
+    }
+
+    var z: Decompressor = R.unwrap_ok[Decompressor, str](ri);
+    val out: R.Result[usize, str] = drive(?z, src, src_len, dst, dst_len);
+    dnit(?z);
+
+    ret out;
+}
+
+fun grow(z: *Decompressor, out: *V.Vector[u8], src: *u8, src_len: usize) R.Result[usize, str] {
+    var in_off: usize = 0;
+
+    for (!is_done(z)) {
+        if (out.len == out.cap) {
+            var next: usize = out.cap * 2;
+            if (next < 4096) { next = 4096; }
+
+            val e: R.Result[usize, str] = V.ensure[u8](out, next);
+            if (R.is_err[usize, str](e)) { ret e; }
+        }
+
+        val r: R.Result[I.Progress, str] = decompress(z, ?src[in_off], src_len - in_off,
+                                                         ?out.data[out.len], out.cap - out.len);
+        if (R.is_err[I.Progress, str](r)) {
+            ret R.err[usize, str](R.unwrap_err[I.Progress, str](r));
+        }
+
+        val p: I.Progress = R.unwrap_ok[I.Progress, str](r);
+        in_off  = in_off + p.consumed;
+        out.len = out.len + p.written;
+
+        if (p.status == I.NEED_INPUT && in_off >= src_len) {
+            ret R.err[usize, str]("truncated gzip stream");
+        }
+    }
+
+    ret R.ok[usize, str](out.len);
+}
+
+# decompress a whole gzip member into a vector that grows as needed
+# ---
+# a:       allocator for the decoder's window and the output vector
+# src:     the complete gzip member
+# src_len: length of that member
+# ret:     a vector owning the decompressed bytes, which the caller must dnit,
+#          or an error if the stream is malformed
+pub fun decompress_alloc(a: *A.Allocator, src: *u8, src_len: usize) R.Result[V.Vector[u8], str] {
+    val ri: R.Result[Decompressor, str] = init(a);
+    if (R.is_err[Decompressor, str](ri)) {
+        ret R.err[V.Vector[u8], str](R.unwrap_err[Decompressor, str](ri));
+    }
+
+    var z: Decompressor = R.unwrap_ok[Decompressor, str](ri);
+    var out: V.Vector[u8] = V.init[u8](a);
+
+    val res: R.Result[usize, str] = grow(?z, ?out, src, src_len);
+    dnit(?z);
+
+    if (R.is_err[usize, str](res)) {
+        V.dnit[u8](?out);
+        ret R.err[V.Vector[u8], str](R.unwrap_err[usize, str](res));
+    }
+
+    ret R.ok[V.Vector[u8], str](out);
+}
