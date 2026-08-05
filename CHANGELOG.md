@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-08-05
+
 ### Added
 - compress: `std.compress.inflate` — DEFLATE decompression (RFC 1951) covering stored, fixed-huffman, and dynamic-huffman blocks. The decoder is a **resumable state machine** rather than a one-pass loop: every point at which it can run out of input or output is a state, so a huffman symbol, a match, or a code-length table may straddle a chunk boundary and resume on the next call. That is what lets a caller feed PNG IDAT chunks one at a time without concatenating them first. Back-references always resolve through a 32 KiB circular window rather than through the caller's output buffer, so output can be drained in pieces of any size; the window is the only allocation and comes from the caller's allocator. `decompress` drives the stream and reports `NEED_INPUT` / `OUTPUT_FULL` / `DONE` with bytes consumed and written; `finish` distinguishes a stream that ended from one that was cut short. `decompress_into` and `decompress_alloc` are one-shot conveniences over the same core (#416).
 - compress: `std.compress.zlib` — RFC 1950 framing over the inflate core, validating the header and verifying the adler32 trailer. Preset dictionaries (`FDICT`) are rejected rather than silently ignored (#416).
