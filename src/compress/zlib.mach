@@ -1,0 +1,606 @@
+# zlib stream decompression (RFC 1950)
+#
+# a zlib stream is a two-byte header, a raw deflate stream, and a big-endian
+# adler32 of the decompressed bytes. this wraps std.compress.inflate with that
+# framing and verifies the checksum, so a mismatch is reported rather than
+# silently returning corrupt output.
+#
+# preset dictionaries (the FDICT header flag) are rejected; no caller in std
+# produces them and honouring one would require a dictionary channel in the API.
+# Progress, its status constants, and WINDOW are re-exported from inflate so a
+# caller needs only this module to drive a stream and size its scratch storage.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+use R: std.types.result;
+use V: std.collections.vector;
+use I: std.compress.inflate;
+use std.allocator.page;
+use std.allocator.fixed;
+use std.crypto.hash.adler32;
+
+fwd I.Progress;
+fwd I.Status;
+fwd I.NEED_INPUT;
+fwd I.OUTPUT_FULL;
+fwd I.DONE;
+fwd I.WINDOW;
+
+val W_HEAD:    u8 = 0;
+val W_DATA:    u8 = 1;
+val W_TRAILER: u8 = 2;
+val W_DONE:    u8 = 3;
+
+# streaming zlib decoder state
+#
+# create with init, drive with decompress, confirm with finish, release with
+# dnit. all fields are internal; the surface is the functions below.
+pub rec Decompressor {
+    inf:   I.Inflater;
+    state: u8;
+    have:  usize;
+    buf:   [4]u8;
+    adler: u32;
+}
+
+fun progress(st: I.Status, consumed: usize, written: usize) R.Result[I.Progress, str] {
+    var p: I.Progress;
+    p.status   = st;
+    p.consumed = consumed;
+    p.written  = written;
+    ret R.ok[I.Progress, str](p);
+}
+
+# reset the decoder to the start of a new stream, keeping the window allocation
+# ---
+# z: decoder to reset
+pub fun reset(z: *Decompressor) {
+    if (z == nil) { ret; }
+
+    I.reset(?z.inf);
+    z.state = W_HEAD;
+    z.have  = 0;
+    z.adler = adler32.init();
+}
+
+# create a decoder, allocating the inflater's window from a
+# ---
+# a:   allocator used for the window and nothing else
+# ret: a ready decoder, or an error if the window could not be allocated
+pub fun init(a: *A.Allocator) R.Result[Decompressor, str] {
+    val ri: R.Result[I.Inflater, str] = I.init(a);
+    if (R.is_err[I.Inflater, str](ri)) {
+        ret R.err[Decompressor, str](R.unwrap_err[I.Inflater, str](ri));
+    }
+
+    var z: Decompressor;
+    z.inf = R.unwrap_ok[I.Inflater, str](ri);
+    reset(?z);
+
+    ret R.ok[Decompressor, str](z);
+}
+
+# release the inflater's window
+# ---
+# z:   decoder to deinitialize
+# ret: true if the window was released
+pub fun dnit(z: *Decompressor) bool {
+    if (z == nil) { ret true; }
+    ret I.dnit(?z.inf);
+}
+
+# check whether the stream finished and its checksum verified
+# ---
+# z:   decoder to query
+# ret: true once the trailer has been read and matched
+pub fun is_done(z: *Decompressor) bool {
+    if (z == nil) { ret false; }
+    ret z.state == W_DONE;
+}
+
+# confirm the stream ended rather than simply running out of input
+# ---
+# z:   decoder to check
+# ret: true if the stream completed, or an error describing why it did not
+pub fun finish(z: *Decompressor) R.Result[bool, str] {
+    if (z == nil) { ret R.err[bool, str]("decompressor is nil"); }
+    if (z.state != W_DONE) { ret R.err[bool, str]("truncated zlib stream"); }
+    ret R.ok[bool, str](true);
+}
+
+# decode as much as src and dst allow
+#
+# returns when src runs out (NEED_INPUT), dst fills (OUTPUT_FULL), or the stream
+# ends and its adler32 matches (DONE). advance src by consumed and dst by
+# written, then call again.
+# ---
+# z:       decoder created by init
+# src:     next chunk of the zlib stream
+# src_len: length of that chunk
+# dst:     where decompressed bytes go
+# dst_len: space available at dst
+# ret:     what the call accomplished, or an error describing the malformed stream
+pub fun decompress(z: *Decompressor, src: *u8, src_len: usize, dst: *u8, dst_len: usize) R.Result[I.Progress, str] {
+    if (z == nil) { ret R.err[I.Progress, str]("decompressor is nil"); }
+
+    var consumed: usize = 0;
+    var written:  usize = 0;
+
+    if (z.state == W_HEAD) {
+        for (z.have < 2 && consumed < src_len) {
+            z.buf[z.have] = src[consumed];
+            z.have   = z.have + 1;
+            consumed = consumed + 1;
+        }
+        if (z.have < 2) { ret progress(I.NEED_INPUT, consumed, 0); }
+
+        val cmf: u32 = z.buf[0]::u32;
+        val flg: u32 = z.buf[1]::u32;
+
+        if ((cmf & 0x0F) != 8) {
+            ret R.err[I.Progress, str]("zlib compression method is not deflate");
+        }
+        if (((cmf >> 4) & 0x0F) > 7) {
+            ret R.err[I.Progress, str]("zlib window size exceeds 32 KiB");
+        }
+        if ((cmf * 256 + flg) % 31 != 0) {
+            ret R.err[I.Progress, str]("zlib header check failed");
+        }
+        if ((flg & 0x20) != 0) {
+            ret R.err[I.Progress, str]("zlib preset dictionary is not supported");
+        }
+
+        z.state = W_DATA;
+        z.have  = 0;
+    }
+
+    if (z.state == W_DATA) {
+        val r: R.Result[I.Progress, str] = I.decompress(?z.inf, ?src[consumed], src_len - consumed, dst, dst_len);
+        if (R.is_err[I.Progress, str](r)) { ret r; }
+
+        val p: I.Progress = R.unwrap_ok[I.Progress, str](r);
+        consumed = consumed + p.consumed;
+        written  = p.written;
+        z.adler  = adler32.update(z.adler, dst, written);
+
+        if (p.status != I.DONE) { ret progress(p.status, consumed, written); }
+
+        # the trailer is byte-aligned and the inflater reads ahead, so some of
+        # it may already be sitting in its bit buffer
+        I.align_to_byte(?z.inf);
+        z.state = W_TRAILER;
+        z.have  = 0;
+    }
+
+    if (z.state == W_TRAILER) {
+        for (z.have < 4 && I.buffered_bytes(?z.inf) > 0) {
+            z.buf[z.have] = I.pop_buffered(?z.inf);
+            z.have = z.have + 1;
+        }
+        for (z.have < 4 && consumed < src_len) {
+            z.buf[z.have] = src[consumed];
+            z.have   = z.have + 1;
+            consumed = consumed + 1;
+        }
+        if (z.have < 4) { ret progress(I.NEED_INPUT, consumed, written); }
+
+        val want: u32 = (z.buf[0]::u32 << 24) | (z.buf[1]::u32 << 16)
+                      | (z.buf[2]::u32 << 8)  |  z.buf[3]::u32;
+        if (want != z.adler) {
+            ret R.err[I.Progress, str]("zlib checksum mismatch");
+        }
+
+        z.state = W_DONE;
+    }
+
+    ret progress(I.DONE, consumed, written);
+}
+
+fun drive(z: *Decompressor, src: *u8, src_len: usize, dst: *u8, dst_len: usize) R.Result[usize, str] {
+    var in_off:  usize = 0;
+    var out_off: usize = 0;
+
+    for (!is_done(z)) {
+        val r: R.Result[I.Progress, str] = decompress(z, ?src[in_off], src_len - in_off,
+                                                         ?dst[out_off], dst_len - out_off);
+        if (R.is_err[I.Progress, str](r)) {
+            ret R.err[usize, str](R.unwrap_err[I.Progress, str](r));
+        }
+
+        val p: I.Progress = R.unwrap_ok[I.Progress, str](r);
+        in_off  = in_off + p.consumed;
+        out_off = out_off + p.written;
+
+        if (p.status == I.OUTPUT_FULL) { ret R.err[usize, str]("output buffer too small"); }
+        if (p.status == I.NEED_INPUT && in_off >= src_len) {
+            ret R.err[usize, str]("truncated zlib stream");
+        }
+    }
+
+    ret R.ok[usize, str](out_off);
+}
+
+# decompress a whole zlib stream into a caller-provided buffer
+# ---
+# a:       allocator for the decoder's window
+# src:     the complete zlib stream
+# src_len: length of that stream
+# dst:     where decompressed bytes go
+# dst_len: space available at dst
+# ret:     bytes written, or an error if the stream is malformed or does not fit
+pub fun decompress_into(a: *A.Allocator, src: *u8, src_len: usize, dst: *u8, dst_len: usize) R.Result[usize, str] {
+    val ri: R.Result[Decompressor, str] = init(a);
+    if (R.is_err[Decompressor, str](ri)) {
+        ret R.err[usize, str](R.unwrap_err[Decompressor, str](ri));
+    }
+
+    var z: Decompressor = R.unwrap_ok[Decompressor, str](ri);
+    val out: R.Result[usize, str] = drive(?z, src, src_len, dst, dst_len);
+    dnit(?z);
+
+    ret out;
+}
+
+fun grow(z: *Decompressor, out: *V.Vector[u8], src: *u8, src_len: usize) R.Result[usize, str] {
+    var in_off: usize = 0;
+
+    for (!is_done(z)) {
+        if (out.len == out.cap) {
+            var next: usize = out.cap * 2;
+            if (next < 4096) { next = 4096; }
+
+            val e: R.Result[usize, str] = V.ensure[u8](out, next);
+            if (R.is_err[usize, str](e)) { ret e; }
+        }
+
+        val r: R.Result[I.Progress, str] = decompress(z, ?src[in_off], src_len - in_off,
+                                                         ?out.data[out.len], out.cap - out.len);
+        if (R.is_err[I.Progress, str](r)) {
+            ret R.err[usize, str](R.unwrap_err[I.Progress, str](r));
+        }
+
+        val p: I.Progress = R.unwrap_ok[I.Progress, str](r);
+        in_off  = in_off + p.consumed;
+        out.len = out.len + p.written;
+
+        if (p.status == I.NEED_INPUT && in_off >= src_len) {
+            ret R.err[usize, str]("truncated zlib stream");
+        }
+    }
+
+    ret R.ok[usize, str](out.len);
+}
+
+# decompress a whole zlib stream into a vector that grows as needed
+# ---
+# a:       allocator for the decoder's window and the output vector
+# src:     the complete zlib stream
+# src_len: length of that stream
+# ret:     a vector owning the decompressed bytes, which the caller must dnit,
+#          or an error if the stream is malformed
+pub fun decompress_alloc(a: *A.Allocator, src: *u8, src_len: usize) R.Result[V.Vector[u8], str] {
+    val ri: R.Result[Decompressor, str] = init(a);
+    if (R.is_err[Decompressor, str](ri)) {
+        ret R.err[V.Vector[u8], str](R.unwrap_err[Decompressor, str](ri));
+    }
+
+    var z: Decompressor = R.unwrap_ok[Decompressor, str](ri);
+    var out: V.Vector[u8] = V.init[u8](a);
+
+    val res: R.Result[usize, str] = grow(?z, ?out, src, src_len);
+    dnit(?z);
+
+    if (R.is_err[usize, str](res)) {
+        V.dnit[u8](?out);
+        ret R.err[V.Vector[u8], str](R.unwrap_err[usize, str](res));
+    }
+
+    ret R.ok[V.Vector[u8], str](out);
+}
+
+val C_Z_L0: [53]u8 = [53]u8{
+    0x78, 0x01, 0x01, 0x2A, 0x00, 0xD5, 0xFF, 0x54, 0x6F, 0x20, 0x62, 0x65, 0x2C, 0x20, 0x6F, 0x72,
+    0x20, 0x6E, 0x6F, 0x74, 0x20, 0x74, 0x6F, 0x20, 0x62, 0x65, 0x2C, 0x20, 0x74, 0x68, 0x61, 0x74,
+    0x20, 0x69, 0x73, 0x20, 0x74, 0x68, 0x65, 0x20, 0x71, 0x75, 0x65, 0x73, 0x74, 0x69, 0x6F, 0x6E,
+    0x2E, 0x27, 0xA9, 0x0E, 0x53
+};
+
+val C_Z_L1: [45]u8 = [45]u8{
+    0x78, 0x01, 0x0B, 0xC9, 0x57, 0x48, 0x4A, 0xD5, 0x51, 0xC8, 0x2F, 0x52, 0xC8, 0xCB, 0x2F, 0x51,
+    0x28, 0x81, 0xF0, 0x4A, 0x32, 0x12, 0x4B, 0x14, 0x32, 0x8B, 0x15, 0x4A, 0x32, 0x52, 0x15, 0x0A,
+    0x4B, 0x53, 0x8B, 0x4B, 0x32, 0xF3, 0xF3, 0xF4, 0x00, 0x27, 0xA9, 0x0E, 0x53
+};
+
+val C_Z_L6: [45]u8 = [45]u8{
+    0x78, 0x9C, 0x0B, 0xC9, 0x57, 0x48, 0x4A, 0xD5, 0x51, 0xC8, 0x2F, 0x52, 0xC8, 0xCB, 0x2F, 0x51,
+    0x28, 0x81, 0xF0, 0x4A, 0x32, 0x12, 0x4B, 0x14, 0x32, 0x8B, 0x15, 0x4A, 0x32, 0x52, 0x15, 0x0A,
+    0x4B, 0x53, 0x8B, 0x4B, 0x32, 0xF3, 0xF3, 0xF4, 0x00, 0x27, 0xA9, 0x0E, 0x53
+};
+
+val C_Z_L9: [44]u8 = [44]u8{
+    0x78, 0xDA, 0x0B, 0xC9, 0x57, 0x48, 0x4A, 0xD5, 0x51, 0xC8, 0x2F, 0x52, 0xC8, 0xCB, 0x2F, 0x51,
+    0x28, 0x81, 0xF0, 0x4A, 0x32, 0x12, 0x4B, 0x14, 0x32, 0x8B, 0x81, 0x74, 0xAA, 0x42, 0x61, 0x69,
+    0x6A, 0x71, 0x49, 0x66, 0x7E, 0x9E, 0x1E, 0x00, 0x27, 0xA9, 0x0E, 0x53
+};
+
+val D_Z_MSG: [42]u8 = [42]u8{
+    0x54, 0x6F, 0x20, 0x62, 0x65, 0x2C, 0x20, 0x6F, 0x72, 0x20, 0x6E, 0x6F, 0x74, 0x20, 0x74, 0x6F,
+    0x20, 0x62, 0x65, 0x2C, 0x20, 0x74, 0x68, 0x61, 0x74, 0x20, 0x69, 0x73, 0x20, 0x74, 0x68, 0x65,
+    0x20, 0x71, 0x75, 0x65, 0x73, 0x74, 0x69, 0x6F, 0x6E, 0x2E
+};
+
+val C_Z_LARGE: [90]u8 = [90]u8{
+    0x78, 0x9C, 0xED, 0xD4, 0xB1, 0x0D, 0x00, 0x20, 0x0C, 0x03, 0xB0, 0x5B, 0x0B, 0xA5, 0x40, 0xFF,
+    0x3F, 0x80, 0x3B, 0x90, 0xBC, 0x65, 0x8E, 0x12, 0xC7, 0x98, 0xB9, 0x6A, 0x9F, 0xDB, 0x21, 0xE9,
+    0xC0, 0x0E, 0x7C, 0x81, 0x07, 0x24, 0x24, 0x21, 0x09, 0x49, 0x48, 0x42, 0x12, 0x92, 0x90, 0x84,
+    0x24, 0x24, 0x21, 0x09, 0x49, 0x48, 0x42, 0x12, 0x92, 0x90, 0x84, 0x24, 0x24, 0x21, 0x09, 0x49,
+    0x48, 0x42, 0x12, 0x92, 0x90, 0x84, 0x24, 0x24, 0x21, 0x09, 0x49, 0x48, 0x42, 0x12, 0x92, 0x90,
+    0x84, 0x24, 0xAC, 0x5F, 0x3B, 0x78, 0xB8, 0xC2, 0x7D, 0xBA
+};
+
+val D_Z_STREAM: [280]u8 = [280]u8{
+    0x4D, 0x61, 0x63, 0x68, 0x20, 0x63, 0x6F, 0x6D, 0x70, 0x72, 0x65, 0x73, 0x73, 0x65, 0x73, 0x3B,
+    0x20, 0x69, 0x74, 0x20, 0x6E, 0x65, 0x76, 0x65, 0x72, 0x20, 0x67, 0x75, 0x65, 0x73, 0x73, 0x65,
+    0x73, 0x2E, 0x20, 0x4D, 0x61, 0x63, 0x68, 0x20, 0x63, 0x6F, 0x6D, 0x70, 0x72, 0x65, 0x73, 0x73,
+    0x65, 0x73, 0x3B, 0x20, 0x69, 0x74, 0x20, 0x6E, 0x65, 0x76, 0x65, 0x72, 0x20, 0x67, 0x75, 0x65,
+    0x73, 0x73, 0x65, 0x73, 0x2E, 0x20, 0x4D, 0x61, 0x63, 0x68, 0x20, 0x63, 0x6F, 0x6D, 0x70, 0x72,
+    0x65, 0x73, 0x73, 0x65, 0x73, 0x3B, 0x20, 0x69, 0x74, 0x20, 0x6E, 0x65, 0x76, 0x65, 0x72, 0x20,
+    0x67, 0x75, 0x65, 0x73, 0x73, 0x65, 0x73, 0x2E, 0x20, 0x4D, 0x61, 0x63, 0x68, 0x20, 0x63, 0x6F,
+    0x6D, 0x70, 0x72, 0x65, 0x73, 0x73, 0x65, 0x73, 0x3B, 0x20, 0x69, 0x74, 0x20, 0x6E, 0x65, 0x76,
+    0x65, 0x72, 0x20, 0x67, 0x75, 0x65, 0x73, 0x73, 0x65, 0x73, 0x2E, 0x20, 0x4D, 0x61, 0x63, 0x68,
+    0x20, 0x63, 0x6F, 0x6D, 0x70, 0x72, 0x65, 0x73, 0x73, 0x65, 0x73, 0x3B, 0x20, 0x69, 0x74, 0x20,
+    0x6E, 0x65, 0x76, 0x65, 0x72, 0x20, 0x67, 0x75, 0x65, 0x73, 0x73, 0x65, 0x73, 0x2E, 0x20, 0x4D,
+    0x61, 0x63, 0x68, 0x20, 0x63, 0x6F, 0x6D, 0x70, 0x72, 0x65, 0x73, 0x73, 0x65, 0x73, 0x3B, 0x20,
+    0x69, 0x74, 0x20, 0x6E, 0x65, 0x76, 0x65, 0x72, 0x20, 0x67, 0x75, 0x65, 0x73, 0x73, 0x65, 0x73,
+    0x2E, 0x20, 0x4D, 0x61, 0x63, 0x68, 0x20, 0x63, 0x6F, 0x6D, 0x70, 0x72, 0x65, 0x73, 0x73, 0x65,
+    0x73, 0x3B, 0x20, 0x69, 0x74, 0x20, 0x6E, 0x65, 0x76, 0x65, 0x72, 0x20, 0x67, 0x75, 0x65, 0x73,
+    0x73, 0x65, 0x73, 0x2E, 0x20, 0x4D, 0x61, 0x63, 0x68, 0x20, 0x63, 0x6F, 0x6D, 0x70, 0x72, 0x65,
+    0x73, 0x73, 0x65, 0x73, 0x3B, 0x20, 0x69, 0x74, 0x20, 0x6E, 0x65, 0x76, 0x65, 0x72, 0x20, 0x67,
+    0x75, 0x65, 0x73, 0x73, 0x65, 0x73, 0x2E, 0x20
+};
+
+val C_Z_STREAM: [43]u8 = [43]u8{
+    0x78, 0x9C, 0xF3, 0x4D, 0x4C, 0xCE, 0x50, 0x48, 0xCE, 0xCF, 0x2D, 0x28, 0x4A, 0x2D, 0x2E, 0x4E,
+    0x2D, 0xB6, 0x56, 0xC8, 0x2C, 0x51, 0xC8, 0x4B, 0x2D, 0x4B, 0x2D, 0x52, 0x48, 0x2F, 0x05, 0x8B,
+    0xE8, 0x29, 0xF8, 0x8E, 0x44, 0x25, 0x00, 0x22, 0x78, 0x66, 0x11
+};
+
+# repeating period-10 pattern used to recompute a large procedural fixture
+# without embedding its expected output
+val REPEAT_PAT: [10]u8 = [10]u8{
+    0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A
+};
+
+fun expected_repeat(i: usize) u8 {
+    ret REPEAT_PAT[i % 10];
+}
+
+var obuf: [4096]u8;
+
+fun check(comp: *u8, comp_len: usize, orig: *u8, orig_len: usize) i32 {
+    var a: A.Allocator;
+    page.make(?a);
+
+    val r: R.Result[usize, str] = decompress_into(?a, comp, comp_len, ?obuf[0], 4096);
+    if (R.is_err[usize, str](r)) { ret 1; }
+
+    val n: usize = R.unwrap_ok[usize, str](r);
+    if (n != orig_len) { ret 2; }
+
+    var i: usize = 0;
+    for (i < n) {
+        if (obuf[i] != orig[i]) { ret 3; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# verify a decompressed stream against a byte generator rather than an
+# embedded array, and via the allocating API since the output is too large
+# for obuf
+fun gen_check_alloc(comp: *u8, comp_len: usize, orig_len: usize, gen: fun(usize) u8) i32 {
+    var a: A.Allocator;
+    page.make(?a);
+
+    val r: R.Result[V.Vector[u8], str] = decompress_alloc(?a, comp, comp_len);
+    if (R.is_err[V.Vector[u8], str](r)) { ret 1; }
+
+    var v: V.Vector[u8] = R.unwrap_ok[V.Vector[u8], str](r);
+    if (v.len != orig_len) { V.dnit[u8](?v); ret 2; }
+
+    var i: usize = 0;
+    for (i < v.len) {
+        if (v.data[i] != gen(i)) { V.dnit[u8](?v); ret 3; }
+        i = i + 1;
+    }
+
+    V.dnit[u8](?v);
+    ret 0;
+}
+
+# drive the streaming API with small, awkward chunk sizes so decoding must
+# suspend and resume mid-symbol, mid-match, and across the header and trailer
+fun stream_check(comp: *u8, comp_len: usize, in_chunk: usize, out_chunk: usize, orig: *u8, orig_len: usize) i32 {
+    var a: A.Allocator;
+    page.make(?a);
+
+    val ri: R.Result[Decompressor, str] = init(?a);
+    if (R.is_err[Decompressor, str](ri)) { ret 1; }
+    var z: Decompressor = R.unwrap_ok[Decompressor, str](ri);
+
+    var in_off:  usize = 0;
+    var out_off: usize = 0;
+    var guard:   usize = 0;
+
+    for (guard < 200000 && !is_done(?z)) {
+        guard = guard + 1;
+
+        var feed: usize = in_chunk;
+        if (in_off + feed > comp_len) { feed = comp_len - in_off; }
+
+        var room: usize = out_chunk;
+        if (out_off + room > 4096) { room = 4096 - out_off; }
+
+        val r: R.Result[I.Progress, str] = decompress(?z, ?comp[in_off], feed, ?obuf[out_off], room);
+        if (R.is_err[I.Progress, str](r)) { dnit(?z); ret 2; }
+
+        val p: I.Progress = R.unwrap_ok[I.Progress, str](r);
+        in_off  = in_off + p.consumed;
+        out_off = out_off + p.written;
+
+        if (p.status == I.NEED_INPUT && in_off >= comp_len) { dnit(?z); ret 3; }
+    }
+
+    val f: R.Result[bool, str] = finish(?z);
+    dnit(?z);
+    if (R.is_err[bool, str](f)) { ret 4; }
+    if (in_off != comp_len)  { ret 5; }
+    if (out_off != orig_len) { ret 6; }
+
+    var i: usize = 0;
+    for (i < out_off) {
+        if (obuf[i] != orig[i]) { ret 7; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test "zlib: round trip at level 0 (stored)" {
+    ret check(?C_Z_L0[0], 53, ?D_Z_MSG[0], 42);
+}
+
+test "zlib: round trip at level 1" {
+    ret check(?C_Z_L1[0], 45, ?D_Z_MSG[0], 42);
+}
+
+test "zlib: round trip at level 6" {
+    ret check(?C_Z_L6[0], 45, ?D_Z_MSG[0], 42);
+}
+
+test "zlib: round trip at level 9" {
+    ret check(?C_Z_L9[0], 44, ?D_Z_MSG[0], 42);
+}
+
+test "zlib: exactly-sized output reaches the trailer" {
+    var a: A.Allocator;
+    page.make(?a);
+
+    val r: R.Result[usize, str] = decompress_into(?a, ?C_Z_L6[0], 45, ?obuf[0], 42);
+    if (R.is_err[usize, str](r)) { ret 1; }
+    if (R.unwrap_ok[usize, str](r) != 42) { ret 2; }
+    ret 0;
+}
+
+val C_Z_EMPTY: [8]u8 = [8]u8{
+    0x78, 0x9C, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01
+};
+
+test "zlib: empty stream fits a zero-length output buffer" {
+    var a: A.Allocator;
+    page.make(?a);
+
+    val r: R.Result[usize, str] = decompress_into(?a, ?C_Z_EMPTY[0], 8, ?obuf[0], 0);
+    if (R.is_err[usize, str](r)) { ret 1; }
+    if (R.unwrap_ok[usize, str](r) != 0) { ret 2; }
+    ret 0;
+}
+
+test "zlib: large repetitive stream round trip" {
+    ret gen_check_alloc(?C_Z_LARGE[0], 90, 10000, expected_repeat);
+}
+
+test "zlib: streaming with 3-byte input and 5-byte output chunks" {
+    ret stream_check(?C_Z_STREAM[0], 43, 3, 5, ?D_Z_STREAM[0], 280);
+}
+
+val N_Z_BAD_ADLER: [42]u8 = [42]u8{
+    0x78, 0x9C, 0xAB, 0xCA, 0xC9, 0x4C, 0x52, 0x28, 0x2F, 0x4A, 0x2C, 0x28, 0x48, 0x2D, 0x52, 0xC8,
+    0x4B, 0x4D, 0x4F, 0x2C, 0xC9, 0x2C, 0x4B, 0x55, 0x48, 0x4E, 0x2C, 0x4E, 0x55, 0x28, 0x48, 0xAC,
+    0xCC, 0xC9, 0x4F, 0x4C, 0x01, 0x00, 0xE5, 0x59, 0x0D, 0xF3
+};
+val N_Z_BAD_METHOD: [42]u8 = [42]u8{
+    0x77, 0x09, 0xAB, 0xCA, 0xC9, 0x4C, 0x52, 0x28, 0x2F, 0x4A, 0x2C, 0x28, 0x48, 0x2D, 0x52, 0xC8,
+    0x4B, 0x4D, 0x4F, 0x2C, 0xC9, 0x2C, 0x4B, 0x55, 0x48, 0x4E, 0x2C, 0x4E, 0x55, 0x28, 0x48, 0xAC,
+    0xCC, 0xC9, 0x4F, 0x4C, 0x01, 0x00, 0xE5, 0x59, 0x0D, 0x0C
+};
+val N_Z_BAD_CHECK: [42]u8 = [42]u8{
+    0x78, 0x9D, 0xAB, 0xCA, 0xC9, 0x4C, 0x52, 0x28, 0x2F, 0x4A, 0x2C, 0x28, 0x48, 0x2D, 0x52, 0xC8,
+    0x4B, 0x4D, 0x4F, 0x2C, 0xC9, 0x2C, 0x4B, 0x55, 0x48, 0x4E, 0x2C, 0x4E, 0x55, 0x28, 0x48, 0xAC,
+    0xCC, 0xC9, 0x4F, 0x4C, 0x01, 0x00, 0xE5, 0x59, 0x0D, 0x0C
+};
+val N_Z_PRESET_DICT: [46]u8 = [46]u8{
+    0x78, 0x20, 0xAB, 0xCA, 0xC9, 0x4C, 0x52, 0x28, 0x2F, 0x4A, 0x2C, 0x28, 0x48, 0x2D, 0x52, 0xC8,
+    0x4B, 0x4D, 0x4F, 0x2C, 0xC9, 0x2C, 0x4B, 0x55, 0x48, 0x4E, 0x2C, 0x4E, 0x55, 0x28, 0x48, 0xAC,
+    0xCC, 0xC9, 0x4F, 0x4C, 0x01, 0x00, 0xE5, 0x59, 0x0D, 0x0C, 0x00, 0x00, 0x00, 0x01
+};
+val N_Z_TRUNC: [36]u8 = [36]u8{
+    0x78, 0x9C, 0xAB, 0xCA, 0xC9, 0x4C, 0x52, 0x28, 0x2F, 0x4A, 0x2C, 0x28, 0x48, 0x2D, 0x52, 0xC8,
+    0x4B, 0x4D, 0x4F, 0x2C, 0xC9, 0x2C, 0x4B, 0x55, 0x48, 0x4E, 0x2C, 0x4E, 0x55, 0x28, 0x48, 0xAC,
+    0xCC, 0xC9, 0x4F, 0x4C
+};
+
+# a malformed stream must be refused, and refused for the stated reason
+fun rejects(comp: *u8, comp_len: usize, want: str) i32 {
+    var a: A.Allocator;
+    page.make(?a);
+
+    val r: R.Result[usize, str] = decompress_into(?a, comp, comp_len, ?obuf[0], 4096);
+    if (!R.is_err[usize, str](r)) { ret 1; }
+    if (!str_equals(R.unwrap_err[usize, str](r), want)) { ret 2; }
+    ret 0;
+}
+test "zlib: corrupt adler32 trailer is rejected" {
+    ret rejects(?N_Z_BAD_ADLER[0], 42, "zlib checksum mismatch");
+}
+test "zlib: compression method that is not deflate is rejected" {
+    ret rejects(?N_Z_BAD_METHOD[0], 42, "zlib compression method is not deflate");
+}
+test "zlib: bad header check value is rejected" {
+    ret rejects(?N_Z_BAD_CHECK[0], 42, "zlib header check failed");
+}
+test "zlib: preset dictionary flag is rejected" {
+    ret rejects(?N_Z_PRESET_DICT[0], 46, "zlib preset dictionary is not supported");
+}
+test "zlib: stream cut before its trailer is rejected" {
+    ret rejects(?N_Z_TRUNC[0], 36, "truncated zlib stream");
+}
+
+var scratch: [32768]u8;
+
+# freestanding callers carve the window out of their own buffer rather than
+# reaching an OS-backed allocator; mach-image decodes PNG this way
+test "zlib: decodes with a fixed-buffer allocator and no OS involvement" {
+    var st: fixed.FixedState;
+    var a:  A.Allocator;
+    fixed.make(?a, ?st, ?scratch[0], I.WINDOW);
+
+    val r: R.Result[usize, str] = decompress_into(?a, ?C_Z_L6[0], 45, ?obuf[0], 4096);
+    if (R.is_err[usize, str](r)) { ret 1; }
+
+    val n: usize = R.unwrap_ok[usize, str](r);
+    if (n != 42) { ret 2; }
+
+    var i: usize = 0;
+    for (i < n) {
+        if (obuf[i] != D_Z_MSG[i]) { ret 3; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# so the scratch requirement is exactly inflate.WINDOW, not merely at least it
+test "zlib: scratch one byte short of the window is refused" {
+    var st: fixed.FixedState;
+    var a:  A.Allocator;
+    fixed.make(?a, ?st, ?scratch[0], I.WINDOW - 1);
+
+    val r: R.Result[usize, str] = decompress_into(?a, ?C_Z_L6[0], 45, ?obuf[0], 4096);
+    if (!R.is_err[usize, str](r)) { ret 1; }
+    ret 0;
+}
