@@ -4,11 +4,21 @@ use std.types.bool.bool;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
+use std.types.string.str_empty;
+use std.types.string.str_copy;
+use std.types.string.str_equals;
+use std.types.string.str_copy_slice;
+use std.types.string.str_join;
+use std.types.string.str_contains_char;
 use std.collections.vector.Vector;
 use std.allocator.fixed;
 
 use A: std.allocator;
 use R: std.types.result;
+
+use path: std.types.path;
+use env: std.process.env;
 
 use std.filesystem;
 use m_reader: std.io.reader;
@@ -238,6 +248,153 @@ pub fun exit(code: i64) {
     os.terminate(code);
 }
 
+# the most candidate spellings one PATH directory is probed for. posix uses
+# one; windows uses one per PATHEXT entry, and the cmd default has four.
+val CAND_MAX: usize = 16;
+
+# resolve a user-named program to a spawnable path using PATH
+#
+# none of the spawn entry points searches PATH: execve resolves nothing, and
+# the windows layer passes a non-NULL lpApplicationName. a caller spawning a
+# program the USER names rather than a fixed path resolves it here first.
+#
+# PATH is the only source. the current directory is never consulted, so a
+# binary committed into a working tree cannot shadow the real tool.
+# ---
+# a:    allocator for the result
+# name: program name, bare or already pathed
+# ret:  an owned spawnable path, or an error
+pub fun resolve(a: *A.Allocator, name: str) R.Result[str, str] {
+    if (str_empty(name)) { ret R.err[str, str]("empty program name"); }
+    if (path.has_separator(name)) { ret str_copy(a, name); }
+
+    val paths_r: R.Result[str, str] = env.value(a, "PATH");
+    if (R.is_err[str, str](paths_r)) { ret R.err[str, str]("PATH unset"); }
+    val paths: str = R.unwrap_ok[str, str](paths_r);
+
+    val out: R.Result[str, str] = resolve_in(a, name, paths);
+    A.deallocate[u8](a, paths, str_len(paths) + 1);
+    ret out;
+}
+
+# resolve a program name against a caller-supplied search list
+#
+# the search policy, with the environment read left to `resolve`. a caller with
+# its own list - a configured toolchain directory, a sandbox - searches it here
+# without going through PATH, and the policy stays testable without a way to
+# set an environment variable.
+#
+# `search` is PATH-shaped and is NOT modified: entries separated by `;` on
+# windows and `:` elsewhere. an EMPTY entry is skipped rather than treated as
+# the current directory, which is the whole point of this function existing -
+# letting the OS search would put the working directory ahead of the real tool
+# on windows.
+#
+# a name that already spells a path is returned unresolved and unprobed. the
+# result is owned by the caller in BOTH cases, so the free is unconditional.
+# returning the borrowed argument for pathed names would make ownership depend
+# on the value, which is how a caller ends up leaking one path and double
+# freeing the other.
+# ---
+# a:      allocator for the result
+# name:   program name, bare or already pathed
+# search: PATH-shaped list of directories, searched in order
+# ret:    an owned spawnable path, or an error
+pub fun resolve_in(a: *A.Allocator, name: str, search: str) R.Result[str, str] {
+    if (str_empty(name)) { ret R.err[str, str]("empty program name"); }
+    if (path.has_separator(name)) { ret str_copy(a, name); }
+
+    var list_sep: u8 = ':';
+    $if ($mach.build.os == $mach.os.windows) {
+        list_sep = ';';
+    }
+
+    # windows spells an executable with an extension: `git` is not a file,
+    # `git.exe` is. joining the bare name alone would resolve nothing there, so
+    # a bare name is tried against each PATHEXT suffix, in order, within a
+    # directory before moving to the next. a name that already carries an
+    # extension is tried as written, and posix always has exactly one spelling.
+    var cand: [CAND_MAX]str;
+    var ncand: usize = 1;
+    cand[0] = name;
+
+    var exts: str = 0::str;
+    var elen: usize = 0;
+    $if ($mach.build.os == $mach.os.windows) {
+        if (!str_contains_char(name, '.')) {
+            val exts_r: R.Result[str, str] = env.value(a, "PATHEXT");
+            if (R.is_ok[str, str](exts_r)) { exts = R.unwrap_ok[str, str](exts_r); }
+
+            # the set cmd.exe assumes when PATHEXT is unset
+            if (str_empty(exts)) {
+                val d_r: R.Result[str, str] = str_copy(a, ".COM;.EXE;.BAT;.CMD");
+                if (R.is_err[str, str](d_r)) { ret R.err[str, str]("out of memory"); }
+                exts = R.unwrap_ok[str, str](d_r);
+            }
+
+            elen = str_len(exts);
+            ncand = 0;
+            var e: usize = 0;
+            for (e < elen && ncand < CAND_MAX) {
+                val estart: usize = e;
+                for (e < elen && exts[e] != ';') { e = e + 1; }
+                val eseg: usize = e - estart;
+                exts[e] = 0;
+                e = e + 1;
+                if (eseg == 0) { cnt; }
+
+                val j_r: R.Result[str, str] = str_join(a, name, (?exts[estart])::str);
+                if (R.is_err[str, str](j_r)) { cnt; }
+                cand[ncand] = R.unwrap_ok[str, str](j_r);
+                ncand = ncand + 1;
+            }
+        }
+    }
+
+    val slen: usize = str_len(search);
+    var found: str = 0::str;
+    var i: usize = 0;
+    for (i < slen && str_empty(found)) {
+        val start: usize = i;
+        for (i < slen && search[i] != list_sep) { i = i + 1; }
+        val seg_len: usize = i - start;
+        i = i + 1;
+
+        # an empty entry means the current directory on both posix and windows,
+        # which is exactly what must never be searched
+        if (seg_len == 0) { cnt; }
+
+        # `search` belongs to the caller and may be a literal in read-only
+        # memory, so the entry is copied out rather than terminated in place
+        val dir_r: R.Result[str, str] = str_copy_slice(a, search, start, seg_len);
+        if (R.is_err[str, str](dir_r)) { cnt; }
+        val dir: str = R.unwrap_ok[str, str](dir_r);
+
+        var c: usize = 0;
+        for (c < ncand) {
+            val cand_r: R.Result[str, str] = path.join(a, dir, cand[c]);
+            if (R.is_ok[str, str](cand_r)) {
+                val full: str = R.unwrap_ok[str, str](cand_r);
+                if (filesystem.is_file(full)) { found = full; brk; }
+                A.deallocate[u8](a, full, str_len(full) + 1);
+            }
+            c = c + 1;
+        }
+        A.deallocate[u8](a, dir, seg_len + 1);
+    }
+
+    # the candidate spellings are owned only when PATHEXT built them; the
+    # single-spelling case aliases `name`, which belongs to the caller
+    if (!str_empty(exts)) {
+        var k: usize = 0;
+        for (k < ncand) { A.deallocate[u8](a, cand[k], str_len(cand[k]) + 1); k = k + 1; }
+        A.deallocate[u8](a, exts, elen + 1);
+    }
+
+    if (str_empty(found)) { ret R.err[str, str]("not found on PATH"); }
+    ret R.ok[str, str](found);
+}
+
 # the exec contract is platform-neutral, but the test programs are not;
 # the $if blocks confine the differences to program paths, argv shapes,
 # and echo's line ending (cmd appends CRLF where posix echo appends LF).
@@ -282,6 +439,9 @@ $if ($mach.build.os == $mach.os.windows) {
         ret "C:\\Windows\\Temp";
     }
     fun probe_cmd() str { ret "echo x>std_exec_cwd_probe.tmp"; }
+    # a bare name that PATH resolves on any windows install. it carries no
+    # extension, so it also exercises the PATHEXT spelling walk.
+    fun known_program() str { ret "cmd"; }
     # a command whose quoting only survives if the interpreter's own rules are
     # honoured: the CRT convention mangles the embedded quotes
     fun probe_quoted_cmd() str { ret "copy \"std exec seed.txt\" std_exec_quoted_probe.tmp"; }
@@ -359,6 +519,8 @@ $or {
     # a scratch directory that is not the test process's own cwd, so a marker
     # created by the child proves the child actually moved there
     fun scratch_dir() str { ret "/tmp"; }
+    # a bare name that PATH resolves on any posix install
+    fun known_program() str { ret "sh"; }
     fun probe_cmd() str { ret "echo x>std_exec_cwd_probe.tmp"; }
     # a command whose quoting only survives if the interpreter's own rules are
     # honoured: the CRT convention mangles the embedded quotes
@@ -586,3 +748,156 @@ test "std.process.exec.run_shell:quoted_command_survives" {
     filesystem.remove_file((?out_path[0])::str);
     ret bad::i32;
 }
+
+# resolve tests
+#
+# the search list is supplied directly rather than through PATH: there is no
+# way to set an environment variable in-process, and a test that read the real
+# PATH could only assert that some program somewhere resolved, which passes
+# against an implementation that ignores order and against one that searches
+# the current directory.
+
+# a pathed name comes back unchanged AND unprobed. the name deliberately does
+# not exist, so an implementation that stats before returning fails here.
+test "std.process.exec.resolve_in:pathed_name_is_verbatim_and_unprobed" {
+    var buf: [8192]u8;
+    var fst: fixed.FixedState;
+    var a: A.Allocator;
+    fixed.make(?a, ?fst, ?buf[0], 8192);
+
+    var probe: [4160]u8;
+    join_scratch(?probe[0], scratch_dir(), "std_exec_resolve_absent.tmp");
+    val want: str = (?probe[0])::str;
+    if (filesystem.is_file(want)) { ret 1; }
+
+    val r: R.Result[str, str] = resolve_in(?a, want, "");
+    if (R.is_err[str, str](r)) { ret 1; }
+    if (!str_equals(R.unwrap_ok[str, str](r), want)) { ret 1; }
+    ret 0;
+}
+
+# the FIRST matching entry wins. the same leaf exists in both directories, so
+# an implementation that searches in the wrong order, or that returns any hit
+# rather than the earliest, gets the other one and fails. running it in both
+# orders is what makes that mutation detectable - a single order would pass
+# against an implementation that always returned the last hit.
+test "std.process.exec.resolve_in:first_entry_wins" {
+    var buf: [16384]u8;
+    var fst: fixed.FixedState;
+    var a: A.Allocator;
+    fixed.make(?a, ?fst, ?buf[0], 16384);
+
+    val leaf: str = "std_exec_resolve_dup.tmp";
+    var da: [4160]u8;
+    var db: [4160]u8;
+    join_scratch(?da[0], scratch_dir(), "std_exec_resolve_a");
+    join_scratch(?db[0], scratch_dir(), "std_exec_resolve_b");
+    val dir_a: str = (?da[0])::str;
+    val dir_b: str = (?db[0])::str;
+
+    filesystem.create_dir(dir_a, 0o755);
+    filesystem.create_dir(dir_b, 0o755);
+
+    var fa: [4288]u8;
+    var fb: [4288]u8;
+    join_scratch(?fa[0], dir_a, leaf);
+    join_scratch(?fb[0], dir_b, leaf);
+    filesystem.write_bytes((?fa[0])::str, "a", 1, 0o644);
+    filesystem.write_bytes((?fb[0])::str, "b", 1, 0o644);
+
+    var bad: u8 = 0;
+
+    val ab_r: R.Result[str, str] = resolve_in(?a, leaf, list_of(?a, dir_a, dir_b));
+    if (R.is_err[str, str](ab_r)) { bad = 1; }
+    or (!str_equals(R.unwrap_ok[str, str](ab_r), (?fa[0])::str)) { bad = 1; }
+
+    val ba_r: R.Result[str, str] = resolve_in(?a, leaf, list_of(?a, dir_b, dir_a));
+    if (R.is_err[str, str](ba_r)) { bad = 1; }
+    or (!str_equals(R.unwrap_ok[str, str](ba_r), (?fb[0])::str)) { bad = 1; }
+
+    filesystem.remove_file((?fa[0])::str);
+    filesystem.remove_file((?fb[0])::str);
+    filesystem.remove_dir(dir_a);
+    filesystem.remove_dir(dir_b);
+    ret bad::i32;
+}
+
+# a program sitting in the CURRENT directory must not resolve. this is the
+# whole reason the lookup is written rather than delegated to the OS: on
+# windows CreateProcess with a NULL lpApplicationName searches the working
+# directory ahead of System32, so a binary committed into a repository would
+# be spawned in preference to the real tool.
+#
+# the empty entries are the shape that expresses "current directory" in a PATH
+# on both posix and windows, so this also pins that they are skipped.
+test "std.process.exec.resolve_in:current_directory_is_never_searched" {
+    var buf: [8192]u8;
+    var fst: fixed.FixedState;
+    var a: A.Allocator;
+    fixed.make(?a, ?fst, ?buf[0], 8192);
+
+    val leaf: str = "std_exec_resolve_cwd.tmp";
+    filesystem.write_bytes(leaf, "x", 1, 0o644);
+
+    var bad: u8 = 0;
+    # a bare empty list, a leading empty entry, an interior one, a trailing one
+    if (R.is_ok[str, str](resolve_in(?a, leaf, "")))    { bad = 1; }
+    if (R.is_ok[str, str](resolve_in(?a, leaf, sep1(?a)))) { bad = 1; }
+    if (R.is_ok[str, str](resolve_in(?a, leaf, sep2(?a)))) { bad = 1; }
+
+    filesystem.remove_file(leaf);
+    ret bad::i32;
+}
+
+# a name that is nowhere on the list is an error, not a silent pass-through of
+# the bare name. returning the name unresolved would hand execve something it
+# cannot run and turn a clear lookup failure into a spawn failure.
+test "std.process.exec.resolve_in:missing_name_errs" {
+    var buf: [8192]u8;
+    var fst: fixed.FixedState;
+    var a: A.Allocator;
+    fixed.make(?a, ?fst, ?buf[0], 8192);
+
+    val r: R.Result[str, str] = resolve_in(?a, "std_exec_no_such_program", scratch_dir());
+    if (R.is_ok[str, str](r)) { ret 1; }
+    ret 0;
+}
+
+test "std.process.exec.resolve_in:empty_name_errs" {
+    var buf: [8192]u8;
+    var fst: fixed.FixedState;
+    var a: A.Allocator;
+    fixed.make(?a, ?fst, ?buf[0], 8192);
+
+    if (R.is_ok[str, str](resolve_in(?a, "", scratch_dir()))) { ret 1; }
+    ret 0;
+}
+
+# `resolve` reads PATH and finds a real program. this is the only test that
+# touches the environment, and it is deliberately weak: it asserts the wrapper
+# reaches the search, and the search itself is pinned by the tests above.
+test "std.process.exec.resolve:finds_a_real_program_on_path" {
+    var buf: [8192]u8;
+    var fst: fixed.FixedState;
+    var a: A.Allocator;
+    fixed.make(?a, ?fst, ?buf[0], 8192);
+
+    val r: R.Result[str, str] = resolve(?a, known_program());
+    if (R.is_err[str, str](r)) { ret 1; }
+    if (!filesystem.is_file(R.unwrap_ok[str, str](r))) { ret 1; }
+    ret 0;
+}
+
+# build a two-entry search list using the platform separator
+fun list_of(a: *A.Allocator, first: str, second: str) str {
+    var sep: str = ":";
+    $if ($mach.build.os == $mach.os.windows) { sep = ";"; }
+    val r: R.Result[str, str] = str_join(a, first, sep, second);
+    if (R.is_err[str, str](r)) { ret ""; }
+    ret R.unwrap_ok[str, str](r);
+}
+
+# a list that is a single empty entry, and one with a leading and a trailing
+# empty entry around a directory that does not hold the leaf
+fun sep1(a: *A.Allocator) str { ret list_of(a, "", ""); }
+fun sep2(a: *A.Allocator) str { ret list_of(a, "", scratch_dir()); }
