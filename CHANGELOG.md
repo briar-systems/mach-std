@@ -54,6 +54,12 @@ Termination is structural and needs no depth counter: a descent instantiates at 
 
 The issue named a second candidate, the `SYMBOLIC_LINK_FLAG_DIRECTORY` flag going unset because the directory probe could not resolve a forward-slashed relative target. It is not live, and that is measured rather than argued: the rewrite reaches `CreateSymbolicLinkA` only, leaving the probe seeing the same `/`-separated target it always did, and the windows leg goes from failing to passing across exactly that change.
 
+#### derive: the reference refusal blamed a compiler gap that has since closed
+
+Three places said the walk stops at a reference because "mach has no `$pointee_of`". briar-systems/mach#2693 landed it, and mach 4.15.0 carries it. Checked against the release binary, `$pointee_of(f.type)` resolves inside a `$fields` walk. The refusal is unchanged and still correct, but the reason is now a semantic one and is stated as such: address semantics versus deep semantics is the caller's choice, and a deep walk allocates, so it needs an allocator argument and a failure mode these signatures do not have. Same for the note on the owning clone, which waits on a signature rather than on a capability.
+
+Behaviour, refusal wording that `test/derive/verify.sh` pins, and the minimum toolchain are all unchanged.
+
 ### Tests
 
 - `test/symlink` links a directory through a relative, `/`-separated target and reads a file **through** the link, and asserts `fs.is_dir` on the link. Creation succeeding is not the property: `fs.symlink` reported success on the bug, which is what made this look fine.
