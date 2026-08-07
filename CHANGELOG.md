@@ -9,18 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.23.0] - 2026-08-07
 
-Adds the shell-execution and working-directory half of the process surface, so a consumer never hand-assembles a shell invocation again.
+Adds the shell-execution and working-directory half of the process surface, so a consumer never hand-assembles a shell invocation again, and fixes the darwin x86_64 entry under `--pie`.
 
 ### Added
 - process: `std.process.exec.run_shell(command, cwd, envp)` — run a command through the host interpreter in a caller-supplied directory. **A command line's encoding is a property of the program being spawned**, so an argv-taking API has to pick a convention, and the CRT convention that `build_cmdline` picks is not the one `cmd.exe` implements: an embedded `"` becomes `\"` and cmd takes those bytes literally. Any caller assembling its own shell invocation therefore corrupts commands carrying quotes, which is how anyone writes a path containing a space. posix hands `sh -c <command>` straight to `execve`, so argv passes through with no encoding step to get wrong. windows resolves the interpreter from `%ComSpec%` and emits `"<comspec>" /s /c "<command verbatim>"`, where `/s` makes cmd strip exactly the first and last quote and keep everything between, so the caller escapes nothing (#424, PR #423).
 - system: `os.spawn_in`, `os.spawn_redirected_in`, and `os.spawn_shell` on all three backends — spawn with an explicit child working directory. The chdir happens **in the child**, so the parent's cwd is untouched and the directory never enters the command line, which is what let a `cd <dir> &&` prefix corrupt it before. linux relies on `SPAWN_CLONE_FLAGS` omitting `CLONE_FS` so the child holds its own filesystem context; darwin forks, which copies it; windows passes `lpCurrentDirectory` (#422, PR #423).
 
+### Fixed
+- runtime: `std.runtime.darwin.x86_64` — the entry now selects its argument-block contract at compile time on `$mach.build.pie`, because **darwin x86_64 has two entry contracts and the image's load command picks which one is used**. A `--pie` image is emitted with `LC_MAIN`, which dyld CALLs like a C `main` (argc/argv/envp in `rdi`/`rsi`/`rdx`, `[rsp]` holding dyld's return address); a non-PIE image is still entered by the kernel with `LC_UNIXTHREAD` and the block on the stack. The entry only ever implemented the stack form, so under `--pie` it captured dyld's return address as `argc`, pointed `argv` one slot past it, and corrupted every `std.process.env` read. The selector is the same request bit the Mach-O writer gates `LC_MAIN` on, so the entry command in the image and the code at the entry cannot disagree. `aarch64` is untouched — arm64 darwin is always PIE and was already on the register convention (mach#2576, PR #421).
+- README pointed at a `docs` directory that does not exist; the documentation lives in `doc` (external contribution, PR #413).
+
 ### Changed
 - system: `std.system.os.darwin.shared.FCNTL_GETPATH` is now **`F_GETPATH`**, matching the name every other library uses for fcntl 50. A **breaking rename** for anything referencing the constant directly; `os.getcwd` is unaffected (external contribution, PR #413).
 - The interpreter for `run_shell` is resolved explicitly and must stay that way. Passing the program through `lpCommandLine` with a NULL `lpApplicationName` would let `CreateProcess` search **the current directory before System32**, so a `cmd.exe` committed into a repository would win over the real one — binary planting via a hostile checkout, on tools whose job is building untrusted source. It would also make windows the only backend that searches at all, since `execve` resolves nothing. Callers needing a PATH lookup for a user-named program should do it explicitly and PATH-only (#425).
-
-### Fixed
-- README pointed at a `docs` directory that does not exist; the documentation lives in `doc` (external contribution, PR #413).
 
 ### CI
 - The backend matrix now **cross-compiles the windows and darwin backends**, which were previously never built by CI — only linux was, so a target-gated module could break without any job going red. `test/backends/verify.sh` asserts the gated modules were genuinely compiled rather than silently skipped, so the job cannot pass vacuously (#426, PR #427).
@@ -30,6 +31,8 @@ Adds the shell-execution and working-directory half of the process surface, so a
 - CI green on build, cross-arm64, cross-riscv64, and the new cross-backends job.
 - `run_shell` was **run**, not merely compiled, on windows: the child started in the requested directory, a quoted command round-tripped intact, and the parent's cwd was byte-identical after. Sabotaging the cwd path to pass `nil` fails the cwd test, and routing the identical quoted command through the CRT-convention encoder instead of `run_shell` fails where `run_shell` passes — a direct A/B on the defect.
 - **Caveat:** that windows run was under **Wine 11.14, not real Windows**. A genuine-runner fixture is tracked on the mach side (mach#2587).
+- The darwin entry fix was re-verified independently of its PR by building the backend smoke test both ways and reading the emitted image: `--pie` yields `cmd LC_MAIN` with a prologue that stores `rdi`/`rsi`/`rdx` RIP-relative, and no flags yields `cmd LC_UNIXTHREAD`. This release is the first in which CI compiled the darwin backends at all, via the new cross-backends job.
+- **Caveat:** the non-PIE darwin x86_64 image is malformed in ways unrelated to this release — short `__PAGEZERO`, base one page low, and no section commands (mach#2599). The `--pie` path, which is what arm64 darwin and every `--pie` x86_64 build use, is unaffected.
 
 ## [0.22.0] - 2026-08-05
 
