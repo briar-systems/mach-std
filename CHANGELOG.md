@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-08-07
+
+Settles the OS-layer filesystem contracts that differed silently between backends. Every fix here is a case where the public docstring described one behaviour and at least one backend did another, and no caller in tree happened to notice.
+
+### Fixed
+- system: **`os.rename` on windows now replaces an existing destination.** It wrapped `MoveFileA`, which fails with `ERROR_ALREADY_EXISTS` whenever the destination exists, contradicting `fs.rename`'s own docstring and diverging from linux and darwin, which both call POSIX `rename(2)`. That broke the write-a-temp-then-rename-into-place pattern in exactly the case it is used in, and mach#2475 hit it across every writer that rebuilds an existing output. Now `MoveFileExA` with `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`. `MOVEFILE_COPY_ALLOWED` is deliberately not set, because POSIX `rename` fails across devices rather than silently copying and so should this. One divergence remains and is now documented rather than implied: `REPLACE_EXISTING` does not apply to a directory destination, so renaming a directory onto an existing empty directory still fails on windows where POSIX succeeds (#414).
+- system: **`os.getcwd` on darwin no longer overruns a caller buffer.** It called `fcntl(F_GETPATH, buf)` and never looked at `size`. XNU receives no capacity for `F_GETPATH` and writes up to `MAXPATHLEN` bytes into the destination regardless, so any caller supplying a smaller buffer could be overrun even though the signature documents `size` as the capacity. The path is now read into a `MAXPATHLEN` scratch and copied out only when it fits, with a path too long for the destination reported as `ERANGE` the way linux reports it. `std.process.env.current_dir` supplies 4096 bytes, so nothing in tree was reaching it (#409).
+- system: **`os.getcwd`'s return value meant two different things.** Linux passed the raw syscall's length through, which includes the terminator, while darwin and windows reported the string length. The docstring said "length of path" on all three. Linux now reports the path length, matching the other two and the wording. `current_dir` only tested `n <= 0 || n >= cap`, which is why an off-by-one in a documented length went unnoticed (#432).
+- system: **`os.getcwd` on windows reported success for a call that wrote nothing.** `GetCurrentDirectoryA` overloads its return with the size *required* when the destination is too small, writing nothing, and the wrapper passed that through as a non-negative result. A caller that did not separately compare the result against its own capacity would read an untouched buffer and believe it held a path. It is now `ERANGE`, matching linux and darwin (#433).
+
+### Changed
+- `ERANGE` is now defined in the darwin and windows errno blocks, alongside linux's.
+- `fs.rename`'s docstring states that an existing destination file is replaced, and that replacing an existing *directory* is not portable.
+
+### Tests
+- The `getcwd` capacity and length assertions are carried by **all three backends** rather than only the one they were written against. The os layer is target-gated, so each backend's tests run on its own CI leg; stating the same rule three times is what stops the three implementations diverging again, which is how every defect in this release arose.
+- `fs.rename:replaces_existing_destination` asserts the destination carries the **source's** bytes rather than merely existing, so it cannot pass against a rename that quietly did nothing.
+
 ## [0.23.0] - 2026-08-07
 
 Adds the shell-execution and working-directory half of the process surface, so a consumer never hand-assembles a shell invocation again, and fixes the darwin x86_64 entry under `--pie`.
