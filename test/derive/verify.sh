@@ -175,17 +175,20 @@ rec Y1 { y: Y2; }
 ' "$ref_msg"
 
 # a `^`-wrapped RECORD field is the one shape the classification cannot catch:
-# $is_record strips `^` and answers true, then $fields refuses the same operand
-# (briar-systems/mach#2692). it still fails the build, so no secret is walked,
-# but the message is mach's rather than ours. pinned so that a mach fix which
-# turns this into a walk -- and therefore into a printed secret -- is caught here
-# instead of in a program's output.
-refuses "a ^ secret record field fails the build, with mach's own message" '
+# a `^`-wrapped record reaches our own fallthrough now. mach#2692 made the shape
+# predicates answer about the outermost constructor, so `$is_record(^SInner)` is
+# false and the field falls to the leaf arm rather than being classified as a
+# record and then dying on `$fields`. this case previously pinned mach's raw
+# message so exactly that change would be caught here, and it was.
+#
+# it stays pinned on OUR message: a future mach change that made a secret record
+# classify as a record again would walk it, and a walk is a printed secret.
+refuses "a ^ secret record field is refused by our own leaf arm" '
 rec SInner { x: i64; }
 rec HasSR { n: i64; s: ^SInner; }
 ' '
     var a: HasSR;
     slot = slot + (derive.hash[HasSR](?a))::i64;
-' "\$fields requires a record type"
+' "$leaf_msg"
 
 echo "OK: every std.derive refusal is pinned"
