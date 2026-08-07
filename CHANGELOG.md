@@ -57,7 +57,7 @@ The issue named a second candidate, the `SYMBOLIC_LINK_FLAG_DIRECTORY` flag goin
 ### Tests
 
 - `test/symlink` links a directory through a relative, `/`-separated target and reads a file **through** the link, and asserts `fs.is_dir` on the link. Creation succeeding is not the property: `fs.symlink` reported success on the bug, which is what made this look fine.
-- A `windows-symlink` CI leg runs that probe on `windows-latest`. It is the first job in the family to create a symlink on a windows host — every existing windows job is a cross-build hosted on linux, which is why this went unseen. Wine cannot stand in either: its filesystem is unix-backed, so it creates a genuine unix symlink and reports a false pass on precisely this bug.
+- A `windows-symlink` CI leg runs that probe on `windows-latest`. It is the first job in the family to create a symlink on a windows host, and every existing windows job is a cross-build hosted on linux, which is why this went unseen. Wine cannot stand in either: its filesystem is unix-backed, so it creates a genuine unix symlink and reports a false pass on precisely this bug.
 - Six-level `eq` / `hash` / `clone` / `fmt` cases, each perturbing one leaf at a time at every depth, so a walk that stops short reports two different values equal.
 - `test/derive/verify.sh` loses its depth-cap case, because the cap it pinned no longer exists, and its positive control now nests six deep rather than four. The other nine refusals are unchanged and still pass.
 
