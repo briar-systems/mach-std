@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- derive: **the walk descends into nested records** (#412). `eq`, `hash` and `fmt` used to refuse any field that was not a scalar numeric, so a record holding a `Vec3` could not be derived at all. They now walk a record-typed field's own fields, four levels deep, and `clone[T]` joins them. Requires mach 4.12.0, which first shipped `$fields(f.type)`, `$is_record` / `$is_union` / `$is_pointer`, and `$type_name`; the module checks `$mach.version` and says so, since `mach.lock` records dependency commits and cannot pin a toolchain.
+- derive: **`check[T]` is the classification contract, written once and `pub`** (#412). Every derive calls it before its own ladder, so all four share one set of refusals and one set of messages, and a hand-written derive can hold itself to the same rule. Adding a derivable trait is now a ladder plus a leaf action, not a fresh set of refusals to get right.
+- derive: **`clone[T](dst, src)`** (#412), a memberwise structural copy. The value of it over `dst = src` is the refusal rather than the copy: a field that a shallow copy would only alias does not classify, so `clone[T]` compiling is the proof that a structural copy is a whole copy.
+
+### Changed
+- derive: **`fmt` now prints the record's type name**, so `{x=1, y=2}` becomes `DV2{x=1, y=2}` and a nested field renders as `pos=Vec3{x=1, y=2, z=3}`. The spelling comes from `$type_name`, which is sema's own diagnostic authority, so a printed name and an error's name cannot drift.
+
+### Known limits
+- **Nesting is capped at four levels**, and the cap is not a design choice. mach cannot re-enter a generic at a field's type — `eq[f.type]` does not parse, there is no inference from the argument, and `$type_of` is not a type operand — so the descent is a hand-written ladder rather than recursion. briar-systems/mach#2691 asks for the fix, after which every ladder collapses to one self-recursive function and the cap disappears. A deeper record is a comptime `$error` naming the cap.
+- **Nothing here is secrecy-aware, and nothing can be**: the shape predicates strip `^` before answering, so no comptime surface can tell a walk that a field is secret (briar-systems/mach#2694). What keeps that from being silent is the scalar gate — type comparison does *not* strip `^`, so a `^u64` field fails `f.type == u64` and is refused at comptime rather than printed. A `^`-wrapped *record* field is the one shape the classification cannot catch: `$is_record` strips `^` and answers true, then `$fields` refuses the same operand (briar-systems/mach#2692). It still fails the build, so no secret is walked, but with mach's message rather than ours.
+- **References are detected, never followed.** `$is_pointer` sees a reference but there is no `$pointee_of` (briar-systems/mach#2693), and address semantics versus deep semantics is the caller's choice, so a reference field is refused. `str` is `def str: *char`, so a `str` field is refused with the rest. An owning clone waits on the same capability.
+
+### Tests
+- `test/derive/verify.sh` — every refusal is a `$error` that fires during instantiation, so the evidence is a build that fails with a written message, which the in-process suite cannot express: a test binary that does not compile cannot run. Ten cases, one per shape and one per derive entry point, plus a positive control so the harness cannot pass on a project that never compiles. Wired into CI.
+- The nesting tests perturb one field at a time at each of the four depths and assert the derive notices. That is the case that separates a real descent from a walk that stops at the first record and reports two different values equal, and each was confirmed to fail against a ladder with that level removed.
+
 ## [0.24.2] - 2026-08-07
 
 Corrects a regression in 0.24.1 that broke directory listing on aarch64.
