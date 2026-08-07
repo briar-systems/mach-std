@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.2] - 2026-08-07
+
+Corrects a regression in 0.24.1 that broke directory listing on aarch64.
+
+### Fixed
+- system: **arm swaps `O_DIRECTORY` and `O_DIRECT` relative to asm-generic, so aarch64 keeps `0o40000`** (#441). 0.24.1 unified the flag to `0o200000` on every linux arch on the strength of `asm-generic/fcntl.h`. That header defines both under `#ifndef` precisely so an arch can override, and arm does: `O_DIRECTORY` `0o40000` and `O_DIRECT` `0o200000`, the reverse of everyone else, inherited by aarch64. So the original arch gate was right about aarch64 and wrong only about riscv64. Both values are now stated with the reason, and the comment warns against unifying them again.
+
+  Getting this backwards is not a compile error and not a wrong result: the open is refused `EINVAL`, so directory listing simply stops working on the arch that was guessed wrong. Both directions have now been observed on real hardware.
+
+### Changed
+- #439 is closed as a non-defect. `fs.read_dir` works on aarch64 with the correct constant, so the aarch64 gate 0.24.1 put on `read_dir:lists_children` is removed and the test runs on every arch again.
+
+### Note
+The native aarch64 CI leg added in 0.24.1 is what caught this, one release after it was introduced rather than silently. qemu-aarch64 had also been reporting it correctly all along; it was discounted because qemu-riscv64 disagreed, and both were right about their own arch.
+
+
 ## [0.24.1] - 2026-08-07
 
 A wrong flag constant that made directory listing impossible on two of three linux arches, and the CI change that found it.
