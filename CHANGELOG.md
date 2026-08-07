@@ -48,8 +48,16 @@ Termination is structural and needs no depth counter: a descent instantiates at 
 
 #450 corrected the four leaf `$error` messages for briar-systems/mach#2692 but not the prose above them, so the header still said the shape predicates strip `^`, still drew a contrast between type comparison and the predicates that no longer exists, and still described a `^`-wrapped record as "the one shape that escapes the classification" failing with a raw intrinsic error — which #450 had just made false. The header now states the rule once: **nothing strips `^`**, so `^u64` fails `f.type == u64` and `^Rec` fails `$is_record`, and both are refused by our own fallback.
 
+#### os(windows): a symlink with a relative target was not traversable as a directory (#454)
+
+`CreateSymbolicLink` stores the target verbatim as the reparse point's substitute name, and a **relative** substitute name is resolved by the kernel, which treats only `\` as a separator. Win32 path normalization, the layer that does accept `/`, never runs over reparse data. A `/`-separated relative target was therefore stored as one unresolvable component: creation reported success and every later read through the link failed, which is why `mach dep pull` looked fine and the next `mach build` did not. Paths are `/`-separated by contract above this layer, so `symlink` now rewrites the target to `\` at the syscall boundary. An over-long target is `ERANGE`, matching what this layer already does for a path too long.
+
+The issue named a second candidate, the `SYMBOLIC_LINK_FLAG_DIRECTORY` flag going unset because the directory probe could not resolve a forward-slashed relative target. It is not live, and that is measured rather than argued: the rewrite reaches `CreateSymbolicLinkA` only, leaving the probe seeing the same `/`-separated target it always did, and the windows leg goes from failing to passing across exactly that change.
+
 ### Tests
 
+- `test/symlink` links a directory through a relative, `/`-separated target and reads a file **through** the link, and asserts `fs.is_dir` on the link. Creation succeeding is not the property: `fs.symlink` reported success on the bug, which is what made this look fine.
+- A `windows-symlink` CI leg runs that probe on `windows-latest`. It is the first job in the family to create a symlink on a windows host — every existing windows job is a cross-build hosted on linux, which is why this went unseen. Wine cannot stand in either: its filesystem is unix-backed, so it creates a genuine unix symlink and reports a false pass on precisely this bug.
 - Six-level `eq` / `hash` / `clone` / `fmt` cases, each perturbing one leaf at a time at every depth, so a walk that stops short reports two different values equal.
 - `test/derive/verify.sh` loses its depth-cap case, because the cap it pinned no longer exists, and its positive control now nests six deep rather than four. The other nine refusals are unchanged and still pass.
 
