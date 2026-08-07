@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.1] - 2026-08-07
+
+A wrong flag constant that made directory listing impossible on two of three linux arches, and the CI change that found it.
+
+### Fixed
+- system: **`O_DIRECTORY` is `0o200000` on every linux arch mach targets, not `0x4000`.** It was arch-gated, with aarch64 and riscv64 given `0x4000`, which is `O_DIRECT`'s value. Opening a directory with `O_DIRECT` is refused `EINVAL`, so `fs.read_dir` could not list anything on either. x86_64, aarch64 and riscv64 all take this flag from `asm-generic/fcntl.h`, so the gate was both wrong and unnecessary. Found when a riscv64 self-host build first enumerated a source tree for briar-systems/mach#2539 and reported `error: invalid argument` (#436).
+
+### Changed
+- ci: **the aarch64 leg runs natively on `ubuntu-24.04-arm` instead of under qemu-user** (#438). qemu-user does not faithfully model the kernel ABI here: its aarch64 target accepts `0x4000` as `O_DIRECTORY` and refuses `0o200000`, while its riscv64 target does the opposite and agrees with the kernel header. The two disagree with each other, so a qemu leg cannot be what decides whether the syscall surface is correct. mach's own int harness keeps its aarch64 leg native for the same class of reason (briar-systems/mach#1885).
+
+### Tests
+- `std.filesystem.read_dir:lists_children` — there was **no `read_dir` test at all**, which is the actual reason a broken directory listing on two of three linux arches survived. It asserts the children are listed and that `.` and `..` are not reported as children, so it checks the listing rather than that the call returned.
+
+### Known broken
+- **`fs.read_dir` does not work on aarch64** (#439). With the corrected flag the directory open is still refused `EINVAL` on real hardware, so the platform is broken independently of the constant. The new test carries an explicit aarch64 gate naming that issue; removing the gate is how the fix is verified. `os.read_dir`'s getdents64 handling is unverified on aarch64, since the open never succeeds and the loop has never executed there.
+
+
 ## [0.24.0] - 2026-08-07
 
 Settles the OS-layer filesystem contracts that differed silently between backends. Every fix here is a case where the public docstring described one behaviour and at least one backend did another, and no caller in tree happened to notice.
