@@ -81,7 +81,7 @@ accepts() {
 union_msg="a union field cannot be walked"
 ref_msg="a reference field is detected but not followed"
 leaf_msg="field type is neither a scalar numeric nor a nested record"
-depth_msg="record nesting is deeper than the walk descends"
+depth_msg="record nesting is deeper than the four levels std.derive descends"
 
 accepts "a four-level record is accepted by every derive" '
 rec P4 { a: i64; b: f64; }
