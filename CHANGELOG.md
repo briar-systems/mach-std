@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+**Requires mach 4.14.0 or newer, and 4.13.0 will NOT build this.** `eq[f.type]` — the walk re-entering itself at a field's type — is a spelling mach did not accept before briar-systems/mach#2691, which landed on mach `dev` after 4.13.0 was tagged. On an older toolchain this is a **parse** error ("expected a module alias before `.`") reported against `src/derive.mach`, and because parsing precedes comptime evaluation the module's own `$mach.version` gate cannot fire ahead of it. That is the missing capability in briar-systems/mach#2714 — a manifest is read before any source is, so a minimum-toolchain key there would diagnose this cleanly. Until then the gate states the requirement where `mach doc` finds it, and this note is what makes an old toolchain diagnosable.
+
+### Changed
+
+#### derive: the depth cap is gone, and the walk is recursion rather than a ladder (#449)
+
+`std.derive` shipped as bounded structural descent four levels deep, with a comptime `$error` past the bound. That bound was never a design choice — mach could not re-enter a generic at a field's type, so the descent had to be a hand-written ladder, one nested `$each` per level per derive.
+
+briar-systems/mach#2691 makes the recursive form spellable, and each of the five walks collapses to its own outermost level with the descent arm calling itself:
+
+```mach
+pub fun eq[T](a: *T, b: *T) bool {
+    check[T]();
+    $each f in $fields(T) {
+        $if ($is_record(f.type)) {
+            if (!eq[f.type](?a.[f], ?b.[f])) { ret false; }
+        }
+        $or (SCALARS) { if (a.[f] != b.[f]) { ret false; } }
+        $or { }
+    }
+    ret true;
+}
+```
+
+**This was a deletion, not a rewrite**, which is how the ladder was shaped: every level was the same arms over the same projection, so levels 2 through 4 came out of five functions and nothing else moved. `check[T]` recurses alongside the walk it guards.
+
+**Behaviour is unchanged, and that is the evidence rather than the claim.** All 784 existing tests pass with **no edits**, including `fmt: four levels of nesting render every leaf` byte for byte. Four tests were added for six-level nesting, which was a comptime error before.
+
+Two details preserve behaviour exactly:
+
+- **`hash` threads its accumulator through the descent** (`fold_fields[T](h, v)`) rather than hashing each nested record on its own and combining. A nested field therefore contributes exactly the bytes a flattened one would, and the digest is identical to what the bounded walk produced. Hashing nested records separately would also have satisfied the eq/hash contract while silently changing every digest.
+- **`fmt` splits the nested label from the nested value.** `write_label` writes `[, ]name=` and the recursive `fmt` call supplies `Type{...}`, which composes to the same `name=Type{...}` the per-level bracketing produced.
+
+Termination is structural and needs no depth counter: a descent instantiates at a field's type, a record's fields are finite, and a record cannot contain itself by value. Note this does **not** extend to following references — `rec Grow[T] { p: *Grow[*T]; }` is legal and has unboundedly many instances reachable through its pointer, so a reference-following derive (briar-systems/mach#2693) needs a termination story this one gets for free.
+
+### Fixed
+
+#### derive: the module header described pre-4.13.0 behaviour (#449)
+
+#450 corrected the four leaf `$error` messages for briar-systems/mach#2692 but not the prose above them, so the header still said the shape predicates strip `^`, still drew a contrast between type comparison and the predicates that no longer exists, and still described a `^`-wrapped record as "the one shape that escapes the classification" failing with a raw intrinsic error — which #450 had just made false. The header now states the rule once: **nothing strips `^`**, so `^u64` fails `f.type == u64` and `^Rec` fails `$is_record`, and both are refused by our own fallback.
+
+### Tests
+
+- Six-level `eq` / `hash` / `clone` / `fmt` cases, each perturbing one leaf at a time at every depth, so a walk that stops short reports two different values equal.
+- `test/derive/verify.sh` loses its depth-cap case, because the cap it pinned no longer exists, and its positive control now nests six deep rather than four. The other nine refusals are unchanged and still pass.
+
 ## [0.25.0] - 2026-08-07
 
 **Requires mach 4.13.0 or newer.** `std.derive`'s recursive tier uses reflection primitives first shipped in 4.12.0, and its `^` handling tracks the shape-predicate change in 4.13.0 (briar-systems/mach#2692). The module checks `$mach.version` and says so, since `mach.lock` records dependency commits and cannot pin a toolchain.
