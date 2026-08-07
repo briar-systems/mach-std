@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-08-07
+
+Adds the shell-execution and working-directory half of the process surface, so a consumer never hand-assembles a shell invocation again.
+
+### Added
+- process: `std.process.exec.run_shell(command, cwd, envp)` — run a command through the host interpreter in a caller-supplied directory. **A command line's encoding is a property of the program being spawned**, so an argv-taking API has to pick a convention, and the CRT convention that `build_cmdline` picks is not the one `cmd.exe` implements: an embedded `"` becomes `\"` and cmd takes those bytes literally. Any caller assembling its own shell invocation therefore corrupts commands carrying quotes, which is how anyone writes a path containing a space. posix hands `sh -c <command>` straight to `execve`, so argv passes through with no encoding step to get wrong. windows resolves the interpreter from `%ComSpec%` and emits `"<comspec>" /s /c "<command verbatim>"`, where `/s` makes cmd strip exactly the first and last quote and keep everything between, so the caller escapes nothing (#424, PR #423).
+- system: `os.spawn_in`, `os.spawn_redirected_in`, and `os.spawn_shell` on all three backends — spawn with an explicit child working directory. The chdir happens **in the child**, so the parent's cwd is untouched and the directory never enters the command line, which is what let a `cd <dir> &&` prefix corrupt it before. linux relies on `SPAWN_CLONE_FLAGS` omitting `CLONE_FS` so the child holds its own filesystem context; darwin forks, which copies it; windows passes `lpCurrentDirectory` (#422, PR #423).
+
+### Changed
+- system: `std.system.os.darwin.shared.FCNTL_GETPATH` is now **`F_GETPATH`**, matching the name every other library uses for fcntl 50. A **breaking rename** for anything referencing the constant directly; `os.getcwd` is unaffected (external contribution, PR #413).
+- The interpreter for `run_shell` is resolved explicitly and must stay that way. Passing the program through `lpCommandLine` with a NULL `lpApplicationName` would let `CreateProcess` search **the current directory before System32**, so a `cmd.exe` committed into a repository would win over the real one — binary planting via a hostile checkout, on tools whose job is building untrusted source. It would also make windows the only backend that searches at all, since `execve` resolves nothing. Callers needing a PATH lookup for a user-named program should do it explicitly and PATH-only (#425).
+
+### Fixed
+- README pointed at a `docs` directory that does not exist; the documentation lives in `doc` (external contribution, PR #413).
+
+### CI
+- The backend matrix now **cross-compiles the windows and darwin backends**, which were previously never built by CI — only linux was, so a target-gated module could break without any job going red. `test/backends/verify.sh` asserts the gated modules were genuinely compiled rather than silently skipped, so the job cannot pass vacuously (#426, PR #427).
+
+### Verification
+- 761/761 linux-x86_64 tests.
+- CI green on build, cross-arm64, cross-riscv64, and the new cross-backends job.
+- `run_shell` was **run**, not merely compiled, on windows: the child started in the requested directory, a quoted command round-tripped intact, and the parent's cwd was byte-identical after. Sabotaging the cwd path to pass `nil` fails the cwd test, and routing the identical quoted command through the CRT-convention encoder instead of `run_shell` fails where `run_shell` passes — a direct A/B on the defect.
+- **Caveat:** that windows run was under **Wine 11.14, not real Windows**. A genuine-runner fixture is tracked on the mach side (mach#2587).
+
+## [0.22.0] - 2026-08-05
+
 ### Added
 - compress: `std.compress.inflate` — DEFLATE decompression (RFC 1951) covering stored, fixed-huffman, and dynamic-huffman blocks. The decoder is a **resumable state machine** rather than a one-pass loop: every point at which it can run out of input or output is a state, so a huffman symbol, a match, or a code-length table may straddle a chunk boundary and resume on the next call. That is what lets a caller feed PNG IDAT chunks one at a time without concatenating them first. Back-references always resolve through a 32 KiB circular window rather than through the caller's output buffer, so output can be drained in pieces of any size; the window is the only allocation and comes from the caller's allocator. `decompress` drives the stream and reports `NEED_INPUT` / `OUTPUT_FULL` / `DONE` with bytes consumed and written; `finish` distinguishes a stream that ended from one that was cut short. `decompress_into` and `decompress_alloc` are one-shot conveniences over the same core (#416).
 - compress: `std.compress.zlib` — RFC 1950 framing over the inflate core, validating the header and verifying the adler32 trailer. Preset dictionaries (`FDICT`) are rejected rather than silently ignored (#416).
