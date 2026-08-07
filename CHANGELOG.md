@@ -5,6 +5,70 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.1] - 2026-08-07
+
+**Requires mach 4.14.0 or newer, and 4.13.0 will NOT build this.** `eq[f.type]` — the walk re-entering itself at a field's type — is a spelling mach did not accept before briar-systems/mach#2691, which landed on mach `dev` after 4.13.0 was tagged. On an older toolchain this is a **parse** error ("expected a module alias before `.`") reported against `src/derive.mach`, and because parsing precedes comptime evaluation the module's own `$mach.version` gate cannot fire ahead of it. That capability now exists: briar-systems/mach#2714 landed and shipped in mach 4.15.0, so `[project].mach` takes a semver minimum and is checked when the manifest is read, before any source is parsed.
+
+**It is not adopted here yet, and the reason is the bootstrap.** The key is only understood by 4.15.0 and newer, so declaring it would move this library's floor to 4.15.0 in order to diagnose a 4.14.0 requirement, which trades a clear error on one old toolchain for a hard failure on a newer one. It becomes the right move once the floor rises to 4.15.0 for an unrelated reason. Until then the `$mach.version` gate states the requirement where `mach doc` finds it, and this note is what makes an old toolchain diagnosable.
+
+### Changed
+
+#### derive: the depth cap is gone, and the walk is recursion rather than a ladder (#449)
+
+`std.derive` shipped as bounded structural descent four levels deep, with a comptime `$error` past the bound. That bound was never a design choice — mach could not re-enter a generic at a field's type, so the descent had to be a hand-written ladder, one nested `$each` per level per derive.
+
+briar-systems/mach#2691 makes the recursive form spellable, and each of the five walks collapses to its own outermost level with the descent arm calling itself:
+
+```mach
+pub fun eq[T](a: *T, b: *T) bool {
+    check[T]();
+    $each f in $fields(T) {
+        $if ($is_record(f.type)) {
+            if (!eq[f.type](?a.[f], ?b.[f])) { ret false; }
+        }
+        $or (SCALARS) { if (a.[f] != b.[f]) { ret false; } }
+        $or { }
+    }
+    ret true;
+}
+```
+
+**This was a deletion, not a rewrite**, which is how the ladder was shaped: every level was the same arms over the same projection, so levels 2 through 4 came out of five functions and nothing else moved. `check[T]` recurses alongside the walk it guards.
+
+**Behaviour is unchanged, and that is the evidence rather than the claim.** All 784 existing tests pass with **no edits**, including `fmt: four levels of nesting render every leaf` byte for byte. Four tests were added for six-level nesting, which was a comptime error before.
+
+Two details preserve behaviour exactly:
+
+- **`hash` threads its accumulator through the descent** (`fold_fields[T](h, v)`) rather than hashing each nested record on its own and combining. A nested field therefore contributes exactly the bytes a flattened one would, and the digest is identical to what the bounded walk produced. Hashing nested records separately would also have satisfied the eq/hash contract while silently changing every digest.
+- **`fmt` splits the nested label from the nested value.** `write_label` writes `[, ]name=` and the recursive `fmt` call supplies `Type{...}`, which composes to the same `name=Type{...}` the per-level bracketing produced.
+
+Termination is structural and needs no depth counter: a descent instantiates at a field's type, a record's fields are finite, and a record cannot contain itself by value. Note this does **not** extend to following references — `rec Grow[T] { p: *Grow[*T]; }` is legal and has unboundedly many instances reachable through its pointer, so a reference-following derive (briar-systems/mach#2693) needs a termination story this one gets for free.
+
+### Fixed
+
+#### derive: the module header described pre-4.13.0 behaviour (#449)
+
+#450 corrected the four leaf `$error` messages for briar-systems/mach#2692 but not the prose above them, so the header still said the shape predicates strip `^`, still drew a contrast between type comparison and the predicates that no longer exists, and still described a `^`-wrapped record as "the one shape that escapes the classification" failing with a raw intrinsic error — which #450 had just made false. The header now states the rule once: **nothing strips `^`**, so `^u64` fails `f.type == u64` and `^Rec` fails `$is_record`, and both are refused by our own fallback.
+
+#### os(windows): a symlink with a relative target was not traversable as a directory (#454)
+
+`CreateSymbolicLink` stores the target verbatim as the reparse point's substitute name, and a **relative** substitute name is resolved by the kernel, which treats only `\` as a separator. Win32 path normalization, the layer that does accept `/`, never runs over reparse data. A `/`-separated relative target was therefore stored as one unresolvable component: creation reported success and every later read through the link failed, which is why `mach dep pull` looked fine and the next `mach build` did not. Paths are `/`-separated by contract above this layer, so `symlink` now rewrites the target to `\` at the syscall boundary. An over-long target is `ERANGE`, matching what this layer already does for a path too long.
+
+The issue named a second candidate, the `SYMBOLIC_LINK_FLAG_DIRECTORY` flag going unset because the directory probe could not resolve a forward-slashed relative target. It is not live, and that is measured rather than argued: the rewrite reaches `CreateSymbolicLinkA` only, leaving the probe seeing the same `/`-separated target it always did, and the windows leg goes from failing to passing across exactly that change.
+
+#### derive: the reference refusal blamed a compiler gap that has since closed
+
+Three places said the walk stops at a reference because "mach has no `$pointee_of`". briar-systems/mach#2693 landed it, and mach 4.15.0 carries it. Checked against the release binary, `$pointee_of(f.type)` resolves inside a `$fields` walk. The refusal is unchanged and still correct, but the reason is now a semantic one and is stated as such: address semantics versus deep semantics is the caller's choice, and a deep walk allocates, so it needs an allocator argument and a failure mode these signatures do not have. Same for the note on the owning clone, which waits on a signature rather than on a capability.
+
+Behaviour, refusal wording that `test/derive/verify.sh` pins, and the minimum toolchain are all unchanged.
+
+### Tests
+
+- `test/symlink` links a directory through a relative, `/`-separated target and reads a file **through** the link, and asserts `fs.is_dir` on the link. Creation succeeding is not the property: `fs.symlink` reported success on the bug, which is what made this look fine.
+- A `windows-symlink` CI leg runs that probe on `windows-latest`. It is the first job in the family to create a symlink on a windows host, and every existing windows job is a cross-build hosted on linux, which is why this went unseen. Wine cannot stand in either: its filesystem is unix-backed, so it creates a genuine unix symlink and reports a false pass on precisely this bug.
+- Six-level `eq` / `hash` / `clone` / `fmt` cases, each perturbing one leaf at a time at every depth, so a walk that stops short reports two different values equal.
+- `test/derive/verify.sh` loses its depth-cap case, because the cap it pinned no longer exists, and its positive control now nests six deep rather than four. The other nine refusals are unchanged and still pass.
+
 ## [0.25.0] - 2026-08-07
 
 **Requires mach 4.13.0 or newer.** `std.derive`'s recursive tier uses reflection primitives first shipped in 4.12.0, and its `^` handling tracks the shape-predicate change in 4.13.0 (briar-systems/mach#2692). The module checks `$mach.version` and says so, since `mach.lock` records dependency commits and cannot pin a toolchain.

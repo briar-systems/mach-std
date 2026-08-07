@@ -81,13 +81,14 @@ accepts() {
 union_msg="a union field cannot be walked"
 ref_msg="a reference field is detected but not followed"
 leaf_msg="field type is neither a scalar numeric nor a nested record"
-depth_msg="record nesting is deeper than the four levels std.derive descends"
 
-accepts "a four-level record is accepted by every derive" '
-rec P4 { a: i64; b: f64; }
-rec P3 { inner: P4; k: u16; }
-rec P2 { mid: P3; n: i32; }
-rec P1 { deep: P2; tag: u8; }
+accepts "a deeply nested record is accepted by every derive" '
+rec P6 { a: i64; b: f64; }
+rec P5 { d: P6; k: u16; }
+rec P4 { d: P5; k: u16; }
+rec P3 { d: P4; k: u16; }
+rec P2 { d: P3; n: i32; }
+rec P1 { d: P2; tag: u8; }
 ' '
     var a: P1;
     var b: P1;
@@ -140,17 +141,6 @@ rec HasK { n: i64; k: ^u64; }
     var b: HasK;
     if (derive.eq[HasK](?a, ?b)) { slot = slot + 1; }
 ' "$leaf_msg"
-
-refuses "fmt refuses nesting deeper than the ladder descends" '
-rec D5 { a: i64; }
-rec D4 { d: D5; }
-rec D3 { d: D4; }
-rec D2 { d: D3; }
-rec D1 { d: D2; }
-' '
-    var a: D1;
-    if (R.is_err[usize, str](derive.fmt[D1](?w, ?a))) { slot = slot + 1; }
-' "$depth_msg"
 
 # the classification runs at every level, not only the first
 refuses "clone refuses a union reached at depth three" '
