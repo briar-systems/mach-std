@@ -48,6 +48,12 @@ Termination is structural and needs no depth counter: a descent instantiates at 
 
 #450 corrected the four leaf `$error` messages for briar-systems/mach#2692 but not the prose above them, so the header still said the shape predicates strip `^`, still drew a contrast between type comparison and the predicates that no longer exists, and still described a `^`-wrapped record as "the one shape that escapes the classification" failing with a raw intrinsic error — which #450 had just made false. The header now states the rule once: **nothing strips `^`**, so `^u64` fails `f.type == u64` and `^Rec` fails `$is_record`, and both are refused by our own fallback.
 
+#### derive: the reference refusal blamed a compiler gap that has since closed
+
+Three places said the walk stops at a reference because "mach has no `$pointee_of`". briar-systems/mach#2693 landed it, and mach 4.15.0 carries it — checked against the release binary, `$pointee_of(f.type)` resolves inside a `$fields` walk. The refusal is unchanged and still correct, but the reason is now a semantic one and is stated as such: address semantics versus deep semantics is the caller's choice, and a deep walk allocates, so it needs an allocator argument and a failure mode these signatures do not have. Same for the note on the owning clone, which waits on a signature rather than on a capability.
+
+Behaviour, refusal wording that `test/derive/verify.sh` pins, and the minimum toolchain are all unchanged.
+
 ### Tests
 
 - Six-level `eq` / `hash` / `clone` / `fmt` cases, each perturbing one leaf at a time at every depth, so a walk that stops short reports two different values equal.
