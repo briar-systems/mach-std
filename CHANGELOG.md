@@ -5,7 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.25.0] - 2026-08-07
+
+**Requires mach 4.13.0 or newer.** `std.derive`'s recursive tier uses reflection primitives first shipped in 4.12.0, and its `^` handling tracks the shape-predicate change in 4.13.0 (briar-systems/mach#2692). The module checks `$mach.version` and says so, since `mach.lock` records dependency commits and cannot pin a toolchain.
+
+### Added
+
+#### `exec.resolve` / `exec.resolve_in` - one shared PATH lookup (#425)
+No spawn entry point searches PATH: `execve` resolves nothing, and the windows layer passes a non-NULL `lpApplicationName`. Every caller spawning a program the *user* names had to hand-roll the same walk, and briar-systems/mach carried three copies of it.
+
+`resolve` reads PATH; `resolve_in` takes the search list. The split keeps the policy pure, gives callers with their own list a way in, and makes the search testable at all - there is no way to set an environment variable in-process, so a test against the real PATH could only assert that some program somewhere resolved.
+
+**The current directory is never searched.** An empty entry means cwd on both posix and windows and is skipped, which is the whole reason this is written rather than delegated to the OS: `CreateProcess` with a NULL `lpApplicationName` searches the working directory ahead of System32.
+
+**Windows resolves a bare name through PATHEXT.** `git` is not a file, `git.exe` is, so a lookup that only joined the name would resolve nothing there.
+
+- derive: **the walk descends into nested records** (#412). `eq`, `hash` and `fmt` used to refuse any field that was not a scalar numeric, so a record holding a `Vec3` could not be derived at all. They now walk a record-typed field's own fields, four levels deep, and `clone[T]` joins them. Requires mach 4.12.0, which first shipped `$fields(f.type)`, `$is_record` / `$is_union` / `$is_pointer`, and `$type_name`; the module checks `$mach.version` and says so, since `mach.lock` records dependency commits and cannot pin a toolchain.
+- derive: **`check[T]` is the classification contract, written once and `pub`** (#412). Every derive calls it before its own ladder, so all four share one set of refusals and one set of messages, and a hand-written derive can hold itself to the same rule. Adding a derivable trait is now a ladder plus a leaf action, not a fresh set of refusals to get right.
+- derive: **`clone[T](dst, src)`** (#412), a memberwise structural copy. The value of it over `dst = src` is the refusal rather than the copy: a field that a shallow copy would only alias does not classify, so `clone[T]` compiling is the proof that a structural copy is a whole copy.
+
+### Changed
+- derive: **`fmt` now prints the record's type name**, so `{x=1, y=2}` becomes `DV2{x=1, y=2}` and a nested field renders as `pos=Vec3{x=1, y=2, z=3}`. The spelling comes from `$type_name`, which is sema's own diagnostic authority, so a printed name and an error's name cannot drift.
+
+### Known limits
+- **This is bounded structural descent, not recursion, and the bound is four levels.** mach cannot re-enter a generic at a field's type — `eq[f.type]` does not parse, there is no inference from the argument, and `$type_of` is not a type operand — so each level of descent is a `$each` block someone wrote. Four is measured rather than rounded: across the 500 records in mach-std and the mach compiler the deepest by-value nesting is exactly four, reached only by `Loop` (`iv: InductionVar` → `init: Value` → `bytes: ValueBytes`) and `PcgWorker` (`sess: Session` → `registry: TargetRegistry` → `isa: IsaRegistry`); mach-std's own deepest is three. So the bound covers every record either codebase has, with the deepest sitting exactly on it. A deeper record is a comptime `$error` naming the bound and what to do about it. briar-systems/mach#2691 removes this, and lands as a deletion rather than a rewrite: each ladder collapses to its own outermost level with the descent arm calling itself.
+- **Nothing here is secrecy-aware, and nothing can be**: the shape predicates strip `^` before answering, so no comptime surface can tell a walk that a field is secret (briar-systems/mach#2694). What keeps that from being silent is the scalar gate — type comparison does *not* strip `^`, so a `^u64` field fails `f.type == u64` and is refused at comptime rather than printed. A `^`-wrapped *record* field is the one shape the classification cannot catch: `$is_record` strips `^` and answers true, then `$fields` refuses the same operand (briar-systems/mach#2692). It still fails the build, so no secret is walked, but with mach's message rather than ours.
+- **References are detected, never followed.** `$is_pointer` sees a reference but there is no `$pointee_of` (briar-systems/mach#2693), and address semantics versus deep semantics is the caller's choice, so a reference field is refused. `str` is `def str: *char`, so a `str` field is refused with the rest. An owning clone waits on the same capability.
+
+### Tests
+
+#### The library suite runs on riscv64 (#443)
+No part of this suite had ever executed on riscv64: the leg ran a runtime smoke test and the RELRO contract only, and `mach.toml` declared no `linux-riscv64` target so `mach test .` could not target it. The compiler blocker (briar-systems/mach#2654) is fixed, and all tests now build and pass there.
+
+qemu-user is real coverage for logic and a weak signal for ABI constants, and riscv64 has no native runner, so a riscv64-only result stays provisional. It would still have caught #436, whose defect was a wrong constant producing a hard `EINVAL`.
+
+- `test/derive/verify.sh` — every refusal is a `$error` that fires during instantiation, so the evidence is a build that fails with a written message, which the in-process suite cannot express: a test binary that does not compile cannot run. Ten cases, one per shape and one per derive entry point, plus a positive control so the harness cannot pass on a project that never compiles. Wired into CI.
+- The nesting tests perturb one field at a time at each of the four depths and assert the derive notices. That is the case that separates a real descent from a walk that stops at the first record and reports two different values equal, and each was confirmed to fail against a ladder with that level removed.
+
+#### A `^` record is refused by our own leaf arm (#448)
+mach 4.13.0 makes the shape predicates answer about the outermost constructor, so `$is_record(^SInner)` is false and a secret record field falls to `std.derive`'s leaf arm rather than classifying as a record and dying on `$fields`. The user-visible message is now our written explanation instead of a raw intrinsic error.
+
+The refusal harness had deliberately pinned mach's raw message so exactly this change would be caught here rather than in a program's output. It was, on the first release carrying it.
 
 ## [0.24.2] - 2026-08-07
 
