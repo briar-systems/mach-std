@@ -5,9 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.25.1] - 2026-08-07
 
-**Requires mach 4.14.0 or newer, and 4.13.0 will NOT build this.** `eq[f.type]` — the walk re-entering itself at a field's type — is a spelling mach did not accept before briar-systems/mach#2691, which landed on mach `dev` after 4.13.0 was tagged. On an older toolchain this is a **parse** error ("expected a module alias before `.`") reported against `src/derive.mach`, and because parsing precedes comptime evaluation the module's own `$mach.version` gate cannot fire ahead of it. That is the missing capability in briar-systems/mach#2714 — a manifest is read before any source is, so a minimum-toolchain key there would diagnose this cleanly. Until then the gate states the requirement where `mach doc` finds it, and this note is what makes an old toolchain diagnosable.
+**Requires mach 4.14.0 or newer, and 4.13.0 will NOT build this.** `eq[f.type]` — the walk re-entering itself at a field's type — is a spelling mach did not accept before briar-systems/mach#2691, which landed on mach `dev` after 4.13.0 was tagged. On an older toolchain this is a **parse** error ("expected a module alias before `.`") reported against `src/derive.mach`, and because parsing precedes comptime evaluation the module's own `$mach.version` gate cannot fire ahead of it. That capability now exists: briar-systems/mach#2714 landed and shipped in mach 4.15.0, so `[project].mach` takes a semver minimum and is checked when the manifest is read, before any source is parsed.
+
+**It is not adopted here yet, and the reason is the bootstrap.** The key is only understood by 4.15.0 and newer, so declaring it would move this library's floor to 4.15.0 in order to diagnose a 4.14.0 requirement, which trades a clear error on one old toolchain for a hard failure on a newer one. It becomes the right move once the floor rises to 4.15.0 for an unrelated reason. Until then the `$mach.version` gate states the requirement where `mach doc` finds it, and this note is what makes an old toolchain diagnosable.
 
 ### Changed
 
