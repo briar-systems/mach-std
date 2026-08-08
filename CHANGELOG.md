@@ -5,6 +5,71 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.26.0] - 2026-08-08
+
+### Changed
+
+#### darwin: the clocks and `sleep` go through libSystem (#415)
+
+**darwin has no `clock_gettime` trap at all.** The backend called syscall 427 and read the result as a time; whatever that number is on current macOS, it is not one — `now()` came back *below the unix epoch*. The three `std.chrono.time` tests had been failing for as long as nothing was running them. `clock_gettime(3)` is public, has shipped since macOS 10.12, and is implemented in userspace over `mach_absolute_time()` and the commpage rather than as a trap, which is why hunting for a syscall number was never going to work. 10.12 is older than any macOS running on hardware these targets support, so this moves no deployment floor — unlike `os_sync_wait_on_address`, which is why the thread layer went a different way.
+
+The `CLOCK_REALTIME` / `CLOCK_MONOTONIC` constants needed no change: they were always written against darwin's own `<time.h>` values, even while the call underneath did not exist.
+
+**`sleep` moves to `nanosleep(3)`.** The note it carried — "darwin has no nanosleep syscall" — was true of the trap table and false of libSystem, so it went through `select` with a `timeval` timeout and lost sub-microsecond resolution on the way. It now also handles `EINTR` by resuming with the *remaining* time, so an interrupted sleep ends at about the requested moment instead of stretching towards double it. `rec timeval` and three more `SYS_*` constants go with it.
+
+**A broken clock is not a clock that errors — it is one that returns a plausible-looking number**, so none of the seven new tests checks a return code. Each pins the clock against something independent: the epoch against a timestamp the *filesystem* just wrote (same kernel clock, completely different path), the unit against a measured 50ms sleep (which is what catches microseconds, milliseconds, or raw mach ticks), and `tv_nsec` against its documented range. Monotonicity is checked across 200 reads, and an unknown clock id is provoked for `EINVAL`.
+
+
+
+#### darwin: threads are pthreads, not bsdthreads (#415)
+
+`bsdthread_create` / `bsdthread_register` was never an ABI. `bsdthread_register` publishes a workqueue callback the kernel invokes, versioned against the libpthread that shipped with the OS — an internal kernel↔libpthread protocol this backend was impersonating. It is what #415 singles out as the most fragile code on the least stable part of the surface, and on current macOS it does not work: all three `std.sync.thread` tests were failing before this change, and had been failing unnoticed because nothing had ever run this suite on darwin.
+
+**This had to come before the rest of the migration, not after it.** libSystem reaches errno through `__error()`, a thread-local resolved against the pthread structure libpthread installs for threads it created. A raw bsdthread never had one, because the start routine never performed libpthread's own `_pthread_set_self` handshake. Every libSystem call already migrated would therefore have carried an unvalidated errno path the moment it ran off the main thread. `pthread_create` makes every thread a real pthread and the question stops existing.
+
+**pthread does not use errno, and that is the trap.** Every other libSystem entry point reports failure as `-1` and leaves the reason in errno. The pthread family returns the error number *directly* and leaves errno untouched, so the `if (rc < 0) { ret fail_errno(); }` shape used everywhere else is wrong twice over — the branch never fires, and if it did it would report an unrelated stale errno. The pthread wrappers negate `rc` itself and never call `fail_errno`.
+
+**The OS-layer contract is unchanged; stack ownership moved.** `thread_spawn` still takes a caller-allocated region and a completion flag, and `thread_wait`/`thread_wake` are still address-keyed. The caller's region is now a *context block* only — pthread allocates and frees the real stack — which is exactly how the windows backend has always used it. The block is released by the new thread itself, so an unjoined thread still reclaims it, matching what `bsdthread_terminate` did. Threads are created **detached**, because joining waits on the completion flag rather than calling `pthread_join`, and a joinable pthread would leave its descriptor unreaped.
+
+**The address-keyed wait is a table of condition variables.** darwin's futex equivalent, `__ulock_wait`, is as private as the bsdthread traps; the public replacement `os_sync_wait_on_address` is macOS 14.4+ and adopting it would quietly raise this library's deployment floor. So the wait is built from pthread condition variables in a fixed table hashed by address. Buckets are genuinely shared, and the consequences are handled rather than hoped away: `thread_wake` **broadcasts**, because a signal could hand the one wakeup to a waiter on an unrelated address; and the lost-wakeup race is closed by lock discipline, since the waiter re-reads the address under the bucket mutex that `pthread_cond_wait` releases atomically and that `thread_wake` must hold to broadcast.
+
+Deleted with it: both hand-written `asm` trampolines (including the x86_64 stack-realignment fixup that existed only because the kernel *jumped* to the entry rather than calling it), the workqueue callback, and six `SYS_*` constants.
+
+
+
+#### darwin: the filesystem layer calls libSystem instead of raw BSD traps (#415)
+
+Apple does not guarantee syscall-number stability. `svc 0x80` / `syscall` works today and has been broken across macOS releases before, and libSystem is the only interface Apple supports. This moves the **filesystem and descriptor** primitives of the darwin backend onto it. Memory, time, process, sockets, threads, `read_dir`, and `terminal` still issue raw traps; see "what is deliberately left" below.
+
+**The errno contract inverts, so every error path was re-derived rather than re-pointed.** A raw BSD trap sets the carry flag and returns the *positive* errno in the result register. libSystem returns `-1` (or `nil`) and leaves the errno in thread-local storage, reached through `__error()`. Two facts follow that the old code never had to encode:
+
+- **errno is not cleared on success.** It may only be read once the return value has already reported failure. `fail_errno` is the single place the conversion happens and is only ever reached from inside a test of the documented sentinel.
+- **the sentinel is per-function, not "negative".** `lseek` returns a file offset, and its failure value is exactly `-1`; testing the sign would be a different predicate that happens to agree today.
+
+The layer's outward contract is unchanged — a count or descriptor on success, a negative errno on failure — so nothing above `std.system.os.darwin` moved.
+
+**`open`, `fcntl`, and the apple arm64 variadic ABI.** `openat` and `fcntl` are C-variadic, and apple arm64 passes *every* variadic argument on the stack with no register phase. A fixed-arity declaration lowers `mode` into `x2` while libSystem reads it off the stack — which links, runs, and creates a file with the wrong permission bits. They are declared with mach's C-variadic `ext fun` form (briar-systems/mach#2575) and, where a call needs no tail, called with none: two-argument `openat` without `O_CREAT`, and `F_GETFD` / `F_GETFL`. Passing a dummy zero would not be an equivalent spelling on that target. Every tail this layer passes is an int, never a float, which keeps `AL` at zero on the SysV x86_64 leg.
+
+**The stat family is arch-gated on `$INODE64`.** On x86_64 the plain `_fstat` is still the legacy 32-bit-`st_ino` struct and the 64-bit layout — the one `stat_t` describes — is reached through the `$INODE64` variant symbol. arm64 has only the plain name. Binding the plain name on x86_64 would link and run and quietly fill `stat_t` from a different field order, so the suffix is applied by an explicit gate and asserted in CI per architecture.
+
+**Cancellation: the plain entry points, deliberately.** libSystem exports a `$NOCANCEL` twin for every cancellation point. std has no cancellation model, never calls `pthread_cancel`, and exposes no way to, so a cancellation point never acts and the plain entry point does exactly what its twin does — while remaining the public symbol. The decision is recorded in one place rather than left to whatever the linker resolves.
+
+**Deletions.** `getcwd` was an `open(".")` + `fcntl(F_GETPATH)` dance with a `MAXPATHLEN` bounce buffer, because `F_GETPATH` carries no capacity and XNU writes up to `MAXPATHLEN` bytes whatever the caller sized its destination. `getcwd(3)` takes the capacity, so the scratch buffer, the copy loop, the `F_GETPATH` constant and `MAXPATHLEN` all go (#409, #413). The hand-written `pipe` asm in both arch modules — which existed only because the raw trap returns two descriptors in `x0`/`x1` and signals through the carry flag — collapses to one line, identical on both architectures. Fifteen `SYS_*` constants are gone.
+
+### Added
+
+#### CI runs the suite natively on both darwin architectures
+
+There was no darwin execution anywhere in this repo's CI: `cross-backends` compiles the darwin backends from linux and runs nothing. The suite now runs natively on `macos-15` (arm64) and `macos-15-intel`, matching the reasoning already applied to the arm64 linux job — a psABI fact is exactly what an emulator or a cross-build can be wrong about.
+
+The two rows are not interchangeable. The stack-passed variadic tail exists on apple arm64 and nowhere else, and the `$INODE64` suffix exists on x86_64 and nowhere else, so each divergence is invisible on the other row. CI additionally asserts that a linked darwin image names **exactly one** libSystem, at its install path — the implicit platform dependency plus a manifest entry spelled differently enough not to match it produces two `LC_LOAD_DYLIB` commands, which loads and runs and would otherwise go unnoticed.
+
+Tests assert observable effects, not return codes: a file created with `O_CREAT` is stat'd back and its mode compared **exactly** (with the umask pinned to zero, so a dropped variadic argument cannot pass), `FD_CLOEXEC` is set and read back and cleared and read back, a pipe carries bytes end to end, `lseek` reports the size the writes produced, and the claimed error paths are provoked for their **specific** errno — `EEXIST`, `ENOENT`, `EBADF`.
+
+### What is deliberately left, and why
+
+This is a partial migration and the mixed state is intentional. `read_dir` needs `getdirentries64`, which is not public API on darwin; replacing it means an `opendir`/`readdir` redesign that changes the primitive's shape rather than just its callee. The thread layer's `bsdthread_create` / `__ulock_*` is the highest-value part of this issue and carries its own risk, and it interacts with everything else here — see the follow-up issue for the ordering question it raises.
+
 ## [0.25.1] - 2026-08-07
 
 **Requires mach 4.14.0 or newer, and 4.13.0 will NOT build this.** `eq[f.type]` — the walk re-entering itself at a field's type — is a spelling mach did not accept before briar-systems/mach#2691, which landed on mach `dev` after 4.13.0 was tagged. On an older toolchain this is a **parse** error ("expected a module alias before `.`") reported against `src/derive.mach`, and because parsing precedes comptime evaluation the module's own `$mach.version` gate cannot fire ahead of it. That capability now exists: briar-systems/mach#2714 landed and shipped in mach 4.15.0, so `[project].mach` takes a semver minimum and is checked when the manifest is read, before any source is parsed.
