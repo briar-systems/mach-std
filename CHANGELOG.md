@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+#### darwin: threads are pthreads, not bsdthreads (#415)
+
+`bsdthread_create` / `bsdthread_register` was never an ABI. `bsdthread_register` publishes a workqueue callback the kernel invokes, versioned against the libpthread that shipped with the OS — an internal kernel↔libpthread protocol this backend was impersonating. It is what #415 singles out as the most fragile code on the least stable part of the surface, and on current macOS it does not work: all three `std.sync.thread` tests were failing before this change, and had been failing unnoticed because nothing had ever run this suite on darwin.
+
+**This had to come before the rest of the migration, not after it.** libSystem reaches errno through `__error()`, a thread-local resolved against the pthread structure libpthread installs for threads it created. A raw bsdthread never had one, because the start routine never performed libpthread's own `_pthread_set_self` handshake. Every libSystem call already migrated would therefore have carried an unvalidated errno path the moment it ran off the main thread. `pthread_create` makes every thread a real pthread and the question stops existing.
+
+**pthread does not use errno, and that is the trap.** Every other libSystem entry point reports failure as `-1` and leaves the reason in errno. The pthread family returns the error number *directly* and leaves errno untouched, so the `if (rc < 0) { ret fail_errno(); }` shape used everywhere else is wrong twice over — the branch never fires, and if it did it would report an unrelated stale errno. The pthread wrappers negate `rc` itself and never call `fail_errno`.
+
+**The OS-layer contract is unchanged; stack ownership moved.** `thread_spawn` still takes a caller-allocated region and a completion flag, and `thread_wait`/`thread_wake` are still address-keyed. The caller's region is now a *context block* only — pthread allocates and frees the real stack — which is exactly how the windows backend has always used it. The block is released by the new thread itself, so an unjoined thread still reclaims it, matching what `bsdthread_terminate` did. Threads are created **detached**, because joining waits on the completion flag rather than calling `pthread_join`, and a joinable pthread would leave its descriptor unreaped.
+
+**The address-keyed wait is a table of condition variables.** darwin's futex equivalent, `__ulock_wait`, is as private as the bsdthread traps; the public replacement `os_sync_wait_on_address` is macOS 14.4+ and adopting it would quietly raise this library's deployment floor. So the wait is built from pthread condition variables in a fixed table hashed by address. Buckets are genuinely shared, and the consequences are handled rather than hoped away: `thread_wake` **broadcasts**, because a signal could hand the one wakeup to a waiter on an unrelated address; and the lost-wakeup race is closed by lock discipline, since the waiter re-reads the address under the bucket mutex that `pthread_cond_wait` releases atomically and that `thread_wake` must hold to broadcast.
+
+Deleted with it: both hand-written `asm` trampolines (including the x86_64 stack-realignment fixup that existed only because the kernel *jumped* to the entry rather than calling it), the workqueue callback, and six `SYS_*` constants.
+
+
+
 #### darwin: the filesystem layer calls libSystem instead of raw BSD traps (#415)
 
 Apple does not guarantee syscall-number stability. `svc 0x80` / `syscall` works today and has been broken across macOS releases before, and libSystem is the only interface Apple supports. This moves the **filesystem and descriptor** primitives of the darwin backend onto it. Memory, time, process, sockets, threads, `read_dir`, and `terminal` still issue raw traps; see "what is deliberately left" below.
