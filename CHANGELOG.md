@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+#### darwin: the clocks and `sleep` go through libSystem (#415)
+
+**darwin has no `clock_gettime` trap at all.** The backend called syscall 427 and read the result as a time; whatever that number is on current macOS, it is not one — `now()` came back *below the unix epoch*. The three `std.chrono.time` tests had been failing for as long as nothing was running them. `clock_gettime(3)` is public, has shipped since macOS 10.12, and is implemented in userspace over `mach_absolute_time()` and the commpage rather than as a trap, which is why hunting for a syscall number was never going to work. 10.12 is older than any macOS running on hardware these targets support, so this moves no deployment floor — unlike `os_sync_wait_on_address`, which is why the thread layer went a different way.
+
+The `CLOCK_REALTIME` / `CLOCK_MONOTONIC` constants needed no change: they were always written against darwin's own `<time.h>` values, even while the call underneath did not exist.
+
+**`sleep` moves to `nanosleep(3)`.** The note it carried — "darwin has no nanosleep syscall" — was true of the trap table and false of libSystem, so it went through `select` with a `timeval` timeout and lost sub-microsecond resolution on the way. It now also handles `EINTR` by resuming with the *remaining* time, so an interrupted sleep ends at about the requested moment instead of stretching towards double it. `rec timeval` and three more `SYS_*` constants go with it.
+
+**A broken clock is not a clock that errors — it is one that returns a plausible-looking number**, so none of the seven new tests checks a return code. Each pins the clock against something independent: the epoch against a timestamp the *filesystem* just wrote (same kernel clock, completely different path), the unit against a measured 50ms sleep (which is what catches microseconds, milliseconds, or raw mach ticks), and `tv_nsec` against its documented range. Monotonicity is checked across 200 reads, and an unknown clock id is provoked for `EINVAL`.
+
+
+
 #### darwin: threads are pthreads, not bsdthreads (#415)
 
 `bsdthread_create` / `bsdthread_register` was never an ABI. `bsdthread_register` publishes a workqueue callback the kernel invokes, versioned against the libpthread that shipped with the OS — an internal kernel↔libpthread protocol this backend was impersonating. It is what #415 singles out as the most fragile code on the least stable part of the surface, and on current macOS it does not work: all three `std.sync.thread` tests were failing before this change, and had been failing unnoticed because nothing had ever run this suite on darwin.
