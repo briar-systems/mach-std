@@ -37,9 +37,6 @@ val SYS_MUNLOCK:          usize = 204;
 val SYS_EXECVE:           usize = 59;
 val SYS_VFORK:            usize = 66;
 val SYS_GETDIRENTRIES64:  usize = 344;
-val SYS_SELECT:           usize = 93;
-val SYS_GETTIMEOFDAY:     usize = 116;
-val SYS_CLOCK_GETTIME:    usize = 427;
 val SYS_GETPID:           usize = 20;
 val SYS_KILL:             usize = 37;
 val SYS___SYSCTL:         usize = 202;
@@ -119,13 +116,6 @@ pub rec stat_t {
     _reserved0:        i32;
     _reserved1:        i64;
     _reserved2:        i64;
-}
-
-# gettimeofday result
-rec timeval {
-    tv_sec:  i64;
-    tv_usec: i32;
-    _pad:    i32;
 }
 
 # time specification with seconds and nanoseconds
@@ -1070,21 +1060,34 @@ pub fun getpid() i64 {
 
 # suspend execution for the given number of nanoseconds
 #
-# darwin has no nanosleep syscall; uses select with a timeval timeout.
+# uses nanosleep(3). the previous note here - "darwin has no nanosleep
+# syscall" - was true of the trap table and false of libSystem, so this went
+# through `select` with a timeout and lost the sub-microsecond resolution to
+# `timeval` on the way.
+#
+# a signal that cuts the sleep short leaves the unslept remainder in `rem`, and
+# the retry resumes with THAT rather than restarting the full interval, so an
+# interrupted sleep still ends at about the requested time instead of
+# stretching towards double it.
 # ---
 # nsec: nanoseconds to sleep
 pub fun sleep(nsec: i64) {
     if (nsec <= 0) { ret; }
-    var sec: i64 = nsec / 1000000000;
-    var usec: i64 = (nsec % 1000000000 + 999) / 1000;
-    if (usec >= 1000000) {
-        sec = sec + 1;
-        usec = usec - 1000000;
+    var req: timespec;
+    req.tv_sec  = nsec / 1000000000;
+    req.tv_nsec = nsec % 1000000000;
+
+    var rem: timespec;
+    rem.tv_sec  = 0;
+    rem.tv_nsec = 0;
+
+    var retries: usize = 0;
+    for (retries < EINTR_MAX_RETRIES) {
+        if (ls.nanosleep((?req)::usize::*u8, (?rem)::usize::*u8) == 0) { ret; }
+        if (ls.fail_errno() != EINTR) { ret; }
+        req = rem;
+        retries = retries + 1;
     }
-    var tv: timeval;
-    tv.tv_sec = sec;
-    tv.tv_usec = usec::i32;
-    syscall5(SYS_SELECT, 0, 0, 0, 0, (?tv)::usize);
 }
 
 # the number of CPUs available to this process
@@ -2103,14 +2106,169 @@ pub fun random_fill(buf: *u8, len: usize) i64 {
 # time
 
 # read a clock into a timespec
-# uses the kernel clock_gettime syscall (available since macOS 10.12).
-# CLOCK_MONOTONIC returns true monotonic time via the kernel's nanouptime.
+#
+# CLOCK_REALTIME (0) and CLOCK_MONOTONIC (6) are darwin's own `clockid_t`
+# values from <time.h>, not linux's - they happen to have been correct already,
+# because the constants were always written against darwin's header even while
+# the call underneath was a trap that does not exist.
 # ---
 # clock_id: CLOCK_REALTIME or CLOCK_MONOTONIC
 # ts:       output timespec
 # ret:      0 on success, or negative errno
 pub fun clock_gettime(clock_id: i32, ts: *timespec) i64 {
-    ret syscall2(SYS_CLOCK_GETTIME, clock_id::u32::usize, ts::usize);
+    if (ls.clock_gettime(clock_id, ts::usize::*u8) < 0) { ret ls.fail_errno(); }
+    ret 0;
+}
+
+# clock migration tests
+#
+# a broken clock is not a clock that errors - it is a clock that returns a
+# plausible-looking number. the old backend's `clock_gettime` returned 0
+# happily and produced a time below the unix epoch. so none of these check a
+# return code: each one pins the clock against something independent.
+#
+#   epoch  -- compared against a timestamp the FILESYSTEM wrote, which comes
+#             from the same kernel wall clock by a completely different path
+#   unit   -- compared against a measured sleep, which is what catches a clock
+#             reporting microseconds, milliseconds, or raw mach ticks
+#   field  -- tv_nsec held to its documented range, which a tick count spilled
+#             into the struct would violate
+
+# both clocks report nanoseconds in tv_nsec, not some other unit
+#
+# a tick count or a microsecond value dropped into this field lands outside
+# [0, 1e9) almost immediately, so this is a cheap unit check independent of
+# how long anything takes.
+test "std.system.os.darwin.libsystem:clock_tv_nsec_is_within_one_second" {
+    var rt: timespec;
+    if (clock_gettime(CLOCK_REALTIME, ?rt) != 0) { ret 1; }
+    if (rt.tv_nsec < 0 || rt.tv_nsec >= 1000000000) { ret 1; }
+
+    var mt: timespec;
+    if (clock_gettime(CLOCK_MONOTONIC, ?mt) != 0) { ret 1; }
+    if (mt.tv_nsec < 0 || mt.tv_nsec >= 1000000000) { ret 1; }
+    ret 0;
+}
+
+# CLOCK_REALTIME agrees with the timestamp the filesystem just wrote
+#
+# the strongest reference available without a network: create a file, read its
+# mtime back through fstat, and require the wall clock to agree. both numbers
+# come from the same kernel clock by entirely different routes, so an epoch
+# error, a unit error, or a stuck clock all break the comparison. the old
+# implementation - which returned a time below 1970 - fails this outright.
+test "std.system.os.darwin.libsystem:realtime_agrees_with_a_filesystem_timestamp" {
+    var path: [64]u8;
+    tmp_path(?path[0], 'k'::u8);
+    unlink(AT_FDCWD, ?path[0], 0);
+
+    val fd: i64 = open(AT_FDCWD, ?path[0], O_CREAT | O_RDWR, 0o600);
+    if (fd < 0) { ret 1; }
+
+    var st: stat_t;
+    val sr: i64 = stat(fd::i32, ?st);
+    close(fd::i32);
+    unlink(AT_FDCWD, ?path[0], 0);
+    if (sr != 0) { ret 1; }
+
+    var now: timespec;
+    if (clock_gettime(CLOCK_REALTIME, ?now) != 0) { ret 1; }
+
+    var delta: i64 = now.tv_sec - st.st_mtime;
+    if (delta < 0) { delta = -delta; }
+    # generous enough never to flake on a loaded runner, tight enough that a
+    # wrong epoch or unit cannot slip through
+    if (delta > 60) { ret 1; }
+    ret 0;
+}
+
+# the wall clock sits in a plausible span of years
+#
+# guards the direction the filesystem comparison cannot: if BOTH the clock and
+# the filesystem were wrong in the same way the check above would still pass.
+# the lower bound is a date already in the past when this was written.
+test "std.system.os.darwin.libsystem:realtime_is_a_plausible_wall_clock" {
+    var ts: timespec;
+    if (clock_gettime(CLOCK_REALTIME, ?ts) != 0) { ret 1; }
+    # 2023-01-01 .. 2100-01-01
+    if (ts.tv_sec < 1672531200) { ret 1; }
+    if (ts.tv_sec > 4102444800) { ret 1; }
+    ret 0;
+}
+
+# the monotonic clock advances by about the interval we actually slept
+#
+# this is the unit check with teeth. sleep for 50ms and require the clock to
+# report an advance in the same ballpark: a clock counting microseconds would
+# report ~50, a clock counting mach ticks something wildly larger, and a stuck
+# clock zero. it also proves `sleep` itself works, which the old select-based
+# implementation could not be assumed to.
+test "std.system.os.darwin.libsystem:monotonic_advances_by_the_interval_slept" {
+    var before: timespec;
+    if (clock_gettime(CLOCK_MONOTONIC, ?before) != 0) { ret 1; }
+
+    sleep(50000000);
+
+    var after: timespec;
+    if (clock_gettime(CLOCK_MONOTONIC, ?after) != 0) { ret 1; }
+
+    val elapsed: i64 = (after.tv_sec - before.tv_sec) * 1000000000
+                     + (after.tv_nsec - before.tv_nsec);
+
+    # at least the interval requested, and not so much more that the units
+    # could be wrong; a heavily loaded runner still lands far inside 5s
+    if (elapsed < 40000000)   { ret 1; }
+    if (elapsed > 5000000000) { ret 1; }
+    ret 0;
+}
+
+# the wall clock advances across a sleep too, at the same rate
+#
+# a realtime clock that is merely a constant would satisfy the epoch checks
+# above forever. this requires it to actually move, and to move by roughly what
+# the monotonic clock says elapsed.
+test "std.system.os.darwin.libsystem:realtime_advances_across_a_sleep" {
+    var before: timespec;
+    if (clock_gettime(CLOCK_REALTIME, ?before) != 0) { ret 1; }
+
+    sleep(50000000);
+
+    var after: timespec;
+    if (clock_gettime(CLOCK_REALTIME, ?after) != 0) { ret 1; }
+
+    val elapsed: i64 = (after.tv_sec - before.tv_sec) * 1000000000
+                     + (after.tv_nsec - before.tv_nsec);
+    if (elapsed < 40000000)   { ret 1; }
+    if (elapsed > 5000000000) { ret 1; }
+    ret 0;
+}
+
+# the monotonic clock never runs backwards across repeated reads
+test "std.system.os.darwin.libsystem:monotonic_never_decreases" {
+    var prev: timespec;
+    if (clock_gettime(CLOCK_MONOTONIC, ?prev) != 0) { ret 1; }
+
+    var i: usize = 0;
+    for (i < 200) {
+        var cur: timespec;
+        if (clock_gettime(CLOCK_MONOTONIC, ?cur) != 0) { ret 1; }
+        if (cur.tv_sec < prev.tv_sec) { ret 1; }
+        if (cur.tv_sec == prev.tv_sec && cur.tv_nsec < prev.tv_nsec) { ret 1; }
+        prev = cur;
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# an unknown clock id is refused with EINVAL, not answered with a wrong number
+#
+# the error path, provoked rather than assumed. this also confirms the wrapper
+# reads errno at all: the old trap-based version reported failure through a
+# different channel entirely.
+test "std.system.os.darwin.libsystem:unknown_clock_id_is_einval" {
+    var ts: timespec;
+    if (clock_gettime(9999, ?ts) != EINVAL) { ret 1; }
+    ret 0;
 }
 
 # errno
