@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+#### `sync.atomic`: every operation is `#[inline]`, so it costs its instructions and not a call as well (briar-systems/mach#2231)
+
+Each body in `sync.atomic` is three to six instructions. Every one of them was reached through a function call, because a dependency's ordinary function body is emitted extern in an importer and called through the linker - and **every** caller of this module is in another module. So the call was most of the price of using an atomic, and a spin loop paid it every iteration.
+
+`#[inline]` is what declares that a body is part of a function's public surface and may be materialised by whoever imports it. It has to be spelled, because the flow is opt-**in**: without it a dependency body never crosses a module boundary, which is what keeps an unrelated edit in a library from re-lowering everything downstream of it.
+
+Measured by the compiler-side change, x86-64 release, a loop over `store` / `load` / `fetch_add` / `fetch_sub` with six values live across each barrier: **25.0 ms -> 21.1 ms (-15.5%)**, identical results.
+
+**Nothing here changes the ordering guarantee.** Inlining removes the CALL and leaves the `asm` statement, which the middle end treats as at least as strong a barrier as the call it replaced, so every reordering these bodies forbid is still forbidden. The guarantee is still sequential consistency on every operation on every target.
+
+**This is inert on a compiler that does not implement the cross-module flow.** `#[inline]` was already accepted as a same-module hint, so this module builds and behaves identically on an older mach and simply does not get the win there. It requires no version floor and does not change this library's bootstrap.
+
 ## [0.25.1] - 2026-08-07
 
 **Requires mach 4.14.0 or newer, and 4.13.0 will NOT build this.** `eq[f.type]` — the walk re-entering itself at a field's type — is a spelling mach did not accept before briar-systems/mach#2691, which landed on mach `dev` after 4.13.0 was tagged. On an older toolchain this is a **parse** error ("expected a module alias before `.`") reported against `src/derive.mach`, and because parsing precedes comptime evaluation the module's own `$mach.version` gate cannot fire ahead of it. That capability now exists: briar-systems/mach#2714 landed and shipped in mach 4.15.0, so `[project].mach` takes a semver minimum and is checked when the manifest is read, before any source is parsed.
