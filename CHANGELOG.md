@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+#### darwin: the filesystem layer calls libSystem instead of raw BSD traps (#415)
+
+Apple does not guarantee syscall-number stability. `svc 0x80` / `syscall` works today and has been broken across macOS releases before, and libSystem is the only interface Apple supports. This moves the **filesystem and descriptor** primitives of the darwin backend onto it. Memory, time, process, sockets, threads, `read_dir`, and `terminal` still issue raw traps; see "what is deliberately left" below.
+
+**The errno contract inverts, so every error path was re-derived rather than re-pointed.** A raw BSD trap sets the carry flag and returns the *positive* errno in the result register. libSystem returns `-1` (or `nil`) and leaves the errno in thread-local storage, reached through `__error()`. Two facts follow that the old code never had to encode:
+
+- **errno is not cleared on success.** It may only be read once the return value has already reported failure. `fail_errno` is the single place the conversion happens and is only ever reached from inside a test of the documented sentinel.
+- **the sentinel is per-function, not "negative".** `lseek` returns a file offset, and its failure value is exactly `-1`; testing the sign would be a different predicate that happens to agree today.
+
+The layer's outward contract is unchanged — a count or descriptor on success, a negative errno on failure — so nothing above `std.system.os.darwin` moved.
+
+**`open`, `fcntl`, and the apple arm64 variadic ABI.** `openat` and `fcntl` are C-variadic, and apple arm64 passes *every* variadic argument on the stack with no register phase. A fixed-arity declaration lowers `mode` into `x2` while libSystem reads it off the stack — which links, runs, and creates a file with the wrong permission bits. They are declared with mach's C-variadic `ext fun` form (briar-systems/mach#2575) and, where a call needs no tail, called with none: two-argument `openat` without `O_CREAT`, and `F_GETFD` / `F_GETFL`. Passing a dummy zero would not be an equivalent spelling on that target. Every tail this layer passes is an int, never a float, which keeps `AL` at zero on the SysV x86_64 leg.
+
+**The stat family is arch-gated on `$INODE64`.** On x86_64 the plain `_fstat` is still the legacy 32-bit-`st_ino` struct and the 64-bit layout — the one `stat_t` describes — is reached through the `$INODE64` variant symbol. arm64 has only the plain name. Binding the plain name on x86_64 would link and run and quietly fill `stat_t` from a different field order, so the suffix is applied by an explicit gate and asserted in CI per architecture.
+
+**Cancellation: the plain entry points, deliberately.** libSystem exports a `$NOCANCEL` twin for every cancellation point. std has no cancellation model, never calls `pthread_cancel`, and exposes no way to, so a cancellation point never acts and the plain entry point does exactly what its twin does — while remaining the public symbol. The decision is recorded in one place rather than left to whatever the linker resolves.
+
+**Deletions.** `getcwd` was an `open(".")` + `fcntl(F_GETPATH)` dance with a `MAXPATHLEN` bounce buffer, because `F_GETPATH` carries no capacity and XNU writes up to `MAXPATHLEN` bytes whatever the caller sized its destination. `getcwd(3)` takes the capacity, so the scratch buffer, the copy loop, the `F_GETPATH` constant and `MAXPATHLEN` all go (#409, #413). The hand-written `pipe` asm in both arch modules — which existed only because the raw trap returns two descriptors in `x0`/`x1` and signals through the carry flag — collapses to one line, identical on both architectures. Fifteen `SYS_*` constants are gone.
+
+### Added
+
+#### CI runs the suite natively on both darwin architectures
+
+There was no darwin execution anywhere in this repo's CI: `cross-backends` compiles the darwin backends from linux and runs nothing. The suite now runs natively on `macos-15` (arm64) and `macos-15-intel`, matching the reasoning already applied to the arm64 linux job — a psABI fact is exactly what an emulator or a cross-build can be wrong about.
+
+The two rows are not interchangeable. The stack-passed variadic tail exists on apple arm64 and nowhere else, and the `$INODE64` suffix exists on x86_64 and nowhere else, so each divergence is invisible on the other row. CI additionally asserts that a linked darwin image names **exactly one** libSystem, at its install path — the implicit platform dependency plus a manifest entry spelled differently enough not to match it produces two `LC_LOAD_DYLIB` commands, which loads and runs and would otherwise go unnoticed.
+
+Tests assert observable effects, not return codes: a file created with `O_CREAT` is stat'd back and its mode compared **exactly** (with the umask pinned to zero, so a dropped variadic argument cannot pass), `FD_CLOEXEC` is set and read back and cleared and read back, a pipe carries bytes end to end, `lseek` reports the size the writes produced, and the claimed error paths are provoked for their **specific** errno — `EEXIST`, `ENOENT`, `EBADF`.
+
+### What is deliberately left, and why
+
+This is a partial migration and the mixed state is intentional. `read_dir` needs `getdirentries64`, which is not public API on darwin; replacing it means an `opendir`/`readdir` redesign that changes the primitive's shape rather than just its callee. The thread layer's `bsdthread_create` / `__ulock_*` is the highest-value part of this issue and carries its own risk, and it interacts with everything else here — see the follow-up issue for the ordering question it raises.
+
 ## [0.25.1] - 2026-08-07
 
 **Requires mach 4.14.0 or newer, and 4.13.0 will NOT build this.** `eq[f.type]` — the walk re-entering itself at a field's type — is a spelling mach did not accept before briar-systems/mach#2691, which landed on mach `dev` after 4.13.0 was tagged. On an older toolchain this is a **parse** error ("expected a module alias before `.`") reported against `src/derive.mach`, and because parsing precedes comptime evaluation the module's own `$mach.version` gate cannot fire ahead of it. That capability now exists: briar-systems/mach#2714 landed and shipped in mach 4.15.0, so `[project].mach` takes a semver minimum and is checked when the manifest is read, before any source is parsed.
