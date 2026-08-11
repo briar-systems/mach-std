@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.26.1] - 2026-08-10
+
+### Changed
+
+#### log: lines carry an RFC 3339 timestamp, and the level loses its brackets
+
+A log line was `[INFO] message`, which said when nothing about *when*. It is now `2026-08-10T14:03:21Z INFO message`: an RFC 3339 UTC timestamp from `std.chrono.time.now()`, then the bare level tag, then the message. The brackets are gone because the timestamp already gives the eye a fixed-width column to stop at, and two bracketed fields would fight it.
+
+The timestamp is formatted through `std.chrono.format.rfc3339` rather than a private formatter, so the wire format tracks that one definition. If the clock read or the format call fails, the line still prints — level and message first, timestamp dropped — because a log line missing its timestamp is worth more than no log line.
+
 ## [0.26.0] - 2026-08-08
 
 ### Changed
