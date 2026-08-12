@@ -267,6 +267,81 @@ pub fun write_bytes(p: Path, data: *u8, len: usize, mode: i32) O.Option[str] {
     ret e;
 }
 
+# replace a file with complete bytes through a durable sibling temporary
+#
+# missing parent directories are created before the temporary. the temporary is
+# created beside the destination with O_EXCL, flushed, and closed before rename,
+# so readers see either the old file or the complete replacement and a
+# cross-device rename cannot occur. after rename, posix also flushes the parent
+# directory so the new namespace entry survives a crash. if that final flush
+# fails, the replacement is already visible even though this function reports
+# the durability failure.
+# ---
+# a:    allocator for temporary paths
+# p:    destination path
+# data: bytes to write
+# len:  number of bytes
+# file_mode: permission bits for the replacement file
+# dir_mode:  permission bits for newly created parent directories
+# ret:       none on success, or an error
+pub fun replace_bytes_atomic(a: *A.Allocator, p: Path, data: *u8, len: usize, file_mode: i32, dir_mode: i32) O.Option[str] {
+    if (a == nil)         { ret O.some[str]("allocator is nil"); }
+    if (path.is_empty(p)) { ret O.some[str]("path is empty"); }
+    if (data == nil && len > 0) { ret O.some[str]("data is nil"); }
+
+    val pr: R.Result[Path, str] = path.parent(a, p);
+    if (R.is_err[Path, str](pr)) { ret O.some[str](R.unwrap_err[Path, str](pr)); }
+    val parent: Path = R.unwrap_ok[Path, str](pr);
+
+    val de: O.Option[str] = create_dir_all(a, parent, dir_mode);
+    if (O.is_some[str](de)) {
+        A.deallocate[u8](a, parent, str_len(parent) + 1);
+        ret de;
+    }
+
+    val tr: R.Result[TempFile, str] = sibling_temp_create(a, parent, path.filename(p), file_mode);
+    if (R.is_err[TempFile, str](tr)) {
+        A.deallocate[u8](a, parent, str_len(parent) + 1);
+        ret O.some[str](R.unwrap_err[TempFile, str](tr));
+    }
+    var temp: TempFile = R.unwrap_ok[TempFile, str](tr);
+
+    var w: m_writer.Writer = writer(temp.file);
+    val we: O.Option[str] = m_writer.write_all(?w, data, len);
+    if (O.is_some[str](we)) {
+        close(temp.file);
+        remove_file(temp.path);
+        atomic_paths_free(a, parent, temp.path);
+        ret we;
+    }
+
+    val se: O.Option[str] = sync(temp.file);
+    if (O.is_some[str](se)) {
+        close(temp.file);
+        remove_file(temp.path);
+        atomic_paths_free(a, parent, temp.path);
+        ret se;
+    }
+
+    val ce: O.Option[str] = close(temp.file);
+    if (O.is_some[str](ce)) {
+        remove_file(temp.path);
+        atomic_paths_free(a, parent, temp.path);
+        ret ce;
+    }
+
+    val re: O.Option[str] = rename(temp.path, p);
+    if (O.is_some[str](re)) {
+        remove_file(temp.path);
+        atomic_paths_free(a, parent, temp.path);
+        ret re;
+    }
+
+    val synced: O.Option[str] = sync_directory(parent);
+    atomic_paths_free(a, parent, temp.path);
+    ret synced;
+}
+
 # classify a raw stat mode into a Kind
 fun kind_from_mode(mode: u32) Kind {
     val t: u32 = mode & os.S_IFMT;
@@ -724,6 +799,90 @@ fun temp_build_path(a: *A.Allocator, prefix: str, rnd: *u8) R.Result[Path, str] 
     ret str_copy(a, (?buf[0])::str);
 }
 
+# create an exclusive temporary beside a destination
+fun sibling_temp_create(a: *A.Allocator, parent: Path, name: str, mode: i32) R.Result[TempFile, str] {
+    var attempt: usize = 0;
+    for (attempt < TEMP_MAX_ATTEMPTS) {
+        var rnd: [8]u8;
+        if (rand.fill(?rnd[0], 8) < 0) { ret R.err[TempFile, str]("entropy source failed"); }
+
+        val nr: R.Result[Path, str] = sibling_temp_name(a, name, ?rnd[0]);
+        if (R.is_err[Path, str](nr)) { ret R.err[TempFile, str](R.unwrap_err[Path, str](nr)); }
+        val temp_name: Path = R.unwrap_ok[Path, str](nr);
+
+        val jr: R.Result[Path, str] = path.join(a, parent, temp_name);
+        A.deallocate[u8](a, temp_name, str_len(temp_name) + 1);
+        if (R.is_err[Path, str](jr)) { ret R.err[TempFile, str](R.unwrap_err[Path, str](jr)); }
+        val temp_path: Path = R.unwrap_ok[Path, str](jr);
+
+        val flags: i32 = os.O_CREAT | os.O_EXCL | os.O_WRONLY;
+        val raw: i64 = os.open(os.AT_FDCWD, temp_path, flags, mode);
+        if (raw >= 0) {
+            ret R.ok[TempFile, str](TempFile{file: raw::File, path: temp_path});
+        }
+
+        A.deallocate[u8](a, temp_path, str_len(temp_path) + 1);
+        if (raw != os.EEXIST) { ret R.err[TempFile, str](os.message(raw)); }
+        attempt = attempt + 1;
+    }
+
+    ret R.err[TempFile, str]("atomic write: max temporary attempts exceeded");
+}
+
+# assemble ".<name>.tmp-<hex>" into an allocated filename
+fun sibling_temp_name(a: *A.Allocator, name: str, rnd: *u8) R.Result[Path, str] {
+    var name_len: usize = 0;
+    if (name != nil) { name_len = str_len(name); }
+    val len: usize = 1 + name_len + 5 + 16;
+
+    val ar: R.Result[*u8, str] = A.allocate[u8](a, len + 1);
+    if (R.is_err[*u8, str](ar)) { ret R.err[Path, str](R.unwrap_err[*u8, str](ar)); }
+    val buf: *u8 = R.unwrap_ok[*u8, str](ar);
+
+    var off: usize = 0;
+    buf[off] = '.';
+    off = off + 1;
+    if (name_len > 0) {
+        memory.raw_copy(?buf[off], name, name_len);
+        off = off + name_len;
+    }
+    memory.raw_copy(?buf[off], ".tmp-", 5);
+    off = off + 5;
+
+    val hex: *u8 = HEX_CHARS::*u8;
+    var i: usize = 0;
+    for (i < 8) {
+        buf[off]     = hex[rnd[i]::usize >> 4];
+        buf[off + 1] = hex[rnd[i]::usize & 0x0F];
+        off = off + 2;
+        i = i + 1;
+    }
+    buf[off] = 0;
+    ret R.ok[Path, str](buf::Path);
+}
+
+# flush a directory entry update on posix; MoveFileEx is write-through on windows
+fun sync_directory(p: Path) O.Option[str] {
+    $if ($mach.build.os == $mach.os.windows) {
+        ret O.none[str]();
+    }
+    $or {
+        val raw: i64 = os.open(os.AT_FDCWD, p, os.O_RDONLY | os.O_DIRECTORY, 0);
+        if (raw < 0) { ret O.some[str](os.message(raw)); }
+        val f: File = raw::File;
+
+        val se: O.Option[str] = sync(f);
+        val ce: O.Option[str] = close(f);
+        if (O.is_some[str](se)) { ret se; }
+        ret ce;
+    }
+}
+
+fun atomic_paths_free(a: *A.Allocator, parent: Path, temp: Path) {
+    A.deallocate[u8](a, temp, str_len(temp) + 1);
+    A.deallocate[u8](a, parent, str_len(parent) + 1);
+}
+
 # the tests exercise the real filesystem under posix literal /tmp paths (the
 # hosts that run `mach test`); each test uses a distinct name and removes
 # what it creates
@@ -743,6 +902,66 @@ test "std.filesystem.write_bytes:read_string_roundtrip" {
     if (R.is_err[str, str](r))                            { ret 1; }
     if (!str_equals(R.unwrap_ok[str, str](r), "hello, mach")) { ret 1; }
     ret 0;
+}
+
+# atomic writes create a destination, replace it whole, and leave no sibling
+# temporary behind
+test "std.filesystem.replace_bytes_atomic:create_replace_and_cleanup" {
+    var buf: [32768]u8;
+    var st: fixed.FixedState;
+    var a: A.Allocator;
+    fixed.make(?a, ?st, ?buf[0], 32768);
+
+    val d: Path = "/tmp/mach_std_fs_atomic";
+    val p: Path = "/tmp/mach_std_fs_atomic/nested/state.dat";
+    remove_all(?a, d);
+    if (O.is_some[str](replace_bytes_atomic(?a, p, "first", 5, 0o600, 0o700))) { remove_all(?a, d); ret 1; }
+    if (O.is_some[str](replace_bytes_atomic(?a, p, "second", 6, 0o600, 0o700))) { remove_all(?a, d); ret 2; }
+
+    var bad: i32 = 0;
+    val rr: R.Result[str, str] = read_string(?a, p);
+    if (R.is_err[str, str](rr)) { bad = 4; }
+    or (!str_equals(R.unwrap_ok[str, str](rr), "second")) { bad = 5; }
+
+    val lr: R.Result[Vector[str], str] = read_dir(?a, "/tmp/mach_std_fs_atomic/nested");
+    if (R.is_err[Vector[str], str](lr)) { bad = 6; }
+    or {
+        var names: Vector[str] = R.unwrap_ok[Vector[str], str](lr);
+        if (names.len != 1 || !str_equals(names.data[0], "state.dat")) { bad = 7; }
+        vector.dnit[str](?names);
+    }
+
+    remove_all(?a, d);
+    ret bad;
+}
+
+# a failed namespace replacement preserves the destination and removes the
+# completed temporary
+test "std.filesystem.replace_bytes_atomic:rename_failure_cleans_temp" {
+    var buf: [32768]u8;
+    var st: fixed.FixedState;
+    var a: A.Allocator;
+    fixed.make(?a, ?st, ?buf[0], 32768);
+
+    val d: Path = "/tmp/mach_std_fs_atomic_fail";
+    val p: Path = "/tmp/mach_std_fs_atomic_fail/destination";
+    remove_all(?a, d);
+    if (O.is_some[str](create_dir(d, 0o700))) { ret 1; }
+    if (O.is_some[str](create_dir(p, 0o700))) { remove_all(?a, d); ret 2; }
+    if (O.is_none[str](replace_bytes_atomic(?a, p, "bytes", 5, 0o600, 0o700))) { remove_all(?a, d); ret 3; }
+
+    var bad: i32 = 0;
+    if (!is_dir(p)) { bad = 4; }
+    val lr: R.Result[Vector[str], str] = read_dir(?a, d);
+    if (R.is_err[Vector[str], str](lr)) { bad = 5; }
+    or {
+        var names: Vector[str] = R.unwrap_ok[Vector[str], str](lr);
+        if (names.len != 1 || !str_equals(names.data[0], "destination")) { bad = 6; }
+        vector.dnit[str](?names);
+    }
+
+    remove_all(?a, d);
+    ret bad;
 }
 
 # read_bytes returns the exact byte count and content. read_all reserves in
