@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### process: spawned children can be force-stopped without being reaped (#470)
+
+`std.process.exec.terminate_child()` forcefully stops one `Child` while leaving
+its status available to `wait()` / `wait_any()`. The portable OS primitive uses
+`SIGKILL` after a non-reaping child-ownership check on Linux and Darwin, and
+`TerminateProcess` through the retained child handle on Windows. Unknown and
+already-reaped children return `ECHILD` instead of falling through to a raw PID
+operation that could affect a reused process ID.
+
 #### os: pipe writers can opt out of SIGPIPE termination (#468)
 
 `std.system.os.ignore_sigpipe()` installs the process-wide ignored disposition
