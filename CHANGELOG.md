@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+#### os: pipe writers can opt out of SIGPIPE termination (#468)
+
+`std.system.os.ignore_sigpipe()` installs the process-wide ignored disposition
+on Linux and Darwin, so subsequent broken-pipe writes from every thread return
+`EPIPE` instead of terminating the process. Windows exposes the same portable
+call as a successful no-op because its writes already report broken pipes as
+ordinary errors.
+
 ## [0.26.1] - 2026-08-10
 
 ### Changed
