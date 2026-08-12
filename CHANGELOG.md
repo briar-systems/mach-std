@@ -16,7 +16,9 @@ its status available to `wait()` / `wait_any()`. The portable OS primitive uses
 `SIGKILL` after a non-reaping child-ownership check on Linux and Darwin, and
 `TerminateProcess` through the retained child handle on Windows. Unknown and
 already-reaped children return `ECHILD` instead of falling through to a raw PID
-operation that could affect a reused process ID.
+operation that could affect a reused process ID. Termination and reaping of the
+same child must be serialized; a concurrent wait could release that numeric ID
+between POSIX's ownership check and signal delivery.
 
 #### os: pipe writers can opt out of SIGPIPE termination (#468)
 
