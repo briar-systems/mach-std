@@ -25,6 +25,7 @@ decode() {
         28|29) echo "the terminated second child was not waitable with force-stop status" ;;
         30) echo "failed to spawn after earlier terminate/reap cycles" ;;
         31) echo "repeated terminate/reap cycle failed" ;;
+        32) echo "an invalid child PID was not EINVAL" ;;
         *) echo "unexpected exit code $1" ;;
     esac
 }
