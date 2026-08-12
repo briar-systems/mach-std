@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### path: portable lexical normalization (#472)
+
+`std.types.path.clean()` now produces an allocator-owned, stable spelling
+without consulting the filesystem. It removes repeated separators and `.`
+segments, resolves safe `..` segments, clamps climbs at absolute roots, and
+preserves leading relative climbs. POSIX roots, Windows drive and
+drive-relative prefixes, and UNC share roots keep their identities; Windows
+accepts both separator spellings and emits `\`, while POSIX keeps `\` as a
+filename byte. The operation deliberately does not resolve symlinks, make paths
+absolute, or normalize case.
+
 #### process: spawned children can be force-stopped without being reaped (#470)
 
 `std.process.exec.terminate_child()` forcefully stops one `Child` while leaving
