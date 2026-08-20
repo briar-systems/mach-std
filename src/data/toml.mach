@@ -24,6 +24,7 @@ use std.types.string.str_len;
 
 use std.allocator.Allocator;
 use std.allocator.allocate;
+use std.allocator.deallocate;
 
 use std.memory;
 use std.allocator.page;
@@ -83,6 +84,114 @@ rec KeySegs {
     cap:  usize;
 }
 
+
+# release a string this module allocated with `alloc_str`
+#
+# `alloc_str` reserves `len + 1` bytes and null-terminates, so the length the
+# free needs is recoverable from the string itself. Written here rather than
+# reached for from `std.text.string` because the allocation is `u8`-typed and the
+# pairing must be visible beside the code that made it.
+# ---
+# a: allocator the string was allocated from
+# s: string to release; nil is a no-op
+fun free_str(a: *Allocator, s: str) {
+    if (s == nil) { ret; }
+    deallocate[u8](a, s::*u8, str_len(s) + 1);
+}
+
+# release everything a value owns, leaving the value itself untouched
+#
+# Only the three payload-bearing tags own storage. The scalars carry their value
+# inline and have nothing to release, which is why this is a dispatch rather than
+# a table.
+# ---
+# a: allocator the value was parsed with
+# v: value whose payload to release
+fun value_dnit(a: *Allocator, v: *Value) {
+    if (v == nil) { ret; }
+    if (v.tag == TYPE_STRING) { free_str(a, v.data.string); ret; }
+    if (v.tag == TYPE_TABLE)  { dnit(a, ?v.data.table); ret; }
+    if (v.tag == TYPE_ARRAY)  { array_dnit(a, ?v.data.array); ret; }
+}
+
+# release an array's elements and its backing storage
+# ---
+# a:   allocator the array was parsed with
+# arr: array to tear down; reset to empty
+fun array_dnit(a: *Allocator, arr: *Array) {
+    if (arr == nil) { ret; }
+    val items: *Value = arr.items::*Value;
+    var i: usize = 0;
+    for (i < arr.len) {
+        value_dnit(a, ?items[i]);
+        i = i + 1;
+    }
+    if (arr.items != nil && arr.cap > 0) {
+        deallocate[u8](a, arr.items::*u8, arr.cap * VALUE_SIZE);
+    }
+    arr.items = nil;
+    arr.len = 0;
+    arr.cap = 0;
+}
+
+# release a key-segment list: every segment string, then the segment array
+#
+# A segment is never adopted by a table - `table_set` stores its own copy - so
+# the list owns every segment it parsed and frees all of them, whether or not the
+# key they spell was already present.
+# ---
+# a:  allocator the segments were parsed with
+# ks: segment list to tear down; reset to empty
+fun keysegs_dnit(a: *Allocator, ks: *KeySegs) {
+    if (ks == nil) { ret; }
+    var i: usize = 0;
+    for (i < ks.len) {
+        free_str(a, ks.segs[i]);
+        i = i + 1;
+    }
+    if (ks.segs != nil && ks.cap > 0) {
+        deallocate[u8](a, ks.segs::*u8, ks.cap * 8);
+    }
+    ks.segs = nil;
+    ks.len = 0;
+    ks.cap = 0;
+}
+
+# release a parsed table and everything under it
+#
+# The teardown `parse` has always needed and never had. A `Table` owns its key
+# copies, its value payloads, and its two parallel arrays, all from the allocator
+# `parse` was handed, so one recursive walk returns the whole tree. Callers that
+# outlive a single parse - anything holding a Session across reloads - must call
+# this or the parse is a permanent allocation.
+#
+# The table is reset to the empty state rather than left dangling, so a
+# double-dnit is a no-op rather than a double free.
+# ---
+# a: allocator the table was parsed with
+# t: table to tear down; nil is a no-op
+pub fun dnit(a: *Allocator, t: *Table) {
+    if (t == nil) { ret; }
+    val keys: *str = t.keys::*str;
+    val vals: *Value = t.values::*Value;
+    var i: usize = 0;
+    for (i < t.len) {
+        free_str(a, keys[i]);
+        value_dnit(a, ?vals[i]);
+        i = i + 1;
+    }
+    if (t.keys != nil && t.cap > 0) {
+        deallocate[u8](a, t.keys::*u8, t.cap * 8);
+    }
+    if (t.values != nil && t.cap > 0) {
+        deallocate[u8](a, t.values::*u8, t.cap * VALUE_SIZE);
+    }
+    t.keys = nil;
+    t.values = nil;
+    t.len = 0;
+    t.cap = 0;
+}
+
 # create an empty table with nil backing storage
 fun table_make() Table {
     var t: Table;
@@ -105,17 +214,26 @@ fun table_set(a: *Allocator, t: *Table, key: str, val_: Value) Result[bool, str]
         ret err[bool, str]("nil argument");
     }
 
-    # overwrite existing key
+    # overwrite existing key: the table keeps the key copy it already owns and
+    # releases the value being displaced, so a re-set never strands the old one
     val keys: *str = t.keys::*str;
     val vals: *Value = t.values::*Value;
     var i: usize = 0;
     for (i < t.len) {
         if (str_equals(keys[i], key)) {
+            value_dnit(a, ?vals[i]);
             vals[i] = val_;
             ret ok[bool, str](true);
         }
         i = i + 1;
     }
+
+    # the table owns its keys, so it stores a copy rather than adopting the
+    # caller's string. one rule for every insert path: the caller frees what it
+    # passed, whether or not the key was already present
+    val kd: Result[str, str] = alloc_str(a, key, 0, str_len(key));
+    if (is_err[str, str](kd)) { ret err[bool, str](unwrap_err[str, str](kd)); }
+    val owned_key: str = unwrap_ok[str, str](kd);
 
     # grow parallel arrays if at capacity
     if (t.len >= t.cap) {
@@ -140,6 +258,12 @@ fun table_set(a: *Allocator, t: *Table, key: str, val_: Value) Result[bool, str]
             memory.raw_copy(new_keys::ptr, t.keys, t.len * 8);
             memory.raw_copy(new_vals::ptr, t.values, t.len * VALUE_SIZE);
         }
+        if (t.keys != nil && t.cap > 0) {
+            deallocate[u8](a, t.keys::*u8, t.cap * 8);
+        }
+        if (t.values != nil && t.cap > 0) {
+            deallocate[u8](a, t.values::*u8, t.cap * VALUE_SIZE);
+        }
 
         t.keys = new_keys::ptr;
         t.values = new_vals::ptr;
@@ -148,7 +272,7 @@ fun table_set(a: *Allocator, t: *Table, key: str, val_: Value) Result[bool, str]
 
     val keys2: *str = t.keys::*str;
     val vals2: *Value = t.values::*Value;
-    keys2[t.len] = key;
+    keys2[t.len] = owned_key;
     vals2[t.len] = val_;
     t.len = t.len + 1;
     ret ok[bool, str](true);
@@ -234,6 +358,9 @@ fun array_push(a: *Allocator, arr: *Array, val_: Value) Result[bool, str] {
         if (arr.len > 0) {
             memory.raw_copy(new_items::ptr, arr.items, arr.len * VALUE_SIZE);
         }
+        if (arr.items != nil && arr.cap > 0) {
+            deallocate[u8](a, arr.items::*u8, arr.cap * VALUE_SIZE);
+        }
 
         arr.items = new_items::ptr;
         arr.cap = new_cap;
@@ -276,6 +403,9 @@ fun keysegs_push(a: *Allocator, ks: *KeySegs, seg: str) Result[bool, str] {
         val new_segs: *str = unwrap_ok[*u8, str](r)::*str;
         if (ks.len > 0) {
             memory.raw_copy(new_segs::ptr, ks.segs::ptr, ks.len * 8);
+        }
+        if (ks.segs != nil && ks.cap > 0) {
+            deallocate[u8](a, ks.segs::*u8, ks.cap * 8);
         }
         ks.segs = new_segs;
         ks.cap = new_cap;
@@ -1243,6 +1373,7 @@ fun parse_array_value(a: *Allocator, src: str, i: *usize) Result[Value, str] {
 fun parse_inline_table(a: *Allocator, src: str, i: *usize) Result[Value, str] {
     @i = @i + 1;
     var t: Table = table_make();
+    var ks: KeySegs = keysegs_make();
 
     skip_ws(src, i);
     if (src[@i] == '}') {
@@ -1250,25 +1381,49 @@ fun parse_inline_table(a: *Allocator, src: str, i: *usize) Result[Value, str] {
         ret ok[Value, str](value_table(t));
     }
 
+    val r: Result[bool, str] = parse_inline_entries(a, src, i, ?t, ?ks);
+    keysegs_dnit(a, ?ks);
+    if (is_err[bool, str](r)) {
+        dnit(a, ?t);
+        ret err[Value, str](unwrap_err[bool, str](r));
+    }
+    ret ok[Value, str](value_table(t));
+}
+
+# the inline table's entry loop, split out for the same reason `parse_walk` is:
+# `t` and `ks` are owned by the caller, so an error return here cannot strand the
+# partially built table or the key path in flight
+# ---
+# a:   allocator for parsed storage
+# src: document text
+# i:   cursor, positioned after the opening brace
+# t:   the inline table being built
+# ks:  scratch key-path segments, owned by the caller
+# ret: true when the closing brace was consumed, or the parse error
+fun parse_inline_entries(a: *Allocator, src: str, i: *usize, t: *Table, ks: *KeySegs) Result[bool, str] {
     for {
         skip_ws(src, i);
 
+        keysegs_dnit(a, ks);
         val ksr: Result[KeySegs, str] = parse_key_path(a, src, i);
-        if (is_err[KeySegs, str](ksr)) { ret err[Value, str](unwrap_err[KeySegs, str](ksr)); }
-        var ks: KeySegs = unwrap_ok[KeySegs, str](ksr);
+        if (is_err[KeySegs, str](ksr)) { ret err[bool, str](unwrap_err[KeySegs, str](ksr)); }
+        @ks = unwrap_ok[KeySegs, str](ksr);
 
         skip_ws(src, i);
-        if (src[@i] != '=') { ret err[Value, str]("expected '=' in inline table"); }
+        if (src[@i] != '=') { ret err[bool, str]("expected '=' in inline table"); }
         @i = @i + 1;
 
         val vr: Result[Value, str] = parse_value(a, src, i);
-        if (is_err[Value, str](vr)) { ret vr; }
+        if (is_err[Value, str](vr)) { ret err[bool, str](unwrap_err[Value, str](vr)); }
 
-        val nr: Result[*Table, str] = navigate_segs(a, ?t, ?ks);
-        if (is_err[*Table, str](nr)) { ret err[Value, str](unwrap_err[*Table, str](nr)); }
+        val nr: Result[*Table, str] = navigate_segs(a, t, ks);
+        if (is_err[*Table, str](nr)) {
+            value_dnit(a, ?unwrap_ok[Value, str](vr));
+            ret err[bool, str](unwrap_err[*Table, str](nr));
+        }
 
         val sr: Result[bool, str] = table_set(a, unwrap_ok[*Table, str](nr), ks.segs[ks.len - 1], unwrap_ok[Value, str](vr));
-        if (is_err[bool, str](sr)) { ret err[Value, str](unwrap_err[bool, str](sr)); }
+        if (is_err[bool, str](sr)) { ret err[bool, str](unwrap_err[bool, str](sr)); }
 
         skip_ws(src, i);
         if (src[@i] == ',') {
@@ -1280,10 +1435,10 @@ fun parse_inline_table(a: *Allocator, src: str, i: *usize) Result[Value, str] {
             brk;
         }
 
-        ret err[Value, str]("expected ',' or '}' in inline table");
+        ret err[bool, str]("expected ',' or '}' in inline table");
     }
 
-    ret ok[Value, str](value_table(t));
+    ret ok[bool, str](true);
 }
 
 # resolve a [[key]] header
@@ -1378,8 +1533,33 @@ pub fun parse(a: *Allocator, src: str) Result[Table, str] {
         ret err[Table, str]("source is nil");
     }
 
+    # the two owned values the walk builds are held HERE, so every failure inside
+    # it releases them on the way out. the walk itself only reports the failure -
+    # it never has to unwind, and a new error return cannot forget to (#3001)
     var root: Table = table_make();
-    var current: *Table = ?root;
+    var ks: KeySegs = keysegs_make();
+    val r: Result[bool, str] = parse_walk(a, src, ?root, ?ks);
+    keysegs_dnit(a, ?ks);
+    if (is_err[bool, str](r)) {
+        dnit(a, ?root);
+        ret err[Table, str](unwrap_err[bool, str](r));
+    }
+    ret ok[Table, str](root);
+}
+
+# the document walk: table headers, arrays of tables, and key/value lines
+#
+# `root` and `ks` are borrowed from `parse`, which owns and releases them however
+# this returns. `ks` is reused across every key path rather than being created
+# per line, and each reuse releases the previous path first.
+# ---
+# a:    allocator for parsed storage
+# src:  document text
+# root: the table being built
+# ks:   scratch key-path segments, owned by the caller
+# ret:  true when the document was consumed, or the parse error
+fun parse_walk(a: *Allocator, src: str, root: *Table, ks: *KeySegs) Result[bool, str] {
+    var current: *Table = root;
     var i: usize = 0;
 
     for {
@@ -1391,18 +1571,19 @@ pub fun parse(a: *Allocator, src: str) Result[Table, str] {
             i = i + 2;
             skip_ws(src, ?i);
 
+            keysegs_dnit(a, ks);
             val ksr: Result[KeySegs, str] = parse_key_path(a, src, ?i);
-            if (is_err[KeySegs, str](ksr)) { ret err[Table, str](unwrap_err[KeySegs, str](ksr)); }
-            var ks: KeySegs = unwrap_ok[KeySegs, str](ksr);
+            if (is_err[KeySegs, str](ksr)) { ret err[bool, str](unwrap_err[KeySegs, str](ksr)); }
+            @ks = unwrap_ok[KeySegs, str](ksr);
 
             skip_ws(src, ?i);
             if (src[i] != ']' || src[i + 1] != ']') {
-                ret err[Table, str]("expected ']]'");
+                ret err[bool, str]("expected ']]'");
             }
             i = i + 2;
 
-            val tr: Result[*Table, str] = navigate_for_array_table(a, ?root, ?ks);
-            if (is_err[*Table, str](tr)) { ret err[Table, str](unwrap_err[*Table, str](tr)); }
+            val tr: Result[*Table, str] = navigate_for_array_table(a, root, ks);
+            if (is_err[*Table, str](tr)) { ret err[bool, str](unwrap_err[*Table, str](tr)); }
             current = unwrap_ok[*Table, str](tr);
 
             skip_to_newline(src, ?i);
@@ -1414,21 +1595,22 @@ pub fun parse(a: *Allocator, src: str) Result[Table, str] {
             i = i + 1;
             skip_ws(src, ?i);
 
+            keysegs_dnit(a, ks);
             val ksr: Result[KeySegs, str] = parse_key_path(a, src, ?i);
-            if (is_err[KeySegs, str](ksr)) { ret err[Table, str](unwrap_err[KeySegs, str](ksr)); }
-            var ks: KeySegs = unwrap_ok[KeySegs, str](ksr);
+            if (is_err[KeySegs, str](ksr)) { ret err[bool, str](unwrap_err[KeySegs, str](ksr)); }
+            @ks = unwrap_ok[KeySegs, str](ksr);
 
             skip_ws(src, ?i);
             if (src[i] != ']') {
-                ret err[Table, str]("expected ']'");
+                ret err[bool, str]("expected ']'");
             }
             i = i + 1;
 
-            var target: *Table = ?root;
+            var target: *Table = root;
             var si: usize = 0;
             for (si < ks.len) {
                 val tr: Result[*Table, str] = table_ensure_subtable(a, target, ks.segs[si]);
-                if (is_err[*Table, str](tr)) { ret err[Table, str](unwrap_err[*Table, str](tr)); }
+                if (is_err[*Table, str](tr)) { ret err[bool, str](unwrap_err[*Table, str](tr)); }
                 target = unwrap_ok[*Table, str](tr);
                 si = si + 1;
             }
@@ -1439,29 +1621,30 @@ pub fun parse(a: *Allocator, src: str) Result[Table, str] {
         }
 
         # key = value
+        keysegs_dnit(a, ks);
         val ksr: Result[KeySegs, str] = parse_key_path(a, src, ?i);
-        if (is_err[KeySegs, str](ksr)) { ret err[Table, str](unwrap_err[KeySegs, str](ksr)); }
-        var ks: KeySegs = unwrap_ok[KeySegs, str](ksr);
+        if (is_err[KeySegs, str](ksr)) { ret err[bool, str](unwrap_err[KeySegs, str](ksr)); }
+        @ks = unwrap_ok[KeySegs, str](ksr);
 
         skip_ws(src, ?i);
         if (src[i] != '=') {
-            ret err[Table, str]("expected '='");
+            ret err[bool, str]("expected '='");
         }
         i = i + 1;
 
         val vr: Result[Value, str] = parse_value(a, src, ?i);
-        if (is_err[Value, str](vr)) { ret err[Table, str](unwrap_err[Value, str](vr)); }
+        if (is_err[Value, str](vr)) { ret err[bool, str](unwrap_err[Value, str](vr)); }
 
-        val nr: Result[*Table, str] = navigate_segs(a, current, ?ks);
-        if (is_err[*Table, str](nr)) { ret err[Table, str](unwrap_err[*Table, str](nr)); }
+        val nr: Result[*Table, str] = navigate_segs(a, current, ks);
+        if (is_err[*Table, str](nr)) { ret err[bool, str](unwrap_err[*Table, str](nr)); }
 
         val sr: Result[bool, str] = table_set(a, unwrap_ok[*Table, str](nr), ks.segs[ks.len - 1], unwrap_ok[Value, str](vr));
-        if (is_err[bool, str](sr)) { ret err[Table, str](unwrap_err[bool, str](sr)); }
+        if (is_err[bool, str](sr)) { ret err[bool, str](unwrap_err[bool, str](sr)); }
 
         skip_to_newline(src, ?i);
     }
 
-    ret ok[Table, str](root);
+    ret ok[bool, str](true);
 }
 
 # float regression tests (#278). these exercise the f64 paths that transit
@@ -1520,5 +1703,129 @@ test "toml: float with negative exponent (apply_pow10 divide)" {
     if (!is_some[f64](o)) { ret 2; }
     val v: f64 = unwrap[f64](o);
     if (v < 0.0149 || v > 0.0151) { ret 3; }
+    ret 0;
+}
+
+# teardown tests (#474). `parse` allocates the whole tree from the caller's
+# allocator and `dnit` is its pairing, so the property worth asserting is a
+# BALANCE rather than any particular call: a parse followed by a teardown must
+# leave the allocator exactly where it started. Measured through a counting
+# allocator, since nothing about a leak is visible from the returned value.
+
+rec CountingAlloc {
+    backing: Allocator;
+    live:    i64;
+}
+
+fun counting_allocate(ctx: ptr, size: usize, align: usize) Option[ptr] {
+    val c: *CountingAlloc = ctx::*CountingAlloc;
+    val r: Option[ptr] = c.backing.fn_allocate(c.backing.ctx, size, align);
+    if (is_some[ptr](r)) { c.live = c.live + size::i64; }
+    ret r;
+}
+
+fun counting_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) Option[ptr] {
+    val c: *CountingAlloc = ctx::*CountingAlloc;
+    val r: Option[ptr] = c.backing.fn_reallocate(c.backing.ctx, p, old_size, new_size, align);
+    if (is_some[ptr](r)) { c.live = c.live - old_size::i64 + new_size::i64; }
+    ret r;
+}
+
+fun counting_deallocate(ctx: ptr, p: ptr, size: usize, align: usize) i64 {
+    val c: *CountingAlloc = ctx::*CountingAlloc;
+    c.live = c.live - size::i64;
+    ret c.backing.fn_deallocate(c.backing.ctx, p, size, align);
+}
+
+fun counting_make(c: *CountingAlloc, a: *Allocator) bool {
+    if (is_some[str](page.make(?c.backing))) { ret false; }
+    c.live          = 0;
+    a.ctx           = c::ptr;
+    a.fn_allocate   = counting_allocate;
+    a.fn_reallocate = counting_reallocate;
+    a.fn_deallocate = counting_deallocate;
+    ret true;
+}
+
+# a document covering every construct that owns storage: nested tables through a
+# dotted key, an array of tables, an inline table, arrays of each scalar type, and
+# enough keys in one table to force the parallel arrays to grow past their initial
+# capacity (which is where the old code stranded the buffer it replaced)
+fun teardown_doc() str {
+    ret "title = \"demo\"\nk1 = 1\nk2 = 2\nk3 = 3\nk4 = 4\nk5 = 5\nk6 = 6\nk7 = 7\nk8 = 8\nk9 = 9\nk10 = 10\n\n[owner]\nname = \"someone\"\nnums = [1, 2, 3, 4, 5, 6, 7, 8]\nstrs = [\"a\", \"bb\", \"ccc\"]\nflag = true\nratio = 1.5\n\n[deep.nested.table]\nx = \"y\"\n\n[[items]]\nid = 1\ntag = \"first\"\n\n[[items]]\nid = 2\ntag = \"second\"\n\n[inline]\npair = { a = 1, b = \"two\", c = [3, 4] }\n";
+}
+
+test "toml: parse then dnit returns every byte" {
+    var c: CountingAlloc;
+    var a: Allocator;
+    if (!counting_make(?c, ?a)) { ret 1; }
+
+    val r: Result[Table, str] = parse(?a, teardown_doc());
+    if (is_err[Table, str](r)) { ret 2; }
+    var t: Table = unwrap_ok[Table, str](r);
+    if (c.live == 0) { ret 3; }   # the parse must actually have allocated
+
+    dnit(?a, ?t);
+    if (c.live != 0) { ret 4; }
+    if (t.len != 0 || t.keys != nil || t.values != nil) { ret 5; }
+
+    # a second teardown is a no-op, not a double free
+    dnit(?a, ?t);
+    if (c.live != 0) { ret 6; }
+    ret 0;
+}
+
+test "toml: repeated parse and dnit is steady state" {
+    var c: CountingAlloc;
+    var a: Allocator;
+    if (!counting_make(?c, ?a)) { ret 1; }
+
+    var i: i32 = 0;
+    for (i < 8) {
+        val r: Result[Table, str] = parse(?a, teardown_doc());
+        if (is_err[Table, str](r)) { ret 2; }
+        var t: Table = unwrap_ok[Table, str](r);
+        dnit(?a, ?t);
+        if (c.live != 0) { ret 3; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# a document that fails partway must not strand what it built before failing.
+# this is the shape an editor hits: a manifest is re-parsed on every keystroke and
+# is transiently invalid for most of them
+test "toml: a failed parse strands nothing" {
+    var c: CountingAlloc;
+    var a: Allocator;
+    if (!counting_make(?c, ?a)) { ret 1; }
+
+    var i: i32 = 0;
+    for (i < 8) {
+        # valid prefix, then an unterminated table header
+        val r: Result[Table, str] = parse(?a,
+            "a = 1\nb = \"two\"\n[sect]\nc = [1, 2, 3]\n[unterminated\n");
+        if (!is_err[Table, str](r)) { ret 2; }
+        if (c.live != 0) { ret 3; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# the key a caller hands to the parser is never adopted, so a document that sets
+# the same key twice releases the loser rather than keeping both
+test "toml: an overwritten key and value are released" {
+    var c: CountingAlloc;
+    var a: Allocator;
+    if (!counting_make(?c, ?a)) { ret 1; }
+
+    val r: Result[Table, str] = parse(?a,
+        "dup = \"first value here\"\ndup = \"second value here\"\ndup = [1, 2, 3]\ndup = { x = \"y\" }\n");
+    if (is_err[Table, str](r)) { ret 2; }
+    var t: Table = unwrap_ok[Table, str](r);
+    if (table_len(?t) != 1) { ret 3; }
+
+    dnit(?a, ?t);
+    if (c.live != 0) { ret 4; }
     ret 0;
 }
