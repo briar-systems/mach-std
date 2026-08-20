@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### data(toml): `dnit` releases a parsed table (#474)
+
+`toml.parse` had no pairing. It allocates the table, its key copies, its string
+values, and the backing arrays of every nested table and array, and nothing
+returned any of it, so **every parse was a permanent allocation**. Invisible in a
+one-shot process, unbounded in anything that parses twice: a retained compiler
+session was growing ~7.4 MiB per manifest reload
+(briar-systems/mach#3001), and the parsed table was 96% of it.
+
+`dnit(a, t)` walks the tree once, releasing keys, value payloads, and both
+parallel arrays, and resets the table to empty so a second call is a no-op rather
+than a double free.
+
+### Fixed
+
+#### data(toml): table ownership is one rule instead of four (#474)
+
+Three ownership defects sat behind the missing teardown, each of them a leak on
+an ordinary successful parse.
+
+**Growth stranded the buffer it replaced.** `table_set`, `array_push`, and
+`keysegs_push` allocated a new array, copied into it, and reassigned the field
+without releasing the old one, so every doubling leaked the previous array.
+
+**Whether a key was adopted depended on the path taken.** `table_set` took
+ownership of the caller's key when the key was new and stranded it on the
+overwrite path; `table_ensure_subtable` stranded its key whenever the subtable
+already existed. No caller could tell which had happened, so no caller could be
+correct. **A table now stores a copy of its key**, which makes the rule sayable in
+one sentence: the caller keeps and frees what it passed, always.
+
+**The overwrite path stranded the value it displaced.** Setting an existing key
+overwrote a `Value` that may own a string, a table, or an array, releasing none of
+it.
+
+`parse` and `parse_inline_table` are also restructured so the owned values live in
+the caller and the walk below only reports failure. A parse that fails partway now
+releases the partial tree on every error return rather than each new return having
+to remember to - which matters for an editor, where a file being typed into is
+invalid for most keystrokes.
+
+The four new tests assert a **balance** rather than any particular call: parse and
+tear down through a counting allocator and the allocator must end exactly where it
+started, across repeated cycles, on a failed parse, and over a document that
+overwrites the same key with each value kind.
+
+### Added
+
 #### process: spawned children can be force-stopped without being reaped (#470)
 
 `std.process.exec.terminate_child()` forcefully stops one `Child` while leaving
