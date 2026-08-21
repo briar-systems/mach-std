@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.0] - 2026-08-21
+
+### Added
+
+#### types(path): `clean` normalizes a path lexically (#472)
+
+`path.clean(a, p)` collapses `.`, resolves safe `..`, squashes separator runs, and
+emits the target's native separator - without touching the filesystem.
+
+**Purely lexical is the contract, not a limitation.** Two spellings that clean to the
+same bytes name the same path *as written*, which is the identity an editor overlay
+needs: a compiler composes `<root>/./src/f.mach` from a manifest's `src = "./src"`
+while the editor supplies `<root>/src/f.mach`, and the unsaved buffer is missed unless
+those compare equal (briar-systems/mach#2998, briar-systems/mach-lsp#141). Resolving
+symlinks is a different, I/O-bearing question.
+
+The root is preserved and never climbed through - a POSIX `/`, a drive `C:\`, a UNC
+`\\server\share` - so a `..` that would escape one is dropped. A **relative** path
+keeps its leading `..`: there is nothing above it to cancel against, so `../a/../b`
+cleans to `../b` rather than `b`.
+
+Separators go in either way on Windows, where `/` and `\` both separate, and come out
+native - which is what lets a compiler's forward-slash spelling and an editor's
+backslash one meet at one canonical result.
+
+An embedded NUL is not representable: `Path` is a null-terminated `str`, so a path
+ends at its first NUL by construction and there is nothing to reject. Stated because
+the question is a real one for a byte-oriented normalizer, and the answer is a
+property of the type.
+
 ## [0.27.0] - 2026-08-20
 
 ### Added
