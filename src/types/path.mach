@@ -36,6 +36,8 @@ use std.types.string.str_equals;
 use std.memory;
 use std.allocator;
 use std.allocator.fixed;
+use std.allocator.page;
+use std.allocator.Allocator;
 use std.system.os;
 
 use R: std.types.result;
@@ -403,7 +405,138 @@ pub fun resolve(a: *allocator.Allocator, base: Path, p: Path) R.Result[Path, str
     ret join(a, base, p);
 }
 
+# lexically normalize a path: collapse `.`, resolve safe `..`, and squash
+# separator runs, without touching the filesystem (mach#2998, mach-lsp#141)
+#
+# PURELY LEXICAL, and that is the contract rather than a limitation. No `stat`, no
+# symlink resolution, no current-directory lookup - two spellings that clean to the
+# same bytes name the same path *as written*, which is exactly the identity an editor
+# overlay needs: the compiler composes `<root>/./src/f.mach` from a manifest's
+# `src = "./src"` while the editor supplies `<root>/src/f.mach`, and the buffer is
+# missed unless those two compare equal. Resolving symlinks would be a different
+# (and I/O-bearing) question.
+#
+# THE ROOT IS PRESERVED, NEVER CLIMBED THROUGH. `root_len` already knows what a root
+# is on this target - a POSIX `/`, a drive `C:\`, a UNC `\\server\share` - so a `..`
+# that would escape one is dropped, the way every real path resolver behaves. A
+# RELATIVE path keeps its leading `..` segments, because there is nothing above it to
+# cancel them against yet; `../a/../b` cleans to `../b`, not `b`.
+#
+# SEPARATORS COME OUT NATIVE, and go in either way on windows. `is_separator` accepts
+# both `/` and `\` there, which is what lets a compiler-produced forward-slash
+# spelling and an editor's backslash one meet; the output uses `separator()` so the
+# result is one canonical spelling rather than whichever the caller happened to pass.
+#
+# EMBEDDED NUL IS NOT REPRESENTABLE. `Path` is a null-terminated `str`, so a path ends
+# at its first NUL by construction and there is nothing to reject - stated here
+# because the question is a real one for a byte-oriented normalizer and the answer is
+# a property of the type rather than of this function.
+#
+# An empty result is spelled `.`, so the return is always a usable path.
+# ---
+# a: allocator for the returned path
+# p: the path to normalize
+# ret: the cleaned path, or an allocation error
+pub fun clean(a: *allocator.Allocator, p: Path) R.Result[Path, str] {
+    if (is_empty(p)) { ret clone_dot(a); }
+
+    val len: usize = str_len(p);
+
+    # the root prefix this path may not climb above
+    var rl: usize = root_len(p);
+    var rooted: bool = false;
+    if (rl > 0) { rooted = is_abs(p); }
+    or {
+        if (is_separator(p[0])) { rl = 1; rooted = true; }
+    }
+
+    # the output can never exceed the input, except for the lone `.` case
+    val br: R.Result[*u8, str] = allocator.allocate[u8](a, len + 2);
+    if (R.is_err[*u8, str](br)) { ret R.err[Path, str](R.unwrap_err[*u8, str](br)); }
+    val out: *u8 = R.unwrap_ok[*u8, str](br);
+
+    # where each kept segment begins in `out`, so a `..` can pop one
+    var seg_cap: usize = len / 2 + 2;
+    val sr: R.Result[*usize, str] = allocator.allocate[usize](a, seg_cap);
+    if (R.is_err[*usize, str](sr)) {
+        allocator.deallocate[u8](a, out, len + 2);
+        ret R.err[Path, str](R.unwrap_err[*usize, str](sr));
+    }
+    val starts: *usize = R.unwrap_ok[*usize, str](sr);
+    var nseg: usize = 0;
+
+    # copy the root prefix, normalizing its separators to the native one
+    var w: usize = 0;
+    var i: usize = 0;
+    for (i < rl) {
+        if (is_separator(p[i])) { out[w] = separator(); }
+        or                      { out[w] = p[i]; }
+        w = w + 1;
+        i = i + 1;
+    }
+    val prefix_end: usize = w;
+
+    for (i < len) {
+        # skip a run of separators
+        if (is_separator(p[i])) { i = i + 1; cnt; }
+
+        # measure this segment
+        var j: usize = i;
+        for (j < len && !is_separator(p[j])) { j = j + 1; }
+        val slen: usize = j - i;
+
+        if (slen == 1 && p[i] == '.') { i = j; cnt; }
+
+        if (slen == 2 && p[i] == '.' && p[i + 1] == '.') {
+            if (nseg > 0) {
+                # pop the last kept segment
+                nseg = nseg - 1;
+                w = starts[nseg];
+                # drop the separator that preceded it, unless that is the root
+                if (w > prefix_end) { w = w - 1; }
+            }
+            or (!rooted) {
+                # nothing to cancel against and no root above: the climb is real
+                if (w > prefix_end) { out[w] = separator(); w = w + 1; }
+                out[w] = '.'; w = w + 1;
+                out[w] = '.'; w = w + 1;
+                # a kept `..` is not poppable by a later one, so it is not pushed
+            }
+            # rooted with nothing to pop: `..` above the root is dropped
+            i = j;
+            cnt;
+        }
+
+        # an ordinary segment
+        if (w > prefix_end) { out[w] = separator(); w = w + 1; }
+        if (nseg < seg_cap) { starts[nseg] = w; nseg = nseg + 1; }
+        var k: usize = 0;
+        for (k < slen) { out[w] = p[i + k]; w = w + 1; k = k + 1; }
+        i = j;
+    }
+
+    allocator.deallocate[usize](a, starts, seg_cap);
+
+    if (w == 0) {
+        allocator.deallocate[u8](a, out, len + 2);
+        ret clone_dot(a);
+    }
+    out[w] = 0;
+    ret R.ok[Path, str](out::str);
+}
+
+# the one-byte relative path `.`
+fun clone_dot(a: *allocator.Allocator) R.Result[Path, str] {
+    val r: R.Result[*u8, str] = allocator.allocate[u8](a, 2);
+    if (R.is_err[*u8, str](r)) { ret R.err[Path, str](R.unwrap_err[*u8, str](r)); }
+    val buf: *u8 = R.unwrap_ok[*u8, str](r);
+    buf[0] = '.';
+    buf[1] = 0;
+    ret R.ok[Path, str](buf::str);
+}
+
 # clone a single separator byte as a null-terminated path
+
 fun clone_sep(a: *allocator.Allocator, sep: u8) R.Result[Path, str] {
     val r: R.Result[*u8, str] = allocator.allocate[u8](a, 2);
     if (R.is_err[*u8, str](r)) {
@@ -612,4 +745,120 @@ test "std.types.path.resolve:abs_verbatim_rel_joined" {
     if (!str_equals(R.unwrap_ok[Path, str](resolve(?a, "/base", "/abs")), "/abs"))     { ret 1; }
     if (!str_equals(R.unwrap_ok[Path, str](resolve(?a, "/base", "rel")), "/base/rel")) { ret 1; }
     ret 0;
+}
+
+# lexical normalization (mach#2998).
+#
+# The cases are the ones an editor overlay actually produces: a manifest's `./src`
+# against an editor's canonical spelling, a `..` that must cancel, a `..` that must
+# NOT cancel because there is nothing above it yet, and a `..` that must not climb
+# out of a root.
+test "path: clean collapses dot and separator runs" {
+    var a: Allocator;
+    page.make(?a);
+
+    if (!clean_is(?a, "./src", "src"))                 { ret 1; }
+    if (!clean_is(?a, "a/./b", "a/b"))                 { ret 2; }
+    if (!clean_is(?a, "a//b", "a/b"))                  { ret 3; }
+    if (!clean_is(?a, "a/b/", "a/b"))                  { ret 4; }
+    if (!clean_is(?a, "./a/././b//", "a/b"))           { ret 5; }
+
+    # the compiler's own shape: `<root>/./src/f.mach` must equal the editor's
+    if (!clean_is(?a, "/r/./src/f.mach", "/r/src/f.mach")) { ret 6; }
+    ret 0;
+}
+
+test "path: clean resolves dot-dot without leaving the root" {
+    var a: Allocator;
+    page.make(?a);
+
+    if (!clean_is(?a, "a/../b", "b"))          { ret 1; }
+    if (!clean_is(?a, "a/b/../c", "a/c"))      { ret 2; }
+    if (!clean_is(?a, "a/b/../../c", "c"))     { ret 3; }
+
+    # A RELATIVE PATH KEEPS A LEADING CLIMB: there is nothing above it to cancel
+    # against, so dropping these would change which directory the path names.
+    if (!clean_is(?a, "../a", "../a"))         { ret 4; }
+    if (!clean_is(?a, "../a/../b", "../b"))    { ret 5; }
+    if (!clean_is(?a, "../../a", "../../a"))   { ret 6; }
+    # a climb that cancels a real segment first, then keeps going
+    if (!clean_is(?a, "a/../../b", "../b"))    { ret 7; }
+
+    # AN ABSOLUTE PATH CANNOT CLIMB OUT: `/..` is `/`, as every resolver behaves.
+    if (!clean_is(?a, "/../a", "/a"))          { ret 8; }
+    if (!clean_is(?a, "/a/../../b", "/b"))     { ret 9; }
+    ret 0;
+}
+
+test "path: clean degenerate and root inputs" {
+    var a: Allocator;
+    page.make(?a);
+
+    # an empty result is spelled `.` so the return is always a usable path
+    if (!clean_is(?a, "", "."))        { ret 1; }
+    if (!clean_is(?a, ".", "."))       { ret 2; }
+    if (!clean_is(?a, "./", "."))      { ret 3; }
+    if (!clean_is(?a, "a/..", "."))    { ret 4; }
+    if (!clean_is(?a, "..", ".."))     { ret 5; }
+
+    # a root stays a root rather than becoming `.`
+    if (!clean_is(?a, "/", "/"))       { ret 6; }
+    if (!clean_is(?a, "//", "/"))      { ret 7; }
+    if (!clean_is(?a, "/.", "/"))      { ret 8; }
+    if (!clean_is(?a, "/..", "/"))     { ret 9; }
+
+    # CLEAN IS IDEMPOTENT: cleaning an already-clean path returns it unchanged,
+    # which is what lets a consumer compare two cleaned paths for identity.
+    if (!clean_is(?a, "a/b", "a/b"))   { ret 10; }
+    if (!clean_is(?a, "/a/b", "/a/b")) { ret 11; }
+    ret 0;
+}
+
+# the roots only windows has. A drive or UNC root is what `root_len` exists to
+# protect, and a `..` must not climb through one any more than through a posix `/`.
+# A bare `C:` is drive-RELATIVE, so it is not a root to be protected: `C:..` climbs
+# above the current directory on that drive exactly as `..` does.
+test "path: clean preserves windows drive and UNC roots" {
+    $if ($mach.build.os == $mach.os.windows) {
+        var a: Allocator;
+        page.make(?a);
+
+        if (!clean_is(?a, "C:/a/./b", "C:/a/b"))       { ret 1; }
+        if (!clean_is(?a, "C:/a/../b", "C:/b"))        { ret 2; }
+        # cannot climb out of a drive root
+        if (!clean_is(?a, "C:/../a", "C:/a"))          { ret 3; }
+        if (!clean_is(?a, "C:/", "C:/"))               { ret 4; }
+        # a forward-slash spelling comes back native, which is the whole point for a
+        # compiler-produced path meeting an editor-produced one
+        if (!clean_is(?a, "C:/a/b", "C:/a/b"))         { ret 5; }
+
+        # UNC: the whole `\\server\share` is one indivisible root
+        if (!clean_is(?a, "//server/share/a/./b", "//server/share/a/b")) { ret 6; }
+        if (!clean_is(?a, "//server/share/../a", "//server/share/a"))    { ret 7; }
+    }
+    ret 0;
+}
+
+# clean `input` and compare the result against `want`
+#
+# `want` is written with `/` and translated to the target's separator before the
+# comparison, because `clean` emits the NATIVE one - so these cases state the shape
+# they mean once and hold on every platform rather than encoding a posix spelling
+# that the windows leg would fail on.
+fun clean_is(a: *Allocator, input: str, want: str) bool {
+    val r: R.Result[Path, str] = clean(a, input);
+    if (R.is_err[Path, str](r)) { ret false; }
+    val got: Path = R.unwrap_ok[Path, str](r);
+
+    val wl: usize = str_len(want);
+    var buf: [128]u8;
+    if (wl >= 128) { ret false; }
+    var i: usize = 0;
+    for (i < wl) {
+        if (want[i] == '/') { buf[i] = separator(); }
+        or                  { buf[i] = want[i]; }
+        i = i + 1;
+    }
+    buf[wl] = 0;
+    ret str_equals(got, (?buf[0])::str);
 }
