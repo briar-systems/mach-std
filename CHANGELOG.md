@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.1] - 2026-08-21
+
+### Fixed
+
+#### types(path): a cleaned path is freed to exactly nothing (#478)
+
+`clean` worked in a buffer sized for its INPUT and returned it untrimmed, so a caller
+freeing the result with `str_free` - which releases `str_len + 1` - returned less than
+was taken and leaked the difference. Every other allocating function here reserves
+exactly `str_len + 1`; cleaning cannot know its output length until it has produced
+it, so the working buffer is now shrunk before it is handed back rather than making
+this one return value the odd one out.
+
+Caught by leak assertions one repo over (briar-systems/mach#3001), which is exactly
+how far a size mismatch travels before anyone notices - so the new test asserts the
+balance directly, through a counting allocator, on the inputs whose cleaned length
+differs most from their input length.
+
 ## [0.28.0] - 2026-08-21
 
 ### Added
