@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+#### collections(vector): deinitialization clears released storage
+
+`Vector.dnit` returned after releasing its allocation without clearing `data`,
+`len`, or `cap`. A repeated call could therefore submit the same allocation for
+deallocation again. Successful teardown now commits an empty descriptor, and a
+regression test exercises repeated teardown.
+
 ## [0.28.1] - 2026-08-21
 
 ### Fixed
