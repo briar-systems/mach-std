@@ -33,8 +33,8 @@ if ! grep -qE '[0-9]+ passed, [0-9]+ failed' "$out"; then
     exit 1
 fi
 
-# "  FAIL  <name>  ./src/...:NN  (exit 1)" -> "<name>"
-actual="$(sed -n 's/^[[:space:]]*FAIL[[:space:]]\{1,\}\(.*\)[[:space:]]\{2,\}\.\/[^[:space:]]*[[:space:]]*(exit [0-9]*)[[:space:]]*$/\1/p' "$out" \
+# "  FAIL  <name>  <relative-path>:NN  (exit 1)" -> "<name>"
+actual="$(sed -n 's/^[[:space:]]*FAIL[[:space:]]\{1,\}\([^[:space:]]*\)[[:space:]]\{2,\}[^[:space:]]*[[:space:]]*(exit [0-9]*)[[:space:]]*$/\1/p' "$out" \
           | sed 's/[[:space:]]*$//' | sort -u)"
 
 rc=0
