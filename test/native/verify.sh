@@ -38,6 +38,8 @@ required=(
     'src/net/tcp.mach'
     'src/net/udp.mach'
     'src/chrono/time.mach'
+    'src/sync/channel.mach'
+    'src/sync/worker_pool.mach'
 )
 for source in "${required[@]}"; do
     grep -qF "$source" "$list" || fail "$target omitted required tests from $source"
