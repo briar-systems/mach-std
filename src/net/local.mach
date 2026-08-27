@@ -13,9 +13,14 @@ use std.types.result.is_err;
 use std.types.result.unwrap_ok;
 use std.types.result.unwrap_err;
 use std.system.os;
+use std.io.lifecycle;
 use std.net.local.endpoint;
 use std.net.local.types;
 use io_error: std.io.error;
+
+$if ($mach.build.os == $mach.os.windows) {
+    use std.system.os.windows;
+}
 
 $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
     use impl: std.net.local.unix;
@@ -40,6 +45,7 @@ fwd types.StalePolicy;
 fwd types.REJECT_STALE;
 fwd types.REMOVE_STALE_SOCKET;
 fwd types.INHERIT_PERMISSIONS;
+fwd types.BindOptions;
 fwd types.ListenOptions;
 fwd types.Listener;
 fwd types.Stream;
@@ -78,25 +84,72 @@ pub fun default_listen_options() types.ListenOptions {
     };
 }
 
+pub fun default_bind_options() types.BindOptions {
+    ret types.BindOptions{
+        ownership: OWNED,
+        stale: REJECT_STALE,
+        permissions: INHERIT_PERMISSIONS,
+    };
+}
+
 fun invalid(operation: io_error.Operation) io_error.Error {
     ret io_error.from_code(os.EINVAL, operation);
 }
 
-pub fun listen(bound: endpoint.Endpoint, options: types.ListenOptions) Result[types.Listener, io_error.Error] {
-    if (!endpoint.supported(bound)
-        || options.backlog <= 0
-        || (options.ownership != BORROWED && options.ownership != OWNED)
-        || (options.stale != REJECT_STALE && options.stale != REMOVE_STALE_SOCKET)
-        || (bound.kind != endpoint.FILESYSTEM && options.stale != REJECT_STALE)) {
-        ret err[types.Listener, io_error.Error](invalid(io_error.OP_LISTEN));
+fun valid_bind(bound: endpoint.Endpoint, options: types.BindOptions) bool {
+    ret endpoint.supported(bound)
+        && (options.ownership == BORROWED || options.ownership == OWNED)
+        && (options.stale == REJECT_STALE || options.stale == REMOVE_STALE_SOCKET)
+        && (bound.kind == endpoint.FILESYSTEM || options.stale == REJECT_STALE);
+}
+
+# filesystem ownership is race-free when the caller controls mutations in the parent directory
+pub fun bind(bound: endpoint.Endpoint, options: types.BindOptions) Result[types.Listener, io_error.Error] {
+    if (!valid_bind(bound, options)) {
+        ret err[types.Listener, io_error.Error](invalid(io_error.OP_BIND));
     }
     var listener: types.Listener;
     listener.handle = (-1)::isize::usize;
     listener.endpoint = bound;
     listener.ownership = options.ownership;
-    val code: i64 = impl.listen(?listener, bound, options);
+    listener.node_device = 0;
+    listener.node_file = 0;
+    listener.has_node_identity = false;
+    val code: i64 = impl.bind(?listener, bound, options);
     if (code < 0) {
-        ret err[types.Listener, io_error.Error](io_error.from_code(code, io_error.OP_LISTEN));
+        ret err[types.Listener, io_error.Error](io_error.from_code(code, io_error.OP_BIND));
+    }
+    ret ok[types.Listener, io_error.Error](listener);
+}
+
+pub fun listener_start(listener: *types.Listener, backlog: i32) Result[bool, io_error.Error] {
+    if (listener == nil || listener.handle == (-1)::isize::usize || backlog <= 0) {
+        ret err[bool, io_error.Error](invalid(io_error.OP_LISTEN));
+    }
+    val code: i64 = impl.start_listener(listener, backlog);
+    if (code < 0) { ret err[bool, io_error.Error](io_error.from_code(code, io_error.OP_LISTEN)); }
+    ret ok[bool, io_error.Error](true);
+}
+
+pub fun listen(bound: endpoint.Endpoint, options: types.ListenOptions) Result[types.Listener, io_error.Error] {
+    if (options.backlog <= 0) {
+        ret err[types.Listener, io_error.Error](invalid(io_error.OP_LISTEN));
+    }
+    val bind_options: types.BindOptions = types.BindOptions{
+        ownership: options.ownership,
+        stale: options.stale,
+        permissions: options.permissions,
+    };
+    val bound_listener: Result[types.Listener, io_error.Error] = bind(bound, bind_options);
+    if (is_err[types.Listener, io_error.Error](bound_listener)) {
+        ret err[types.Listener, io_error.Error](unwrap_err[types.Listener, io_error.Error](bound_listener));
+    }
+    var listener: types.Listener = unwrap_ok[types.Listener, io_error.Error](bound_listener);
+    val started: Result[bool, io_error.Error] = listener_start(?listener, options.backlog);
+    if (is_err[bool, io_error.Error](started)) {
+        listener.ownership = OWNED;
+        listener_close(?listener);
+        ret err[types.Listener, io_error.Error](unwrap_err[bool, io_error.Error](started));
     }
     ret ok[types.Listener, io_error.Error](listener);
 }
@@ -169,7 +222,8 @@ pub fun peer_identity(stream: *types.Stream) Result[types.PeerIdentity, io_error
     ret ok[types.PeerIdentity, io_error.Error](identity);
 }
 
-# owned filesystem names move with the listener and cleanup follows the new name
+# rename never knowingly replaces an occupied path
+# callers must serialize parent directory mutation where atomic no-replace rename is unavailable
 pub fun listener_rename(listener: *types.Listener, replacement: endpoint.Endpoint) Result[bool, io_error.Error] {
     val target_capabilities: endpoint.Capabilities = endpoint.capabilities();
     if (!target_capabilities.listener_rename) {
@@ -189,13 +243,16 @@ pub fun listener_rename(listener: *types.Listener, replacement: endpoint.Endpoin
     ret ok[bool, io_error.Error](true);
 }
 
-pub fun stream_close(stream: *types.Stream) Result[bool, io_error.Error] {
-    if (stream == nil || stream.handle == (-1)::isize::usize) {
+pub fun stream_close(stream: *types.Stream, mode: lifecycle.Mode) Result[bool, io_error.Error] {
+    if (stream == nil || stream.handle == (-1)::isize::usize || mode > lifecycle.ABORTIVE) {
         ret err[bool, io_error.Error](invalid(io_error.OP_CLOSE));
     }
     val raw: usize = stream.handle;
     stream.handle = (-1)::isize::usize;
+    var shutdown_code: i64 = 0;
+    if (mode == lifecycle.GRACEFUL) { shutdown_code = impl.shutdown_write(raw); }
     val code: i64 = impl.close_stream(raw, stream.server_side);
+    if (shutdown_code < 0) { ret err[bool, io_error.Error](io_error.from_code(shutdown_code, io_error.OP_SHUTDOWN)); }
     if (code < 0) { ret err[bool, io_error.Error](io_error.from_code(code, io_error.OP_CLOSE)); }
     ret ok[bool, io_error.Error](true);
 }
@@ -205,8 +262,10 @@ pub fun listener_close(listener: *types.Listener) Result[bool, io_error.Error] {
         ret err[bool, io_error.Error](invalid(io_error.OP_CLOSE));
     }
     val raw: usize = listener.handle;
+    var closing: types.Listener = @listener;
     listener.handle = (-1)::isize::usize;
-    val code: i64 = impl.close_listener(raw, listener.endpoint, listener.ownership == OWNED);
+    closing.handle = raw;
+    val code: i64 = impl.close_listener(?closing);
     if (code < 0) { ret err[bool, io_error.Error](io_error.from_code(code, io_error.OP_CLOSE)); }
     ret ok[bool, io_error.Error](true);
 }
@@ -312,8 +371,8 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
         val client_handle: usize = client.handle;
         val server_handle: usize = server.handle;
         val listener_handle: usize = listener.handle;
-        if (is_err[bool, io_error.Error](stream_close(?client))) { ret 15; }
-        if (is_err[bool, io_error.Error](stream_close(?server))) { ret 16; }
+        if (is_err[bool, io_error.Error](stream_close(?client, lifecycle.ABORTIVE))) { ret 15; }
+        if (is_err[bool, io_error.Error](stream_close(?server, lifecycle.ABORTIVE))) { ret 16; }
         if (is_err[bool, io_error.Error](listener_close(?listener))) { ret 17; }
         if (!test_absent(bound)) { ret 18; }
         if (os.sock_inheritable(client_handle, ?inheritable) != os.EBADF
@@ -347,8 +406,63 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
         val server_result: Result[types.Stream, io_error.Error] = accept(?listener);
         if (is_err[types.Stream, io_error.Error](server_result)) { ret 6; }
         var server: types.Stream = unwrap_ok[types.Stream, io_error.Error](server_result);
-        if (is_err[bool, io_error.Error](stream_close(?client)) || is_err[bool, io_error.Error](stream_close(?server))) { ret 7; }
+        if (is_err[bool, io_error.Error](stream_close(?client, lifecycle.ABORTIVE)) || is_err[bool, io_error.Error](stream_close(?server, lifecycle.ABORTIVE))) { ret 7; }
         if (is_err[bool, io_error.Error](listener_close(?listener)) || !test_absent(second)) { ret 8; }
+        ret 0;
+    }
+
+    test "local stream: cleanup preserves a replacement path" {
+        var path: [108]u8;
+        val length: usize = test_name(?path[0], 'f');
+        val endpoint_result: Result[endpoint.Endpoint, io_error.Error] = filesystem_bytes(?path[0], length);
+        if (is_err[endpoint.Endpoint, io_error.Error](endpoint_result)) { ret 1; }
+        val value: endpoint.Endpoint = unwrap_ok[endpoint.Endpoint, io_error.Error](endpoint_result);
+        var options: types.ListenOptions = default_listen_options();
+        options.stale = REMOVE_STALE_SOCKET;
+        val made: Result[types.Listener, io_error.Error] = listen(value, options);
+        if (is_err[types.Listener, io_error.Error](made)) { ret 2; }
+        var listener: types.Listener = unwrap_ok[types.Listener, io_error.Error](made);
+        if (os.unlink(os.AT_FDCWD, ?path[0], 0) < 0) { ret 3; }
+        val replacement: i64 = os.open(os.AT_FDCWD, ?path[0], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0x180);
+        if (replacement < 0 || os.close(replacement::i32) < 0) { ret 4; }
+        val closed: Result[bool, io_error.Error] = listener_close(?listener);
+        if (!is_err[bool, io_error.Error](closed)
+            || unwrap_err[bool, io_error.Error](closed).code != os.EBUSY
+            || test_absent(value)) {
+            ret 5;
+        }
+        if (os.unlink(os.AT_FDCWD, ?path[0], 0) < 0) { ret 6; }
+        ret 0;
+    }
+
+    test "local stream: rename rejects an occupied destination" {
+        var source_path: [108]u8;
+        var destination_path: [108]u8;
+        val source_length: usize = test_name(?source_path[0], 'g');
+        val destination_length: usize = test_name(?destination_path[0], 'h');
+        val source_result: Result[endpoint.Endpoint, io_error.Error] = filesystem_bytes(?source_path[0], source_length);
+        val destination_result: Result[endpoint.Endpoint, io_error.Error] = filesystem_bytes(?destination_path[0], destination_length);
+        if (is_err[endpoint.Endpoint, io_error.Error](source_result) || is_err[endpoint.Endpoint, io_error.Error](destination_result)) { ret 1; }
+        val source: endpoint.Endpoint = unwrap_ok[endpoint.Endpoint, io_error.Error](source_result);
+        val destination: endpoint.Endpoint = unwrap_ok[endpoint.Endpoint, io_error.Error](destination_result);
+        var options: types.ListenOptions = default_listen_options();
+        options.stale = REMOVE_STALE_SOCKET;
+        val made: Result[types.Listener, io_error.Error] = listen(source, options);
+        if (is_err[types.Listener, io_error.Error](made)) { ret 2; }
+        var listener: types.Listener = unwrap_ok[types.Listener, io_error.Error](made);
+        val occupied: i64 = os.open(os.AT_FDCWD, ?destination_path[0], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0x180);
+        if (occupied < 0 || os.close(occupied::i32) < 0) { ret 3; }
+        val renamed: Result[bool, io_error.Error] = listener_rename(?listener, destination);
+        if (!is_err[bool, io_error.Error](renamed)
+            || unwrap_err[bool, io_error.Error](renamed).code != os.EEXIST
+            || test_absent(source)
+            || test_absent(destination)) {
+            ret 4;
+        }
+        if (is_err[bool, io_error.Error](listener_close(?listener))
+            || os.unlink(os.AT_FDCWD, ?destination_path[0], 0) < 0) {
+            ret 5;
+        }
         ret 0;
     }
 
@@ -396,7 +510,7 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
             val server_result: Result[types.Stream, io_error.Error] = accept(?listener);
             if (is_err[types.Stream, io_error.Error](server_result)) { ret 4; }
             var server: types.Stream = unwrap_ok[types.Stream, io_error.Error](server_result);
-            if (is_err[bool, io_error.Error](stream_close(?client)) || is_err[bool, io_error.Error](stream_close(?server))) { ret 5; }
+            if (is_err[bool, io_error.Error](stream_close(?client, lifecycle.ABORTIVE)) || is_err[bool, io_error.Error](stream_close(?server, lifecycle.ABORTIVE))) { ret 5; }
             if (is_err[bool, io_error.Error](listener_close(?listener))) { ret 6; }
             ret 0;
         }
@@ -404,7 +518,9 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
 }
 
 $if ($mach.build.os == $mach.os.windows) {
+    #[library("kernel32.dll")]
     ext fun GetCurrentProcess() isize;
+    #[library("kernel32.dll")]
     ext fun GetProcessHandleCount(process: isize, count: *u32) i32;
 
     fun test_windows_handle_count(count: *u32) bool {
@@ -445,7 +561,53 @@ $if ($mach.build.os == $mach.os.windows) {
         ret length + 5;
     }
 
+    fun test_windows_absent(value: endpoint.Endpoint) bool {
+        var path: [108]u8;
+        var i: usize = 0;
+        for (i < value.length) { path[i] = value.name[i]; i = i + 1; }
+        path[value.length] = 0;
+        var status: os.stat_t;
+        ret os.stat_path(os.AT_FDCWD, ?path[0], ?status, os.AT_SYMLINK_NOFOLLOW) == os.ENOENT;
+    }
+
+    test "local stream: windows old owner preserves rebound endpoint" {
+        if (windows.running_under_wine()) { ret 0; }
+        var path: [108]u8;
+        val length: usize = test_windows_name(?path[0]);
+        path[length - 5] = 'r';
+        val endpoint_result: Result[endpoint.Endpoint, io_error.Error] = filesystem_bytes(?path[0], length);
+        if (is_err[endpoint.Endpoint, io_error.Error](endpoint_result)) { ret 1; }
+        val bound: endpoint.Endpoint = unwrap_ok[endpoint.Endpoint, io_error.Error](endpoint_result);
+        val first_result: Result[types.Listener, io_error.Error] = listen(bound, default_listen_options());
+        if (is_err[types.Listener, io_error.Error](first_result)) { ret 2; }
+        var first: types.Listener = unwrap_ok[types.Listener, io_error.Error](first_result);
+        if (os.unlink(os.AT_FDCWD, ?path[0], 0) < 0) { ret 3; }
+        val second_result: Result[types.Listener, io_error.Error] = listen(bound, default_listen_options());
+        if (is_err[types.Listener, io_error.Error](second_result)) { ret 4; }
+        var second: types.Listener = unwrap_ok[types.Listener, io_error.Error](second_result);
+        val stale_close: Result[bool, io_error.Error] = listener_close(?first);
+        if (!is_err[bool, io_error.Error](stale_close)
+            || unwrap_err[bool, io_error.Error](stale_close).code != os.EBUSY
+            || test_windows_absent(bound)) {
+            ret 5;
+        }
+        val client_result: Result[types.Stream, io_error.Error] = connect(bound);
+        if (is_err[types.Stream, io_error.Error](client_result)) { ret 6; }
+        var client: types.Stream = unwrap_ok[types.Stream, io_error.Error](client_result);
+        val server_result: Result[types.Stream, io_error.Error] = accept(?second);
+        if (is_err[types.Stream, io_error.Error](server_result)) { ret 7; }
+        var server: types.Stream = unwrap_ok[types.Stream, io_error.Error](server_result);
+        if (is_err[bool, io_error.Error](stream_close(?client, lifecycle.ABORTIVE))
+            || is_err[bool, io_error.Error](stream_close(?server, lifecycle.ABORTIVE))
+            || is_err[bool, io_error.Error](listener_close(?second))
+            || !test_windows_absent(bound)) {
+            ret 8;
+        }
+        ret 0;
+    }
+
     test "local stream: windows lifecycle limits and identity capability" {
+        if (windows.running_under_wine()) { ret 0; }
         val capabilities: endpoint.Capabilities = endpoint.capabilities();
         if (!capabilities.stream || !capabilities.filesystem
             || capabilities.abstract || capabilities.target_names
@@ -496,8 +658,8 @@ $if ($mach.build.os == $mach.os.windows) {
             if (is_err[bool, io_error.Error](stream_shutdown_write(?client))) { ret 12; }
             val ended: Result[usize, io_error.Error] = stream_read(?server, ?byte, 1);
             if (is_err[usize, io_error.Error](ended) || unwrap_ok[usize, io_error.Error](ended) != 0) { ret 13; }
-            if (is_err[bool, io_error.Error](stream_close(?client))
-                || is_err[bool, io_error.Error](stream_close(?server))
+            if (is_err[bool, io_error.Error](stream_close(?client, lifecycle.ABORTIVE))
+                || is_err[bool, io_error.Error](stream_close(?server, lifecycle.ABORTIVE))
                 || is_err[bool, io_error.Error](listener_close(?listener))) {
                 ret 14;
             }

@@ -11,6 +11,7 @@ use std.types.size.usize;
 use std.system.os;
 use std.system.os.shared;
 use std.net.local.endpoint;
+use local_types: std.net.local.types;
 use std.net.async.types;
 use std.io.runtime;
 use std.sync.mutex;
@@ -66,6 +67,7 @@ rec QueuedCompletion {
 
 pub rec Backend {
     queue: *shared.IoQueue;
+    source_id: u16;
     operations: *Operation;
     resources: *Resource;
     resource_map: *u32;
@@ -105,13 +107,17 @@ $or {
 
 fun invalid() i64 { ret native.EINVAL; }
 
-fun token_context(token: types.Token) usize {
-    ret ((token.generation::u64 << 32) | (token.index::u64 + 1))::usize;
+fun token_context(backend: *Backend, token: types.Token) usize {
+    ret ((backend.source_id::u64 << 48) | ((token.index::u64 + 1) << 32) | token.generation::u64)::usize;
 }
 
-fun context_token(context: usize) types.Token {
+fun context_token(backend: *Backend, context: usize, token: *types.Token) bool {
     val raw: u64 = context::u64;
-    ret types.Token{index: ((raw & 0xffffffff) - 1)::u32, generation: (raw >> 32)::u32};
+    val index: u64 = (raw >> 32) & 0xffff;
+    if ((raw >> 48)::u16 != backend.source_id || index == 0 || token == nil) { ret false; }
+    token.index = (index - 1)::u32;
+    token.generation = raw::u32;
+    ret token.generation != 0;
 }
 
 fun operation_for(backend: *Backend, token: types.Token) *Operation {
@@ -405,7 +411,7 @@ fun arm_resource(backend: *Backend, resource: *Resource) {
         ret;
     }
     val token: types.Token = types.Token{index: resource_index(backend, resource), generation: resource.generation};
-    val status: i64 = native.io_queue_watch(backend.queue, resource.resource, token_context(token), events);
+    val status: i64 = native.io_queue_watch(backend.queue, resource.resource, token_context(backend, token), events);
     if (status < 0) {
         fail_resource(backend, resource, status);
         native.io_queue_unwatch(backend.queue, resource.resource);
@@ -468,8 +474,8 @@ fun submission_done(backend: *Backend, resource: *Resource) {
     native.io_queue_wake(backend.queue);
 }
 
-pub fun make(backend: *Backend, queue: *shared.IoQueue, capacity: usize) i64 {
-    if (backend == nil || queue == nil || capacity == 0) { ret invalid(); }
+pub fun make(backend: *Backend, queue: *shared.IoQueue, capacity: usize, source_id: u16) i64 {
+    if (backend == nil || queue == nil || capacity == 0 || capacity > 0xffff || source_id == 0) { ret invalid(); }
     val map_capacity: usize = required_map_capacity(capacity);
     if (map_capacity == 0) { ret native.ENOMEM; }
     val operation_size: usize = $size_of(Operation);
@@ -525,6 +531,7 @@ pub fun make(backend: *Backend, queue: *shared.IoQueue, capacity: usize) i64 {
         ret native.ENOMEM;
     }
     backend.queue = queue;
+    backend.source_id = source_id;
     backend.capacity = capacity;
     backend.map_capacity = map_capacity;
     backend.live = 0;
@@ -558,8 +565,12 @@ pub fun create_connect(value: endpoint.Endpoint, resource: *usize) i64 {
     ret local_impl.create_stream(value, true, resource);
 }
 
-pub fun cleanup_endpoint(value: endpoint.Endpoint) i64 {
-    ret local_impl.cleanup_endpoint(value);
+pub fun cleanup_listener(listener: *local_types.Listener) i64 {
+    ret local_impl.cleanup_listener(listener);
+}
+
+pub fun rename_listener(listener: *local_types.Listener, replacement: endpoint.Endpoint) i64 {
+    ret local_impl.rename(listener, replacement);
 }
 
 pub fun close_resource(backend: *Backend, resource: usize) i64 {
@@ -736,6 +747,38 @@ fun publish_ready(backend: *Backend) usize {
     ret count;
 }
 
+pub fun flush(backend: *Backend) i64 {
+    if (backend == nil) { ret invalid(); }
+    mutex.lock(?backend.lock);
+    val ready: usize = publish_ready(backend);
+    mutex.unlock(?backend.lock);
+    ret ready::i64;
+}
+
+pub fun dispatch(
+    backend: *Backend,
+    context: usize,
+    events: u32,
+    status: i64,
+    flags: u64,
+    claimed: *bool,
+) i64 {
+    if (backend == nil || claimed == nil) { ret invalid(); }
+    @claimed = false;
+    var resource_token: types.Token;
+    if (!context_token(backend, context, ?resource_token)) { ret 0; }
+    @claimed = true;
+    mutex.lock(?backend.lock);
+    val resource: *Resource = resource_for(backend, resource_token);
+    if (resource != nil) {
+        resource.armed = false;
+        drive_resource(backend, resource, events);
+    }
+    val ready: usize = publish_ready(backend);
+    mutex.unlock(?backend.lock);
+    ret ready::i64;
+}
+
 # one thread owns poll and completion retrieval
 pub fun poll(backend: *Backend, timeout_ms: i32) i64 {
     if (backend == nil) { ret invalid(); }
@@ -753,11 +796,13 @@ pub fun poll(backend: *Backend, timeout_ms: i32) i64 {
         for (i < count::usize) {
             val native_completion: native.IoCompletion = backend.native[i];
             if (native_completion.context != 0 && (native_completion.events & native.IO_EVENT_WAKE) == 0) {
-                val resource_token: types.Token = context_token(native_completion.context);
-                val resource: *Resource = resource_for(backend, resource_token);
-                if (resource != nil) {
-                    resource.armed = false;
-                    drive_resource(backend, resource, native_completion.events);
+                var resource_token: types.Token;
+                if (context_token(backend, native_completion.context, ?resource_token)) {
+                    val resource: *Resource = resource_for(backend, resource_token);
+                    if (resource != nil) {
+                        resource.armed = false;
+                        drive_resource(backend, resource, native_completion.events);
+                    }
                 }
             }
             i = i + 1;
@@ -804,6 +849,7 @@ pub fun destroy(backend: *Backend) i64 {
     backend.map_capacity = 0;
     backend.ready_count = 0;
     backend.queue = nil;
+    backend.source_id = 0;
     mutex.unlock(?backend.lock);
     ret 0;
 }
