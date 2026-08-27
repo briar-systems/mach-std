@@ -1,9 +1,9 @@
 # binary encoding with explicit byte order
 #
 # encodes and decodes fixed-width scalars in a chosen endianness. an Encoder
-# builds a growable byte sequence; a Decoder reads a cursor over existing
-# bytes. both carry their Order so every value is written and read in a
-# defined layout rather than the machine's native one.
+# builds a growable byte sequence, a Builder writes transactional fields into
+# fixed storage, and a Decoder reads a checked cursor over existing bytes. all
+# carry their Order so layouts never depend on the machine's native order.
 #
 # only fixed-width unsigned scalars have an unambiguous byte layout, so the
 # scalar surface is the named-width write_u*/read_u*/patch_u* family; signed
@@ -14,6 +14,7 @@
 
 use std.types.bool.bool;
 use std.types.bool.true;
+use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
@@ -26,6 +27,9 @@ use R: std.types.result;
 pub def Order: u8;
 pub val LITTLE: Order = 0;
 pub val BIG:    Order = 1;
+
+# a logical position captured for explicit rollback
+pub def Checkpoint: usize;
 
 # write the low sz bytes of v into dst in the given order
 # ---
@@ -64,6 +68,37 @@ pub fun get_uint(src: *u8, sz: usize, order: Order) u64 {
         i = i + 1;
     }
     ret v;
+}
+
+# whether width bytes fit in the region beginning at offset
+fun span_fits(total: usize, offset: usize, width: usize) bool {
+    if (offset > total) { ret false; }
+    ret width <= total - offset;
+}
+
+# padding required to reach a power-of-two boundary
+fun alignment_padding(pos: usize, boundary: usize) R.Result[usize, str] {
+    if (boundary == 0) { ret R.err[usize, str]("invalid alignment"); }
+
+    val mask: usize = boundary - 1;
+    if ((boundary & mask) != 0) { ret R.err[usize, str]("invalid alignment"); }
+
+    val rem: usize = pos & mask;
+    if (rem == 0) { ret R.ok[usize, str](0); }
+    ret R.ok[usize, str](boundary - rem);
+}
+
+# grow by powers of two without allowing the capacity to wrap
+fun growth_capacity(current: usize, need: usize) usize {
+    var cap: usize = current;
+    if (cap == 0) { cap = 256; }
+
+    for (cap < need) {
+        val doubled: usize = cap + cap;
+        if (doubled <= cap) { cap = need; brk; }
+        cap = doubled;
+    }
+    ret cap;
 }
 
 
@@ -120,17 +155,14 @@ pub fun encoder_dnit(e: *Encoder) bool {
 # additional: number of additional bytes needed
 # ret:        new capacity, or an error
 pub fun reserve(e: *Encoder, additional: usize) R.Result[usize, str] {
+    if (e.len > e.cap) { ret R.err[usize, str]("invalid encoder"); }
+    if (e.cap > 0 && e.data == nil) { ret R.err[usize, str]("invalid encoder"); }
+
     val need: usize = e.len + additional;
     if (need < e.len)  { ret R.err[usize, str]("capacity overflow"); }
     if (e.cap >= need) { ret R.ok[usize, str](e.cap); }
 
-    var new_cap: usize = e.cap * 2;
-    if (e.cap == 0) { new_cap = 256; }
-    for (new_cap < need) {
-        val prev: usize = new_cap;
-        new_cap = new_cap * 2;
-        if (new_cap < prev) { new_cap = need; brk; }
-    }
+    val new_cap: usize = growth_capacity(e.cap, need);
 
     val r: R.Result[*u8, *u8] = A.reallocate[u8](e.alloc, e.data, e.cap, new_cap);
     if (R.is_err[*u8, *u8](r)) { ret R.err[usize, str](R.unwrap_err[*u8, *u8](r)); }
@@ -210,6 +242,7 @@ pub fun write_bytes(e: *Encoder, p: *u8, len: usize) R.Result[usize, str] {
 # ret: new length, or an error
 pub fun write_str(e: *Encoder, s: str) R.Result[usize, str] {
     val slen:  usize = str_len(s);
+    if (slen == 0 - 1) { ret R.err[usize, str]("capacity overflow"); }
     val total: usize = slen + 1;
 
     val rr: R.Result[usize, str] = reserve(e, total);
@@ -227,9 +260,15 @@ pub fun write_str(e: *Encoder, s: str) R.Result[usize, str] {
 # boundary: alignment boundary (a power of two)
 # ret:      new length, or an error
 pub fun align(e: *Encoder, boundary: usize) R.Result[usize, str] {
-    val aligned: usize = (e.len + boundary - 1) & (0 - boundary);
-    val pad:     usize = aligned - e.len;
-    if (pad == 0) { ret R.ok[usize, str](e.len); }
+    val pr: R.Result[usize, str] = alignment_padding(e.len, boundary);
+    if (R.is_err[usize, str](pr)) { ret pr; }
+
+    val pad: usize = R.unwrap_ok[usize, str](pr);
+    if (pad == 0) {
+        val rr: R.Result[usize, str] = reserve(e, 0);
+        if (R.is_err[usize, str](rr)) { ret rr; }
+        ret R.ok[usize, str](e.len);
+    }
 
     val rr: R.Result[usize, str] = reserve(e, pad);
     if (R.is_err[usize, str](rr)) { ret rr; }
@@ -246,6 +285,11 @@ fun patch_uint(e: *Encoder, offset: usize, v: u64, sz: usize) R.Result[usize, st
 
     put_uint(?e.data[offset], v, sz, e.order);
     ret R.ok[usize, str](sz);
+}
+
+# overwrite a u8 at an earlier offset without changing length
+pub fun patch_u8(e: *Encoder, offset: usize, v: u8) R.Result[usize, str] {
+    ret patch_uint(e, offset, v::u64, 1);
 }
 
 # overwrite a u16 at an earlier offset in the encoder's byte order
@@ -278,6 +322,275 @@ pub fun patch_u64(e: *Encoder, offset: usize, v: u64) R.Result[usize, str] {
     ret patch_uint(e, offset, v, 8);
 }
 
+# fixed-capacity byte builder with a transactional reservation lock
+# ---
+# order:    byte order for multi-byte writes
+# data:     caller-owned backing bytes
+# len:      logically published bytes
+# cap:      backing capacity
+# reserved: whether a child reservation owns the unpublished tail
+# epoch:    monotonically increasing reservation identity
+pub rec Builder {
+    order:    Order;
+    data:     *u8;
+    len:      usize;
+    cap:      usize;
+    reserved: bool;
+    epoch:    usize;
+}
+
+# unpublished child builder over a reserved parent tail
+# ---
+# parent: parent whose logical length remains unchanged until commit
+# body:   fixed child builder bounded to the reservation
+# start:  parent's logical length when the reservation began
+# limit:  reserved byte capacity
+# epoch:  identity used to reject stale reservation handles
+# active: whether the reservation can still commit or roll back
+#
+# an active reservation and its parent must stay at stable addresses. resolve
+# nested reservations before their parents and do not copy active handles.
+pub rec Reservation {
+    parent: *Builder;
+    body:   Builder;
+    start:  usize;
+    limit:  usize;
+    epoch:  usize;
+    active: bool;
+}
+
+# wrap caller-owned storage as an empty fixed builder
+pub fun builder(data: *u8, cap: usize, order: Order) Builder {
+    var b: Builder;
+    b.order    = order;
+    b.data     = data;
+    b.len      = 0;
+    b.cap      = cap;
+    b.reserved = false;
+    b.epoch    = 0;
+    ret b;
+}
+
+# bytes available after the builder's published prefix
+pub fun builder_remaining(b: *Builder) usize {
+    if (b == nil || b.reserved || b.len > b.cap) { ret 0; }
+    ret b.cap - b.len;
+}
+
+# validate one atomic fixed-buffer write and return its start
+fun builder_prepare(b: *Builder, width: usize) R.Result[usize, str] {
+    if (b == nil) { ret R.err[usize, str]("builder nil"); }
+    if (b.reserved) { ret R.err[usize, str]("builder reserved"); }
+    if (b.len > b.cap) { ret R.err[usize, str]("invalid builder"); }
+    if (width > b.cap - b.len) { ret R.err[usize, str]("builder full"); }
+    if (width > 0 && b.data == nil) { ret R.err[usize, str]("invalid builder"); }
+    ret R.ok[usize, str](b.len);
+}
+
+# append one fixed-width integer atomically
+fun builder_write_uint(b: *Builder, v: u64, width: usize) R.Result[usize, str] {
+    val pr: R.Result[usize, str] = builder_prepare(b, width);
+    if (R.is_err[usize, str](pr)) { ret pr; }
+
+    val start: usize = R.unwrap_ok[usize, str](pr);
+    put_uint(?b.data[start], v, width, b.order);
+    b.len = start + width;
+    ret R.ok[usize, str](b.len);
+}
+
+# append a u8 atomically
+pub fun builder_write_u8(b: *Builder, v: u8) R.Result[usize, str] {
+    ret builder_write_uint(b, v::u64, 1);
+}
+
+# append a u16 in the builder's byte order atomically
+pub fun builder_write_u16(b: *Builder, v: u16) R.Result[usize, str] {
+    ret builder_write_uint(b, v::u64, 2);
+}
+
+# append a u32 in the builder's byte order atomically
+pub fun builder_write_u32(b: *Builder, v: u32) R.Result[usize, str] {
+    ret builder_write_uint(b, v::u64, 4);
+}
+
+# append a u64 in the builder's byte order atomically
+pub fun builder_write_u64(b: *Builder, v: u64) R.Result[usize, str] {
+    ret builder_write_uint(b, v, 8);
+}
+
+# append raw bytes atomically
+pub fun builder_write_bytes(b: *Builder, data: *u8, len: usize) R.Result[usize, str] {
+    if (len > 0 && data == nil) { ret R.err[usize, str]("source nil"); }
+
+    val pr: R.Result[usize, str] = builder_prepare(b, len);
+    if (R.is_err[usize, str](pr)) { ret pr; }
+
+    val start: usize = R.unwrap_ok[usize, str](pr);
+    if (len > 0) { memory.copy[u8](?b.data[start], data, len); }
+    b.len = start + len;
+    ret R.ok[usize, str](b.len);
+}
+
+# append a string and null terminator atomically
+pub fun builder_write_str(b: *Builder, s: str) R.Result[usize, str] {
+    val slen: usize = str_len(s);
+    if (slen == 0 - 1) { ret R.err[usize, str]("capacity overflow"); }
+
+    val total: usize = slen + 1;
+    val pr: R.Result[usize, str] = builder_prepare(b, total);
+    if (R.is_err[usize, str](pr)) { ret pr; }
+
+    val start: usize = R.unwrap_ok[usize, str](pr);
+    if (slen > 0) { memory.copy[u8](?b.data[start], s, slen); }
+    b.data[start + slen] = 0;
+    b.len = start + total;
+    ret R.ok[usize, str](b.len);
+}
+
+# append zero padding to a power-of-two boundary atomically
+pub fun builder_align(b: *Builder, boundary: usize) R.Result[usize, str] {
+    if (b == nil) { ret R.err[usize, str]("builder nil"); }
+
+    val ar: R.Result[usize, str] = alignment_padding(b.len, boundary);
+    if (R.is_err[usize, str](ar)) { ret ar; }
+
+    val pad: usize = R.unwrap_ok[usize, str](ar);
+    val pr: R.Result[usize, str] = builder_prepare(b, pad);
+    if (R.is_err[usize, str](pr)) { ret pr; }
+
+    val start: usize = R.unwrap_ok[usize, str](pr);
+    if (pad > 0) { memory.fill[u8](?b.data[start], 0, pad); }
+    b.len = start + pad;
+    ret R.ok[usize, str](b.len);
+}
+
+# patch a published fixed-width integer without changing length
+fun builder_patch_uint(b: *Builder, offset: usize, v: u64, width: usize) R.Result[usize, str] {
+    if (b == nil) { ret R.err[usize, str]("builder nil"); }
+    if (b.reserved) { ret R.err[usize, str]("builder reserved"); }
+    if (!span_fits(b.len, offset, width)) { ret R.err[usize, str]("patch out of bounds"); }
+    if (width > 0 && b.data == nil) { ret R.err[usize, str]("invalid builder"); }
+
+    put_uint(?b.data[offset], v, width, b.order);
+    ret R.ok[usize, str](width);
+}
+
+# patch one published byte without changing length
+pub fun builder_patch_u8(b: *Builder, offset: usize, v: u8) R.Result[usize, str] {
+    ret builder_patch_uint(b, offset, v::u64, 1);
+}
+
+# patch a published u16 without changing length
+pub fun builder_patch_u16(b: *Builder, offset: usize, v: u16) R.Result[usize, str] {
+    ret builder_patch_uint(b, offset, v::u64, 2);
+}
+
+# patch a published u32 without changing length
+pub fun builder_patch_u32(b: *Builder, offset: usize, v: u32) R.Result[usize, str] {
+    ret builder_patch_uint(b, offset, v::u64, 4);
+}
+
+# patch a published u64 without changing length
+pub fun builder_patch_u64(b: *Builder, offset: usize, v: u64) R.Result[usize, str] {
+    ret builder_patch_uint(b, offset, v, 8);
+}
+
+# capture the current fixed-builder length for explicit rollback
+pub fun builder_checkpoint(b: *Builder) R.Result[Checkpoint, str] {
+    if (b == nil) { ret R.err[Checkpoint, str]("builder nil"); }
+    if (b.reserved) { ret R.err[Checkpoint, str]("builder reserved"); }
+    if (b.len > b.cap) { ret R.err[Checkpoint, str]("invalid builder"); }
+    ret R.ok[Checkpoint, str](b.len);
+}
+
+# restore a prior builder checkpoint without changing backing bytes
+pub fun builder_rollback(b: *Builder, mark: Checkpoint) R.Result[usize, str] {
+    if (b == nil) { ret R.err[usize, str]("builder nil"); }
+    if (b.reserved) { ret R.err[usize, str]("builder reserved"); }
+    if (b.len > b.cap || mark > b.len) { ret R.err[usize, str]("invalid checkpoint"); }
+
+    b.len = mark;
+    ret R.ok[usize, str](b.len);
+}
+
+# lock capacity for a child field without publishing parent length
+pub fun builder_reserve(b: *Builder, capacity: usize) R.Result[Reservation, str] {
+    if (b == nil) { ret R.err[Reservation, str]("builder nil"); }
+    if (b.reserved) { ret R.err[Reservation, str]("builder reserved"); }
+    if (b.len > b.cap) { ret R.err[Reservation, str]("invalid builder"); }
+    if (capacity > b.cap - b.len) { ret R.err[Reservation, str]("builder full"); }
+    if (capacity > 0 && b.data == nil) { ret R.err[Reservation, str]("invalid builder"); }
+    if (b.epoch == 0 - 1) { ret R.err[Reservation, str]("reservation overflow"); }
+
+    var child_data: *u8 = nil;
+    if (capacity > 0) { child_data = ?b.data[b.len]; }
+
+    b.epoch = b.epoch + 1;
+    b.reserved = true;
+
+    var r: Reservation;
+    r.parent = b;
+    r.body   = builder(child_data, capacity, b.order);
+    r.start  = b.len;
+    r.limit  = capacity;
+    r.epoch  = b.epoch;
+    r.active = true;
+    ret R.ok[Reservation, str](r);
+}
+
+# invalidate a resolved reservation and revoke its child builder
+fun reservation_close(r: *Reservation) {
+    val order: Order = r.body.order;
+    r.parent = nil;
+    r.body   = builder(nil, 0, order);
+    r.start  = 0;
+    r.limit  = 0;
+    r.epoch  = 0;
+    r.active = false;
+}
+
+# publish the completed prefix of a reservation as one logical field
+pub fun builder_commit(r: *Reservation) R.Result[usize, str] {
+    if (r == nil || !r.active || r.parent == nil) {
+        ret R.err[usize, str]("invalid reservation");
+    }
+
+    val b: *Builder = r.parent;
+    if (!b.reserved || b.epoch != r.epoch || b.len != r.start) {
+        ret R.err[usize, str]("stale reservation");
+    }
+    if (r.body.reserved) { ret R.err[usize, str]("child reserved"); }
+    if (r.body.len > r.body.cap || r.body.cap != r.limit) {
+        ret R.err[usize, str]("invalid reservation");
+    }
+    if (!span_fits(b.cap, r.start, r.limit)) {
+        ret R.err[usize, str]("invalid reservation");
+    }
+    if (r.body.len > r.limit) { ret R.err[usize, str]("invalid reservation"); }
+
+    b.len = r.start + r.body.len;
+    b.reserved = false;
+    reservation_close(r);
+    ret R.ok[usize, str](b.len);
+}
+
+# discard an unpublished reservation and unlock its parent
+pub fun reservation_rollback(r: *Reservation) R.Result[usize, str] {
+    if (r == nil || !r.active || r.parent == nil) {
+        ret R.err[usize, str]("invalid reservation");
+    }
+
+    val b: *Builder = r.parent;
+    if (!b.reserved || b.epoch != r.epoch || b.len != r.start) {
+        ret R.err[usize, str]("stale reservation");
+    }
+    if (r.body.reserved) { ret R.err[usize, str]("child reserved"); }
+
+    b.reserved = false;
+    reservation_close(r);
+    ret R.ok[usize, str](b.len);
+}
+
 # cursor over existing bytes with a fixed byte order
 # ---
 # order: byte order for multi-byte reads
@@ -290,6 +603,9 @@ pub rec Decoder {
     len:   usize;
     pos:   usize;
 }
+
+# checked borrowed cursor, retained as an alias of Decoder for compatibility
+pub def Cursor: Decoder;
 
 # wrap existing bytes as a decoder positioned at offset 0
 # ---
@@ -306,9 +622,15 @@ pub fun decoder(data: *u8, len: usize, order: Order) Decoder {
     ret d;
 }
 
+# wrap existing bytes as a checked cursor positioned at offset 0
+pub fun cursor(data: *u8, len: usize, order: Order) Cursor {
+    ret decoder(data, len, order);
+}
+
 # read sz bytes in the decoder's byte order and advance
 fun read_uint(d: *Decoder, sz: usize) R.Result[u64, str] {
-    if (sz > d.len - d.pos || d.pos > d.len) { ret R.err[u64, str]("eof"); }
+    if (!span_fits(d.len, d.pos, sz)) { ret R.err[u64, str]("eof"); }
+    if (sz > 0 && d.data == nil) { ret R.err[u64, str]("invalid cursor"); }
 
     val v: u64 = get_uint(?d.data[d.pos], sz, d.order);
     d.pos = d.pos + sz;
@@ -359,7 +681,9 @@ pub fun read_u64(d: *Decoder) R.Result[u64, str] {
 # len: number of bytes to consume
 # ret: pointer into the decoder's data, or an error
 pub fun read_bytes(d: *Decoder, len: usize) R.Result[*u8, str] {
-    if (d.pos + len > d.len) { ret R.err[*u8, str]("eof"); }
+    if (!span_fits(d.len, d.pos, len)) { ret R.err[*u8, str]("eof"); }
+    if (len == 0) { ret R.ok[*u8, str](nil); }
+    if (d.data == nil) { ret R.err[*u8, str]("invalid cursor"); }
 
     val p: *u8 = ?d.data[d.pos];
     d.pos = d.pos + len;
@@ -371,6 +695,9 @@ pub fun read_bytes(d: *Decoder, len: usize) R.Result[*u8, str] {
 # d:   decoder to read from
 # ret: pointer to the string within the data, or an error
 pub fun read_str(d: *Decoder) R.Result[str, str] {
+    if (d.pos > d.len) { ret R.err[str, str]("eof"); }
+    if (d.pos < d.len && d.data == nil) { ret R.err[str, str]("invalid cursor"); }
+
     var i: usize = d.pos;
     for (i < d.len) {
         if (d.data[i] == 0) {
@@ -389,7 +716,7 @@ pub fun read_str(d: *Decoder) R.Result[str, str] {
 # n:   number of bytes to skip
 # ret: new position, or an error
 pub fun skip(d: *Decoder, n: usize) R.Result[usize, str] {
-    if (d.pos + n > d.len) { ret R.err[usize, str]("eof"); }
+    if (!span_fits(d.len, d.pos, n)) { ret R.err[usize, str]("eof"); }
     d.pos = d.pos + n;
     ret R.ok[usize, str](d.pos);
 }
@@ -400,9 +727,40 @@ pub fun skip(d: *Decoder, n: usize) R.Result[usize, str] {
 # boundary: alignment boundary (a power of two)
 # ret:      new position, or an error
 pub fun align_read(d: *Decoder, boundary: usize) R.Result[usize, str] {
-    val aligned: usize = (d.pos + boundary - 1) & (0 - boundary);
-    if (aligned == d.pos) { ret R.ok[usize, str](d.pos); }
-    ret skip(d, aligned - d.pos);
+    if (d.pos > d.len) { ret R.err[usize, str]("eof"); }
+
+    val ar: R.Result[usize, str] = alignment_padding(d.pos, boundary);
+    if (R.is_err[usize, str](ar)) { ret ar; }
+    ret skip(d, R.unwrap_ok[usize, str](ar));
+}
+
+# return a bounded child cursor and advance only after validation
+pub fun read_subview(d: *Decoder, len: usize) R.Result[Cursor, str] {
+    if (!span_fits(d.len, d.pos, len)) { ret R.err[Cursor, str]("eof"); }
+    if (len > 0 && d.data == nil) { ret R.err[Cursor, str]("invalid cursor"); }
+
+    var data: *u8 = nil;
+    if (len > 0) { data = ?d.data[d.pos]; }
+
+    val sub: Cursor = cursor(data, len, d.order);
+    d.pos = d.pos + len;
+    ret R.ok[Cursor, str](sub);
+}
+
+# capture a cursor position for speculative decoding
+pub fun cursor_checkpoint(d: *Decoder) R.Result[Checkpoint, str] {
+    if (d == nil || d.pos > d.len) { ret R.err[Checkpoint, str]("invalid cursor"); }
+    ret R.ok[Checkpoint, str](d.pos);
+}
+
+# restore an earlier cursor checkpoint
+pub fun cursor_rollback(d: *Decoder, mark: Checkpoint) R.Result[usize, str] {
+    if (d == nil || d.pos > d.len || mark > d.pos) {
+        ret R.err[usize, str]("invalid checkpoint");
+    }
+
+    d.pos = mark;
+    ret R.ok[usize, str](d.pos);
 }
 
 # bytes remaining between the cursor and the end
@@ -410,5 +768,573 @@ pub fun align_read(d: *Decoder, boundary: usize) R.Result[usize, str] {
 # d:   decoder to query
 # ret: unread byte count
 pub fun remaining(d: *Decoder) usize {
+    if (d == nil || d.pos > d.len) { ret 0; }
     ret d.len - d.pos;
+}
+
+test "binary cursor: exhaustive small-region reads preserve failure position" {
+    var data: [16]u8;
+    var i: usize = 0;
+    for (i < 16) {
+        data[i] = (i + 1)::u8;
+        i = i + 1;
+    }
+
+    var region_len: usize = 0;
+    for (region_len <= 16) {
+        var offset: usize = 0;
+        for (offset <= 17) {
+            var width: usize = 0;
+            for (width <= 17) {
+                var d: Decoder = decoder(?data[0], region_len, LITTLE);
+                d.pos = offset;
+                val before: usize = d.pos;
+                val r: R.Result[*u8, str] = read_bytes(?d, width);
+
+                var fits: bool = false;
+                if (offset <= region_len && width <= region_len - offset) { fits = true; }
+
+                if (R.is_ok[*u8, str](r) != fits) { ret 1; }
+                if (!fits && d.pos != before) { ret 1; }
+                if (fits && d.pos != before + width) { ret 1; }
+                if (fits && width == 0 && R.unwrap_ok[*u8, str](r) != nil) { ret 1; }
+                if (fits && width > 0 && R.unwrap_ok[*u8, str](r) != ?data[offset]) { ret 1; }
+
+                width = width + 1;
+            }
+            offset = offset + 1;
+        }
+        region_len = region_len + 1;
+    }
+    ret 0;
+}
+
+test "binary cursor: exhaustive scalar widths obey the region and byte order" {
+    var data: [16]u8;
+    var i: usize = 0;
+    for (i < 16) {
+        data[i] = (0x80 + i)::u8;
+        i = i + 1;
+    }
+
+    var order: Order = LITTLE;
+    for (order <= BIG) {
+        var region_len: usize = 0;
+        for (region_len <= 16) {
+            var offset: usize = 0;
+            for (offset <= 17) {
+                var width: usize = 1;
+                for (width <= 8) {
+                    var d: Decoder = decoder(?data[0], region_len, order);
+                    d.pos = offset;
+                    val before: usize = d.pos;
+                    val r: R.Result[u64, str] = read_uint(?d, width);
+
+                    var fits: bool = false;
+                    if (offset <= region_len && width <= region_len - offset) { fits = true; }
+
+                    if (R.is_ok[u64, str](r) != fits) { ret 1; }
+                    if (!fits && d.pos != before) { ret 1; }
+                    if (fits) {
+                        if (d.pos != before + width) { ret 1; }
+                        if (R.unwrap_ok[u64, str](r) != get_uint(?data[offset], width, order)) { ret 1; }
+                    }
+
+                    width = width + 1;
+                }
+                offset = offset + 1;
+            }
+            region_len = region_len + 1;
+        }
+        order = order + 1;
+    }
+    ret 0;
+}
+
+test "binary cursor: exhaustive skips and subviews are transactional" {
+    var data: [16]u8;
+    var region_len: usize = 0;
+    for (region_len <= 16) {
+        var offset: usize = 0;
+        for (offset <= 17) {
+            var width: usize = 0;
+            for (width <= 17) {
+                var fits: bool = false;
+                if (offset <= region_len && width <= region_len - offset) { fits = true; }
+
+                var ds: Decoder = decoder(?data[0], region_len, BIG);
+                ds.pos = offset;
+                val sr: R.Result[usize, str] = skip(?ds, width);
+                if (R.is_ok[usize, str](sr) != fits) { ret 1; }
+                if (!fits && ds.pos != offset) { ret 1; }
+                if (fits && ds.pos != offset + width) { ret 1; }
+
+                var dv: Decoder = decoder(?data[0], region_len, BIG);
+                dv.pos = offset;
+                val vr: R.Result[Cursor, str] = read_subview(?dv, width);
+                if (R.is_ok[Cursor, str](vr) != fits) { ret 1; }
+                if (!fits && dv.pos != offset) { ret 1; }
+                if (fits) {
+                    if (dv.pos != offset + width) { ret 1; }
+                    val sub: Cursor = R.unwrap_ok[Cursor, str](vr);
+                    if (sub.len != width || sub.pos != 0 || sub.order != BIG) { ret 1; }
+                    if (width == 0 && sub.data != nil) { ret 1; }
+                    if (width > 0 && sub.data != ?data[offset]) { ret 1; }
+                }
+
+                width = width + 1;
+            }
+            offset = offset + 1;
+        }
+        region_len = region_len + 1;
+    }
+    ret 0;
+}
+
+test "binary cursor: operation sequences match a reference position model" {
+    var data: [32]u8;
+    var seed: usize = 0;
+    for (seed < 128) {
+        val region_len: usize = seed % 33;
+        var d: Decoder = decoder(?data[0], region_len, LITTLE);
+        var model: usize = seed % (region_len + 1);
+        d.pos = model;
+
+        var state: usize = seed + 1;
+        var step: usize = 0;
+        for (step < 64) {
+            state = state * 1664525 + 1013904223;
+            val width: usize = (state >> 8) % 12;
+            val kind: usize = state & 1;
+            val fits: bool = width <= region_len - model;
+
+            if (kind == 0) {
+                val r: R.Result[usize, str] = skip(?d, width);
+                if (R.is_ok[usize, str](r) != fits) { ret 1; }
+            } or {
+                val r: R.Result[*u8, str] = read_bytes(?d, width);
+                if (R.is_ok[*u8, str](r) != fits) { ret 1; }
+            }
+
+            if (fits) { model = model + width; }
+            if (d.pos != model || remaining(?d) != region_len - model) { ret 1; }
+            step = step + 1;
+        }
+        seed = seed + 1;
+    }
+    ret 0;
+}
+
+test "binary cursor: checkpoints restore only earlier valid positions" {
+    var data: [16]u8;
+    var d: Decoder = decoder(?data[0], 16, LITTLE);
+    if (R.is_err[u16, str](read_u16(?d))) { ret 1; }
+
+    val mr: R.Result[Checkpoint, str] = cursor_checkpoint(?d);
+    if (R.is_err[Checkpoint, str](mr)) { ret 1; }
+    val mark: Checkpoint = R.unwrap_ok[Checkpoint, str](mr);
+
+    if (R.is_err[u32, str](read_u32(?d))) { ret 1; }
+    if (d.pos != 6) { ret 1; }
+    if (R.is_err[usize, str](cursor_rollback(?d, mark))) { ret 1; }
+    if (d.pos != 2) { ret 1; }
+
+    val failed: R.Result[usize, str] = cursor_rollback(?d, 3);
+    if (R.is_ok[usize, str](failed) || d.pos != 2) { ret 1; }
+    ret 0;
+}
+
+test "binary cursor: failed string scan preserves position" {
+    var data: [8]u8;
+    memory.fill[u8](?data[0], 0x41, 8);
+    var d: Decoder = decoder(?data[0], 8, LITTLE);
+    d.pos = 2;
+    if (R.is_ok[str, str](read_str(?d)) || d.pos != 2) { ret 1; }
+
+    data[5] = 0;
+    val r: R.Result[str, str] = read_str(?d);
+    if (R.is_err[str, str](r) || d.pos != 6) { ret 1; }
+
+    d.pos = 0 - 1;
+    if (R.is_ok[str, str](read_str(?d)) || d.pos != 0 - 1) { ret 1; }
+    ret 0;
+}
+
+test "binary cursor: malformed positions and huge widths never wrap" {
+    var data: [8]u8;
+    val max: usize = 0 - 1;
+
+    var d: Decoder = decoder(?data[0], 8, LITTLE);
+    d.pos = max;
+    if (R.is_ok[*u8, str](read_bytes(?d, 1)) || d.pos != max) { ret 1; }
+    if (R.is_ok[usize, str](skip(?d, 1)) || d.pos != max) { ret 1; }
+    if (R.is_ok[Cursor, str](read_subview(?d, 1)) || d.pos != max) { ret 1; }
+    if (R.is_ok[usize, str](align_read(?d, 8)) || d.pos != max) { ret 1; }
+    if (remaining(?d) != 0) { ret 1; }
+
+    d.pos = 1;
+    if (R.is_ok[*u8, str](read_bytes(?d, max)) || d.pos != 1) { ret 1; }
+    if (R.is_ok[usize, str](skip(?d, max)) || d.pos != 1) { ret 1; }
+
+    d.pos = 3;
+    if (R.is_ok[usize, str](align_read(?d, 0)) || d.pos != 3) { ret 1; }
+    if (R.is_ok[usize, str](align_read(?d, 3)) || d.pos != 3) { ret 1; }
+    ret 0;
+}
+
+test "binary builder: exhaustive small-region writes preserve failure state" {
+    var backing: [32]u8;
+    var input: [17]u8;
+    var i: usize = 0;
+    for (i < 17) {
+        input[i] = (i + 1)::u8;
+        i = i + 1;
+    }
+
+    var cap: usize = 0;
+    for (cap <= 16) {
+        var offset: usize = 0;
+        for (offset <= cap + 1) {
+            var width: usize = 0;
+            for (width <= 17) {
+                i = 0;
+                for (i < 32) {
+                    backing[i] = 0xA5;
+                    i = i + 1;
+                }
+
+                var b: Builder = builder(?backing[0], cap, BIG);
+                b.len = offset;
+                val r: R.Result[usize, str] = builder_write_bytes(?b, ?input[0], width);
+
+                var fits: bool = false;
+                if (offset <= cap && width <= cap - offset) { fits = true; }
+                if (R.is_ok[usize, str](r) != fits) { ret 1; }
+                if (!fits && b.len != offset) { ret 1; }
+                if (fits && b.len != offset + width) { ret 1; }
+
+                i = 0;
+                for (i < 32) {
+                    var expected: u8 = 0xA5;
+                    if (fits && i >= offset && i < offset + width) {
+                        expected = input[i - offset];
+                    }
+                    if (backing[i] != expected) { ret 1; }
+                    i = i + 1;
+                }
+
+                width = width + 1;
+            }
+            offset = offset + 1;
+        }
+        cap = cap + 1;
+    }
+    ret 0;
+}
+
+test "binary builder: scalar output matches the growable encoder" {
+    var order: Order = LITTLE;
+    for (order <= BIG) {
+        var fixed_data: [32]u8;
+        var encoded_data: [32]u8;
+        var b: Builder = builder(?fixed_data[0], 32, order);
+        var e: Encoder;
+        e.alloc = nil;
+        e.order = order;
+        e.data = ?encoded_data[0];
+        e.len = 0;
+        e.cap = 32;
+
+        if (R.is_err[usize, str](builder_write_u8(?b, 0x12))) { ret 1; }
+        if (R.is_err[usize, str](builder_write_u16(?b, 0x3456))) { ret 1; }
+        if (R.is_err[usize, str](builder_write_u32(?b, 0x789ABCDE))) { ret 1; }
+        if (R.is_err[usize, str](builder_write_u64(?b, 0x0123456789ABCDEF))) { ret 1; }
+
+        if (R.is_err[usize, str](write_u8(?e, 0x12))) { ret 1; }
+        if (R.is_err[usize, str](write_u16(?e, 0x3456))) { ret 1; }
+        if (R.is_err[usize, str](write_u32(?e, 0x789ABCDE))) { ret 1; }
+        if (R.is_err[usize, str](write_u64(?e, 0x0123456789ABCDEF))) { ret 1; }
+
+        if (b.len != e.len) { ret 1; }
+        var i: usize = 0;
+        for (i < b.len) {
+            if (b.data[i] != e.data[i]) { ret 1; }
+            i = i + 1;
+        }
+        order = order + 1;
+    }
+    ret 0;
+}
+
+test "binary builder: scalar wrappers round trip through the checked cursor" {
+    var data: [32]u8;
+    var order: Order = LITTLE;
+    for (order <= BIG) {
+        var b: Builder = builder(?data[0], 32, order);
+        if (R.is_err[usize, str](builder_write_u8(?b, 0x12))) { ret 1; }
+        if (R.is_err[usize, str](builder_write_u16(?b, 0x3456))) { ret 1; }
+        if (R.is_err[usize, str](builder_write_u32(?b, 0x789ABCDE))) { ret 1; }
+        if (R.is_err[usize, str](builder_write_u64(?b, 0x0123456789ABCDEF))) { ret 1; }
+
+        var c: Cursor = cursor(?data[0], b.len, order);
+        val u8r: R.Result[u8, str] = read_u8(?c);
+        val u16r: R.Result[u16, str] = read_u16(?c);
+        val u32r: R.Result[u32, str] = read_u32(?c);
+        val u64r: R.Result[u64, str] = read_u64(?c);
+        if (R.is_err[u8, str](u8r) || R.unwrap_ok[u8, str](u8r) != 0x12) { ret 1; }
+        if (R.is_err[u16, str](u16r) || R.unwrap_ok[u16, str](u16r) != 0x3456) { ret 1; }
+        if (R.is_err[u32, str](u32r) || R.unwrap_ok[u32, str](u32r) != 0x789ABCDE) { ret 1; }
+        if (R.is_err[u64, str](u64r) || R.unwrap_ok[u64, str](u64r) != 0x0123456789ABCDEF) { ret 1; }
+        if (remaining(?c) != 0) { ret 1; }
+        order = order + 1;
+    }
+    ret 0;
+}
+
+test "binary builder: strings and alignment publish only after full validation" {
+    var data: [16]u8;
+    memory.fill[u8](?data[0], 0xA5, 16);
+    var b: Builder = builder(?data[0], 16, BIG);
+
+    if (R.is_err[usize, str](builder_write_str(?b, "ab"))) { ret 1; }
+    if (b.len != 3 || data[0] != 'a' || data[1] != 'b' || data[2] != 0) { ret 1; }
+    if (R.is_err[usize, str](builder_align(?b, 4))) { ret 1; }
+    if (b.len != 4 || data[3] != 0) { ret 1; }
+
+    b.cap = 6;
+    if (R.is_err[usize, str](builder_write_u8(?b, 0x11))) { ret 1; }
+    if (R.is_ok[usize, str](builder_align(?b, 8)) || b.len != 5) { ret 1; }
+    if (data[5] != 0xA5) { ret 1; }
+    if (R.is_ok[usize, str](builder_write_str(?b, "x")) || b.len != 5) { ret 1; }
+    if (data[5] != 0xA5) { ret 1; }
+    ret 0;
+}
+
+test "binary builder: reservation bounds are exhaustive and transactional" {
+    var data: [16]u8;
+    var cap: usize = 0;
+    for (cap <= 16) {
+        var offset: usize = 0;
+        for (offset <= cap + 1) {
+            var capacity: usize = 0;
+            for (capacity <= 17) {
+                memory.fill[u8](?data[0], 0xA5, 16);
+                var b: Builder = builder(?data[0], cap, BIG);
+                b.len = offset;
+                b.epoch = 5;
+
+                val rr: R.Result[Reservation, str] = builder_reserve(?b, capacity);
+                var fits: bool = false;
+                if (offset <= cap && capacity <= cap - offset) { fits = true; }
+                if (R.is_ok[Reservation, str](rr) != fits) { ret 1; }
+
+                if (!fits) {
+                    if (b.len != offset || b.cap != cap || b.reserved || b.epoch != 5) { ret 1; }
+                } or {
+                    if (b.len != offset || !b.reserved || b.epoch != 6) { ret 1; }
+                    if (builder_remaining(?b) != 0) { ret 1; }
+                    var reservation: Reservation = R.unwrap_ok[Reservation, str](rr);
+                    if (reservation.start != offset || reservation.limit != capacity) { ret 1; }
+                    if (reservation.body.len != 0 || reservation.body.cap != capacity) { ret 1; }
+                    if (R.is_err[usize, str](reservation_rollback(?reservation))) { ret 1; }
+                    if (b.len != offset || b.reserved || b.epoch != 6) { ret 1; }
+                }
+
+                var i: usize = 0;
+                for (i < 16) {
+                    if (data[i] != 0xA5) { ret 1; }
+                    i = i + 1;
+                }
+                capacity = capacity + 1;
+            }
+            offset = offset + 1;
+        }
+        cap = cap + 1;
+    }
+    ret 0;
+}
+
+test "binary builder: reservation commits one length-prefixed field" {
+    var data: [32]u8;
+    var payload: [3]u8 = [3]u8{0xAA, 0xBB, 0xCC};
+    var b: Builder = builder(?data[0], 32, BIG);
+
+    val rr: R.Result[Reservation, str] = builder_reserve(?b, 16);
+    if (R.is_err[Reservation, str](rr)) { ret 1; }
+    var r: Reservation = R.unwrap_ok[Reservation, str](rr);
+    if (b.len != 0 || !b.reserved) { ret 1; }
+
+    if (R.is_err[usize, str](builder_write_u16(?r.body, 0))) { ret 1; }
+    if (R.is_err[usize, str](builder_write_bytes(?r.body, ?payload[0], 3))) { ret 1; }
+    if (R.is_err[usize, str](builder_patch_u16(?r.body, 0, 3))) { ret 1; }
+    if (b.len != 0) { ret 1; }
+
+    val cr: R.Result[usize, str] = builder_commit(?r);
+    if (R.is_err[usize, str](cr) || b.len != 5 || b.reserved) { ret 1; }
+    if (data[0] != 0 || data[1] != 3) { ret 1; }
+    if (data[2] != 0xAA || data[3] != 0xBB || data[4] != 0xCC) { ret 1; }
+    ret 0;
+}
+
+test "binary builder: nested reservations commit inside out" {
+    var data: [32]u8;
+    var root: Builder = builder(?data[0], 32, LITTLE);
+
+    val orr: R.Result[Reservation, str] = builder_reserve(?root, 16);
+    if (R.is_err[Reservation, str](orr)) { ret 1; }
+    var outer: Reservation = R.unwrap_ok[Reservation, str](orr);
+    if (R.is_err[usize, str](builder_write_u8(?outer.body, 0xAA))) { ret 1; }
+
+    val irr: R.Result[Reservation, str] = builder_reserve(?outer.body, 8);
+    if (R.is_err[Reservation, str](irr)) { ret 1; }
+    var inner: Reservation = R.unwrap_ok[Reservation, str](irr);
+    if (R.is_err[usize, str](builder_write_u32(?inner.body, 0x11223344))) { ret 1; }
+    if (R.is_ok[usize, str](builder_commit(?outer))) { ret 1; }
+    if (root.len != 0 || !root.reserved || !outer.body.reserved) { ret 1; }
+    if (R.is_ok[usize, str](reservation_rollback(?outer))) { ret 1; }
+    if (root.len != 0 || !root.reserved || !outer.body.reserved) { ret 1; }
+    if (R.is_err[usize, str](builder_commit(?inner))) { ret 1; }
+    if (R.is_err[usize, str](builder_write_u8(?outer.body, 0xBB))) { ret 1; }
+    if (root.len != 0) { ret 1; }
+    if (R.is_err[usize, str](builder_commit(?outer))) { ret 1; }
+
+    if (root.len != 6) { ret 1; }
+    if (data[0] != 0xAA || data[1] != 0x44 || data[2] != 0x33) { ret 1; }
+    if (data[3] != 0x22 || data[4] != 0x11 || data[5] != 0xBB) { ret 1; }
+    ret 0;
+}
+
+test "binary builder: failed child write and reservation rollback publish nothing" {
+    var data: [8]u8;
+    memory.fill[u8](?data[0], 0xCC, 8);
+    var b: Builder = builder(?data[0], 8, BIG);
+    if (R.is_err[usize, str](builder_write_u8(?b, 0x11))) { ret 1; }
+
+    val rr: R.Result[Reservation, str] = builder_reserve(?b, 4);
+    if (R.is_err[Reservation, str](rr)) { ret 1; }
+    var r: Reservation = R.unwrap_ok[Reservation, str](rr);
+
+    if (R.is_ok[usize, str](builder_write_u64(?r.body, 1))) { ret 1; }
+    if (r.body.len != 0 || b.len != 1) { ret 1; }
+    if (data[1] != 0xCC || data[4] != 0xCC) { ret 1; }
+
+    if (R.is_err[usize, str](builder_write_u32(?r.body, 0xAABBCCDD))) { ret 1; }
+    if (b.len != 1) { ret 1; }
+    if (R.is_err[usize, str](reservation_rollback(?r))) { ret 1; }
+    if (b.len != 1 || b.reserved) { ret 1; }
+
+    if (R.is_err[usize, str](builder_write_u8(?b, 0x22))) { ret 1; }
+    if (b.len != 2 || data[1] != 0x22) { ret 1; }
+    ret 0;
+}
+
+test "binary builder: malformed and stale commits leave the parent unchanged" {
+    var data: [16]u8;
+    var b: Builder = builder(?data[0], 16, LITTLE);
+
+    val rr: R.Result[Reservation, str] = builder_reserve(?b, 4);
+    if (R.is_err[Reservation, str](rr)) { ret 1; }
+    var malformed: Reservation = R.unwrap_ok[Reservation, str](rr);
+    malformed.body.len = 5;
+    if (R.is_ok[usize, str](builder_commit(?malformed))) { ret 1; }
+    if (b.len != 0 || !b.reserved || !malformed.active) { ret 1; }
+    if (R.is_err[usize, str](reservation_rollback(?malformed))) { ret 1; }
+
+    val first_r: R.Result[Reservation, str] = builder_reserve(?b, 4);
+    if (R.is_err[Reservation, str](first_r)) { ret 1; }
+    var first: Reservation = R.unwrap_ok[Reservation, str](first_r);
+    var stale: Reservation = first;
+    if (R.is_err[usize, str](reservation_rollback(?first))) { ret 1; }
+
+    val second_r: R.Result[Reservation, str] = builder_reserve(?b, 4);
+    if (R.is_err[Reservation, str](second_r)) { ret 1; }
+    var second: Reservation = R.unwrap_ok[Reservation, str](second_r);
+    if (R.is_ok[usize, str](builder_commit(?stale))) { ret 1; }
+    if (b.len != 0 || !b.reserved) { ret 1; }
+    if (R.is_err[usize, str](reservation_rollback(?second))) { ret 1; }
+    ret 0;
+}
+
+test "binary builder: checkpoints and locked parents roll back explicitly" {
+    var data: [16]u8;
+    var b: Builder = builder(?data[0], 16, BIG);
+    if (R.is_err[usize, str](builder_write_u16(?b, 0x1234))) { ret 1; }
+
+    val mr: R.Result[Checkpoint, str] = builder_checkpoint(?b);
+    if (R.is_err[Checkpoint, str](mr)) { ret 1; }
+    val mark: Checkpoint = R.unwrap_ok[Checkpoint, str](mr);
+    if (R.is_err[usize, str](builder_write_u32(?b, 0x55667788))) { ret 1; }
+    if (R.is_err[usize, str](builder_rollback(?b, mark))) { ret 1; }
+    if (b.len != 2) { ret 1; }
+
+    if (R.is_ok[usize, str](builder_rollback(?b, 3)) || b.len != 2) { ret 1; }
+    val rr: R.Result[Reservation, str] = builder_reserve(?b, 4);
+    if (R.is_err[Reservation, str](rr)) { ret 1; }
+    var reservation: Reservation = R.unwrap_ok[Reservation, str](rr);
+    if (R.is_ok[Checkpoint, str](builder_checkpoint(?b)) || b.len != 2) { ret 1; }
+    if (R.is_ok[usize, str](builder_rollback(?b, 0)) || b.len != 2) { ret 1; }
+    if (R.is_err[usize, str](reservation_rollback(?reservation))) { ret 1; }
+    ret 0;
+}
+
+test "binary builder: patch failures leave length and bytes unchanged" {
+    var data: [8]u8;
+    memory.fill[u8](?data[0], 0xA5, 8);
+    var b: Builder = builder(?data[0], 8, LITTLE);
+    b.len = 4;
+
+    if (R.is_ok[usize, str](builder_patch_u64(?b, 0, 1))) { ret 1; }
+    if (b.len != 4) { ret 1; }
+    var i: usize = 0;
+    for (i < 8) {
+        if (data[i] != 0xA5) { ret 1; }
+        i = i + 1;
+    }
+
+    if (R.is_err[usize, str](builder_patch_u8(?b, 3, 0x11))) { ret 1; }
+    if (b.len != 4 || data[3] != 0x11) { ret 1; }
+
+    val rr: R.Result[Reservation, str] = builder_reserve(?b, 2);
+    if (R.is_err[Reservation, str](rr)) { ret 1; }
+    var reservation: Reservation = R.unwrap_ok[Reservation, str](rr);
+    if (R.is_ok[usize, str](builder_patch_u8(?b, 0, 0x22))) { ret 1; }
+    if (data[0] != 0xA5 || b.len != 4) { ret 1; }
+    if (R.is_err[usize, str](reservation_rollback(?reservation))) { ret 1; }
+    ret 0;
+}
+
+test "binary builder: capacity and alignment arithmetic never wraps" {
+    var data: [8]u8;
+    val max: usize = 0 - 1;
+    val high: usize = 0x8000000000000000;
+    var input: [2]u8 = [2]u8{1, 2};
+
+    if (growth_capacity(0, 255) != 256) { ret 1; }
+    if (growth_capacity(256, 257) != 512) { ret 1; }
+    if (growth_capacity(high, high + 1) != high + 1) { ret 1; }
+    if (growth_capacity(0, max) != max) { ret 1; }
+
+    var b: Builder = builder(?data[0], max, LITTLE);
+    b.len = max - 1;
+    if (R.is_ok[usize, str](builder_write_bytes(?b, ?input[0], 2)) || b.len != max - 1) { ret 1; }
+    if (R.is_ok[usize, str](builder_align(?b, 8)) || b.len != max - 1) { ret 1; }
+    if (R.is_ok[Reservation, str](builder_reserve(?b, 2)) || b.len != max - 1) { ret 1; }
+
+    b.len = 3;
+    b.cap = 8;
+    if (R.is_ok[usize, str](builder_write_bytes(?b, nil, 1)) || b.len != 3) { ret 1; }
+    if (R.is_ok[usize, str](builder_align(?b, 0)) || b.len != 3) { ret 1; }
+    if (R.is_ok[usize, str](builder_align(?b, 3)) || b.len != 3) { ret 1; }
+
+    b.epoch = max;
+    if (R.is_ok[Reservation, str](builder_reserve(?b, 0))) { ret 1; }
+    if (b.len != 3 || b.reserved || b.epoch != max) { ret 1; }
+
+    var e: Encoder = encoder(nil, LITTLE);
+    e.data = ?data[0];
+    e.len = max;
+    e.cap = max;
+    if (R.is_ok[usize, str](reserve(?e, 1)) || e.len != max || e.cap != max) { ret 1; }
+    if (R.is_ok[usize, str](align(?e, 8)) || e.len != max || e.cap != max) { ret 1; }
+    ret 0;
 }
