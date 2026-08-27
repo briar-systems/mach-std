@@ -22,12 +22,13 @@ cp -R "$root/src" "$here/dep/std/src"
 
 cd "$here"
 
-list="$(mktemp)"
+list="$here/results/$target-list.txt"
 expected_file="$(mktemp)"
 actual_file="$(mktemp)"
-trap 'rm -f "$list" "$expected_file" "$actual_file"' EXIT
+trap 'rm -f "$expected_file" "$actual_file"' EXIT
 
-"$mach" test . --target "$target" --include-deps --list > "$list" \
+"$mach" test . --target "$target" --include-deps --list \
+    | tr '\\' '/' > "$list" \
     || fail "$target suite could not be listed"
 
 required=(
@@ -83,4 +84,3 @@ fi
 expected_count="$(wc -l < "$expected_file" | tr -d '[:space:]')"
 echo "OK: $target ran the complete native suite with $expected_count known failures"
 echo "OK: thread, process, file, socket, and timer coverage is present"
-
