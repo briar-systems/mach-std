@@ -23,6 +23,7 @@ val REG_UNUSED:    i64 = 0;
 val REG_ACTIVE:    i64 = 1;
 val REG_CANCELLED: i64 = 2;
 val REG_COMPLETED: i64 = 3;
+val REG_CLAIMING:  i64 = 4;
 val GATE_CLOSED:   i64 = -1;
 
 pub rec Registration {
@@ -161,19 +162,24 @@ fun registration_remove(registration: *Registration) {
 pub fun attach(scope: *Scope, registration: *Registration, callback: CancelFun, context: ptr) Reason {
     if (scope == nil || registration == nil || callback::usize == 0) { ret INVALID; }
     if (!scope_enter(scope)) { ret DESTROYED; }
+    val registration_state: i64 = atomic.load(?registration.state);
+    if (registration_state != REG_UNUSED && registration_state != REG_COMPLETED) {
+        scope_leave(scope);
+        ret INVALID;
+    }
+    var expected: i64 = registration_state;
+    if (!atomic.cas(?registration.state, ?expected, REG_CLAIMING)) {
+        scope_leave(scope);
+        ret INVALID;
+    }
     val root: *Scope = scope.root;
     mutex.lock(?root.lock);
     val state: Reason = atomic.load(?scope.state);
     if (state != ACTIVE) {
+        atomic.store(?registration.state, registration_state);
         mutex.unlock(?root.lock);
         scope_leave(scope);
         ret state;
-    }
-    val registration_state: i64 = atomic.load(?registration.state);
-    if (registration_state != REG_UNUSED && registration_state != REG_COMPLETED) {
-        mutex.unlock(?root.lock);
-        scope_leave(scope);
-        ret INVALID;
     }
     registration.root = root;
     registration.scope = scope;
@@ -296,9 +302,13 @@ pub fun expire(scope: *Scope, now: time.Time) bool {
     val has_deadline: bool = scope.has_deadline;
     val deadline: time.Time = scope.deadline;
     val owner: *Scope = scope.deadline_owner;
+    if (!has_deadline || time.time_before(now, deadline)) {
+        scope_leave(scope);
+        ret false;
+    }
+    val expired: bool = timeout(owner);
     scope_leave(scope);
-    if (!has_deadline || time.time_before(now, deadline)) { ret false; }
-    ret timeout(owner);
+    ret expired;
 }
 
 # returns the effective deadline and the ancestor that owns it
@@ -444,6 +454,56 @@ test "cancel scope: active registrations cannot be attached twice" {
     if (attach(?other, ?registration, test_callback, (?callback)::ptr) != INVALID) { ret 1; }
     if (!cancel(?root) || atomic.load(?count) != 1 || atomic.load(?why) != CANCELLED) { ret 1; }
     if (!destroy(?root) || !destroy(?other)) { ret 1; }
+    ret 0;
+}
+
+rec AttachRaceContext {
+    scope: *Scope;
+    registration: *Registration;
+    callback: *TestCallback;
+    ready: *i64;
+    go: *i64;
+    result: *i64;
+}
+
+fun attach_race_worker(arg: *u8) {
+    val context: *AttachRaceContext = arg::*AttachRaceContext;
+    atomic.fetch_add(context.ready, 1);
+    for (atomic.load(context.go) == 0) { atomic.spin_hint(); }
+    val attached: Reason = attach(context.scope, context.registration, test_callback, context.callback::ptr);
+    atomic.store(context.result, attached);
+}
+
+test "cancel scope: concurrent roots cannot claim one registration" {
+    var first: Scope;
+    var second: Scope;
+    val none: time.Time = time.Time{sec: 0, nsec: 0};
+    if (!make_root(?first, false, none) || !make_root(?second, false, none)) { ret 1; }
+    var count: i64 = 0;
+    var why: i64 = ACTIVE;
+    var callback: TestCallback = TestCallback{count: ?count, reason: ?why};
+    var registration: Registration;
+    init_registration(?registration);
+    var ready: i64 = 0;
+    var go: i64 = 0;
+    var results: [2]i64;
+    var contexts: [2]AttachRaceContext;
+    contexts[0] = AttachRaceContext{scope: ?first, registration: ?registration, callback: ?callback, ready: ?ready, go: ?go, result: ?results[0]};
+    contexts[1] = AttachRaceContext{scope: ?second, registration: ?registration, callback: ?callback, ready: ?ready, go: ?go, result: ?results[1]};
+    var workers: [2]thread.Thread;
+    thread.spawn_with(attach_race_worker, (?contexts[0])::*u8, ?workers[0]);
+    thread.spawn_with(attach_race_worker, (?contexts[1])::*u8, ?workers[1]);
+    if (workers[0].tid < 0 || workers[1].tid < 0) { ret 1; }
+    for (atomic.load(?ready) != 2) { atomic.spin_hint(); }
+    atomic.store(?go, 1);
+    thread.join(?workers[0]);
+    thread.join(?workers[1]);
+    val first_result: Reason = atomic.load(?results[0]);
+    val second_result: Reason = atomic.load(?results[1]);
+    if (!((first_result == ACTIVE && second_result == INVALID) || (first_result == INVALID && second_result == ACTIVE))) { ret 1; }
+    cancel(?first);
+    cancel(?second);
+    if (atomic.load(?count) != 1 || !destroy(?first) || !destroy(?second)) { ret 1; }
     ret 0;
 }
 
