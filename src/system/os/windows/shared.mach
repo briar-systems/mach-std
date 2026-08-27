@@ -299,6 +299,8 @@ ext fun GetCurrentProcess() isize;
 ext fun GetProcessHandleCount(p0: isize, p1: *u32) i32;
 #[library("kernel32.dll")]
 ext fun LocalFree(p0: ptr) ptr;
+#[library("kernel32.dll")]
+ext fun VirtualQuery(p0: ptr, p1: ptr, p2: usize) usize;
 
 # WaitOnAddress / WakeByAddressSingle live in the synch apiset DLL, not kernel32
 # real windows' kernel32 does not export them (only wine's does), so without
@@ -2493,17 +2495,30 @@ fun set_thread_name(handle: isize, name: *u8) i64 {
     ret 0;
 }
 
+fun abort_thread_start(handle: isize, start: *ThreadStart, failure: i64) i64 {
+    atomic.store(?start.run, -1);
+    if (WaitForSingleObject(handle, INFINITE) != WAIT_OBJECT_0) {
+        val wait_error: i64 = last_error();
+        CloseHandle(handle);
+        ret wait_error;
+    }
+    if (CloseHandle(handle) == 0) { ret last_error(); }
+    ret failure;
+}
+
+fun abort_thread_prepare(start_mem: ptr, failure: i64) i64 {
+    val deallocate_error: i64 = deallocate(start_mem, THREAD_START_SIZE);
+    if (deallocate_error < 0) { ret deallocate_error; }
+    ret failure;
+}
+
 # create a thread with a retained native handle
 pub fun thread_spawn(
     f: fun(*u8), arg: *u8, state: *i64, reclaimable: *i64,
     owner: ptr, owner_size: usize, name: *u8,
     stack_reserve: usize, stack_commit: usize, native: *usize,
-    failure_stage: i64,
 ) i64 {
     if (stack_commit != 0) { ret -95; }
-    if (failure_stage == os_shared.THREAD_SPAWN_FAIL_BEFORE_ALLOCATE) {
-        ret os_shared.THREAD_SPAWN_ERROR_INJECTED;
-    }
 
     val start_mem: ptr = allocate(THREAD_START_SIZE);
     if (start_mem == nil) { ret -12; }
@@ -2515,16 +2530,6 @@ pub fun thread_spawn(
     start.owner_base = owner::usize;
     start.owner_size = owner_size;
     start.run = 0;
-
-    if (failure_stage == os_shared.THREAD_SPAWN_FAIL_AFTER_ALLOCATE) {
-        deallocate(start_mem, THREAD_START_SIZE);
-        ret os_shared.THREAD_SPAWN_ERROR_INJECTED;
-    }
-
-    if (failure_stage == os_shared.THREAD_SPAWN_FAIL_AFTER_PREPARE) {
-        deallocate(start_mem, THREAD_START_SIZE);
-        ret os_shared.THREAD_SPAWN_ERROR_INJECTED;
-    }
 
     var tid: u32 = 0;
     val tramp: fun(ptr) = thread_trampoline;
@@ -2538,31 +2543,12 @@ pub fun thread_spawn(
     );
     if (h == 0) {
         val r: i64 = last_error();
-        deallocate(start_mem, THREAD_START_SIZE);
-        ret r;
-    }
-
-    if (failure_stage == os_shared.THREAD_SPAWN_FAIL_AFTER_THREAD) {
-        atomic.store(?start.run, -1);
-        if (WaitForSingleObject(h, INFINITE) != WAIT_OBJECT_0) {
-            val wait_error: i64 = last_error();
-            CloseHandle(h);
-            ret wait_error;
-        }
-        if (CloseHandle(h) == 0) { ret last_error(); }
-        ret os_shared.THREAD_SPAWN_ERROR_INJECTED;
+        ret abort_thread_prepare(start_mem, r);
     }
 
     val name_error: i64 = set_thread_name(h, name);
     if (name_error < 0) {
-        atomic.store(?start.run, -1);
-        if (WaitForSingleObject(h, INFINITE) != WAIT_OBJECT_0) {
-            val wait_error: i64 = last_error();
-            CloseHandle(h);
-            ret wait_error;
-        }
-        if (CloseHandle(h) == 0) { ret last_error(); }
-        ret name_error;
+        ret abort_thread_start(h, start, name_error);
     }
 
     @native = h::usize;
@@ -2610,10 +2596,104 @@ pub fun thread_current_name(name: *u8, cap: usize) i64 {
     ret n::i64;
 }
 
-pub fun thread_resource_count() i64 {
+var test_name_worker_ran: i64 = 0;
+
+rec TestMemoryBasicInformation {
+    base:               ptr;
+    allocation_base:    ptr;
+    allocation_protect: u32;
+    padding0:           u32;
+    region_size:        usize;
+    state:              u32;
+    protect:            u32;
+    typ:                u32;
+    padding1:           u32;
+}
+
+fun test_thread_resources(allocations: *u64, handles: *u64) bool {
+    var address: usize = 0;
+    var total: u64 = 0;
+    for (address < (-1)::usize - 65535) {
+        var info: TestMemoryBasicInformation;
+        if (VirtualQuery(address::ptr, (?info)::ptr, 48) == 0) {
+            address = (-1)::usize;
+            cnt;
+        }
+        if (info.typ == 0x20000) { total = total + info.region_size::u64; }
+        val next: usize = info.base::usize + info.region_size;
+        if (next <= address) { ret false; }
+        address = next;
+    }
     var count: u32 = 0;
-    if (GetProcessHandleCount(GetCurrentProcess(), ?count) == 0) { ret last_error(); }
-    ret count::i64;
+    if (GetProcessHandleCount(GetCurrentProcess(), ?count) == 0) { ret false; }
+    @allocations = total;
+    @handles = count::u64;
+    ret true;
+}
+
+fun test_name_worker(arg: *u8) {
+    atomic.store(?test_name_worker_ran, 1);
+}
+
+test "std.system.os.windows: injected failure releases startup context" {
+    var allocations_before: u64 = 0;
+    var handles_before: u64 = 0;
+    if (!test_thread_resources(?allocations_before, ?handles_before)) { ret 1; }
+    val start_mem: ptr = allocate(THREAD_START_SIZE);
+    if (start_mem == nil) { ret 1; }
+    val injected: i64 = -125;
+    if (abort_thread_prepare(start_mem, injected) != injected) { ret 1; }
+    var allocations_after: u64 = 0;
+    var handles_after: u64 = 0;
+    if (!test_thread_resources(?allocations_after, ?handles_after)) { ret 1; }
+    if (allocations_after != allocations_before || handles_after != handles_before) { ret 1; }
+    ret 0;
+}
+
+test "std.system.os.windows: native name failure aborts before user entry" {
+    atomic.store(?test_name_worker_ran, 0);
+    var allocations_before: u64 = 0;
+    var handles_before: u64 = 0;
+    if (!test_thread_resources(?allocations_before, ?handles_before)) { ret 1; }
+    var state: i64 = 0;
+    var reclaimable: i64 = 0;
+    val owner: ptr = allocate(4096);
+    if (owner == nil) { ret 1; }
+    val start_mem: ptr = allocate(THREAD_START_SIZE);
+    if (start_mem == nil) { deallocate(owner, 4096); ret 1; }
+
+    val start: *ThreadStart = start_mem::usize::*ThreadStart;
+    start.fn_addr = test_name_worker::usize;
+    start.arg_addr = 0;
+    start.state_addr = (?state)::usize;
+    start.reclaimable_addr = (?reclaimable)::usize;
+    start.owner_base = owner::usize;
+    start.owner_size = 4096;
+    start.run = 0;
+
+    var tid: u32 = 0;
+    val tramp: fun(ptr) = thread_trampoline;
+    val handle: isize = CreateThread(nil, 65536, tramp::usize, start_mem, 0, ?tid);
+    if (handle == 0) {
+        deallocate(start_mem, THREAD_START_SIZE);
+        deallocate(owner, 4096);
+        ret 1;
+    }
+
+    val native_error: i64 = set_thread_name(INVALID_HANDLE_VALUE, "name-failure");
+    val abort_error: i64 = abort_thread_start(handle, start, native_error);
+    if (native_error >= 0 || abort_error != native_error) {
+        deallocate(owner, 4096);
+        ret 1;
+    }
+    val bad: bool = atomic.load(?test_name_worker_ran) != 0 || atomic.load(?reclaimable) != 1;
+    deallocate(owner, 4096);
+    if (bad) { ret 1; }
+    var allocations_after: u64 = 0;
+    var handles_after: u64 = 0;
+    if (!test_thread_resources(?allocations_after, ?handles_after)) { ret 1; }
+    if (allocations_after != allocations_before || handles_after != handles_before) { ret 1; }
+    ret 0;
 }
 
 # block until the value at addr changes from expected
