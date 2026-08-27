@@ -38,6 +38,8 @@ required=(
     'src/io/file/tests.mach'
     'src/net/tcp.mach'
     'src/net/udp.mach'
+    'src/net/local.mach'
+    'src/net/async/local.mach'
     'src/chrono/time.mach'
     'src/sync/channel.mach'
     'src/sync/worker_pool.mach'
