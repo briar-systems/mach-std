@@ -11,6 +11,7 @@ use std.types.result.is_err;
 use std.types.result.unwrap_ok;
 use std.types.result.unwrap_err;
 use std.system.os;
+use std.chrono.time;
 use std.sync.atomic;
 use std.sync.mutex;
 use std.sync.thread;
@@ -62,7 +63,13 @@ val SLOT_QUEUED: u8 = 2;
 rec Slot {
     state: u8;
     generation: u32;
+    timer_index: usize;
     operation: Operation;
+}
+
+rec TimerEntry {
+    deadline: time.Time;
+    token: Token;
 }
 
 pub val OPEN: u8 = 0;
@@ -74,12 +81,14 @@ pub rec Runtime {
     queue: os.IoQueue;
     slots: *Slot;
     completions: *Completion;
+    timers: *TimerEntry;
     capacity: usize;
     next_slot: usize;
     head: usize;
     tail: usize;
     count: usize;
     live: usize;
+    timer_count: usize;
     state: u8;
     lock: mutex.Mutex;
 }
@@ -98,9 +107,11 @@ pub fun make(runtime: *Runtime, capacity: usize) Result[bool, io_error.Error] {
     }
     val slot_size: usize = $size_of(Slot);
     val completion_size: usize = $size_of(Completion);
+    val timer_size: usize = $size_of(TimerEntry);
     val slots_bytes: usize = slot_size * capacity;
     val completions_bytes: usize = completion_size * capacity;
-    if (slots_bytes / slot_size != capacity || completions_bytes / completion_size != capacity) {
+    val timers_bytes: usize = timer_size * capacity;
+    if (slots_bytes / slot_size != capacity || completions_bytes / completion_size != capacity || timers_bytes / timer_size != capacity) {
         ret err[bool, io_error.Error](exhausted(io_error.OP_CREATE));
     }
 
@@ -112,6 +123,14 @@ pub fun make(runtime: *Runtime, capacity: usize) Result[bool, io_error.Error] {
         runtime.slots = nil;
         ret err[bool, io_error.Error](exhausted(io_error.OP_CREATE));
     }
+    runtime.timers = os.allocate(timers_bytes)::*TimerEntry;
+    if (runtime.timers == nil) {
+        os.deallocate(runtime.completions::ptr, completions_bytes);
+        os.deallocate(runtime.slots::ptr, slots_bytes);
+        runtime.completions = nil;
+        runtime.slots = nil;
+        ret err[bool, io_error.Error](exhausted(io_error.OP_CREATE));
+    }
 
     runtime.capacity = capacity;
     runtime.next_slot = 0;
@@ -119,19 +138,23 @@ pub fun make(runtime: *Runtime, capacity: usize) Result[bool, io_error.Error] {
     runtime.tail = 0;
     runtime.count = 0;
     runtime.live = 0;
+    runtime.timer_count = 0;
     runtime.state = OPEN;
     runtime.lock = mutex.make();
     var i: usize = 0;
     for (i < capacity) {
         runtime.slots[i].state = SLOT_FREE;
         runtime.slots[i].generation = 0;
+        runtime.slots[i].timer_index = capacity;
         i = i + 1;
     }
     val code: i64 = os.io_queue_create(?runtime.queue);
     if (code < 0) {
+        os.deallocate(runtime.timers::ptr, timers_bytes);
         os.deallocate(runtime.completions::ptr, completions_bytes);
         os.deallocate(runtime.slots::ptr, slots_bytes);
         runtime.completions = nil;
+        runtime.timers = nil;
         runtime.slots = nil;
         runtime.capacity = 0;
         ret err[bool, io_error.Error](io_error.from_code(code, io_error.OP_CREATE));
@@ -139,16 +162,12 @@ pub fun make(runtime: *Runtime, capacity: usize) Result[bool, io_error.Error] {
     ret ok[bool, io_error.Error](true);
 }
 
-pub fun submit(runtime: *Runtime, operation: Operation) Result[Token, io_error.Error] {
-    if (runtime == nil) { ret err[Token, io_error.Error](invalid(io_error.OP_SUBMIT)); }
-    mutex.lock(?runtime.lock);
+fun claim_locked(runtime: *Runtime, operation: Operation, token: *Token) i64 {
     if (runtime.state != OPEN) {
-        mutex.unlock(?runtime.lock);
-        ret err[Token, io_error.Error](io_error.from_code(os.EBADF, io_error.OP_SUBMIT));
+        ret os.EBADF;
     }
     if (runtime.live == runtime.capacity) {
-        mutex.unlock(?runtime.lock);
-        ret err[Token, io_error.Error](exhausted(io_error.OP_SUBMIT));
+        ret os.ENOMEM;
     }
 
     var scanned: usize = 0;
@@ -158,8 +177,7 @@ pub fun submit(runtime: *Runtime, operation: Operation) Result[Token, io_error.E
         scanned = scanned + 1;
     }
     if (scanned == runtime.capacity) {
-        mutex.unlock(?runtime.lock);
-        ret err[Token, io_error.Error](exhausted(io_error.OP_SUBMIT));
+        ret os.ENOMEM;
     }
     runtime.next_slot = (index + 1) % runtime.capacity;
     var generation: u32 = runtime.slots[index].generation + 1;
@@ -168,8 +186,18 @@ pub fun submit(runtime: *Runtime, operation: Operation) Result[Token, io_error.E
     runtime.slots[index].operation = operation;
     runtime.slots[index].state = SLOT_ACTIVE;
     runtime.live = runtime.live + 1;
+    @token = Token{index: index::u32, generation: generation};
+    ret 0;
+}
+
+pub fun submit(runtime: *Runtime, operation: Operation) Result[Token, io_error.Error] {
+    if (runtime == nil) { ret err[Token, io_error.Error](invalid(io_error.OP_SUBMIT)); }
+    mutex.lock(?runtime.lock);
+    var token: Token;
+    val code: i64 = claim_locked(runtime, operation, ?token);
     mutex.unlock(?runtime.lock);
-    ret ok[Token, io_error.Error](Token{index: index::u32, generation: generation});
+    if (code < 0) { ret err[Token, io_error.Error](io_error.from_code(code, io_error.OP_SUBMIT)); }
+    ret ok[Token, io_error.Error](token);
 }
 
 fun slot_for(runtime: *Runtime, token: Token) *Slot {
@@ -177,6 +205,83 @@ fun slot_for(runtime: *Runtime, token: Token) *Slot {
     val slot: *Slot = ?runtime.slots[token.index::usize];
     if (slot.generation != token.generation || slot.state != SLOT_ACTIVE) { ret nil; }
     ret slot;
+}
+
+fun token_equal(a: Token, b: Token) bool {
+    ret a.index == b.index && a.generation == b.generation;
+}
+
+fun timer_less(a: TimerEntry, b: TimerEntry) bool {
+    if (time.time_before(a.deadline, b.deadline)) { ret true; }
+    if (time.time_after(a.deadline, b.deadline)) { ret false; }
+    if (a.token.index < b.token.index) { ret true; }
+    if (a.token.index > b.token.index) { ret false; }
+    ret a.token.generation < b.token.generation;
+}
+
+fun timer_swap(runtime: *Runtime, a: usize, b: usize) {
+    val entry: TimerEntry = runtime.timers[a];
+    runtime.timers[a] = runtime.timers[b];
+    runtime.timers[b] = entry;
+    runtime.slots[runtime.timers[a].token.index::usize].timer_index = a;
+    runtime.slots[runtime.timers[b].token.index::usize].timer_index = b;
+}
+
+fun timer_sift_up(runtime: *Runtime, start: usize) {
+    var index: usize = start;
+    for (index > 0) {
+        val parent: usize = (index - 1) / 2;
+        if (!timer_less(runtime.timers[index], runtime.timers[parent])) { ret; }
+        timer_swap(runtime, index, parent);
+        index = parent;
+    }
+}
+
+fun timer_sift_down(runtime: *Runtime, start: usize) {
+    var index: usize = start;
+    for (true) {
+        val left: usize = index * 2 + 1;
+        if (left >= runtime.timer_count) { ret; }
+        var child: usize = left;
+        val right: usize = left + 1;
+        if (right < runtime.timer_count && timer_less(runtime.timers[right], runtime.timers[left])) { child = right; }
+        if (!timer_less(runtime.timers[child], runtime.timers[index])) { ret; }
+        timer_swap(runtime, index, child);
+        index = child;
+    }
+}
+
+fun timer_push(runtime: *Runtime, entry: TimerEntry) {
+    val index: usize = runtime.timer_count;
+    runtime.timers[index] = entry;
+    runtime.slots[entry.token.index::usize].timer_index = index;
+    runtime.timer_count = runtime.timer_count + 1;
+    timer_sift_up(runtime, index);
+}
+
+fun timer_remove_at(runtime: *Runtime, index: usize) TimerEntry {
+    val removed: TimerEntry = runtime.timers[index];
+    runtime.slots[removed.token.index::usize].timer_index = runtime.capacity;
+    runtime.timer_count = runtime.timer_count - 1;
+    if (index < runtime.timer_count) {
+        runtime.timers[index] = runtime.timers[runtime.timer_count];
+        runtime.slots[runtime.timers[index].token.index::usize].timer_index = index;
+        if (index > 0 && timer_less(runtime.timers[index], runtime.timers[(index - 1) / 2])) {
+            timer_sift_up(runtime, index);
+        } or {
+            timer_sift_down(runtime, index);
+        }
+    }
+    ret removed;
+}
+
+fun timer_remove_token(runtime: *Runtime, token: Token) bool {
+    val slot: *Slot = slot_for(runtime, token);
+    if (slot == nil || slot.operation.kind != TIMER || slot.timer_index >= runtime.timer_count) { ret false; }
+    val index: usize = slot.timer_index;
+    if (!token_equal(runtime.timers[index].token, token)) { ret false; }
+    timer_remove_at(runtime, index);
+    ret true;
 }
 
 fun enqueue(runtime: *Runtime, token: Token, slot: *Slot, bytes: usize, resource: usize, has_error: bool, failure: io_error.Error, eof: bool) {
@@ -203,6 +308,7 @@ fun resolve(runtime: *Runtime, token: Token, bytes: usize, resource: usize, has_
         mutex.unlock(?runtime.lock);
         ret err[bool, io_error.Error](io_error.from_code(os.EBADF, io_error.OP_SUBMIT));
     }
+    if (slot.operation.kind == TIMER) { timer_remove_token(runtime, token); }
     enqueue(runtime, token, slot, bytes, resource, has_error, failure, eof);
     mutex.unlock(?runtime.lock);
     val wake_result: i64 = os.io_queue_wake(?runtime.queue);
@@ -218,6 +324,67 @@ pub fun complete(runtime: *Runtime, token: Token, bytes: usize, resource: usize,
 
 pub fun fail(runtime: *Runtime, token: Token, failure: io_error.Error) Result[bool, io_error.Error] {
     ret resolve(runtime, token, 0, 0, true, failure, false);
+}
+
+# deadlines are absolute monotonic instants and never expire early
+# late delivery is limited only by native scheduling and runtime dequeue latency
+pub fun submit_timer(runtime: *Runtime, deadline: time.Time, context: usize) Result[Token, io_error.Error] {
+    if (runtime == nil || deadline.sec < 0 || deadline.nsec < 0 || deadline.nsec >= 1000000000) {
+        ret err[Token, io_error.Error](invalid(io_error.OP_SUBMIT));
+    }
+    val operation: Operation = Operation{kind: TIMER, resource: 0, buffer: nil, length: 0, offset: 0, context: context};
+    mutex.lock(?runtime.lock);
+    var token: Token;
+    val code: i64 = claim_locked(runtime, operation, ?token);
+    if (code == 0) { timer_push(runtime, TimerEntry{deadline: deadline, token: token}); }
+    mutex.unlock(?runtime.lock);
+    if (code < 0) { ret err[Token, io_error.Error](io_error.from_code(code, io_error.OP_SUBMIT)); }
+    val wake_result: i64 = os.io_queue_wake(?runtime.queue);
+    if (wake_result < 0) { ret err[Token, io_error.Error](io_error.from_code(wake_result, io_error.OP_WAKE)); }
+    ret ok[Token, io_error.Error](token);
+}
+
+# expiry and cancellation race under one lock and publish one terminal result
+pub fun cancel_timer(runtime: *Runtime, token: Token) Result[bool, io_error.Error] {
+    if (runtime == nil) { ret err[bool, io_error.Error](invalid(io_error.OP_SUBMIT)); }
+    mutex.lock(?runtime.lock);
+    val slot: *Slot = slot_for(runtime, token);
+    if (slot == nil || slot.operation.kind != TIMER || !timer_remove_token(runtime, token)) {
+        mutex.unlock(?runtime.lock);
+        ret err[bool, io_error.Error](io_error.from_code(os.EBADF, io_error.OP_SUBMIT));
+    }
+    enqueue(runtime, token, slot, 0, 0, true, io_error.from_code(os.ECANCELED, io_error.OP_WAIT), false);
+    mutex.unlock(?runtime.lock);
+    val wake_result: i64 = os.io_queue_wake(?runtime.queue);
+    if (wake_result < 0) { ret err[bool, io_error.Error](io_error.from_code(wake_result, io_error.OP_WAKE)); }
+    ret ok[bool, io_error.Error](true);
+}
+
+fun timers_expire(runtime: *Runtime, now: time.Time) {
+    # all due timers enter the completion queue in deadline and token order
+    for (runtime.timer_count > 0 && !time.time_before(now, runtime.timers[0].deadline)) {
+        val entry: TimerEntry = timer_remove_at(runtime, 0);
+        val slot: *Slot = slot_for(runtime, entry.token);
+        if (slot != nil) {
+            enqueue(runtime, entry.token, slot, 0, 0, false, io_error.from_code(0, io_error.OP_UNKNOWN), false);
+        }
+    }
+}
+
+fun timer_timeout(runtime: *Runtime, requested_ms: i32, now: time.Time) i32 {
+    if (runtime.timer_count == 0) { ret requested_ms; }
+    val deadline: time.Time = runtime.timers[0].deadline;
+    if (!time.time_before(now, deadline)) { ret 0; }
+    var sec: i64 = deadline.sec - now.sec;
+    var nsec: i64 = deadline.nsec - now.nsec;
+    if (nsec < 0) { sec = sec - 1; nsec = nsec + 1000000000; }
+    var timer_ms: i32 = 0x7fffffff;
+    if (sec < 2147483) {
+        val rounded: i64 = sec * 1000 + (nsec + 999999) / 1000000;
+        timer_ms = rounded::i32;
+    }
+    if (requested_ms >= 0 && requested_ms < timer_ms) { ret requested_ms; }
+    ret timer_ms;
 }
 
 fun drain(runtime: *Runtime, output: *Completion, output_capacity: usize) usize {
@@ -242,17 +409,21 @@ pub fun wait(runtime: *Runtime, output: *Completion, output_capacity: usize, tim
         ret err[usize, io_error.Error](invalid(io_error.OP_WAIT));
     }
     mutex.lock(?runtime.lock);
+    val before: time.Time = time.monotonic();
+    timers_expire(runtime, before);
     var written: usize = drain(runtime, output, output_capacity);
     if (written > 0 || runtime.state != OPEN) {
         mutex.unlock(?runtime.lock);
         ret ok[usize, io_error.Error](written);
     }
+    val native_timeout: i32 = timer_timeout(runtime, timeout_ms, before);
     mutex.unlock(?runtime.lock);
 
-    val waited: i64 = os.io_queue_wait(?runtime.queue, timeout_ms);
+    val waited: i64 = os.io_queue_wait(?runtime.queue, native_timeout);
     if (waited < 0) { ret err[usize, io_error.Error](io_error.from_code(waited, io_error.OP_WAIT)); }
 
     mutex.lock(?runtime.lock);
+    timers_expire(runtime, time.monotonic());
     written = drain(runtime, output, output_capacity);
     mutex.unlock(?runtime.lock);
     ret ok[usize, io_error.Error](written);
@@ -292,6 +463,7 @@ pub fun close(runtime: *Runtime) Result[bool, io_error.Error] {
         }
         i = i + 1;
     }
+    runtime.timer_count = 0;
     mutex.unlock(?runtime.lock);
     val code: i64 = os.io_queue_wake(?runtime.queue);
     if (code < 0) { ret err[bool, io_error.Error](io_error.from_code(code, io_error.OP_CLOSE)); }
@@ -311,16 +483,19 @@ pub fun destroy(runtime: *Runtime) Result[bool, io_error.Error] {
     val capacity: usize = runtime.capacity;
     val slots: *Slot = runtime.slots;
     val completions: *Completion = runtime.completions;
+    val timers: *TimerEntry = runtime.timers;
     runtime.state = DESTROYED;
     mutex.unlock(?runtime.lock);
     val queue_result: i64 = os.io_queue_close(?runtime.queue);
     val completion_result: i64 = os.deallocate(completions::ptr, $size_of(Completion) * capacity);
+    val timer_result: i64 = os.deallocate(timers::ptr, $size_of(TimerEntry) * capacity);
     val slot_result: i64 = os.deallocate(slots::ptr, $size_of(Slot) * capacity);
     runtime.slots = nil;
     runtime.completions = nil;
+    runtime.timers = nil;
     runtime.capacity = 0;
     if (queue_result < 0) { ret err[bool, io_error.Error](io_error.from_code(queue_result, io_error.OP_CLOSE)); }
-    if (completion_result < 0 || slot_result < 0) { ret err[bool, io_error.Error](io_error.from_code(os.EIO, io_error.OP_CLOSE)); }
+    if (completion_result < 0 || timer_result < 0 || slot_result < 0) { ret err[bool, io_error.Error](io_error.from_code(os.EIO, io_error.OP_CLOSE)); }
     ret ok[bool, io_error.Error](true);
 }
 
@@ -479,5 +654,171 @@ test "runtime: sustained mixed completions remain bounded and fair" {
     }
     close(?runtime);
     destroy(?runtime);
+    ret 0;
+}
+
+test "runtime timer: large heaps expire in deadline order" {
+    var runtime: Runtime;
+    if (is_err[bool, io_error.Error](make(?runtime, 1024))) { ret 1; }
+    val base: time.Time = time.Time{sec: 10, nsec: 0};
+    var i: usize = 0;
+    for (i < 1024) {
+        val deadline: time.Time = time.time_add(base, ((1024 - i) * 1000000)::i64);
+        if (is_err[Token, io_error.Error](submit_timer(?runtime, deadline, i))) { ret 1; }
+        i = i + 1;
+    }
+    mutex.lock(?runtime.lock);
+    timers_expire(?runtime, time.time_add(base, 513000000));
+    var output: [1024]Completion;
+    val count: usize = drain(?runtime, ?output[0], 1024);
+    mutex.unlock(?runtime.lock);
+    if (count != 513) { ret 1; }
+    i = 0;
+    for (i < 513) {
+        if (output[i].context != 1023 - i || output[i].has_error) { ret 1; }
+        i = i + 1;
+    }
+    if (runtime.timer_count != 511 || pending(?runtime) != 511) { ret 1; }
+    close(?runtime);
+    mutex.lock(?runtime.lock);
+    val closed_count: usize = drain(?runtime, ?output[0], 1024);
+    mutex.unlock(?runtime.lock);
+    if (closed_count != 511) { ret 1; }
+    if (is_err[bool, io_error.Error](destroy(?runtime))) { ret 1; }
+    ret 0;
+}
+
+test "runtime timer: cancellation and expiry each publish once" {
+    var runtime: Runtime;
+    if (is_err[bool, io_error.Error](make(?runtime, 2))) { ret 1; }
+    val base: time.Time = time.Time{sec: 10, nsec: 0};
+    val cancelled_result: Result[Token, io_error.Error] = submit_timer(?runtime, time.time_add(base, 1000000), 1);
+    if (is_err[Token, io_error.Error](cancelled_result)) { ret 1; }
+    val cancelled: Token = unwrap_ok[Token, io_error.Error](cancelled_result);
+    if (is_err[bool, io_error.Error](cancel_timer(?runtime, cancelled))) { ret 1; }
+    if (!is_err[bool, io_error.Error](cancel_timer(?runtime, cancelled))) { ret 1; }
+    mutex.lock(?runtime.lock);
+    timers_expire(?runtime, time.time_add(base, 2000000));
+    mutex.unlock(?runtime.lock);
+
+    val expired_result: Result[Token, io_error.Error] = submit_timer(?runtime, time.time_add(base, 3000000), 2);
+    if (is_err[Token, io_error.Error](expired_result)) { ret 1; }
+    val expired: Token = unwrap_ok[Token, io_error.Error](expired_result);
+    mutex.lock(?runtime.lock);
+    timers_expire(?runtime, time.time_add(base, 4000000));
+    mutex.unlock(?runtime.lock);
+    if (!is_err[bool, io_error.Error](cancel_timer(?runtime, expired))) { ret 1; }
+
+    var output: [2]Completion;
+    val result: Result[usize, io_error.Error] = wait(?runtime, ?output[0], 2, 0);
+    if (is_err[usize, io_error.Error](result) || unwrap_ok[usize, io_error.Error](result) != 2) { ret 1; }
+    if (!output[0].has_error || output[0].error.kind != io_error.CANCELLED || output[0].context != 1) { ret 1; }
+    if (output[1].has_error || output[1].context != 2 || pending(?runtime) != 0) { ret 1; }
+    close(?runtime);
+    if (is_err[bool, io_error.Error](destroy(?runtime))) { ret 1; }
+    ret 0;
+}
+
+test "runtime timer: wall clock adjustments cannot change ordering" {
+    var runtime: Runtime;
+    if (is_err[bool, io_error.Error](make(?runtime, 1))) { ret 1; }
+    val monotonic_base: time.Time = time.Time{sec: 50, nsec: 0};
+    val submitted: Result[Token, io_error.Error] = submit_timer(?runtime, time.time_add(monotonic_base, 20000000), 7);
+    if (is_err[Token, io_error.Error](submitted)) { ret 1; }
+    var wall_clock: time.Time = time.Time{sec: 2000000000, nsec: 0};
+    wall_clock = time.Time{sec: 1000000000, nsec: 0};
+    if (wall_clock.sec != 1000000000) { ret 1; }
+    mutex.lock(?runtime.lock);
+    timers_expire(?runtime, time.time_add(monotonic_base, 19000000));
+    if (runtime.count != 0 || runtime.timer_count != 1) {
+        mutex.unlock(?runtime.lock);
+        ret 1;
+    }
+    wall_clock = time.Time{sec: 3000000000, nsec: 0};
+    timers_expire(?runtime, time.time_add(monotonic_base, 20000000));
+    if (wall_clock.sec != 3000000000 || runtime.count != 1 || runtime.timer_count != 0) {
+        mutex.unlock(?runtime.lock);
+        ret 1;
+    }
+    var output: [1]Completion;
+    if (drain(?runtime, ?output[0], 1) != 1) {
+        mutex.unlock(?runtime.lock);
+        ret 1;
+    }
+    mutex.unlock(?runtime.lock);
+    if (output[0].context != 7 || output[0].has_error) { ret 1; }
+    close(?runtime);
+    if (is_err[bool, io_error.Error](destroy(?runtime))) { ret 1; }
+    ret 0;
+}
+
+rec TimerRaceContext {
+    runtime: *Runtime;
+    token: Token;
+    cancelled: *i64;
+}
+
+fun timer_cancel_worker(arg: *u8) {
+    val context: *TimerRaceContext = arg::*TimerRaceContext;
+    val result: Result[bool, io_error.Error] = cancel_timer(context.runtime, context.token);
+    if (is_err[bool, io_error.Error](result)) {
+        atomic.store(context.cancelled, 0);
+    } or {
+        atomic.store(context.cancelled, 1);
+    }
+}
+
+test "runtime timer: concurrent cancellation and expiry have one winner" {
+    var runtime: Runtime;
+    if (is_err[bool, io_error.Error](make(?runtime, 1))) { ret 1; }
+    var round: usize = 0;
+    for (round < 32) {
+        val submitted: Result[Token, io_error.Error] = submit_timer(?runtime, time.monotonic(), round);
+        if (is_err[Token, io_error.Error](submitted)) { ret 1; }
+        var cancelled: i64 = -1;
+        var context: TimerRaceContext = TimerRaceContext{
+            runtime: ?runtime,
+            token: unwrap_ok[Token, io_error.Error](submitted),
+            cancelled: ?cancelled,
+        };
+        var worker: thread.Thread;
+        thread.spawn_with(timer_cancel_worker, (?context)::*u8, ?worker);
+        if (worker.tid < 0) { ret 1; }
+        var output: [1]Completion;
+        val result: Result[usize, io_error.Error] = wait(?runtime, ?output[0], 1, -1);
+        thread.join(?worker);
+        if (is_err[usize, io_error.Error](result) || unwrap_ok[usize, io_error.Error](result) != 1) { ret 1; }
+        if (output[0].context != round || pending(?runtime) != 0) { ret 1; }
+        if (atomic.load(?cancelled) == 1 && (!output[0].has_error || output[0].error.kind != io_error.CANCELLED)) { ret 1; }
+        if (atomic.load(?cancelled) == 0 && output[0].has_error) { ret 1; }
+        if (!is_err[bool, io_error.Error](cancel_timer(?runtime, context.token))) { ret 1; }
+        round = round + 1;
+    }
+    close(?runtime);
+    if (is_err[bool, io_error.Error](destroy(?runtime))) { ret 1; }
+    ret 0;
+}
+
+test "runtime timer: native wait uses monotonic deadlines" {
+    var runtime: Runtime;
+    if (is_err[bool, io_error.Error](make(?runtime, 1))) { ret 1; }
+    val start: time.Time = time.monotonic();
+    val deadline: time.Time = time.time_add(start, 20000000);
+    val submitted: Result[Token, io_error.Error] = submit_timer(?runtime, deadline, 91);
+    if (is_err[Token, io_error.Error](submitted)) { ret 1; }
+    var output: [1]Completion;
+    var count: usize = 0;
+    var attempts: usize = 0;
+    for (count == 0 && attempts < 4) {
+        val result: Result[usize, io_error.Error] = wait(?runtime, ?output[0], 1, -1);
+        if (is_err[usize, io_error.Error](result)) { ret 1; }
+        count = unwrap_ok[usize, io_error.Error](result);
+        attempts = attempts + 1;
+    }
+    val finished: time.Time = time.monotonic();
+    if (count != 1 || output[0].context != 91 || output[0].has_error) { ret 1; }
+    if (time.time_before(finished, deadline) || time.time_sub(finished, deadline) > 5000000000) { ret 1; }
+    close(?runtime);
+    if (is_err[bool, io_error.Error](destroy(?runtime))) { ret 1; }
     ret 0;
 }
