@@ -1,0 +1,143 @@
+# windows winsock system resolver adapter
+
+$if ($mach.build.os != $mach.os.windows) {
+    $error("std.net.resolve.windows: requires windows target");
+}
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.allocator;
+use std.sync.once;
+use std.system.os;
+use std.net.ip;
+use std.net.resolve.types;
+use std.net.resolve.shared;
+
+rec AddrInfo {
+    flags: i32;
+    family: i32;
+    socket_kind: i32;
+    protocol: i32;
+    address_length: usize;
+    canonical_name: *u8;
+    address: *u8;
+    next: *AddrInfo;
+}
+
+val AI_PASSIVE: i32 = 0x0001;
+val AI_CANONNAME: i32 = 0x0002;
+val AI_NUMERICHOST: i32 = 0x0004;
+val AI_NUMERICSERV: i32 = 0x0008;
+
+val WSA_NOT_ENOUGH_MEMORY: i32 = 8;
+val WSAEINVAL: i32 = 10022;
+val WSAEAFNOSUPPORT: i32 = 10047;
+val WSAHOST_NOT_FOUND: i32 = 11001;
+val WSATRY_AGAIN: i32 = 11002;
+val WSANO_RECOVERY: i32 = 11003;
+val WSANO_DATA: i32 = 11004;
+val WSAENOBUFS: i32 = 10055;
+
+#[library("ws2_32.dll")]
+ext fun WSAStartup(version: u16, data: *u8) i32;
+
+#[library("ws2_32.dll")]
+ext fun GetAddrInfoA(node: *u8, service: *u8, hints: *AddrInfo, output: **AddrInfo) i32;
+
+#[library("ws2_32.dll")]
+ext fun FreeAddrInfoA(value: *AddrInfo);
+
+var initialized: once.Once = once.Once{state: once.PENDING, waiters: 0};
+
+fun initialize(context: ptr) bool {
+    var data: [408]u8;
+    ret WSAStartup(0x0202, ?data[0]) == 0;
+}
+
+fun failure(code: i32) types.Error {
+    if (code == WSAHOST_NOT_FOUND || code == WSANO_DATA) { ret shared.error(types.NO_NAME, code::i64); }
+    if (code == WSATRY_AGAIN) { ret shared.error(types.TEMPORARY, code::i64); }
+    if (code == WSA_NOT_ENOUGH_MEMORY || code == WSAENOBUFS) { ret shared.error(types.OUT_OF_MEMORY, code::i64); }
+    if (code == WSANO_RECOVERY) { ret shared.error(types.MALFORMED, code::i64); }
+    if (code == WSAEINVAL || code == WSAEAFNOSUPPORT) { ret shared.error(types.INVALID, code::i64); }
+    ret shared.error(types.SYSTEM_FAILURE, code::i64);
+}
+
+fun family(query: *types.Query) i32 {
+    if (query.family == types.IPV4_ONLY) { ret os.AF_INET; }
+    if (query.family == types.IPV6_ONLY) { ret os.AF_INET6; }
+    ret 0;
+}
+
+fun socket_kind(query: *types.Query) i32 {
+    if (query.socket_kind == types.STREAM_SOCKET) { ret os.SOCK_STREAM; }
+    if (query.socket_kind == types.DATAGRAM_SOCKET) { ret os.SOCK_DGRAM; }
+    ret 0;
+}
+
+fun flags(query: *types.Query) i32 {
+    var output: i32 = 0;
+    if ((query.flags & types.PASSIVE) != 0) { output = output | AI_PASSIVE; }
+    if ((query.flags & types.CANONICAL_NAME) != 0) { output = output | AI_CANONNAME; }
+    if ((query.flags & types.NUMERIC_HOST) != 0) { output = output | AI_NUMERICHOST; }
+    if ((query.flags & types.NUMERIC_SERVICE) != 0) { output = output | AI_NUMERICSERV; }
+    ret output;
+}
+
+pub fun resolve(query: *types.Query, owner: *allocator.Allocator, output: *types.Resolution) types.Error {
+    if (query == nil || owner == nil || output == nil) { ret shared.error(types.INVALID, os.EINVAL); }
+    shared.clear(output, owner);
+    if (!once.run(?initialized, nil, initialize)) { ret shared.error(types.SYSTEM_FAILURE, 0); }
+
+    var hints: AddrInfo;
+    hints.flags = flags(query);
+    hints.family = family(query);
+    hints.socket_kind = socket_kind(query);
+    hints.protocol = query.protocol;
+    hints.address_length = 0;
+    hints.canonical_name = nil;
+    hints.address = nil;
+    hints.next = nil;
+    var first: *AddrInfo = nil;
+    val code: i32 = GetAddrInfoA(query.host, query.service, ?hints, ?first);
+    if (code != 0) { ret failure(code); }
+    if (first == nil) { ret shared.error(types.NO_NAME, WSAHOST_NOT_FOUND); }
+
+    var count: usize = 0;
+    var current: *AddrInfo = first;
+    for (current != nil) {
+        if (count == ~(0::usize)) { FreeAddrInfoA(first); ret shared.error(types.MALFORMED, WSANO_RECOVERY); }
+        count = count + 1;
+        current = current.next;
+    }
+    if (!shared.allocate_endpoints(output, count)) {
+        FreeAddrInfoA(first);
+        ret shared.error(types.OUT_OF_MEMORY, os.ENOMEM);
+    }
+
+    current = first;
+    var malformed: bool = false;
+    for (current != nil) {
+        if ((current.family == os.AF_INET || current.family == os.AF_INET6) && current.address != nil) {
+            var endpoint: ip.Endpoint;
+            if (!ip.from_sockaddr(current.address, ?endpoint)
+             || !shared.append_unique(output, endpoint)) { malformed = true; }
+        }
+        if (output.canonical_name == nil && current.canonical_name != nil
+         && !shared.set_canonical(output, current.canonical_name)) {
+            FreeAddrInfoA(first);
+            shared.destroy(output);
+            ret shared.error(types.OUT_OF_MEMORY, os.ENOMEM);
+        }
+        current = current.next;
+    }
+    FreeAddrInfoA(first);
+    if (output.len == 0) {
+        shared.destroy(output);
+        if (malformed) { ret shared.error(types.MALFORMED, WSANO_RECOVERY); }
+        ret shared.error(types.NO_NAME, WSAHOST_NOT_FOUND);
+    }
+    ret shared.error(types.NO_ERROR, 0);
+}
