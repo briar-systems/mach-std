@@ -17,6 +17,7 @@ use std.sync.atomic;
 use std.sync.cancel;
 use std.sync.mutex;
 use std.sync.thread;
+use std.io.lifecycle;
 use io_error: std.io.error;
 
 $if ($mach.build.os == $mach.os.linux) {
@@ -117,6 +118,7 @@ rec Source {
     release: ReleaseFun;
     live: usize;
     busy: usize;
+    attachment: lifecycle.Attachment;
 }
 
 rec Slot {
@@ -128,6 +130,7 @@ rec Slot {
     deadline_timer_index: usize;
     cancellation_active: bool;
     cancellation: cancel.Registration;
+    attachment: lifecycle.Attachment;
     source_index: u32;
     operation: Operation;
 }
@@ -142,9 +145,9 @@ rec TimerEntry {
     scope: *cancel.Scope;
 }
 
-pub val OPEN: u8 = 0;
-pub val CLOSING: u8 = 1;
-pub val CLOSED: u8 = 2;
+pub val OPEN: u8 = lifecycle.OPEN;
+pub val CLOSING: u8 = lifecycle.CLOSING;
+pub val CLOSED: u8 = lifecycle.CLOSED;
 pub val DESTROYED: u8 = 3;
 
 # one thread owns wait and dequeue, while submission and resolution may be concurrent
@@ -165,7 +168,8 @@ pub rec Runtime {
     source_count: usize;
     next_source_tag: u32;
     native_controls: usize;
-    state: u8;
+    lifecycle: lifecycle.Lifecycle;
+    destroyed: bool;
     lock: mutex.Mutex;
     native_lock: mutex.Mutex;
 }
@@ -246,7 +250,8 @@ pub fun make(runtime: *Runtime, capacity: usize) Result[bool, io_error.Error] {
     runtime.source_count = 0;
     runtime.next_source_tag = 1;
     runtime.native_controls = 0;
-    runtime.state = OPEN;
+    lifecycle.make(?runtime.lifecycle);
+    runtime.destroyed = false;
     runtime.lock = mutex.make();
     runtime.native_lock = mutex.make();
     var i: usize = 0;
@@ -258,6 +263,10 @@ pub fun make(runtime: *Runtime, capacity: usize) Result[bool, io_error.Error] {
         runtime.slots[i].operation_timer_index = timer_capacity;
         runtime.slots[i].deadline_timer_index = timer_capacity;
         runtime.slots[i].cancellation_active = false;
+        runtime.slots[i].attachment.owner = nil;
+        runtime.slots[i].attachment.generation = 0;
+        runtime.slots[i].attachment.sequence = 0;
+        runtime.slots[i].attachment.active = false;
         runtime.slots[i].source_index = NO_SOURCE;
         cancel.init_registration(?runtime.slots[i].cancellation);
         runtime.sources[i].state = SOURCE_UNUSED;
@@ -265,6 +274,10 @@ pub fun make(runtime: *Runtime, capacity: usize) Result[bool, io_error.Error] {
         runtime.sources[i].tag = 0;
         runtime.sources[i].live = 0;
         runtime.sources[i].busy = 0;
+        runtime.sources[i].attachment.owner = nil;
+        runtime.sources[i].attachment.generation = 0;
+        runtime.sources[i].attachment.sequence = 0;
+        runtime.sources[i].attachment.active = false;
         i = i + 1;
     }
     val code: i64 = os.io_queue_create(?runtime.queue);
@@ -280,6 +293,7 @@ pub fun make(runtime: *Runtime, capacity: usize) Result[bool, io_error.Error] {
         runtime.native_events = nil;
         runtime.slots = nil;
         runtime.capacity = 0;
+        runtime.destroyed = true;
         ret err[bool, io_error.Error](io_error.from_code(code, io_error.OP_CREATE));
     }
     ret ok[bool, io_error.Error](true);
@@ -303,7 +317,11 @@ pub fun register_source(
         ret err[SourceToken, io_error.Error](invalid(io_error.OP_CREATE));
     }
     mutex.lock(?runtime.lock);
-    if (runtime.state != OPEN || runtime.source_count >= runtime.capacity || runtime.next_source_tag > 0xffff) {
+    if (runtime.destroyed || lifecycle.snapshot(?runtime.lifecycle).state != lifecycle.OPEN) {
+        mutex.unlock(?runtime.lock);
+        ret err[SourceToken, io_error.Error](io_error.from_code(os.EBADF, io_error.OP_CREATE));
+    }
+    if (runtime.source_count >= runtime.capacity || runtime.next_source_tag > 0xffff) {
         mutex.unlock(?runtime.lock);
         ret err[SourceToken, io_error.Error](exhausted(io_error.OP_CREATE));
     }
@@ -326,6 +344,12 @@ pub fun register_source(
     source.release = release;
     source.live = 0;
     source.busy = 0;
+    if (!lifecycle.attach(?runtime.lifecycle, ?source.attachment)) {
+        source.state = SOURCE_RETIRED;
+        source.context = nil;
+        mutex.unlock(?runtime.lock);
+        ret err[SourceToken, io_error.Error](io_error.from_code(os.EBADF, io_error.OP_CREATE));
+    }
     runtime.source_count = runtime.source_count + 1;
     runtime.next_source_tag = runtime.next_source_tag + 1;
     mutex.unlock(?runtime.lock);
@@ -347,7 +371,13 @@ pub fun unregister_source(runtime: *Runtime, token: SourceToken) Result[bool, io
     source.state = SOURCE_RETIRED;
     source.context = nil;
     runtime.source_count = runtime.source_count - 1;
+    val completed: bool = lifecycle.settle(?source.attachment);
+    var wake_result: i64 = 0;
+    if (completed) { wake_result = os.io_queue_wake(?runtime.queue); }
     mutex.unlock(?runtime.lock);
+    if (wake_result < 0) {
+        ret err[bool, io_error.Error](io_error.from_code(wake_result, io_error.OP_WAKE));
+    }
     ret ok[bool, io_error.Error](true);
 }
 
@@ -356,7 +386,7 @@ pub fun source_id(token: SourceToken) u16 {
 }
 
 fun claim_locked(runtime: *Runtime, operation: Operation, source_index: u32, token: *Token) i64 {
-    if (runtime.state != OPEN) {
+    if (runtime.destroyed || lifecycle.snapshot(?runtime.lifecycle).state != lifecycle.OPEN) {
         ret os.EBADF;
     }
     if (runtime.live == runtime.capacity) {
@@ -382,6 +412,9 @@ fun claim_locked(runtime: *Runtime, operation: Operation, source_index: u32, tok
     runtime.slots[index].cancellation_active = false;
     runtime.slots[index].source_index = source_index;
     cancel.init_registration(?runtime.slots[index].cancellation);
+    if (!lifecycle.attach(?runtime.lifecycle, ?runtime.slots[index].attachment)) {
+        ret os.EBADF;
+    }
     runtime.slots[index].state = SLOT_ACTIVE;
     runtime.live = runtime.live + 1;
     if (source_index != NO_SOURCE) {
@@ -592,6 +625,12 @@ fun release_claim_locked(runtime: *Runtime, token: Token) {
     slot.source_index = NO_SOURCE;
     cancel.init_registration(?slot.cancellation);
     runtime.live = runtime.live - 1;
+    if (!lifecycle.settle(?slot.attachment)) {
+        val current: lifecycle.Snapshot = lifecycle.snapshot(?runtime.lifecycle);
+        if (current.state != lifecycle.OPEN) {
+            panic.panic("std.io.runtime: released claim did not settle open lifecycle\n");
+        }
+    }
 }
 
 fun attach_scope_locked(runtime: *Runtime, token: Token, scope: *cancel.Scope) cancel.Reason {
@@ -849,7 +888,10 @@ fun drain(runtime: *Runtime, output: *Completion, output_capacity: usize) usize 
             val source: *Source = ?runtime.sources[source_index::usize];
             source.live = source.live - 1;
         }
-        if (runtime.state == CLOSING && runtime.live == 0) { runtime.state = CLOSED; }
+        val completed: bool = lifecycle.settle(?slot.attachment);
+        if (completed && os.io_queue_wake(?runtime.queue) < 0) {
+            panic.panic("std.io.runtime: terminal lifecycle wake failed\n");
+        }
         written = written + 1;
     }
     ret written;
@@ -871,7 +913,7 @@ pub fun poll(runtime: *Runtime, output: *Completion, output_capacity: usize) Res
         ret err[usize, io_error.Error](invalid(io_error.OP_WAIT));
     }
     mutex.lock(?runtime.lock);
-    if (runtime.state == DESTROYED) {
+    if (runtime.destroyed) {
         mutex.unlock(?runtime.lock);
         ret err[usize, io_error.Error](invalid(io_error.OP_WAIT));
     }
@@ -887,12 +929,12 @@ pub fun prepare_wait(runtime: *Runtime, timeout_ms: i32) Result[WaitPlan, io_err
         ret err[WaitPlan, io_error.Error](invalid(io_error.OP_WAIT));
     }
     mutex.lock(?runtime.lock);
-    if (runtime.state == DESTROYED) {
+    if (runtime.destroyed) {
         mutex.unlock(?runtime.lock);
         ret err[WaitPlan, io_error.Error](invalid(io_error.OP_WAIT));
     }
     settle_expired_locked(runtime);
-    if (runtime.state == CLOSED || runtime.count != 0) {
+    if (lifecycle.snapshot(?runtime.lifecycle).state == lifecycle.CLOSED || runtime.count != 0) {
         mutex.unlock(?runtime.lock);
         ret ok[WaitPlan, io_error.Error](WaitPlan{wait: false, timeout_ms: 0});
     }
@@ -904,7 +946,7 @@ pub fun prepare_wait(runtime: *Runtime, timeout_ms: i32) Result[WaitPlan, io_err
 pub fun begin_native_control(runtime: *Runtime) Result[bool, io_error.Error] {
     if (runtime == nil) { ret err[bool, io_error.Error](invalid(io_error.OP_WAIT)); }
     mutex.lock(?runtime.lock);
-    if (runtime.state == DESTROYED) {
+    if (runtime.destroyed) {
         mutex.unlock(?runtime.lock);
         ret err[bool, io_error.Error](invalid(io_error.OP_WAIT));
     }
@@ -1019,7 +1061,7 @@ pub fun wake(runtime: *Runtime) Result[bool, io_error.Error] {
         ret err[bool, io_error.Error](invalid(io_error.OP_WAKE));
     }
     mutex.lock(?runtime.lock);
-    val destroyed: bool = runtime.state == DESTROYED;
+    val destroyed: bool = runtime.destroyed;
     var code: i64 = os.EINVAL;
     if (!destroyed) { code = os.io_queue_wake(?runtime.queue); }
     mutex.unlock(?runtime.lock);
@@ -1028,59 +1070,75 @@ pub fun wake(runtime: *Runtime) Result[bool, io_error.Error] {
     ret ok[bool, io_error.Error](true);
 }
 
-# close rejects new work and queues one closed completion for every active operation
-pub fun close(runtime: *Runtime) Result[bool, io_error.Error] {
-    if (runtime == nil) { ret err[bool, io_error.Error](invalid(io_error.OP_CLOSE)); }
+# close rejects new work and queues one terminal completion for every active operation
+pub fun begin_close(runtime: *Runtime, mode: lifecycle.Mode, cause: lifecycle.Cause) Result[lifecycle.CloseResult, io_error.Error] {
+    if (runtime == nil) { ret err[lifecycle.CloseResult, io_error.Error](invalid(io_error.OP_CLOSE)); }
     mutex.lock(?runtime.lock);
-    if (runtime.state == DESTROYED) {
+    if (runtime.destroyed) {
         mutex.unlock(?runtime.lock);
-        ret err[bool, io_error.Error](invalid(io_error.OP_CLOSE));
+        ret err[lifecycle.CloseResult, io_error.Error](invalid(io_error.OP_CLOSE));
     }
-    if (runtime.state != OPEN) {
+    val closing: lifecycle.CloseResult = lifecycle.begin_close(?runtime.lifecycle, mode, cause);
+    if (!closing.started && !closing.escalated) {
         mutex.unlock(?runtime.lock);
-        ret ok[bool, io_error.Error](false);
+        ret ok[lifecycle.CloseResult, io_error.Error](closing);
     }
-    runtime.state = CLOSING;
-    val closed_error: io_error.Error = io_error.from_code(os.EBADF, io_error.OP_CLOSE);
-    var i: usize = 0;
-    for (i < runtime.capacity) {
-        val slot: *Slot = ?runtime.slots[i];
-        if (slot.state == SLOT_ACTIVE) {
-            val token: Token = Token{index: i::u32, generation: slot.generation};
-            if (!slot.cancellation_active || cancel.unregister(?slot.cancellation)) {
-                slot.cancellation_active = false;
-                remove_slot_timers(runtime, token);
-                slot.state = SLOT_CANCELLING;
-                val source_index: u32 = slot.source_index;
-                mutex.unlock(?runtime.lock);
-                if (source_index != NO_SOURCE) {
-                    val source: *Source = ?runtime.sources[source_index::usize];
-                    if (source.cancel(source.context, token) < 0) {
-                        panic.panic("std.io.runtime: close lost source operation ownership\n");
+    if (closing.started) {
+        var code: i64 = os.EBADF;
+        if (cause == lifecycle.DEADLINE) { code = os.ETIMEDOUT; }
+        or (cause == lifecycle.CANCELLATION) { code = os.ECANCELED; }
+        or (cause == lifecycle.FAILURE) { code = os.EIO; }
+        val closed_error: io_error.Error = io_error.from_code(code, io_error.OP_CLOSE);
+        var i: usize = 0;
+        for (i < runtime.capacity) {
+            val slot: *Slot = ?runtime.slots[i];
+            if (slot.state == SLOT_ACTIVE) {
+                val token: Token = Token{index: i::u32, generation: slot.generation};
+                if (!slot.cancellation_active || cancel.unregister(?slot.cancellation)) {
+                    slot.cancellation_active = false;
+                    remove_slot_timers(runtime, token);
+                    slot.state = SLOT_CANCELLING;
+                    val source_index: u32 = slot.source_index;
+                    mutex.unlock(?runtime.lock);
+                    if (source_index != NO_SOURCE) {
+                        val source: *Source = ?runtime.sources[source_index::usize];
+                        if (source.cancel(source.context, token) < 0) {
+                            panic.panic("std.io.runtime: close lost source operation ownership\n");
+                        }
+                    }
+                    mutex.lock(?runtime.lock);
+                    if (slot.state == SLOT_CANCELLING) {
+                        enqueue(runtime, token, slot, 0, 0, 0, true, closed_error, false);
                     }
                 }
-                mutex.lock(?runtime.lock);
-                if (slot.state == SLOT_CANCELLING) {
-                    enqueue(runtime, token, slot, 0, 0, 0, true, closed_error, false);
-                }
             }
+            i = i + 1;
         }
-        i = i + 1;
     }
-    if (runtime.live == 0) { runtime.state = CLOSED; }
     val code: i64 = os.io_queue_wake(?runtime.queue);
     mutex.unlock(?runtime.lock);
-    if (code < 0) { ret err[bool, io_error.Error](io_error.from_code(code, io_error.OP_CLOSE)); }
-    ret ok[bool, io_error.Error](true);
+    if (code < 0) { ret err[lifecycle.CloseResult, io_error.Error](io_error.from_code(code, io_error.OP_CLOSE)); }
+    ret ok[lifecycle.CloseResult, io_error.Error](closing);
+}
+
+pub fun close(runtime: *Runtime) Result[bool, io_error.Error] {
+    val closed: Result[lifecycle.CloseResult, io_error.Error] = begin_close(runtime, lifecycle.ABORTIVE, lifecycle.EXPLICIT);
+    if (is_err[lifecycle.CloseResult, io_error.Error](closed)) {
+        ret err[bool, io_error.Error](unwrap_err[lifecycle.CloseResult, io_error.Error](closed));
+    }
+    ret ok[bool, io_error.Error](unwrap_ok[lifecycle.CloseResult, io_error.Error](closed).started);
 }
 
 # destroy is valid only after close completions have been dequeued
 pub fun destroy(runtime: *Runtime) Result[bool, io_error.Error] {
-    if (runtime == nil || runtime.state != CLOSED) {
+    if (runtime == nil) {
         ret err[bool, io_error.Error](invalid(io_error.OP_CLOSE));
     }
     mutex.lock(?runtime.lock);
-    if (runtime.live != 0 || runtime.count != 0) {
+    if (runtime.destroyed
+        || lifecycle.snapshot(?runtime.lifecycle).state != lifecycle.CLOSED
+        || runtime.live != 0
+        || runtime.count != 0) {
         mutex.unlock(?runtime.lock);
         ret err[bool, io_error.Error](invalid(io_error.OP_CLOSE));
     }
@@ -1098,7 +1156,7 @@ pub fun destroy(runtime: *Runtime) Result[bool, io_error.Error] {
     val timers: *TimerEntry = runtime.timers;
     val sources: *Source = runtime.sources;
     val native_events: *NativeEvent = runtime.native_events;
-    runtime.state = DESTROYED;
+    runtime.destroyed = true;
     mutex.unlock(?runtime.lock);
     val queue_result: i64 = os.io_queue_close(?runtime.queue);
     val completion_result: i64 = os.deallocate(completions::ptr, $size_of(Completion) * capacity);
@@ -1118,11 +1176,24 @@ pub fun destroy(runtime: *Runtime) Result[bool, io_error.Error] {
 }
 
 pub fun pending(runtime: *Runtime) usize {
-    if (runtime == nil || runtime.state == DESTROYED) { ret 0; }
+    if (runtime == nil || runtime.destroyed) { ret 0; }
     mutex.lock(?runtime.lock);
     val count: usize = runtime.live;
     mutex.unlock(?runtime.lock);
     ret count;
+}
+
+pub fun snapshot(runtime: *Runtime) lifecycle.Snapshot {
+    if (runtime == nil || runtime.destroyed) {
+        ret lifecycle.Snapshot{
+            state: lifecycle.CLOSED,
+            mode: lifecycle.ABORTIVE,
+            cause: lifecycle.FAILURE,
+            terminal_cause: lifecycle.FAILURE,
+            outstanding: 0,
+        };
+    }
+    ret lifecycle.snapshot(?runtime.lifecycle);
 }
 
 fun test_operation(kind: Kind, context: usize) Operation {
@@ -1790,6 +1861,52 @@ test "runtime: retired source slots reject stale tokens and remain reusable" {
     }
     if (is_err[bool, io_error.Error](unregister_source(?runtime, second))) { ret 10; }
     close(?runtime);
+    if (is_err[bool, io_error.Error](destroy(?runtime))) { ret 11; }
+    ret 0;
+}
+
+test "runtime: source and operation ownership share one close lifecycle" {
+    var runtime: Runtime;
+    if (is_err[bool, io_error.Error](make(?runtime, 2))) { ret 1; }
+    var context: TestSource = TestSource{released: 0};
+    val source_result: Result[SourceToken, io_error.Error] = register_source(?runtime, (?context)::ptr, test_source_dispatch, test_source_cancel, test_source_release);
+    if (is_err[SourceToken, io_error.Error](source_result)) { ret 2; }
+    val source: SourceToken = unwrap_ok[SourceToken, io_error.Error](source_result);
+    val operation_result: Result[Token, io_error.Error] = submit_owned(?runtime, source, test_operation(ACCEPT, 92));
+    if (is_err[Token, io_error.Error](operation_result)) { ret 3; }
+    val closing_result: Result[lifecycle.CloseResult, io_error.Error] = begin_close(?runtime, lifecycle.GRACEFUL, lifecycle.PROCESS_TERMINATION);
+    if (is_err[lifecycle.CloseResult, io_error.Error](closing_result)) { ret 4; }
+    val closing: lifecycle.CloseResult = unwrap_ok[lifecycle.CloseResult, io_error.Error](closing_result);
+    if (!closing.started
+        || closing.complete
+        || closing.snapshot.mode != lifecycle.GRACEFUL
+        || closing.snapshot.cause != lifecycle.PROCESS_TERMINATION
+        || closing.snapshot.outstanding != 2) {
+        ret 5;
+    }
+    var output: Completion;
+    val polled: Result[usize, io_error.Error] = poll(?runtime, ?output, 1);
+    val after_operation: lifecycle.Snapshot = snapshot(?runtime);
+    if (is_err[usize, io_error.Error](polled)
+        || unwrap_ok[usize, io_error.Error](polled) != 1
+        || !output.has_error
+        || output.error.kind != io_error.CLOSED
+        || context.released != 1
+        || after_operation.state != lifecycle.CLOSING
+        || after_operation.outstanding != 1) {
+        ret 6;
+    }
+    if (is_err[bool, io_error.Error](unregister_source(?runtime, source))) { ret 7; }
+    val closed: lifecycle.Snapshot = snapshot(?runtime);
+    if (closed.state != lifecycle.CLOSED || closed.outstanding != 0) { ret 8; }
+    val duplicate_result: Result[lifecycle.CloseResult, io_error.Error] = begin_close(?runtime, lifecycle.ABORTIVE, lifecycle.DEADLINE);
+    if (is_err[lifecycle.CloseResult, io_error.Error](duplicate_result)) { ret 9; }
+    val duplicate: lifecycle.CloseResult = unwrap_ok[lifecycle.CloseResult, io_error.Error](duplicate_result);
+    if (duplicate.started || duplicate.escalated || !duplicate.complete
+        || duplicate.snapshot.mode != lifecycle.GRACEFUL
+        || duplicate.snapshot.terminal_cause != lifecycle.PROCESS_TERMINATION) {
+        ret 10;
+    }
     if (is_err[bool, io_error.Error](destroy(?runtime))) { ret 11; }
     ret 0;
 }
