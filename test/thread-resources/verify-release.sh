@@ -28,8 +28,10 @@ if [ -z "$artifact" ] || [ -z "$object" ]; then
     echo "FAIL: optimized artifact or OS object not found" >&2
     exit 1
 fi
-if { strings "$artifact"; strings "$object"; } \
-    | grep -qE 'injected failure releases|native name failure aborts|test_map_hex_digit|test_name_worker|test_thread_mapped_bytes|test_thread_resources'; then
+matches="$({ strings "$artifact"; strings "$object"; } \
+    | grep -E 'injected .* failure|native (name|setup) failure aborts|test_map_hex_digit|test_name_worker|test_thread_mapped_bytes|test_thread_resources' || true)"
+if [ -n "$matches" ]; then
+    printf '%s\n' "$matches" >&2
     echo "FAIL: thread fixture code entered the optimized artifact" >&2
     exit 1
 fi
