@@ -19,6 +19,19 @@ use std.sync.mutex;
 use std.sync.thread;
 use io_error: std.io.error;
 
+$if ($mach.build.os == $mach.os.linux) {
+    use native_os: std.system.os.linux;
+}
+$or ($mach.build.os == $mach.os.darwin) {
+    use native_os: std.system.os.darwin;
+}
+$or ($mach.build.os == $mach.os.windows) {
+    use native_os: std.system.os.windows;
+}
+$or {
+    $error("std.io.runtime: unsupported target");
+}
+
 pub def Kind: u8;
 pub val ACCEPT:      Kind = 0;
 pub val CONNECT:     Kind = 1;
@@ -61,6 +74,21 @@ pub rec Completion {
     end_of_stream: bool;
 }
 
+pub rec NativeEvent {
+    context: usize;
+    events: u32;
+    status: i64;
+    flags: u64;
+}
+
+pub rec SourceToken {
+    index: u32;
+}
+
+pub def DispatchFun: fun(ptr, usize, u32, i64, u64) bool;
+pub def CancelFun: fun(ptr, Token) i64;
+pub def ReleaseFun: fun(ptr, *Completion);
+
 pub rec WaitPlan {
     wait: bool;
     timeout_ms: i32;
@@ -70,6 +98,22 @@ val SLOT_FREE: u8 = 0;
 val SLOT_ACTIVE: u8 = 1;
 val SLOT_QUEUED: u8 = 2;
 val SLOT_CANCELLING: u8 = 3;
+val SLOT_RELEASING: u8 = 4;
+
+val SOURCE_UNUSED: u8 = 0;
+val SOURCE_REGISTERED: u8 = 1;
+val SOURCE_RETIRED: u8 = 2;
+val NO_SOURCE: u32 = 0xffffffff;
+
+rec Source {
+    state: u8;
+    context: ptr;
+    dispatch: DispatchFun;
+    cancel: CancelFun;
+    release: ReleaseFun;
+    live: usize;
+    busy: usize;
+}
 
 rec Slot {
     state: u8;
@@ -80,6 +124,7 @@ rec Slot {
     deadline_timer_index: usize;
     cancellation_active: bool;
     cancellation: cancel.Registration;
+    source_index: u32;
     operation: Operation;
 }
 
@@ -94,8 +139,9 @@ rec TimerEntry {
 }
 
 pub val OPEN: u8 = 0;
-pub val CLOSED: u8 = 1;
-pub val DESTROYED: u8 = 2;
+pub val CLOSING: u8 = 1;
+pub val CLOSED: u8 = 2;
+pub val DESTROYED: u8 = 3;
 
 # one thread owns wait and dequeue, while submission and resolution may be concurrent
 pub rec Runtime {
@@ -103,6 +149,8 @@ pub rec Runtime {
     slots: *Slot;
     completions: *Completion;
     timers: *TimerEntry;
+    sources: *Source;
+    native_events: *NativeEvent;
     capacity: usize;
     next_slot: usize;
     head: usize;
@@ -110,8 +158,11 @@ pub rec Runtime {
     count: usize;
     live: usize;
     timer_count: usize;
+    source_count: usize;
+    native_controls: usize;
     state: u8;
     lock: mutex.Mutex;
+    native_lock: mutex.Mutex;
 }
 
 fun invalid(operation: io_error.Operation) io_error.Error {
@@ -129,11 +180,15 @@ pub fun make(runtime: *Runtime, capacity: usize) Result[bool, io_error.Error] {
     val slot_size: usize = $size_of(Slot);
     val completion_size: usize = $size_of(Completion);
     val timer_size: usize = $size_of(TimerEntry);
+    val source_size: usize = $size_of(Source);
+    val native_event_size: usize = $size_of(NativeEvent);
     val slots_bytes: usize = slot_size * capacity;
     val completions_bytes: usize = completion_size * capacity;
     val timer_capacity: usize = capacity * 2;
     val timers_bytes: usize = timer_size * timer_capacity;
-    if (slots_bytes / slot_size != capacity || completions_bytes / completion_size != capacity || timer_capacity / 2 != capacity || timers_bytes / timer_size != timer_capacity) {
+    val sources_bytes: usize = source_size * capacity;
+    val native_events_bytes: usize = native_event_size * capacity;
+    if (slots_bytes / slot_size != capacity || completions_bytes / completion_size != capacity || timer_capacity / 2 != capacity || timers_bytes / timer_size != timer_capacity || sources_bytes / source_size != capacity || native_events_bytes / native_event_size != capacity) {
         ret err[bool, io_error.Error](exhausted(io_error.OP_CREATE));
     }
 
@@ -153,6 +208,28 @@ pub fun make(runtime: *Runtime, capacity: usize) Result[bool, io_error.Error] {
         runtime.slots = nil;
         ret err[bool, io_error.Error](exhausted(io_error.OP_CREATE));
     }
+    runtime.sources = os.allocate(sources_bytes)::*Source;
+    if (runtime.sources == nil) {
+        os.deallocate(runtime.timers::ptr, timers_bytes);
+        os.deallocate(runtime.completions::ptr, completions_bytes);
+        os.deallocate(runtime.slots::ptr, slots_bytes);
+        runtime.timers = nil;
+        runtime.completions = nil;
+        runtime.slots = nil;
+        ret err[bool, io_error.Error](exhausted(io_error.OP_CREATE));
+    }
+    runtime.native_events = os.allocate(native_events_bytes)::*NativeEvent;
+    if (runtime.native_events == nil) {
+        os.deallocate(runtime.sources::ptr, sources_bytes);
+        os.deallocate(runtime.timers::ptr, timers_bytes);
+        os.deallocate(runtime.completions::ptr, completions_bytes);
+        os.deallocate(runtime.slots::ptr, slots_bytes);
+        runtime.sources = nil;
+        runtime.timers = nil;
+        runtime.completions = nil;
+        runtime.slots = nil;
+        ret err[bool, io_error.Error](exhausted(io_error.OP_CREATE));
+    }
 
     runtime.capacity = capacity;
     runtime.next_slot = 0;
@@ -161,8 +238,11 @@ pub fun make(runtime: *Runtime, capacity: usize) Result[bool, io_error.Error] {
     runtime.count = 0;
     runtime.live = 0;
     runtime.timer_count = 0;
+    runtime.source_count = 0;
+    runtime.native_controls = 0;
     runtime.state = OPEN;
     runtime.lock = mutex.make();
+    runtime.native_lock = mutex.make();
     var i: usize = 0;
     for (i < capacity) {
         runtime.slots[i].state = SLOT_FREE;
@@ -172,16 +252,24 @@ pub fun make(runtime: *Runtime, capacity: usize) Result[bool, io_error.Error] {
         runtime.slots[i].operation_timer_index = timer_capacity;
         runtime.slots[i].deadline_timer_index = timer_capacity;
         runtime.slots[i].cancellation_active = false;
+        runtime.slots[i].source_index = NO_SOURCE;
         cancel.init_registration(?runtime.slots[i].cancellation);
+        runtime.sources[i].state = SOURCE_UNUSED;
+        runtime.sources[i].live = 0;
+        runtime.sources[i].busy = 0;
         i = i + 1;
     }
     val code: i64 = os.io_queue_create(?runtime.queue);
     if (code < 0) {
+        os.deallocate(runtime.native_events::ptr, native_events_bytes);
+        os.deallocate(runtime.sources::ptr, sources_bytes);
         os.deallocate(runtime.timers::ptr, timers_bytes);
         os.deallocate(runtime.completions::ptr, completions_bytes);
         os.deallocate(runtime.slots::ptr, slots_bytes);
         runtime.completions = nil;
         runtime.timers = nil;
+        runtime.sources = nil;
+        runtime.native_events = nil;
         runtime.slots = nil;
         runtime.capacity = 0;
         ret err[bool, io_error.Error](io_error.from_code(code, io_error.OP_CREATE));
@@ -189,7 +277,65 @@ pub fun make(runtime: *Runtime, capacity: usize) Result[bool, io_error.Error] {
     ret ok[bool, io_error.Error](true);
 }
 
-fun claim_locked(runtime: *Runtime, operation: Operation, token: *Token) i64 {
+fun source_for(runtime: *Runtime, token: SourceToken) *Source {
+    if (token.index::usize >= runtime.source_count) { ret nil; }
+    val source: *Source = ?runtime.sources[token.index::usize];
+    if (source.state != SOURCE_REGISTERED) { ret nil; }
+    ret source;
+}
+
+pub fun register_source(
+    runtime: *Runtime,
+    context: ptr,
+    dispatch: DispatchFun,
+    cancel_operation: CancelFun,
+    release: ReleaseFun,
+) Result[SourceToken, io_error.Error] {
+    if (runtime == nil || context == nil) {
+        ret err[SourceToken, io_error.Error](invalid(io_error.OP_CREATE));
+    }
+    mutex.lock(?runtime.lock);
+    if (runtime.state != OPEN || runtime.source_count >= runtime.capacity || runtime.source_count >= 0xffff) {
+        mutex.unlock(?runtime.lock);
+        ret err[SourceToken, io_error.Error](exhausted(io_error.OP_CREATE));
+    }
+    val index: usize = runtime.source_count;
+    val source: *Source = ?runtime.sources[index];
+    source.state = SOURCE_REGISTERED;
+    source.context = context;
+    source.dispatch = dispatch;
+    source.cancel = cancel_operation;
+    source.release = release;
+    source.live = 0;
+    source.busy = 0;
+    runtime.source_count = index + 1;
+    mutex.unlock(?runtime.lock);
+    ret ok[SourceToken, io_error.Error](SourceToken{index: index::u32});
+}
+
+pub fun unregister_source(runtime: *Runtime, token: SourceToken) Result[bool, io_error.Error] {
+    if (runtime == nil) { ret err[bool, io_error.Error](invalid(io_error.OP_CLOSE)); }
+    mutex.lock(?runtime.lock);
+    val source: *Source = source_for(runtime, token);
+    if (source == nil) {
+        mutex.unlock(?runtime.lock);
+        ret err[bool, io_error.Error](invalid(io_error.OP_CLOSE));
+    }
+    if (source.live != 0 || source.busy != 0) {
+        mutex.unlock(?runtime.lock);
+        ret err[bool, io_error.Error](io_error.from_code(os.EBUSY, io_error.OP_CLOSE));
+    }
+    source.state = SOURCE_RETIRED;
+    source.context = nil;
+    mutex.unlock(?runtime.lock);
+    ret ok[bool, io_error.Error](true);
+}
+
+pub fun source_id(token: SourceToken) u16 {
+    ret (token.index + 1)::u16;
+}
+
+fun claim_locked(runtime: *Runtime, operation: Operation, source_index: u32, token: *Token) i64 {
     if (runtime.state != OPEN) {
         ret os.EBADF;
     }
@@ -214,9 +360,13 @@ fun claim_locked(runtime: *Runtime, operation: Operation, token: *Token) i64 {
     runtime.slots[index].operation_timer_index = timer_capacity(runtime);
     runtime.slots[index].deadline_timer_index = timer_capacity(runtime);
     runtime.slots[index].cancellation_active = false;
+    runtime.slots[index].source_index = source_index;
     cancel.init_registration(?runtime.slots[index].cancellation);
     runtime.slots[index].state = SLOT_ACTIVE;
     runtime.live = runtime.live + 1;
+    if (source_index != NO_SOURCE) {
+        runtime.sources[source_index::usize].live = runtime.sources[source_index::usize].live + 1;
+    }
     @token = Token{index: index::u32, generation: generation};
     ret 0;
 }
@@ -225,7 +375,21 @@ pub fun submit(runtime: *Runtime, operation: Operation) Result[Token, io_error.E
     if (runtime == nil) { ret err[Token, io_error.Error](invalid(io_error.OP_SUBMIT)); }
     mutex.lock(?runtime.lock);
     var token: Token;
-    val code: i64 = claim_locked(runtime, operation, ?token);
+    val code: i64 = claim_locked(runtime, operation, NO_SOURCE, ?token);
+    mutex.unlock(?runtime.lock);
+    if (code < 0) { ret err[Token, io_error.Error](io_error.from_code(code, io_error.OP_SUBMIT)); }
+    ret ok[Token, io_error.Error](token);
+}
+
+pub fun submit_owned(runtime: *Runtime, source_token: SourceToken, operation: Operation) Result[Token, io_error.Error] {
+    if (runtime == nil) { ret err[Token, io_error.Error](invalid(io_error.OP_SUBMIT)); }
+    mutex.lock(?runtime.lock);
+    if (source_for(runtime, source_token) == nil) {
+        mutex.unlock(?runtime.lock);
+        ret err[Token, io_error.Error](invalid(io_error.OP_SUBMIT));
+    }
+    var token: Token;
+    val code: i64 = claim_locked(runtime, operation, source_token.index, ?token);
     mutex.unlock(?runtime.lock);
     if (code < 0) { ret err[Token, io_error.Error](io_error.from_code(code, io_error.OP_SUBMIT)); }
     ret ok[Token, io_error.Error](token);
@@ -368,7 +532,14 @@ fun scope_cancel_callback(context: ptr, reason: cancel.Reason) {
     val token: Token = Token{index: slot.index, generation: slot.generation};
     remove_slot_timers(runtime, token);
     slot.state = SLOT_CANCELLING;
+    val source_index: u32 = slot.source_index;
     mutex.unlock(?runtime.lock);
+    if (source_index != NO_SOURCE) {
+        val source: *Source = ?runtime.sources[source_index::usize];
+        if (source.cancel(source.context, token) < 0) {
+            panic.panic("std.io.runtime: source cancellation lost operation ownership\n");
+        }
+    }
 }
 
 fun scope_cancel_complete(context: ptr, reason: cancel.Reason) {
@@ -392,8 +563,13 @@ fun scope_cancel_complete(context: ptr, reason: cancel.Reason) {
 
 fun release_claim_locked(runtime: *Runtime, token: Token) {
     val slot: *Slot = ?runtime.slots[token.index::usize];
+    if (slot.source_index != NO_SOURCE) {
+        val source: *Source = ?runtime.sources[slot.source_index::usize];
+        source.live = source.live - 1;
+    }
     slot.state = SLOT_FREE;
     slot.cancellation_active = false;
+    slot.source_index = NO_SOURCE;
     cancel.init_registration(?slot.cancellation);
     runtime.live = runtime.live - 1;
 }
@@ -416,16 +592,24 @@ fun attach_scope_locked(runtime: *Runtime, token: Token, scope: *cancel.Scope) c
     ret cancel.ACTIVE;
 }
 
-# prior cancellation is observed or the returned token is atomically scope-owned
-pub fun submit_scoped(runtime: *Runtime, scope: *cancel.Scope, operation: Operation) Result[Token, io_error.Error] {
+fun submit_scoped_with_source(
+    runtime: *Runtime,
+    source_index: u32,
+    scope: *cancel.Scope,
+    operation: Operation,
+) Result[Token, io_error.Error] {
     if (runtime == nil || scope == nil) { ret err[Token, io_error.Error](invalid(io_error.OP_SUBMIT)); }
     cancel.expire(scope, time.monotonic());
     var deadline: time.Time;
     var owner: *cancel.Scope;
     val needs_wake: bool = cancel.get_deadline(scope, ?deadline, ?owner);
     mutex.lock(?runtime.lock);
+    if (source_index != NO_SOURCE && source_for(runtime, SourceToken{index: source_index}) == nil) {
+        mutex.unlock(?runtime.lock);
+        ret err[Token, io_error.Error](invalid(io_error.OP_SUBMIT));
+    }
     var token: Token;
-    val code: i64 = claim_locked(runtime, operation, ?token);
+    val code: i64 = claim_locked(runtime, operation, source_index, ?token);
     if (code < 0) {
         mutex.unlock(?runtime.lock);
         ret err[Token, io_error.Error](io_error.from_code(code, io_error.OP_SUBMIT));
@@ -446,6 +630,20 @@ pub fun submit_scoped(runtime: *Runtime, scope: *cancel.Scope, operation: Operat
     }
     mutex.unlock(?runtime.lock);
     ret ok[Token, io_error.Error](token);
+}
+
+# prior cancellation is observed or the returned token is atomically scope-owned
+pub fun submit_scoped(runtime: *Runtime, scope: *cancel.Scope, operation: Operation) Result[Token, io_error.Error] {
+    ret submit_scoped_with_source(runtime, NO_SOURCE, scope, operation);
+}
+
+pub fun submit_scoped_owned(
+    runtime: *Runtime,
+    source_token: SourceToken,
+    scope: *cancel.Scope,
+    operation: Operation,
+) Result[Token, io_error.Error] {
+    ret submit_scoped_with_source(runtime, source_token.index, scope, operation);
 }
 
 fun resolve(runtime: *Runtime, token: Token, bytes: usize, items: usize, resource: usize, has_error: bool, failure: io_error.Error, eof: bool) Result[bool, io_error.Error] {
@@ -493,7 +691,7 @@ pub fun submit_timer(runtime: *Runtime, deadline: time.Time, context: usize) Res
     val operation: Operation = Operation{kind: TIMER, resource: 0, buffer: nil, length: 0, offset: 0, context: context};
     mutex.lock(?runtime.lock);
     var token: Token;
-    val code: i64 = claim_locked(runtime, operation, ?token);
+    val code: i64 = claim_locked(runtime, operation, NO_SOURCE, ?token);
     if (code == 0) {
         val wake_result: i64 = os.io_queue_wake(?runtime.queue);
         if (wake_result < 0) {
@@ -521,7 +719,7 @@ pub fun submit_timer_scoped(runtime: *Runtime, scope: *cancel.Scope, deadline: t
     val operation: Operation = Operation{kind: TIMER, resource: 0, buffer: nil, length: 0, offset: 0, context: context};
     mutex.lock(?runtime.lock);
     var token: Token;
-    val code: i64 = claim_locked(runtime, operation, ?token);
+    val code: i64 = claim_locked(runtime, operation, NO_SOURCE, ?token);
     if (code < 0) {
         mutex.unlock(?runtime.lock);
         ret err[Token, io_error.Error](io_error.from_code(code, io_error.OP_SUBMIT));
@@ -607,14 +805,28 @@ fun drain(runtime: *Runtime, output: *Completion, output_capacity: usize) usize 
     var written: usize = 0;
     for (written < output_capacity && runtime.count > 0) {
         val completion: Completion = runtime.completions[runtime.head];
-        output[written] = completion;
         runtime.head = (runtime.head + 1) % runtime.capacity;
         runtime.count = runtime.count - 1;
         val slot: *Slot = ?runtime.slots[completion.token.index::usize];
+        val source_index: u32 = slot.source_index;
+        slot.state = SLOT_RELEASING;
+        mutex.unlock(?runtime.lock);
+        if (source_index != NO_SOURCE) {
+            val source: *Source = ?runtime.sources[source_index::usize];
+            source.release(source.context, ?completion);
+        }
+        output[written] = completion;
+        mutex.lock(?runtime.lock);
         slot.state = SLOT_FREE;
         slot.cancellation_active = false;
+        slot.source_index = NO_SOURCE;
         cancel.init_registration(?slot.cancellation);
         runtime.live = runtime.live - 1;
+        if (source_index != NO_SOURCE) {
+            val source: *Source = ?runtime.sources[source_index::usize];
+            source.live = source.live - 1;
+        }
+        if (runtime.state == CLOSING && runtime.live == 0) { runtime.state = CLOSED; }
         written = written + 1;
     }
     ret written;
@@ -657,7 +869,7 @@ pub fun prepare_wait(runtime: *Runtime, timeout_ms: i32) Result[WaitPlan, io_err
         ret err[WaitPlan, io_error.Error](invalid(io_error.OP_WAIT));
     }
     settle_expired_locked(runtime);
-    if (runtime.state != OPEN || runtime.count != 0) {
+    if (runtime.state == CLOSED || runtime.count != 0) {
         mutex.unlock(?runtime.lock);
         ret ok[WaitPlan, io_error.Error](WaitPlan{wait: false, timeout_ms: 0});
     }
@@ -666,12 +878,99 @@ pub fun prepare_wait(runtime: *Runtime, timeout_ms: i32) Result[WaitPlan, io_err
     ret ok[WaitPlan, io_error.Error](WaitPlan{wait: true, timeout_ms: native_timeout});
 }
 
+pub fun begin_native_control(runtime: *Runtime) Result[bool, io_error.Error] {
+    if (runtime == nil) { ret err[bool, io_error.Error](invalid(io_error.OP_WAIT)); }
+    mutex.lock(?runtime.lock);
+    if (runtime.state == DESTROYED) {
+        mutex.unlock(?runtime.lock);
+        ret err[bool, io_error.Error](invalid(io_error.OP_WAIT));
+    }
+    runtime.native_controls = runtime.native_controls + 1;
+    val wake_result: i64 = os.io_queue_wake(?runtime.queue);
+    mutex.unlock(?runtime.lock);
+    if (wake_result < 0) {
+        mutex.lock(?runtime.lock);
+        runtime.native_controls = runtime.native_controls - 1;
+        mutex.unlock(?runtime.lock);
+        ret err[bool, io_error.Error](io_error.from_code(wake_result, io_error.OP_WAKE));
+    }
+    mutex.lock(?runtime.native_lock);
+    ret ok[bool, io_error.Error](true);
+}
+
+pub fun end_native_control(runtime: *Runtime) {
+    mutex.lock(?runtime.lock);
+    runtime.native_controls = runtime.native_controls - 1;
+    mutex.unlock(?runtime.lock);
+    mutex.unlock(?runtime.native_lock);
+}
+
+fun native_poll(runtime: *Runtime, timeout_ms: i32) i64 {
+    mutex.lock(?runtime.native_lock);
+    mutex.lock(?runtime.lock);
+    val controlled: bool = runtime.native_controls != 0;
+    mutex.unlock(?runtime.lock);
+    if (controlled) {
+        mutex.unlock(?runtime.native_lock);
+        ret 0;
+    }
+    val count: i64 = native_os.io_queue_poll(
+        ?runtime.queue,
+        runtime.native_events::*native_os.IoCompletion,
+        runtime.capacity,
+        timeout_ms,
+    );
+    mutex.unlock(?runtime.native_lock);
+    ret count;
+}
+
+fun dispatch_source(runtime: *Runtime, index: usize, event: NativeEvent) bool {
+    mutex.lock(?runtime.lock);
+    val source: *Source = ?runtime.sources[index];
+    if (source.state != SOURCE_REGISTERED) {
+        mutex.unlock(?runtime.lock);
+        ret false;
+    }
+    source.busy = source.busy + 1;
+    val context: ptr = source.context;
+    val dispatch: DispatchFun = source.dispatch;
+    mutex.unlock(?runtime.lock);
+    val claimed: bool = dispatch(context, event.context, event.events, event.status, event.flags);
+    mutex.lock(?runtime.lock);
+    source.busy = source.busy - 1;
+    mutex.unlock(?runtime.lock);
+    ret claimed;
+}
+
+fun dispatch_sources(runtime: *Runtime, event: NativeEvent) {
+    val wake: bool = (event.events & native_os.IO_EVENT_WAKE) != 0;
+    mutex.lock(?runtime.lock);
+    val source_count: usize = runtime.source_count;
+    mutex.unlock(?runtime.lock);
+    var i: usize = 0;
+    for (i < source_count) {
+        val claimed: bool = dispatch_source(runtime, i, event);
+        if (claimed && !wake) { ret; }
+        i = i + 1;
+    }
+}
+
+fun flush_sources(runtime: *Runtime) {
+    dispatch_sources(runtime, NativeEvent{
+        context: 0,
+        events: native_os.IO_EVENT_WAKE,
+        status: 0,
+        flags: 0,
+    });
+}
+
 # timeout_ms is relative and uses -1 for an unbounded wait
 # the caller owns output and may reuse it after this call returns
 pub fun wait(runtime: *Runtime, output: *Completion, output_capacity: usize, timeout_ms: i32) Result[usize, io_error.Error] {
     if (runtime == nil || output == nil || output_capacity == 0 || timeout_ms < -1) {
         ret err[usize, io_error.Error](invalid(io_error.OP_WAIT));
     }
+    flush_sources(runtime);
     val initial: Result[usize, io_error.Error] = poll(runtime, output, output_capacity);
     if (is_err[usize, io_error.Error](initial)) { ret initial; }
     val initial_count: usize = unwrap_ok[usize, io_error.Error](initial);
@@ -683,8 +982,14 @@ pub fun wait(runtime: *Runtime, output: *Completion, output_capacity: usize, tim
     val plan: WaitPlan = unwrap_ok[WaitPlan, io_error.Error](prepared);
     if (!plan.wait) { ret ok[usize, io_error.Error](0); }
 
-    val waited: i64 = os.io_queue_wait(?runtime.queue, plan.timeout_ms);
+    val waited: i64 = native_poll(runtime, plan.timeout_ms);
     if (waited < 0) { ret err[usize, io_error.Error](io_error.from_code(waited, io_error.OP_WAIT)); }
+    var i: usize = 0;
+    for (i < waited::usize) {
+        dispatch_sources(runtime, runtime.native_events[i]);
+        i = i + 1;
+    }
+    flush_sources(runtime);
     ret poll(runtime, output, output_capacity);
 }
 
@@ -705,15 +1010,17 @@ pub fun wake(runtime: *Runtime) Result[bool, io_error.Error] {
 
 # close rejects new work and queues one closed completion for every active operation
 pub fun close(runtime: *Runtime) Result[bool, io_error.Error] {
-    if (runtime == nil || runtime.state == DESTROYED) {
+    if (runtime == nil) { ret err[bool, io_error.Error](invalid(io_error.OP_CLOSE)); }
+    mutex.lock(?runtime.lock);
+    if (runtime.state == DESTROYED) {
+        mutex.unlock(?runtime.lock);
         ret err[bool, io_error.Error](invalid(io_error.OP_CLOSE));
     }
-    mutex.lock(?runtime.lock);
-    if (runtime.state == CLOSED) {
+    if (runtime.state != OPEN) {
         mutex.unlock(?runtime.lock);
         ret ok[bool, io_error.Error](false);
     }
-    runtime.state = CLOSED;
+    runtime.state = CLOSING;
     val closed_error: io_error.Error = io_error.from_code(os.EBADF, io_error.OP_CLOSE);
     var i: usize = 0;
     for (i < runtime.capacity) {
@@ -723,14 +1030,24 @@ pub fun close(runtime: *Runtime) Result[bool, io_error.Error] {
             if (!slot.cancellation_active || cancel.unregister(?slot.cancellation)) {
                 slot.cancellation_active = false;
                 remove_slot_timers(runtime, token);
-                enqueue(runtime, token, slot, 0, 0, 0, true, closed_error, false);
+                slot.state = SLOT_CANCELLING;
+                val source_index: u32 = slot.source_index;
+                mutex.unlock(?runtime.lock);
+                if (source_index != NO_SOURCE) {
+                    val source: *Source = ?runtime.sources[source_index::usize];
+                    if (source.cancel(source.context, token) < 0) {
+                        panic.panic("std.io.runtime: close lost source operation ownership\n");
+                    }
+                }
+                mutex.lock(?runtime.lock);
+                if (slot.state == SLOT_CANCELLING) {
+                    enqueue(runtime, token, slot, 0, 0, 0, true, closed_error, false);
+                }
             }
         }
-        slot.operation_timer_index = timer_capacity(runtime);
-        slot.deadline_timer_index = timer_capacity(runtime);
         i = i + 1;
     }
-    runtime.timer_count = 0;
+    if (runtime.live == 0) { runtime.state = CLOSED; }
     val code: i64 = os.io_queue_wake(?runtime.queue);
     mutex.unlock(?runtime.lock);
     if (code < 0) { ret err[bool, io_error.Error](io_error.from_code(code, io_error.OP_CLOSE)); }
@@ -747,22 +1064,36 @@ pub fun destroy(runtime: *Runtime) Result[bool, io_error.Error] {
         mutex.unlock(?runtime.lock);
         ret err[bool, io_error.Error](invalid(io_error.OP_CLOSE));
     }
+    var i: usize = 0;
+    for (i < runtime.source_count) {
+        if (runtime.sources[i].state == SOURCE_REGISTERED) {
+            mutex.unlock(?runtime.lock);
+            ret err[bool, io_error.Error](io_error.from_code(os.EBUSY, io_error.OP_CLOSE));
+        }
+        i = i + 1;
+    }
     val capacity: usize = runtime.capacity;
     val slots: *Slot = runtime.slots;
     val completions: *Completion = runtime.completions;
     val timers: *TimerEntry = runtime.timers;
+    val sources: *Source = runtime.sources;
+    val native_events: *NativeEvent = runtime.native_events;
     runtime.state = DESTROYED;
     mutex.unlock(?runtime.lock);
     val queue_result: i64 = os.io_queue_close(?runtime.queue);
     val completion_result: i64 = os.deallocate(completions::ptr, $size_of(Completion) * capacity);
     val timer_result: i64 = os.deallocate(timers::ptr, $size_of(TimerEntry) * capacity * 2);
+    val source_result: i64 = os.deallocate(sources::ptr, $size_of(Source) * capacity);
+    val native_result: i64 = os.deallocate(native_events::ptr, $size_of(NativeEvent) * capacity);
     val slot_result: i64 = os.deallocate(slots::ptr, $size_of(Slot) * capacity);
     runtime.slots = nil;
     runtime.completions = nil;
     runtime.timers = nil;
+    runtime.sources = nil;
+    runtime.native_events = nil;
     runtime.capacity = 0;
     if (queue_result < 0) { ret err[bool, io_error.Error](io_error.from_code(queue_result, io_error.OP_CLOSE)); }
-    if (completion_result < 0 || timer_result < 0 || slot_result < 0) { ret err[bool, io_error.Error](io_error.from_code(os.EIO, io_error.OP_CLOSE)); }
+    if (completion_result < 0 || timer_result < 0 || source_result < 0 || native_result < 0 || slot_result < 0) { ret err[bool, io_error.Error](io_error.from_code(os.EIO, io_error.OP_CLOSE)); }
     ret ok[bool, io_error.Error](true);
 }
 
