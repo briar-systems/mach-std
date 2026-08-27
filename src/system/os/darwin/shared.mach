@@ -1566,14 +1566,10 @@ pub fun getenv(name: *u8, buf: *u8, cap: usize) i64 {
 # rest of the migration could not proceed, because libSystem reaches errno
 # through a thread-local that only exists on a thread libpthread created.
 #
-# the shape of the OS-layer contract is unchanged: `thread_spawn` still takes a
-# caller-allocated region and a completion flag, and `thread_wait`/`thread_wake`
-# are still address-keyed. what changed underneath is who owns the stack. the
-# caller's region is now a CONTEXT BLOCK only - pthread allocates and frees the
-# real stack from `stack_size` - which is exactly how the windows backend has
-# always used it (see `thread_trampoline` there). the context block is released
-# by the new thread itself, so an unjoined thread still reclaims it, matching
-# what `bsdthread_terminate` used to do.
+# pthread owns the native stack. the portable layer owns a separate context
+# until join, or transfers it to the thread through detach. a retained pthread
+# handle makes join a native teardown barrier and detach hands descriptor
+# reclamation back to libpthread.
 
 # ## the address-keyed wait, and why it is a table of condition variables
 #
@@ -1643,88 +1639,245 @@ fun wait_bucket(addr: usize) usize {
     ret h % WAIT_BUCKETS;
 }
 
-# the pthread start routine
-#
-# receives the caller's context block, whose five words are [fn, done, base,
-# size, user]. it runs on a stack pthread allocated, NOT on the context block,
-# which is why the block can be released here: nothing this function or the
-# user body touches lives in it once the five words have been copied out.
-# releasing it here rather than in `join` means a thread nobody joins still
-# reclaims its memory, which is the behaviour `bsdthread_terminate` gave.
-#
-# declared returning `usize` where C says `void *`: the value is discarded (the
-# thread is detached) and a 64-bit zero in the return register is the same
-# thing a `return NULL` puts there.
-# ---
-# arg: the context block address, as handed to pthread_create
-# ret: always 0, never read
-fun thread_entry(arg: ptr) usize {
-    val ctx: *usize = arg::usize::*usize;
-    val fn_addr:    usize = ctx[0];
-    val done_addr:  usize = ctx[1];
-    val stack_base: usize = ctx[2];
-    val stack_size: usize = ctx[3];
-    val user:       usize = ctx[4];
+rec ThreadStart {
+    fn_addr:          usize;
+    arg_addr:         usize;
+    state_addr:       usize;
+    reclaimable_addr: usize;
+    owner_base:       usize;
+    owner_size:       usize;
+    name_addr:        usize;
+    run:              i64;
+    setup:            i64;
+    setup_error:      i64;
+    diagnostic_id:    i64;
+}
 
-    deallocate(stack_base::ptr, stack_size);
+val THREAD_START_SIZE: usize = 4096;
+
+fun abort_thread_prepare(start_mem: ptr, attr: *u8, failure: i64) i64 {
+    var attr_error: i32 = 0;
+    if (attr != nil) { attr_error = ls.pthread_attr_destroy(attr); }
+    val deallocate_error: i64 = deallocate(start_mem, THREAD_START_SIZE);
+    if (attr_error != 0) { ret -(attr_error::i64); }
+    if (deallocate_error < 0) { ret deallocate_error; }
+    ret failure;
+}
+
+fun abort_thread_start(thread: usize, start: *ThreadStart, failure: i64) i64 {
+    atomic.store(?start.run, -1);
+    thread_wake(?start.run);
+    val join_error: i32 = ls.pthread_join(thread, nil);
+    if (join_error != 0) { ret -(join_error::i64); }
+    ret failure;
+}
+
+# pthread entry with a parent-controlled setup gate
+fun thread_entry(arg: ptr) usize {
+    val start: *ThreadStart = arg::usize::*ThreadStart;
+    var setup_error: i64 = 0;
+    if (@(start.name_addr::*u8) != 0) {
+        val rc: i32 = ls.pthread_setname_np(start.name_addr::*u8);
+        if (rc != 0) { setup_error = -(rc::i64); }
+    }
+
+    var diagnostic_id: u64 = 0;
+    if (setup_error == 0) {
+        val rc: i32 = ls.pthread_threadid_np(0, ?diagnostic_id);
+        if (rc != 0) { setup_error = -(rc::i64); }
+    }
+    start.diagnostic_id = diagnostic_id::i64;
+    start.setup_error = setup_error;
+    atomic.store(?start.setup, 1);
+    thread_wake(?start.setup);
+
+    for (atomic.load(?start.run) == 0) {
+        thread_wait(?start.run, 0);
+    }
+
+    val fn_addr: usize = start.fn_addr;
+    val arg_addr: usize = start.arg_addr;
+    val state_addr: usize = start.state_addr;
+    val reclaimable_addr: usize = start.reclaimable_addr;
+    val owner_base: usize = start.owner_base;
+    val owner_size: usize = start.owner_size;
+    val run: i64 = atomic.load(?start.run);
+    deallocate(start::ptr, THREAD_START_SIZE);
+
+    if (run < 0) {
+        atomic.store(reclaimable_addr::*i64, 1);
+        thread_wake(reclaimable_addr::*i64);
+        ret 0;
+    }
 
     val fn_ptr: fun(*u8) = fn_addr::fun(*u8);
-    fn_ptr(user::*u8);
+    fn_ptr(arg_addr::*u8);
 
-    val done: *i64 = done_addr::*i64;
-    atomic.store(done, 1);
-    thread_wake(done);
+    val state: *i64 = state_addr::*i64;
+    var expected: i64 = 0;
+    if (atomic.cas(state, ?expected, 1)) {
+        atomic.store(reclaimable_addr::*i64, 1);
+        thread_wake(reclaimable_addr::*i64);
+    }
+    or {
+        deallocate(owner_base::ptr, owner_size);
+    }
     ret 0;
 }
 
-# create a new thread via pthread_create
-#
-# the thread is created DETACHED. joining is done by `sync.thread.join`, which
-# waits on the completion flag rather than calling pthread_join, so a joinable
-# pthread would leave its descriptor unreaped forever. detaching hands that
-# cleanup to libpthread and keeps the flag as the single synchronisation point.
-#
-# note the error contract: pthread_* return the error number directly and do
-# NOT set errno, so these results are negated as they stand and `fail_errno`
-# is deliberately not used anywhere in this function.
-# ---
-# f:          entry function to execute in the new thread
-# arg:        opaque pointer passed through to f
-# done_ptr:   pointer to a completion flag (set to 1 when thread exits)
-# stack_base: base of a caller-allocated region used as the context block;
-#             released by the new thread, or by the caller if this call fails
-# stack_size: size of the stack pthread will allocate for the thread
-# ret:        thread handle on success, or negative errno on failure
-pub fun thread_spawn(f: fun(*u8), arg: *u8, done_ptr: *i64, stack_base: usize, stack_size: usize) i64 {
-    val ctx: *usize = stack_base::*usize;
-    ctx[0] = f::usize;
-    ctx[1] = done_ptr::usize;
-    ctx[2] = stack_base;
-    ctx[3] = stack_size;
-    ctx[4] = arg::usize;
+# create a joinable pthread and release it only through join or detach
+pub fun thread_spawn(
+    f: fun(*u8), arg: *u8, state: *i64, reclaimable: *i64,
+    owner: ptr, owner_size: usize, name: *u8,
+    stack_reserve: usize, stack_commit: usize, native: *usize,
+) i64 {
+    if (stack_commit != 0) { ret -95; }
+
+    val start_mem: ptr = allocate(THREAD_START_SIZE);
+    if (start_mem == nil) { ret -12; }
+    val start: *ThreadStart = start_mem::usize::*ThreadStart;
+    start.fn_addr = f::usize;
+    start.arg_addr = arg::usize;
+    start.state_addr = state::usize;
+    start.reclaimable_addr = reclaimable::usize;
+    start.owner_base = owner::usize;
+    start.owner_size = owner_size;
+    start.name_addr = name::usize;
+    start.run = 0;
+    start.setup = 0;
+    start.setup_error = 0;
+    start.diagnostic_id = 0;
 
     var attr: [64]u8;
     var rc: i32 = ls.pthread_attr_init(?attr[0]);
-    if (rc != 0) { ret -(rc::i64); }
-
-    rc = ls.pthread_attr_setstacksize(?attr[0], stack_size);
-    if (rc == 0) {
-        rc = ls.pthread_attr_setdetachstate(?attr[0], ls.PTHREAD_CREATE_DETACHED);
+    if (rc != 0) {
+        ret abort_thread_prepare(start_mem, nil, -(rc::i64));
     }
+    rc = ls.pthread_attr_setstacksize(?attr[0], stack_reserve);
 
-    var tid: usize = 0;
+    var thread: usize = 0;
     if (rc == 0) {
         val entry: fun(ptr) usize = thread_entry;
-        rc = ls.pthread_create(?tid, ?attr[0], entry::usize, stack_base::ptr);
+        rc = ls.pthread_create(?thread, ?attr[0], entry::usize, start_mem);
+    }
+
+    if (rc != 0) {
+        ret abort_thread_prepare(start_mem, ?attr[0], -(rc::i64));
     }
     ls.pthread_attr_destroy(?attr[0]);
 
-    if (rc != 0) { ret -(rc::i64); }
+    for (atomic.load(?start.setup) == 0) {
+        thread_wait(?start.setup, 0);
+    }
+    if (start.setup_error < 0) {
+        val setup_error: i64 = start.setup_error;
+        ret abort_thread_start(thread, start, setup_error);
+    }
 
-    # a darwin user-space pointer never sets the top bit, so the handle is
-    # always positive and cannot be mistaken for the negative-errno failure
-    # this function's contract returns.
-    ret tid::i64;
+    val diagnostic_id: i64 = start.diagnostic_id;
+    @native = thread;
+    atomic.store(?start.run, 1);
+    thread_wake(?start.run);
+    ret diagnostic_id;
+}
+
+pub fun thread_join(native: usize, reclaimable: *i64) i64 {
+    val rc: i32 = ls.pthread_join(native, nil);
+    if (rc != 0) { ret -(rc::i64); }
+    ret 0;
+}
+
+pub fun thread_detach(native: usize) i64 {
+    val rc: i32 = ls.pthread_detach(native);
+    if (rc != 0) { ret -(rc::i64); }
+    ret 0;
+}
+
+pub fun thread_current_id() i64 {
+    var id: u64 = 0;
+    val rc: i32 = ls.pthread_threadid_np(0, ?id);
+    if (rc != 0) { ret -(rc::i64); }
+    ret id::i64;
+}
+
+pub fun thread_current_name(name: *u8, cap: usize) i64 {
+    if (cap == 0) { ret -22; }
+    val rc: i32 = ls.pthread_getname_np(ls.pthread_self(), name, cap);
+    if (rc != 0) { ret -(rc::i64); }
+    var n: usize = 0;
+    for (n < cap && name[n] != 0) { n = n + 1; }
+    ret n::i64;
+}
+
+test "std.system.os.darwin: injected failure releases startup context" {
+    val start_mem: ptr = allocate(THREAD_START_SIZE);
+    if (start_mem == nil) { ret 1; }
+    val injected: i64 = -125;
+    if (abort_thread_prepare(start_mem, nil, injected) != injected) { ret 1; }
+    ret 0;
+}
+
+test "std.system.os.darwin: injected failure releases pthread attributes" {
+    val start_mem: ptr = allocate(THREAD_START_SIZE);
+    if (start_mem == nil) { ret 1; }
+    var attr: [64]u8;
+    val rc: i32 = ls.pthread_attr_init(?attr[0]);
+    if (rc != 0) {
+        deallocate(start_mem, THREAD_START_SIZE);
+        ret 1;
+    }
+    val injected: i64 = -125;
+    if (abort_thread_prepare(start_mem, ?attr[0], injected) != injected) { ret 1; }
+    ret 0;
+}
+
+test "std.system.os.darwin: native setup failure aborts before user entry" {
+    var state: i64 = 0;
+    var reclaimable: i64 = 0;
+    val owner: ptr = allocate(4096);
+    if (owner == nil) { ret 1; }
+    val start_mem: ptr = allocate(THREAD_START_SIZE);
+    if (start_mem == nil) { deallocate(owner, 4096); ret 1; }
+    val start: *ThreadStart = start_mem::usize::*ThreadStart;
+    start.fn_addr = 1;
+    start.arg_addr = 0;
+    start.state_addr = (?state)::usize;
+    start.reclaimable_addr = (?reclaimable)::usize;
+    start.owner_base = owner::usize;
+    start.owner_size = 4096;
+    start.name_addr = ""::usize;
+    start.run = 0;
+    start.setup = 0;
+    start.setup_error = 0;
+    start.diagnostic_id = 0;
+
+    var attr: [64]u8;
+    var rc: i32 = ls.pthread_attr_init(?attr[0]);
+    if (rc != 0) {
+        deallocate(start_mem, THREAD_START_SIZE);
+        deallocate(owner, 4096);
+        ret 1;
+    }
+    rc = ls.pthread_attr_setstacksize(?attr[0], 2097152);
+    var native: usize = 0;
+    if (rc == 0) {
+        val entry: fun(ptr) usize = thread_entry;
+        rc = ls.pthread_create(?native, ?attr[0], entry::usize, start_mem);
+    }
+    ls.pthread_attr_destroy(?attr[0]);
+    if (rc != 0) {
+        deallocate(start_mem, THREAD_START_SIZE);
+        deallocate(owner, 4096);
+        ret 1;
+    }
+    for (atomic.load(?start.setup) == 0) { thread_wait(?start.setup, 0); }
+
+    val setup_rc: i32 = ls.pthread_threadid_np(0, nil);
+    val setup_error: i64 = -(setup_rc::i64);
+    val abort_error: i64 = abort_thread_start(native, start, setup_error);
+    deallocate(owner, 4096);
+    if (setup_rc == 0 || abort_error != setup_error || atomic.load(?reclaimable) != 1) { ret 1; }
+    ret 0;
 }
 
 # block until the value at addr changes from expected
@@ -1946,23 +2099,31 @@ pub fun io_queue_close(queue: *os_shared.IoQueue) i64 {
 # the OS-layer thread primitives, asserted for effect. `std.sync.thread` covers
 # the portable API on top of these; what is tested here is what is specific to
 # the darwin implementation and could be wrong without the portable tests
-# noticing - the opaque object sizes, the release of the context block, and the
+# noticing - the opaque object sizes, native join ownership, and the
 # bucket sharing in the address-keyed wait.
 
-val TEST_REGION: usize = 2097152;
+val TEST_REGION: usize = 4096;
 
 rec TestThread {
-    done: i64;
-    base: usize;
+    state:       i64;
+    reclaimable: i64;
+    native:      usize;
+    base:        usize;
 }
 
 fun tt_spawn(f: fun(*u8), arg: *u8, t: *TestThread) i64 {
-    t.done = 0;
+    t.state = 0;
+    t.reclaimable = 0;
+    t.native = 0;
     t.base = 0;
     val base: usize = allocate(TEST_REGION)::usize;
     if (base == 0) { ret -1; }
     t.base = base;
-    val r: i64 = thread_spawn(f, arg, ?t.done, base, TEST_REGION);
+    val r: i64 = thread_spawn(
+        f, arg, ?t.state, ?t.reclaimable,
+        base::ptr, TEST_REGION, "",
+        2097152, 0, ?t.native,
+    );
     if (r < 0) {
         deallocate(base::ptr, TEST_REGION);
         t.base = 0;
@@ -1971,9 +2132,9 @@ fun tt_spawn(f: fun(*u8), arg: *u8, t: *TestThread) i64 {
 }
 
 fun tt_join(t: *TestThread) {
-    for (atomic.load(?t.done) == 0) {
-        thread_wait(?t.done, 0);
-    }
+    thread_join(t.native, ?t.reclaimable);
+    deallocate(t.base::ptr, TEST_REGION);
+    t.base = 0;
 }
 
 var tw_flag: i64 = 0;
@@ -2037,14 +2198,8 @@ test "std.system.os.darwin.libsystem:thread_spawn_runs_body_and_wakes_waiter" {
     ret 0;
 }
 
-# the context block is released by the thread, not leaked
-#
-# `thread_entry` frees the caller's region before it runs the body, so by the
-# time the completion flag is set the region is already unmapped. mprotect over
-# an unmapped range fails, which is the observable. nothing allocates between
-# the join and the probe, so the range cannot have been handed to something
-# else in the meantime.
-test "std.system.os.darwin.libsystem:thread_releases_its_context_block" {
+# join releases the portable owner after native pthread teardown
+test "std.system.os.darwin.libsystem:thread_join_releases_its_owner" {
     atomic.store(?tw_flag, 0);
     var t: TestThread;
     if (tt_spawn(tw_setter, nil, ?t) < 0) { ret 1; }

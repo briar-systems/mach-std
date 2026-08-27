@@ -1,195 +1,496 @@
-# thread creation and management
+# thread creation and resource ownership
 #
-# spawns OS-level threads via the OS layer primitives. each thread gets
-# a dedicated stack allocated via the OS allocator. the thread's
-# trampoline frees the stack before exiting, so stacks are reclaimed
-# even if join is never called.
-#
-# limitations:
-#   - no thread-local storage support.
+# every spawned thread has one private owner record. the public handle may move
+# after spawn because target trampolines refer to that record, never the handle.
+# a joinable thread leaves the record for join. detach transfers it to the
+# exiting thread, which releases it after the user context has been destroyed.
 
 use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
 use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
 use std.sync.atomic;
 use std.system.os;
 
-val STACK_SIZE: usize = 2097152;
+pub val ERROR_INVALID:     i64 = -22;
+pub val ERROR_NO_MEMORY:   i64 = -12;
+pub val ERROR_UNSUPPORTED: i64 = -95;
+
+pub val DEFAULT_STACK_RESERVE: usize = 2097152;
+pub val MIN_STACK_RESERVE:     usize = 65536;
+pub val MAX_NAME_BYTES:        usize = 15;
+
+val OWNER_REGION_SIZE: usize = 4096;
+
+val STATE_RUNNING:  i64 = 0;
+val STATE_FINISHED: i64 = 1;
+val STATE_DETACHED: i64 = 2;
+
+# portable thread creation policy
+# ---
+# stack_reserve: virtual address space reserved for the stack, or 0 for default
+# stack_commit:  initial committed stack bytes, or 0 for the target default
+# name:          nil or a portable ASCII diagnostic name of at most 15 bytes
+pub rec Config {
+    stack_reserve: usize;
+    stack_commit:  usize;
+    name:          str;
+}
+
+# initialize a thread configuration with portable defaults
+pub fun config_default(c: *Config) {
+    c.stack_reserve = DEFAULT_STACK_RESERVE;
+    c.stack_commit = 0;
+    c.name = nil;
+}
 
 # handle to a spawned thread
 # ---
-# tid:   kernel thread id
-# stack: pointer to the base of the allocated stack region
-# done:  completion flag (0=running, 1=finished)
+# tid:   stable native diagnostic identifier, or a negative spawn error
+# stack: opaque resource-owner address, retained for source compatibility
+# done:  0 while joinable, 1 after join, -1 after detach
 pub rec Thread {
     tid:   i64;
     stack: usize;
     done:  i64;
 }
 
-# spawn a new thread that executes f, handing it an opaque context pointer
-#
-# allocates a 2MB stack, then calls the OS thread_spawn primitive which
-# handles clone and trampoline setup. the child invokes f(arg), sets the
-# done flag, and wakes waiters on exit. arg is delivered to the entry with
-# no interpretation, so a caller can hand a thread its per-thread state
-# directly (e.g. an accepted connection) instead of routing it through a
-# global slot.
-#
-# the handle is caller-owned and initialized in place: the child writes
-# the completion flag through ?t.done, so the record must stay at a
-# stable address for the thread's lifetime (a by-value return would
-# hand the child the address of a dead frame, see issue #195). arg must
-# likewise outlive the thread.
-# ---
-# f:   entry function; receives arg as its sole argument
-# arg: opaque pointer delivered to f, or nil
-# t:   caller-owned handle, initialized by this call; t.tid < 0 on failure
-pub fun spawn_with(f: fun(*u8), arg: *u8, t: *Thread) {
-    t.tid = -1;
+rec Owner {
+    entry:       usize;
+    arg:         usize;
+    destroy:     usize;
+    state:       i64;
+    reclaimable: i64;
+    native:      usize;
+    name:        [16]u8;
+}
+
+fun destroy_arg(arg: *u8, destroy_addr: usize) {
+    if (destroy_addr == 0) { ret; }
+    val destroy: fun(*u8) = destroy_addr::fun(*u8);
+    destroy(arg);
+}
+
+# target trampolines call this exactly once after target setup succeeds
+fun owner_entry(arg: *u8) {
+    val o: *Owner = arg::*Owner;
+    val entry: fun(*u8) = o.entry::fun(*u8);
+    val user_arg: *u8 = o.arg::*u8;
+    val destroy_addr: usize = o.destroy;
+    entry(user_arg);
+    destroy_arg(user_arg, destroy_addr);
+}
+
+fun initialize_thread(t: *Thread) {
+    t.tid = ERROR_INVALID;
     t.stack = 0;
     t.done = 0;
+}
 
-    val stack_base: usize = os.allocate(STACK_SIZE)::usize;
-    if (stack_base == 0) {
-        ret;
+fun validate_config(c: *Config) i64 {
+    val page: usize = os.page_size();
+    var reserve: usize = c.stack_reserve;
+    if (reserve == 0) { reserve = DEFAULT_STACK_RESERVE; }
+    if (reserve < MIN_STACK_RESERVE || reserve % page != 0) {
+        ret ERROR_INVALID;
+    }
+    if (c.stack_commit != 0) {
+        if (c.stack_commit < page || c.stack_commit % page != 0 || c.stack_commit > reserve) {
+            ret ERROR_INVALID;
+        }
     }
 
-    t.stack = stack_base;
+    if (c.name != nil) {
+        val n: usize = str_len(c.name);
+        if (n == 0 || n > MAX_NAME_BYTES) { ret ERROR_INVALID; }
+        var i: usize = 0;
+        for (i < n) {
+            val ch: u8 = c.name[i];
+            if (ch < 32 || ch > 126) { ret ERROR_INVALID; }
+            i = i + 1;
+        }
+    }
+    ret 0;
+}
+
+fun copy_name(dst: *u8, name: str) {
+    var i: usize = 0;
+    if (name != nil) {
+        val n: usize = str_len(name);
+        for (i < n) {
+            dst[i] = name[i];
+            i = i + 1;
+        }
+    }
+    dst[i] = 0;
+}
+
+fun finish_spawn_failure(
+    arg: *u8, destroy_addr: usize, owner_base: ptr, t: *Thread, failure: i64,
+) i64 {
+    destroy_arg(arg, destroy_addr);
+    os.deallocate(owner_base, OWNER_REGION_SIZE);
+    t.tid = failure;
+    ret failure;
+}
+
+fun spawn_impl(f: fun(*u8), arg: *u8, destroy_addr: usize, c: *Config, t: *Thread) i64 {
+    initialize_thread(t);
+
+    val config_error: i64 = validate_config(c);
+    if (config_error < 0) {
+        destroy_arg(arg, destroy_addr);
+        t.tid = config_error;
+        ret config_error;
+    }
+
+    val owner_base: ptr = os.allocate(OWNER_REGION_SIZE);
+    if (owner_base == nil) {
+        destroy_arg(arg, destroy_addr);
+        t.tid = ERROR_NO_MEMORY;
+        ret ERROR_NO_MEMORY;
+    }
+
+    val o: *Owner = owner_base::usize::*Owner;
+    o.entry = f::usize;
+    o.arg = arg::usize;
+    o.destroy = destroy_addr;
+    o.state = STATE_RUNNING;
+    o.reclaimable = 0;
+    o.native = 0;
+    copy_name(?o.name[0], c.name);
+
+    var reserve: usize = c.stack_reserve;
+    if (reserve == 0) { reserve = DEFAULT_STACK_RESERVE; }
 
     atomic.fence();
-
-    val tid: i64 = os.thread_spawn(f, arg, ?t.done, t.stack, STACK_SIZE);
+    val tid: i64 = os.thread_spawn(
+        owner_entry,
+        owner_base::*u8,
+        ?o.state,
+        ?o.reclaimable,
+        owner_base,
+        OWNER_REGION_SIZE,
+        ?o.name[0],
+        reserve,
+        c.stack_commit,
+        ?o.native,
+    );
     if (tid < 0) {
-        os.deallocate(stack_base::ptr, STACK_SIZE);
-        t.stack = 0;
-        t.tid = tid;
-        ret;
+        ret finish_spawn_failure(arg, destroy_addr, owner_base, t, tid);
     }
 
     t.tid = tid;
+    t.stack = owner_base::usize;
+    ret 0;
 }
 
-# spawn a new thread that executes the given zero-argument function
+# spawn with borrowed caller context and explicit configuration
 #
-# a convenience over spawn_with for entries that need no context: the entry
-# runs with a nil argument it can ignore.
-# ---
-# f: function to execute in the new thread
-# t: caller-owned handle, initialized by this call; t.tid < 0 on failure
+# arg must remain valid until the entry returns. ownership stays with the caller.
+pub fun spawn_with_config(f: fun(*u8), arg: *u8, c: *Config, t: *Thread) i64 {
+    ret spawn_impl(f, arg, 0, c, t);
+}
+
+# spawn with owned caller context and explicit configuration
+#
+# destroy runs exactly once after the entry returns, including an early return.
+# if spawning fails, destroy runs before this call returns.
+pub fun spawn_owned_with_config(f: fun(*u8), arg: *u8, destroy: fun(*u8), c: *Config, t: *Thread) i64 {
+    ret spawn_impl(f, arg, destroy::usize, c, t);
+}
+
+# spawn with borrowed caller context and default configuration
+pub fun spawn_with(f: fun(*u8), arg: *u8, t: *Thread) {
+    var c: Config;
+    config_default(?c);
+    spawn_with_config(f, arg, ?c, t);
+}
+
+# spawn a zero-argument function with explicit configuration
+pub fun spawn_config(f: fun(), c: *Config, t: *Thread) i64 {
+    ret spawn_with_config((f::usize)::fun(*u8), nil, c, t);
+}
+
+# spawn with owned caller context and default configuration
+pub fun spawn_owned(f: fun(*u8), arg: *u8, destroy: fun(*u8), t: *Thread) i64 {
+    var c: Config;
+    config_default(?c);
+    ret spawn_owned_with_config(f, arg, destroy, ?c, t);
+}
+
+# spawn a zero-argument function with default configuration
 pub fun spawn(f: fun(), t: *Thread) {
     spawn_with((f::usize)::fun(*u8), nil, t);
 }
 
-# wait for a thread to finish
-#
-# blocks on the done flag using OS wait primitives. the thread's stack
-# is freed by the trampoline before the thread exits.
-# ---
-# t: pointer to the thread handle
-pub fun join(t: *Thread) {
-    for (atomic.load(?t.done) == 0) {
-        os.thread_wait(?t.done, 0);
-    }
+# join and release every library-owned resource
+pub fun join_result(t: *Thread) i64 {
+    if (t.stack == 0 || t.done != 0) { ret ERROR_INVALID; }
+    val o: *Owner = t.stack::*Owner;
+    val r: i64 = os.thread_join(o.native, ?o.reclaimable);
+    if (r < 0) { ret r; }
+    os.deallocate(t.stack::ptr, OWNER_REGION_SIZE);
     t.stack = 0;
+    t.done = 1;
+    ret 0;
 }
 
-# check whether a thread has finished executing
-# ---
-# t:   pointer to the thread handle
-# ret: true if the thread has completed
+# compatibility wrapper for callers that do not consume join errors
+pub fun join(t: *Thread) {
+    join_result(t);
+}
+
+# transfer ownership to the running or completed thread
+pub fun detach(t: *Thread) i64 {
+    if (t.stack == 0 || t.done != 0) { ret ERROR_INVALID; }
+    val o: *Owner = t.stack::*Owner;
+    val r: i64 = os.thread_detach(o.native);
+    if (r < 0) { ret r; }
+
+    var expected: i64 = STATE_RUNNING;
+    if (!atomic.cas(?o.state, ?expected, STATE_DETACHED)) {
+        if (expected != STATE_FINISHED) { ret ERROR_INVALID; }
+        for (atomic.load(?o.reclaimable) == 0) {
+            atomic.spin_hint();
+        }
+        os.deallocate(t.stack::ptr, OWNER_REGION_SIZE);
+    }
+
+    t.stack = 0;
+    t.done = -1;
+    ret 0;
+}
+
+# check whether a joinable thread body has finished
 pub fun is_done(t: *Thread) bool {
-    ret atomic.load(?t.done) != 0;
+    if (t.done == 1) { ret true; }
+    if (t.stack == 0) { ret false; }
+    val o: *Owner = t.stack::*Owner;
+    ret atomic.load(?o.state) == STATE_FINISHED;
 }
 
-$if ($mach.build.os == $mach.os.windows) {
-    use std.system.os.windows;
+# return the stable native diagnostic identifier captured at spawn
+pub fun diagnostic_id(t: *Thread) i64 {
+    ret t.tid;
 }
 
 var test_flag: i64 = 0;
+var test_destroyed: i64 = 0;
+
+rec DiagnosticCapture {
+    id:          i64;
+    name_result: i64;
+    name:        [16]u8;
+}
 
 fun test_worker() {
     atomic.store(?test_flag, 1);
 }
 
-# spawn_with entry: read the context pointer and add 100 to the i64 it points at.
 fun ud_worker(arg: *u8) {
     val slot: *i64 = arg::*i64;
     @slot = @slot + 100;
 }
 
+fun owned_worker(arg: *u8) {
+    val slot: *i64 = arg::*i64;
+    atomic.store(slot, atomic.load(slot) + 1);
+}
+
+fun owned_early_return(arg: *u8) {
+    val slot: *i64 = arg::*i64;
+    atomic.store(slot, atomic.load(slot) + 1);
+    ret;
+}
+
+fun owned_destroy(arg: *u8) {
+    val slot: *i64 = arg::*i64;
+    atomic.store(slot, atomic.load(slot) + 1);
+    atomic.fetch_add(?test_destroyed, 1);
+}
+
+fun diagnostic_worker(arg: *u8) {
+    val capture: *DiagnosticCapture = arg::*DiagnosticCapture;
+    capture.id = os.thread_current_id();
+    capture.name_result = os.thread_current_name(?capture.name[0], 16);
+}
+
 test "thread: Thread record initializes" {
     var t: Thread;
-    t.tid = 0;
-    t.stack = 0;
-    t.done = 0;
-    if (t.tid != 0) { ret 1; }
-    if (t.done != 0) { ret 1; }
+    initialize_thread(?t);
+    if (t.tid != ERROR_INVALID) { ret 1; }
+    if (t.stack != 0 || t.done != 0) { ret 1; }
     ret 0;
 }
 
 test "thread: spawn and join" {
-    $if ($mach.build.os == $mach.os.windows) {
-        # WaitOnAddress/WakeByAddressSingle are correctly pinned to the synch
-        # apiset (#253), and wine resolves it (apiset -> kernelbase/ntdll), but
-        # mach v1.5.0 omits the import call-thunk for the last PE import
-        # descriptor (mach#1388, the same codegen gap behind the #241 RtlGenRandom
-        # failures), so the wait path dispatches through a null pointer and
-        # faults. skip under wine until mach#1388 lands.
-        if (windows.running_under_wine()) { ret 0; }
-    }
     atomic.store(?test_flag, 0);
     var t: Thread;
     spawn(test_worker, ?t);
-    if (t.tid < 0) { ret 1; }
-    join(?t);
-    if (atomic.load(?test_flag) != 1) { ret 1; }
+    if (t.tid < 0 || diagnostic_id(?t) != t.tid) { ret 1; }
+    if (join_result(?t) != 0) { ret 1; }
+    if (atomic.load(?test_flag) != 1 || !is_done(?t)) { ret 1; }
     ret 0;
 }
 
-test "thread: is_done after join" {
-    $if ($mach.build.os == $mach.os.windows) {
-        # see "thread: spawn and join" above, the synch-apiset wait path faults
-        # under wine on mach#1388's missing last-descriptor thunk. skip under wine.
-        if (windows.running_under_wine()) { ret 0; }
-    }
+test "thread: handle may move after spawn" {
     atomic.store(?test_flag, 0);
-    var t: Thread;
-    spawn(test_worker, ?t);
-    if (t.tid < 0) { ret 1; }
-    join(?t);
-    if (!is_done(?t)) { ret 1; }
+    var original: Thread;
+    spawn(test_worker, ?original);
+    if (original.tid < 0) { ret 1; }
+    var moved: Thread = original;
+    original.stack = 0;
+    if (join_result(?moved) != 0 || atomic.load(?test_flag) != 1) { ret 1; }
     ret 0;
 }
 
 test "thread: spawn_with delivers distinct userdata" {
-    $if ($mach.build.os == $mach.os.windows) {
-        # same missing last-descriptor import thunk (mach#1388) as the spawn/join
-        # tests above faults the wait path under wine. skip under wine.
-        if (windows.running_under_wine()) { ret 0; }
-    }
-
     var vals: [4]i64;
-    var i: usize = 0;
-    for (i < 4) { vals[i] = i::i64; i = i + 1; }
-
-    # each thread gets a distinct pointer into vals and writes through it, with
-    # no shared slot or handshake.
     var threads: [4]Thread;
-    i = 0;
+    var i: usize = 0;
     for (i < 4) {
+        vals[i] = i::i64;
         spawn_with(ud_worker, (?vals[i])::*u8, ?threads[i]);
         i = i + 1;
     }
-
     i = 0;
     for (i < 4) {
-        if (threads[i].tid >= 0) { join(?threads[i]); }
+        if (threads[i].tid < 0 || join_result(?threads[i]) != 0) { ret 1; }
+        if (vals[i] != i::i64 + 100) { ret 1; }
         i = i + 1;
     }
+    ret 0;
+}
 
+test "thread: owned context is destroyed once after return" {
+    atomic.store(?test_destroyed, 0);
+    var value: i64 = 0;
+    var t: Thread;
+    if (spawn_owned(owned_early_return, (?value)::*u8, owned_destroy, ?t) != 0) { ret 1; }
+    if (join_result(?t) != 0) { ret 1; }
+    if (atomic.load(?value) != 2 || atomic.load(?test_destroyed) != 1) { ret 1; }
+    ret 0;
+}
+
+test "thread: spawn validation destroys owned context once" {
+    atomic.store(?test_destroyed, 0);
+    var value: i64 = 0;
+    var c: Config;
+    config_default(?c);
+    c.stack_reserve = 1;
+    var t: Thread;
+    val r: i64 = spawn_owned_with_config(owned_worker, (?value)::*u8, owned_destroy, ?c, ?t);
+    if (r != ERROR_INVALID || t.stack != 0) { ret 1; }
+    if (atomic.load(?value) != 1 || atomic.load(?test_destroyed) != 1) { ret 1; }
+    ret 0;
+}
+
+test "thread: target spawn failure destroys owned context once" {
+    atomic.store(?test_destroyed, 0);
+    var value: i64 = 0;
+    var c: Config;
+    config_default(?c);
+    c.stack_reserve = 1::usize << 63;
+    var t: Thread;
+    val r: i64 = spawn_owned_with_config(owned_worker, (?value)::*u8, owned_destroy, ?c, ?t);
+    if (r >= 0 || t.stack != 0) { ret 1; }
+    if (atomic.load(?value) != 1 || atomic.load(?test_destroyed) != 1) { ret 1; }
+    ret 0;
+}
+
+test "thread: injected failure after owner acquisition destroys context once" {
+    atomic.store(?test_destroyed, 0);
+    var value: i64 = 0;
+    val owner: ptr = os.allocate(OWNER_REGION_SIZE);
+    if (owner == nil) { ret 1; }
+    var t: Thread;
+    initialize_thread(?t);
+    val injected: i64 = -125;
+    val r: i64 = finish_spawn_failure(
+        (?value)::*u8, owned_destroy::usize, owner, ?t, injected,
+    );
+    if (r != injected || t.tid != injected || t.stack != 0) { ret 1; }
+    if (atomic.load(?value) != 1 || atomic.load(?test_destroyed) != 1) { ret 1; }
+    ret 0;
+}
+
+test "thread: custom reserve and portable name" {
+    var capture: DiagnosticCapture;
+    capture.id = 0;
+    capture.name_result = 0;
+    var c: Config;
+    config_default(?c);
+    c.stack_reserve = 1048576;
+    c.name = "mach-diag";
+    var t: Thread;
+    if (spawn_with_config(diagnostic_worker, (?capture)::*u8, ?c, ?t) != 0) { ret 1; }
+    val diagnostic_id: i64 = t.tid;
+    if (join_result(?t) != 0) { ret 1; }
+    if (capture.id != diagnostic_id || capture.name_result != 9) { ret 1; }
+    val expected: str = "mach-diag";
+    var i: usize = 0;
+    for (i < 9) {
+        if (capture.name[i] != expected[i]) { ret 1; }
+        i = i + 1;
+    }
+    if (capture.name[9] != 0) { ret 1; }
+    ret 0;
+}
+
+test "thread: target stack commit policy is explicit" {
+    atomic.store(?test_destroyed, 0);
+    var value: i64 = 0;
+    var c: Config;
+    config_default(?c);
+    c.stack_commit = 65536;
+    var t: Thread;
+    val r: i64 = spawn_owned_with_config(owned_worker, (?value)::*u8, owned_destroy, ?c, ?t);
+    if (r != ERROR_UNSUPPORTED || t.stack != 0) { ret 1; }
+    if (atomic.load(?value) != 1 || atomic.load(?test_destroyed) != 1) { ret 1; }
+    ret 0;
+}
+
+test "thread: detach transfers resource ownership" {
+    atomic.store(?test_destroyed, 0);
+    var value: i64 = 0;
+    var t: Thread;
+    if (spawn_owned(owned_worker, (?value)::*u8, owned_destroy, ?t) != 0) { ret 1; }
+    if (detach(?t) != 0 || t.stack != 0 || t.done != -1) { ret 1; }
+    for (atomic.load(?test_destroyed) != 1) { atomic.spin_hint(); }
+    if (atomic.load(?value) != 2) { ret 1; }
+    ret 0;
+}
+
+test "thread: repeated spawn and join reuses ownership cleanly" {
+    var i: usize = 0;
+    for (i < 64) {
+        atomic.store(?test_flag, 0);
+        var t: Thread;
+        spawn(test_worker, ?t);
+        if (t.tid < 0 || join_result(?t) != 0 || atomic.load(?test_flag) != 1) { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test "thread: repeated detach completes owned contexts" {
+    atomic.store(?test_destroyed, 0);
+    var values: [32]i64;
+    var i: usize = 0;
+    for (i < 32) {
+        values[i] = 0;
+        var t: Thread;
+        if (spawn_owned(owned_worker, (?values[i])::*u8, owned_destroy, ?t) != 0) { ret 1; }
+        if (detach(?t) != 0) { ret 1; }
+        i = i + 1;
+    }
+    for (atomic.load(?test_destroyed) != 32) { atomic.spin_hint(); }
     i = 0;
-    for (i < 4) {
-        if (vals[i] != i::i64 + 100) { ret 1; }
+    for (i < 32) {
+        if (atomic.load(?values[i]) != 2) { ret 1; }
         i = i + 1;
     }
     ret 0;
