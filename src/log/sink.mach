@@ -15,7 +15,7 @@ use std.system.os;
 use std.sync.atomic;
 use std.sync.mutex;
 use std.sync.thread;
-use record: std.log.record;
+use std.log.record;
 
 pub val ERR_INVALID_SINK: str = "ERR_INVALID_SINK";
 pub val ERR_INVALID_REPORT: str = "ERR_INVALID_REPORT";
@@ -69,6 +69,7 @@ pub rec Contract {
 
 pub def PublishFun: fun(ptr, *u8, usize) WriteReport;
 
+# sink ctx is borrowed and must outlive every publish
 # publish callbacks must consume or copy the borrowed bytes before returning
 pub rec Sink {
     ctx:       ptr;
@@ -172,20 +173,21 @@ pub fun publish(sink: *Sink, data: *u8, len: usize) WriteReport {
     if (result.status > WRITE_SUPPRESSED || result.offered != len || result.persisted > len) {
         ret failed(len, 0, ERR_INVALID_REPORT);
     }
+    if (sink.contract.delivery == DELIVERY_DIRECT) { ret normalize_direct(result, len); }
     ret result;
 }
 
+# direct publication confirms the complete record or exposes no persisted bytes
 fun normalize_direct(result: WriteReport, len: usize) WriteReport {
-    if (result.status > WRITE_FAILED || result.persisted > len) {
+    if (result.status == WRITE_PERSISTED) {
+        if (result.persisted != len) { ret failed(len, 0, ERR_INVALID_REPORT); }
+        ret report(WRITE_PERSISTED, len, len, result.truncated, result.error);
+    }
+    if (result.status == WRITE_ENQUEUED || result.status == WRITE_SUPPRESSED) {
         ret failed(len, 0, ERR_INVALID_REPORT);
     }
-    if (result.status == WRITE_PERSISTED && result.persisted != len) {
-        ret partial(len, result.persisted, result.error);
-    }
-    if (result.status == WRITE_PARTIAL && result.persisted == len) {
-        ret persisted(len);
-    }
-    ret report(result.status, len, result.persisted, result.truncated, result.error);
+    if (len > 0 && result.persisted == len) { ret failed(len, 0, ERR_INVALID_REPORT); }
+    ret report(result.status, len, 0, result.truncated, result.error);
 }
 
 fun direct_publish(ctx: ptr, data: *u8, len: usize) WriteReport {
@@ -197,7 +199,7 @@ fun direct_publish(ctx: ptr, data: *u8, len: usize) WriteReport {
     mutex.lock(?direct.lock);
     val result: WriteReport = direct.f_write(direct.adapter_ctx, data, len);
     mutex.unlock(?direct.lock);
-    ret normalize_direct(result, len);
+    ret result;
 }
 
 fun writer_publish(ctx: ptr, data: *u8, len: usize) WriteReport {
@@ -231,6 +233,7 @@ fun direct_sink(direct: *Direct, contract: Contract) R.Result[Sink, str] {
     ret make(direct::ptr, direct_publish, contract);
 }
 
+# ctx is borrowed and must outlive direct and every sink created from it
 # the custom callback is serialized by direct before each invocation
 pub fun custom(direct: *Direct, ctx: ptr, f_write: PublishFun, max_record: usize, oversize: record.OversizePolicy, target_atomic_limit: usize) R.Result[Sink, str] {
     if (direct == nil || f_write::usize == 0) { ret R.err[Sink, str](ERR_INVALID_SINK); }
@@ -240,6 +243,7 @@ pub fun custom(direct: *Direct, ctx: ptr, f_write: PublishFun, max_record: usize
     ret direct_sink(direct, R.unwrap_ok[Contract, str](cr));
 }
 
+# the writer value is copied while its ctx remains borrowed for every sink created from direct
 # io writers report a failed call or a partial successful call
 pub fun from_writer(direct: *Direct, output: writer.Writer, max_record: usize, oversize: record.OversizePolicy, target_atomic_limit: usize) R.Result[Sink, str] {
     if (direct == nil) { ret R.err[Sink, str](ERR_INVALID_SINK); }
@@ -260,6 +264,7 @@ pub fun console(direct: *Direct, stderr: bool, max_record: usize, oversize: reco
     ret direct_sink(direct, R.unwrap_ok[Contract, str](cr));
 }
 
+# the caller owns the file handle and closes it only after sink use stops
 # regular files guarantee one in-process callback but no cross-process limit
 pub fun file(direct: *Direct, output: filesystem.File, max_record: usize, oversize: record.OversizePolicy) R.Result[Sink, str] {
     if (direct == nil) { ret R.err[Sink, str](ERR_INVALID_SINK); }
@@ -278,6 +283,7 @@ pub fun pipe_target_atomic_limit() usize {
 # linux pipe writes through 4096 bytes are cross-process atomic
 # darwin exposes the posix minimum of 512 bytes through this contract
 # windows anonymous byte pipes publish once but expose no portable byte limit
+# the caller owns the pipe handle and closes it only after sink use stops
 pub fun pipe(direct: *Direct, output: filesystem.File, max_record: usize, oversize: record.OversizePolicy) R.Result[Sink, str] {
     if (direct == nil) { ret R.err[Sink, str](ERR_INVALID_SINK); }
     val cr: R.Result[Contract, str] = direct_contract(max_record, oversize, ADAPTER_PIPE, pipe_target_atomic_limit());
@@ -343,8 +349,63 @@ test "log.sink: custom adapter reports partial writes and recovers after failure
 
     capture.partial_at = 2;
     val third: WriteReport = publish(?sink, "third", 5);
-    if (third.status != WRITE_PARTIAL || third.offered != 5 || third.persisted != 2) { ret 4; }
+    if (third.status != WRITE_PARTIAL || third.offered != 5 || third.persisted != 0) { ret 4; }
     if (capture.calls != 3 || !bytes_equal((?capture.data)::*u8, capture.len, "secondth")) { ret 5; }
+    ret 0;
+}
+
+rec MalformedCapture {
+    result: WriteReport;
+}
+
+fun malformed_write(ctx: ptr, data: *u8, len: usize) WriteReport {
+    val capture: *MalformedCapture = ctx::*MalformedCapture;
+    ret capture.result;
+}
+
+test "log.sink: direct publication rejects contradictory adapter reports" {
+    val cr: R.Result[Contract, str] = direct_contract(128, record.OVERSIZE_REJECT, ADAPTER_CUSTOM, 0);
+    if (R.is_err[Contract, str](cr)) { ret 1; }
+    var capture: MalformedCapture;
+    val sr: R.Result[Sink, str] = make(?capture, malformed_write, R.unwrap_ok[Contract, str](cr));
+    if (R.is_err[Sink, str](sr)) { ret 2; }
+    var sink: Sink = R.unwrap_ok[Sink, str](sr);
+
+    capture.result = report(WRITE_PERSISTED, 4, 3, false, nil);
+    val short_ok: WriteReport = publish(?sink, "test", 4);
+    if (short_ok.status != WRITE_FAILED || short_ok.persisted != 0 || short_ok.error != ERR_INVALID_REPORT) { ret 3; }
+
+    capture.result = report(WRITE_FAILED, 4, 4, false, ERR_DIRECT_WRITE_FAILED);
+    val failed_full: WriteReport = publish(?sink, "test", 4);
+    if (failed_full.status != WRITE_FAILED || failed_full.persisted != 0 || failed_full.error != ERR_INVALID_REPORT) { ret 4; }
+
+    capture.result = report(WRITE_REJECTED, 4, 4, false, ERR_DIRECT_WRITE_FAILED);
+    val rejected_full: WriteReport = publish(?sink, "test", 4);
+    if (rejected_full.status != WRITE_FAILED || rejected_full.persisted != 0 || rejected_full.error != ERR_INVALID_REPORT) { ret 5; }
+
+    capture.result = report(WRITE_PERSISTED, 4, 5, false, nil);
+    val oversized: WriteReport = publish(?sink, "test", 4);
+    if (oversized.status != WRITE_FAILED || oversized.persisted != 0 || oversized.error != ERR_INVALID_REPORT) { ret 6; }
+    ret 0;
+}
+
+test "log.sink: direct publication exposes no partial persistence" {
+    val cr: R.Result[Contract, str] = direct_contract(128, record.OVERSIZE_REJECT, ADAPTER_CUSTOM, 0);
+    if (R.is_err[Contract, str](cr)) { ret 1; }
+    var capture: MalformedCapture;
+    val sr: R.Result[Sink, str] = make(?capture, malformed_write, R.unwrap_ok[Contract, str](cr));
+    if (R.is_err[Sink, str](sr)) { ret 2; }
+    var sink: Sink = R.unwrap_ok[Sink, str](sr);
+
+    capture.result = report(WRITE_PARTIAL, 4, 2, false, writer.ERR_SHORT_WRITE);
+    val partial_result: WriteReport = publish(?sink, "test", 4);
+    if (partial_result.status != WRITE_PARTIAL || partial_result.persisted != 0
+     || partial_result.error != writer.ERR_SHORT_WRITE) { ret 3; }
+
+    capture.result = report(WRITE_FAILED, 4, 2, false, ERR_DIRECT_WRITE_FAILED);
+    val failed_result: WriteReport = publish(?sink, "test", 4);
+    if (failed_result.status != WRITE_FAILED || failed_result.persisted != 0
+     || failed_result.error != ERR_DIRECT_WRITE_FAILED) { ret 4; }
     ret 0;
 }
 
