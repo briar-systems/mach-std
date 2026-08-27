@@ -33,6 +33,7 @@ pub rec Registration {
     prev: *Registration;
     next: *Registration;
     callback: CancelFun;
+    completion: CancelFun;
     context: ptr;
     reason: Reason;
     state: i64;
@@ -143,6 +144,7 @@ pub fun init_registration(registration: *Registration) bool {
     registration.prev = nil;
     registration.next = nil;
     registration.callback = (0::usize)::CancelFun;
+    registration.completion = (0::usize)::CancelFun;
     registration.context = nil;
     registration.reason = ACTIVE;
     registration.state = REG_UNUSED;
@@ -159,8 +161,7 @@ fun registration_remove(registration: *Registration) {
     if (registration.next != nil) { registration.next.prev = registration.prev; }
 }
 
-# successful registration is the ownership linearization point
-pub fun attach(scope: *Scope, registration: *Registration, callback: CancelFun, context: ptr) Reason {
+fun attach_internal(scope: *Scope, registration: *Registration, callback: CancelFun, completion: CancelFun, context: ptr) Reason {
     if (scope == nil || registration == nil || callback::usize == 0) { ret INVALID; }
     if (!scope_enter(scope)) { ret DESTROYED; }
     val registration_state: i64 = atomic.load(?registration.state);
@@ -188,6 +189,7 @@ pub fun attach(scope: *Scope, registration: *Registration, callback: CancelFun, 
     registration.next = scope.first_registration;
     if (scope.first_registration != nil) { scope.first_registration.prev = registration; }
     registration.callback = callback;
+    registration.completion = completion;
     registration.context = context;
     registration.reason = ACTIVE;
     atomic.store(?registration.state, REG_ACTIVE);
@@ -195,6 +197,24 @@ pub fun attach(scope: *Scope, registration: *Registration, callback: CancelFun, 
     mutex.unlock(?root.lock);
     scope_leave(scope);
     ret ACTIVE;
+}
+
+# successful registration is the ownership linearization point
+pub fun attach(scope: *Scope, registration: *Registration, callback: CancelFun, context: ptr) Reason {
+    ret attach_internal(scope, registration, callback, (0::usize)::CancelFun, context);
+}
+
+# completion publishes external work and must call finish under its lifetime lock
+pub fun attach_with_completion(scope: *Scope, registration: *Registration, callback: CancelFun, completion: CancelFun, context: ptr) Reason {
+    if (completion::usize == 0) { ret INVALID; }
+    ret attach_internal(scope, registration, callback, completion, context);
+}
+
+# this must be the completion hook's final registration operation
+pub fun finish(registration: *Registration) bool {
+    if (registration == nil) { ret false; }
+    var expected: i64 = REG_CANCELLED;
+    ret atomic.cas(?registration.state, ?expected, REG_COMPLETED);
 }
 
 # completion wins only while the registration remains owned by its scope
@@ -279,11 +299,16 @@ fun transition(scope: *Scope, reason: Reason) bool {
     for (registration != nil) {
         val next: *Registration = registration.next;
         val callback: CancelFun = registration.callback;
+        val completion: CancelFun = registration.completion;
         val context: ptr = registration.context;
         val callback_reason: Reason = registration.reason;
         registration.root = nil;
-        atomic.store(?registration.state, REG_COMPLETED);
         callback(context, callback_reason);
+        if (completion::usize == 0) {
+            finish(registration);
+        } or {
+            completion(context, callback_reason);
+        }
         registration = next;
     }
 
@@ -496,6 +521,33 @@ fun unregister_race_worker(arg: *u8) {
     atomic.store(context.result, result);
 }
 
+rec CallbackBlockContext {
+    count: *i64;
+    reason: *i64;
+    started: *i64;
+    release: *i64;
+}
+
+fun blocking_callback(context: ptr, why: Reason) {
+    val block: *CallbackBlockContext = context::*CallbackBlockContext;
+    atomic.store(block.started, 1);
+    for (atomic.load(block.release) == 0) { atomic.spin_hint(); }
+    atomic.fetch_add(block.count, 1);
+    atomic.store(block.reason, why);
+}
+
+rec CancelRaceContext {
+    scope: *Scope;
+    result: *i64;
+}
+
+fun cancel_race_worker(arg: *u8) {
+    val context: *CancelRaceContext = arg::*CancelRaceContext;
+    var result: i64 = 0;
+    if (cancel(context.scope)) { result = 1; }
+    atomic.store(context.result, result);
+}
+
 test "cancel scope: concurrent roots cannot claim one registration" {
     var first: Scope;
     var second: Scope;
@@ -557,6 +609,34 @@ test "cancel scope: unregister pins scope lifetime until removal" {
         if ((unregistered && atomic.load(?count) != 0) || (!unregistered && (atomic.load(?count) != 1 || atomic.load(?why) != CANCELLED))) { ret 1; }
         round = round + 1;
     }
+    ret 0;
+}
+
+test "cancel scope: registration reuse waits for callback return" {
+    var first: Scope;
+    var second: Scope;
+    val none: time.Time = time.Time{sec: 0, nsec: 0};
+    if (!make_root(?first, false, none) || !make_root(?second, false, none)) { ret 1; }
+    var count: i64 = 0;
+    var why: i64 = ACTIVE;
+    var started: i64 = 0;
+    var release: i64 = 0;
+    var block: CallbackBlockContext = CallbackBlockContext{count: ?count, reason: ?why, started: ?started, release: ?release};
+    var registration: Registration;
+    init_registration(?registration);
+    if (attach(?first, ?registration, blocking_callback, (?block)::ptr) != ACTIVE) { ret 1; }
+    var cancel_result: i64 = 0;
+    var context: CancelRaceContext = CancelRaceContext{scope: ?first, result: ?cancel_result};
+    var worker: thread.Thread;
+    thread.spawn_with(cancel_race_worker, (?context)::*u8, ?worker);
+    if (worker.tid < 0) { ret 1; }
+    for (atomic.load(?started) == 0) { atomic.spin_hint(); }
+    if (attach(?second, ?registration, blocking_callback, (?block)::ptr) != INVALID) { ret 1; }
+    atomic.store(?release, 1);
+    thread.join(?worker);
+    if (atomic.load(?cancel_result) != 1 || atomic.load(?count) != 1 || atomic.load(?why) != CANCELLED) { ret 1; }
+    if (attach(?second, ?registration, blocking_callback, (?block)::ptr) != ACTIVE) { ret 1; }
+    if (!cancel(?second) || atomic.load(?count) != 2 || !destroy(?first) || !destroy(?second)) { ret 1; }
     ret 0;
 }
 
