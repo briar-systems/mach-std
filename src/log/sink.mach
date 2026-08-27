@@ -1,0 +1,975 @@
+# serialized record sinks with direct atomic publication
+
+use R: std.types.result;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.io.writer;
+use io_error: std.io.error;
+use io_handle: std.io.handle;
+use std.filesystem;
+use std.system.os;
+use std.sync.atomic;
+use std.sync.channel;
+use std.sync.condition;
+use std.sync.mutex;
+use std.sync.thread;
+use std.log.record;
+
+pub val ERR_INVALID_SINK: str = "ERR_INVALID_SINK";
+pub val ERR_INVALID_REPORT: str = "ERR_INVALID_REPORT";
+pub val ERR_QUEUE_FULL: str = "ERR_QUEUE_FULL";
+pub val ERR_QUEUE_CLOSED: str = "ERR_QUEUE_CLOSED";
+pub val ERR_QUEUE_SPAWN_FAILED: str = "ERR_QUEUE_SPAWN_FAILED";
+val ERR_DIRECT_WRITE_FAILED: str = "ERR_DIRECT_WRITE_FAILED";
+val QUEUE_JOIN_OPEN: i64 = 0;
+val QUEUE_JOINING:   i64 = 1;
+val QUEUE_JOINED:    i64 = 2;
+val QUEUE_JOIN_FAILED: i64 = 3;
+
+pub def WriteStatus: u8;
+pub val WRITE_PERSISTED:  WriteStatus = 0;
+pub val WRITE_PARTIAL:    WriteStatus = 1;
+pub val WRITE_FAILED:     WriteStatus = 2;
+pub val WRITE_REJECTED:   WriteStatus = 3;
+pub val WRITE_DROPPED:    WriteStatus = 4;
+pub val WRITE_ENQUEUED:   WriteStatus = 5;
+pub val WRITE_SUPPRESSED: WriteStatus = 6;
+
+# offered is the full logical size before truncation
+# persisted is the byte count confirmed by the adapter
+pub rec WriteReport {
+    status:    WriteStatus;
+    offered:   usize;
+    persisted: usize;
+    truncated: bool;
+    error:     str;
+}
+
+pub def Delivery: u8;
+pub val DELIVERY_DIRECT:         Delivery = 0;
+pub val DELIVERY_BOUNDED_QUEUED: Delivery = 1;
+
+pub def OverloadPolicy: u8;
+pub val OVERLOAD_REJECT_NEW: OverloadPolicy = 0;
+pub val OVERLOAD_DROP_NEW:   OverloadPolicy = 1;
+pub val OVERLOAD_BLOCK:      OverloadPolicy = 2;
+
+pub def AdapterKind: u8;
+pub val ADAPTER_CONSOLE: AdapterKind = 0;
+pub val ADAPTER_PIPE:    AdapterKind = 1;
+pub val ADAPTER_FILE:    AdapterKind = 2;
+pub val ADAPTER_CUSTOM:  AdapterKind = 3;
+
+# target_atomic_limit is zero when the target offers no cross-process limit
+# every direct adapter still serializes callbacks within this process
+pub rec Contract {
+    delivery:            Delivery;
+    max_record:          usize;
+    oversize:            record.OversizePolicy;
+    adapter:             AdapterKind;
+    target_atomic_limit: usize;
+    queue_capacity:      usize;
+    overload:            OverloadPolicy;
+}
+
+pub def PublishFun: fun(ptr, *u8, usize) WriteReport;
+
+# sink ctx is borrowed and must outlive every publish
+# publish callbacks must consume or copy the borrowed bytes before returning
+pub rec Sink {
+    ctx:       ptr;
+    f_publish: PublishFun;
+    contract:  Contract;
+}
+
+# direct sinks must remain at a stable address and must not be copied in use
+# reinitialization requires every current publication to stop first
+# existing sinks retarget to the new adapter but retain their copied contract and must be discarded
+# direct owns no resources and requires no destruction
+pub rec Direct {
+    lock:        mutex.Mutex;
+    adapter_ctx: ptr;
+    f_write:     PublishFun;
+    writer:      writer.Writer;
+    initialized: bool;
+}
+
+pub rec QueuedRecord {
+    data: [record.MAX_RECORD_BYTES]u8;
+    len:  usize;
+}
+
+pub rec QueueStats {
+    enqueued:  usize;
+    persisted: usize;
+    partial:   usize;
+    failed:    usize;
+    rejected:  usize;
+    dropped:   usize;
+    aborted:   usize;
+    last:      WriteReport;
+}
+
+# queued and its caller-owned records remain stable through join
+pub rec Queued {
+    queue:       channel.Channel[QueuedRecord];
+    downstream:  *Sink;
+    worker:      thread.Thread;
+    overload:    OverloadPolicy;
+    enqueued:    i64;
+    persisted:   i64;
+    partial:     i64;
+    failed:      i64;
+    rejected:    i64;
+    dropped:     i64;
+    aborted:     i64;
+    last:        WriteReport;
+    lock:        mutex.Mutex;
+    state_lock:  mutex.Mutex;
+    joined:      condition.Condition;
+    initialized: bool;
+    join_state:  i64;
+    thread_error: i64;
+}
+
+pub fun report(status: WriteStatus, offered: usize, persisted: usize, truncated: bool, error: str) WriteReport {
+    ret WriteReport{
+        status: status,
+        offered: offered,
+        persisted: persisted,
+        truncated: truncated,
+        error: error,
+    };
+}
+
+pub fun persisted(bytes: usize) WriteReport {
+    ret report(WRITE_PERSISTED, bytes, bytes, false, nil);
+}
+
+pub fun partial(offered: usize, persisted_bytes: usize, error: str) WriteReport {
+    ret report(WRITE_PARTIAL, offered, persisted_bytes, false, error);
+}
+
+pub fun failed(offered: usize, persisted_bytes: usize, error: str) WriteReport {
+    ret report(WRITE_FAILED, offered, persisted_bytes, false, error);
+}
+
+pub fun suppressed() WriteReport {
+    ret report(WRITE_SUPPRESSED, 0, 0, false, nil);
+}
+
+pub fun contract_valid(contract: Contract) bool {
+    if (contract.delivery > DELIVERY_BOUNDED_QUEUED) { ret false; }
+    if (contract.max_record == 0 || contract.max_record > record.MAX_RECORD_BYTES) { ret false; }
+    if (contract.oversize > record.OVERSIZE_TRUNCATE) { ret false; }
+    if (contract.oversize == record.OVERSIZE_TRUNCATE && contract.max_record < record.MIN_TRUNCATED_BYTES) { ret false; }
+    if (contract.adapter > ADAPTER_CUSTOM) { ret false; }
+    if (contract.overload > OVERLOAD_BLOCK) { ret false; }
+    if (contract.delivery == DELIVERY_DIRECT && contract.queue_capacity != 0) { ret false; }
+    if (contract.delivery == DELIVERY_BOUNDED_QUEUED && contract.queue_capacity == 0) { ret false; }
+    ret true;
+}
+
+fun direct_contract(max_record: usize, oversize: record.OversizePolicy, adapter: AdapterKind, target_atomic_limit: usize) R.Result[Contract, str] {
+    val contract: Contract = Contract{
+        delivery: DELIVERY_DIRECT,
+        max_record: max_record,
+        oversize: oversize,
+        adapter: adapter,
+        target_atomic_limit: target_atomic_limit,
+        queue_capacity: 0,
+        overload: OVERLOAD_REJECT_NEW,
+    };
+    if (!contract_valid(contract)) { ret R.err[Contract, str](ERR_INVALID_SINK); }
+    ret R.ok[Contract, str](contract);
+}
+
+# describe a bounded queued delivery contract
+pub fun queued_contract(max_record: usize, oversize: record.OversizePolicy, capacity: usize, overload: OverloadPolicy, adapter: AdapterKind, target_atomic_limit: usize) R.Result[Contract, str] {
+    val contract: Contract = Contract{
+        delivery: DELIVERY_BOUNDED_QUEUED,
+        max_record: max_record,
+        oversize: oversize,
+        adapter: adapter,
+        target_atomic_limit: target_atomic_limit,
+        queue_capacity: capacity,
+        overload: overload,
+    };
+    if (!contract_valid(contract)) { ret R.err[Contract, str](ERR_INVALID_SINK); }
+    ret R.ok[Contract, str](contract);
+}
+
+# construct a sink from an implementation and a validated contract
+pub fun make(ctx: ptr, f_publish: PublishFun, contract: Contract) R.Result[Sink, str] {
+    if (f_publish::usize == 0 || !contract_valid(contract)) {
+        ret R.err[Sink, str](ERR_INVALID_SINK);
+    }
+    ret R.ok[Sink, str](Sink{ctx: ctx, f_publish: f_publish, contract: contract});
+}
+
+pub fun publish(sink: *Sink, data: *u8, len: usize) WriteReport {
+    if (sink == nil || sink.f_publish::usize == 0 || !contract_valid(sink.contract)) {
+        ret failed(len, 0, ERR_INVALID_SINK);
+    }
+    if (len > 0 && data == nil) { ret failed(len, 0, ERR_INVALID_SINK); }
+    if (len > sink.contract.max_record) {
+        ret report(WRITE_REJECTED, len, 0, false, record.ERR_RECORD_TOO_LARGE);
+    }
+    val result: WriteReport = sink.f_publish(sink.ctx, data, len);
+    if (sink.contract.delivery == DELIVERY_DIRECT) { ret validate_direct(result, len); }
+    if (!validate_queued(result, len)) {
+        ret failed(len, 0, ERR_INVALID_REPORT);
+    }
+    ret result;
+}
+
+fun validate_queued(result: WriteReport, len: usize) bool {
+    if (result.offered != len || result.persisted != 0 || result.truncated) { ret false; }
+    if (result.status == WRITE_ENQUEUED) { ret result.error == nil; }
+    if (result.status == WRITE_DROPPED) { ret result.error == nil; }
+    if (result.status == WRITE_REJECTED) { ret result.error != nil; }
+    ret false;
+}
+
+# direct atomicity is one callback while confirmed short-write bytes remain observable
+fun validate_direct(result: WriteReport, len: usize) WriteReport {
+    if (result.offered != len || result.persisted > len) {
+        ret failed(len, 0, ERR_INVALID_REPORT);
+    }
+    if (result.status == WRITE_PERSISTED) {
+        if (result.persisted != len || result.error != nil) {
+            ret failed(len, 0, ERR_INVALID_REPORT);
+        }
+        ret result;
+    }
+    if (result.status == WRITE_PARTIAL) {
+        if (result.persisted == 0 || result.persisted == len || result.error == nil) {
+            ret failed(len, 0, ERR_INVALID_REPORT);
+        }
+        ret result;
+    }
+    if (result.status == WRITE_FAILED) {
+        if (result.error == nil || (len > 0 && result.persisted == len)) {
+            ret failed(len, 0, ERR_INVALID_REPORT);
+        }
+        ret result;
+    }
+    ret failed(len, 0, ERR_INVALID_REPORT);
+}
+
+fun direct_publish(ctx: ptr, data: *u8, len: usize) WriteReport {
+    val direct: *Direct = ctx::*Direct;
+    if (!direct.initialized || direct.f_write::usize == 0) {
+        ret failed(len, 0, ERR_INVALID_SINK);
+    }
+
+    mutex.lock(?direct.lock);
+    val result: WriteReport = direct.f_write(direct.adapter_ctx, data, len);
+    mutex.unlock(?direct.lock);
+    ret result;
+}
+
+fun writer_publish(ctx: ptr, data: *u8, len: usize) WriteReport {
+    val output: *writer.Writer = ctx::*writer.Writer;
+    val result: R.Result[usize, str] = writer.write(output, data, len);
+    if (R.is_err[usize, str](result)) {
+        ret failed(len, 0, R.unwrap_err[usize, str](result));
+    }
+    val written: usize = R.unwrap_ok[usize, str](result);
+    if (written > len) { ret failed(len, 0, ERR_INVALID_REPORT); }
+    if (written == 0 && len > 0) { ret failed(len, 0, writer.ERR_SHORT_WRITE); }
+    if (written < len) { ret partial(len, written, writer.ERR_SHORT_WRITE); }
+    ret persisted(len);
+}
+
+fun init_custom(direct: *Direct, ctx: ptr, f_write: PublishFun) {
+    direct.lock = mutex.make();
+    direct.adapter_ctx = ctx;
+    direct.f_write = f_write;
+    direct.initialized = true;
+}
+
+fun init_writer(direct: *Direct, output: writer.Writer) {
+    direct.writer = output;
+    init_custom(direct, (?direct.writer)::ptr, writer_publish);
+}
+
+fun direct_sink(direct: *Direct, contract: Contract) R.Result[Sink, str] {
+    if (direct == nil || !direct.initialized || contract.delivery != DELIVERY_DIRECT) {
+        ret R.err[Sink, str](ERR_INVALID_SINK);
+    }
+    ret make(direct::ptr, direct_publish, contract);
+}
+
+# ctx is borrowed and must outlive direct and every sink created from it
+# the custom callback is serialized by direct before each invocation
+pub fun custom(direct: *Direct, ctx: ptr, f_write: PublishFun, max_record: usize, oversize: record.OversizePolicy, target_atomic_limit: usize) R.Result[Sink, str] {
+    if (direct == nil || f_write::usize == 0) { ret R.err[Sink, str](ERR_INVALID_SINK); }
+    val cr: R.Result[Contract, str] = direct_contract(max_record, oversize, ADAPTER_CUSTOM, target_atomic_limit);
+    if (R.is_err[Contract, str](cr)) { ret R.err[Sink, str](R.unwrap_err[Contract, str](cr)); }
+    init_custom(direct, ctx, f_write);
+    ret direct_sink(direct, R.unwrap_ok[Contract, str](cr));
+}
+
+# the writer value is copied while its ctx remains borrowed for every sink created from direct
+# io writers report a failed call or a partial successful call
+pub fun from_writer(direct: *Direct, output: writer.Writer, max_record: usize, oversize: record.OversizePolicy, target_atomic_limit: usize) R.Result[Sink, str] {
+    if (direct == nil) { ret R.err[Sink, str](ERR_INVALID_SINK); }
+    val cr: R.Result[Contract, str] = direct_contract(max_record, oversize, ADAPTER_CUSTOM, target_atomic_limit);
+    if (R.is_err[Contract, str](cr)) { ret R.err[Sink, str](R.unwrap_err[Contract, str](cr)); }
+    init_writer(direct, output);
+    ret direct_sink(direct, R.unwrap_ok[Contract, str](cr));
+}
+
+# consoles guarantee one in-process callback but no cross-process byte limit
+pub fun console(direct: *Direct, stderr: bool, max_record: usize, oversize: record.OversizePolicy) R.Result[Sink, str] {
+    if (direct == nil) { ret R.err[Sink, str](ERR_INVALID_SINK); }
+    var file: filesystem.File = filesystem.STDOUT;
+    if (stderr) { file = filesystem.STDERR; }
+    val cr: R.Result[Contract, str] = direct_contract(max_record, oversize, ADAPTER_CONSOLE, 0);
+    if (R.is_err[Contract, str](cr)) { ret R.err[Sink, str](R.unwrap_err[Contract, str](cr)); }
+    init_writer(direct, filesystem.writer(file));
+    ret direct_sink(direct, R.unwrap_ok[Contract, str](cr));
+}
+
+# the caller owns the file handle and closes it only after sink use stops
+# regular files guarantee one in-process callback but no cross-process limit
+pub fun file(direct: *Direct, output: filesystem.File, max_record: usize, oversize: record.OversizePolicy) R.Result[Sink, str] {
+    if (direct == nil) { ret R.err[Sink, str](ERR_INVALID_SINK); }
+    val cr: R.Result[Contract, str] = direct_contract(max_record, oversize, ADAPTER_FILE, 0);
+    if (R.is_err[Contract, str](cr)) { ret R.err[Sink, str](R.unwrap_err[Contract, str](cr)); }
+    init_writer(direct, filesystem.writer(output));
+    ret direct_sink(direct, R.unwrap_ok[Contract, str](cr));
+}
+
+pub fun pipe_target_atomic_limit() usize {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    $if ($mach.build.os == $mach.os.darwin) { ret 512; }
+    ret 4096;
+}
+
+# linux pipe writes through 4096 bytes are cross-process atomic
+# darwin exposes the posix minimum of 512 bytes through this contract
+# windows anonymous byte pipes publish once but expose no portable byte limit
+# the caller owns the pipe handle and closes it only after sink use stops
+pub fun pipe(direct: *Direct, output: filesystem.File, max_record: usize, oversize: record.OversizePolicy) R.Result[Sink, str] {
+    if (direct == nil) { ret R.err[Sink, str](ERR_INVALID_SINK); }
+    val cr: R.Result[Contract, str] = direct_contract(max_record, oversize, ADAPTER_PIPE, pipe_target_atomic_limit());
+    if (R.is_err[Contract, str](cr)) { ret R.err[Sink, str](R.unwrap_err[Contract, str](cr)); }
+    init_writer(direct, filesystem.writer(output));
+    ret direct_sink(direct, R.unwrap_ok[Contract, str](cr));
+}
+
+fun queued_result(status: channel.Status, len: usize, overload: OverloadPolicy) WriteReport {
+    if (status == channel.SENT) { ret report(WRITE_ENQUEUED, len, 0, false, nil); }
+    if (status == channel.FULL) {
+        if (overload == OVERLOAD_DROP_NEW) { ret report(WRITE_DROPPED, len, 0, false, nil); }
+        ret report(WRITE_REJECTED, len, 0, false, ERR_QUEUE_FULL);
+    }
+    ret report(WRITE_REJECTED, len, 0, false, ERR_QUEUE_CLOSED);
+}
+
+fun queued_publish(ctx: ptr, data: *u8, len: usize) WriteReport {
+    val queued: *Queued = ctx::*Queued;
+    if (!queued.initialized || atomic.load(?queued.join_state) != QUEUE_JOIN_OPEN) { ret report(WRITE_REJECTED, len, 0, false, ERR_QUEUE_CLOSED); }
+    var entry: QueuedRecord;
+    entry.len = len;
+    var i: usize = 0;
+    for (i < len) {
+        entry.data[i] = data[i];
+        i = i + 1;
+    }
+
+    var status: channel.Status = channel.FULL;
+    if (queued.overload == OVERLOAD_BLOCK) {
+        status = channel.send[QueuedRecord](?queued.queue, entry);
+    }
+    or {
+        status = channel.try_send[QueuedRecord](?queued.queue, entry);
+    }
+    val result: WriteReport = queued_result(status, len, queued.overload);
+    if (result.status == WRITE_ENQUEUED) { atomic.fetch_add(?queued.enqueued, 1); }
+    or (result.status == WRITE_DROPPED) { atomic.fetch_add(?queued.dropped, 1); }
+    or { atomic.fetch_add(?queued.rejected, 1); }
+    ret result;
+}
+
+fun queued_worker(arg: *u8) {
+    val queued: *Queued = arg::*Queued;
+    var entry: QueuedRecord;
+    var status: channel.Status = channel.receive[QueuedRecord](?queued.queue, ?entry);
+    for (status == channel.RECEIVED) {
+        val result: WriteReport = publish(queued.downstream, (?entry.data)::*u8, entry.len);
+        if (result.status == WRITE_PERSISTED) { atomic.fetch_add(?queued.persisted, 1); }
+        or (result.status == WRITE_PARTIAL) { atomic.fetch_add(?queued.partial, 1); }
+        or { atomic.fetch_add(?queued.failed, 1); }
+        mutex.lock(?queued.lock);
+        queued.last = result;
+        mutex.unlock(?queued.lock);
+        status = channel.receive[QueuedRecord](?queued.queue, ?entry);
+    }
+}
+
+# the downstream sink and every borrowed adapter context outlive queued join
+# downstream publication failure is recorded and does not stop queue service
+pub fun queued_with_config(queued: *Queued, storage: *QueuedRecord, capacity: usize, downstream: *Sink, max_record: usize, oversize: record.OversizePolicy, overload: OverloadPolicy, config: *thread.Config) R.Result[Sink, str] {
+    if (queued == nil || storage == nil || capacity == 0 || downstream == nil || !contract_valid(downstream.contract) || downstream.f_publish::usize == 0 || downstream.contract.delivery != DELIVERY_DIRECT || max_record > downstream.contract.max_record || config == nil) {
+        ret R.err[Sink, str](ERR_INVALID_SINK);
+    }
+    val cr: R.Result[Contract, str] = queued_contract(max_record, oversize, capacity, overload, downstream.contract.adapter, downstream.contract.target_atomic_limit);
+    if (R.is_err[Contract, str](cr) || !channel.make[QueuedRecord](?queued.queue, storage, capacity)) {
+        ret R.err[Sink, str](ERR_INVALID_SINK);
+    }
+    queued.downstream = downstream;
+    queued.overload = overload;
+    queued.enqueued = 0;
+    queued.persisted = 0;
+    queued.partial = 0;
+    queued.failed = 0;
+    queued.rejected = 0;
+    queued.dropped = 0;
+    queued.aborted = 0;
+    queued.last = suppressed();
+    queued.lock = mutex.make();
+    queued.state_lock = mutex.make();
+    queued.joined = condition.make();
+    queued.initialized = true;
+    queued.join_state = QUEUE_JOIN_OPEN;
+    queued.thread_error = 0;
+    val spawn_result: i64 = thread.spawn_with_config(queued_worker, queued::*u8, config, ?queued.worker);
+    if (spawn_result < 0) {
+        channel.close[QueuedRecord](?queued.queue);
+        channel.destroy[QueuedRecord](?queued.queue);
+        queued.initialized = false;
+        ret R.err[Sink, str](ERR_QUEUE_SPAWN_FAILED);
+    }
+    ret make(queued::ptr, queued_publish, R.unwrap_ok[Contract, str](cr));
+}
+
+pub fun queued(queued: *Queued, storage: *QueuedRecord, capacity: usize, downstream: *Sink, max_record: usize, oversize: record.OversizePolicy, overload: OverloadPolicy) R.Result[Sink, str] {
+    var config: thread.Config;
+    thread.config_default(?config);
+    ret queued_with_config(queued, storage, capacity, downstream, max_record, oversize, overload, ?config);
+}
+
+pub fun queued_close_drain(queued: *Queued) bool {
+    if (queued == nil || !queued.initialized) { ret false; }
+    ret channel.close[QueuedRecord](?queued.queue);
+}
+
+# abort transfers every unpublished record to caller storage
+pub fun queued_close_abort(queued: *Queued, rejected: *QueuedRecord, rejected_capacity: usize, rejected_len: *usize) bool {
+    if (queued == nil || !queued.initialized || rejected_len == nil) { ret false; }
+    val status: channel.Status = channel.close_abort[QueuedRecord](?queued.queue, rejected, rejected_capacity, rejected_len);
+    if (status != channel.ABORTED) { ret false; }
+    atomic.fetch_add(?queued.aborted, (@rejected_len)::i64);
+    ret true;
+}
+
+# downstream callbacks must not join their own queue
+pub fun queued_join(queued: *Queued) bool {
+    if (queued == nil || !queued.initialized || !channel.is_closed[QueuedRecord](?queued.queue)) { ret false; }
+    mutex.lock(?queued.state_lock);
+    for (atomic.load(?queued.join_state) == QUEUE_JOINING) {
+        condition.wait(?queued.joined, ?queued.state_lock);
+    }
+    if (atomic.load(?queued.join_state) == QUEUE_JOINED) {
+        mutex.unlock(?queued.state_lock);
+        ret true;
+    }
+    atomic.store(?queued.join_state, QUEUE_JOINING);
+    mutex.unlock(?queued.state_lock);
+
+    val result: i64 = thread.join_result(?queued.worker);
+    mutex.lock(?queued.state_lock);
+    atomic.store(?queued.thread_error, result);
+    if (result == 0) { atomic.store(?queued.join_state, QUEUE_JOINED); }
+    or { atomic.store(?queued.join_state, QUEUE_JOIN_FAILED); }
+    condition.broadcast(?queued.joined);
+    mutex.unlock(?queued.state_lock);
+    ret result == 0;
+}
+
+pub fun queued_stats(queued: *Queued) QueueStats {
+    if (queued == nil || !queued.initialized) {
+        ret QueueStats{enqueued: 0, persisted: 0, partial: 0, failed: 0, rejected: 0, dropped: 0, aborted: 0, last: failed(0, 0, ERR_INVALID_SINK)};
+    }
+    mutex.lock(?queued.lock);
+    val last: WriteReport = queued.last;
+    mutex.unlock(?queued.lock);
+    ret QueueStats{
+        enqueued: atomic.load(?queued.enqueued)::usize,
+        persisted: atomic.load(?queued.persisted)::usize,
+        partial: atomic.load(?queued.partial)::usize,
+        failed: atomic.load(?queued.failed)::usize,
+        rejected: atomic.load(?queued.rejected)::usize,
+        dropped: atomic.load(?queued.dropped)::usize,
+        aborted: atomic.load(?queued.aborted)::usize,
+        last: last,
+    };
+}
+
+pub fun queued_thread_error(queued: *Queued) i64 {
+    if (queued == nil || !queued.initialized) { ret thread.ERROR_INVALID; }
+    ret atomic.load(?queued.thread_error);
+}
+
+pub fun queued_destroy(queued: *Queued) bool {
+    if (queued == nil || !queued.initialized) { ret false; }
+    mutex.lock(?queued.state_lock);
+    if (atomic.load(?queued.join_state) != QUEUE_JOINED || condition.waiter_count(?queued.joined) != 0 || !channel.destroy[QueuedRecord](?queued.queue)) {
+        mutex.unlock(?queued.state_lock);
+        ret false;
+    }
+    queued.downstream = nil;
+    queued.initialized = false;
+    mutex.unlock(?queued.state_lock);
+    ret true;
+}
+
+rec Capture {
+    data:       [256]u8;
+    len:        usize;
+    calls:      usize;
+    fail_calls: usize;
+    partial_at: usize;
+}
+
+fun capture_write(ctx: ptr, data: *u8, len: usize) WriteReport {
+    val capture: *Capture = ctx::*Capture;
+    capture.calls = capture.calls + 1;
+    if (capture.fail_calls > 0) {
+        capture.fail_calls = capture.fail_calls - 1;
+        ret failed(len, 0, ERR_DIRECT_WRITE_FAILED);
+    }
+
+    var count: usize = len;
+    if (capture.partial_at < count) { count = capture.partial_at; }
+    if (count > 256 - capture.len) { count = 256 - capture.len; }
+    var i: usize = 0;
+    for (i < count) {
+        capture.data[capture.len + i] = data[i];
+        i = i + 1;
+    }
+    capture.len = capture.len + count;
+    if (count < len) { ret partial(len, count, writer.ERR_SHORT_WRITE); }
+    ret persisted(len);
+}
+
+fun bytes_equal(data: *u8, len: usize, expected: str) bool {
+    if (str_len(expected) != len) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        if (data[i] != expected[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+test "log.sink: custom adapter reports partial writes and recovers after failure" {
+    var capture: Capture;
+    capture.len = 0;
+    capture.calls = 0;
+    capture.fail_calls = 1;
+    capture.partial_at = 256;
+    var direct: Direct;
+    val sr: R.Result[Sink, str] = custom(?direct, ?capture, capture_write, 128, record.OVERSIZE_REJECT, 0);
+    if (R.is_err[Sink, str](sr)) { ret 1; }
+    var sink: Sink = R.unwrap_ok[Sink, str](sr);
+
+    val first: WriteReport = publish(?sink, "first", 5);
+    if (first.status != WRITE_FAILED || first.persisted != 0) { ret 2; }
+    val second: WriteReport = publish(?sink, "second", 6);
+    if (second.status != WRITE_PERSISTED || second.persisted != 6) { ret 3; }
+
+    capture.partial_at = 2;
+    val third: WriteReport = publish(?sink, "third", 5);
+    if (third.status != WRITE_PARTIAL || third.offered != 5 || third.persisted != 2) { ret 4; }
+    if (capture.calls != 3 || !bytes_equal((?capture.data)::*u8, capture.len, "secondth")) { ret 5; }
+    ret 0;
+}
+
+rec ShortWriter {
+    count: usize;
+}
+
+fun short_writer(ctx: ptr, data: *u8, len: usize) R.Result[usize, str] {
+    val state: *ShortWriter = ctx::*ShortWriter;
+    ret R.ok[usize, str](state.count);
+}
+
+test "log.sink: writer adapter preserves confirmed short-write bytes" {
+    var state: ShortWriter = ShortWriter{count: 2};
+    val output: writer.Writer = writer.Writer{ctx: ?state, f_write: short_writer};
+    var direct: Direct;
+    val sr: R.Result[Sink, str] = from_writer(?direct, output, 128, record.OVERSIZE_REJECT, 0);
+    if (R.is_err[Sink, str](sr)) { ret 1; }
+    var sink: Sink = R.unwrap_ok[Sink, str](sr);
+
+    val partial_result: WriteReport = publish(?sink, "short", 5);
+    if (partial_result.status != WRITE_PARTIAL || partial_result.persisted != 2
+     || partial_result.error != writer.ERR_SHORT_WRITE) { ret 2; }
+
+    state.count = 0;
+    val stalled: WriteReport = publish(?sink, "stalled", 7);
+    if (stalled.status != WRITE_FAILED || stalled.persisted != 0
+     || stalled.error != writer.ERR_SHORT_WRITE) { ret 3; }
+    ret 0;
+}
+
+rec DirectReportCase {
+    result: WriteReport;
+    valid:  bool;
+}
+
+rec MalformedCapture {
+    result: WriteReport;
+}
+
+fun malformed_write(ctx: ptr, data: *u8, len: usize) WriteReport {
+    val capture: *MalformedCapture = ctx::*MalformedCapture;
+    ret capture.result;
+}
+
+test "log.sink: direct adapter report status error and count matrix" {
+    val cr: R.Result[Contract, str] = direct_contract(128, record.OVERSIZE_REJECT, ADAPTER_CUSTOM, 0);
+    if (R.is_err[Contract, str](cr)) { ret 1; }
+    var capture: MalformedCapture;
+    val sr: R.Result[Sink, str] = make(?capture, malformed_write, R.unwrap_ok[Contract, str](cr));
+    if (R.is_err[Sink, str](sr)) { ret 2; }
+    var sink: Sink = R.unwrap_ok[Sink, str](sr);
+
+    var cases: [18]DirectReportCase;
+    cases[0] = DirectReportCase{result: report(WRITE_PERSISTED, 4, 4, false, nil), valid: true};
+    cases[1] = DirectReportCase{result: report(WRITE_PARTIAL, 4, 2, false, writer.ERR_SHORT_WRITE), valid: true};
+    cases[2] = DirectReportCase{result: report(WRITE_FAILED, 4, 0, false, ERR_DIRECT_WRITE_FAILED), valid: true};
+    cases[3] = DirectReportCase{result: report(WRITE_FAILED, 4, 2, false, ERR_DIRECT_WRITE_FAILED), valid: true};
+    cases[4] = DirectReportCase{result: report(WRITE_PERSISTED, 4, 3, false, nil), valid: false};
+    cases[5] = DirectReportCase{result: report(WRITE_PERSISTED, 4, 4, false, ERR_DIRECT_WRITE_FAILED), valid: false};
+    cases[6] = DirectReportCase{result: report(WRITE_PARTIAL, 4, 0, false, writer.ERR_SHORT_WRITE), valid: false};
+    cases[7] = DirectReportCase{result: report(WRITE_PARTIAL, 4, 4, false, writer.ERR_SHORT_WRITE), valid: false};
+    cases[8] = DirectReportCase{result: report(WRITE_PARTIAL, 4, 2, false, nil), valid: false};
+    cases[9] = DirectReportCase{result: report(WRITE_FAILED, 4, 0, false, nil), valid: false};
+    cases[10] = DirectReportCase{result: report(WRITE_FAILED, 4, 4, false, ERR_DIRECT_WRITE_FAILED), valid: false};
+    cases[11] = DirectReportCase{result: report(WRITE_REJECTED, 4, 0, false, ERR_DIRECT_WRITE_FAILED), valid: false};
+    cases[12] = DirectReportCase{result: report(WRITE_DROPPED, 4, 0, false, ERR_DIRECT_WRITE_FAILED), valid: false};
+    cases[13] = DirectReportCase{result: report(WRITE_ENQUEUED, 4, 0, false, nil), valid: false};
+    cases[14] = DirectReportCase{result: report(WRITE_SUPPRESSED, 4, 0, false, nil), valid: false};
+    cases[15] = DirectReportCase{result: report((WRITE_SUPPRESSED + 1)::WriteStatus, 4, 0, false, nil), valid: false};
+    cases[16] = DirectReportCase{result: report(WRITE_PERSISTED, 4, 5, false, nil), valid: false};
+    cases[17] = DirectReportCase{result: report(WRITE_PERSISTED, 3, 3, false, nil), valid: false};
+
+    var i: usize = 0;
+    for (i < 18) {
+        capture.result = cases[i].result;
+        val result: WriteReport = publish(?sink, "test", 4);
+        if (cases[i].valid) {
+            if (result.status != cases[i].result.status || result.offered != cases[i].result.offered
+             || result.persisted != cases[i].result.persisted || result.error != cases[i].result.error) { ret 3; }
+        }
+        or {
+            if (result.status != WRITE_FAILED || result.offered != 4 || result.persisted != 0
+             || result.error != ERR_INVALID_REPORT) { ret 4; }
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+rec ConcurrentCapture {
+    active:  i64;
+    overlap: i64;
+    calls:   i64;
+}
+
+fun concurrent_write(ctx: ptr, data: *u8, len: usize) WriteReport {
+    val capture: *ConcurrentCapture = ctx::*ConcurrentCapture;
+    if (atomic.exchange(?capture.active, 1) != 0) { atomic.store(?capture.overlap, 1); }
+    var i: usize = 0;
+    for (i < 1000) { atomic.spin_hint(); i = i + 1; }
+    capture.calls = capture.calls + 1;
+    atomic.store(?capture.active, 0);
+    ret persisted(len);
+}
+
+rec PublishContext {
+    sink: *Sink;
+    runs: usize;
+}
+
+fun publish_worker(arg: *u8) {
+    val context: *PublishContext = arg::*PublishContext;
+    var i: usize = 0;
+    for (i < context.runs) {
+        publish(context.sink, "one-record\n", 11);
+        i = i + 1;
+    }
+}
+
+test "log.sink: concurrent direct publishers never overlap one callback" {
+    var capture: ConcurrentCapture = ConcurrentCapture{active: 0, overlap: 0, calls: 0};
+    var direct: Direct;
+    val sr: R.Result[Sink, str] = custom(?direct, ?capture, concurrent_write, 128, record.OVERSIZE_REJECT, 0);
+    if (R.is_err[Sink, str](sr)) { ret 1; }
+    var sink: Sink = R.unwrap_ok[Sink, str](sr);
+    var contexts: [4]PublishContext;
+    var threads: [4]thread.Thread;
+    var i: usize = 0;
+    for (i < 4) {
+        contexts[i] = PublishContext{sink: ?sink, runs: 25};
+        thread.spawn_with(publish_worker, (?contexts[i])::*u8, ?threads[i]);
+        if (threads[i].tid < 0) {
+            var joined: usize = 0;
+            for (joined < i) { thread.join(?threads[joined]); joined = joined + 1; }
+            ret 2;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 4) { thread.join(?threads[i]); i = i + 1; }
+    if (atomic.load(?capture.overlap) != 0 || capture.calls != 100) { ret 3; }
+    ret 0;
+}
+
+test "log.sink: file adapter publishes one complete region" {
+    val path: str = ".mach-log-sink-497.tmp";
+    filesystem.remove_file(path);
+    val created: R.Result[filesystem.File, io_error.Error] = filesystem.create(path, 0o600);
+    if (R.is_err[filesystem.File, io_error.Error](created)) { ret 1; }
+    var output: filesystem.File = R.unwrap_ok[filesystem.File, io_error.Error](created);
+
+    var direct: Direct;
+    val sr: R.Result[Sink, str] = file(?direct, output, 128, record.OVERSIZE_REJECT);
+    if (R.is_err[Sink, str](sr)) { filesystem.close(?output); filesystem.remove_file(path); ret 2; }
+    var sink: Sink = R.unwrap_ok[Sink, str](sr);
+    val result: WriteReport = publish(?sink, "file-record\n", 12);
+    filesystem.close(?output);
+    if (result.status != WRITE_PERSISTED || result.persisted != 12) { filesystem.remove_file(path); ret 3; }
+
+    val opened: R.Result[filesystem.File, io_error.Error] = filesystem.open(path);
+    if (R.is_err[filesystem.File, io_error.Error](opened)) { filesystem.remove_file(path); ret 4; }
+    var input: filesystem.File = R.unwrap_ok[filesystem.File, io_error.Error](opened);
+    var data: [32]u8;
+    val read: R.Result[usize, io_error.Error] = filesystem.read(input, (?data)::*u8, 32);
+    filesystem.close(?input);
+    filesystem.remove_file(path);
+    if (R.is_err[usize, io_error.Error](read)) { ret 5; }
+    val len: usize = R.unwrap_ok[usize, io_error.Error](read);
+    if (!bytes_equal((?data)::*u8, len, "file-record\n")) { ret 6; }
+    ret 0;
+}
+
+test "log.sink: pipe adapter publishes one complete region" {
+    var fds: [2]i32;
+    if (os.pipe(?fds[0]) < 0) { ret 1; }
+    var input: filesystem.File = filesystem.File{handle: io_handle.FileHandle{value: fds[0]::usize}};
+    var output: filesystem.File = filesystem.File{handle: io_handle.FileHandle{value: fds[1]::usize}};
+    var direct: Direct;
+    val sr: R.Result[Sink, str] = pipe(?direct, output, 128, record.OVERSIZE_REJECT);
+    if (R.is_err[Sink, str](sr)) { filesystem.close(?input); filesystem.close(?output); ret 2; }
+    var sink: Sink = R.unwrap_ok[Sink, str](sr);
+    if (sink.contract.target_atomic_limit != pipe_target_atomic_limit()) { filesystem.close(?input); filesystem.close(?output); ret 3; }
+    val result: WriteReport = publish(?sink, "pipe-record\n", 12);
+    filesystem.close(?output);
+    if (result.status != WRITE_PERSISTED) { filesystem.close(?input); ret 4; }
+    var data: [32]u8;
+    val read: R.Result[usize, io_error.Error] = filesystem.read(input, (?data)::*u8, 32);
+    filesystem.close(?input);
+    if (R.is_err[usize, io_error.Error](read)) { ret 5; }
+    val len: usize = R.unwrap_ok[usize, io_error.Error](read);
+    if (!bytes_equal((?data)::*u8, len, "pipe-record\n")) { ret 6; }
+    ret 0;
+}
+
+test "log.sink: console adapter publishes through the native stream" {
+    var direct: Direct;
+    val sr: R.Result[Sink, str] = console(?direct, true, 128, record.OVERSIZE_REJECT);
+    if (R.is_err[Sink, str](sr)) { ret 1; }
+    var sink: Sink = R.unwrap_ok[Sink, str](sr);
+    val result: WriteReport = publish(?sink, "log console adapter ok\n", 23);
+    if (result.status != WRITE_PERSISTED || result.persisted != 23) { ret 2; }
+    ret 0;
+}
+
+test "log.sink: queued extension requires capacity and overload policy" {
+    val invalid: R.Result[Contract, str] = queued_contract(128, record.OVERSIZE_REJECT, 0, OVERLOAD_DROP_NEW, ADAPTER_FILE, 0);
+    if (R.is_ok[Contract, str](invalid)) { ret 1; }
+    val valid: R.Result[Contract, str] = queued_contract(128, record.OVERSIZE_REJECT, 64, OVERLOAD_REJECT_NEW, ADAPTER_FILE, 0);
+    if (R.is_err[Contract, str](valid)) { ret 2; }
+    val contract: Contract = R.unwrap_ok[Contract, str](valid);
+    if (contract.delivery != DELIVERY_BOUNDED_QUEUED || contract.queue_capacity != 64 || contract.overload != OVERLOAD_REJECT_NEW) { ret 3; }
+    ret 0;
+}
+
+test "log.sink: queued sink drains records and reports downstream failure" {
+    var capture: Capture;
+    capture.len = 0;
+    capture.calls = 0;
+    capture.fail_calls = 1;
+    capture.partial_at = 256;
+    var direct: Direct;
+    val dr: R.Result[Sink, str] = custom(?direct, ?capture, capture_write, 128, record.OVERSIZE_REJECT, 0);
+    if (R.is_err[Sink, str](dr)) { ret 1; }
+    var downstream: Sink = R.unwrap_ok[Sink, str](dr);
+
+    var storage: [2]QueuedRecord;
+    var queue: Queued;
+    val qr: R.Result[Sink, str] = queued(?queue, (?storage)::*QueuedRecord, 2, ?downstream, 128, record.OVERSIZE_REJECT, OVERLOAD_BLOCK);
+    if (R.is_err[Sink, str](qr)) { ret 2; }
+    var output: Sink = R.unwrap_ok[Sink, str](qr);
+    if (publish(?output, "failed", 6).status != WRITE_ENQUEUED || publish(?output, "persisted", 9).status != WRITE_ENQUEUED) { ret 3; }
+    if (!queued_close_drain(?queue) || !queued_join(?queue)) { ret 4; }
+    val result: QueueStats = queued_stats(?queue);
+    if (result.enqueued != 2 || result.failed != 1 || result.persisted != 1 || result.last.status != WRITE_PERSISTED) { ret 5; }
+    if (!bytes_equal((?capture.data)::*u8, capture.len, "persisted")) { ret 6; }
+    if (!queued_destroy(?queue)) { ret 7; }
+    ret 0;
+}
+
+test "log.sink: queued spawn failure releases channel ownership" {
+    var capture: Capture;
+    capture.len = 0;
+    capture.calls = 0;
+    capture.fail_calls = 0;
+    capture.partial_at = 256;
+    var direct: Direct;
+    val dr: R.Result[Sink, str] = custom(?direct, ?capture, capture_write, 128, record.OVERSIZE_REJECT, 0);
+    if (R.is_err[Sink, str](dr)) { ret 1; }
+    var downstream: Sink = R.unwrap_ok[Sink, str](dr);
+    var storage: [1]QueuedRecord;
+    var queue: Queued;
+    var config: thread.Config;
+    thread.config_default(?config);
+    config.stack_reserve = 1;
+    val result: R.Result[Sink, str] = queued_with_config(?queue, (?storage)::*QueuedRecord, 1, ?downstream, 128, record.OVERSIZE_REJECT, OVERLOAD_BLOCK, ?config);
+    if (R.is_ok[Sink, str](result) || R.unwrap_err[Sink, str](result) != ERR_QUEUE_SPAWN_FAILED) { ret 2; }
+    if (queue.initialized || queued_destroy(?queue)) { ret 3; }
+    ret 0;
+}
+
+rec BlockingCapture {
+    entered: *i64;
+    release: *i64;
+    calls:   i64;
+}
+
+fun blocking_write(ctx: ptr, data: *u8, len: usize) WriteReport {
+    val capture: *BlockingCapture = ctx::*BlockingCapture;
+    atomic.fetch_add(?capture.calls, 1);
+    atomic.store(capture.entered, 1);
+    os.thread_wake(capture.entered);
+    for (atomic.load(capture.release) == 0) { os.thread_wait(capture.release, 0); }
+    ret persisted(len);
+}
+
+test "log.sink: queued overload rejects new records without consuming them" {
+    var entered: i64 = 0;
+    var release: i64 = 0;
+    var capture: BlockingCapture = BlockingCapture{entered: ?entered, release: ?release, calls: 0};
+    var direct: Direct;
+    val dr: R.Result[Sink, str] = custom(?direct, ?capture, blocking_write, 128, record.OVERSIZE_REJECT, 0);
+    if (R.is_err[Sink, str](dr)) { ret 1; }
+    var downstream: Sink = R.unwrap_ok[Sink, str](dr);
+
+    var storage: [1]QueuedRecord;
+    var queue: Queued;
+    val qr: R.Result[Sink, str] = queued(?queue, (?storage)::*QueuedRecord, 1, ?downstream, 128, record.OVERSIZE_REJECT, OVERLOAD_REJECT_NEW);
+    if (R.is_err[Sink, str](qr)) { ret 2; }
+    var output: Sink = R.unwrap_ok[Sink, str](qr);
+    if (publish(?output, "active", 6).status != WRITE_ENQUEUED) { ret 3; }
+    for (atomic.load(?entered) == 0) { os.thread_wait(?entered, 0); }
+    if (publish(?output, "queued", 6).status != WRITE_ENQUEUED) { ret 4; }
+    val rejected_result: WriteReport = publish(?output, "caller-retains", 14);
+    if (rejected_result.status != WRITE_REJECTED || rejected_result.error != ERR_QUEUE_FULL) { ret 5; }
+
+    atomic.store(?release, 1);
+    os.thread_wake(?release);
+    if (!queued_close_drain(?queue) || !queued_join(?queue)) { ret 6; }
+    val result: QueueStats = queued_stats(?queue);
+    if (result.enqueued != 2 || result.persisted != 2 || result.rejected != 1 || atomic.load(?capture.calls) != 2) { ret 7; }
+    if (!queued_destroy(?queue)) { ret 8; }
+    ret 0;
+}
+
+rec QueuedJoinContext {
+    queue:     *Queued;
+    succeeded: *i64;
+}
+
+fun queued_join_worker(arg: *u8) {
+    val context: *QueuedJoinContext = arg::*QueuedJoinContext;
+    if (queued_join(context.queue)) { atomic.fetch_add(context.succeeded, 1); }
+}
+
+test "log.sink: concurrent queued joins share one native join" {
+    var entered: i64 = 0;
+    var release: i64 = 0;
+    var capture: BlockingCapture = BlockingCapture{entered: ?entered, release: ?release, calls: 0};
+    var direct: Direct;
+    val dr: R.Result[Sink, str] = custom(?direct, ?capture, blocking_write, 128, record.OVERSIZE_REJECT, 0);
+    if (R.is_err[Sink, str](dr)) { ret 1; }
+    var downstream: Sink = R.unwrap_ok[Sink, str](dr);
+
+    var storage: [1]QueuedRecord;
+    var queue: Queued;
+    val qr: R.Result[Sink, str] = queued(?queue, (?storage)::*QueuedRecord, 1, ?downstream, 128, record.OVERSIZE_REJECT, OVERLOAD_BLOCK);
+    if (R.is_err[Sink, str](qr)) { ret 2; }
+    var output: Sink = R.unwrap_ok[Sink, str](qr);
+    if (publish(?output, "active", 6).status != WRITE_ENQUEUED) { ret 3; }
+    for (atomic.load(?entered) == 0) { os.thread_wait(?entered, 0); }
+    if (!queued_close_drain(?queue)) { ret 4; }
+
+    var succeeded: i64 = 0;
+    var context: QueuedJoinContext = QueuedJoinContext{queue: ?queue, succeeded: ?succeeded};
+    var joins: [2]thread.Thread;
+    thread.spawn_with(queued_join_worker, (?context)::*u8, ?joins[0]);
+    thread.spawn_with(queued_join_worker, (?context)::*u8, ?joins[1]);
+    if (joins[0].tid < 0 || joins[1].tid < 0) { ret 5; }
+    var attempts: usize = 0;
+    for (condition.waiter_count(?queue.joined) == 0 && attempts < 1000) {
+        os.sleep(1000000);
+        attempts = attempts + 1;
+    }
+    atomic.store(?release, 1);
+    os.thread_wake(?release);
+    thread.join(?joins[0]);
+    thread.join(?joins[1]);
+    if (condition.waiter_count(?queue.joined) != 0 || atomic.load(?succeeded) != 2) { ret 6; }
+    if (!queued_destroy(?queue)) { ret 7; }
+    ret 0;
+}
+
+test "log.sink: queued abort returns unpublished records in fifo order" {
+    var entered: i64 = 0;
+    var release: i64 = 0;
+    var capture: BlockingCapture = BlockingCapture{entered: ?entered, release: ?release, calls: 0};
+    var direct: Direct;
+    val dr: R.Result[Sink, str] = custom(?direct, ?capture, blocking_write, 128, record.OVERSIZE_REJECT, 0);
+    if (R.is_err[Sink, str](dr)) { ret 1; }
+    var downstream: Sink = R.unwrap_ok[Sink, str](dr);
+
+    var storage: [2]QueuedRecord;
+    var queue: Queued;
+    val qr: R.Result[Sink, str] = queued(?queue, (?storage)::*QueuedRecord, 2, ?downstream, 128, record.OVERSIZE_REJECT, OVERLOAD_BLOCK);
+    if (R.is_err[Sink, str](qr)) { ret 2; }
+    var output: Sink = R.unwrap_ok[Sink, str](qr);
+    if (publish(?output, "active", 6).status != WRITE_ENQUEUED) { ret 3; }
+    for (atomic.load(?entered) == 0) { os.thread_wait(?entered, 0); }
+    if (publish(?output, "first", 5).status != WRITE_ENQUEUED || publish(?output, "second", 6).status != WRITE_ENQUEUED) { ret 4; }
+
+    var rejected: [2]QueuedRecord;
+    var rejected_len: usize = 0;
+    if (!queued_close_abort(?queue, (?rejected)::*QueuedRecord, 2, ?rejected_len) || rejected_len != 2) { ret 5; }
+    if (!bytes_equal((?rejected[0].data)::*u8, rejected[0].len, "first") || !bytes_equal((?rejected[1].data)::*u8, rejected[1].len, "second")) { ret 6; }
+    atomic.store(?release, 1);
+    os.thread_wake(?release);
+    if (!queued_join(?queue)) { ret 7; }
+    val result: QueueStats = queued_stats(?queue);
+    if (result.aborted != 2 || result.persisted != 1 || atomic.load(?capture.calls) != 1) { ret 8; }
+    if (!queued_destroy(?queue)) { ret 9; }
+    ret 0;
+}

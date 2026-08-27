@@ -1,0 +1,217 @@
+# condition variable over a generation word
+
+use std.types.size.usize;
+use std.chrono.time;
+use std.sync.atomic;
+use std.sync.mutex;
+use std.sync.thread;
+use std.system.os;
+
+pub rec Condition {
+    generation: i64;
+    waiters:    i64;
+}
+
+pub def WaitStatus: u8;
+pub val NOTIFIED:       WaitStatus = 0;
+pub val TIMED_OUT:      WaitStatus = 1;
+pub val WAIT_FAILED:    WaitStatus = 2;
+
+# conditions are unfair and callers must always wait in a predicate loop
+# target waits may wake spuriously and signal may be observed by any waiter
+# predicate access and notification must use the same caller-owned mutex
+# failure while holding the paired mutex does not poison the condition
+# conditions own no target handle and may be discarded only without waiters
+pub fun make() Condition {
+    ret Condition{generation: 0, waiters: 0};
+}
+
+# generation closes the race between releasing the mutex and sleeping
+pub fun wait(c: *Condition, m: *mutex.Mutex) {
+    val observed: i64 = atomic.load(?c.generation);
+    atomic.fetch_add(?c.waiters, 1);
+    mutex.unlock(m);
+    os.thread_wait(?c.generation, observed);
+    mutex.lock(m);
+    atomic.fetch_sub(?c.waiters, 1);
+}
+
+# the deadline is an absolute monotonic instant and never expires early
+pub fun wait_until(c: *Condition, m: *mutex.Mutex, deadline: time.Time) WaitStatus {
+    if (c == nil || m == nil || deadline.sec < 0 || deadline.nsec < 0 || deadline.nsec >= 1000000000) { ret WAIT_FAILED; }
+    val observed: i64 = atomic.load(?c.generation);
+    atomic.fetch_add(?c.waiters, 1);
+    mutex.unlock(m);
+    var native_deadline: os.Timespec = os.Timespec{sec: deadline.sec, nsec: deadline.nsec};
+    val result: i64 = os.thread_wait_until(?c.generation, observed, ?native_deadline);
+    mutex.lock(m);
+    atomic.fetch_sub(?c.waiters, 1);
+    if (result == os.ETIMEDOUT) { ret TIMED_OUT; }
+    if (result < 0) { ret WAIT_FAILED; }
+    ret NOTIFIED;
+}
+
+pub fun signal(c: *Condition) {
+    atomic.fetch_add(?c.generation, 1);
+    if (atomic.load(?c.waiters) > 0) {
+        os.thread_wake(?c.generation);
+    }
+}
+
+pub fun broadcast(c: *Condition) {
+    val count: i64 = atomic.load(?c.waiters);
+    atomic.fetch_add(?c.generation, 1);
+    var i: i64 = 0;
+    for (i < count) {
+        os.thread_wake(?c.generation);
+        i = i + 1;
+    }
+}
+
+# this diagnostic result is stale as soon as it is returned
+pub fun waiter_count(c: *Condition) i64 {
+    ret atomic.load(?c.waiters);
+}
+
+rec WaitContext {
+    mutex:    *mutex.Mutex;
+    cond:     *Condition;
+    ready:    *i64;
+    observed: *i64;
+}
+
+fun predicate_worker(arg: *u8) {
+    val ctx: *WaitContext = arg::*WaitContext;
+    mutex.lock(ctx.mutex);
+    for (atomic.load(ctx.ready) == 0) {
+        wait(ctx.cond, ctx.mutex);
+    }
+    atomic.fetch_add(ctx.observed, 1);
+    mutex.unlock(ctx.mutex);
+}
+
+test "condition: wait releases and reacquires its mutex" {
+    var m: mutex.Mutex = mutex.make();
+    var c: Condition = make();
+    var ready: i64 = 0;
+    var observed: i64 = 0;
+    var ctx: WaitContext = WaitContext{mutex: ?m, cond: ?c, ready: ?ready, observed: ?observed};
+    var t: thread.Thread;
+
+    thread.spawn_with(predicate_worker, (?ctx)::*u8, ?t);
+    if (t.tid < 0) { ret 1; }
+    for (waiter_count(?c) != 1) { atomic.spin_hint(); }
+
+    mutex.lock(?m);
+    atomic.store(?ready, 1);
+    signal(?c);
+    mutex.unlock(?m);
+
+    thread.join(?t);
+    if (atomic.load(?observed) != 1) { ret 1; }
+    if (waiter_count(?c) != 0) { ret 1; }
+    ret 0;
+}
+
+test "condition: broadcast releases every predicate waiter" {
+    var m: mutex.Mutex = mutex.make();
+    var c: Condition = make();
+    var ready: i64 = 0;
+    var observed: i64 = 0;
+    var ctx: WaitContext = WaitContext{mutex: ?m, cond: ?c, ready: ?ready, observed: ?observed};
+    var threads: [3]thread.Thread;
+    var i: usize = 0;
+
+    for (i < 3) {
+        thread.spawn_with(predicate_worker, (?ctx)::*u8, ?threads[i]);
+        if (threads[i].tid < 0) {
+            mutex.lock(?m);
+            atomic.store(?ready, 1);
+            broadcast(?c);
+            mutex.unlock(?m);
+            var j: usize = 0;
+            for (j < i) { thread.join(?threads[j]); j = j + 1; }
+            ret 1;
+        }
+        i = i + 1;
+    }
+
+    for (waiter_count(?c) != 3) { atomic.spin_hint(); }
+    mutex.lock(?m);
+    atomic.store(?ready, 1);
+    broadcast(?c);
+    mutex.unlock(?m);
+
+    i = 0;
+    for (i < 3) { thread.join(?threads[i]); i = i + 1; }
+    if (atomic.load(?observed) != 3) { ret 1; }
+    if (waiter_count(?c) != 0) { ret 1; }
+    ret 0;
+}
+
+test "condition: timed wait uses an absolute monotonic deadline" {
+    var m: mutex.Mutex = mutex.make();
+    var c: Condition = make();
+    val deadline: time.Time = time.time_add(time.monotonic(), 20000000);
+    mutex.lock(?m);
+    val status: WaitStatus = wait_until(?c, ?m, deadline);
+    val finished: time.Time = time.monotonic();
+    mutex.unlock(?m);
+    if (status != TIMED_OUT || time.time_before(finished, deadline)) { ret 1; }
+    if (waiter_count(?c) != 0) { ret 1; }
+    ret 0;
+}
+
+test "condition: timed wait distinguishes an invalid target deadline" {
+    var m: mutex.Mutex = mutex.make();
+    var c: Condition = make();
+    mutex.lock(?m);
+    val status: WaitStatus = wait_until(?c, ?m, time.Time{sec: 0, nsec: 1000000000});
+    mutex.unlock(?m);
+    if (status != WAIT_FAILED || waiter_count(?c) != 0) { ret 1; }
+    ret 0;
+}
+
+rec TimedWaitContext {
+    mutex:    *mutex.Mutex;
+    cond:     *Condition;
+    deadline: time.Time;
+    status:   *i64;
+}
+
+fun timed_wait_worker(arg: *u8) {
+    val context: *TimedWaitContext = arg::*TimedWaitContext;
+    mutex.lock(context.mutex);
+    val status: WaitStatus = wait_until(context.cond, context.mutex, context.deadline);
+    atomic.store(context.status, status::i64);
+    mutex.unlock(context.mutex);
+}
+
+test "condition: signal wins before a timed wait deadline" {
+    var m: mutex.Mutex = mutex.make();
+    var c: Condition = make();
+    var status: i64 = WAIT_FAILED::i64;
+    var context: TimedWaitContext = TimedWaitContext{
+        mutex: ?m,
+        cond: ?c,
+        deadline: time.time_add(time.monotonic(), 1000000000),
+        status: ?status,
+    };
+    var t: thread.Thread;
+    thread.spawn_with(timed_wait_worker, (?context)::*u8, ?t);
+    if (t.tid < 0) { ret 1; }
+    var attempts: usize = 0;
+    for (waiter_count(?c) == 0 && attempts < 1000) {
+        os.sleep(1000000);
+        attempts = attempts + 1;
+    }
+    if (waiter_count(?c) == 0) {
+        thread.join_result(?t);
+        ret 1;
+    }
+    mutex.lock(?m);
+    signal(?c);
+    mutex.unlock(?m);
+    if (thread.join_result(?t) != 0 || atomic.load(?status) != NOTIFIED::i64) { ret 1; }
+    ret 0;
+}
