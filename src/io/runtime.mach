@@ -92,6 +92,7 @@ pub rec SourceToken {
 pub def DispatchFun: fun(ptr, usize, u32, i64, u64) bool;
 pub def CancelFun: fun(ptr, Token) i64;
 pub def ReleaseFun: fun(ptr, *Completion);
+pub val CANCELLATION_PENDING: i64 = 1;
 
 pub rec WaitPlan {
     wait: bool;
@@ -130,7 +131,9 @@ rec Slot {
     operation_timer_index: usize;
     deadline_timer_index: usize;
     cancellation_active: bool;
+    cancellation_pending: bool;
     cancellation: cancel.Registration;
+    terminal_error: io_error.Error;
     attachment: lifecycle.Attachment;
     source_index: u32;
     operation: Operation;
@@ -264,6 +267,8 @@ pub fun make(runtime: *Runtime, capacity: usize) Result[bool, io_error.Error] {
         runtime.slots[i].operation_timer_index = timer_capacity;
         runtime.slots[i].deadline_timer_index = timer_capacity;
         runtime.slots[i].cancellation_active = false;
+        runtime.slots[i].cancellation_pending = false;
+        runtime.slots[i].terminal_error = io_error.from_code(0, io_error.OP_UNKNOWN);
         runtime.slots[i].attachment.owner = nil;
         runtime.slots[i].attachment.generation = 0;
         runtime.slots[i].attachment.sequence = 0;
@@ -411,6 +416,8 @@ fun claim_locked(runtime: *Runtime, operation: Operation, source_index: u32, tok
     runtime.slots[index].operation_timer_index = timer_capacity(runtime);
     runtime.slots[index].deadline_timer_index = timer_capacity(runtime);
     runtime.slots[index].cancellation_active = false;
+    runtime.slots[index].cancellation_pending = false;
+    runtime.slots[index].terminal_error = io_error.from_code(0, io_error.OP_UNKNOWN);
     runtime.slots[index].source_index = source_index;
     cancel.init_registration(?runtime.slots[index].cancellation);
     if (!lifecycle.attach(?runtime.lifecycle, ?runtime.slots[index].attachment)) {
@@ -586,30 +593,47 @@ fun scope_cancel_callback(context: ptr, reason: cancel.Reason) {
     val token: Token = Token{index: slot.index, generation: slot.generation};
     remove_slot_timers(runtime, token);
     slot.state = SLOT_CANCELLING;
+    slot.terminal_error = cancellation_error(reason);
     val source_index: u32 = slot.source_index;
+    slot.cancellation_pending = source_index != NO_SOURCE;
     mutex.unlock(?runtime.lock);
+    var code: i64 = 0;
     if (source_index != NO_SOURCE) {
         val source: *Source = ?runtime.sources[source_index::usize];
-        if (source.cancel(source.context, token) < 0) {
-            panic.panic("std.io.runtime: source cancellation lost operation ownership\n");
-        }
+        code = source.cancel(source.context, token);
     }
+    mutex.lock(?runtime.lock);
+    if (code < 0) {
+        mutex.unlock(?runtime.lock);
+        panic.panic("std.io.runtime: source cancellation lost operation ownership\n");
+    }
+    if (slot.state == SLOT_CANCELLING && code != CANCELLATION_PENDING) {
+        slot.cancellation_pending = false;
+    } or (slot.state != SLOT_CANCELLING && slot.state != SLOT_QUEUED) {
+        mutex.unlock(?runtime.lock);
+        panic.panic("std.io.runtime: asynchronous cancellation lost operation ownership\n");
+    }
+    mutex.unlock(?runtime.lock);
 }
 
 fun scope_cancel_complete(context: ptr, reason: cancel.Reason) {
     val slot: *Slot = context::*Slot;
     val runtime: *Runtime = slot.runtime;
     mutex.lock(?runtime.lock);
-    if (slot.state != SLOT_CANCELLING) {
+    if (slot.state != SLOT_CANCELLING && slot.state != SLOT_QUEUED) {
         panic.panic("std.io.runtime: cancellation completion lost ownership\n");
     }
     val token: Token = Token{index: slot.index, generation: slot.generation};
-    enqueue(runtime, token, slot, 0, 0, 0, true, cancellation_error(reason), false);
+    var published: bool = false;
+    if (slot.state == SLOT_CANCELLING && !slot.cancellation_pending) {
+        enqueue(runtime, token, slot, 0, 0, 0, true, slot.terminal_error, false);
+        published = true;
+    }
     slot.cancellation_active = false;
     if (!cancel.finish(?slot.cancellation)) {
         panic.panic("std.io.runtime: cancellation completion was not owned\n");
     }
-    if (os.io_queue_wake(?runtime.queue) < 0) {
+    if (published && os.io_queue_wake(?runtime.queue) < 0) {
         panic.panic("std.io.runtime: open queue wake failed\n");
     }
     mutex.unlock(?runtime.lock);
@@ -623,6 +647,7 @@ fun release_claim_locked(runtime: *Runtime, token: Token) {
     }
     slot.state = SLOT_FREE;
     slot.cancellation_active = false;
+    slot.cancellation_pending = false;
     slot.source_index = NO_SOURCE;
     cancel.init_registration(?slot.cancellation);
     runtime.live = runtime.live - 1;
@@ -757,6 +782,27 @@ pub fun complete_batch(runtime: *Runtime, token: Token, bytes: usize, items: usi
 
 pub fun fail(runtime: *Runtime, token: Token, failure: io_error.Error) Result[bool, io_error.Error] {
     ret resolve(runtime, token, 0, 0, 0, true, failure, false);
+}
+
+# asynchronous sources publish only after target ownership has quiesced
+pub fun complete_cancellation(runtime: *Runtime, token: Token) Result[bool, io_error.Error] {
+    if (runtime == nil) { ret err[bool, io_error.Error](invalid(io_error.OP_SUBMIT)); }
+    mutex.lock(?runtime.lock);
+    if (token.index::usize >= runtime.capacity) {
+        mutex.unlock(?runtime.lock);
+        ret err[bool, io_error.Error](io_error.from_code(os.EBADF, io_error.OP_SUBMIT));
+    }
+    val slot: *Slot = ?runtime.slots[token.index::usize];
+    if (slot.generation != token.generation || slot.state != SLOT_CANCELLING || !slot.cancellation_pending) {
+        mutex.unlock(?runtime.lock);
+        ret err[bool, io_error.Error](io_error.from_code(os.EBADF, io_error.OP_SUBMIT));
+    }
+    slot.cancellation_pending = false;
+    enqueue(runtime, token, slot, 0, 0, 0, true, slot.terminal_error, false);
+    val wake_result: i64 = os.io_queue_wake(?runtime.queue);
+    mutex.unlock(?runtime.lock);
+    if (wake_result < 0) { ret err[bool, io_error.Error](io_error.from_code(wake_result, io_error.OP_WAKE)); }
+    ret ok[bool, io_error.Error](true);
 }
 
 # deadlines are absolute monotonic instants and never expire early
@@ -896,6 +942,7 @@ fun drain(runtime: *Runtime, output: *Completion, output_capacity: usize) usize 
         mutex.lock(?runtime.lock);
         slot.state = SLOT_FREE;
         slot.cancellation_active = false;
+        slot.cancellation_pending = false;
         slot.source_index = NO_SOURCE;
         cancel.init_registration(?slot.cancellation);
         runtime.live = runtime.live - 1;
@@ -1113,17 +1160,26 @@ pub fun begin_close(runtime: *Runtime, mode: lifecycle.Mode, cause: lifecycle.Ca
                     slot.cancellation_active = false;
                     remove_slot_timers(runtime, token);
                     slot.state = SLOT_CANCELLING;
+                    slot.terminal_error = closed_error;
                     val source_index: u32 = slot.source_index;
+                    slot.cancellation_pending = source_index != NO_SOURCE;
                     mutex.unlock(?runtime.lock);
+                    var cancel_code: i64 = 0;
                     if (source_index != NO_SOURCE) {
                         val source: *Source = ?runtime.sources[source_index::usize];
-                        if (source.cancel(source.context, token) < 0) {
-                            panic.panic("std.io.runtime: close lost source operation ownership\n");
-                        }
+                        cancel_code = source.cancel(source.context, token);
                     }
                     mutex.lock(?runtime.lock);
-                    if (slot.state == SLOT_CANCELLING) {
+                    if (cancel_code < 0) {
+                        mutex.unlock(?runtime.lock);
+                        panic.panic("std.io.runtime: close lost source operation ownership\n");
+                    }
+                    if (slot.state == SLOT_CANCELLING && cancel_code != CANCELLATION_PENDING) {
+                        slot.cancellation_pending = false;
                         enqueue(runtime, token, slot, 0, 0, 0, true, closed_error, false);
+                    } or (slot.state != SLOT_CANCELLING && slot.state != SLOT_QUEUED) {
+                        mutex.unlock(?runtime.lock);
+                        panic.panic("std.io.runtime: asynchronous close lost operation ownership\n");
                     }
                 }
             }
@@ -1905,6 +1961,8 @@ test "runtime: batch completion separates bytes and items" {
 
 rec TestSource {
     released: usize;
+    cancellation_pending: bool;
+    cancelled: Token;
 }
 
 fun test_source_dispatch(context: ptr, native_context: usize, events: u32, status: i64, flags: u64) bool {
@@ -1912,6 +1970,9 @@ fun test_source_dispatch(context: ptr, native_context: usize, events: u32, statu
 }
 
 fun test_source_cancel(context: ptr, token: Token) i64 {
+    val source: *TestSource = context::*TestSource;
+    source.cancelled = token;
+    if (source.cancellation_pending) { ret CANCELLATION_PENDING; }
     ret 0;
 }
 
@@ -1923,7 +1984,7 @@ fun test_source_release(context: ptr, completion: *Completion) {
 test "runtime: retired source slots reject stale tokens and remain reusable" {
     var runtime: Runtime;
     if (is_err[bool, io_error.Error](make(?runtime, 1))) { ret 1; }
-    var context: TestSource = TestSource{released: 0};
+    var context: TestSource = TestSource{released: 0, cancellation_pending: false, cancelled: Token{index: 0, generation: 0}};
     val first_result: Result[SourceToken, io_error.Error] = register_source(?runtime, (?context)::ptr, test_source_dispatch, test_source_cancel, test_source_release);
     if (is_err[SourceToken, io_error.Error](first_result)) { ret 2; }
     val first: SourceToken = unwrap_ok[SourceToken, io_error.Error](first_result);
@@ -1953,7 +2014,7 @@ test "runtime: retired source slots reject stale tokens and remain reusable" {
 test "runtime: source and operation ownership share one close lifecycle" {
     var runtime: Runtime;
     if (is_err[bool, io_error.Error](make(?runtime, 2))) { ret 1; }
-    var context: TestSource = TestSource{released: 0};
+    var context: TestSource = TestSource{released: 0, cancellation_pending: false, cancelled: Token{index: 0, generation: 0}};
     val source_result: Result[SourceToken, io_error.Error] = register_source(?runtime, (?context)::ptr, test_source_dispatch, test_source_cancel, test_source_release);
     if (is_err[SourceToken, io_error.Error](source_result)) { ret 2; }
     val source: SourceToken = unwrap_ok[SourceToken, io_error.Error](source_result);
@@ -1993,5 +2054,43 @@ test "runtime: source and operation ownership share one close lifecycle" {
         ret 10;
     }
     if (is_err[bool, io_error.Error](destroy(?runtime))) { ret 11; }
+    ret 0;
+}
+
+test "runtime: asynchronous source cancellation publishes after quiescence" {
+    var runtime: Runtime;
+    if (is_err[bool, io_error.Error](make(?runtime, 2))) { ret 1; }
+    var context: TestSource = TestSource{released: 0, cancellation_pending: true, cancelled: Token{index: 0, generation: 0}};
+    val source_result: Result[SourceToken, io_error.Error] = register_source(?runtime, (?context)::ptr, test_source_dispatch, test_source_cancel, test_source_release);
+    if (is_err[SourceToken, io_error.Error](source_result)) { ret 2; }
+    val source: SourceToken = unwrap_ok[SourceToken, io_error.Error](source_result);
+    var scope: cancel.Scope;
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 3; }
+    val submitted: Result[Token, io_error.Error] = submit_scoped_owned(?runtime, source, ?scope, test_operation(FILE_READ, 93));
+    if (is_err[Token, io_error.Error](submitted)) { ret 4; }
+    val token: Token = unwrap_ok[Token, io_error.Error](submitted);
+    if (!cancel.cancel(?scope)
+        || context.cancelled.index != token.index
+        || context.cancelled.generation != token.generation) {
+        ret 5;
+    }
+    var output: Completion;
+    val early: Result[usize, io_error.Error] = poll(?runtime, ?output, 1);
+    if (is_err[usize, io_error.Error](early) || unwrap_ok[usize, io_error.Error](early) != 0) { ret 6; }
+    if (is_err[bool, io_error.Error](complete_cancellation(?runtime, token))) { ret 7; }
+    val settled: Result[usize, io_error.Error] = wait(?runtime, ?output, 1, 1000);
+    if (is_err[usize, io_error.Error](settled)
+        || unwrap_ok[usize, io_error.Error](settled) != 1
+        || !output.has_error
+        || output.error.kind != io_error.CANCELLED
+        || context.released != 1) {
+        ret 8;
+    }
+    if (!cancel.destroy(?scope)
+        || is_err[bool, io_error.Error](unregister_source(?runtime, source))
+        || is_err[bool, io_error.Error](close(?runtime))
+        || is_err[bool, io_error.Error](destroy(?runtime))) {
+        ret 9;
+    }
     ret 0;
 }
