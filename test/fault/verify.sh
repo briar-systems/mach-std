@@ -42,9 +42,14 @@ explicit="$scratch/repo/test/fault/out/$target/debug/lib/fault"
 [ -f "$explicit" ] || fail "explicit fault archive was not built"
 
 members="$("${AR:-ar}" t "$explicit")"
+normalized_members="$(printf '%s\n' "$members" \
+    | tr '\\' '/' \
+    | sed -E 's#/$##; s#^.*/##; s#[.]o$##; s#[[:space:]]+$##')"
 for module in script reader writer allocator clock datagram race; do
-    grep -q "^fault\.$module$" <<< "$members" \
-        || fail "explicit fault archive omitted fault.$module"
+    if ! grep -Fxq "fault.$module" <<< "$normalized_members"; then
+        printf '%s\n' "$members" >&2
+        fail "explicit fault archive omitted fault.$module"
+    fi
 done
 
 if [ "$release_checked" = 1 ]; then
