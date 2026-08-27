@@ -13,6 +13,7 @@ use std.types.result.unwrap_err;
 use std.system.os;
 use std.chrono.time;
 use std.sync.atomic;
+use std.sync.cancel;
 use std.sync.mutex;
 use std.sync.thread;
 use io_error: std.io.error;
@@ -63,13 +64,22 @@ val SLOT_QUEUED: u8 = 2;
 rec Slot {
     state: u8;
     generation: u32;
-    timer_index: usize;
+    index: u32;
+    runtime: *Runtime;
+    operation_timer_index: usize;
+    deadline_timer_index: usize;
+    cancellation: cancel.Registration;
     operation: Operation;
 }
+
+val TIMER_OPERATION: u8 = 0;
+val TIMER_SCOPE_DEADLINE: u8 = 1;
 
 rec TimerEntry {
     deadline: time.Time;
     token: Token;
+    purpose: u8;
+    scope: *cancel.Scope;
 }
 
 pub val OPEN: u8 = 0;
@@ -110,8 +120,9 @@ pub fun make(runtime: *Runtime, capacity: usize) Result[bool, io_error.Error] {
     val timer_size: usize = $size_of(TimerEntry);
     val slots_bytes: usize = slot_size * capacity;
     val completions_bytes: usize = completion_size * capacity;
-    val timers_bytes: usize = timer_size * capacity;
-    if (slots_bytes / slot_size != capacity || completions_bytes / completion_size != capacity || timers_bytes / timer_size != capacity) {
+    val timer_capacity: usize = capacity * 2;
+    val timers_bytes: usize = timer_size * timer_capacity;
+    if (slots_bytes / slot_size != capacity || completions_bytes / completion_size != capacity || timer_capacity / 2 != capacity || timers_bytes / timer_size != timer_capacity) {
         ret err[bool, io_error.Error](exhausted(io_error.OP_CREATE));
     }
 
@@ -145,7 +156,12 @@ pub fun make(runtime: *Runtime, capacity: usize) Result[bool, io_error.Error] {
     for (i < capacity) {
         runtime.slots[i].state = SLOT_FREE;
         runtime.slots[i].generation = 0;
-        runtime.slots[i].timer_index = capacity;
+        runtime.slots[i].index = i::u32;
+        runtime.slots[i].runtime = runtime;
+        runtime.slots[i].operation_timer_index = timer_capacity;
+        runtime.slots[i].deadline_timer_index = timer_capacity;
+        runtime.slots[i].cancellation.root = nil;
+        runtime.slots[i].cancellation.state = 0;
         i = i + 1;
     }
     val code: i64 = os.io_queue_create(?runtime.queue);
@@ -184,6 +200,9 @@ fun claim_locked(runtime: *Runtime, operation: Operation, token: *Token) i64 {
     if (generation == 0) { generation = 1; }
     runtime.slots[index].generation = generation;
     runtime.slots[index].operation = operation;
+    runtime.slots[index].operation_timer_index = timer_capacity(runtime);
+    runtime.slots[index].deadline_timer_index = timer_capacity(runtime);
+    runtime.slots[index].cancellation.root = nil;
     runtime.slots[index].state = SLOT_ACTIVE;
     runtime.live = runtime.live + 1;
     @token = Token{index: index::u32, generation: generation};
@@ -214,17 +233,31 @@ fun token_equal(a: Token, b: Token) bool {
 fun timer_less(a: TimerEntry, b: TimerEntry) bool {
     if (time.time_before(a.deadline, b.deadline)) { ret true; }
     if (time.time_after(a.deadline, b.deadline)) { ret false; }
+    if (a.purpose != b.purpose) { ret a.purpose == TIMER_SCOPE_DEADLINE; }
     if (a.token.index < b.token.index) { ret true; }
     if (a.token.index > b.token.index) { ret false; }
     ret a.token.generation < b.token.generation;
+}
+
+fun timer_capacity(runtime: *Runtime) usize {
+    ret runtime.capacity * 2;
+}
+
+fun timer_set_index(runtime: *Runtime, entry: TimerEntry, index: usize) {
+    val slot: *Slot = ?runtime.slots[entry.token.index::usize];
+    if (entry.purpose == TIMER_OPERATION) {
+        slot.operation_timer_index = index;
+    } or {
+        slot.deadline_timer_index = index;
+    }
 }
 
 fun timer_swap(runtime: *Runtime, a: usize, b: usize) {
     val entry: TimerEntry = runtime.timers[a];
     runtime.timers[a] = runtime.timers[b];
     runtime.timers[b] = entry;
-    runtime.slots[runtime.timers[a].token.index::usize].timer_index = a;
-    runtime.slots[runtime.timers[b].token.index::usize].timer_index = b;
+    timer_set_index(runtime, runtime.timers[a], a);
+    timer_set_index(runtime, runtime.timers[b], b);
 }
 
 fun timer_sift_up(runtime: *Runtime, start: usize) {
@@ -254,18 +287,18 @@ fun timer_sift_down(runtime: *Runtime, start: usize) {
 fun timer_push(runtime: *Runtime, entry: TimerEntry) {
     val index: usize = runtime.timer_count;
     runtime.timers[index] = entry;
-    runtime.slots[entry.token.index::usize].timer_index = index;
+    timer_set_index(runtime, entry, index);
     runtime.timer_count = runtime.timer_count + 1;
     timer_sift_up(runtime, index);
 }
 
 fun timer_remove_at(runtime: *Runtime, index: usize) TimerEntry {
     val removed: TimerEntry = runtime.timers[index];
-    runtime.slots[removed.token.index::usize].timer_index = runtime.capacity;
+    timer_set_index(runtime, removed, timer_capacity(runtime));
     runtime.timer_count = runtime.timer_count - 1;
     if (index < runtime.timer_count) {
         runtime.timers[index] = runtime.timers[runtime.timer_count];
-        runtime.slots[runtime.timers[index].token.index::usize].timer_index = index;
+        timer_set_index(runtime, runtime.timers[index], index);
         if (index > 0 && timer_less(runtime.timers[index], runtime.timers[(index - 1) / 2])) {
             timer_sift_up(runtime, index);
         } or {
@@ -275,11 +308,12 @@ fun timer_remove_at(runtime: *Runtime, index: usize) TimerEntry {
     ret removed;
 }
 
-fun timer_remove_token(runtime: *Runtime, token: Token) bool {
+fun timer_remove_token(runtime: *Runtime, token: Token, purpose: u8) bool {
     val slot: *Slot = slot_for(runtime, token);
-    if (slot == nil || slot.operation.kind != TIMER || slot.timer_index >= runtime.timer_count) { ret false; }
-    val index: usize = slot.timer_index;
-    if (!token_equal(runtime.timers[index].token, token)) { ret false; }
+    if (slot == nil) { ret false; }
+    var index: usize = slot.operation_timer_index;
+    if (purpose == TIMER_SCOPE_DEADLINE) { index = slot.deadline_timer_index; }
+    if (index >= runtime.timer_count || runtime.timers[index].purpose != purpose || !token_equal(runtime.timers[index].token, token)) { ret false; }
     timer_remove_at(runtime, index);
     ret true;
 }
@@ -300,6 +334,80 @@ fun enqueue(runtime: *Runtime, token: Token, slot: *Slot, bytes: usize, resource
     slot.state = SLOT_QUEUED;
 }
 
+fun cancellation_error(reason: cancel.Reason) io_error.Error {
+    if (reason == cancel.TIMED_OUT) { ret io_error.from_code(os.ETIMEDOUT, io_error.OP_WAIT); }
+    if (reason == cancel.CANCELLED) { ret io_error.from_code(os.ECANCELED, io_error.OP_WAIT); }
+    ret io_error.from_code(os.EBADF, io_error.OP_SUBMIT);
+}
+
+fun remove_slot_timers(runtime: *Runtime, token: Token) {
+    timer_remove_token(runtime, token, TIMER_OPERATION);
+    timer_remove_token(runtime, token, TIMER_SCOPE_DEADLINE);
+}
+
+fun scope_cancel_callback(context: ptr, reason: cancel.Reason) {
+    val slot: *Slot = context::*Slot;
+    val runtime: *Runtime = slot.runtime;
+    mutex.lock(?runtime.lock);
+    if (slot.state == SLOT_ACTIVE) {
+        val token: Token = Token{index: slot.index, generation: slot.generation};
+        remove_slot_timers(runtime, token);
+        enqueue(runtime, token, slot, 0, 0, true, cancellation_error(reason), false);
+    }
+    mutex.unlock(?runtime.lock);
+    os.io_queue_wake(?runtime.queue);
+}
+
+fun release_claim_locked(runtime: *Runtime, token: Token) {
+    val slot: *Slot = ?runtime.slots[token.index::usize];
+    slot.state = SLOT_FREE;
+    slot.cancellation.root = nil;
+    runtime.live = runtime.live - 1;
+}
+
+fun attach_scope_locked(runtime: *Runtime, token: Token, scope: *cancel.Scope) cancel.Reason {
+    val slot: *Slot = ?runtime.slots[token.index::usize];
+    val attached: cancel.Reason = cancel.attach(scope, ?slot.cancellation, scope_cancel_callback, slot::ptr);
+    if (attached != cancel.ACTIVE) { ret attached; }
+    var deadline: time.Time;
+    var owner: *cancel.Scope;
+    if (cancel.get_deadline(scope, ?deadline, ?owner)) {
+        timer_push(runtime, TimerEntry{
+            deadline: deadline,
+            token: token,
+            purpose: TIMER_SCOPE_DEADLINE,
+            scope: owner,
+        });
+    }
+    ret cancel.ACTIVE;
+}
+
+# prior cancellation is observed or the returned token is atomically scope-owned
+pub fun submit_scoped(runtime: *Runtime, scope: *cancel.Scope, operation: Operation) Result[Token, io_error.Error] {
+    if (runtime == nil || scope == nil) { ret err[Token, io_error.Error](invalid(io_error.OP_SUBMIT)); }
+    cancel.expire(scope, time.monotonic());
+    mutex.lock(?runtime.lock);
+    var token: Token;
+    val code: i64 = claim_locked(runtime, operation, ?token);
+    if (code < 0) {
+        mutex.unlock(?runtime.lock);
+        ret err[Token, io_error.Error](io_error.from_code(code, io_error.OP_SUBMIT));
+    }
+    val attached: cancel.Reason = attach_scope_locked(runtime, token, scope);
+    if (attached != cancel.ACTIVE) {
+        release_claim_locked(runtime, token);
+        mutex.unlock(?runtime.lock);
+        ret err[Token, io_error.Error](cancellation_error(attached));
+    }
+    val has_deadline: bool = runtime.slots[token.index::usize].deadline_timer_index < runtime.timer_count;
+    mutex.unlock(?runtime.lock);
+    if (has_deadline) {
+        val wake_result: i64 = os.io_queue_wake(?runtime.queue);
+        if (wake_result < 0) { ret err[Token, io_error.Error](io_error.from_code(wake_result, io_error.OP_WAKE)); }
+    }
+    ret ok[Token, io_error.Error](token);
+}
+
 fun resolve(runtime: *Runtime, token: Token, bytes: usize, resource: usize, has_error: bool, failure: io_error.Error, eof: bool) Result[bool, io_error.Error] {
     if (runtime == nil) { ret err[bool, io_error.Error](invalid(io_error.OP_SUBMIT)); }
     mutex.lock(?runtime.lock);
@@ -308,7 +416,11 @@ fun resolve(runtime: *Runtime, token: Token, bytes: usize, resource: usize, has_
         mutex.unlock(?runtime.lock);
         ret err[bool, io_error.Error](io_error.from_code(os.EBADF, io_error.OP_SUBMIT));
     }
-    if (slot.operation.kind == TIMER) { timer_remove_token(runtime, token); }
+    if (slot.cancellation.root != nil && !cancel.unregister(?slot.cancellation)) {
+        mutex.unlock(?runtime.lock);
+        ret err[bool, io_error.Error](io_error.from_code(os.EBADF, io_error.OP_SUBMIT));
+    }
+    remove_slot_timers(runtime, token);
     enqueue(runtime, token, slot, bytes, resource, has_error, failure, eof);
     mutex.unlock(?runtime.lock);
     val wake_result: i64 = os.io_queue_wake(?runtime.queue);
@@ -336,9 +448,47 @@ pub fun submit_timer(runtime: *Runtime, deadline: time.Time, context: usize) Res
     mutex.lock(?runtime.lock);
     var token: Token;
     val code: i64 = claim_locked(runtime, operation, ?token);
-    if (code == 0) { timer_push(runtime, TimerEntry{deadline: deadline, token: token}); }
+    if (code == 0) {
+        timer_push(runtime, TimerEntry{
+            deadline: deadline,
+            token: token,
+            purpose: TIMER_OPERATION,
+            scope: nil,
+        });
+    }
     mutex.unlock(?runtime.lock);
     if (code < 0) { ret err[Token, io_error.Error](io_error.from_code(code, io_error.OP_SUBMIT)); }
+    val wake_result: i64 = os.io_queue_wake(?runtime.queue);
+    if (wake_result < 0) { ret err[Token, io_error.Error](io_error.from_code(wake_result, io_error.OP_WAKE)); }
+    ret ok[Token, io_error.Error](token);
+}
+
+pub fun submit_timer_scoped(runtime: *Runtime, scope: *cancel.Scope, deadline: time.Time, context: usize) Result[Token, io_error.Error] {
+    if (runtime == nil || scope == nil || deadline.sec < 0 || deadline.nsec < 0 || deadline.nsec >= 1000000000) {
+        ret err[Token, io_error.Error](invalid(io_error.OP_SUBMIT));
+    }
+    cancel.expire(scope, time.monotonic());
+    val operation: Operation = Operation{kind: TIMER, resource: 0, buffer: nil, length: 0, offset: 0, context: context};
+    mutex.lock(?runtime.lock);
+    var token: Token;
+    val code: i64 = claim_locked(runtime, operation, ?token);
+    if (code < 0) {
+        mutex.unlock(?runtime.lock);
+        ret err[Token, io_error.Error](io_error.from_code(code, io_error.OP_SUBMIT));
+    }
+    val attached: cancel.Reason = attach_scope_locked(runtime, token, scope);
+    if (attached != cancel.ACTIVE) {
+        release_claim_locked(runtime, token);
+        mutex.unlock(?runtime.lock);
+        ret err[Token, io_error.Error](cancellation_error(attached));
+    }
+    timer_push(runtime, TimerEntry{
+        deadline: deadline,
+        token: token,
+        purpose: TIMER_OPERATION,
+        scope: nil,
+    });
+    mutex.unlock(?runtime.lock);
     val wake_result: i64 = os.io_queue_wake(?runtime.queue);
     if (wake_result < 0) { ret err[Token, io_error.Error](io_error.from_code(wake_result, io_error.OP_WAKE)); }
     ret ok[Token, io_error.Error](token);
@@ -349,10 +499,15 @@ pub fun cancel_timer(runtime: *Runtime, token: Token) Result[bool, io_error.Erro
     if (runtime == nil) { ret err[bool, io_error.Error](invalid(io_error.OP_SUBMIT)); }
     mutex.lock(?runtime.lock);
     val slot: *Slot = slot_for(runtime, token);
-    if (slot == nil || slot.operation.kind != TIMER || !timer_remove_token(runtime, token)) {
+    if (slot == nil || slot.operation.kind != TIMER || !timer_remove_token(runtime, token, TIMER_OPERATION)) {
         mutex.unlock(?runtime.lock);
         ret err[bool, io_error.Error](io_error.from_code(os.EBADF, io_error.OP_SUBMIT));
     }
+    if (slot.cancellation.root != nil && !cancel.unregister(?slot.cancellation)) {
+        mutex.unlock(?runtime.lock);
+        ret err[bool, io_error.Error](io_error.from_code(os.EBADF, io_error.OP_SUBMIT));
+    }
+    timer_remove_token(runtime, token, TIMER_SCOPE_DEADLINE);
     enqueue(runtime, token, slot, 0, 0, true, io_error.from_code(os.ECANCELED, io_error.OP_WAIT), false);
     mutex.unlock(?runtime.lock);
     val wake_result: i64 = os.io_queue_wake(?runtime.queue);
@@ -360,15 +515,20 @@ pub fun cancel_timer(runtime: *Runtime, token: Token) Result[bool, io_error.Erro
     ret ok[bool, io_error.Error](true);
 }
 
-fun timers_expire(runtime: *Runtime, now: time.Time) {
+fun timers_expire(runtime: *Runtime, now: time.Time) *cancel.Scope {
     # all due timers enter the completion queue in deadline and token order
     for (runtime.timer_count > 0 && !time.time_before(now, runtime.timers[0].deadline)) {
         val entry: TimerEntry = timer_remove_at(runtime, 0);
         val slot: *Slot = slot_for(runtime, entry.token);
+        if (slot != nil && entry.purpose == TIMER_SCOPE_DEADLINE) { ret entry.scope; }
         if (slot != nil) {
-            enqueue(runtime, entry.token, slot, 0, 0, false, io_error.from_code(0, io_error.OP_UNKNOWN), false);
+            if (slot.cancellation.root == nil || cancel.unregister(?slot.cancellation)) {
+                timer_remove_token(runtime, entry.token, TIMER_SCOPE_DEADLINE);
+                enqueue(runtime, entry.token, slot, 0, 0, false, io_error.from_code(0, io_error.OP_UNKNOWN), false);
+            }
         }
     }
+    ret nil;
 }
 
 fun timer_timeout(runtime: *Runtime, requested_ms: i32, now: time.Time) i32 {
@@ -396,6 +556,7 @@ fun drain(runtime: *Runtime, output: *Completion, output_capacity: usize) usize 
         runtime.count = runtime.count - 1;
         val slot: *Slot = ?runtime.slots[completion.token.index::usize];
         slot.state = SLOT_FREE;
+        slot.cancellation.root = nil;
         runtime.live = runtime.live - 1;
         written = written + 1;
     }
@@ -409,8 +570,15 @@ pub fun wait(runtime: *Runtime, output: *Completion, output_capacity: usize, tim
         ret err[usize, io_error.Error](invalid(io_error.OP_WAIT));
     }
     mutex.lock(?runtime.lock);
-    val before: time.Time = time.monotonic();
-    timers_expire(runtime, before);
+    var before: time.Time = time.monotonic();
+    var expired_scope: *cancel.Scope = timers_expire(runtime, before);
+    for (expired_scope != nil) {
+        mutex.unlock(?runtime.lock);
+        cancel.timeout(expired_scope);
+        mutex.lock(?runtime.lock);
+        before = time.monotonic();
+        expired_scope = timers_expire(runtime, before);
+    }
     var written: usize = drain(runtime, output, output_capacity);
     if (written > 0 || runtime.state != OPEN) {
         mutex.unlock(?runtime.lock);
@@ -423,7 +591,13 @@ pub fun wait(runtime: *Runtime, output: *Completion, output_capacity: usize, tim
     if (waited < 0) { ret err[usize, io_error.Error](io_error.from_code(waited, io_error.OP_WAIT)); }
 
     mutex.lock(?runtime.lock);
-    timers_expire(runtime, time.monotonic());
+    expired_scope = timers_expire(runtime, time.monotonic());
+    for (expired_scope != nil) {
+        mutex.unlock(?runtime.lock);
+        cancel.timeout(expired_scope);
+        mutex.lock(?runtime.lock);
+        expired_scope = timers_expire(runtime, time.monotonic());
+    }
     written = drain(runtime, output, output_capacity);
     mutex.unlock(?runtime.lock);
     ret ok[usize, io_error.Error](written);
@@ -459,8 +633,14 @@ pub fun close(runtime: *Runtime) Result[bool, io_error.Error] {
     for (i < runtime.capacity) {
         val slot: *Slot = ?runtime.slots[i];
         if (slot.state == SLOT_ACTIVE) {
-            enqueue(runtime, Token{index: i::u32, generation: slot.generation}, slot, 0, 0, true, closed_error, false);
+            val token: Token = Token{index: i::u32, generation: slot.generation};
+            if (slot.cancellation.root == nil || cancel.unregister(?slot.cancellation)) {
+                remove_slot_timers(runtime, token);
+                enqueue(runtime, token, slot, 0, 0, true, closed_error, false);
+            }
         }
+        slot.operation_timer_index = timer_capacity(runtime);
+        slot.deadline_timer_index = timer_capacity(runtime);
         i = i + 1;
     }
     runtime.timer_count = 0;
@@ -488,7 +668,7 @@ pub fun destroy(runtime: *Runtime) Result[bool, io_error.Error] {
     mutex.unlock(?runtime.lock);
     val queue_result: i64 = os.io_queue_close(?runtime.queue);
     val completion_result: i64 = os.deallocate(completions::ptr, $size_of(Completion) * capacity);
-    val timer_result: i64 = os.deallocate(timers::ptr, $size_of(TimerEntry) * capacity);
+    val timer_result: i64 = os.deallocate(timers::ptr, $size_of(TimerEntry) * capacity * 2);
     val slot_result: i64 = os.deallocate(slots::ptr, $size_of(Slot) * capacity);
     runtime.slots = nil;
     runtime.completions = nil;
@@ -819,6 +999,232 @@ test "runtime timer: native wait uses monotonic deadlines" {
     if (count != 1 || output[0].context != 91 || output[0].has_error) { ret 1; }
     if (time.time_before(finished, deadline) || time.time_sub(finished, deadline) > 5000000000) { ret 1; }
     close(?runtime);
+    if (is_err[bool, io_error.Error](destroy(?runtime))) { ret 1; }
+    ret 0;
+}
+
+test "runtime scope: prior cancellation rejects submission" {
+    var runtime: Runtime;
+    var scope: cancel.Scope;
+    if (is_err[bool, io_error.Error](make(?runtime, 1))) { ret 1; }
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) || !cancel.cancel(?scope)) { ret 1; }
+    val submitted: Result[Token, io_error.Error] = submit_scoped(?runtime, ?scope, test_operation(READ, 1));
+    if (!is_err[Token, io_error.Error](submitted) || unwrap_err[Token, io_error.Error](submitted).kind != io_error.CANCELLED) { ret 1; }
+    if (pending(?runtime) != 0 || !cancel.destroy(?scope)) { ret 1; }
+    close(?runtime);
+    if (is_err[bool, io_error.Error](destroy(?runtime))) { ret 1; }
+    ret 0;
+}
+
+test "runtime scope: parent cancellation settles descendant work once" {
+    var runtime: Runtime;
+    var root: cancel.Scope;
+    var child: cancel.Scope;
+    val none: time.Time = time.Time{sec: 0, nsec: 0};
+    if (is_err[bool, io_error.Error](make(?runtime, 3))) { ret 1; }
+    if (!cancel.make_root(?root, false, none) || !cancel.make_child(?child, ?root, false, none)) { ret 1; }
+    var tokens: [3]Token;
+    val first: Result[Token, io_error.Error] = submit_scoped(?runtime, ?root, test_operation(READ, 10));
+    val second: Result[Token, io_error.Error] = submit_scoped(?runtime, ?child, test_operation(WRITE, 11));
+    val third: Result[Token, io_error.Error] = submit_timer_scoped(?runtime, ?child, time.time_add(time.monotonic(), 1000000000), 12);
+    if (is_err[Token, io_error.Error](first) || is_err[Token, io_error.Error](second) || is_err[Token, io_error.Error](third)) { ret 1; }
+    tokens[0] = unwrap_ok[Token, io_error.Error](first);
+    tokens[1] = unwrap_ok[Token, io_error.Error](second);
+    tokens[2] = unwrap_ok[Token, io_error.Error](third);
+    if (!cancel.cancel(?root) || cancel.cancel(?root)) { ret 1; }
+    var output: [3]Completion;
+    val result: Result[usize, io_error.Error] = wait(?runtime, ?output[0], 3, 0);
+    if (is_err[usize, io_error.Error](result) || unwrap_ok[usize, io_error.Error](result) != 3) { ret 1; }
+    var i: usize = 0;
+    for (i < 3) {
+        if (!output[i].has_error || output[i].error.kind != io_error.CANCELLED) { ret 1; }
+        if (!is_err[bool, io_error.Error](complete(?runtime, tokens[i], 0, 0, false))) { ret 1; }
+        i = i + 1;
+    }
+    if (pending(?runtime) != 0 || !cancel.destroy(?child) || !cancel.destroy(?root)) { ret 1; }
+    close(?runtime);
+    if (is_err[bool, io_error.Error](destroy(?runtime))) { ret 1; }
+    ret 0;
+}
+
+test "runtime scope: equal operation and scope deadlines prefer timeout" {
+    var runtime: Runtime;
+    var scope: cancel.Scope;
+    if (is_err[bool, io_error.Error](make(?runtime, 1))) { ret 1; }
+    val deadline: time.Time = time.time_add(time.monotonic(), 20000000);
+    if (!cancel.make_root(?scope, true, deadline)) { ret 1; }
+    val submitted: Result[Token, io_error.Error] = submit_timer_scoped(?runtime, ?scope, deadline, 21);
+    if (is_err[Token, io_error.Error](submitted)) { ret 1; }
+    var output: [1]Completion;
+    var count: usize = 0;
+    var attempts: usize = 0;
+    for (count == 0 && attempts < 4) {
+        val result: Result[usize, io_error.Error] = wait(?runtime, ?output[0], 1, -1);
+        if (is_err[usize, io_error.Error](result)) { ret 1; }
+        count = unwrap_ok[usize, io_error.Error](result);
+        attempts = attempts + 1;
+    }
+    if (count != 1 || output[0].context != 21 || !output[0].has_error || output[0].error.kind != io_error.TIMEOUT) { ret 1; }
+    if (cancel.reason(?scope) != cancel.TIMED_OUT || !cancel.destroy(?scope)) { ret 1; }
+    close(?runtime);
+    if (is_err[bool, io_error.Error](destroy(?runtime))) { ret 1; }
+    ret 0;
+}
+
+rec CompletionRaceContext {
+    runtime: *Runtime;
+    token: Token;
+    completed: *i64;
+}
+
+fun completion_race_worker(arg: *u8) {
+    val context: *CompletionRaceContext = arg::*CompletionRaceContext;
+    val result: Result[bool, io_error.Error] = complete(context.runtime, context.token, 1, 0, false);
+    if (is_err[bool, io_error.Error](result)) {
+        atomic.store(context.completed, 0);
+    } or {
+        atomic.store(context.completed, 1);
+    }
+}
+
+test "runtime scope: completion and cancellation races have one winner" {
+    var runtime: Runtime;
+    if (is_err[bool, io_error.Error](make(?runtime, 1))) { ret 1; }
+    var round: usize = 0;
+    for (round < 32) {
+        var scope: cancel.Scope;
+        if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 1; }
+        val submitted: Result[Token, io_error.Error] = submit_scoped(?runtime, ?scope, test_operation(READ, round));
+        if (is_err[Token, io_error.Error](submitted)) { ret 1; }
+        var completed: i64 = -1;
+        var context: CompletionRaceContext = CompletionRaceContext{
+            runtime: ?runtime,
+            token: unwrap_ok[Token, io_error.Error](submitted),
+            completed: ?completed,
+        };
+        var worker: thread.Thread;
+        thread.spawn_with(completion_race_worker, (?context)::*u8, ?worker);
+        if (worker.tid < 0) { ret 1; }
+        cancel.cancel(?scope);
+        thread.join(?worker);
+        var output: [1]Completion;
+        val result: Result[usize, io_error.Error] = wait(?runtime, ?output[0], 1, 0);
+        if (is_err[usize, io_error.Error](result) || unwrap_ok[usize, io_error.Error](result) != 1 || output[0].context != round) { ret 1; }
+        if (atomic.load(?completed) == 1 && output[0].has_error) { ret 1; }
+        if (atomic.load(?completed) == 0 && (!output[0].has_error || output[0].error.kind != io_error.CANCELLED)) { ret 1; }
+        if (!cancel.destroy(?scope) || pending(?runtime) != 0) { ret 1; }
+        round = round + 1;
+    }
+    close(?runtime);
+    if (is_err[bool, io_error.Error](destroy(?runtime))) { ret 1; }
+    ret 0;
+}
+
+rec SubmissionRaceContext {
+    runtime: *Runtime;
+    scope: *cancel.Scope;
+    token: *Token;
+    submitted: *i64;
+}
+
+fun submission_race_worker(arg: *u8) {
+    val context: *SubmissionRaceContext = arg::*SubmissionRaceContext;
+    val result: Result[Token, io_error.Error] = submit_scoped(context.runtime, context.scope, test_operation(READ, 41));
+    if (is_err[Token, io_error.Error](result)) {
+        atomic.store(context.submitted, 0);
+    } or {
+        @context.token = unwrap_ok[Token, io_error.Error](result);
+        atomic.store(context.submitted, 1);
+    }
+}
+
+test "runtime scope: submission and cancellation races preserve ownership" {
+    var runtime: Runtime;
+    if (is_err[bool, io_error.Error](make(?runtime, 1))) { ret 1; }
+    var round: usize = 0;
+    for (round < 32) {
+        var scope: cancel.Scope;
+        if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 1; }
+        var token: Token;
+        var submitted: i64 = -1;
+        var context: SubmissionRaceContext = SubmissionRaceContext{
+            runtime: ?runtime,
+            scope: ?scope,
+            token: ?token,
+            submitted: ?submitted,
+        };
+        var worker: thread.Thread;
+        thread.spawn_with(submission_race_worker, (?context)::*u8, ?worker);
+        if (worker.tid < 0) { ret 1; }
+        cancel.cancel(?scope);
+        thread.join(?worker);
+        if (atomic.load(?submitted) == 1) {
+            var output: [1]Completion;
+            val result: Result[usize, io_error.Error] = wait(?runtime, ?output[0], 1, 0);
+            if (is_err[usize, io_error.Error](result) || unwrap_ok[usize, io_error.Error](result) != 1) { ret 1; }
+            if (!output[0].has_error || output[0].error.kind != io_error.CANCELLED || output[0].context != 41) { ret 1; }
+            if (!is_err[bool, io_error.Error](complete(?runtime, token, 0, 0, false))) { ret 1; }
+        } or (pending(?runtime) != 0) {
+            ret 1;
+        }
+        if (!cancel.destroy(?scope) || pending(?runtime) != 0) { ret 1; }
+        round = round + 1;
+    }
+    close(?runtime);
+    if (is_err[bool, io_error.Error](destroy(?runtime))) { ret 1; }
+    ret 0;
+}
+
+rec ScopeTransitionContext {
+    scope: *cancel.Scope;
+}
+
+fun timeout_race_worker(arg: *u8) {
+    val context: *ScopeTransitionContext = arg::*ScopeTransitionContext;
+    cancel.timeout(context.scope);
+}
+
+test "runtime scope: deadline and cancellation races preserve the first reason" {
+    var runtime: Runtime;
+    if (is_err[bool, io_error.Error](make(?runtime, 1))) { ret 1; }
+    var round: usize = 0;
+    for (round < 32) {
+        var scope: cancel.Scope;
+        if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 1; }
+        if (is_err[Token, io_error.Error](submit_scoped(?runtime, ?scope, test_operation(READ, 51)))) { ret 1; }
+        var context: ScopeTransitionContext = ScopeTransitionContext{scope: ?scope};
+        var worker: thread.Thread;
+        thread.spawn_with(timeout_race_worker, (?context)::*u8, ?worker);
+        if (worker.tid < 0) { ret 1; }
+        cancel.cancel(?scope);
+        thread.join(?worker);
+        var output: [1]Completion;
+        val result: Result[usize, io_error.Error] = wait(?runtime, ?output[0], 1, 0);
+        if (is_err[usize, io_error.Error](result) || unwrap_ok[usize, io_error.Error](result) != 1) { ret 1; }
+        val scope_reason: cancel.Reason = cancel.reason(?scope);
+        if (!output[0].has_error || output[0].context != 51) { ret 1; }
+        if (scope_reason == cancel.CANCELLED && output[0].error.kind != io_error.CANCELLED) { ret 1; }
+        if (scope_reason == cancel.TIMED_OUT && output[0].error.kind != io_error.TIMEOUT) { ret 1; }
+        if ((scope_reason != cancel.CANCELLED && scope_reason != cancel.TIMED_OUT) || !cancel.destroy(?scope)) { ret 1; }
+        round = round + 1;
+    }
+    close(?runtime);
+    if (is_err[bool, io_error.Error](destroy(?runtime))) { ret 1; }
+    ret 0;
+}
+
+test "runtime scope: close remains distinct from cancellation" {
+    var runtime: Runtime;
+    var scope: cancel.Scope;
+    if (is_err[bool, io_error.Error](make(?runtime, 1))) { ret 1; }
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 1; }
+    if (is_err[Token, io_error.Error](submit_scoped(?runtime, ?scope, test_operation(READ, 31)))) { ret 1; }
+    if (cancel.destroy(?scope) || is_err[bool, io_error.Error](close(?runtime))) { ret 1; }
+    if (!cancel.destroy(?scope)) { ret 1; }
+    var output: [1]Completion;
+    val result: Result[usize, io_error.Error] = wait(?runtime, ?output[0], 1, 0);
+    if (is_err[usize, io_error.Error](result) || unwrap_ok[usize, io_error.Error](result) != 1) { ret 1; }
+    if (!output[0].has_error || output[0].error.kind != io_error.CLOSED) { ret 1; }
     if (is_err[bool, io_error.Error](destroy(?runtime))) { ret 1; }
     ret 0;
 }
