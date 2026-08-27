@@ -21,7 +21,7 @@ cp "$root/mach.toml" "$fixture/dep/std/mach.toml"
 cp -R "$root/src" "$fixture/dep/std/src"
 
 "$mach" build "$fixture" --target "$target" -O2
-out="$scratch/.mach-out/thread-resources/$target"
+out="$fixture/out/$target"
 artifact="$(find "$out" -type f -path '*/bin/thread-resources' | head -1)"
 object="$(find "$out" -type f -path '*/obj/std/system/os.o' | head -1)"
 if [ -z "$artifact" ] || [ -z "$object" ]; then
