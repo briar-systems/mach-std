@@ -28,7 +28,7 @@ actual_file="$(mktemp)"
 trap 'rm -f "$expected_file" "$actual_file"' EXIT
 
 "$mach" test . --target "$target" --include-deps --list \
-    | tr '\\' '/' > "$list" \
+    | tr '\134' '/' > "$list" \
     || fail "$target suite could not be listed"
 
 required=(
