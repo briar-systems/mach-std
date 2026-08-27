@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -uo pipefail
+set -euo pipefail
 
 mach="${1:-mach}"
 target="${2:-linux-x86_64}"
@@ -43,7 +43,7 @@ for source in "${required[@]}"; do
     grep -qF "$source" "$list" || fail "$target omitted required tests from $source"
 done
 
-grep -vE '^[[:space:]]*(#|$)' "$known" \
+{ grep -vE '^[[:space:]]*(#|$)' "$known" || true; } \
     | sed 's/[[:space:]]*$//' | sort -u > "$expected_file"
 
 set +e
