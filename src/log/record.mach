@@ -1,0 +1,604 @@
+# typed structured log records and deterministic logfmt encoding
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.string.str_equals;
+use std.chrono.time;
+use std.chrono.time.Time;
+use std.chrono.date.Datetime;
+use std.chrono.date.datetime_from_time;
+use std.chrono.format.rfc3339;
+use io_error: std.io.error;
+
+pub val MAX_RECORD_BYTES: usize = 8192;
+pub val MIN_TRUNCATED_BYTES: usize = 15;
+
+pub val ERR_INVALID_RECORD: str = "ERR_INVALID_RECORD";
+pub val ERR_RECORD_TOO_LARGE: str = "ERR_RECORD_TOO_LARGE";
+pub val ERR_BUFFER_TOO_SMALL: str = "ERR_BUFFER_TOO_SMALL";
+pub val ERR_LIMIT_TOO_SMALL: str = "ERR_LIMIT_TOO_SMALL";
+
+pub def Level: u8;
+pub val DEBUG: Level = 0;
+pub val INFO:  Level = 1;
+pub val WARN:  Level = 2;
+pub val ERROR: Level = 3;
+pub val OFF:   Level = 4;
+
+pub def Precision: u8;
+pub val PRECISION_SECONDS: Precision = 0;
+pub val PRECISION_MILLIS:  Precision = 1;
+pub val PRECISION_MICROS:  Precision = 2;
+pub val PRECISION_NANOS:   Precision = 3;
+
+pub def ClockOwnership: u8;
+pub val CLOCK_CONTEXT_NONE:     ClockOwnership = 0;
+pub val CLOCK_CONTEXT_BORROWED: ClockOwnership = 1;
+
+pub def NowFun: fun(ptr) Time;
+
+# the clock context is borrowed and must outlive every logger using it
+pub rec Clock {
+    ctx:       ptr;
+    f_now:     NowFun;
+    precision: Precision;
+    ownership: ClockOwnership;
+}
+
+pub def FieldKind: u8;
+pub val FIELD_I64:    FieldKind = 0;
+pub val FIELD_U64:    FieldKind = 1;
+pub val FIELD_BOOL:   FieldKind = 2;
+pub val FIELD_BYTES:  FieldKind = 3;
+pub val FIELD_STRING: FieldKind = 4;
+pub val FIELD_ERROR:  FieldKind = 5;
+
+pub rec Bytes {
+    data: *u8;
+    len:  usize;
+}
+
+# keys and borrowed string or byte values must outlive record encoding
+pub rec Field {
+    key:  str;
+    kind: FieldKind;
+    value: uni {
+        i64_value:    i64;
+        u64_value:    u64;
+        bool_value:   bool;
+        bytes_value:  Bytes;
+        string_value: str;
+        error_value:  io_error.Error;
+    };
+}
+
+# the timestamp is owned by value while message and fields are borrowed
+pub rec Record {
+    timestamp:   Time;
+    precision:   Precision;
+    level:       Level;
+    message:     str;
+    fields:      *Field;
+    field_count: usize;
+}
+
+pub def OversizePolicy: u8;
+pub val OVERSIZE_REJECT:   OversizePolicy = 0;
+pub val OVERSIZE_TRUNCATE: OversizePolicy = 1;
+
+pub def EncodeStatus: u8;
+pub val ENCODED:          EncodeStatus = 0;
+pub val ENCODED_TRUNCATED: EncodeStatus = 1;
+pub val ENCODE_REJECTED:  EncodeStatus = 2;
+pub val ENCODE_INVALID:   EncodeStatus = 3;
+
+pub rec Encoded {
+    status:   EncodeStatus;
+    len:      usize;
+    required: usize;
+    error:    str;
+}
+
+rec Cursor {
+    data:    *u8;
+    len:     usize;
+    cap:     usize;
+    written: usize;
+    valid:   bool;
+}
+
+fun system_now(ctx: ptr) Time {
+    ret time.now();
+}
+
+pub fun system_clock(precision: Precision) Clock {
+    ret Clock{
+        ctx: nil,
+        f_now: system_now,
+        precision: precision,
+        ownership: CLOCK_CONTEXT_NONE,
+    };
+}
+
+pub fun clock(ctx: ptr, f_now: NowFun, precision: Precision) Clock {
+    ret Clock{
+        ctx: ctx,
+        f_now: f_now,
+        precision: precision,
+        ownership: CLOCK_CONTEXT_BORROWED,
+    };
+}
+
+pub fun clock_valid(c: *Clock) bool {
+    if (c == nil || c.f_now::usize == 0) { ret false; }
+    if (!precision_valid(c.precision)) { ret false; }
+    if (c.ownership == CLOCK_CONTEXT_NONE) { ret c.ctx == nil; }
+    ret c.ownership == CLOCK_CONTEXT_BORROWED;
+}
+
+pub fun clock_now(c: *Clock) Time {
+    if (!clock_valid(c)) { ret Time{sec: 0, nsec: 0}; }
+    ret normalize_time(c.f_now(c.ctx), c.precision);
+}
+
+pub fun record_at(timestamp: Time, precision: Precision, level: Level, message: str, fields: *Field, field_count: usize) Record {
+    ret Record{
+        timestamp: normalize_time(timestamp, precision),
+        precision: precision,
+        level: level,
+        message: message,
+        fields: fields,
+        field_count: field_count,
+    };
+}
+
+pub fun field_i64(key: str, value: i64) Field {
+    var field: Field;
+    field.key = key;
+    field.kind = FIELD_I64;
+    field.value.i64_value = value;
+    ret field;
+}
+
+pub fun field_u64(key: str, value: u64) Field {
+    var field: Field;
+    field.key = key;
+    field.kind = FIELD_U64;
+    field.value.u64_value = value;
+    ret field;
+}
+
+pub fun field_bool(key: str, value: bool) Field {
+    var field: Field;
+    field.key = key;
+    field.kind = FIELD_BOOL;
+    field.value.bool_value = value;
+    ret field;
+}
+
+pub fun field_bytes(key: str, data: *u8, len: usize) Field {
+    var field: Field;
+    field.key = key;
+    field.kind = FIELD_BYTES;
+    field.value.bytes_value = Bytes{data: data, len: len};
+    ret field;
+}
+
+pub fun field_string(key: str, value: str) Field {
+    var field: Field;
+    field.key = key;
+    field.kind = FIELD_STRING;
+    field.value.string_value = value;
+    ret field;
+}
+
+pub fun field_error(key: str, value: io_error.Error) Field {
+    var field: Field;
+    field.key = key;
+    field.kind = FIELD_ERROR;
+    field.value.error_value = value;
+    ret field;
+}
+
+pub fun level_name(level: Level) str {
+    if (level == DEBUG) { ret "DEBUG"; }
+    if (level == INFO)  { ret "INFO"; }
+    if (level == WARN)  { ret "WARN"; }
+    if (level == ERROR) { ret "ERROR"; }
+    if (level == OFF)   { ret "OFF"; }
+    ret "INVALID";
+}
+
+fun precision_valid(precision: Precision) bool {
+    ret precision <= PRECISION_NANOS;
+}
+
+fun normalize_time(value: Time, precision: Precision) Time {
+    var normalized: Time = time.unix(value.sec, value.nsec);
+    if (precision == PRECISION_SECONDS) {
+        normalized.nsec = 0;
+    }
+    or (precision == PRECISION_MILLIS) {
+        normalized.nsec = normalized.nsec / 1000000 * 1000000;
+    }
+    or (precision == PRECISION_MICROS) {
+        normalized.nsec = normalized.nsec / 1000 * 1000;
+    }
+    ret normalized;
+}
+
+fun cursor(data: *u8, cap: usize) Cursor {
+    ret Cursor{data: data, len: 0, cap: cap, written: 0, valid: true};
+}
+
+fun put(c: *Cursor, data: *u8, len: usize) {
+    if (!c.valid) { ret; }
+    if (len > 0 && data == nil) { c.valid = false; ret; }
+    if (len > (0 - 1) - c.len) { c.valid = false; ret; }
+
+    if (c.data != nil) {
+        if (c.written > c.cap || len > c.cap - c.written) {
+            c.valid = false;
+            ret;
+        }
+        var i: usize = 0;
+        for (i < len) {
+            c.data[c.written + i] = data[i];
+            i = i + 1;
+        }
+        c.written = c.written + len;
+    }
+    c.len = c.len + len;
+}
+
+fun put_str(c: *Cursor, value: str) {
+    if (value == nil) { ret; }
+    put(c, value, str_len(value));
+}
+
+fun put_byte(c: *Cursor, value: u8) {
+    val byte: u8 = value;
+    put(c, ?byte, 1);
+}
+
+fun put_u64(c: *Cursor, value: u64) {
+    var digits: [20]u8;
+    var index: usize = 20;
+    var n: u64 = value;
+    if (n == 0) {
+        index = index - 1;
+        digits[index] = '0';
+    }
+    or {
+        for (n > 0) {
+            index = index - 1;
+            digits[index] = (n % 10)::u8 + '0';
+            n = n / 10;
+        }
+    }
+    put(c, ?digits[index], 20 - index);
+}
+
+fun put_i64(c: *Cursor, value: i64) {
+    if (value >= 0) { put_u64(c, value::u64); ret; }
+    if (value == -9223372036854775808) {
+        put_str(c, "-9223372036854775808");
+        ret;
+    }
+    put_byte(c, '-');
+    put_u64(c, (0 - value)::u64);
+}
+
+fun put_hex_byte(c: *Cursor, value: u8) {
+    val hex: str = "0123456789abcdef";
+    put_byte(c, hex[(value >> 4)::usize]);
+    put_byte(c, hex[(value & 15)::usize]);
+}
+
+fun put_quoted(c: *Cursor, value: str) {
+    put_byte(c, '"');
+    if (value != nil) {
+        val len: usize = str_len(value);
+        var i: usize = 0;
+        for (i < len) {
+            val byte: u8 = value[i];
+            if (byte == '"') { put_str(c, "\\\""); }
+            or (byte == '\\') { put_str(c, "\\\\"); }
+            or (byte == '\n') { put_str(c, "\\n"); }
+            or (byte == '\r') { put_str(c, "\\r"); }
+            or (byte == '\t') { put_str(c, "\\t"); }
+            or (byte < 0x20 || byte == 0x7f) {
+                put_str(c, "\\x");
+                put_hex_byte(c, byte);
+            }
+            or { put_byte(c, byte); }
+            i = i + 1;
+        }
+    }
+    put_byte(c, '"');
+}
+
+fun key_valid(key: str) bool {
+    if (key == nil || key[0] == 0) { ret false; }
+    if (str_equals(key, "timestamp") || str_equals(key, "level") || str_equals(key, "message") || str_equals(key, "truncated")) {
+        ret false;
+    }
+    var i: usize = 0;
+    for (key[i] != 0) {
+        val c: u8 = key[i];
+        val alpha: bool = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+        val digit: bool = c >= '0' && c <= '9';
+        if (!alpha && !digit && c != '_' && c != '.' && c != '-') { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun record_valid(record: *Record) bool {
+    if (record == nil) { ret false; }
+    if (!precision_valid(record.precision)) { ret false; }
+    if (record.level > OFF) { ret false; }
+    if (record.field_count > 0 && record.fields == nil) { ret false; }
+
+    var i: usize = 0;
+    for (i < record.field_count) {
+        val field: *Field = ?record.fields[i];
+        if (!key_valid(field.key) || field.kind > FIELD_ERROR) { ret false; }
+        if (field.kind == FIELD_BYTES && field.value.bytes_value.len > 0 && field.value.bytes_value.data == nil) {
+            ret false;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun token_prefix(c: *Cursor, first: bool) {
+    if (!first) { put_byte(c, ' '); }
+}
+
+fun timestamp_token(c: *Cursor, record: *Record, first: bool) {
+    token_prefix(c, first);
+    put_str(c, "timestamp=");
+    var timestamp: [64]u8;
+    val normalized: Time = normalize_time(record.timestamp, record.precision);
+    val datetime: Datetime = datetime_from_time(normalized);
+    val len: usize = rfc3339(datetime, (?timestamp)::*u8, 64);
+    if (len == 0) { c.valid = false; ret; }
+    put(c, (?timestamp)::*u8, len);
+}
+
+fun level_token(c: *Cursor, record: *Record, first: bool) {
+    token_prefix(c, first);
+    put_str(c, "level=");
+    put_str(c, level_name(record.level));
+}
+
+fun message_token(c: *Cursor, record: *Record, first: bool) {
+    token_prefix(c, first);
+    put_str(c, "message=");
+    put_quoted(c, record.message);
+}
+
+fun field_token(c: *Cursor, field: *Field, first: bool) {
+    token_prefix(c, first);
+    put_str(c, field.key);
+    put_byte(c, '=');
+
+    if (field.kind == FIELD_I64) { put_i64(c, field.value.i64_value); }
+    or (field.kind == FIELD_U64) { put_u64(c, field.value.u64_value); }
+    or (field.kind == FIELD_BOOL) {
+        if (field.value.bool_value) { put_str(c, "true"); }
+        or { put_str(c, "false"); }
+    }
+    or (field.kind == FIELD_BYTES) {
+        put_str(c, "0x");
+        var i: usize = 0;
+        for (i < field.value.bytes_value.len) {
+            put_hex_byte(c, field.value.bytes_value.data[i]);
+            i = i + 1;
+        }
+    }
+    or (field.kind == FIELD_STRING) { put_quoted(c, field.value.string_value); }
+    or (field.kind == FIELD_ERROR) {
+        val error: io_error.Error = field.value.error_value;
+        put_str(c, "error(kind=");
+        put_u64(c, error.kind::u64);
+        put_str(c, ",code=");
+        put_i64(c, error.code);
+        put_str(c, ",operation=");
+        put_u64(c, error.operation::u64);
+        put_str(c, ",message=");
+        put_quoted(c, io_error.message(error));
+        put_byte(c, ')');
+    }
+}
+
+fun full_record(c: *Cursor, record: *Record) {
+    timestamp_token(c, record, true);
+    level_token(c, record, false);
+    message_token(c, record, false);
+    var i: usize = 0;
+    for (i < record.field_count) {
+        field_token(c, ?record.fields[i], false);
+        i = i + 1;
+    }
+    put_byte(c, '\n');
+}
+
+fun token_size(record: *Record, kind: u8, index: usize, first: bool) usize {
+    var size: Cursor = cursor(nil, 0);
+    if (kind == 0) { timestamp_token(?size, record, first); }
+    or (kind == 1) { level_token(?size, record, first); }
+    or (kind == 2) { message_token(?size, record, first); }
+    or { field_token(?size, ?record.fields[index], first); }
+    if (!size.valid) { ret 0 - 1; }
+    ret size.len;
+}
+
+fun write_token(c: *Cursor, record: *Record, kind: u8, index: usize, first: bool) {
+    if (kind == 0) { timestamp_token(c, record, first); }
+    or (kind == 1) { level_token(c, record, first); }
+    or (kind == 2) { message_token(c, record, first); }
+    or { field_token(c, ?record.fields[index], first); }
+}
+
+fun encoded(status: EncodeStatus, len: usize, required: usize, error: str) Encoded {
+    ret Encoded{status: status, len: len, required: required, error: error};
+}
+
+# encode one record into caller-owned storage
+#
+# reject emits no bytes. truncate retains whole leading tokens and appends
+# truncated=true, so the result remains a complete logfmt line.
+pub fun encode(record: *Record, data: *u8, cap: usize, limit: usize, policy: OversizePolicy) Encoded {
+    if (!record_valid(record) || policy > OVERSIZE_TRUNCATE) {
+        ret encoded(ENCODE_INVALID, 0, 0, ERR_INVALID_RECORD);
+    }
+    if (limit == 0 || limit > MAX_RECORD_BYTES) {
+        ret encoded(ENCODE_INVALID, 0, 0, ERR_INVALID_RECORD);
+    }
+    if (cap > 0 && data == nil) {
+        ret encoded(ENCODE_INVALID, 0, 0, ERR_INVALID_RECORD);
+    }
+
+    var sizing: Cursor = cursor(nil, 0);
+    full_record(?sizing, record);
+    if (!sizing.valid) { ret encoded(ENCODE_INVALID, 0, 0, ERR_INVALID_RECORD); }
+    val required: usize = sizing.len;
+
+    if (required <= limit) {
+        if (required > cap) { ret encoded(ENCODE_INVALID, 0, required, ERR_BUFFER_TOO_SMALL); }
+        var output: Cursor = cursor(data, cap);
+        full_record(?output, record);
+        if (!output.valid) { ret encoded(ENCODE_INVALID, 0, required, ERR_BUFFER_TOO_SMALL); }
+        ret encoded(ENCODED, output.written, required, nil);
+    }
+
+    if (policy == OVERSIZE_REJECT) {
+        ret encoded(ENCODE_REJECTED, 0, required, ERR_RECORD_TOO_LARGE);
+    }
+    if (limit < MIN_TRUNCATED_BYTES) {
+        ret encoded(ENCODE_INVALID, 0, required, ERR_LIMIT_TOO_SMALL);
+    }
+    if (limit > cap) {
+        ret encoded(ENCODE_INVALID, 0, required, ERR_BUFFER_TOO_SMALL);
+    }
+
+    var output: Cursor = cursor(data, cap);
+    var first: bool = true;
+    var stopped: bool = false;
+    var kind: u8 = 0;
+    for (kind < 3 && !stopped) {
+        val size: usize = token_size(record, kind, 0, first);
+        val suffix: usize = 16;
+        if (limit < suffix || size == 0 - 1 || size > limit - suffix || output.len > limit - suffix - size) {
+            stopped = true;
+        }
+        or {
+            write_token(?output, record, kind, 0, first);
+            first = false;
+        }
+        kind = kind + 1;
+    }
+
+    var i: usize = 0;
+    for (i < record.field_count && !stopped) {
+        val size: usize = token_size(record, 3, i, first);
+        val suffix: usize = 16;
+        if (limit < suffix || size == 0 - 1 || size > limit - suffix || output.len > limit - suffix - size) {
+            stopped = true;
+        }
+        or {
+            write_token(?output, record, 3, i, first);
+            first = false;
+        }
+        i = i + 1;
+    }
+
+    if (first) { put_str(?output, "truncated=true\n"); }
+    or { put_str(?output, " truncated=true\n"); }
+    if (!output.valid || output.written > limit) {
+        ret encoded(ENCODE_INVALID, 0, required, ERR_BUFFER_TOO_SMALL);
+    }
+    ret encoded(ENCODED_TRUNCATED, output.written, required, nil);
+}
+
+fun bytes_equal(data: *u8, len: usize, expected: str) bool {
+    if (str_len(expected) != len) { ret false; }
+    var i: usize = 0;
+    for (i < len) {
+        if (data[i] != expected[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+test "log.record: typed fields encode after timestamp capture" {
+    var raw: [3]u8;
+    raw[0] = 0x00;
+    raw[1] = 0xab;
+    raw[2] = 0xff;
+    var fields: [6]Field;
+    fields[0] = field_i64("signed", -7);
+    fields[1] = field_u64("unsigned", 9);
+    fields[2] = field_bool("ready", true);
+    fields[3] = field_bytes("body", (?raw)::*u8, 3);
+    fields[4] = field_string("name", "a\"b");
+    fields[5] = field_error("cause", io_error.Error{kind: io_error.INVALID, code: -22, operation: io_error.OP_WRITE});
+
+    var record: Record = record_at(time.unix(0, 123456789), PRECISION_MILLIS, INFO, "hello\nworld", ?fields[0], 6);
+    var output: [512]u8;
+    val result: Encoded = encode(?record, (?output)::*u8, 512, 512, OVERSIZE_REJECT);
+    if (result.status != ENCODED) { ret 1; }
+    val expected: str = "timestamp=1970-01-01T00:00:00.123000000Z level=INFO message=\"hello\\nworld\" signed=-7 unsigned=9 ready=true body=0x00abff name=\"a\\\"b\" cause=error(kind=12,code=-22,operation=4,message=\"invalid argument\")\n";
+    if (!bytes_equal((?output)::*u8, result.len, expected)) { ret 2; }
+
+    var reserved: [1]Field;
+    reserved[0] = field_bool("truncated", false);
+    var invalid: Record = record_at(time.unix(0, 0), PRECISION_SECONDS, INFO, "reserved", ?reserved[0], 1);
+    if (encode(?invalid, (?output)::*u8, 512, 512, OVERSIZE_REJECT).status != ENCODE_INVALID) { ret 3; }
+    ret 0;
+}
+
+test "log.record: reject and truncate policies are deterministic" {
+    var record: Record = record_at(time.unix(0, 0), PRECISION_SECONDS, WARN, "a message too large for the configured record budget", nil, 0);
+    var output: [128]u8;
+
+    val rejected: Encoded = encode(?record, (?output)::*u8, 128, 64, OVERSIZE_REJECT);
+    if (rejected.status != ENCODE_REJECTED || rejected.len != 0 || rejected.required <= 64) { ret 1; }
+
+    val truncated: Encoded = encode(?record, (?output)::*u8, 128, 64, OVERSIZE_TRUNCATE);
+    if (truncated.status != ENCODED_TRUNCATED || truncated.len > 64 || truncated.required != rejected.required) { ret 2; }
+    if (!bytes_equal((?output)::*u8, truncated.len, "timestamp=1970-01-01T00:00:00Z level=WARN truncated=true\n")) { ret 3; }
+
+    var minimum: [MIN_TRUNCATED_BYTES]u8;
+    val minimal: Encoded = encode(?record, (?minimum)::*u8, MIN_TRUNCATED_BYTES, MIN_TRUNCATED_BYTES, OVERSIZE_TRUNCATE);
+    if (minimal.status != ENCODED_TRUNCATED || !bytes_equal((?minimum)::*u8, minimal.len, "truncated=true\n")) { ret 4; }
+    ret 0;
+}
+
+rec TestClock {
+    calls: i64;
+    value: Time;
+}
+
+fun test_now(ctx: ptr) Time {
+    val source: *TestClock = ctx::*TestClock;
+    source.calls = source.calls + 1;
+    ret source.value;
+}
+
+test "log.record: clock source precision and ownership are explicit" {
+    var system: Clock = system_clock(PRECISION_NANOS);
+    if (system.ownership != CLOCK_CONTEXT_NONE || !clock_valid(?system)) { ret 1; }
+    var source: TestClock = TestClock{calls: 0, value: time.unix(10, 987654321)};
+    var c: Clock = clock(?source, test_now, PRECISION_MICROS);
+    if (c.ownership != CLOCK_CONTEXT_BORROWED || !clock_valid(?c)) { ret 2; }
+    val sampled: Time = clock_now(?c);
+    if (source.calls != 1 || sampled.sec != 10 || sampled.nsec != 987654000) { ret 3; }
+    ret 0;
+}
