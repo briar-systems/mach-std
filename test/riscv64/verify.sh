@@ -3,7 +3,7 @@
 # and run it under qemu-riscv64, asserting its exit code. proves the riscv64
 # runtime (_start + the syscall stubs) links and runs end to end.
 #
-# usage: verify.sh [path-to-mach]   (defaults to `mach` on PATH)
+# usage: verify.sh [path-to-mach] [runner]
 #
 # requires: qemu-riscv64 (or qemu-riscv64-static).
 set -euo pipefail
@@ -12,6 +12,7 @@ set -euo pipefail
 expect_code=42
 
 mach="${1:-mach}"
+runner="${2:-}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$here"
 
@@ -28,10 +29,12 @@ exe="$(find out -name rvprobe -type f -print -quit)"
 [ -n "$exe" ] || fail "no rvprobe binary produced"
 
 echo "running $exe under qemu-riscv64"
-qemu="$(command -v qemu-riscv64 || command -v qemu-riscv64-static || true)"
-[ -n "$qemu" ] || fail "qemu-riscv64 not found"
+if [ -z "$runner" ]; then
+    runner="$(command -v qemu-riscv64 || command -v qemu-riscv64-static || true)"
+fi
+[ -n "$runner" ] || fail "qemu-riscv64 not found"
 set +e
-"$qemu" "$exe"
+"$runner" "$exe"
 code=$?
 set -e
 [ "$code" -eq "$expect_code" ] || fail "exit code $code, expected $expect_code"
