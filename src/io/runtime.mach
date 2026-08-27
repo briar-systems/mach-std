@@ -1090,26 +1090,26 @@ pub fun end_native_control(runtime: *Runtime) {
 }
 
 fun native_poll(runtime: *Runtime, timeout_ms: i32) i64 {
-    mutex.lock(?runtime.native_lock);
     mutex.lock(?runtime.lock);
+    val destroyed: bool = runtime.destroyed;
     val controlled: bool = runtime.native_controls != 0;
     mutex.unlock(?runtime.lock);
-    if (controlled) {
-        mutex.unlock(?runtime.native_lock);
-        ret 0;
-    }
-    val count: i64 = native_os.io_queue_poll(
+    if (destroyed) { ret os.EBADF; }
+    if (controlled) { ret 0; }
+    ret native_os.io_queue_poll(
         ?runtime.queue,
         runtime.native_events::*native_os.IoCompletion,
         runtime.capacity,
         timeout_ms,
     );
-    mutex.unlock(?runtime.native_lock);
-    ret count;
 }
 
 fun dispatch_source(runtime: *Runtime, index: usize, event: NativeEvent) bool {
     mutex.lock(?runtime.lock);
+    if (runtime.destroyed || index >= runtime.capacity) {
+        mutex.unlock(?runtime.lock);
+        ret false;
+    }
     val source: *Source = ?runtime.sources[index];
     if (source.state != SOURCE_REGISTERED) {
         mutex.unlock(?runtime.lock);
@@ -1151,7 +1151,16 @@ pub fun wait(runtime: *Runtime, output: *Completion, output_capacity: usize, tim
     if (runtime == nil || output == nil || output_capacity == 0 || timeout_ms < -1) {
         ret err[usize, io_error.Error](invalid(io_error.OP_WAIT));
     }
+    mutex.lock(?runtime.native_lock);
+    mutex.lock(?runtime.lock);
+    val destroyed: bool = runtime.destroyed;
+    mutex.unlock(?runtime.lock);
+    if (destroyed) {
+        mutex.unlock(?runtime.native_lock);
+        ret err[usize, io_error.Error](invalid(io_error.OP_WAIT));
+    }
     flush_sources(runtime);
+    mutex.unlock(?runtime.native_lock);
     val initial: Result[usize, io_error.Error] = poll(runtime, output, output_capacity);
     if (is_err[usize, io_error.Error](initial)) { ret initial; }
     val initial_count: usize = unwrap_ok[usize, io_error.Error](initial);
@@ -1163,14 +1172,19 @@ pub fun wait(runtime: *Runtime, output: *Completion, output_capacity: usize, tim
     val plan: WaitPlan = unwrap_ok[WaitPlan, io_error.Error](prepared);
     if (!plan.wait) { ret ok[usize, io_error.Error](0); }
 
+    mutex.lock(?runtime.native_lock);
     val waited: i64 = native_poll(runtime, plan.timeout_ms);
-    if (waited < 0) { ret err[usize, io_error.Error](io_error.from_code(waited, io_error.OP_WAIT)); }
+    if (waited < 0) {
+        mutex.unlock(?runtime.native_lock);
+        ret err[usize, io_error.Error](io_error.from_code(waited, io_error.OP_WAIT));
+    }
     var i: usize = 0;
     for (i < waited::usize) {
         dispatch_sources(runtime, runtime.native_events[i]);
         i = i + 1;
     }
     flush_sources(runtime);
+    mutex.unlock(?runtime.native_lock);
     ret poll(runtime, output, output_capacity);
 }
 
@@ -1265,16 +1279,13 @@ pub fun close(runtime: *Runtime) Result[bool, io_error.Error] {
     ret ok[bool, io_error.Error](unwrap_ok[lifecycle.CloseResult, io_error.Error](closed).started);
 }
 
-# destroy is valid only after close completions have been dequeued
-pub fun destroy(runtime: *Runtime) Result[bool, io_error.Error] {
-    if (runtime == nil) {
-        ret err[bool, io_error.Error](invalid(io_error.OP_CLOSE));
-    }
+fun destroy_with_native_ownership(runtime: *Runtime) Result[bool, io_error.Error] {
     mutex.lock(?runtime.lock);
     if (runtime.destroyed
         || lifecycle.snapshot(?runtime.lifecycle).state != lifecycle.CLOSED
         || runtime.live != 0
-        || runtime.count != 0) {
+        || runtime.count != 0
+        || runtime.native_controls != 0) {
         mutex.unlock(?runtime.lock);
         ret err[bool, io_error.Error](invalid(io_error.OP_CLOSE));
     }
@@ -1309,6 +1320,17 @@ pub fun destroy(runtime: *Runtime) Result[bool, io_error.Error] {
     if (queue_result < 0) { ret err[bool, io_error.Error](io_error.from_code(queue_result, io_error.OP_CLOSE)); }
     if (completion_result < 0 || timer_result < 0 || source_result < 0 || native_result < 0 || slot_result < 0) { ret err[bool, io_error.Error](io_error.from_code(os.EIO, io_error.OP_CLOSE)); }
     ret ok[bool, io_error.Error](true);
+}
+
+# destroy is valid only after close completions have been dequeued
+pub fun destroy(runtime: *Runtime) Result[bool, io_error.Error] {
+    if (runtime == nil) {
+        ret err[bool, io_error.Error](invalid(io_error.OP_CLOSE));
+    }
+    mutex.lock(?runtime.native_lock);
+    val result: Result[bool, io_error.Error] = destroy_with_native_ownership(runtime);
+    mutex.unlock(?runtime.native_lock);
+    ret result;
 }
 
 pub fun pending(runtime: *Runtime) usize {
@@ -1711,6 +1733,135 @@ test "runtime timer: concurrent cancellation and expiry have one winner" {
     }
     close(?runtime);
     if (is_err[bool, io_error.Error](destroy(?runtime))) { ret 1; }
+    ret 0;
+}
+
+rec DestroyWaitContext {
+    runtime: *Runtime;
+    closed: *i64;
+    destroyed: *i64;
+}
+
+rec NativeControlRaceContext {
+    runtime: *Runtime;
+    acquired: *i64;
+    release: *i64;
+}
+
+fun close_destroy_worker(arg: *u8) {
+    val context: *DestroyWaitContext = arg::*DestroyWaitContext;
+    val closed: Result[bool, io_error.Error] = close(context.runtime);
+    if (is_err[bool, io_error.Error](closed)) {
+        atomic.store(context.closed, -1);
+        atomic.store(context.destroyed, -1);
+        ret;
+    }
+    atomic.store(context.closed, 1);
+    val destroyed: Result[bool, io_error.Error] = destroy(context.runtime);
+    if (is_err[bool, io_error.Error](destroyed)) { atomic.store(context.destroyed, -1); }
+    or { atomic.store(context.destroyed, 1); }
+}
+
+fun native_control_worker(arg: *u8) {
+    val context: *NativeControlRaceContext = arg::*NativeControlRaceContext;
+    val controlled: Result[bool, io_error.Error] = begin_native_control(context.runtime);
+    if (is_err[bool, io_error.Error](controlled)) {
+        atomic.store(context.acquired, -1);
+        ret;
+    }
+    atomic.store(context.acquired, 1);
+    for (atomic.load(context.release) == 0) {}
+    end_native_control(context.runtime);
+}
+
+test "runtime wait and destroy serialize both native ownership interleavings" {
+    var runtime: Runtime;
+    if (is_err[bool, io_error.Error](make(?runtime, 1))) { ret 1; }
+    val prepared: Result[WaitPlan, io_error.Error] = prepare_wait(?runtime, -1);
+    if (is_err[WaitPlan, io_error.Error](prepared)) { ret 2; }
+    val plan: WaitPlan = unwrap_ok[WaitPlan, io_error.Error](prepared);
+    if (!plan.wait
+        || is_err[bool, io_error.Error](close(?runtime))
+        || is_err[bool, io_error.Error](destroy(?runtime))) {
+        ret 3;
+    }
+    mutex.lock(?runtime.native_lock);
+    val stale_wait: i64 = native_poll(?runtime, plan.timeout_ms);
+    mutex.unlock(?runtime.native_lock);
+    if (stale_wait != os.EBADF) { ret 4; }
+
+    if (is_err[bool, io_error.Error](make(?runtime, 1))) { ret 5; }
+    val second_prepared: Result[WaitPlan, io_error.Error] = prepare_wait(?runtime, -1);
+    if (is_err[WaitPlan, io_error.Error](second_prepared)) { ret 6; }
+    val second_plan: WaitPlan = unwrap_ok[WaitPlan, io_error.Error](second_prepared);
+    var closed: i64 = 0;
+    var destroyed: i64 = 0;
+    var context: DestroyWaitContext = DestroyWaitContext{
+        runtime: ?runtime,
+        closed: ?closed,
+        destroyed: ?destroyed,
+    };
+    mutex.lock(?runtime.native_lock);
+    var worker: thread.Thread;
+    thread.spawn_with(close_destroy_worker, (?context)::*u8, ?worker);
+    if (worker.tid < 0) {
+        mutex.unlock(?runtime.native_lock);
+        ret 7;
+    }
+    for (atomic.load(?closed) == 0) {}
+    if (atomic.load(?closed) != 1 || atomic.load(?destroyed) != 0) {
+        mutex.unlock(?runtime.native_lock);
+        thread.join(?worker);
+        ret 8;
+    }
+    val owned_wait: i64 = native_poll(?runtime, second_plan.timeout_ms);
+    mutex.unlock(?runtime.native_lock);
+    thread.join(?worker);
+    if (owned_wait < 0 || atomic.load(?destroyed) != 1) { ret 9; }
+
+    if (is_err[bool, io_error.Error](make(?runtime, 1))
+        || is_err[bool, io_error.Error](close(?runtime))) {
+        ret 10;
+    }
+    var acquired: i64 = 0;
+    var release: i64 = 0;
+    var control_context: NativeControlRaceContext = NativeControlRaceContext{
+        runtime: ?runtime,
+        acquired: ?acquired,
+        release: ?release,
+    };
+    mutex.lock(?runtime.native_lock);
+    thread.spawn_with(native_control_worker, (?control_context)::*u8, ?worker);
+    if (worker.tid < 0) {
+        mutex.unlock(?runtime.native_lock);
+        ret 11;
+    }
+    var queued: bool = false;
+    for (!queued) {
+        mutex.lock(?runtime.lock);
+        queued = runtime.native_controls == 1;
+        mutex.unlock(?runtime.lock);
+    }
+    val rejected: Result[bool, io_error.Error] = destroy_with_native_ownership(?runtime);
+    mutex.lock(?runtime.lock);
+    val was_destroyed: bool = runtime.destroyed;
+    mutex.unlock(?runtime.lock);
+    if (!is_err[bool, io_error.Error](rejected) || was_destroyed) {
+        mutex.unlock(?runtime.native_lock);
+        atomic.store(?release, 1);
+        thread.join(?worker);
+        ret 12;
+    }
+    mutex.unlock(?runtime.native_lock);
+    for (atomic.load(?acquired) == 0) {}
+    if (atomic.load(?acquired) != 1) {
+        atomic.store(?release, 1);
+        thread.join(?worker);
+        ret 13;
+    }
+    atomic.store(?release, 1);
+    thread.join(?worker);
+    if (is_err[bool, io_error.Error](destroy(?runtime))) { ret 14; }
     ret 0;
 }
 
