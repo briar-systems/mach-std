@@ -15,6 +15,7 @@ pub val ACTIVE:    Reason = 0;
 pub val CANCELLED: Reason = 1;
 pub val TIMED_OUT: Reason = 2;
 pub val DESTROYED: Reason = 3;
+pub val INVALID:   Reason = 4;
 
 pub def CancelFun: fun(ptr, Reason);
 
@@ -22,6 +23,7 @@ val REG_UNUSED:    i64 = 0;
 val REG_ACTIVE:    i64 = 1;
 val REG_CANCELLED: i64 = 2;
 val REG_COMPLETED: i64 = 3;
+val CLOSING:       i64 = 5;
 
 pub rec Registration {
     root: *Scope;
@@ -46,6 +48,7 @@ pub rec Scope {
     has_deadline: bool;
     state: i64;
     waiters: i64;
+    entries: i64;
     callback_count: usize;
     lock: mutex.Mutex;
 }
@@ -55,7 +58,8 @@ fun valid_deadline(has_deadline: bool, deadline: time.Time) bool {
     ret deadline.sec >= 0 && deadline.nsec >= 0 && deadline.nsec < 1000000000;
 }
 
-# scopes are fixed in memory from initialization through destruction
+# scopes are fixed in memory and own no target handle or allocation
+# callers stop starting new calls before reclaiming a destroyed scope
 pub fun make_root(scope: *Scope, has_deadline: bool, deadline: time.Time) bool {
     if (scope == nil || !valid_deadline(has_deadline, deadline)) { ret false; }
     scope.root = scope;
@@ -70,19 +74,35 @@ pub fun make_root(scope: *Scope, has_deadline: bool, deadline: time.Time) bool {
     if (has_deadline) { scope.deadline_owner = scope; }
     scope.state = ACTIVE;
     scope.waiters = 0;
+    scope.entries = 0;
     scope.callback_count = 0;
     scope.lock = mutex.make();
     ret true;
 }
 
 # child deadlines inherit the earliest absolute monotonic ancestor deadline
+fun scope_enter(scope: *Scope) bool {
+    if (scope == nil) { ret false; }
+    atomic.fetch_add(?scope.entries, 1);
+    val state: Reason = atomic.load(?scope.state);
+    if (state == DESTROYED || state == CLOSING) {
+        atomic.fetch_sub(?scope.entries, 1);
+        ret false;
+    }
+    ret true;
+}
+
+fun scope_leave(scope: *Scope) {
+    atomic.fetch_sub(?scope.entries, 1);
+}
+
 pub fun make_child(scope: *Scope, parent: *Scope, has_deadline: bool, deadline: time.Time) bool {
-    if (scope == nil || parent == nil || scope == parent || !valid_deadline(has_deadline, deadline)) { ret false; }
+    if (scope == nil || parent == nil || scope == parent || !valid_deadline(has_deadline, deadline) || !scope_enter(parent)) { ret false; }
     val root: *Scope = parent.root;
-    if (root == nil) { ret false; }
     mutex.lock(?root.lock);
     if (atomic.load(?parent.state) == DESTROYED) {
         mutex.unlock(?root.lock);
+        scope_leave(parent);
         ret false;
     }
     scope.root = root;
@@ -105,9 +125,25 @@ pub fun make_child(scope: *Scope, parent: *Scope, has_deadline: bool, deadline: 
     }
     scope.state = atomic.load(?parent.state);
     scope.waiters = 0;
+    scope.entries = 0;
     scope.callback_count = 0;
     scope.lock = mutex.make();
     mutex.unlock(?root.lock);
+    scope_leave(parent);
+    ret true;
+}
+
+# initialization is valid before first attachment or after terminal completion
+pub fun init_registration(registration: *Registration) bool {
+    if (registration == nil) { ret false; }
+    registration.root = nil;
+    registration.scope = nil;
+    registration.prev = nil;
+    registration.next = nil;
+    registration.callback = (0::usize)::CancelFun;
+    registration.context = nil;
+    registration.reason = ACTIVE;
+    registration.state = REG_UNUSED;
     ret true;
 }
 
@@ -123,13 +159,21 @@ fun registration_remove(registration: *Registration) {
 
 # successful registration is the ownership linearization point
 pub fun attach(scope: *Scope, registration: *Registration, callback: CancelFun, context: ptr) Reason {
-    if (scope == nil || registration == nil || callback::usize == 0 || scope.root == nil) { ret DESTROYED; }
+    if (scope == nil || registration == nil || callback::usize == 0) { ret INVALID; }
+    if (!scope_enter(scope)) { ret DESTROYED; }
     val root: *Scope = scope.root;
     mutex.lock(?root.lock);
     val state: Reason = atomic.load(?scope.state);
     if (state != ACTIVE) {
         mutex.unlock(?root.lock);
+        scope_leave(scope);
         ret state;
+    }
+    val registration_state: i64 = atomic.load(?registration.state);
+    if (registration_state != REG_UNUSED && registration_state != REG_COMPLETED) {
+        mutex.unlock(?root.lock);
+        scope_leave(scope);
+        ret INVALID;
     }
     registration.root = root;
     registration.scope = scope;
@@ -139,9 +183,10 @@ pub fun attach(scope: *Scope, registration: *Registration, callback: CancelFun, 
     registration.callback = callback;
     registration.context = context;
     registration.reason = ACTIVE;
-    registration.state = REG_ACTIVE;
+    atomic.store(?registration.state, REG_ACTIVE);
     scope.first_registration = registration;
     mutex.unlock(?root.lock);
+    scope_leave(scope);
     ret ACTIVE;
 }
 
@@ -150,7 +195,7 @@ pub fun unregister(registration: *Registration) bool {
     if (registration == nil || registration.root == nil) { ret false; }
     val root: *Scope = registration.root;
     mutex.lock(?root.lock);
-    if (registration.state != REG_ACTIVE) {
+    if (atomic.load(?registration.state) != REG_ACTIVE) {
         mutex.unlock(?root.lock);
         ret false;
     }
@@ -158,7 +203,7 @@ pub fun unregister(registration: *Registration) bool {
     registration.scope = nil;
     registration.root = nil;
     registration.reason = ACTIVE;
-    registration.state = REG_COMPLETED;
+    atomic.store(?registration.state, REG_COMPLETED);
     mutex.unlock(?root.lock);
     ret true;
 }
@@ -186,7 +231,7 @@ fun mark_tree_locked(scope: *Scope, reason: Reason, callbacks: **Registration, c
                 registration.next = @callbacks;
                 registration.scope = nil;
                 registration.reason = reason;
-                registration.state = REG_CANCELLED;
+                atomic.store(?registration.state, REG_CANCELLED);
                 @callbacks = registration;
                 @callback_count = @callback_count + 1;
                 registration = next;
@@ -204,13 +249,14 @@ fun mark_tree_locked(scope: *Scope, reason: Reason, callbacks: **Registration, c
 }
 
 fun transition(scope: *Scope, reason: Reason) bool {
-    if (scope == nil || scope.root == nil || reason == ACTIVE || reason == DESTROYED) { ret false; }
+    if (scope == nil || reason == ACTIVE || reason == DESTROYED || reason == INVALID || !scope_enter(scope)) { ret false; }
     val root: *Scope = scope.root;
     var callbacks: *Registration = nil;
     var callback_count: usize = 0;
     mutex.lock(?root.lock);
     if (atomic.load(?scope.state) != ACTIVE) {
         mutex.unlock(?root.lock);
+        scope_leave(scope);
         ret false;
     }
     mark_tree_locked(scope, reason, ?callbacks, ?callback_count);
@@ -220,13 +266,19 @@ fun transition(scope: *Scope, reason: Reason) bool {
     var registration: *Registration = callbacks;
     for (registration != nil) {
         val next: *Registration = registration.next;
-        registration.callback(registration.context, registration.reason);
+        val callback: CancelFun = registration.callback;
+        val context: ptr = registration.context;
+        val callback_reason: Reason = registration.reason;
+        registration.root = nil;
+        atomic.store(?registration.state, REG_COMPLETED);
+        callback(context, callback_reason);
         registration = next;
     }
 
     mutex.lock(?root.lock);
     root.callback_count = root.callback_count - callback_count;
     mutex.unlock(?root.lock);
+    scope_leave(scope);
     ret true;
 }
 
@@ -240,28 +292,43 @@ pub fun timeout(scope: *Scope) bool {
 
 # callers without a runtime may drive absolute deadlines explicitly
 pub fun expire(scope: *Scope, now: time.Time) bool {
-    if (scope == nil || !scope.has_deadline || time.time_before(now, scope.deadline)) { ret false; }
-    ret timeout(scope.deadline_owner);
+    if (scope == nil || !scope_enter(scope)) { ret false; }
+    val has_deadline: bool = scope.has_deadline;
+    val deadline: time.Time = scope.deadline;
+    val owner: *Scope = scope.deadline_owner;
+    scope_leave(scope);
+    if (!has_deadline || time.time_before(now, deadline)) { ret false; }
+    ret timeout(owner);
 }
 
 # returns the effective deadline and the ancestor that owns it
 pub fun get_deadline(scope: *Scope, deadline: *time.Time, owner: **Scope) bool {
-    if (scope == nil || deadline == nil || owner == nil || !scope.has_deadline) { ret false; }
+    if (scope == nil || deadline == nil || owner == nil || !scope_enter(scope)) { ret false; }
+    if (!scope.has_deadline) {
+        scope_leave(scope);
+        ret false;
+    }
     @deadline = scope.deadline;
     @owner = scope.deadline_owner;
+    scope_leave(scope);
     ret true;
 }
 
 pub fun reason(scope: *Scope) Reason {
-    if (scope == nil) { ret DESTROYED; }
-    ret atomic.load(?scope.state);
+    if (scope == nil || !scope_enter(scope)) { ret DESTROYED; }
+    val state: Reason = atomic.load(?scope.state);
+    scope_leave(scope);
+    ret state;
 }
 
 pub fun wait(scope: *Scope) Reason {
-    if (scope == nil) { ret DESTROYED; }
+    if (scope == nil || !scope_enter(scope)) { ret DESTROYED; }
     for (true) {
         val observed: Reason = atomic.load(?scope.state);
-        if (observed != ACTIVE) { ret observed; }
+        if (observed != ACTIVE) {
+            scope_leave(scope);
+            ret observed;
+        }
         atomic.fetch_add(?scope.waiters, 1);
         if (atomic.load(?scope.state) == ACTIVE) { os.thread_wait(?scope.state, ACTIVE); }
         atomic.fetch_sub(?scope.waiters, 1);
@@ -270,8 +337,10 @@ pub fun wait(scope: *Scope) Reason {
 }
 
 pub fun waiter_count(scope: *Scope) i64 {
-    if (scope == nil) { ret 0; }
-    ret atomic.load(?scope.waiters);
+    if (scope == nil || !scope_enter(scope)) { ret 0; }
+    val count: i64 = atomic.load(?scope.waiters);
+    scope_leave(scope);
+    ret count;
 }
 
 # destruction rejects children, live registrations, waiters, and callbacks
@@ -279,7 +348,14 @@ pub fun destroy(scope: *Scope) bool {
     if (scope == nil || scope.root == nil) { ret false; }
     val root: *Scope = scope.root;
     mutex.lock(?root.lock);
-    if (atomic.load(?scope.state) == DESTROYED || scope.first_child != nil || scope.first_registration != nil || atomic.load(?scope.waiters) != 0 || root.callback_count != 0) {
+    val prior_state: Reason = atomic.load(?scope.state);
+    if (prior_state == DESTROYED || prior_state == CLOSING || scope.first_child != nil || scope.first_registration != nil || atomic.load(?scope.waiters) != 0 || root.callback_count != 0) {
+        mutex.unlock(?root.lock);
+        ret false;
+    }
+    atomic.store(?scope.state, CLOSING);
+    if (atomic.load(?scope.entries) != 0) {
+        atomic.store(?scope.state, prior_state);
         mutex.unlock(?root.lock);
         ret false;
     }
@@ -293,8 +369,6 @@ pub fun destroy(scope: *Scope) bool {
     }
     atomic.store(?scope.state, DESTROYED);
     mutex.unlock(?root.lock);
-    scope.root = nil;
-    scope.parent = nil;
     ret true;
 }
 
@@ -324,6 +398,9 @@ test "cancel scope: parent cancellation reaches every descendant once" {
     callbacks[0] = TestCallback{count: ?counts[0], reason: ?reasons[0]};
     callbacks[1] = TestCallback{count: ?counts[1], reason: ?reasons[1]};
     callbacks[2] = TestCallback{count: ?counts[2], reason: ?reasons[2]};
+    init_registration(?registrations[0]);
+    init_registration(?registrations[1]);
+    init_registration(?registrations[2]);
     if (attach(?root, ?registrations[0], test_callback, (?callbacks[0])::ptr) != ACTIVE) { ret 1; }
     if (attach(?child, ?registrations[1], test_callback, (?callbacks[1])::ptr) != ACTIVE) { ret 1; }
     if (attach(?grandchild, ?registrations[2], test_callback, (?callbacks[2])::ptr) != ACTIVE) { ret 1; }
@@ -346,9 +423,28 @@ test "cancel scope: registration and destruction have one owner" {
     var why: i64 = ACTIVE;
     var callback: TestCallback = TestCallback{count: ?count, reason: ?why};
     var registration: Registration;
+    init_registration(?registration);
     if (attach(?scope, ?registration, test_callback, (?callback)::ptr) != ACTIVE) { ret 1; }
     if (destroy(?scope) || !unregister(?registration) || unregister(?registration)) { ret 1; }
     if (!destroy(?scope) || atomic.load(?count) != 0) { ret 1; }
+    ret 0;
+}
+
+test "cancel scope: active registrations cannot be attached twice" {
+    var root: Scope;
+    var other: Scope;
+    val none: time.Time = time.Time{sec: 0, nsec: 0};
+    if (!make_root(?root, false, none) || !make_root(?other, false, none)) { ret 1; }
+    var count: i64 = 0;
+    var why: i64 = ACTIVE;
+    var callback: TestCallback = TestCallback{count: ?count, reason: ?why};
+    var registration: Registration;
+    init_registration(?registration);
+    if (attach(?root, ?registration, test_callback, (?callback)::ptr) != ACTIVE) { ret 1; }
+    if (attach(?root, ?registration, test_callback, (?callback)::ptr) != INVALID) { ret 1; }
+    if (attach(?other, ?registration, test_callback, (?callback)::ptr) != INVALID) { ret 1; }
+    if (!cancel(?root) || atomic.load(?count) != 1 || atomic.load(?why) != CANCELLED) { ret 1; }
+    if (!destroy(?root) || !destroy(?other)) { ret 1; }
     ret 0;
 }
 
@@ -385,6 +481,7 @@ test "cancel scope: native wait observes cancellation without spinning" {
     thread.spawn_with(wait_worker, (?context)::*u8, ?worker);
     if (worker.tid < 0) { ret 1; }
     for (waiter_count(?scope) == 0) { atomic.spin_hint(); }
+    if (destroy(?scope)) { ret 1; }
     if (!cancel(?scope)) { ret 1; }
     thread.join(?worker);
     if (atomic.load(?result) != CANCELLED || waiter_count(?scope) != 0 || !destroy(?scope)) { ret 1; }
