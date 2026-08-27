@@ -1,0 +1,305 @@
+# unix-domain local byte streams
+
+$if ($mach.build.os != $mach.os.linux && $mach.build.os != $mach.os.darwin) {
+    $error("std.net.local.unix: requires linux or darwin target");
+}
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.size.isize;
+use std.system.os;
+use std.net.socket;
+use std.net.local.endpoint;
+use std.net.local.types;
+
+$if ($mach.build.os == $mach.os.linux) {
+    use native: std.system.os.linux;
+}
+$or {
+    use native: std.system.os.darwin;
+}
+
+val AF_UNIX: i32 = 1;
+val S_IFSOCK: u32 = 0x0000c000;
+val SO_PEERCRED: i32 = 17;
+val SYS_CHMOD_X86_64: usize = 90;
+val SYS_FCHMODAT: usize = 53;
+
+$if ($mach.build.os == $mach.os.darwin) {
+    #[library("libSystem")]
+    ext fun chmod(path: *u8, mode: u32) i32;
+    #[library("libSystem")]
+    ext fun getpeereid(socket: i32, user: *u32, group: *u32) i32;
+    #[library("libSystem")]
+    ext fun __error() *i32;
+}
+
+fun path_buffer(value: endpoint.Endpoint, output: *u8) {
+    var i: usize = 0;
+    for (i < value.length) { output[i] = value.name[i]; i = i + 1; }
+    output[value.length] = 0;
+}
+
+fun socket_node(path: *u8) i64 {
+    var status: os.stat_t;
+    val code: i64 = os.stat_path(os.AT_FDCWD, path, ?status, os.AT_SYMLINK_NOFOLLOW);
+    if (code < 0) { ret code; }
+    if ((os.stat_mode(?status) & os.S_IFMT) != S_IFSOCK) { ret os.EEXIST; }
+    ret 0;
+}
+
+fun remove_stale(value: endpoint.Endpoint) i64 {
+    var path: [108]u8;
+    path_buffer(value, ?path[0]);
+    val existing: i64 = socket_node(?path[0]);
+    if (existing == os.ENOENT) { ret 0; }
+    if (existing < 0) { ret existing; }
+    ret os.unlink(os.AT_FDCWD, ?path[0], 0);
+}
+
+fun capture_identity(listener: *types.Listener) i64 {
+    if (listener.endpoint.kind != endpoint.FILESYSTEM) {
+        listener.has_node_identity = false;
+        ret 0;
+    }
+    var path: [108]u8;
+    path_buffer(listener.endpoint, ?path[0]);
+    var status: os.stat_t;
+    val code: i64 = os.stat_path(os.AT_FDCWD, ?path[0], ?status, os.AT_SYMLINK_NOFOLLOW);
+    if (code < 0) { ret code; }
+    if ((os.stat_mode(?status) & os.S_IFMT) != S_IFSOCK) { ret os.EEXIST; }
+    $if ($mach.build.os == $mach.os.linux) {
+        listener.node_device = status.st_dev;
+    }
+    $or {
+        listener.node_device = status.st_dev::u32::u64;
+    }
+    listener.node_file = status.st_ino;
+    listener.has_node_identity = true;
+    ret 0;
+}
+
+fun remove_owned(listener: *types.Listener) i64 {
+    if (listener.endpoint.kind != endpoint.FILESYSTEM) { ret 0; }
+    var path: [108]u8;
+    path_buffer(listener.endpoint, ?path[0]);
+    var status: os.stat_t;
+    val inspected: i64 = os.stat_path(os.AT_FDCWD, ?path[0], ?status, os.AT_SYMLINK_NOFOLLOW);
+    if (inspected == os.ENOENT) { ret 0; }
+    if (inspected < 0) { ret inspected; }
+    $if ($mach.build.os == $mach.os.linux) {
+        if (!listener.has_node_identity
+            || status.st_dev != listener.node_device
+            || status.st_ino != listener.node_file) {
+            ret os.EBUSY;
+        }
+    }
+    $or {
+        if (!listener.has_node_identity
+            || status.st_dev::u32::u64 != listener.node_device
+            || status.st_ino != listener.node_file) {
+            ret os.EBUSY;
+        }
+    }
+    val code: i64 = os.unlink(os.AT_FDCWD, ?path[0], 0);
+    if (code == os.ENOENT) { ret 0; }
+    ret code;
+}
+
+pub fun cleanup_listener(listener: *types.Listener) i64 {
+    ret remove_owned(listener);
+}
+
+fun apply_permissions(value: endpoint.Endpoint, permissions: u32) i64 {
+    if (value.kind != endpoint.FILESYSTEM || permissions == types.INHERIT_PERMISSIONS) { ret 0; }
+    if ((permissions & ~0x01ff) != 0) { ret os.EINVAL; }
+    var path: [108]u8;
+    path_buffer(value, ?path[0]);
+    $if ($mach.build.os == $mach.os.linux) {
+        $if ($mach.build.arch == $mach.arch.x86_64) {
+            ret native.syscall2(SYS_CHMOD_X86_64, (?path[0])::usize, permissions::usize);
+        }
+        $or {
+            ret native.syscall3(SYS_FCHMODAT, os.AT_FDCWD::isize::usize, (?path[0])::usize, permissions::usize);
+        }
+    }
+    $or {
+        if (chmod(?path[0], permissions) < 0) {
+            val error_cell: *i32 = __error();
+            val error_number: i32 = @error_cell;
+            ret -(error_number::i64);
+        }
+        ret 0;
+    }
+}
+
+pub fun create_stream(value: endpoint.Endpoint, asynchronous: bool, handle: *usize) i64 {
+    var flags: socket.Flags = socket.blocking_flags();
+    if (asynchronous) { flags = socket.async_flags(); }
+    ret os.sock_create_flags(AF_UNIX, os.SOCK_STREAM, 0, flags.nonblocking, flags.non_inheritable, handle);
+}
+
+pub fun connect_start(handle: usize, value: endpoint.Endpoint) i64 {
+    var address: [128]u8;
+    var length: usize = 0;
+    val encoded: i64 = endpoint.to_sockaddr(value, ?address[0], 128, ?length);
+    if (encoded < 0) { ret encoded; }
+    ret os.sock_connect(handle, ?address[0], length);
+}
+
+pub fun bind(listener: *types.Listener, value: endpoint.Endpoint, options: types.BindOptions) i64 {
+    if (value.kind == endpoint.FILESYSTEM && options.stale == types.REMOVE_STALE_SOCKET) {
+        val removed: i64 = remove_stale(value);
+        if (removed < 0) { ret removed; }
+    }
+    var handle: usize = (-1)::isize::usize;
+    var code: i64 = create_stream(value, true, ?handle);
+    if (code < 0) { ret code; }
+    var address: [128]u8;
+    var length: usize = 0;
+    code = endpoint.to_sockaddr(value, ?address[0], 128, ?length);
+    if (code >= 0) { code = os.sock_bind(handle, ?address[0], length); }
+    var bound: bool = code >= 0;
+    listener.handle = handle;
+    if (code >= 0) { code = capture_identity(listener); }
+    if (code >= 0) { code = apply_permissions(value, options.permissions); }
+    if (code < 0) {
+        os.sock_close(handle);
+        if (bound && value.kind == endpoint.FILESYSTEM) { remove_owned(listener); }
+        listener.handle = (-1)::isize::usize;
+        ret code;
+    }
+    ret 0;
+}
+
+pub fun start_listener(listener: *types.Listener, backlog: i32) i64 {
+    ret os.sock_listen(listener.handle, backlog);
+}
+
+pub fun listen(listener: *types.Listener, value: endpoint.Endpoint, options: types.ListenOptions) i64 {
+    val bind_options: types.BindOptions = types.BindOptions{
+        ownership: options.ownership,
+        stale: options.stale,
+        permissions: options.permissions,
+    };
+    val bound: i64 = bind(listener, value, bind_options);
+    if (bound < 0) { ret bound; }
+    val listening: i64 = start_listener(listener, options.backlog);
+    if (listening < 0) {
+        close_listener(listener);
+        ret listening;
+    }
+    ret 0;
+}
+
+pub fun connect(stream: *types.Stream, value: endpoint.Endpoint, asynchronous: bool) i64 {
+    var handle: usize = (-1)::isize::usize;
+    val created: i64 = create_stream(value, asynchronous, ?handle);
+    if (created < 0) { ret created; }
+    val code: i64 = connect_start(handle, value);
+    if (code < 0) {
+        os.sock_close(handle);
+        ret code;
+    }
+    stream.handle = handle;
+    stream.server_side = false;
+    ret 0;
+}
+
+pub fun accept(listener: *types.Listener, stream: *types.Stream, asynchronous: bool) i64 {
+    var flags: socket.Flags = socket.blocking_flags();
+    if (asynchronous) { flags = socket.async_flags(); }
+    var handle: usize = (-1)::isize::usize;
+    var address: [128]u8;
+    var length: u32 = 128;
+    val code: i64 = os.sock_accept_flags(listener.handle, ?address[0], ?length, flags.nonblocking, flags.non_inheritable, ?handle);
+    if (code < 0) { ret code; }
+    stream.handle = handle;
+    stream.server_side = true;
+    ret 0;
+}
+
+pub fun read(handle: usize, buffer: *u8, length: usize) i64 {
+    ret os.sock_recv(handle, buffer, length);
+}
+
+pub fun write(handle: usize, buffer: *u8, length: usize) i64 {
+    ret os.sock_send(handle, buffer, length);
+}
+
+pub fun shutdown_write(handle: usize) i64 {
+    ret os.sock_shutdown(handle, os.SHUT_WR);
+}
+
+pub fun peer_identity(handle: usize, server_side: bool, identity: *types.PeerIdentity) i64 {
+    $if ($mach.build.os == $mach.os.linux) {
+        var credential: [3]u32;
+        var length: u32 = 12;
+        val code: i64 = os.sock_getopt(handle, os.SOL_SOCKET, SO_PEERCRED, (?credential[0])::*u8, ?length);
+        if (code < 0) { ret code; }
+        if (length < 12) { ret os.EIO; }
+        identity.process = credential[0]::u64;
+        identity.user = credential[1]::u64;
+        identity.group = credential[2]::u64;
+        identity.has_process = true;
+        identity.has_user = true;
+        identity.has_group = true;
+        ret 0;
+    }
+    $or {
+        var user: u32 = 0;
+        var group: u32 = 0;
+        if (getpeereid(handle::i32, ?user, ?group) < 0) {
+            val error_cell: *i32 = __error();
+            val error_number: i32 = @error_cell;
+            ret -(error_number::i64);
+        }
+        identity.user = user::u64;
+        identity.group = group::u64;
+        identity.has_user = true;
+        identity.has_group = true;
+        ret 0;
+    }
+}
+
+pub fun rename(listener: *types.Listener, replacement: endpoint.Endpoint) i64 {
+    var source: [108]u8;
+    var destination: [108]u8;
+    path_buffer(listener.endpoint, ?source[0]);
+    path_buffer(replacement, ?destination[0]);
+    var status: os.stat_t;
+    val occupied: i64 = os.stat_path(os.AT_FDCWD, ?destination[0], ?status, os.AT_SYMLINK_NOFOLLOW);
+    if (occupied >= 0) { ret os.EEXIST; }
+    if (occupied != os.ENOENT) { ret occupied; }
+    val source_status: i64 = os.stat_path(os.AT_FDCWD, ?source[0], ?status, os.AT_SYMLINK_NOFOLLOW);
+    if (source_status < 0) { ret source_status; }
+    $if ($mach.build.os == $mach.os.linux) {
+        if (!listener.has_node_identity
+            || status.st_dev != listener.node_device
+            || status.st_ino != listener.node_file) {
+            ret os.EBUSY;
+        }
+    }
+    $or {
+        if (!listener.has_node_identity
+            || status.st_dev::u32::u64 != listener.node_device
+            || status.st_ino != listener.node_file) {
+            ret os.EBUSY;
+        }
+    }
+    ret os.rename(os.AT_FDCWD, ?source[0], os.AT_FDCWD, ?destination[0]);
+}
+
+pub fun close_stream(handle: usize, server_side: bool) i64 {
+    ret os.sock_close(handle);
+}
+
+pub fun close_listener(listener: *types.Listener) i64 {
+    val closed: i64 = os.sock_close(listener.handle);
+    var removed: i64 = 0;
+    if (listener.ownership == types.OWNED) { removed = remove_owned(listener); }
+    if (closed < 0) { ret closed; }
+    ret removed;
+}

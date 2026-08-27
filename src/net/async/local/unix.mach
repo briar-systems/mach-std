@@ -1,0 +1,889 @@
+# bounded local unix readiness backend
+
+$if ($mach.build.os != $mach.os.linux && $mach.build.os != $mach.os.darwin) {
+    $error("std.net.async.local.unix: requires linux or darwin target");
+}
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.system.os;
+use std.system.os.shared;
+use std.net.local.endpoint;
+use local_types: std.net.local.types;
+use std.net.async.types;
+use std.io.runtime;
+use std.sync.mutex;
+
+$if ($mach.build.os == $mach.os.linux) {
+    use native: std.system.os.linux;
+    use local_impl: std.net.local.unix;
+}
+$or {
+    use native: std.system.os.darwin;
+    use local_impl: std.net.local.unix;
+}
+
+fwd types.Token;
+fwd types.NativeCompletion;
+
+pub rec Operation {
+    state: u8;
+    generation: u32;
+    kind: runtime.Kind;
+    resource: usize;
+    context: usize;
+    buffer: *u8;
+    length: usize;
+    peer: endpoint.Endpoint;
+    sequence: u64;
+    previous: u32;
+    next: u32;
+    resource_index: u32;
+    lane: u8;
+    stage: u8;
+}
+
+rec Resource {
+    state: u8;
+    generation: u32;
+    resource: usize;
+    read_head: u32;
+    read_tail: u32;
+    write_head: u32;
+    write_tail: u32;
+    close_index: u32;
+    armed: bool;
+    closing: bool;
+    write_closed: bool;
+    next_free: u32;
+}
+
+rec QueuedCompletion {
+    value: types.NativeCompletion;
+    operation_index: u32;
+}
+
+pub rec Backend {
+    queue: *shared.IoQueue;
+    source_id: u16;
+    operations: *Operation;
+    resources: *Resource;
+    resource_map: *u32;
+    native: *native.IoCompletion;
+    queued: *QueuedCompletion;
+    ready: *types.NativeCompletion;
+    capacity: usize;
+    map_capacity: usize;
+    live: usize;
+    resource_count: usize;
+    free_operation: u32;
+    free_resource: u32;
+    queued_head: usize;
+    queued_tail: usize;
+    queued_count: usize;
+    ready_count: usize;
+    sequence: u64;
+    lock: mutex.Mutex;
+}
+
+val SLOT_FREE: u8 = 0;
+val SLOT_ACTIVE: u8 = 1;
+val SLOT_QUEUED: u8 = 2;
+val RESOURCE_FREE: u8 = 0;
+val RESOURCE_ACTIVE: u8 = 1;
+val LANE_NONE: u8 = 0;
+val LANE_READ: u8 = 1;
+val LANE_WRITE: u8 = 2;
+val NONE: u32 = 0xffffffff;
+val MAP_TOMBSTONE: u32 = 0xffffffff;
+$if ($mach.build.os == $mach.os.linux) {
+    val IN_PROGRESS: i64 = -115;
+}
+$or {
+    val IN_PROGRESS: i64 = -36;
+}
+
+fun invalid() i64 { ret native.EINVAL; }
+
+fun token_context(backend: *Backend, token: types.Token) usize {
+    ret ((backend.source_id::u64 << 48) | ((token.index::u64 + 1) << 32) | token.generation::u64)::usize;
+}
+
+fun context_token(backend: *Backend, context: usize, token: *types.Token) bool {
+    val raw: u64 = context::u64;
+    val index: u64 = (raw >> 32) & 0xffff;
+    if ((raw >> 48)::u16 != backend.source_id || index == 0 || token == nil) { ret false; }
+    token.index = (index - 1)::u32;
+    token.generation = raw::u32;
+    ret token.generation != 0;
+}
+
+fun operation_for(backend: *Backend, token: types.Token) *Operation {
+    if (token.index::usize >= backend.capacity) { ret nil; }
+    val operation: *Operation = ?backend.operations[token.index::usize];
+    if (operation.state != SLOT_ACTIVE || operation.generation != token.generation) { ret nil; }
+    ret operation;
+}
+
+fun operation_any(backend: *Backend, token: types.Token) *Operation {
+    if (token.index::usize >= backend.capacity) { ret nil; }
+    val operation: *Operation = ?backend.operations[token.index::usize];
+    if (operation.state == SLOT_FREE || operation.generation != token.generation) { ret nil; }
+    ret operation;
+}
+
+fun resource_for(backend: *Backend, token: types.Token) *Resource {
+    if (token.index::usize >= backend.capacity) { ret nil; }
+    val resource: *Resource = ?backend.resources[token.index::usize];
+    if (resource.state != RESOURCE_ACTIVE || resource.generation != token.generation) { ret nil; }
+    ret resource;
+}
+
+fun required_map_capacity(capacity: usize) usize {
+    if (capacity > 0x3fffffff) { ret 0; }
+    val required: usize = capacity * 2;
+    var size: usize = 1;
+    for (size < required) { size = size * 2; }
+    ret size;
+}
+
+fun resource_hash(resource: usize) usize {
+    ret resource * 11400714819323198485;
+}
+
+fun resource_lookup(backend: *Backend, resource: usize) *Resource {
+    var slot: usize = resource_hash(resource) & (backend.map_capacity - 1);
+    var scanned: usize = 0;
+    for (scanned < backend.map_capacity) {
+        val entry: u32 = backend.resource_map[slot];
+        if (entry == 0) { ret nil; }
+        if (entry != MAP_TOMBSTONE) {
+            val candidate: *Resource = ?backend.resources[(entry - 1)::usize];
+            if (candidate.state == RESOURCE_ACTIVE && candidate.resource == resource) { ret candidate; }
+        }
+        slot = (slot + 1) & (backend.map_capacity - 1);
+        scanned = scanned + 1;
+    }
+    ret nil;
+}
+
+fun resource_map_insert(backend: *Backend, index: u32) bool {
+    val resource: usize = backend.resources[index::usize].resource;
+    var slot: usize = resource_hash(resource) & (backend.map_capacity - 1);
+    var tombstone: usize = backend.map_capacity;
+    var scanned: usize = 0;
+    for (scanned < backend.map_capacity) {
+        val entry: u32 = backend.resource_map[slot];
+        if (entry == 0) {
+            if (tombstone != backend.map_capacity) { slot = tombstone; }
+            backend.resource_map[slot] = index + 1;
+            ret true;
+        }
+        if (entry == MAP_TOMBSTONE && tombstone == backend.map_capacity) { tombstone = slot; }
+        slot = (slot + 1) & (backend.map_capacity - 1);
+        scanned = scanned + 1;
+    }
+    if (tombstone != backend.map_capacity) {
+        backend.resource_map[tombstone] = index + 1;
+        ret true;
+    }
+    ret false;
+}
+
+fun resource_map_remove(backend: *Backend, index: u32) {
+    val resource: usize = backend.resources[index::usize].resource;
+    var slot: usize = resource_hash(resource) & (backend.map_capacity - 1);
+    var scanned: usize = 0;
+    for (scanned < backend.map_capacity) {
+        val entry: u32 = backend.resource_map[slot];
+        if (entry == 0) { ret; }
+        if (entry == index + 1) {
+            backend.resource_map[slot] = MAP_TOMBSTONE;
+            ret;
+        }
+        slot = (slot + 1) & (backend.map_capacity - 1);
+        scanned = scanned + 1;
+    }
+}
+
+fun resource_acquire(backend: *Backend, resource_value: usize, created: *bool) *Resource {
+    val existing: *Resource = resource_lookup(backend, resource_value);
+    if (existing != nil) { @created = false; ret existing; }
+    if (backend.free_resource == NONE) { ret nil; }
+    val index: u32 = backend.free_resource;
+    val resource: *Resource = ?backend.resources[index::usize];
+    backend.free_resource = resource.next_free;
+    var generation: u32 = resource.generation + 1;
+    if (generation == 0) { generation = 1; }
+    resource.state = RESOURCE_ACTIVE;
+    resource.generation = generation;
+    resource.resource = resource_value;
+    resource.read_head = NONE;
+    resource.read_tail = NONE;
+    resource.write_head = NONE;
+    resource.write_tail = NONE;
+    resource.close_index = NONE;
+    resource.armed = false;
+    resource.closing = false;
+    resource.write_closed = false;
+    if (!resource_map_insert(backend, index)) {
+        resource.state = RESOURCE_FREE;
+        resource.next_free = backend.free_resource;
+        backend.free_resource = index;
+        ret nil;
+    }
+    backend.resource_count = backend.resource_count + 1;
+    @created = true;
+    ret resource;
+}
+
+fun resource_release_unwatched(backend: *Backend, resource: *Resource) {
+    val index: u32 = ((resource::usize - backend.resources::usize) / $size_of(Resource))::u32;
+    resource_map_remove(backend, index);
+    resource.state = RESOURCE_FREE;
+    resource.armed = false;
+    resource.next_free = backend.free_resource;
+    backend.free_resource = index;
+    backend.resource_count = backend.resource_count - 1;
+}
+
+fun resource_release(backend: *Backend, resource: *Resource) {
+    native.io_queue_unwatch(backend.queue, resource.resource);
+    resource.armed = false;
+    resource_release_unwatched(backend, resource);
+}
+
+fun operation_claim(backend: *Backend, kind: runtime.Kind, resource_value: usize, context: usize, token: *types.Token) *Operation {
+    if (backend.live == backend.capacity || backend.free_operation == NONE) { ret nil; }
+    val index: u32 = backend.free_operation;
+    val operation: *Operation = ?backend.operations[index::usize];
+    backend.free_operation = operation.next;
+    var generation: u32 = operation.generation + 1;
+    if (generation == 0) { generation = 1; }
+    operation.state = SLOT_ACTIVE;
+    operation.generation = generation;
+    operation.kind = kind;
+    operation.resource = resource_value;
+    operation.context = context;
+    operation.sequence = backend.sequence;
+    operation.previous = NONE;
+    operation.next = NONE;
+    operation.lane = LANE_NONE;
+    operation.stage = 0;
+    backend.sequence = backend.sequence + 1;
+    backend.live = backend.live + 1;
+    @token = types.Token{index: index, generation: generation};
+    ret operation;
+}
+
+fun operation_release(backend: *Backend, index: u32) {
+    val operation: *Operation = ?backend.operations[index::usize];
+    operation.state = SLOT_FREE;
+    operation.next = backend.free_operation;
+    backend.free_operation = index;
+    backend.live = backend.live - 1;
+}
+
+fun operation_index(backend: *Backend, operation: *Operation) u32 {
+    ret ((operation::usize - backend.operations::usize) / $size_of(Operation))::u32;
+}
+
+fun resource_index(backend: *Backend, resource: *Resource) u32 {
+    ret ((resource::usize - backend.resources::usize) / $size_of(Resource))::u32;
+}
+
+fun enqueue(backend: *Backend, resource: *Resource, operation: *Operation, lane: u8) {
+    val index: u32 = operation_index(backend, operation);
+    operation.resource_index = resource_index(backend, resource);
+    operation.lane = lane;
+    if (lane == LANE_READ) {
+        operation.previous = resource.read_tail;
+        if (resource.read_tail == NONE) { resource.read_head = index; }
+        or { backend.operations[resource.read_tail::usize].next = index; }
+        resource.read_tail = index;
+    } or {
+        operation.previous = resource.write_tail;
+        if (resource.write_tail == NONE) { resource.write_head = index; }
+        or { backend.operations[resource.write_tail::usize].next = index; }
+        resource.write_tail = index;
+    }
+}
+
+fun unlink(backend: *Backend, resource: *Resource, operation: *Operation) {
+    val previous: u32 = operation.previous;
+    val next: u32 = operation.next;
+    if (operation.lane == LANE_READ) {
+        if (previous == NONE) { resource.read_head = next; }
+        or { backend.operations[previous::usize].next = next; }
+        if (next == NONE) { resource.read_tail = previous; }
+        or { backend.operations[next::usize].previous = previous; }
+    } or (operation.lane == LANE_WRITE) {
+        if (previous == NONE) { resource.write_head = next; }
+        or { backend.operations[previous::usize].next = next; }
+        if (next == NONE) { resource.write_tail = previous; }
+        or { backend.operations[next::usize].previous = previous; }
+    }
+    operation.previous = NONE;
+    operation.next = NONE;
+    operation.lane = LANE_NONE;
+}
+
+fun finish(backend: *Backend, resource: *Resource, operation: *Operation, status: i64, bytes: usize, items: usize, native_resource: usize, end_of_stream: bool) {
+    unlink(backend, resource, operation);
+    val index: u32 = operation_index(backend, operation);
+    backend.queued[backend.queued_tail].value.context = operation.context;
+    backend.queued[backend.queued_tail].value.kind = operation.kind;
+    backend.queued[backend.queued_tail].value.bytes = bytes;
+    backend.queued[backend.queued_tail].value.items = items;
+    backend.queued[backend.queued_tail].value.resource = native_resource;
+    backend.queued[backend.queued_tail].value.status = status;
+    backend.queued[backend.queued_tail].value.end_of_stream = end_of_stream;
+    backend.queued[backend.queued_tail].operation_index = index;
+    backend.queued_tail = (backend.queued_tail + 1) % backend.capacity;
+    backend.queued_count = backend.queued_count + 1;
+    operation.state = SLOT_QUEUED;
+}
+
+fun would_block(status: i64) bool {
+    ret status == native.EAGAIN || status == IN_PROGRESS;
+}
+
+fun attempt(backend: *Backend, resource: *Resource, operation: *Operation) bool {
+    var result: i64 = 0;
+    var completed_resource: usize = operation.resource;
+    var end_of_stream: bool = false;
+    if (operation.kind == runtime.ACCEPT) {
+        result = stream_accept(operation.resource, ?completed_resource);
+    } or (operation.kind == runtime.CONNECT) {
+        if (operation.stage == 0) {
+            result = stream_connect(operation.resource, operation.peer);
+            if (would_block(result)) { operation.stage = 1; ret false; }
+        } or {
+            result = stream_connect_status(operation.resource);
+        }
+    } or (operation.kind == runtime.READ) {
+        result = stream_read(operation.resource, operation.buffer, operation.length);
+        end_of_stream = result == 0 && operation.length != 0;
+    } or (operation.kind == runtime.WRITE) {
+        result = stream_write(operation.resource, operation.buffer, operation.length);
+    } or (operation.kind == runtime.SHUTDOWN) {
+        result = stream_shutdown_write(operation.resource);
+        if (result >= 0) { resource.write_closed = true; }
+    } or {
+        result = native.EINVAL;
+    }
+    if (would_block(result)) { ret false; }
+    if (result < 0) { finish(backend, resource, operation, result, 0, 0, completed_resource, false); }
+    or {
+        var bytes: usize = 0;
+        if (operation.kind == runtime.READ || operation.kind == runtime.WRITE) { bytes = result::usize; }
+        finish(backend, resource, operation, 0, bytes, 0, completed_resource, end_of_stream);
+    }
+    ret true;
+}
+
+fun fail_resource(backend: *Backend, resource: *Resource, status: i64) {
+    for (resource.read_head != NONE || resource.write_head != NONE) {
+        var index: u32 = resource.read_head;
+        if (index == NONE) { index = resource.write_head; }
+        or (resource.write_head != NONE && backend.operations[resource.write_head::usize].sequence < backend.operations[index::usize].sequence) { index = resource.write_head; }
+        val operation: *Operation = ?backend.operations[index::usize];
+        finish(backend, resource, operation, status, 0, 0, operation.resource, false);
+    }
+}
+
+fun arm_resource(backend: *Backend, resource: *Resource) {
+    var events: u32 = 0;
+    if (resource.read_head != NONE) { events = events | native.IO_EVENT_READ; }
+    if (resource.write_head != NONE) { events = events | native.IO_EVENT_WRITE; }
+    if (events == 0) {
+        native.io_queue_unwatch(backend.queue, resource.resource);
+        resource.armed = false;
+        if (resource.close_index != NONE) {
+            val close_operation: *Operation = ?backend.operations[resource.close_index::usize];
+            resource.close_index = NONE;
+            val closed: i64 = socket_close(resource.resource);
+            finish(backend, resource, close_operation, closed, 0, 0, resource.resource, false);
+        }
+        resource_release_unwatched(backend, resource);
+        ret;
+    }
+    val token: types.Token = types.Token{index: resource_index(backend, resource), generation: resource.generation};
+    val status: i64 = native.io_queue_watch(backend.queue, resource.resource, token_context(backend, token), events);
+    if (status < 0) {
+        fail_resource(backend, resource, status);
+        native.io_queue_unwatch(backend.queue, resource.resource);
+        resource.armed = false;
+        if (resource.close_index != NONE) {
+            val close_operation: *Operation = ?backend.operations[resource.close_index::usize];
+            resource.close_index = NONE;
+            val closed: i64 = socket_close(resource.resource);
+            finish(backend, resource, close_operation, closed, 0, 0, resource.resource, false);
+        }
+        resource_release_unwatched(backend, resource);
+        ret;
+    }
+    resource.armed = true;
+}
+
+fun drive_resource(backend: *Backend, resource: *Resource, events: u32) {
+    val failure: bool = (events & (native.IO_EVENT_ERROR | native.IO_EVENT_HANGUP)) != 0;
+    if ((events & native.IO_EVENT_READ) != 0 || failure) {
+        var progress: bool = true;
+        for (progress && resource.read_head != NONE) {
+            progress = attempt(backend, resource, ?backend.operations[resource.read_head::usize]);
+        }
+    }
+    if ((events & native.IO_EVENT_WRITE) != 0 || failure) {
+        var progress: bool = true;
+        for (progress && resource.write_head != NONE) {
+            progress = attempt(backend, resource, ?backend.operations[resource.write_head::usize]);
+        }
+    }
+    arm_resource(backend, resource);
+}
+
+fun begin(backend: *Backend, resource_value: usize, kind: runtime.Kind, context: usize, lane: u8, token: *types.Token, resource_out: **Resource, operation_out: **Operation) i64 {
+    if (backend == nil || token == nil || resource_out == nil || operation_out == nil) { ret invalid(); }
+    var created: bool = false;
+    val resource: *Resource = resource_acquire(backend, resource_value, ?created);
+    if (resource == nil || resource.closing) { ret native.EBADF; }
+    if (lane == LANE_WRITE && resource.write_closed && kind != runtime.CLOSE) {
+        if (created) { resource_release(backend, resource); }
+        ret native.EPIPE;
+    }
+    val operation: *Operation = operation_claim(backend, kind, resource_value, context, token);
+    if (operation == nil) {
+        if (created) { resource_release(backend, resource); }
+        ret native.ENOMEM;
+    }
+    operation.buffer = nil;
+    operation.length = 0;
+    operation.resource_index = resource_index(backend, resource);
+    if (lane != LANE_NONE) { enqueue(backend, resource, operation, lane); }
+    @resource_out = resource;
+    @operation_out = operation;
+    ret 0;
+}
+
+fun submission_done(backend: *Backend, resource: *Resource) {
+    drive_resource(backend, resource, native.IO_EVENT_READ | native.IO_EVENT_WRITE);
+    mutex.unlock(?backend.lock);
+    native.io_queue_wake(backend.queue);
+}
+
+pub fun make(backend: *Backend, queue: *shared.IoQueue, capacity: usize, source_id: u16) i64 {
+    if (backend == nil || queue == nil || capacity == 0 || capacity > 0xffff || source_id == 0) { ret invalid(); }
+    val map_capacity: usize = required_map_capacity(capacity);
+    if (map_capacity == 0) { ret native.ENOMEM; }
+    val operation_size: usize = $size_of(Operation);
+    val resource_size: usize = $size_of(Resource);
+    val map_size: usize = $size_of(u32);
+    val native_size: usize = $size_of(native.IoCompletion);
+    val queued_size: usize = $size_of(QueuedCompletion);
+    val ready_size: usize = $size_of(types.NativeCompletion);
+    val operation_bytes: usize = operation_size * capacity;
+    val resource_bytes: usize = resource_size * capacity;
+    val map_bytes: usize = map_size * map_capacity;
+    val native_bytes: usize = native_size * capacity;
+    val queued_bytes: usize = queued_size * capacity;
+    val ready_bytes: usize = ready_size * capacity;
+    if (operation_bytes / operation_size != capacity || resource_bytes / resource_size != capacity || map_bytes / map_size != map_capacity || native_bytes / native_size != capacity || queued_bytes / queued_size != capacity || ready_bytes / ready_size != capacity) { ret native.ENOMEM; }
+
+    backend.operations = native.allocate(operation_bytes)::*Operation;
+    if (backend.operations == nil) { ret native.ENOMEM; }
+    backend.resources = native.allocate(resource_bytes)::*Resource;
+    if (backend.resources == nil) {
+        native.deallocate(backend.operations::ptr, operation_bytes);
+        backend.operations = nil;
+        ret native.ENOMEM;
+    }
+    backend.resource_map = native.allocate(map_bytes)::*u32;
+    if (backend.resource_map == nil) {
+        native.deallocate(backend.resources::ptr, resource_bytes);
+        native.deallocate(backend.operations::ptr, operation_bytes);
+        ret native.ENOMEM;
+    }
+    backend.native = native.allocate(native_bytes)::*native.IoCompletion;
+    if (backend.native == nil) {
+        native.deallocate(backend.resource_map::ptr, map_bytes);
+        native.deallocate(backend.resources::ptr, resource_bytes);
+        native.deallocate(backend.operations::ptr, operation_bytes);
+        ret native.ENOMEM;
+    }
+    backend.queued = native.allocate(queued_bytes)::*QueuedCompletion;
+    if (backend.queued == nil) {
+        native.deallocate(backend.native::ptr, native_bytes);
+        native.deallocate(backend.resource_map::ptr, map_bytes);
+        native.deallocate(backend.resources::ptr, resource_bytes);
+        native.deallocate(backend.operations::ptr, operation_bytes);
+        ret native.ENOMEM;
+    }
+    backend.ready = native.allocate(ready_bytes)::*types.NativeCompletion;
+    if (backend.ready == nil) {
+        native.deallocate(backend.queued::ptr, queued_bytes);
+        native.deallocate(backend.native::ptr, native_bytes);
+        native.deallocate(backend.resource_map::ptr, map_bytes);
+        native.deallocate(backend.resources::ptr, resource_bytes);
+        native.deallocate(backend.operations::ptr, operation_bytes);
+        ret native.ENOMEM;
+    }
+    backend.queue = queue;
+    backend.source_id = source_id;
+    backend.capacity = capacity;
+    backend.map_capacity = map_capacity;
+    backend.live = 0;
+    backend.resource_count = 0;
+    backend.free_operation = 0;
+    backend.free_resource = 0;
+    backend.queued_head = 0;
+    backend.queued_tail = 0;
+    backend.queued_count = 0;
+    backend.ready_count = 0;
+    backend.sequence = 1;
+    backend.lock = mutex.make();
+    var i: usize = 0;
+    for (i < capacity) {
+        backend.operations[i].state = SLOT_FREE;
+        backend.operations[i].generation = 0;
+        backend.operations[i].next = (i + 1)::u32;
+        backend.resources[i].state = RESOURCE_FREE;
+        backend.resources[i].generation = 0;
+        backend.resources[i].next_free = (i + 1)::u32;
+        i = i + 1;
+    }
+    backend.operations[capacity - 1].next = NONE;
+    backend.resources[capacity - 1].next_free = NONE;
+    i = 0;
+    for (i < map_capacity) { backend.resource_map[i] = 0; i = i + 1; }
+    ret 0;
+}
+
+pub fun create_connect(value: endpoint.Endpoint, resource: *usize) i64 {
+    ret local_impl.create_stream(value, true, resource);
+}
+
+pub fun cleanup_listener(listener: *local_types.Listener) i64 {
+    ret local_impl.cleanup_listener(listener);
+}
+
+pub fun rename_listener(listener: *local_types.Listener, replacement: endpoint.Endpoint) i64 {
+    ret local_impl.rename(listener, replacement);
+}
+
+pub fun close_resource(backend: *Backend, resource: usize) i64 {
+    ret os.sock_close(resource);
+}
+
+pub fun submit_accept(backend: *Backend, listener: usize, context: usize, token: *types.Token) i64 {
+    if (backend == nil || token == nil) { ret invalid(); }
+    mutex.lock(?backend.lock);
+    var resource: *Resource;
+    var operation: *Operation;
+    val status: i64 = begin(backend, listener, runtime.ACCEPT, context, LANE_READ, token, ?resource, ?operation);
+    if (status < 0) {
+        mutex.unlock(?backend.lock);
+        ret status;
+    }
+    submission_done(backend, resource);
+    ret 0;
+}
+
+pub fun submit_connect(backend: *Backend, resource_value: usize, peer: endpoint.Endpoint, context: usize, token: *types.Token) i64 {
+    if (backend == nil || token == nil) { ret invalid(); }
+    mutex.lock(?backend.lock);
+    var resource: *Resource;
+    var operation: *Operation;
+    val status: i64 = begin(backend, resource_value, runtime.CONNECT, context, LANE_WRITE, token, ?resource, ?operation);
+    if (status < 0) {
+        mutex.unlock(?backend.lock);
+        ret status;
+    }
+    operation.peer = peer;
+    submission_done(backend, resource);
+    ret 0;
+}
+
+pub fun submit_read(backend: *Backend, resource_value: usize, buffer: *u8, length: usize, context: usize, token: *types.Token) i64 {
+    if (backend == nil || token == nil || (buffer == nil && length != 0)) { ret invalid(); }
+    mutex.lock(?backend.lock);
+    var resource: *Resource;
+    var operation: *Operation;
+    val status: i64 = begin(backend, resource_value, runtime.READ, context, LANE_READ, token, ?resource, ?operation);
+    if (status < 0) {
+        mutex.unlock(?backend.lock);
+        ret status;
+    }
+    operation.buffer = buffer;
+    operation.length = length;
+    submission_done(backend, resource);
+    ret 0;
+}
+
+pub fun submit_write(backend: *Backend, resource_value: usize, buffer: *u8, length: usize, context: usize, token: *types.Token) i64 {
+    if (backend == nil || token == nil || (buffer == nil && length != 0)) { ret invalid(); }
+    mutex.lock(?backend.lock);
+    var resource: *Resource;
+    var operation: *Operation;
+    val status: i64 = begin(backend, resource_value, runtime.WRITE, context, LANE_WRITE, token, ?resource, ?operation);
+    if (status < 0) {
+        mutex.unlock(?backend.lock);
+        ret status;
+    }
+    operation.buffer = buffer;
+    operation.length = length;
+    submission_done(backend, resource);
+    ret 0;
+}
+
+pub fun submit_shutdown_write(backend: *Backend, resource_value: usize, context: usize, token: *types.Token) i64 {
+    if (backend == nil || token == nil) { ret invalid(); }
+    mutex.lock(?backend.lock);
+    var resource: *Resource;
+    var operation: *Operation;
+    val status: i64 = begin(backend, resource_value, runtime.SHUTDOWN, context, LANE_WRITE, token, ?resource, ?operation);
+    if (status < 0) {
+        mutex.unlock(?backend.lock);
+        ret status;
+    }
+    submission_done(backend, resource);
+    ret 0;
+}
+
+pub fun submit_close(backend: *Backend, resource_value: usize, context: usize, token: *types.Token) i64 {
+    if (backend == nil || token == nil) { ret invalid(); }
+    mutex.lock(?backend.lock);
+    var resource: *Resource;
+    var operation: *Operation;
+    val status: i64 = begin(backend, resource_value, runtime.CLOSE, context, LANE_NONE, token, ?resource, ?operation);
+    if (status < 0) {
+        mutex.unlock(?backend.lock);
+        ret status;
+    }
+    resource.closing = true;
+    resource.close_index = operation_index(backend, operation);
+    for (resource.read_head != NONE) {
+        val read_operation: *Operation = ?backend.operations[resource.read_head::usize];
+        finish(backend, resource, read_operation, native.ECANCELED, 0, 0, resource_value, false);
+    }
+    submission_done(backend, resource);
+    ret 0;
+}
+
+pub fun cancel(backend: *Backend, token: types.Token) i64 {
+    if (backend == nil) { ret invalid(); }
+    mutex.lock(?backend.lock);
+    val operation: *Operation = operation_any(backend, token);
+    if (operation == nil) {
+        mutex.unlock(?backend.lock);
+        ret native.EBADF;
+    }
+    if (operation.state == SLOT_QUEUED) {
+        var offset: usize = 0;
+        var found: bool = false;
+        var removed: types.NativeCompletion;
+        for (offset < backend.queued_count && !found) {
+            val position: usize = (backend.queued_head + offset) % backend.capacity;
+            if (backend.queued[position].operation_index == token.index) {
+                removed = backend.queued[position].value;
+                var current: usize = offset;
+                for (current + 1 < backend.queued_count) {
+                    val from: usize = (backend.queued_head + current + 1) % backend.capacity;
+                    val to: usize = (backend.queued_head + current) % backend.capacity;
+                    backend.queued[to] = backend.queued[from];
+                    current = current + 1;
+                }
+                backend.queued_tail = (backend.queued_tail + backend.capacity - 1) % backend.capacity;
+                backend.queued_count = backend.queued_count - 1;
+                found = true;
+            }
+            offset = offset + 1;
+        }
+        if (!found) {
+            mutex.unlock(?backend.lock);
+            ret native.EBADF;
+        }
+        operation_release(backend, token.index);
+        mutex.unlock(?backend.lock);
+        if (removed.kind == runtime.ACCEPT && removed.status == 0) { socket_close(removed.resource); }
+        native.io_queue_wake(backend.queue);
+        ret 0;
+    }
+    val resource: *Resource = ?backend.resources[operation.resource_index::usize];
+    if (operation.kind == runtime.CLOSE) {
+        resource.close_index = NONE;
+        unlink(backend, resource, operation);
+        operation_release(backend, token.index);
+        fail_resource(backend, resource, native.ECANCELED);
+        native.io_queue_unwatch(backend.queue, resource.resource);
+        resource.armed = false;
+        socket_close(resource.resource);
+        resource_release_unwatched(backend, resource);
+        mutex.unlock(?backend.lock);
+        native.io_queue_wake(backend.queue);
+        ret 0;
+    }
+    unlink(backend, resource, operation);
+    operation_release(backend, token.index);
+    drive_resource(backend, resource, native.IO_EVENT_READ | native.IO_EVENT_WRITE);
+    mutex.unlock(?backend.lock);
+    native.io_queue_wake(backend.queue);
+    ret 0;
+}
+
+fun publish_ready(backend: *Backend) usize {
+    var count: usize = 0;
+    for (backend.queued_count > 0) {
+        val queued: QueuedCompletion = backend.queued[backend.queued_head];
+        backend.ready[count] = queued.value;
+        operation_release(backend, queued.operation_index);
+        backend.queued_head = (backend.queued_head + 1) % backend.capacity;
+        backend.queued_count = backend.queued_count - 1;
+        count = count + 1;
+    }
+    backend.ready_count = count;
+    ret count;
+}
+
+pub fun flush(backend: *Backend) i64 {
+    if (backend == nil) { ret invalid(); }
+    mutex.lock(?backend.lock);
+    val ready: usize = publish_ready(backend);
+    mutex.unlock(?backend.lock);
+    ret ready::i64;
+}
+
+pub fun dispatch(
+    backend: *Backend,
+    context: usize,
+    events: u32,
+    status: i64,
+    flags: u64,
+    claimed: *bool,
+) i64 {
+    if (backend == nil || claimed == nil) { ret invalid(); }
+    @claimed = false;
+    var resource_token: types.Token;
+    if (!context_token(backend, context, ?resource_token)) { ret 0; }
+    @claimed = true;
+    mutex.lock(?backend.lock);
+    val resource: *Resource = resource_for(backend, resource_token);
+    if (resource != nil) {
+        resource.armed = false;
+        drive_resource(backend, resource, events);
+    }
+    val ready: usize = publish_ready(backend);
+    mutex.unlock(?backend.lock);
+    ret ready::i64;
+}
+
+# one thread owns poll and completion retrieval
+pub fun poll(backend: *Backend, timeout_ms: i32) i64 {
+    if (backend == nil) { ret invalid(); }
+    mutex.lock(?backend.lock);
+    backend.ready_count = 0;
+    val already_ready: bool = backend.queued_count != 0;
+    mutex.unlock(?backend.lock);
+
+    var native_timeout: i32 = timeout_ms;
+    if (already_ready) { native_timeout = 0; }
+    val count: i64 = native.io_queue_poll(backend.queue, backend.native, backend.capacity, native_timeout);
+    mutex.lock(?backend.lock);
+    var i: usize = 0;
+    if (count > 0) {
+        for (i < count::usize) {
+            val native_completion: native.IoCompletion = backend.native[i];
+            if (native_completion.context != 0 && (native_completion.events & native.IO_EVENT_WAKE) == 0) {
+                var resource_token: types.Token;
+                if (context_token(backend, native_completion.context, ?resource_token)) {
+                    val resource: *Resource = resource_for(backend, resource_token);
+                    if (resource != nil) {
+                        resource.armed = false;
+                        drive_resource(backend, resource, native_completion.events);
+                    }
+                }
+            }
+            i = i + 1;
+        }
+    }
+    val ready: usize = publish_ready(backend);
+    mutex.unlock(?backend.lock);
+    if (ready == 0 && count < 0) { ret count; }
+    ret ready::i64;
+}
+
+pub fun completion(backend: *Backend, index: usize, out: *types.NativeCompletion) i64 {
+    if (backend == nil || out == nil || index >= backend.ready_count) { ret invalid(); }
+    @out = backend.ready[index];
+    ret 0;
+}
+
+pub fun destroy(backend: *Backend) i64 {
+    if (backend == nil) { ret invalid(); }
+    mutex.lock(?backend.lock);
+    if (backend.live != 0 || backend.resource_count != 0 || backend.queued_count != 0) {
+        mutex.unlock(?backend.lock);
+        ret native.EBUSY;
+    }
+    val operation_bytes: usize = $size_of(Operation) * backend.capacity;
+    val resource_bytes: usize = $size_of(Resource) * backend.capacity;
+    val map_bytes: usize = $size_of(u32) * backend.map_capacity;
+    val native_bytes: usize = $size_of(native.IoCompletion) * backend.capacity;
+    val queued_bytes: usize = $size_of(QueuedCompletion) * backend.capacity;
+    val ready_bytes: usize = $size_of(types.NativeCompletion) * backend.capacity;
+    native.deallocate(backend.ready::ptr, ready_bytes);
+    native.deallocate(backend.queued::ptr, queued_bytes);
+    native.deallocate(backend.native::ptr, native_bytes);
+    native.deallocate(backend.resource_map::ptr, map_bytes);
+    native.deallocate(backend.resources::ptr, resource_bytes);
+    native.deallocate(backend.operations::ptr, operation_bytes);
+    backend.ready = nil;
+    backend.queued = nil;
+    backend.native = nil;
+    backend.resource_map = nil;
+    backend.resources = nil;
+    backend.operations = nil;
+    backend.capacity = 0;
+    backend.map_capacity = 0;
+    backend.ready_count = 0;
+    backend.queue = nil;
+    backend.source_id = 0;
+    mutex.unlock(?backend.lock);
+    ret 0;
+}
+
+fun stream_accept(listener: usize, accepted: *usize) i64 {
+    if (accepted == nil) { ret invalid(); }
+    var address: [128]u8;
+    var address_length: u32 = 128;
+    ret native.sock_accept_flags(listener, ?address[0], ?address_length, true, true, accepted);
+}
+
+fun stream_connect(resource: usize, peer: endpoint.Endpoint) i64 {
+    ret local_impl.connect_start(resource, peer);
+}
+
+fun stream_connect_status(resource: usize) i64 {
+    ret native.sock_connect_status(resource);
+}
+
+fun stream_read(resource: usize, buffer: *u8, length: usize) i64 {
+    if (buffer == nil && length != 0) { ret invalid(); }
+    ret native.sock_recv(resource, buffer, length);
+}
+
+fun stream_write(resource: usize, buffer: *u8, length: usize) i64 {
+    if (buffer == nil && length != 0) { ret invalid(); }
+    ret native.sock_send(resource, buffer, length);
+}
+
+
+fun stream_shutdown_write(resource: usize) i64 {
+    ret native.sock_shutdown(resource, native.SHUT_WR);
+}
+
+fun socket_close(resource: usize) i64 {
+    ret native.sock_close(resource);
+}
