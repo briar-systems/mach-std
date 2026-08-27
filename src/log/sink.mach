@@ -78,6 +78,9 @@ pub rec Sink {
 }
 
 # direct sinks must remain at a stable address and must not be copied in use
+# reinitialization requires every current publication to stop first
+# existing sinks retarget to the new adapter but retain their copied contract and must be discarded
+# direct owns no resources and requires no destruction
 pub rec Direct {
     lock:        mutex.Mutex;
     adapter_ctx: ptr;
@@ -170,24 +173,37 @@ pub fun publish(sink: *Sink, data: *u8, len: usize) WriteReport {
         ret report(WRITE_REJECTED, len, 0, false, record.ERR_RECORD_TOO_LARGE);
     }
     val result: WriteReport = sink.f_publish(sink.ctx, data, len);
+    if (sink.contract.delivery == DELIVERY_DIRECT) { ret validate_direct(result, len); }
     if (result.status > WRITE_SUPPRESSED || result.offered != len || result.persisted > len) {
         ret failed(len, 0, ERR_INVALID_REPORT);
     }
-    if (sink.contract.delivery == DELIVERY_DIRECT) { ret normalize_direct(result, len); }
     ret result;
 }
 
-# direct publication confirms the complete record or exposes no persisted bytes
-fun normalize_direct(result: WriteReport, len: usize) WriteReport {
-    if (result.status == WRITE_PERSISTED) {
-        if (result.persisted != len) { ret failed(len, 0, ERR_INVALID_REPORT); }
-        ret report(WRITE_PERSISTED, len, len, result.truncated, result.error);
-    }
-    if (result.status == WRITE_ENQUEUED || result.status == WRITE_SUPPRESSED) {
+# direct atomicity is one callback while confirmed short-write bytes remain observable
+fun validate_direct(result: WriteReport, len: usize) WriteReport {
+    if (result.offered != len || result.persisted > len) {
         ret failed(len, 0, ERR_INVALID_REPORT);
     }
-    if (len > 0 && result.persisted == len) { ret failed(len, 0, ERR_INVALID_REPORT); }
-    ret report(result.status, len, 0, result.truncated, result.error);
+    if (result.status == WRITE_PERSISTED) {
+        if (result.persisted != len || result.error != nil) {
+            ret failed(len, 0, ERR_INVALID_REPORT);
+        }
+        ret result;
+    }
+    if (result.status == WRITE_PARTIAL) {
+        if (result.persisted == 0 || result.persisted == len || result.error == nil) {
+            ret failed(len, 0, ERR_INVALID_REPORT);
+        }
+        ret result;
+    }
+    if (result.status == WRITE_FAILED) {
+        if (result.error == nil || (len > 0 && result.persisted == len)) {
+            ret failed(len, 0, ERR_INVALID_REPORT);
+        }
+        ret result;
+    }
+    ret failed(len, 0, ERR_INVALID_REPORT);
 }
 
 fun direct_publish(ctx: ptr, data: *u8, len: usize) WriteReport {
@@ -210,6 +226,7 @@ fun writer_publish(ctx: ptr, data: *u8, len: usize) WriteReport {
     }
     val written: usize = R.unwrap_ok[usize, str](result);
     if (written > len) { ret failed(len, 0, ERR_INVALID_REPORT); }
+    if (written == 0 && len > 0) { ret failed(len, 0, writer.ERR_SHORT_WRITE); }
     if (written < len) { ret partial(len, written, writer.ERR_SHORT_WRITE); }
     ret persisted(len);
 }
@@ -349,9 +366,42 @@ test "log.sink: custom adapter reports partial writes and recovers after failure
 
     capture.partial_at = 2;
     val third: WriteReport = publish(?sink, "third", 5);
-    if (third.status != WRITE_PARTIAL || third.offered != 5 || third.persisted != 0) { ret 4; }
+    if (third.status != WRITE_PARTIAL || third.offered != 5 || third.persisted != 2) { ret 4; }
     if (capture.calls != 3 || !bytes_equal((?capture.data)::*u8, capture.len, "secondth")) { ret 5; }
     ret 0;
+}
+
+rec ShortWriter {
+    count: usize;
+}
+
+fun short_writer(ctx: ptr, data: *u8, len: usize) R.Result[usize, str] {
+    val state: *ShortWriter = ctx::*ShortWriter;
+    ret R.ok[usize, str](state.count);
+}
+
+test "log.sink: writer adapter preserves confirmed short-write bytes" {
+    var state: ShortWriter = ShortWriter{count: 2};
+    val output: writer.Writer = writer.Writer{ctx: ?state, f_write: short_writer};
+    var direct: Direct;
+    val sr: R.Result[Sink, str] = from_writer(?direct, output, 128, record.OVERSIZE_REJECT, 0);
+    if (R.is_err[Sink, str](sr)) { ret 1; }
+    var sink: Sink = R.unwrap_ok[Sink, str](sr);
+
+    val partial_result: WriteReport = publish(?sink, "short", 5);
+    if (partial_result.status != WRITE_PARTIAL || partial_result.persisted != 2
+     || partial_result.error != writer.ERR_SHORT_WRITE) { ret 2; }
+
+    state.count = 0;
+    val stalled: WriteReport = publish(?sink, "stalled", 7);
+    if (stalled.status != WRITE_FAILED || stalled.persisted != 0
+     || stalled.error != writer.ERR_SHORT_WRITE) { ret 3; }
+    ret 0;
+}
+
+rec DirectReportCase {
+    result: WriteReport;
+    valid:  bool;
 }
 
 rec MalformedCapture {
@@ -363,7 +413,7 @@ fun malformed_write(ctx: ptr, data: *u8, len: usize) WriteReport {
     ret capture.result;
 }
 
-test "log.sink: direct publication rejects contradictory adapter reports" {
+test "log.sink: direct adapter report status error and count matrix" {
     val cr: R.Result[Contract, str] = direct_contract(128, record.OVERSIZE_REJECT, ADAPTER_CUSTOM, 0);
     if (R.is_err[Contract, str](cr)) { ret 1; }
     var capture: MalformedCapture;
@@ -371,41 +421,40 @@ test "log.sink: direct publication rejects contradictory adapter reports" {
     if (R.is_err[Sink, str](sr)) { ret 2; }
     var sink: Sink = R.unwrap_ok[Sink, str](sr);
 
-    capture.result = report(WRITE_PERSISTED, 4, 3, false, nil);
-    val short_ok: WriteReport = publish(?sink, "test", 4);
-    if (short_ok.status != WRITE_FAILED || short_ok.persisted != 0 || short_ok.error != ERR_INVALID_REPORT) { ret 3; }
+    var cases: [18]DirectReportCase;
+    cases[0] = DirectReportCase{result: report(WRITE_PERSISTED, 4, 4, false, nil), valid: true};
+    cases[1] = DirectReportCase{result: report(WRITE_PARTIAL, 4, 2, false, writer.ERR_SHORT_WRITE), valid: true};
+    cases[2] = DirectReportCase{result: report(WRITE_FAILED, 4, 0, false, ERR_DIRECT_WRITE_FAILED), valid: true};
+    cases[3] = DirectReportCase{result: report(WRITE_FAILED, 4, 2, false, ERR_DIRECT_WRITE_FAILED), valid: true};
+    cases[4] = DirectReportCase{result: report(WRITE_PERSISTED, 4, 3, false, nil), valid: false};
+    cases[5] = DirectReportCase{result: report(WRITE_PERSISTED, 4, 4, false, ERR_DIRECT_WRITE_FAILED), valid: false};
+    cases[6] = DirectReportCase{result: report(WRITE_PARTIAL, 4, 0, false, writer.ERR_SHORT_WRITE), valid: false};
+    cases[7] = DirectReportCase{result: report(WRITE_PARTIAL, 4, 4, false, writer.ERR_SHORT_WRITE), valid: false};
+    cases[8] = DirectReportCase{result: report(WRITE_PARTIAL, 4, 2, false, nil), valid: false};
+    cases[9] = DirectReportCase{result: report(WRITE_FAILED, 4, 0, false, nil), valid: false};
+    cases[10] = DirectReportCase{result: report(WRITE_FAILED, 4, 4, false, ERR_DIRECT_WRITE_FAILED), valid: false};
+    cases[11] = DirectReportCase{result: report(WRITE_REJECTED, 4, 0, false, ERR_DIRECT_WRITE_FAILED), valid: false};
+    cases[12] = DirectReportCase{result: report(WRITE_DROPPED, 4, 0, false, ERR_DIRECT_WRITE_FAILED), valid: false};
+    cases[13] = DirectReportCase{result: report(WRITE_ENQUEUED, 4, 0, false, nil), valid: false};
+    cases[14] = DirectReportCase{result: report(WRITE_SUPPRESSED, 4, 0, false, nil), valid: false};
+    cases[15] = DirectReportCase{result: report((WRITE_SUPPRESSED + 1)::WriteStatus, 4, 0, false, nil), valid: false};
+    cases[16] = DirectReportCase{result: report(WRITE_PERSISTED, 4, 5, false, nil), valid: false};
+    cases[17] = DirectReportCase{result: report(WRITE_PERSISTED, 3, 3, false, nil), valid: false};
 
-    capture.result = report(WRITE_FAILED, 4, 4, false, ERR_DIRECT_WRITE_FAILED);
-    val failed_full: WriteReport = publish(?sink, "test", 4);
-    if (failed_full.status != WRITE_FAILED || failed_full.persisted != 0 || failed_full.error != ERR_INVALID_REPORT) { ret 4; }
-
-    capture.result = report(WRITE_REJECTED, 4, 4, false, ERR_DIRECT_WRITE_FAILED);
-    val rejected_full: WriteReport = publish(?sink, "test", 4);
-    if (rejected_full.status != WRITE_FAILED || rejected_full.persisted != 0 || rejected_full.error != ERR_INVALID_REPORT) { ret 5; }
-
-    capture.result = report(WRITE_PERSISTED, 4, 5, false, nil);
-    val oversized: WriteReport = publish(?sink, "test", 4);
-    if (oversized.status != WRITE_FAILED || oversized.persisted != 0 || oversized.error != ERR_INVALID_REPORT) { ret 6; }
-    ret 0;
-}
-
-test "log.sink: direct publication exposes no partial persistence" {
-    val cr: R.Result[Contract, str] = direct_contract(128, record.OVERSIZE_REJECT, ADAPTER_CUSTOM, 0);
-    if (R.is_err[Contract, str](cr)) { ret 1; }
-    var capture: MalformedCapture;
-    val sr: R.Result[Sink, str] = make(?capture, malformed_write, R.unwrap_ok[Contract, str](cr));
-    if (R.is_err[Sink, str](sr)) { ret 2; }
-    var sink: Sink = R.unwrap_ok[Sink, str](sr);
-
-    capture.result = report(WRITE_PARTIAL, 4, 2, false, writer.ERR_SHORT_WRITE);
-    val partial_result: WriteReport = publish(?sink, "test", 4);
-    if (partial_result.status != WRITE_PARTIAL || partial_result.persisted != 0
-     || partial_result.error != writer.ERR_SHORT_WRITE) { ret 3; }
-
-    capture.result = report(WRITE_FAILED, 4, 2, false, ERR_DIRECT_WRITE_FAILED);
-    val failed_result: WriteReport = publish(?sink, "test", 4);
-    if (failed_result.status != WRITE_FAILED || failed_result.persisted != 0
-     || failed_result.error != ERR_DIRECT_WRITE_FAILED) { ret 4; }
+    var i: usize = 0;
+    for (i < 18) {
+        capture.result = cases[i].result;
+        val result: WriteReport = publish(?sink, "test", 4);
+        if (cases[i].valid) {
+            if (result.status != cases[i].result.status || result.offered != cases[i].result.offered
+             || result.persisted != cases[i].result.persisted || result.error != cases[i].result.error) { ret 3; }
+        }
+        or {
+            if (result.status != WRITE_FAILED || result.offered != 4 || result.persisted != 0
+             || result.error != ERR_INVALID_REPORT) { ret 4; }
+        }
+        i = i + 1;
+    }
     ret 0;
 }
 
