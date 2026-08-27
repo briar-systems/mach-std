@@ -43,7 +43,7 @@ explicit="$scratch/repo/test/fault/out/$target/debug/lib/fault"
 
 members="$("${AR:-ar}" t "$explicit")"
 for module in script reader writer allocator clock datagram race; do
-    printf '%s\n' "$members" | grep -q "^fault\.$module$" \
+    grep -q "^fault\.$module$" <<< "$members" \
         || fail "explicit fault archive omitted fault.$module"
 done
 

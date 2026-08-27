@@ -12,7 +12,7 @@ fail() { echo "FAIL: $1" >&2; exit 1; }
 members="$($archive_tool t "$archive")" \
     || fail "release archive could not be inspected"
 normalized="$(printf '%s\n' "$members" | tr '\\' '/')"
-if printf '%s\n' "$normalized" | grep -Eq '(^|[./])fault([./]|$)'; then
+if grep -Eq '(^|[./])fault([./]|$)' <<< "$normalized"; then
     fail "test-only fault module entered the release archive"
 fi
 
