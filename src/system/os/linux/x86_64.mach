@@ -5,6 +5,7 @@
 
 use std.types.size.usize;
 use std.system.panic.panic;
+use std.sync.atomic;
 
 use std.system.os.linux.shared;
 
@@ -45,40 +46,95 @@ pub fun page_size() usize {
 
 val THREAD_CLONE_FLAGS: usize = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM;
 
-# entered by a direct jump from the child side of clone (see thread_spawn);
-# the symbol is pinned so the inline-asm branch can target it. at entry rsp
-# points at the argument block on the child stack, so after the prologue the
-# args sit at [rbp+8..rbp+40] exactly as if the trampoline had been called.
+# entered by a direct jump from the child side of clone
 #[symbol("_std_thread_trampoline")]
 fun thread_trampoline() {
     var fn_addr: usize = 0;
-    var done_addr: usize = 0;
+    var arg_addr: usize = 0;
+    var state_addr: usize = 0;
+    var reclaimable_addr: usize = 0;
+    var owner_base: usize = 0;
+    var owner_size: usize = 0;
     var stack_base: usize = 0;
     var stack_size: usize = 0;
-    var arg_addr: usize = 0;
+    var name_addr: usize = 0;
+    var setup_addr: usize = 0;
+    var run_addr: usize = 0;
+    var setup_error_addr: usize = 0;
     asm x86_64 {
         mov rax, [rbp+8]
         mov {fn_addr}, rax
         mov rax, [rbp+16]
-        mov {done_addr}, rax
-        mov rax, [rbp+24]
-        mov {stack_base}, rax
-        mov rax, [rbp+32]
-        mov {stack_size}, rax
-        mov rax, [rbp+40]
         mov {arg_addr}, rax
+        mov rax, [rbp+24]
+        mov {state_addr}, rax
+        mov rax, [rbp+32]
+        mov {reclaimable_addr}, rax
+        mov rax, [rbp+40]
+        mov {owner_base}, rax
+        mov rax, [rbp+48]
+        mov {owner_size}, rax
+        mov rax, [rbp+56]
+        mov {stack_base}, rax
+        mov rax, [rbp+64]
+        mov {stack_size}, rax
+        mov rax, [rbp+72]
+        mov {name_addr}, rax
+        lea rax, [rbp+80]
+        mov {setup_addr}, rax
+        lea rax, [rbp+88]
+        mov {run_addr}, rax
+        lea rax, [rbp+96]
+        mov {setup_error_addr}, rax
     }
-    val fn_ptr: fun(*u8) = fn_addr::fun(*u8);
-    fn_ptr(arg_addr::*u8);
-    val done: *i64 = done_addr::*i64;
-    @done = 1;
-    shared.syscall6(shared.SYS_FUTEX, done_addr, shared.FUTEX_WAKE, 1, 0, 0, 0);
+
+    val setup: *i64 = setup_addr::*i64;
+    val run: *i64 = run_addr::*i64;
+    atomic.store(setup_error_addr::*i64, shared.thread_set_name(name_addr::*u8));
+    atomic.store(setup, 1);
+    shared.thread_wake(setup);
+    for (atomic.load(run) == 0) { shared.thread_wait(run, 0); }
+
+    var detached: i64 = 0;
+    if (atomic.load(run) > 0) {
+        val fn_ptr: fun(*u8) = fn_addr::fun(*u8);
+        fn_ptr(arg_addr::*u8);
+        val state: *i64 = state_addr::*i64;
+        var expected: i64 = 0;
+        if (!atomic.cas(state, ?expected, 1)) { detached = 1; }
+    }
+
     asm x86_64 {
-        # munmap stack then exit
-        mov rdi, {stack_base}
-        mov rsi, {stack_size}
+        mov r12, {stack_base}
+        mov r13, {stack_size}
+        mov r14, {reclaimable_addr}
+        mov r15, {owner_base}
+        mov rbx, {owner_size}
+        mov r10, {detached}
+
+        mov rdi, r12
+        mov rsi, r13
         mov rax, 11           # SYS_munmap
         syscall
+
+        test r10, r10
+        jnz 1f
+        mov qword [r14], 1
+        mov rdi, r14
+        mov rsi, 1            # FUTEX_WAKE
+        mov rdx, 1
+        xor r10, r10
+        xor r8, r8
+        xor r9, r9
+        mov rax, 202          # SYS_futex
+        syscall
+        jmp 2f
+    1:
+        mov rdi, r15
+        mov rsi, rbx
+        mov rax, 11           # SYS_munmap
+        syscall
+    2:
         mov rdi, 0
         mov rax, 60           # SYS_exit
         syscall
@@ -88,26 +144,34 @@ fun thread_trampoline() {
 
 # create a new thread sharing the current address space
 #
-# uses clone with shared VM, FS, files, and signals. the child's stack
-# carries the entry pointer, done_ptr, and the opaque arg, so no globals
-# are needed. the child calls f(arg), sets *done_ptr to 1, wakes one
-# futex waiter, and exits. arg rides in the fifth (previously slack) word
-# of the argument block, so child_sp keeps its 8-mod-16 alignment.
+# uses clone with shared VM, FS, files, and signals. target-owned stack metadata
+# and portable owner pointers ride on the child stack without global handoff.
 # ---
-# f:          entry function to execute in the new thread
-# arg:        opaque pointer passed through to f
-# done_ptr:   pointer to a completion flag (set to 1 when thread exits)
-# stack_base: base address of the pre-allocated stack region
-# stack_size: size of the stack in bytes
-# ret:        thread ID on success, or negative errno on failure
-pub fun thread_spawn(f: fun(*u8), arg: *u8, done_ptr: *i64, stack_base: usize, stack_size: usize) i64 {
+# ret: thread ID on success, or negative errno on failure
+pub fun thread_spawn(
+    f: fun(*u8), arg: *u8, state: *i64, reclaimable: *i64,
+    owner: ptr, owner_size: usize, name: *u8,
+    stack_reserve: usize, stack_commit: usize, native: *usize,
+) i64 {
+    var stack_base: usize = 0;
+    val allocation_error: i64 = shared.thread_stack_allocate(stack_reserve, stack_commit, ?stack_base);
+    if (allocation_error < 0) { ret allocation_error; }
+
+    val stack_size: usize = stack_reserve;
     val stack_top: usize = stack_base + stack_size;
-    val child_sp: usize = stack_top - 40;
+    val child_sp: usize = stack_top - 104;
     @(child_sp::*usize) = f::usize;
-    @((child_sp + 8)::*usize) = done_ptr::usize;
-    @((child_sp + 16)::*usize) = stack_base;
-    @((child_sp + 24)::*usize) = stack_size;
-    @((child_sp + 32)::*usize) = arg::usize;
+    @((child_sp + 8)::*usize) = arg::usize;
+    @((child_sp + 16)::*usize) = state::usize;
+    @((child_sp + 24)::*usize) = reclaimable::usize;
+    @((child_sp + 32)::*usize) = owner::usize;
+    @((child_sp + 40)::*usize) = owner_size;
+    @((child_sp + 48)::*usize) = stack_base;
+    @((child_sp + 56)::*usize) = stack_size;
+    @((child_sp + 64)::*usize) = name::usize;
+    @((child_sp + 72)::*i64) = 0;
+    @((child_sp + 80)::*i64) = 0;
+    @((child_sp + 88)::*i64) = 0;
 
     var flags: usize = THREAD_CLONE_FLAGS;
     var stack_ptr: usize = child_sp;
@@ -132,7 +196,38 @@ pub fun thread_spawn(f: fun(*u8), arg: *u8, done_ptr: *i64, stack_base: usize, s
         mov {result}, rax     # parent: tid, or negative errno on failure
     }
 
+    if (result < 0) {
+        shared.deallocate(stack_base::ptr, stack_size);
+        ret result;
+    }
+
+    val setup: *i64 = (child_sp + 72)::*i64;
+    val run: *i64 = (child_sp + 80)::*i64;
+    val setup_error: *i64 = (child_sp + 88)::*i64;
+    for (atomic.load(setup) == 0) { shared.thread_wait(setup, 0); }
+    if (atomic.load(setup_error) < 0) {
+        val r: i64 = atomic.load(setup_error);
+        atomic.store(run, -1);
+        shared.thread_wake(run);
+        for (atomic.load(reclaimable) == 0) { shared.thread_wait(reclaimable, 0); }
+        ret r;
+    }
+
+    @native = 0;
+    atomic.store(run, 1);
+    shared.thread_wake(run);
     ret result;
+}
+
+pub fun thread_join(native: usize, reclaimable: *i64) i64 {
+    for (atomic.load(reclaimable) == 0) {
+        shared.thread_wait(reclaimable, 0);
+    }
+    ret 0;
+}
+
+pub fun thread_detach(native: usize) i64 {
+    ret 0;
 }
 
 # kernel ABI types

@@ -135,6 +135,8 @@ val WAIT_TIMEOUT:  u32 = 258;
 val WAIT_FAILED:   u32 = 0xFFFFFFFF;
 val INFINITE:      u32 = 0xFFFFFFFF;
 
+val STACK_SIZE_PARAM_IS_A_RESERVATION: u32 = 0x00010000;
+
 # CreateProcess / STARTUPINFO
 val STARTF_USESTDHANDLES:         u32 = 0x00000100;
 val HANDLE_FLAG_INHERIT:          u32 = 0x00000001;
@@ -283,6 +285,8 @@ ext fun QueryPerformanceFrequency(p0: *i64) i32;
 
 #[library("kernel32.dll")]
 ext fun CreateThread(p0: ptr, p1: usize, p2: usize, p3: ptr, p4: u32, p5: *u32) isize;
+#[library("kernel32.dll")]
+ext fun SetThreadDescription(p0: isize, p1: *u16) i32;
 
 # WaitOnAddress / WakeByAddressSingle live in the synch apiset DLL, not kernel32
 # real windows' kernel32 does not export them (only wine's does), so without
@@ -2418,46 +2422,123 @@ pub fun stop_signal(status: i32) i32 {
 
 # threads
 
-# thread callback. receives the pre-allocated stack base as its parameter,
-# where fn_addr, done_addr, and the opaque arg are stored at offsets 0, 8,
-# and 16.
-fun thread_trampoline(arg: ptr) {
-    val base: usize = arg::usize;
-    val fn_addr: usize = @(base::*usize);
-    val done_addr: usize = @((base + 8)::*usize);
-    val user: usize = @((base + 16)::*usize);
-    val fn_ptr: fun(*u8) = fn_addr::fun(*u8);
-    fn_ptr(user::*u8);
-    val done: *i64 = done_addr::*i64;
-    @done = 1;
-    WakeByAddressSingle(done::ptr);
+rec ThreadStart {
+    fn_addr:          usize;
+    arg_addr:         usize;
+    state_addr:       usize;
+    reclaimable_addr: usize;
+    owner_base:       usize;
+    owner_size:       usize;
+    run:              i64;
 }
 
-# create a new thread via CreateThread
-#
-# stores fn, done_ptr, and the opaque arg at the base of the pre-allocated
-# stack region, then passes that address as CreateThread's lpParameter. the
-# trampoline reads the values from the parameter, so no globals are needed
-# and multiple threads may be spawned concurrently.
-# ---
-# f:          entry function to execute in the new thread
-# arg:        opaque pointer passed through to f
-# done_ptr:   pointer to a completion flag (set to 1 when thread exits)
-# stack_base: base address of the pre-allocated stack region
-# stack_size: size of the stack in bytes
-# ret:        thread ID on success, or negative errno on failure
-pub fun thread_spawn(f: fun(*u8), arg: *u8, done_ptr: *i64, stack_base: usize, stack_size: usize) i64 {
-    @(stack_base::*usize) = f::usize;
-    @((stack_base + 8)::*usize) = done_ptr::usize;
-    @((stack_base + 16)::*usize) = arg::usize;
+val THREAD_START_SIZE: usize = 4096;
+
+fun thread_trampoline(arg: ptr) {
+    val start: *ThreadStart = arg::usize::*ThreadStart;
+    for (atomic.load(?start.run) == 0) {
+        atomic.spin_hint();
+    }
+
+    val fn_addr: usize = start.fn_addr;
+    val arg_addr: usize = start.arg_addr;
+    val state_addr: usize = start.state_addr;
+    val reclaimable_addr: usize = start.reclaimable_addr;
+    val owner_base: usize = start.owner_base;
+    val owner_size: usize = start.owner_size;
+    val run: i64 = atomic.load(?start.run);
+    deallocate(start::ptr, THREAD_START_SIZE);
+
+    if (run < 0) {
+        atomic.store(reclaimable_addr::*i64, 1);
+        ret;
+    }
+
+    val fn_ptr: fun(*u8) = fn_addr::fun(*u8);
+    fn_ptr(arg_addr::*u8);
+
+    val state: *i64 = state_addr::*i64;
+    var expected: i64 = 0;
+    if (atomic.cas(state, ?expected, 1)) {
+        atomic.store(reclaimable_addr::*i64, 1);
+    }
+    or {
+        deallocate(owner_base::ptr, owner_size);
+    }
+}
+
+fun set_thread_name(handle: isize, name: *u8) i64 {
+    if (@name == 0) { ret 0; }
+    var wide: [16]u16;
+    var i: usize = 0;
+    for (i < 15 && name[i] != 0) {
+        wide[i] = name[i]::u16;
+        i = i + 1;
+    }
+    wide[i] = 0;
+    val rc: i32 = SetThreadDescription(handle, ?wide[0]);
+    if (rc < 0) { ret rc::i64; }
+    ret 0;
+}
+
+# create a thread with a retained native handle
+pub fun thread_spawn(
+    f: fun(*u8), arg: *u8, state: *i64, reclaimable: *i64,
+    owner: ptr, owner_size: usize, name: *u8,
+    stack_reserve: usize, stack_commit: usize, native: *usize,
+) i64 {
+    if (stack_commit != 0) { ret -95; }
+
+    val start_mem: ptr = allocate(THREAD_START_SIZE);
+    if (start_mem == nil) { ret -12; }
+    val start: *ThreadStart = start_mem::usize::*ThreadStart;
+    start.fn_addr = f::usize;
+    start.arg_addr = arg::usize;
+    start.state_addr = state::usize;
+    start.reclaimable_addr = reclaimable::usize;
+    start.owner_base = owner::usize;
+    start.owner_size = owner_size;
+    start.run = 0;
+
     var tid: u32 = 0;
     val tramp: fun(ptr) = thread_trampoline;
-    val h: isize = CreateThread(nil, stack_size, tramp::usize, stack_base::ptr, 0, ?tid);
+    val h: isize = CreateThread(
+        nil,
+        stack_reserve,
+        tramp::usize,
+        start_mem,
+        STACK_SIZE_PARAM_IS_A_RESERVATION,
+        ?tid,
+    );
     if (h == 0) {
-        ret last_error();
+        val r: i64 = last_error();
+        deallocate(start_mem, THREAD_START_SIZE);
+        ret r;
     }
-    CloseHandle(h);
+
+    val name_error: i64 = set_thread_name(h, name);
+    if (name_error < 0) {
+        atomic.store(?start.run, -1);
+        WaitForSingleObject(h, INFINITE);
+        CloseHandle(h);
+        ret name_error;
+    }
+
+    @native = h::usize;
+    atomic.store(?start.run, 1);
     ret tid::i64;
+}
+
+pub fun thread_join(native: usize, reclaimable: *i64) i64 {
+    val h: isize = native::isize;
+    if (WaitForSingleObject(h, INFINITE) != WAIT_OBJECT_0) { ret last_error(); }
+    if (CloseHandle(h) == 0) { ret last_error(); }
+    ret 0;
+}
+
+pub fun thread_detach(native: usize) i64 {
+    if (CloseHandle(native::isize) == 0) { ret last_error(); }
+    ret 0;
 }
 
 # block until the value at addr changes from expected
