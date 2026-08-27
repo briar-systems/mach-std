@@ -81,6 +81,7 @@ pub rec Backend {
     operations: *Operation;
     attached: *usize;
     native: *windows.IoCompletion;
+    preserved: *windows.IoCompletion;
     completions: *types.NativeCompletion;
     capacity: usize;
     active: usize;
@@ -88,6 +89,7 @@ pub rec Backend {
     next: usize;
     attached_count: usize;
     lock: mutex.Mutex;
+    io_lock: mutex.Mutex;
 }
 
 val SLOT_FREE: u8 = 0;
@@ -290,11 +292,21 @@ pub fun make(backend: *Backend, queue: *shared.IoQueue, capacity: usize, source_
         backend.operations = nil;
         ret windows.ENOMEM;
     }
+    backend.preserved = windows.allocate(native_bytes)::*windows.IoCompletion;
+    if (backend.preserved == nil) {
+        windows.deallocate(backend.native::ptr, native_bytes);
+        windows.deallocate(backend.operations::ptr, operation_bytes);
+        backend.native = nil;
+        backend.operations = nil;
+        ret windows.ENOMEM;
+    }
     backend.attached = windows.allocate(attached_bytes)::*usize;
     if (backend.attached == nil) {
+        windows.deallocate(backend.preserved::ptr, native_bytes);
         windows.deallocate(backend.native::ptr, native_bytes);
         windows.deallocate(backend.operations::ptr, operation_bytes);
         backend.attached = nil;
+        backend.preserved = nil;
         backend.native = nil;
         backend.operations = nil;
         ret windows.ENOMEM;
@@ -302,9 +314,11 @@ pub fun make(backend: *Backend, queue: *shared.IoQueue, capacity: usize, source_
     backend.completions = windows.allocate(completion_bytes)::*types.NativeCompletion;
     if (backend.completions == nil) {
         windows.deallocate(backend.attached::ptr, attached_bytes);
+        windows.deallocate(backend.preserved::ptr, native_bytes);
         windows.deallocate(backend.native::ptr, native_bytes);
         windows.deallocate(backend.operations::ptr, operation_bytes);
         backend.attached = nil;
+        backend.preserved = nil;
         backend.native = nil;
         backend.operations = nil;
         ret windows.ENOMEM;
@@ -316,6 +330,7 @@ pub fun make(backend: *Backend, queue: *shared.IoQueue, capacity: usize, source_
     backend.next = 0;
     backend.attached_count = 0;
     backend.lock = mutex.make();
+    backend.io_lock = mutex.make();
     var i: usize = 0;
     for (i < capacity) {
         backend.operations[i].state = SLOT_FREE;
@@ -373,9 +388,9 @@ fun submit_buffer(backend: *Backend, resource: usize, buffer: *u8, length: usize
     operation.vectors[0] = operation.buffer;
     var result: i64 = 0;
     if (kind == runtime.READ) {
-        result = windows.sock_async_receive(resource, (?operation.vectors[0])::ptr, 1, ?operation.transferred, ?operation.native_flags, (?operation.overlapped)::ptr);
+        result = windows.sock_async_receive(resource, (?operation.vectors[0])::ptr, 1, ?operation.native_flags, (?operation.overlapped)::ptr);
     } or {
-        result = windows.sock_async_send(resource, (?operation.vectors[0])::ptr, 1, ?operation.transferred, 0, (?operation.overlapped)::ptr);
+        result = windows.sock_async_send(resource, (?operation.vectors[0])::ptr, 1, 0, (?operation.overlapped)::ptr);
     }
     if (result < 0) { release_locked(backend, operation); }
     mutex.unlock(?backend.lock);
@@ -411,7 +426,7 @@ pub fun submit_write_vector(backend: *Backend, resource: usize, vectors: *types.
         operation.vectors[i] = NativeBuffer{length: vectors[i].length::u32, data: vectors[i].data};
         i = i + 1;
     }
-    val result: i64 = windows.sock_async_send(resource, (?operation.vectors[0])::ptr, count, ?operation.transferred, 0, (?operation.overlapped)::ptr);
+    val result: i64 = windows.sock_async_send(resource, (?operation.vectors[0])::ptr, count, 0, (?operation.overlapped)::ptr);
     if (result < 0) { release_locked(backend, operation); }
     mutex.unlock(?backend.lock);
     ret result;
@@ -555,7 +570,7 @@ fun start_receive_packet(operation: *Operation) i64 {
     operation.message.control = NativeBuffer{length: 128, data: ?operation.control[0]};
     operation.message.flags = 0;
     zero_overlapped(?operation.overlapped);
-    ret windows.sock_async_receive_message(operation.resource, (?operation.message)::ptr, ?operation.transferred, (?operation.overlapped)::ptr);
+    ret windows.sock_async_receive_message(operation.resource, (?operation.message)::ptr, (?operation.overlapped)::ptr);
 }
 
 fun start_send_packet(operation: *Operation) i64 {
@@ -575,7 +590,7 @@ fun start_send_packet(operation: *Operation) i64 {
     if (control_length == 0) { operation.message.control.data = nil; }
     operation.message.flags = 0;
     zero_overlapped(?operation.overlapped);
-    ret windows.sock_async_send_message(operation.resource, (?operation.message)::ptr, 0, ?operation.transferred, (?operation.overlapped)::ptr);
+    ret windows.sock_async_send_message(operation.resource, (?operation.message)::ptr, 0, (?operation.overlapped)::ptr);
 }
 
 fun validate_packets(packets: *types.Packet, count: usize, sending: bool) i64 {
@@ -676,6 +691,21 @@ pub fun submit_close(backend: *Backend, resource: usize, context: usize, token: 
     ret 0;
 }
 
+fun restore_preserved(backend: *Backend, count: usize, wake: bool) i64 {
+    var result: i64 = 0;
+    var i: usize = 0;
+    for (i < count) {
+        val restored: i64 = windows.io_queue_restore(backend.queue, backend.preserved[i]);
+        if (result >= 0 && restored < 0) { result = restored; }
+        i = i + 1;
+    }
+    if (wake) {
+        val restored_wake: i64 = windows.io_queue_wake(backend.queue);
+        if (result >= 0 && restored_wake < 0) { result = restored_wake; }
+    }
+    ret result;
+}
+
 # successful cancellation synchronously ends all native access to borrowed data
 pub fun cancel(backend: *Backend, token: types.Token) i64 {
     if (backend == nil) { ret invalid(); }
@@ -691,31 +721,61 @@ pub fun cancel(backend: *Backend, token: types.Token) i64 {
     if (operation.state != SLOT_ACTIVE) { mutex.unlock(?backend.lock); ret windows.EBADF; }
     val cancelled: i64 = windows.io_queue_cancel(operation.resource, (?operation.overlapped)::ptr);
     if (cancelled < 0) { mutex.unlock(?backend.lock); ret cancelled; }
-    var bytes: u32 = 0;
-    var flags: u32 = 0;
-    windows.sock_async_result(operation.resource, (?operation.overlapped)::ptr, ?bytes, ?flags, true);
-    if (operation.kind == runtime.ACCEPT && operation.auxiliary != INVALID_SOCKET) {
-        windows.sock_close(operation.auxiliary);
-        operation.auxiliary = INVALID_SOCKET;
-    }
-    clear_borrowed(operation);
     operation.state = SLOT_CANCELLED;
     val context: usize = (?operation.overlapped)::usize;
+    mutex.unlock(?backend.lock);
+
+    mutex.lock(?backend.io_lock);
+    mutex.lock(?backend.lock);
+    val pending: *Operation = operation_for(backend, token);
+    if (pending == nil) {
+        mutex.unlock(?backend.lock);
+        mutex.unlock(?backend.io_lock);
+        ret 0;
+    }
+    if (pending.state != SLOT_CANCELLED) {
+        mutex.unlock(?backend.lock);
+        mutex.unlock(?backend.io_lock);
+        ret windows.EBADF;
+    }
+    mutex.unlock(?backend.lock);
+
     var found: bool = false;
-    for (!found) {
+    var preserved_count: usize = 0;
+    var preserved_wake: bool = false;
+    var result: i64 = 0;
+    for (!found && result >= 0) {
         var native: windows.IoCompletion;
         val count: i64 = windows.io_queue_poll(backend.queue, ?native, 1, -1);
-        if (count < 0) { mutex.unlock(?backend.lock); ret count; }
-        if (native.context == context) {
+        if (count < 0) { result = count; }
+        or (count == 0) { result = windows.EIO; }
+        or (native.context == context) {
             found = true;
+        } or ((native.events & windows.IO_EVENT_WAKE) != 0) {
+            preserved_wake = true;
+        } or (preserved_count == backend.capacity) {
+            result = windows.ENOMEM;
         } or {
-            val restored: i64 = windows.io_queue_restore(backend.queue, native);
-            if (restored < 0) { mutex.unlock(?backend.lock); ret restored; }
+            backend.preserved[preserved_count] = native;
+            preserved_count = preserved_count + 1;
         }
     }
-    release_locked(backend, operation);
-    mutex.unlock(?backend.lock);
-    ret 0;
+    if (found) {
+        mutex.lock(?backend.lock);
+        val completed: *Operation = operation_for(backend, token);
+        if (completed != nil && completed.state == SLOT_CANCELLED) {
+            if (completed.kind == runtime.ACCEPT && completed.auxiliary != INVALID_SOCKET) {
+                windows.sock_close(completed.auxiliary);
+                completed.auxiliary = INVALID_SOCKET;
+            }
+            release_locked(backend, completed);
+        }
+        mutex.unlock(?backend.lock);
+    }
+    val restored: i64 = restore_preserved(backend, preserved_count, preserved_wake);
+    mutex.unlock(?backend.io_lock);
+    if (result < 0) { ret result; }
+    ret restored;
 }
 
 fun emit_operation_locked(backend: *Backend, operation: *Operation, status: i64, bytes: usize) {
@@ -830,8 +890,7 @@ fun consume_native_locked(backend: *Backend, native: windows.IoCompletion) {
     var bytes: u32 = native.flags::u32;
     var flags: u32 = operation.native_flags;
     val observed: i64 = windows.sock_async_result(operation.resource, (?operation.overlapped)::ptr, ?bytes, ?flags, false);
-    var status: i64 = native.status;
-    if (status >= 0) { status = observed; }
+    val status: i64 = observed;
     if (operation.kind == runtime.RECEIVE_FROM) {
         finish_receive_packet_locked(backend, operation, status, bytes::usize, flags);
     } or (operation.kind == runtime.SEND_TO) {
@@ -894,8 +953,9 @@ pub fun poll(backend: *Backend, timeout_ms: i32) i64 {
     mutex.unlock(?backend.lock);
     if (immediately_ready != 0) { ret immediately_ready::i64; }
 
+    mutex.lock(?backend.io_lock);
     val count: i64 = windows.io_queue_poll(backend.queue, backend.native, backend.capacity, timeout_ms);
-    if (count <= 0) { ret count; }
+    if (count <= 0) { mutex.unlock(?backend.io_lock); ret count; }
     mutex.lock(?backend.lock);
     var i: usize = 0;
     for (i < count::usize && backend.ready < backend.capacity) {
@@ -906,6 +966,7 @@ pub fun poll(backend: *Backend, timeout_ms: i32) i64 {
     emit_control_locked(backend);
     val ready: usize = backend.ready;
     mutex.unlock(?backend.lock);
+    mutex.unlock(?backend.io_lock);
     ret ready::i64;
 }
 
@@ -925,10 +986,12 @@ pub fun destroy(backend: *Backend) i64 {
     val attached_bytes: usize = $size_of(usize) * backend.capacity;
     windows.deallocate(backend.completions::ptr, completion_bytes);
     windows.deallocate(backend.attached::ptr, attached_bytes);
+    windows.deallocate(backend.preserved::ptr, native_bytes);
     windows.deallocate(backend.native::ptr, native_bytes);
     windows.deallocate(backend.operations::ptr, operation_bytes);
     backend.completions = nil;
     backend.attached = nil;
+    backend.preserved = nil;
     backend.native = nil;
     backend.operations = nil;
     backend.capacity = 0;
@@ -1272,7 +1335,24 @@ test "async windows: UDP batches preserve zero truncation and destination" {
         }
         attempts = attempts + 1;
     }
-    val valid: bool = receive_done && send_done && receive_items == 3 && send_items == 3 && receive_bytes == 4 && send_bytes == 6 && received[0].length == 0 && received[0].zero_length && !received[0].truncated && received[0].has_local_destination && received[0].interface_index != 0 && received[1].length == 3 && second[0] == 'a' && second[2] == 'c' && received[2].length == 1 && third == 'a' && received[2].truncated && !received[2].zero_length;
+    var failure: i32 = 0;
+    if (!receive_done) { failure = 2; }
+    or (!send_done) { failure = 3; }
+    or (receive_items != 3) { failure = 4; }
+    or (send_items != 3) { failure = 5; }
+    or (receive_bytes != 4) { failure = 6; }
+    or (send_bytes != 6) { failure = 7; }
+    or (received[0].length != 0) { failure = 8; }
+    or (!received[0].zero_length) { failure = 9; }
+    or (received[0].truncated) { failure = 10; }
+    or (!received[0].has_local_destination) { failure = 11; }
+    or (received[0].interface_index == 0) { failure = 12; }
+    or (received[1].length != 3) { failure = 13; }
+    or (second[0] != 'a' || second[2] != 'c') { failure = 14; }
+    or (received[2].length != 1) { failure = 15; }
+    or (third != 'a') { failure = 16; }
+    or (!received[2].truncated) { failure = 17; }
+    or (received[2].zero_length) { failure = 18; }
     var close_receiver: types.Token;
     var close_sender: types.Token;
     if (submit_close(?backend, receiver, 32, ?close_receiver) < 0 || submit_close(?backend, sender, 33, ?close_sender) < 0) { ret 1; }
@@ -1290,7 +1370,12 @@ test "async windows: UDP batches preserve zero truncation and destination" {
         }
         attempts = attempts + 1;
     }
-    if (!valid || closed != 2 || destroy(?backend) < 0 || windows.io_queue_close(?queue) < 0) { ret 1; }
+    if (failure == 0 && closed != 2) { failure = 19; }
+    val destroyed: i64 = destroy(?backend);
+    if (failure == 0 && destroyed < 0) { failure = 20; }
+    val queue_closed: i64 = windows.io_queue_close(?queue);
+    if (failure == 0 && queue_closed < 0) { failure = 21; }
+    if (failure != 0) { ret failure; }
     ret 0;
 }
 
@@ -1444,6 +1529,13 @@ test "async windows: cancellation preserves earlier IOCP packets" {
     val canceled_submitted: i64 = submit_read(?backend, second_server, ?canceled_input, 1, 44, ?canceled_token);
     var output: u8 = 0x5a;
     val sent: i64 = windows.sock_send(first_client, ?output, 1);
+    var earlier: windows.IoCompletion;
+    val earlier_count: i64 = windows.io_queue_poll(?queue, ?earlier, 1, 1000);
+    val first_native_context: usize = (?backend.operations[first_token.index::usize].overlapped)::usize;
+    var earlier_restored: i64 = windows.EIO;
+    if (earlier_count == 1 && earlier.context == first_native_context) {
+        earlier_restored = windows.io_queue_restore(?queue, earlier);
+    }
     val canceled: i64 = cancel(?backend, canceled_token);
     var saw_first: bool = false;
     var saw_canceled: bool = false;
@@ -1463,7 +1555,7 @@ test "async windows: cancellation preserves earlier IOCP packets" {
             attempts = attempts + 1;
         }
     }
-    val valid: bool = first_submitted == 0 && canceled_submitted == 0 && sent == 1 && canceled == 0 && saw_first && !saw_canceled && first_input == 0x5a && canceled_input == 0xa5 && backend.active == 0;
+    val valid: bool = first_submitted == 0 && canceled_submitted == 0 && sent == 1 && earlier_count == 1 && earlier.context == first_native_context && earlier_restored == 0 && canceled == 0 && saw_first && !saw_canceled && first_input == 0x5a && canceled_input == 0xa5 && backend.active == 0;
     windows.sock_close(first_server);
     windows.sock_close(first_client);
     windows.sock_close(first_listener);
