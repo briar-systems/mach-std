@@ -5,7 +5,6 @@ use std.types.bool.bool;
 use std.types.bool.true;
 use std.types.bool.false;
 use std.types.size.usize;
-use std.chrono.time;
 use std.filesystem;
 use std.memory;
 use std.system.os;
@@ -35,11 +34,16 @@ val REQUEST_QUEUED:    i64 = 1;
 val REQUEST_RUNNING:   i64 = 2;
 val REQUEST_CANCELLED: i64 = 3;
 val REQUEST_ABORTED:   i64 = 4;
+val REQUEST_QUIESCED:  i64 = 5;
 
 val ADAPTER_OPEN:     u8 = 0;
 val ADAPTER_DRAINING: u8 = 1;
 val ADAPTER_ABORTING: u8 = 2;
 val ADAPTER_JOINED:   u8 = 3;
+val ADAPTER_RETIRING:      u8 = 4;
+val ADAPTER_RETIRED:       u8 = 5;
+val ADAPTER_POOL_DESTROYED: u8 = 6;
+val ADAPTER_RELEASING:     u8 = 7;
 
 pub rec Request {
     adapter:             *Adapter;
@@ -49,17 +53,13 @@ pub rec Request {
     length:              usize;
     offset:              u64;
     scratch:             *u8;
-    scope:               *cancel.Scope;
     token:               io_runtime.Token;
-    cancellation:        cancel.Registration;
-    cancellation_active: bool;
-    cancel_done:         i64;
-    cancel_reason:       i64;
 }
 
 # request, task, abort, worker, thread, and scratch storage are caller-owned
 pub rec Adapter {
     runtime:          *io_runtime.Runtime;
+    source:           io_runtime.SourceToken;
     requests:         *Request;
     request_capacity: usize;
     scratch:          *u8;
@@ -78,46 +78,48 @@ pub rec Adapter {
     lock:             mutex.Mutex;
 }
 
-fun cancel_error(reason: cancel.Reason, operation: io_error.Operation) io_error.Error {
-    if (reason == cancel.TIMED_OUT) { ret failure(os.ETIMEDOUT, operation); }
-    ret failure(os.ECANCELED, operation);
+fun token_equal(a: io_runtime.Token, b: io_runtime.Token) bool {
+    ret a.index == b.index && a.generation == b.generation;
 }
 
-fun request_cancel(context: ptr, reason: cancel.Reason) {
-    val request: *Request = context::*Request;
-    atomic.store(?request.cancel_reason, reason);
-    var expected: i64 = REQUEST_QUEUED;
-    atomic.cas(?request.state, ?expected, REQUEST_CANCELLED);
+fun source_dispatch(context: ptr, native_context: usize, events: u32, status: i64, flags: u64) bool {
+    ret false;
 }
 
-fun request_cancel_complete(context: ptr, reason: cancel.Reason) {
-    val request: *Request = context::*Request;
-    val lock: *mutex.Mutex = ?request.adapter.lock;
-    val registration: *cancel.Registration = ?request.cancellation;
-    val done: *i64 = ?request.cancel_done;
-    mutex.lock(lock);
-    atomic.store(done, 1);
-    os.thread_wake(done);
-    val finished: bool = cancel.finish(registration);
-    mutex.unlock(lock);
-    if (!finished) { panic.panic("std.io.file: cancellation completion lost ownership\n"); }
+fun source_release(context: ptr, completion: *io_runtime.Completion) {
+    ret;
 }
 
-fun detach_cancellation(request: *Request) {
-    if (!request.cancellation_active) { ret; }
-    if (!cancel.unregister(?request.cancellation)) {
-        for (atomic.load(?request.cancel_done) == 0) { os.thread_wait(?request.cancel_done, 0); }
-        mutex.lock(?request.adapter.lock);
-        mutex.unlock(?request.adapter.lock);
+fun source_cancel(context: ptr, token: io_runtime.Token, reason: io_error.Error) i64 {
+    val adapter: *Adapter = context::*Adapter;
+    mutex.lock(?adapter.lock);
+    var i: usize = 0;
+    for (i < adapter.request_capacity) {
+        val request: *Request = ?adapter.requests[i];
+        var current: i64 = atomic.load(?request.state);
+        if (current != REQUEST_FREE && token_equal(request.token, token)) {
+            for (current == REQUEST_QUEUED || current == REQUEST_RUNNING) {
+                var expected: i64 = current;
+                if (atomic.cas(?request.state, ?expected, REQUEST_CANCELLED)) {
+                    mutex.unlock(?adapter.lock);
+                    ret io_runtime.CANCELLATION_PENDING;
+                }
+                current = expected;
+            }
+            mutex.unlock(?adapter.lock);
+            if (current == REQUEST_CANCELLED) { ret io_runtime.CANCELLATION_PENDING; }
+            ret 0;
+        }
+        i = i + 1;
     }
-    request.cancellation_active = false;
+    mutex.unlock(?adapter.lock);
+    ret 0;
 }
 
 fun release_request(request: *Request) {
     val adapter: *Adapter = request.adapter;
     mutex.lock(?adapter.lock);
-    request.state = REQUEST_FREE;
-    request.scope = nil;
+    atomic.store(?request.state, REQUEST_FREE);
     adapter.active = adapter.active - 1;
     mutex.unlock(?adapter.lock);
 }
@@ -127,24 +129,43 @@ fun request_operation(request: *Request) io_error.Operation {
     ret io_error.OP_WRITE;
 }
 
-fun publish_cancelled(request: *Request) {
-    val reason: cancel.Reason = atomic.load(?request.cancel_reason)::cancel.Reason;
-    io_runtime.fail(request.adapter.runtime, request.token, cancel_error(reason, request_operation(request)));
+fun complete_pending_cancellation(request: *Request) {
+    val completed: R.Result[bool, io_error.Error] = io_runtime.complete_cancellation(request.adapter.runtime, request.token);
+    if (R.is_err[bool, io_error.Error](completed)) {
+        panic.panic("std.io.file: cancellation completion lost ownership\n");
+    }
+}
+
+fun settle_resolution(request: *Request, resolved: R.Result[bool, io_error.Error]) {
+    if (R.is_err[bool, io_error.Error](resolved)) {
+        var state: i64 = atomic.load(?request.state);
+        for (state == REQUEST_RUNNING) {
+            var expected: i64 = state;
+            if (atomic.cas(?request.state, ?expected, REQUEST_QUIESCED)) {
+                state = REQUEST_QUIESCED;
+            }
+            or { state = expected; }
+        }
+        if (state == REQUEST_CANCELLED) { complete_pending_cancellation(request); }
+        or (state != REQUEST_ABORTED && state != REQUEST_QUIESCED) { panic.panic("std.io.file: runtime completion lost ownership\n"); }
+    }
+    release_request(request);
 }
 
 fun execute_request(context: ptr) bool {
     val request: *Request = context::*Request;
-    cancel.expire(request.scope, time.monotonic());
     var expected: i64 = REQUEST_QUEUED;
     if (!atomic.cas(?request.state, ?expected, REQUEST_RUNNING)) {
-        detach_cancellation(request);
-        if (expected == REQUEST_CANCELLED) { publish_cancelled(request); }
-        or { io_runtime.fail(request.adapter.runtime, request.token, failure(os.ECANCELED, request_operation(request))); }
+        if (expected == REQUEST_CANCELLED) { complete_pending_cancellation(request); }
+        or {
+            val resolved: R.Result[bool, io_error.Error] = io_runtime.fail(request.adapter.runtime, request.token, failure(os.ECANCELED, request_operation(request)));
+            settle_resolution(request, resolved);
+            ret true;
+        }
         release_request(request);
         ret true;
     }
 
-    detach_cancellation(request);
     var result: i64 = 0;
     if (request.kind == io_runtime.FILE_READ) {
         result = platform.read_at(request.file.handle.value::i32, request.scratch, request.length, request.offset);
@@ -152,17 +173,23 @@ fun execute_request(context: ptr) bool {
     or {
         result = platform.write_at(request.file.handle.value::i32, request.scratch, request.length, request.offset);
     }
+    if (atomic.load(?request.state) == REQUEST_CANCELLED) {
+        complete_pending_cancellation(request);
+        release_request(request);
+        ret true;
+    }
+    var resolved: R.Result[bool, io_error.Error];
     if (result < 0) {
-        io_runtime.fail(request.adapter.runtime, request.token, failure(result, request_operation(request)));
+        resolved = io_runtime.fail(request.adapter.runtime, request.token, failure(result, request_operation(request)));
     }
     or (request.kind == io_runtime.FILE_READ) {
         val count: usize = result::usize;
-        io_runtime.complete_copy(request.adapter.runtime, request.token, request.scratch, count, request.file.handle.value, count == 0 && request.length != 0);
+        resolved = io_runtime.complete_copy(request.adapter.runtime, request.token, request.scratch, count, request.file.handle.value, count == 0 && request.length != 0);
     }
     or {
-        io_runtime.complete(request.adapter.runtime, request.token, result::usize, request.file.handle.value, false);
+        resolved = io_runtime.complete(request.adapter.runtime, request.token, result::usize, request.file.handle.value, false);
     }
-    release_request(request);
+    settle_resolution(request, resolved);
     ret true;
 }
 
@@ -215,24 +242,33 @@ pub fun make(
     adapter.next_request = 0;
     adapter.active = 0;
     adapter.state = ADAPTER_OPEN;
-    adapter.initialized = true;
+    adapter.initialized = false;
     adapter.lock = mutex.make();
     var i: usize = 0;
     for (i < request_capacity) {
         adapter.requests[i].adapter = adapter;
         adapter.requests[i].state = REQUEST_FREE;
         adapter.requests[i].scratch = (scratch::usize + i * max_transfer)::*u8;
-        adapter.requests[i].cancellation_active = false;
-        adapter.requests[i].cancel_done = 0;
-        cancel.init_registration(?adapter.requests[i].cancellation);
         i = i + 1;
     }
+    val registered: R.Result[io_runtime.SourceToken, io_error.Error] = io_runtime.register_source(
+        runtime,
+        adapter::ptr,
+        source_dispatch,
+        source_cancel,
+        source_release,
+    );
+    if (R.is_err[io_runtime.SourceToken, io_error.Error](registered)) {
+        ret R.err[bool, io_error.Error](R.unwrap_err[io_runtime.SourceToken, io_error.Error](registered));
+    }
+    adapter.source = R.unwrap_ok[io_runtime.SourceToken, io_error.Error](registered);
     val status: worker_pool.Status = worker_pool.make(?adapter.pool, tasks, request_capacity, threads, workers, worker_count);
     if (status != worker_pool.ACCEPTED) {
         if (worker_pool.state(?adapter.pool) == worker_pool.JOINED) { worker_pool.destroy(?adapter.pool); }
-        adapter.initialized = false;
+        io_runtime.unregister_source(runtime, adapter.source);
         ret R.err[bool, io_error.Error](failure(os.EAGAIN, io_error.OP_CREATE));
     }
+    adapter.initialized = true;
     ret R.ok[bool, io_error.Error](true);
 }
 
@@ -259,22 +295,8 @@ fun submit_operation(adapter: *Adapter, scope: *cancel.Scope, file: *filesystem.
     request.file = @file;
     request.length = length;
     request.offset = offset;
-    request.scope = scope;
-    request.cancel_done = 0;
-    request.cancel_reason = cancel.ACTIVE;
-    request.cancellation_active = false;
-    cancel.init_registration(?request.cancellation);
     if (kind == io_runtime.FILE_WRITE && length > 0) { memory.raw_copy(request.scratch::ptr, buffer::ptr, length); }
     atomic.store(?request.state, REQUEST_QUEUED);
-    val attached: cancel.Reason = cancel.attach_with_completion(scope, ?request.cancellation, request_cancel, request_cancel_complete, request::ptr);
-    if (attached != cancel.ACTIVE) {
-        request.state = REQUEST_FREE;
-        request.scope = nil;
-        adapter.active = adapter.active - 1;
-        mutex.unlock(?adapter.lock);
-        ret R.err[io_runtime.Token, io_error.Error](cancel_error(attached, normalized_kind));
-    }
-    request.cancellation_active = true;
     var runtime_buffer: *u8 = buffer;
     if (kind == io_runtime.FILE_WRITE) { runtime_buffer = nil; }
     val operation: io_runtime.Operation = io_runtime.Operation{
@@ -285,20 +307,20 @@ fun submit_operation(adapter: *Adapter, scope: *cancel.Scope, file: *filesystem.
         offset: offset,
         context: context,
     };
-    val submitted: R.Result[io_runtime.Token, io_error.Error] = io_runtime.submit(adapter.runtime, operation);
+    val submitted: R.Result[io_runtime.Token, io_error.Error] = io_runtime.submit_scoped_owned(adapter.runtime, adapter.source, scope, operation);
     if (R.is_err[io_runtime.Token, io_error.Error](submitted)) {
+        request.state = REQUEST_FREE;
+        adapter.active = adapter.active - 1;
         mutex.unlock(?adapter.lock);
-        detach_cancellation(request);
-        release_request(request);
         ret R.err[io_runtime.Token, io_error.Error](R.unwrap_err[io_runtime.Token, io_error.Error](submitted));
     }
     request.token = R.unwrap_ok[io_runtime.Token, io_error.Error](submitted);
     val queued: worker_pool.Status = worker_pool.try_submit(?adapter.pool, worker_pool.Task{context: request::ptr, run: execute_request});
     if (queued != worker_pool.ACCEPTED) {
-        io_runtime.fail(adapter.runtime, request.token, failure(os.EBUSY, io_error.OP_SUBMIT));
+        atomic.store(?request.state, REQUEST_ABORTED);
         mutex.unlock(?adapter.lock);
-        detach_cancellation(request);
-        release_request(request);
+        val resolved: R.Result[bool, io_error.Error] = io_runtime.fail(adapter.runtime, request.token, failure(os.EBUSY, io_error.OP_SUBMIT));
+        settle_resolution(request, resolved);
         ret R.ok[io_runtime.Token, io_error.Error](request.token);
     }
     val token: io_runtime.Token = request.token;
@@ -318,10 +340,8 @@ pub fun submit_write(adapter: *Adapter, scope: *cancel.Scope, file: *filesystem.
 }
 
 fun publish_aborted(request: *Request) {
-    detach_cancellation(request);
-    if (atomic.load(?request.state) == REQUEST_CANCELLED) { publish_cancelled(request); }
-    or { io_runtime.fail(request.adapter.runtime, request.token, failure(os.ECANCELED, io_error.OP_SHUTDOWN)); }
-    release_request(request);
+    val resolved: R.Result[bool, io_error.Error] = io_runtime.fail(request.adapter.runtime, request.token, failure(os.ECANCELED, io_error.OP_SHUTDOWN));
+    settle_resolution(request, resolved);
 }
 
 pub fun shutdown_drain(adapter: *Adapter) R.Result[bool, io_error.Error] {
@@ -404,14 +424,44 @@ pub fun destroy(adapter: *Adapter) R.Result[bool, io_error.Error] {
         mutex.unlock(?adapter.lock);
         ret R.err[bool, io_error.Error](failure(os.EINVAL, io_error.OP_CLOSE));
     }
-    if (adapter.state != ADAPTER_JOINED || adapter.active != 0) {
+    var retire: bool = false;
+    if (adapter.state == ADAPTER_JOINED && adapter.active == 0) {
+        adapter.state = ADAPTER_RETIRING;
+        retire = true;
+    }
+    or ((adapter.state != ADAPTER_RETIRED && adapter.state != ADAPTER_POOL_DESTROYED) || adapter.active != 0) {
         mutex.unlock(?adapter.lock);
         ret R.err[bool, io_error.Error](failure(os.EBUSY, io_error.OP_CLOSE));
     }
-    if (!worker_pool.destroy(?adapter.pool)) {
+    if (retire) {
         mutex.unlock(?adapter.lock);
-        ret R.err[bool, io_error.Error](failure(os.EIO, io_error.OP_CLOSE));
+        val retired: R.Result[bool, io_error.Error] = io_runtime.retire_source(adapter.runtime, adapter.source);
+        if (R.is_err[bool, io_error.Error](retired)) {
+            mutex.lock(?adapter.lock);
+            adapter.state = ADAPTER_JOINED;
+            mutex.unlock(?adapter.lock);
+            ret R.err[bool, io_error.Error](R.unwrap_err[bool, io_error.Error](retired));
+        }
+        mutex.lock(?adapter.lock);
+        adapter.state = ADAPTER_RETIRED;
     }
+    if (adapter.state == ADAPTER_RETIRED) {
+        if (!worker_pool.destroy(?adapter.pool)) {
+            mutex.unlock(?adapter.lock);
+            ret R.err[bool, io_error.Error](failure(os.EIO, io_error.OP_CLOSE));
+        }
+        adapter.state = ADAPTER_POOL_DESTROYED;
+    }
+    adapter.state = ADAPTER_RELEASING;
+    mutex.unlock(?adapter.lock);
+    val released: R.Result[bool, io_error.Error] = io_runtime.release_source(adapter.runtime, adapter.source);
+    if (R.is_err[bool, io_error.Error](released)) {
+        mutex.lock(?adapter.lock);
+        adapter.state = ADAPTER_POOL_DESTROYED;
+        mutex.unlock(?adapter.lock);
+        ret R.err[bool, io_error.Error](R.unwrap_err[bool, io_error.Error](released));
+    }
+    mutex.lock(?adapter.lock);
     adapter.runtime = nil;
     adapter.requests = nil;
     adapter.scratch = nil;

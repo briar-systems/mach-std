@@ -21,6 +21,10 @@ use std.sync.mutex;
 use std.sync.thread;
 use std.sync.worker_pool;
 use std.system.os;
+use std.system.panic;
+use io_runtime: std.io.runtime;
+use io_error: std.io.error;
+use std.io.lifecycle;
 use std.net.ip;
 use std.net.resolve.types;
 use std.net.resolve.shared;
@@ -99,6 +103,15 @@ rec Operation {
     cancellation_reason: i64;
     scope_use_done: i64;
     registration_done: i64;
+    runtime_token: io_runtime.Token;
+    runtime_owned: bool;
+    runtime_published: bool;
+    runtime_released: bool;
+    internal_dequeued: bool;
+    runtime_cancellation_pending: bool;
+    runtime_terminal_claimed: bool;
+    runtime_terminal_failure: io_error.Error;
+    terminal_failure: types.Error;
     resolution: types.Resolution;
 }
 
@@ -111,6 +124,9 @@ pub rec Resolver {
     adapter: types.AdapterFun;
     adapter_context: ptr;
     result_limits: types.ResultLimits;
+    runtime: *io_runtime.Runtime;
+    runtime_source: io_runtime.SourceToken;
+    runtime_registered: bool;
     operations: *Operation;
     completions: *types.Completion;
     capacity: usize;
@@ -142,6 +158,15 @@ fun pool_error(status: worker_pool.Status) types.Error {
     ret shared.error(types.SYSTEM_FAILURE, status::i64);
 }
 
+fun runtime_error(failure: io_error.Error) types.Error {
+    if (failure.kind == io_error.TIMEOUT) { ret shared.error(types.TIMED_OUT, failure.code); }
+    if (failure.kind == io_error.CANCELLED) { ret shared.error(types.CANCELLED, failure.code); }
+    if (failure.kind == io_error.CLOSED) { ret shared.error(types.CLOSED, failure.code); }
+    if (failure.kind == io_error.RESOURCE_EXHAUSTED) { ret shared.error(types.OVERLOADED, failure.code); }
+    if (failure.kind == io_error.INVALID) { ret shared.error(types.INVALID, failure.code); }
+    ret shared.error(types.SYSTEM_FAILURE, failure.code);
+}
+
 pub fun make_with_adapter(resolver: *Resolver, pool: *worker_pool.Pool, owner: *allocator.Allocator,
     capacity: usize, result_limits: types.ResultLimits, adapter_context: ptr, adapter: types.AdapterFun) types.Error {
     if (resolver == nil || pool == nil || owner == nil || capacity == 0
@@ -169,6 +194,9 @@ pub fun make_with_adapter(resolver: *Resolver, pool: *worker_pool.Pool, owner: *
     resolver.adapter = adapter;
     resolver.adapter_context = adapter_context;
     resolver.result_limits = result_limits;
+    resolver.runtime = nil;
+    resolver.runtime_source = io_runtime.SourceToken{index: 0, generation: 0, tag: 0};
+    resolver.runtime_registered = false;
     resolver.capacity = capacity;
     resolver.next_slot = 0;
     resolver.head = 0;
@@ -189,6 +217,15 @@ pub fun make_with_adapter(resolver: *Resolver, pool: *worker_pool.Pool, owner: *
         operation.cancellation_reason = cancellation.ACTIVE;
         operation.scope_use_done = 1;
         operation.registration_done = 1;
+        operation.runtime_token = io_runtime.Token{index: 0, generation: 0};
+        operation.runtime_owned = false;
+        operation.runtime_published = false;
+        operation.runtime_released = false;
+        operation.internal_dequeued = false;
+        operation.runtime_cancellation_pending = false;
+        operation.runtime_terminal_claimed = false;
+        operation.runtime_terminal_failure = io_error.from_code(0, io_error.OP_UNKNOWN);
+        operation.terminal_failure = shared.error(types.NO_ERROR, 0);
         cancellation.init_registration(?operation.registration);
         shared.clear(?operation.resolution, owner);
         i = i + 1;
@@ -199,6 +236,35 @@ pub fun make_with_adapter(resolver: *Resolver, pool: *worker_pool.Pool, owner: *
 pub fun make(resolver: *Resolver, pool: *worker_pool.Pool, owner: *allocator.Allocator,
     capacity: usize, result_limits: types.ResultLimits) types.Error {
     ret make_with_adapter(resolver, pool, owner, capacity, result_limits, nil, system_adapter);
+}
+
+pub fun make_runtime_with_adapter(resolver: *Resolver, runtime: *io_runtime.Runtime,
+    pool: *worker_pool.Pool, owner: *allocator.Allocator, capacity: usize,
+    result_limits: types.ResultLimits, adapter_context: ptr, adapter: types.AdapterFun) types.Error {
+    if (runtime == nil) { ret shared.error(types.INVALID, 0); }
+    val made: types.Error = make_with_adapter(resolver, pool, owner, capacity,
+        result_limits, adapter_context, adapter);
+    if (made.kind != types.NO_ERROR) { ret made; }
+    resolver.runtime = runtime;
+    val registered: Result[io_runtime.SourceToken, io_error.Error] = io_runtime.register_source(
+        runtime, resolver::ptr, runtime_dispatch, runtime_cancel, runtime_release);
+    if (is_err[io_runtime.SourceToken, io_error.Error](registered)) {
+        val failure: types.Error = runtime_error(unwrap_err[io_runtime.SourceToken, io_error.Error](registered));
+        resolver.runtime = nil;
+        close(resolver);
+        destroy(resolver);
+        ret failure;
+    }
+    resolver.runtime_source = unwrap_ok[io_runtime.SourceToken, io_error.Error](registered);
+    resolver.runtime_registered = true;
+    ret shared.error(types.NO_ERROR, 0);
+}
+
+pub fun make_runtime(resolver: *Resolver, runtime: *io_runtime.Runtime,
+    pool: *worker_pool.Pool, owner: *allocator.Allocator, capacity: usize,
+    result_limits: types.ResultLimits) types.Error {
+    ret make_runtime_with_adapter(resolver, runtime, pool, owner, capacity,
+        result_limits, nil, system_adapter);
 }
 
 fun valid_query(query: *types.Query) bool {
@@ -228,6 +294,15 @@ fun claim_locked(resolver: *Resolver) *Operation {
             operation.cancellation_reason = cancellation.ACTIVE;
             operation.scope_use_done = 1;
             operation.registration_done = 1;
+            operation.runtime_token = io_runtime.Token{index: 0, generation: 0};
+            operation.runtime_owned = false;
+            operation.runtime_published = false;
+            operation.runtime_released = false;
+            operation.internal_dequeued = false;
+            operation.runtime_cancellation_pending = false;
+            operation.runtime_terminal_claimed = false;
+            operation.runtime_terminal_failure = io_error.from_code(0, io_error.OP_UNKNOWN);
+            operation.terminal_failure = shared.error(types.NO_ERROR, 0);
             cancellation.init_registration(?operation.registration);
             shared.clear(?operation.resolution, resolver.allocator);
             resolver.live = resolver.live + 1;
@@ -244,6 +319,15 @@ fun release_locked(resolver: *Resolver, operation: *Operation) {
     operation.cancellation_reason = cancellation.ACTIVE;
     operation.scope_use_done = 1;
     operation.registration_done = 1;
+    operation.runtime_token = io_runtime.Token{index: 0, generation: 0};
+    operation.runtime_owned = false;
+    operation.runtime_published = false;
+    operation.runtime_released = false;
+    operation.internal_dequeued = false;
+    operation.runtime_cancellation_pending = false;
+    operation.runtime_terminal_claimed = false;
+    operation.runtime_terminal_failure = io_error.from_code(0, io_error.OP_UNKNOWN);
+    operation.terminal_failure = shared.error(types.NO_ERROR, 0);
     cancellation.init_registration(?operation.registration);
     shared.clear(?operation.resolution, resolver.allocator);
     resolver.live = resolver.live - 1;
@@ -295,8 +379,16 @@ fun enqueue_locked(resolver: *Resolver, operation: *Operation, failure: types.Er
     };
     resolver.tail = (resolver.tail + 1) % resolver.capacity;
     resolver.count = resolver.count + 1;
+    operation.terminal_failure = failure;
     operation.state = SLOT_QUEUED;
-    condition.signal(?resolver.ready);
+    if (resolver.runtime == nil) {
+        condition.signal(?resolver.ready);
+    } or {
+        val woken: Result[bool, io_error.Error] = io_runtime.wake(resolver.runtime);
+        if (is_err[bool, io_error.Error](woken)) {
+            panic.panic("std.net.resolve: runtime wake failed\n");
+        }
+    }
 }
 
 fun claim_reason(operation: *Operation, reason: cancellation.Reason) bool {
@@ -304,6 +396,133 @@ fun claim_reason(operation: *Operation, reason: cancellation.Reason) bool {
     val changed: bool = atomic.cas(?operation.cancellation_reason, ?expected, reason);
     if (changed) { os.thread_wake(?operation.cancellation_reason); }
     ret changed;
+}
+
+fun runtime_token_equal(a: io_runtime.Token, b: io_runtime.Token) bool {
+    ret a.index == b.index && a.generation == b.generation;
+}
+
+fun operation_for_runtime_locked(resolver: *Resolver, token: io_runtime.Token) *Operation {
+    var i: usize = 0;
+    for (i < resolver.capacity) {
+        val operation: *Operation = ?resolver.operations[i];
+        if (operation.state != SLOT_FREE && operation.runtime_owned
+         && runtime_token_equal(operation.runtime_token, token)) { ret operation; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun runtime_cancel_reason(failure: io_error.Error) cancellation.Reason {
+    if (failure.kind == io_error.TIMEOUT) { ret cancellation.TIMED_OUT; }
+    ret cancellation.CANCELLED;
+}
+
+fun resolver_io_error(failure: types.Error) io_error.Error {
+    var code: i64 = os.EIO;
+    if (failure.kind == types.INVALID) { code = os.EINVAL; }
+    or (failure.kind == types.OVERLOADED || failure.kind == types.OUT_OF_MEMORY) { code = os.ENOMEM; }
+    or (failure.kind == types.CLOSED) { code = os.EBADF; }
+    or (failure.kind == types.NO_NAME) { code = os.ENOENT; }
+    or (failure.kind == types.TEMPORARY) { code = os.EAGAIN; }
+    or (failure.kind == types.CANCELLED) { code = os.ECANCELED; }
+    or (failure.kind == types.TIMED_OUT) { code = os.ETIMEDOUT; }
+    ret io_error.from_code(code, io_error.OP_SUBMIT);
+}
+
+fun queued_completion_locked(resolver: *Resolver, operation: *Operation) *types.Completion {
+    var offset: usize = 0;
+    var index: usize = resolver.head;
+    for (offset < resolver.count) {
+        val completion: *types.Completion = ?resolver.completions[index];
+        if (completion.token.index == operation.index
+         && completion.token.generation == operation.generation) { ret completion; }
+        index = (index + 1) % resolver.capacity;
+        offset = offset + 1;
+    }
+    ret nil;
+}
+
+fun rewrite_queued_runtime_terminal_locked(resolver: *Resolver, operation: *Operation,
+    runtime_failure: io_error.Error) {
+    val completion: *types.Completion = queued_completion_locked(resolver, operation);
+    if (completion == nil) { ret; }
+    if (operation.terminal_failure.kind == types.NO_ERROR) {
+        cleanup_failed_result(operation);
+    }
+    val failure: types.Error = runtime_error(runtime_failure);
+    operation.terminal_failure = failure;
+    completion.resolution = operation.resolution;
+    completion.has_error = true;
+    completion.error = failure;
+}
+
+fun runtime_cancel(context: ptr, token: io_runtime.Token, failure: io_error.Error) i64 {
+    val resolver: *Resolver = context::*Resolver;
+    mutex.lock(?resolver.lock);
+    val operation: *Operation = operation_for_runtime_locked(resolver, token);
+    if (operation == nil) {
+        mutex.unlock(?resolver.lock);
+        ret 0;
+    }
+    if (operation.state == SLOT_QUEUED) {
+        if (!operation.runtime_published && !operation.internal_dequeued) {
+            operation.runtime_terminal_claimed = true;
+            operation.runtime_terminal_failure = failure;
+            rewrite_queued_runtime_terminal_locked(resolver, operation, failure);
+        }
+        operation.runtime_published = true;
+        mutex.unlock(?resolver.lock);
+        ret 0;
+    }
+    if (claim_reason(operation, runtime_cancel_reason(failure))) {
+        operation.runtime_terminal_claimed = true;
+        operation.runtime_terminal_failure = failure;
+    }
+    operation.runtime_cancellation_pending = true;
+    mutex.unlock(?resolver.lock);
+    ret io_runtime.CANCELLATION_PENDING;
+}
+
+fun runtime_release(context: ptr, completion: *io_runtime.Completion) {
+    val resolver: *Resolver = context::*Resolver;
+    mutex.lock(?resolver.lock);
+    val operation: *Operation = operation_for_runtime_locked(resolver, completion.token);
+    if (operation != nil && !operation.runtime_released) {
+        operation.runtime_released = true;
+        if (operation.internal_dequeued) { release_locked(resolver, operation); }
+    }
+    mutex.unlock(?resolver.lock);
+}
+
+fun runtime_dispatch(context: ptr, native_context: usize, events: u32, status: i64, flags: u64) bool {
+    val resolver: *Resolver = context::*Resolver;
+    var published: bool = false;
+    mutex.lock(?resolver.lock);
+    var i: usize = 0;
+    for (i < resolver.capacity) {
+        val operation: *Operation = ?resolver.operations[i];
+        if (operation.state == SLOT_QUEUED && operation.runtime_owned && !operation.runtime_published) {
+            var completed: Result[bool, io_error.Error];
+            if (operation.runtime_cancellation_pending) {
+                completed = io_runtime.complete_cancellation(resolver.runtime, operation.runtime_token);
+            }
+            or (operation.terminal_failure.kind != types.NO_ERROR) {
+                completed = io_runtime.fail(resolver.runtime, operation.runtime_token,
+                    resolver_io_error(operation.terminal_failure));
+            }
+            or {
+                completed = io_runtime.complete(resolver.runtime, operation.runtime_token, 0, 0, false);
+            }
+            if (!is_err[bool, io_error.Error](completed)) {
+                operation.runtime_published = true;
+                published = true;
+            }
+        }
+        i = i + 1;
+    }
+    mutex.unlock(?resolver.lock);
+    ret published;
 }
 
 fun cancel_callback(context: ptr, reason: cancellation.Reason) {
@@ -366,7 +585,8 @@ fun run_operation(context: ptr) bool {
     val resolver: *Resolver = operation.resolver;
     var failure: types.Error = shared.error(types.NO_ERROR, 0);
     var deadline: time.Time = time.Time{sec: 0, nsec: 0};
-    val has_deadline: bool = read_deadline(operation.scope, ?deadline);
+    var has_deadline: bool = false;
+    if (!operation.runtime_owned) { has_deadline = read_deadline(operation.scope, ?deadline); }
     if (deadline_reached(has_deadline, deadline)) {
         claim_reason(operation, cancellation.TIMED_OUT);
     }
@@ -377,12 +597,17 @@ fun run_operation(context: ptr) bool {
     if (deadline_reached(has_deadline, deadline)) {
         claim_reason(operation, cancellation.TIMED_OUT);
     }
-    finish_scope_use(operation);
+    if (!operation.runtime_owned) { finish_scope_use(operation); }
 
     mutex.lock(?resolver.lock);
-    val reason: cancellation.Reason = settle_registration(operation);
+    var reason: cancellation.Reason = atomic.load(?operation.cancellation_reason);
+    if (!operation.runtime_owned) { reason = settle_registration(operation); }
 
-    if (reason != cancellation.ACTIVE) {
+    if (operation.runtime_owned && operation.runtime_terminal_claimed) {
+        cleanup_failed_result(operation);
+        failure = runtime_error(operation.runtime_terminal_failure);
+    }
+    or (reason != cancellation.ACTIVE) {
         cleanup_failed_result(operation);
         failure = cancellation_error(reason);
     }
@@ -428,8 +653,11 @@ fun build_numeric_locked(resolver: *Resolver, operation: *Operation, addr: ip.Ad
 
 fun complete_immediate_locked(resolver: *Resolver, operation: *Operation, failure: types.Error) {
     var final_error: types.Error = failure;
-    finish_scope_use(operation);
-    val reason: cancellation.Reason = settle_registration(operation);
+    var reason: cancellation.Reason = atomic.load(?operation.cancellation_reason);
+    if (!operation.runtime_owned) {
+        finish_scope_use(operation);
+        reason = settle_registration(operation);
+    }
     if (reason != cancellation.ACTIVE) {
         cleanup_failed_result(operation);
         final_error = cancellation_error(reason);
@@ -439,6 +667,9 @@ fun complete_immediate_locked(resolver: *Resolver, operation: *Operation, failur
 
 pub fun submit(resolver: *Resolver, scope: *cancellation.Scope, query: *types.Query, context: usize) Result[types.Token, types.Error] {
     if (resolver == nil || scope == nil || !valid_query(query)) {
+        ret err[types.Token, types.Error](shared.error(types.INVALID, 0));
+    }
+    if (resolver.runtime != nil) {
         ret err[types.Token, types.Error](shared.error(types.INVALID, 0));
     }
     cancellation.expire(scope, time.monotonic());
@@ -503,11 +734,76 @@ pub fun submit(resolver: *Resolver, scope: *cancellation.Scope, query: *types.Qu
     ret ok[types.Token, types.Error](token);
 }
 
+pub fun submit_runtime(resolver: *Resolver, scope: *cancellation.Scope,
+    query: *types.Query, context: usize) Result[io_runtime.Token, types.Error] {
+    if (resolver == nil || resolver.runtime == nil || scope == nil || !valid_query(query)) {
+        ret err[io_runtime.Token, types.Error](shared.error(types.INVALID, 0));
+    }
+    mutex.lock(?resolver.lock);
+    if (resolver.state != OPEN || !resolver.runtime_registered) {
+        mutex.unlock(?resolver.lock);
+        ret err[io_runtime.Token, types.Error](shared.error(types.CLOSED, 0));
+    }
+    val operation: *Operation = claim_locked(resolver);
+    if (operation == nil) {
+        mutex.unlock(?resolver.lock);
+        ret err[io_runtime.Token, types.Error](shared.error(types.OVERLOADED, 0));
+    }
+    copy_query(operation, query, context);
+    operation.runtime_owned = true;
+    operation.scope = nil;
+    operation.scope_use_done = 1;
+    operation.registration_done = 1;
+    val runtime_operation: io_runtime.Operation = io_runtime.Operation{
+        kind: io_runtime.RESOLVE,
+        resource: 0,
+        buffer: nil,
+        length: 0,
+        offset: 0,
+        context: context,
+    };
+    val runtime_submission: Result[io_runtime.Token, io_error.Error] = io_runtime.submit_scoped_owned(
+        resolver.runtime, resolver.runtime_source, scope, runtime_operation);
+    if (is_err[io_runtime.Token, io_error.Error](runtime_submission)) {
+        val failure: types.Error = runtime_error(unwrap_err[io_runtime.Token, io_error.Error](runtime_submission));
+        release_locked(resolver, operation);
+        mutex.unlock(?resolver.lock);
+        ret err[io_runtime.Token, types.Error](failure);
+    }
+    val token: io_runtime.Token = unwrap_ok[io_runtime.Token, io_error.Error](runtime_submission);
+    operation.runtime_token = token;
+
+    var numeric_addr: Result[ip.Addr, *u8] = ip.addr_parse(operation.query.host);
+    var port: u16 = 0;
+    val numeric_service: bool = parse_service(operation.query.service, ?port);
+    if (!is_err[ip.Addr, *u8](numeric_addr) && numeric_service) {
+        val failure: types.Error = build_numeric_locked(resolver, operation,
+            unwrap_ok[ip.Addr, *u8](numeric_addr), port);
+        complete_immediate_locked(resolver, operation, failure);
+        mutex.unlock(?resolver.lock);
+        ret ok[io_runtime.Token, types.Error](token);
+    }
+    if (((operation.query.flags & types.NUMERIC_HOST) != 0 && is_err[ip.Addr, *u8](numeric_addr))
+     || ((operation.query.flags & types.NUMERIC_SERVICE) != 0 && !numeric_service)) {
+        complete_immediate_locked(resolver, operation, shared.error(types.NO_NAME, 0));
+        mutex.unlock(?resolver.lock);
+        ret ok[io_runtime.Token, types.Error](token);
+    }
+    val status: worker_pool.Status = worker_pool.try_submit(resolver.pool,
+        worker_pool.Task{context: operation::ptr, run: run_operation});
+    if (status != worker_pool.ACCEPTED) {
+        enqueue_locked(resolver, operation, pool_error(status));
+    }
+    mutex.unlock(?resolver.lock);
+    ret ok[io_runtime.Token, types.Error](token);
+}
+
 pub fun cancel(resolver: *Resolver, token: types.Token) bool {
     if (resolver == nil || token.index::usize >= resolver.capacity) { ret false; }
     mutex.lock(?resolver.lock);
     val operation: *Operation = ?resolver.operations[token.index::usize];
-    if (operation.state != SLOT_ACTIVE || operation.generation != token.generation) {
+    if (operation.state != SLOT_ACTIVE || operation.generation != token.generation
+     || operation.runtime_owned) {
         mutex.unlock(?resolver.lock);
         ret false;
     }
@@ -520,11 +816,17 @@ fun dequeue_locked(resolver: *Resolver, output: *types.Completion, capacity: usi
     var copied: usize = 0;
     for (copied < capacity && resolver.count != 0) {
         val completion: types.Completion = resolver.completions[resolver.head];
+        val operation: *Operation = ?resolver.operations[completion.token.index::usize];
+        if (operation.runtime_owned && !operation.runtime_released) { ret copied; }
         output[copied] = completion;
         resolver.head = (resolver.head + 1) % resolver.capacity;
         resolver.count = resolver.count - 1;
-        val operation: *Operation = ?resolver.operations[completion.token.index::usize];
-        release_locked(resolver, operation);
+        if (operation.runtime_owned) {
+            operation.internal_dequeued = true;
+            if (operation.runtime_released) { release_locked(resolver, operation); }
+        } or {
+            release_locked(resolver, operation);
+        }
         copied = copied + 1;
     }
     ret copied;
@@ -540,6 +842,7 @@ pub fun poll(resolver: *Resolver, output: *types.Completion, capacity: usize) us
 
 pub fun wait(resolver: *Resolver, output: *types.Completion, capacity: usize) usize {
     if (resolver == nil || output == nil || capacity == 0) { ret 0; }
+    if (resolver.runtime != nil) { ret poll(resolver, output, capacity); }
     mutex.lock(?resolver.lock);
     for (resolver.count == 0 && resolver.live != 0 && resolver.state != DESTROYED) {
         condition.wait(?resolver.ready, ?resolver.lock);
@@ -551,6 +854,7 @@ pub fun wait(resolver: *Resolver, output: *types.Completion, capacity: usize) us
 
 pub fun wait_until(resolver: *Resolver, output: *types.Completion, capacity: usize, deadline: time.Time) usize {
     if (resolver == nil || output == nil || capacity == 0) { ret 0; }
+    if (resolver.runtime != nil) { ret poll(resolver, output, capacity); }
     mutex.lock(?resolver.lock);
     for (resolver.count == 0 && resolver.live != 0 && resolver.state != DESTROYED) {
         val status: condition.WaitStatus = condition.wait_until(?resolver.ready, ?resolver.lock, deadline);
@@ -583,6 +887,18 @@ pub fun destroy(resolver: *Resolver) bool {
         mutex.unlock(?resolver.lock);
         ret false;
     }
+    val attached_runtime: *io_runtime.Runtime = resolver.runtime;
+    val runtime_source: io_runtime.SourceToken = resolver.runtime_source;
+    val runtime_registered: bool = resolver.runtime_registered;
+    if (runtime_registered) {
+        val retired: Result[bool, io_error.Error] = io_runtime.retire_source(
+            resolver.runtime, resolver.runtime_source);
+        if (is_err[bool, io_error.Error](retired)) {
+            mutex.unlock(?resolver.lock);
+            ret false;
+        }
+        resolver.runtime_registered = false;
+    }
     val owner: *allocator.Allocator = resolver.allocator;
     val operations: *Operation = resolver.operations;
     val completions: *types.Completion = resolver.completions;
@@ -593,10 +909,16 @@ pub fun destroy(resolver: *Resolver) bool {
     resolver.capacity = 0;
     resolver.pool = nil;
     resolver.allocator = nil;
+    resolver.runtime = nil;
     mutex.unlock(?resolver.lock);
     val operations_freed: Result[bool, *u8] = allocator.deallocate[Operation](owner, operations, capacity);
     val completions_freed: Result[bool, *u8] = allocator.deallocate[types.Completion](owner, completions, capacity);
-    ret !is_err[bool, *u8](operations_freed) && !is_err[bool, *u8](completions_freed);
+    var source_released: bool = true;
+    if (runtime_registered) {
+        source_released = !is_err[bool, io_error.Error](io_runtime.release_source(attached_runtime, runtime_source));
+    }
+    ret !is_err[bool, *u8](operations_freed) && !is_err[bool, *u8](completions_freed)
+        && source_released;
 }
 
 rec TestPool {
@@ -1116,5 +1438,223 @@ test "resolver: native localhost uses service policy without truncating results"
     }
     if (!resolution_destroy(?completion.resolution) || !cancellation.destroy(?scope)
      || !test_resolver_cleanup(?resolver, ?pool)) { ret 7; }
+    ret 0;
+}
+
+test "resolver: runtime close waits for adapter quiescence and both completion owners" {
+    if (!resolver_threads_supported()) { ret 0; }
+    var owner: allocator.Allocator;
+    page.make(?owner);
+    var runtime: io_runtime.Runtime;
+    if (is_err[bool, io_error.Error](io_runtime.make(?runtime, 2))) { ret 1; }
+    var pool: TestPool;
+    if (!test_pool_make(?pool, 1)) { ret 2; }
+    var gate: Gate = Gate{entered: 0, release: 0};
+    var resolver: Resolver;
+    if (make_runtime_with_adapter(?resolver, ?runtime, ?pool.pool, ?owner, 1,
+        test_limits(), (?gate)::ptr, gated_adapter).kind != types.NO_ERROR) { ret 3; }
+    var scope: cancellation.Scope;
+    if (!cancellation.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 4; }
+    var query: types.Query = test_query("runtime-close", nil, 0);
+    val submitted: Result[io_runtime.Token, types.Error] = submit_runtime(
+        ?resolver, ?scope, ?query, 61);
+    if (is_err[io_runtime.Token, types.Error](submitted)) { ret 5; }
+    gate_wait_entered(?gate);
+    if (is_err[bool, io_error.Error](io_runtime.close(?runtime))) { ret 6; }
+    var runtime_completion: io_runtime.Completion;
+    val early: Result[usize, io_error.Error] = io_runtime.poll(?runtime, ?runtime_completion, 1);
+    var resolver_completion: types.Completion;
+    if (is_err[usize, io_error.Error](early)
+     || unwrap_ok[usize, io_error.Error](early) != 0
+     || poll(?resolver, ?resolver_completion, 1) != 0
+     || !cancellation.destroy(?scope)) { ret 7; }
+    gate_release(?gate);
+    var runtime_wait: Result[usize, io_error.Error] = io_runtime.wait(
+        ?runtime, ?runtime_completion, 1, 1000);
+    if (!is_err[usize, io_error.Error](runtime_wait)
+     && unwrap_ok[usize, io_error.Error](runtime_wait) == 0) {
+        runtime_wait = io_runtime.wait(?runtime, ?runtime_completion, 1, 1000);
+    }
+    if (is_err[usize, io_error.Error](runtime_wait)
+     || unwrap_ok[usize, io_error.Error](runtime_wait) != 1
+     || runtime_completion.kind != io_runtime.RESOLVE
+     || runtime_completion.context != 61
+     || !runtime_completion.has_error
+     || runtime_completion.error.kind != io_error.CLOSED) { ret 8; }
+    if (poll(?resolver, ?resolver_completion, 1) != 1
+     || !resolver_completion.has_error
+     || resolver_completion.error.kind != types.CLOSED
+     || resolver_completion.context != 61
+     || resolver.live != 0) { ret 9; }
+    val duplicate_runtime: Result[usize, io_error.Error] = io_runtime.poll(
+        ?runtime, ?runtime_completion, 1);
+    if (is_err[usize, io_error.Error](duplicate_runtime)
+     || unwrap_ok[usize, io_error.Error](duplicate_runtime) != 0
+     || poll(?resolver, ?resolver_completion, 1) != 0) { ret 10; }
+    if (!close(?resolver) || !destroy(?resolver)
+     || is_err[bool, io_error.Error](io_runtime.destroy(?runtime))
+     || !test_pool_destroy(?pool)) { ret 11; }
+    ret 0;
+}
+
+test "resolver: runtime wake mirrors success while resolver transfers the result" {
+    if (!resolver_threads_supported()) { ret 0; }
+    var owner: allocator.Allocator;
+    page.make(?owner);
+    var runtime: io_runtime.Runtime;
+    if (is_err[bool, io_error.Error](io_runtime.make(?runtime, 2))) { ret 1; }
+    var pool: TestPool;
+    if (!test_pool_make(?pool, 1)) { ret 2; }
+    var resolver: Resolver;
+    if (make_runtime_with_adapter(?resolver, ?runtime, ?pool.pool, ?owner, 1,
+        test_limits(), nil, fake_adapter).kind != types.NO_ERROR) { ret 3; }
+    var scope: cancellation.Scope;
+    cancellation.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    var query: types.Query = test_query("runtime-success", nil, 0);
+    val submitted: Result[io_runtime.Token, types.Error] = submit_runtime(
+        ?resolver, ?scope, ?query, 62);
+    if (is_err[io_runtime.Token, types.Error](submitted)) { ret 4; }
+    var runtime_completion: io_runtime.Completion;
+    val waited: Result[usize, io_error.Error] = io_runtime.wait(
+        ?runtime, ?runtime_completion, 1, 1000);
+    if (is_err[usize, io_error.Error](waited)
+     || unwrap_ok[usize, io_error.Error](waited) != 1
+     || runtime_completion.kind != io_runtime.RESOLVE
+     || runtime_completion.context != 62
+     || runtime_completion.has_error) { ret 5; }
+    var resolver_completion: types.Completion;
+    if (poll(?resolver, ?resolver_completion, 1) != 1
+     || resolver_completion.has_error
+     || resolver_completion.context != 62
+     || resolver_completion.resolution.len != 3
+     || resolver.live != 0) { ret 6; }
+    if (!resolution_destroy(?resolver_completion.resolution)
+     || !cancellation.destroy(?scope)
+     || !close(?resolver)
+     || !destroy(?resolver)
+     || is_err[bool, io_error.Error](io_runtime.close(?runtime))
+     || is_err[bool, io_error.Error](io_runtime.destroy(?runtime))
+     || !test_pool_destroy(?pool)) { ret 7; }
+    ret 0;
+}
+
+test "resolver: queued result adopts runtime close before dispatch" {
+    if (!resolver_threads_supported()) { ret 0; }
+    var owner: allocator.Allocator;
+    page.make(?owner);
+    var runtime: io_runtime.Runtime;
+    if (is_err[bool, io_error.Error](io_runtime.make(?runtime, 2))) { ret 1; }
+    var pool: TestPool;
+    if (!test_pool_make(?pool, 1)) { ret 2; }
+    var resolver: Resolver;
+    if (make_runtime_with_adapter(?resolver, ?runtime, ?pool.pool, ?owner, 1,
+        test_limits(), nil, fake_adapter).kind != types.NO_ERROR) { ret 3; }
+    var scope: cancellation.Scope;
+    cancellation.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    var query: types.Query = test_query("127.0.0.1", "443", 0);
+    query.flags = types.CANONICAL_NAME | types.NUMERIC_HOST | types.NUMERIC_SERVICE;
+    if (is_err[io_runtime.Token, types.Error](submit_runtime(
+        ?resolver, ?scope, ?query, 63)) || resolver.count != 1) { ret 4; }
+    var resolver_completion: types.Completion;
+    if (poll(?resolver, ?resolver_completion, 1) != 0) { ret 5; }
+    if (is_err[bool, io_error.Error](io_runtime.close(?runtime))) { ret 5; }
+    var runtime_completion: io_runtime.Completion;
+    val runtime_result: Result[usize, io_error.Error] = io_runtime.poll(
+        ?runtime, ?runtime_completion, 1);
+    if (is_err[usize, io_error.Error](runtime_result)
+     || unwrap_ok[usize, io_error.Error](runtime_result) != 1
+     || runtime_completion.kind != io_runtime.RESOLVE
+     || runtime_completion.context != 63
+     || !runtime_completion.has_error
+     || runtime_completion.error.kind != io_error.CLOSED) { ret 6; }
+    if (poll(?resolver, ?resolver_completion, 1) != 1
+     || !resolver_completion.has_error
+     || resolver_completion.error.kind != types.CLOSED
+     || resolver_completion.resolution.endpoints != nil
+     || resolver_completion.resolution.canonical_name != nil
+     || resolver.live != 0) { ret 7; }
+    if (!cancellation.destroy(?scope)
+     || !close(?resolver)
+     || !destroy(?resolver)
+     || is_err[bool, io_error.Error](io_runtime.destroy(?runtime))
+     || !test_pool_destroy(?pool)) { ret 8; }
+    ret 0;
+}
+
+test "resolver: runtime cancellation and deadline preserve the first reason" {
+    if (!resolver_threads_supported()) { ret 0; }
+    var owner: allocator.Allocator;
+    page.make(?owner);
+    var runtime: io_runtime.Runtime;
+    if (is_err[bool, io_error.Error](io_runtime.make(?runtime, 2))) { ret 1; }
+    var pool: TestPool;
+    if (!test_pool_make(?pool, 1)) { ret 2; }
+    var gate: Gate = Gate{entered: 0, release: 0};
+    var resolver: Resolver;
+    if (make_runtime_with_adapter(?resolver, ?runtime, ?pool.pool, ?owner, 1,
+        test_limits(), (?gate)::ptr, gated_adapter).kind != types.NO_ERROR) { ret 3; }
+    var scope: cancellation.Scope;
+    cancellation.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    var query: types.Query = test_query("deadline-first", nil, 0);
+    if (is_err[io_runtime.Token, types.Error](submit_runtime(
+        ?resolver, ?scope, ?query, 71))) { ret 4; }
+    gate_wait_entered(?gate);
+    val deadline_close: Result[lifecycle.CloseResult, io_error.Error] = io_runtime.begin_close(
+        ?runtime, lifecycle.ABORTIVE, lifecycle.DEADLINE);
+    val later_cancel: Result[lifecycle.CloseResult, io_error.Error] = io_runtime.begin_close(
+        ?runtime, lifecycle.ABORTIVE, lifecycle.CANCELLATION);
+    if (is_err[lifecycle.CloseResult, io_error.Error](deadline_close)
+     || is_err[lifecycle.CloseResult, io_error.Error](later_cancel)
+     || !unwrap_ok[lifecycle.CloseResult, io_error.Error](deadline_close).started
+     || unwrap_ok[lifecycle.CloseResult, io_error.Error](later_cancel).escalated
+     || !cancellation.destroy(?scope)) { ret 5; }
+    gate_release(?gate);
+    var runtime_completion: io_runtime.Completion;
+    var deadline_wait: Result[usize, io_error.Error] = io_runtime.wait(
+        ?runtime, ?runtime_completion, 1, 1000);
+    if (!is_err[usize, io_error.Error](deadline_wait)
+     && unwrap_ok[usize, io_error.Error](deadline_wait) == 0) {
+        deadline_wait = io_runtime.wait(?runtime, ?runtime_completion, 1, 1000);
+    }
+    var resolver_completion: types.Completion;
+    if (is_err[usize, io_error.Error](deadline_wait)
+     || unwrap_ok[usize, io_error.Error](deadline_wait) != 1
+     || runtime_completion.error.kind != io_error.TIMEOUT
+     || poll(?resolver, ?resolver_completion, 1) != 1
+     || resolver_completion.error.kind != types.TIMED_OUT) { ret 6; }
+    if (!close(?resolver) || !destroy(?resolver)
+     || is_err[bool, io_error.Error](io_runtime.destroy(?runtime))
+     || !test_pool_destroy(?pool)) { ret 7; }
+
+    if (is_err[bool, io_error.Error](io_runtime.make(?runtime, 2))
+     || !test_pool_make(?pool, 1)) { ret 8; }
+    gate = Gate{entered: 0, release: 0};
+    if (make_runtime_with_adapter(?resolver, ?runtime, ?pool.pool, ?owner, 1,
+        test_limits(), (?gate)::ptr, gated_adapter).kind != types.NO_ERROR) { ret 9; }
+    cancellation.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    query = test_query("cancel-first", nil, 0);
+    if (is_err[io_runtime.Token, types.Error](submit_runtime(
+        ?resolver, ?scope, ?query, 72))) { ret 10; }
+    gate_wait_entered(?gate);
+    if (!cancellation.cancel(?scope)) { ret 11; }
+    val later_deadline: Result[lifecycle.CloseResult, io_error.Error] = io_runtime.begin_close(
+        ?runtime, lifecycle.ABORTIVE, lifecycle.DEADLINE);
+    if (is_err[lifecycle.CloseResult, io_error.Error](later_deadline)
+     || !cancellation.destroy(?scope)) { ret 12; }
+    gate_release(?gate);
+    var cancel_wait: Result[usize, io_error.Error] = io_runtime.wait(
+        ?runtime, ?runtime_completion, 1, 1000);
+    if (!is_err[usize, io_error.Error](cancel_wait)
+     && unwrap_ok[usize, io_error.Error](cancel_wait) == 0) {
+        cancel_wait = io_runtime.wait(?runtime, ?runtime_completion, 1, 1000);
+    }
+    if (is_err[usize, io_error.Error](cancel_wait)
+     || unwrap_ok[usize, io_error.Error](cancel_wait) != 1
+     || runtime_completion.error.kind != io_error.CANCELLED
+     || poll(?resolver, ?resolver_completion, 1) != 1
+     || resolver_completion.error.kind != types.CANCELLED) { ret 13; }
+    if (!close(?resolver) || !destroy(?resolver)
+     || is_err[bool, io_error.Error](io_runtime.destroy(?runtime))
+     || !test_pool_destroy(?pool)) { ret 14; }
     ret 0;
 }

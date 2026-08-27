@@ -64,6 +64,7 @@ rec QueuedCompletion {
 
 pub rec Backend {
     queue: *shared.IoQueue;
+    source_id: u16;
     operations: *Operation;
     resources: *Resource;
     resource_map: *u32;
@@ -102,13 +103,17 @@ val IPV6_PKTINFO: i32 = 50;
 
 fun invalid() i64 { ret linux.EINVAL; }
 
-fun token_context(token: types.Token) usize {
-    ret ((token.generation::u64 << 32) | (token.index::u64 + 1))::usize;
+fun token_context(backend: *Backend, token: types.Token) usize {
+    ret ((backend.source_id::u64 << 48) | ((token.index::u64 + 1) << 32) | token.generation::u64)::usize;
 }
 
-fun context_token(context: usize) types.Token {
+fun context_token(backend: *Backend, context: usize, token: *types.Token) bool {
     val raw: u64 = context::u64;
-    ret types.Token{index: ((raw & 0xffffffff) - 1)::u32, generation: (raw >> 32)::u32};
+    val index: u64 = (raw >> 32) & 0xffff;
+    if ((raw >> 48)::u16 != backend.source_id || index == 0 || token == nil) { ret false; }
+    token.index = (index - 1)::u32;
+    token.generation = raw::u32;
+    ret token.generation != 0;
 }
 
 fun operation_for(backend: *Backend, token: types.Token) *Operation {
@@ -428,7 +433,7 @@ fun arm_resource(backend: *Backend, resource: *Resource) {
         ret;
     }
     val token: types.Token = types.Token{index: resource_index(backend, resource), generation: resource.generation};
-    val status: i64 = linux.io_queue_watch(backend.queue, resource.resource, token_context(token), events);
+    val status: i64 = linux.io_queue_watch(backend.queue, resource.resource, token_context(backend, token), events);
     if (status < 0) {
         fail_resource(backend, resource, status);
         linux.io_queue_unwatch(backend.queue, resource.resource);
@@ -496,8 +501,8 @@ fun submission_done(backend: *Backend, resource: *Resource) {
     linux.io_queue_wake(backend.queue);
 }
 
-pub fun make(backend: *Backend, queue: *shared.IoQueue, capacity: usize) i64 {
-    if (backend == nil || queue == nil || capacity == 0) { ret invalid(); }
+pub fun make(backend: *Backend, queue: *shared.IoQueue, capacity: usize, source_id: u16) i64 {
+    if (backend == nil || queue == nil || capacity == 0 || capacity > 0xffff || source_id == 0) { ret invalid(); }
     val map_capacity: usize = required_map_capacity(capacity);
     if (map_capacity == 0) { ret linux.ENOMEM; }
     val operation_size: usize = $size_of(Operation);
@@ -553,6 +558,7 @@ pub fun make(backend: *Backend, queue: *shared.IoQueue, capacity: usize) i64 {
         ret linux.ENOMEM;
     }
     backend.queue = queue;
+    backend.source_id = source_id;
     backend.capacity = capacity;
     backend.map_capacity = map_capacity;
     backend.live = 0;
@@ -803,6 +809,38 @@ fun publish_ready(backend: *Backend) usize {
     ret count;
 }
 
+pub fun flush(backend: *Backend) i64 {
+    if (backend == nil) { ret invalid(); }
+    mutex.lock(?backend.lock);
+    val ready: usize = publish_ready(backend);
+    mutex.unlock(?backend.lock);
+    ret ready::i64;
+}
+
+pub fun dispatch(
+    backend: *Backend,
+    context: usize,
+    events: u32,
+    status: i64,
+    flags: u64,
+    claimed: *bool,
+) i64 {
+    if (backend == nil || claimed == nil) { ret invalid(); }
+    @claimed = false;
+    var resource_token: types.Token;
+    if (!context_token(backend, context, ?resource_token)) { ret 0; }
+    @claimed = true;
+    mutex.lock(?backend.lock);
+    val resource: *Resource = resource_for(backend, resource_token);
+    if (resource != nil) {
+        resource.armed = false;
+        drive_resource(backend, resource, events);
+    }
+    val ready: usize = publish_ready(backend);
+    mutex.unlock(?backend.lock);
+    ret ready::i64;
+}
+
 # one thread owns poll and completion retrieval
 pub fun poll(backend: *Backend, timeout_ms: i32) i64 {
     if (backend == nil) { ret invalid(); }
@@ -820,11 +858,13 @@ pub fun poll(backend: *Backend, timeout_ms: i32) i64 {
         for (i < count::usize) {
             val native_completion: linux.IoCompletion = backend.native[i];
             if (native_completion.context != 0 && (native_completion.events & linux.IO_EVENT_WAKE) == 0) {
-                val resource_token: types.Token = context_token(native_completion.context);
-                val resource: *Resource = resource_for(backend, resource_token);
-                if (resource != nil) {
-                    resource.armed = false;
-                    drive_resource(backend, resource, native_completion.events);
+                var resource_token: types.Token;
+                if (context_token(backend, native_completion.context, ?resource_token)) {
+                    val resource: *Resource = resource_for(backend, resource_token);
+                    if (resource != nil) {
+                        resource.armed = false;
+                        drive_resource(backend, resource, native_completion.events);
+                    }
                 }
             }
             i = i + 1;
@@ -1130,7 +1170,7 @@ test "async linux: UDP batch preserves boundaries and metadata" {
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 8) < 0) { linux.io_queue_close(?queue); ret 1; }
+    if (make(?backend, ?queue, 8, 1) < 0) { linux.io_queue_close(?queue); ret 1; }
     var receiver: usize;
     var receiver_endpoint: ip.Endpoint;
     var sender: usize;
@@ -1215,7 +1255,7 @@ test "async linux: vectored writes and fragmented reads report progress" {
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 8) < 0) { linux.io_queue_close(?queue); ret 1; }
+    if (make(?backend, ?queue, 8, 1) < 0) { linux.io_queue_close(?queue); ret 1; }
     var listener: usize;
     var endpoint: ip.Endpoint;
     if (test_listener(?listener, ?endpoint) < 0) { destroy(?backend); linux.io_queue_close(?queue); ret 1; }
@@ -1273,7 +1313,7 @@ test "async linux: remote half-close reports EOF and preserves writes" {
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 4) < 0) { linux.io_queue_close(?queue); ret 1; }
+    if (make(?backend, ?queue, 4, 1) < 0) { linux.io_queue_close(?queue); ret 1; }
     var listener: usize;
     var endpoint: ip.Endpoint;
     if (test_listener(?listener, ?endpoint) < 0) { destroy(?backend); linux.io_queue_close(?queue); ret 1; }
@@ -1314,7 +1354,7 @@ test "async linux: reset completes a pending read once" {
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 4) < 0) { linux.io_queue_close(?queue); ret 1; }
+    if (make(?backend, ?queue, 4, 1) < 0) { linux.io_queue_close(?queue); ret 1; }
     var listener: usize;
     var endpoint: ip.Endpoint;
     if (test_listener(?listener, ?endpoint) < 0) { destroy(?backend); linux.io_queue_close(?queue); ret 1; }
@@ -1363,7 +1403,7 @@ test "async linux: timeout cancellation releases saturated storage" {
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 2) < 0) { linux.io_queue_close(?queue); ret 1; }
+    if (make(?backend, ?queue, 2, 1) < 0) { linux.io_queue_close(?queue); ret 1; }
     var listener: usize;
     var endpoint: ip.Endpoint;
     if (test_listener(?listener, ?endpoint) < 0) { destroy(?backend); linux.io_queue_close(?queue); ret 1; }
@@ -1399,7 +1439,7 @@ test "async linux: canceling close preserves handle ownership" {
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 8) < 0) { linux.io_queue_close(?queue); ret 1; }
+    if (make(?backend, ?queue, 8, 1) < 0) { linux.io_queue_close(?queue); ret 1; }
     var listener: usize;
     var endpoint: ip.Endpoint;
     if (test_listener(?listener, ?endpoint) < 0) { destroy(?backend); linux.io_queue_close(?queue); ret 1; }
@@ -1455,7 +1495,7 @@ test "async linux: queued cancellation preserves FIFO" {
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 4) < 0) { linux.io_queue_close(?queue); ret 1; }
+    if (make(?backend, ?queue, 4, 1) < 0) { linux.io_queue_close(?queue); ret 1; }
     var socket: usize = (-1)::usize;
     if (linux.sock_create_flags(linux.AF_INET, linux.SOCK_DGRAM, 0, true, true, ?socket) < 0) {
         destroy(?backend); linux.io_queue_close(?queue); ret 1;
@@ -1493,7 +1533,7 @@ test "async linux: queued accept cancellation closes handle" {
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 4) < 0) { linux.io_queue_close(?queue); ret 1; }
+    if (make(?backend, ?queue, 4, 1) < 0) { linux.io_queue_close(?queue); ret 1; }
     var listener: usize;
     var endpoint: ip.Endpoint;
     if (test_listener(?listener, ?endpoint) < 0) { destroy(?backend); linux.io_queue_close(?queue); ret 1; }
@@ -1519,7 +1559,7 @@ test "async linux: one stream drives concurrent read and write" {
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 8) < 0) { linux.io_queue_close(?queue); ret 1; }
+    if (make(?backend, ?queue, 8, 1) < 0) { linux.io_queue_close(?queue); ret 1; }
     var listener: usize;
     var endpoint: ip.Endpoint;
     if (test_listener(?listener, ?endpoint) < 0) { destroy(?backend); linux.io_queue_close(?queue); ret 1; }
@@ -1570,7 +1610,7 @@ test "async linux: listener owns multiple bounded accepts" {
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 8) < 0) { linux.io_queue_close(?queue); ret 1; }
+    if (make(?backend, ?queue, 8, 1) < 0) { linux.io_queue_close(?queue); ret 1; }
     var listener: usize;
     var endpoint: ip.Endpoint;
     if (test_listener(?listener, ?endpoint) < 0) { destroy(?backend); linux.io_queue_close(?queue); ret 1; }
@@ -1617,7 +1657,7 @@ test "async linux: shutdown and close follow prior writes" {
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 8) < 0) { linux.io_queue_close(?queue); ret 1; }
+    if (make(?backend, ?queue, 8, 1) < 0) { linux.io_queue_close(?queue); ret 1; }
     var listener: usize;
     var endpoint: ip.Endpoint;
     if (test_listener(?listener, ?endpoint) < 0) { destroy(?backend); linux.io_queue_close(?queue); ret 1; }
