@@ -1,74 +1,566 @@
-# native conformance probes for contracts that support isolated loopback tests
+# native loopback adapters for deterministic fault traces
 
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
 use std.types.size.usize;
 use std.types.result;
-use std.io.error;
+use std.system.os;
+use std.chrono.time;
+use std.sync.cancel;
+use std.io.handle;
+use io_error: std.io.error;
+use io_runtime: std.io.runtime;
 use std.net.ip;
+use std.net.tcp;
 use std.net.udp;
+use socket_api: std.net.socket;
+use network: std.net.async;
+use network_types: std.net.async.types;
 use fault.script;
+use fault.reader;
+use fault.writer;
 use fault.datagram;
+use fault.race;
 
-fun close_pair(sender: *udp.Socket, receiver: *udp.Socket) {
-    udp.socket_close(sender);
-    udp.socket_close(receiver);
+rec Harness {
+    runtime: io_runtime.Runtime;
+    driver: network.Driver;
 }
 
-test "fault native: udp truncation matches the deterministic datagram contract" {
-    val bound_result: result.Result[udp.Socket, error.Error] = udp.bind(ip.endpoint(127, 0, 0, 1, 0));
-    if (result.is_err[udp.Socket, error.Error](bound_result)) { ret 1; }
-    var receiver: udp.Socket = result.unwrap_ok[udp.Socket, error.Error](bound_result);
-    val endpoint_result: result.Result[ip.Endpoint, error.Error] = udp.local_endpoint(?receiver);
-    if (result.is_err[ip.Endpoint, error.Error](endpoint_result)) {
-        udp.socket_close(?receiver);
-        ret 1;
-    }
-    val endpoint: ip.Endpoint = result.unwrap_ok[ip.Endpoint, error.Error](endpoint_result);
+rec StreamPair {
+    listener: tcp.Listener;
+    client: tcp.Stream;
+    server: tcp.Stream;
+}
 
-    val created: result.Result[udp.Socket, error.Error] = udp.create();
-    if (result.is_err[udp.Socket, error.Error](created)) { udp.socket_close(?receiver); ret 1; }
-    var sender: udp.Socket = result.unwrap_ok[udp.Socket, error.Error](created);
-    val sent: result.Result[usize, error.Error] = udp.send_to(?sender, "abc", 3, endpoint);
-    if (result.is_err[usize, error.Error](sent)
-     || result.unwrap_ok[usize, error.Error](sent) != 3) {
-        close_pair(?sender, ?receiver);
-        ret 1;
+fun harness_make(h: *Harness, capacity: usize) bool {
+    if (result.is_err[bool, io_error.Error](io_runtime.make(?h.runtime, capacity))) { ret false; }
+    if (result.is_err[bool, io_error.Error](network.make(?h.driver, ?h.runtime))) {
+        io_runtime.close(?h.runtime);
+        io_runtime.destroy(?h.runtime);
+        ret false;
     }
-    val sender_endpoint_result: result.Result[ip.Endpoint, error.Error] = udp.local_endpoint(?sender);
-    if (result.is_err[ip.Endpoint, error.Error](sender_endpoint_result)) {
-        close_pair(?sender, ?receiver);
-        ret 1;
-    }
-    val sender_endpoint: ip.Endpoint = result.unwrap_ok[ip.Endpoint, error.Error](sender_endpoint_result);
+    ret true;
+}
 
-    var native_data: [2]u8;
-    var source: ip.Endpoint;
-    val received: result.Result[usize, error.Error] = udp.recv_from(?receiver, ?native_data[0], 2, ?source);
-    close_pair(?sender, ?receiver);
-    $if ($mach.build.os == $mach.os.windows) {
-        # winsock copies the prefix but reports emsgsize instead of a byte count
-        if (!result.is_err[usize, error.Error](received)) { ret 1; }
-        val receive_error: error.Error = result.unwrap_err[usize, error.Error](received);
-        if (receive_error.code != -90 || receive_error.operation != error.OP_RECEIVE) { ret 1; }
-    }
-    $or {
-        if (result.is_err[usize, error.Error](received)
-         || result.unwrap_ok[usize, error.Error](received) != 2) { ret 1; }
-        if (source.port != sender_endpoint.port) { ret 1; }
-    }
-    if (native_data[0] != 'a'::u8 || native_data[1] != 'b'::u8) { ret 1; }
+fun harness_close(h: *Harness) bool {
+    var valid: bool = true;
+    if (result.is_err[bool, io_error.Error](network.destroy(?h.driver))) { valid = false; }
+    if (result.is_err[bool, io_error.Error](io_runtime.close(?h.runtime))) { valid = false; }
+    if (result.is_err[bool, io_error.Error](io_runtime.destroy(?h.runtime))) { valid = false; }
+    ret valid;
+}
 
-    var step: script.Step = script.Step{kind: datagram.DATAGRAM, flags: 0, value0: 0,
+fun scope_make(scope: *cancel.Scope) bool {
+    ret cancel.make_root(scope, false, time.Time{sec: 0, nsec: 0});
+}
+
+fun stream_pair_make(pair: *StreamPair) bool {
+    pair.listener.handle = handle.invalid_socket();
+    pair.client.handle = handle.invalid_socket();
+    pair.server.handle = handle.invalid_socket();
+    val listener_result: result.Result[tcp.Listener, io_error.Error] = tcp.listen(ip.endpoint(127, 0, 0, 1, 0), 8);
+    if (result.is_err[tcp.Listener, io_error.Error](listener_result)) { ret false; }
+    pair.listener = result.unwrap_ok[tcp.Listener, io_error.Error](listener_result);
+    val endpoint_result: result.Result[ip.Endpoint, io_error.Error] = tcp.listener_local_endpoint(?pair.listener);
+    if (result.is_err[ip.Endpoint, io_error.Error](endpoint_result)) {
+        tcp.listener_close(?pair.listener);
+        ret false;
+    }
+    val client_result: result.Result[tcp.Stream, io_error.Error] = tcp.connect(result.unwrap_ok[ip.Endpoint, io_error.Error](endpoint_result));
+    if (result.is_err[tcp.Stream, io_error.Error](client_result)) {
+        tcp.listener_close(?pair.listener);
+        ret false;
+    }
+    pair.client = result.unwrap_ok[tcp.Stream, io_error.Error](client_result);
+    val server_result: result.Result[tcp.Stream, io_error.Error] = tcp.accept_with_flags(?pair.listener, socket_api.async_flags());
+    if (result.is_err[tcp.Stream, io_error.Error](server_result)) {
+        tcp.stream_close(?pair.client);
+        tcp.listener_close(?pair.listener);
+        ret false;
+    }
+    pair.server = result.unwrap_ok[tcp.Stream, io_error.Error](server_result);
+    ret true;
+}
+
+fun stream_pair_close(pair: *StreamPair) bool {
+    var valid: bool = true;
+    if (handle.socket_is_valid(pair.server.handle)
+     && result.is_err[bool, io_error.Error](tcp.stream_close(?pair.server))) { valid = false; }
+    if (handle.socket_is_valid(pair.client.handle)
+     && result.is_err[bool, io_error.Error](tcp.stream_close(?pair.client))) { valid = false; }
+    if (handle.socket_is_valid(pair.listener.handle)
+     && result.is_err[bool, io_error.Error](tcp.listener_close(?pair.listener))) { valid = false; }
+    ret valid;
+}
+
+fun wait_count(h: *Harness, output: *io_runtime.Completion, capacity: usize, timeout_ms: i32, count: *usize) bool {
+    val waited: result.Result[usize, io_error.Error] = network.wait(?h.driver, output, capacity, timeout_ms);
+    if (result.is_err[usize, io_error.Error](waited)) { ret false; }
+    @count = result.unwrap_ok[usize, io_error.Error](waited);
+    ret true;
+}
+
+fun wait_one(h: *Harness, output: *io_runtime.Completion) bool {
+    var attempts: usize = 0;
+    for (attempts < 8) {
+        var count: usize = 0;
+        if (!wait_count(h, output, 1, 1000, ?count)) { ret false; }
+        if (count == 1) { ret true; }
+        attempts = attempts + 1;
+    }
+    ret false;
+}
+
+fun collect(h: *Harness, output: *io_runtime.Completion, capacity: usize, wanted: usize) bool {
+    var count: usize = 0;
+    var attempts: usize = 0;
+    for (count < wanted && attempts < 8) {
+        var available: usize = 0;
+        if (!wait_count(h, ?output[count], capacity - count, 1000, ?available)) { ret false; }
+        count = count + available;
+        attempts = attempts + 1;
+    }
+    ret count == wanted;
+}
+
+fun steps_match(expected: *script.Script, actual: *script.Step, count: usize) bool {
+    var observed: script.Script = script.Script{seed: expected.seed, steps: actual, len: count};
+    ret script.equal(expected, ?observed);
+}
+
+fun reader_step(completion: io_runtime.Completion) script.Step {
+    var kind: u8 = reader.BYTES;
+    if (completion.has_error) { kind = reader.ERROR; }
+    or (completion.end_of_stream) { kind = reader.EOF; }
+    ret script.Step{kind: kind, flags: 0, value0: completion.bytes::u64,
         value1: 0, value2: 0, value3: 0, value4: 0};
-    var replay: script.Script = script.Script{seed: 0, steps: ?step, len: 1};
-    var packet: datagram.Packet;
-    var storage: [3]u8;
-    var network: datagram.Network;
-    if (!datagram.init_scripted(?network, ?packet, 1, ?storage[0], 3, ?replay)) { ret 1; }
-    if (!datagram.send(?network, sender_endpoint.port::u64, endpoint.port::u64, "abc", 3)) { ret 1; }
-    var modeled_data: [2]u8;
-    var delivery: datagram.Delivery;
-    if (!datagram.receive(?network, ?modeled_data[0], 2, ?delivery)) { ret 1; }
-    if (delivery.len != 2 || delivery.original_len != 3 || !delivery.truncated) { ret 1; }
-    if (modeled_data[0] != native_data[0] || modeled_data[1] != native_data[1]) { ret 1; }
+}
+
+fun writer_step(completion: io_runtime.Completion) script.Step {
+    var kind: u8 = writer.BYTES;
+    if (completion.has_error) { kind = writer.ERROR; }
+    ret script.Step{kind: kind, flags: 0, value0: completion.bytes::u64,
+        value1: 0, value2: 0, value3: 0, value4: 0};
+}
+
+fun operation_step(completion: io_runtime.Completion) script.Step {
+    var flags: u8 = 0;
+    if (completion.has_error) { flags = 1; }
+    if (completion.end_of_stream) { flags = flags | 2; }
+    ret script.Step{kind: completion.kind, flags: flags, value0: completion.context::u64,
+        value1: completion.bytes::u64, value2: completion.items::u64,
+        value3: completion.error.kind::u64, value4: 0};
+}
+
+fun sync_write(stream: *tcp.Stream, data: *u8, length: usize) bool {
+    var offset: usize = 0;
+    for (offset < length) {
+        val written: result.Result[usize, io_error.Error] = tcp.stream_write(stream, ?data[offset], length - offset);
+        if (result.is_err[usize, io_error.Error](written)) { ret false; }
+        val count: usize = result.unwrap_ok[usize, io_error.Error](written);
+        if (count == 0) { ret false; }
+        offset = offset + count;
+    }
+    ret true;
+}
+
+fun sync_read(stream: *tcp.Stream, data: *u8, length: usize) bool {
+    var offset: usize = 0;
+    for (offset < length) {
+        val received: result.Result[usize, io_error.Error] = tcp.stream_read(stream, ?data[offset], length - offset);
+        if (result.is_err[usize, io_error.Error](received)) { ret false; }
+        val count: usize = result.unwrap_ok[usize, io_error.Error](received);
+        if (count == 0) { ret false; }
+        offset = offset + count;
+    }
+    ret true;
+}
+
+test "fault native: stream fragmentation matches reader and writer scripts" {
+    var h: Harness;
+    if (!harness_make(?h, 8)) { ret 1; }
+    var pair: StreamPair;
+    if (!stream_pair_make(?pair)) { harness_close(?h); ret 1; }
+    var scope: cancel.Scope;
+    if (!scope_make(?scope)) { stream_pair_close(?pair); harness_close(?h); ret 1; }
+
+    var read_expected_steps: [4]script.Step;
+    read_expected_steps[0] = script.Step{kind: reader.BYTES, flags: 0, value0: 1, value1: 0, value2: 0, value3: 0, value4: 0};
+    read_expected_steps[1] = script.Step{kind: reader.BYTES, flags: 0, value0: 2, value1: 0, value2: 0, value3: 0, value4: 0};
+    read_expected_steps[2] = script.Step{kind: reader.BYTES, flags: 0, value0: 3, value1: 0, value2: 0, value3: 0, value4: 0};
+    read_expected_steps[3] = script.Step{kind: reader.EOF, flags: 0, value0: 0, value1: 0, value2: 0, value3: 0, value4: 0};
+    var read_expected: script.Script = script.Script{seed: 0x49901, steps: ?read_expected_steps[0], len: 4};
+    var read_actual: [4]script.Step;
+    var input: [6]u8;
+    var fragments: [6]u8;
+    fragments[0] = 'a'; fragments[1] = 'b'; fragments[2] = 'c';
+    fragments[3] = 'd'; fragments[4] = 'e'; fragments[5] = 'f';
+    var offset: usize = 0;
+    var i: usize = 0;
+    for (i < 3) {
+        val amount: usize = read_expected_steps[i].value0::usize;
+        if (!sync_write(?pair.client, ?fragments[offset], amount)) { ret 2; }
+        val submitted: result.Result[io_runtime.Token, io_error.Error] = network.submit_read(?h.driver, ?scope, ?pair.server, ?input[offset], 6 - offset, 100 + i);
+        if (result.is_err[io_runtime.Token, io_error.Error](submitted)) { ret 3; }
+        var completion: io_runtime.Completion;
+        if (!wait_one(?h, ?completion) || completion.kind != io_runtime.READ || completion.context != 100 + i || completion.items != 0) { ret 4; }
+        read_actual[i] = reader_step(completion);
+        offset = offset + completion.bytes;
+        i = i + 1;
+    }
+    if (result.is_err[bool, io_error.Error](tcp.stream_shutdown(?pair.client, os.SHUT_WR))) { ret 5; }
+    val eof_submitted: result.Result[io_runtime.Token, io_error.Error] = network.submit_read(?h.driver, ?scope, ?pair.server, ?input[0], 1, 103);
+    var eof_completion: io_runtime.Completion;
+    if (result.is_err[io_runtime.Token, io_error.Error](eof_submitted) || !wait_one(?h, ?eof_completion)) { ret 6; }
+    read_actual[3] = reader_step(eof_completion);
+
+    var write_expected_steps: [3]script.Step;
+    write_expected_steps[0] = script.Step{kind: writer.BYTES, flags: 0, value0: 1, value1: 0, value2: 0, value3: 0, value4: 0};
+    write_expected_steps[1] = script.Step{kind: writer.BYTES, flags: 0, value0: 2, value1: 0, value2: 0, value3: 0, value4: 0};
+    write_expected_steps[2] = script.Step{kind: writer.BYTES, flags: 0, value0: 3, value1: 0, value2: 0, value3: 0, value4: 0};
+    var write_expected: script.Script = script.Script{seed: 0x49902, steps: ?write_expected_steps[0], len: 3};
+    var write_actual: [3]script.Step;
+    var output: [6]u8;
+    output[0] = 'g'; output[1] = 'h'; output[2] = 'i';
+    output[3] = 'j'; output[4] = 'k'; output[5] = 'l';
+    var captured: [6]u8;
+    offset = 0;
+    i = 0;
+    for (i < 3) {
+        val amount: usize = write_expected_steps[i].value0::usize;
+        val submitted: result.Result[io_runtime.Token, io_error.Error] = network.submit_write(?h.driver, ?scope, ?pair.server, ?output[offset], amount, 110 + i);
+        if (result.is_err[io_runtime.Token, io_error.Error](submitted)) { ret 7; }
+        var completion: io_runtime.Completion;
+        if (!wait_one(?h, ?completion) || completion.kind != io_runtime.WRITE || completion.context != 110 + i || completion.items != 0) { ret 8; }
+        write_actual[i] = writer_step(completion);
+        if (!sync_read(?pair.client, ?captured[offset], completion.bytes)) { ret 9; }
+        offset = offset + completion.bytes;
+        i = i + 1;
+    }
+
+    val valid: bool = offset == 6
+        && steps_match(?read_expected, ?read_actual[0], 4)
+        && steps_match(?write_expected, ?write_actual[0], 3)
+        && input[0] == 'a' && input[5] == 'f' && captured[0] == 'g' && captured[5] == 'l';
+    val scope_closed: bool = cancel.destroy(?scope);
+    val pair_closed: bool = stream_pair_close(?pair);
+    val harness_closed: bool = harness_close(?h);
+    if (!valid || !scope_closed || !pair_closed || !harness_closed) { ret 10; }
+    ret 0;
+}
+
+test "fault native: reset and cancellation preserve one terminal result" {
+    var h: Harness;
+    if (!harness_make(?h, 4)) { ret 1; }
+    var pair: StreamPair;
+    if (!stream_pair_make(?pair)) { harness_close(?h); ret 1; }
+    var reset_scope: cancel.Scope;
+    if (!scope_make(?reset_scope)) { stream_pair_close(?pair); harness_close(?h); ret 1; }
+    var reset_byte: u8 = 0;
+    val reset_submitted: result.Result[io_runtime.Token, io_error.Error] = network.submit_read(?h.driver, ?reset_scope, ?pair.server, ?reset_byte, 1, 120);
+    var linger: [2]i32;
+    linger[0] = 1; linger[1] = 0;
+    val configured: i64 = os.sock_setopt(pair.client.handle.value, os.SOL_SOCKET, os.SO_LINGER, (?linger[0])::*u8, 8);
+    val client_closed: result.Result[bool, io_error.Error] = tcp.stream_close(?pair.client);
+    var reset_completion: io_runtime.Completion;
+    var expected_reset_step: script.Step = script.Step{kind: reader.ERROR, flags: 0, value0: 0, value1: 0, value2: 0, value3: 0, value4: 0};
+    var expected_reset: script.Script = script.Script{seed: 0x49903, steps: ?expected_reset_step, len: 1};
+    var actual_reset_step: script.Step;
+    val reset_observed: bool = !result.is_err[io_runtime.Token, io_error.Error](reset_submitted)
+        && configured == 0
+        && !result.is_err[bool, io_error.Error](client_closed)
+        && wait_one(?h, ?reset_completion);
+    if (reset_observed) { actual_reset_step = reader_step(reset_completion); }
+    val reset_valid: bool = reset_observed && reset_completion.context == 120 && reset_completion.kind == io_runtime.READ
+        && reset_completion.has_error && reset_completion.error.kind == io_error.RESET
+        && reset_completion.error.operation == io_error.OP_READ
+        && steps_match(?expected_reset, ?actual_reset_step, 1);
+    val reset_scope_closed: bool = cancel.destroy(?reset_scope);
+    val first_pair_closed: bool = stream_pair_close(?pair);
+
+    var cancel_pair: StreamPair;
+    if (!stream_pair_make(?cancel_pair)) { harness_close(?h); ret 2; }
+    var cancel_scope: cancel.Scope;
+    if (!scope_make(?cancel_scope)) { stream_pair_close(?cancel_pair); harness_close(?h); ret 2; }
+    var sentinel: u8 = 0xa5;
+    var actions: [3]script.Step;
+    actions[0].kind = race.SUBMIT;
+    actions[1].kind = race.CANCEL;
+    actions[2].kind = race.CANCEL;
+    var replay: script.Script = script.Script{seed: 0x49904, steps: ?actions[0], len: 3};
+    var modeled_runtime: race.Runtime = race.runtime();
+    var modeled_operation: race.Operation = race.operation();
+    var expected_outcomes: [3]u8;
+    race.drive(?modeled_runtime, ?modeled_operation, ?replay, ?expected_outcomes[0], 3);
+    var actual_outcomes: [3]u8;
+    val cancel_submitted: result.Result[io_runtime.Token, io_error.Error] = network.submit_read(?h.driver, ?cancel_scope, ?cancel_pair.server, ?sentinel, 1, 121);
+    if (!result.is_err[io_runtime.Token, io_error.Error](cancel_submitted)) { actual_outcomes[0] = race.APPLIED; }
+    or { actual_outcomes[0] = race.REJECTED; }
+    if (cancel.cancel(?cancel_scope)) { actual_outcomes[1] = race.APPLIED; }
+    or { actual_outcomes[1] = race.TOO_LATE; }
+    if (cancel.cancel(?cancel_scope)) { actual_outcomes[2] = race.APPLIED; }
+    or { actual_outcomes[2] = race.TOO_LATE; }
+    var canceled_completion: io_runtime.Completion;
+    val canceled_waited: bool = wait_one(?h, ?canceled_completion);
+    var after_count: usize = 1;
+    var after: io_runtime.Completion;
+    val after_waited: bool = wait_count(?h, ?after, 1, 0, ?after_count);
+    val cancel_valid: bool = actual_outcomes[0] == expected_outcomes[0]
+        && actual_outcomes[1] == expected_outcomes[1]
+        && actual_outcomes[2] == expected_outcomes[2]
+        && canceled_waited && canceled_completion.context == 121
+        && canceled_completion.has_error && canceled_completion.error.kind == io_error.CANCELLED
+        && canceled_completion.error.operation == io_error.OP_WAIT
+        && after_waited && after_count == 0 && sentinel == 0xa5;
+    val cancel_scope_closed: bool = cancel.destroy(?cancel_scope);
+    val second_pair_closed: bool = stream_pair_close(?cancel_pair);
+    val harness_closed: bool = harness_close(?h);
+    if (!reset_valid || !reset_scope_closed || !first_pair_closed
+     || !cancel_valid || !cancel_scope_closed || !second_pair_closed || !harness_closed) { ret 3; }
+    ret 0;
+}
+
+test "fault native: UDP batch matches deterministic packet traces" {
+    var h: Harness;
+    if (!harness_make(?h, 8)) { ret 1; }
+    var scope: cancel.Scope;
+    if (!scope_make(?scope)) { harness_close(?h); ret 1; }
+    val receiver_result: result.Result[udp.Socket, io_error.Error] = network.bind_datagram(ip.endpoint(127, 0, 0, 1, 0));
+    val sender_result: result.Result[udp.Socket, io_error.Error] = network.bind_datagram(ip.endpoint(127, 0, 0, 1, 0));
+    if (result.is_err[udp.Socket, io_error.Error](receiver_result)
+     || result.is_err[udp.Socket, io_error.Error](sender_result)) { ret 2; }
+    var receiver: udp.Socket = result.unwrap_ok[udp.Socket, io_error.Error](receiver_result);
+    var sender: udp.Socket = result.unwrap_ok[udp.Socket, io_error.Error](sender_result);
+    val receiver_endpoint_result: result.Result[ip.Endpoint, io_error.Error] = udp.local_endpoint(?receiver);
+    val sender_endpoint_result: result.Result[ip.Endpoint, io_error.Error] = udp.local_endpoint(?sender);
+    if (result.is_err[ip.Endpoint, io_error.Error](receiver_endpoint_result)
+     || result.is_err[ip.Endpoint, io_error.Error](sender_endpoint_result)) { ret 3; }
+    val receiver_endpoint: ip.Endpoint = result.unwrap_ok[ip.Endpoint, io_error.Error](receiver_endpoint_result);
+    val sender_endpoint: ip.Endpoint = result.unwrap_ok[ip.Endpoint, io_error.Error](sender_endpoint_result);
+
+    var first_out: [3]u8;
+    first_out[0] = 'o'; first_out[1] = 'n'; first_out[2] = 'e';
+    var third_out: [8]u8;
+    var i: usize = 0;
+    for (i < 8) { third_out[i] = (i + 1)::u8; i = i + 1; }
+    var outgoing: [3]network_types.Packet;
+    outgoing[0].buffer = ?first_out[0]; outgoing[0].length = 3;
+    outgoing[1].buffer = nil; outgoing[1].length = 0;
+    outgoing[2].buffer = ?third_out[0]; outgoing[2].length = 8;
+    i = 0;
+    for (i < 3) {
+        outgoing[i].capacity = outgoing[i].length;
+        outgoing[i].peer = receiver_endpoint;
+        outgoing[i].local_destination = ip.addr_v4(ip.ipv4_loopback());
+        outgoing[i].has_local_destination = true;
+        outgoing[i].interface_index = 0;
+        outgoing[i].truncated = false;
+        outgoing[i].zero_length = outgoing[i].length == 0;
+        i = i + 1;
+    }
+    var first_in: [3]u8;
+    var zero_in: u8 = 0;
+    var third_in: [4]u8;
+    var incoming: [3]network_types.Packet;
+    incoming[0].buffer = ?first_in[0]; incoming[0].capacity = 3;
+    incoming[1].buffer = ?zero_in; incoming[1].capacity = 1;
+    incoming[2].buffer = ?third_in[0]; incoming[2].capacity = 4;
+    i = 0;
+    for (i < 3) {
+        incoming[i].length = 0;
+        incoming[i].has_local_destination = false;
+        incoming[i].interface_index = 0;
+        incoming[i].truncated = false;
+        incoming[i].zero_length = false;
+        i = i + 1;
+    }
+
+    val receive_submitted: result.Result[io_runtime.Token, io_error.Error] = network.submit_receive_batch(?h.driver, ?scope, ?receiver, ?incoming[0], 3, 130);
+    val send_submitted: result.Result[io_runtime.Token, io_error.Error] = network.submit_send_batch(?h.driver, ?scope, ?sender, ?outgoing[0], 3, 131);
+    var completed: bool = !result.is_err[io_runtime.Token, io_error.Error](receive_submitted)
+        && !result.is_err[io_runtime.Token, io_error.Error](send_submitted);
+    var receive_items: usize = 0;
+    var receive_bytes: usize = 0;
+    var send_items: usize = 0;
+    var send_bytes: usize = 0;
+    var attempts: usize = 0;
+    for (completed && (receive_items < 3 || send_items < 3) && attempts < 8) {
+        var completion: io_runtime.Completion;
+        if (!wait_one(?h, ?completion) || completion.has_error || completion.items == 0) {
+            completed = false;
+        } or (completion.context == 130 && completion.kind == io_runtime.RECEIVE_FROM
+         && completion.items <= 3 - receive_items) {
+            receive_items = receive_items + completion.items;
+            receive_bytes = receive_bytes + completion.bytes;
+            if (receive_items < 3) {
+                val resumed: result.Result[io_runtime.Token, io_error.Error] = network.submit_receive_batch(
+                    ?h.driver, ?scope, ?receiver, ?incoming[receive_items], 3 - receive_items, 130,
+                );
+                if (result.is_err[io_runtime.Token, io_error.Error](resumed)) { completed = false; }
+            }
+        } or (completion.context == 131 && completion.kind == io_runtime.SEND_TO
+         && completion.items <= 3 - send_items) {
+            send_items = send_items + completion.items;
+            send_bytes = send_bytes + completion.bytes;
+            if (send_items < 3) {
+                val resumed: result.Result[io_runtime.Token, io_error.Error] = network.submit_send_batch(
+                    ?h.driver, ?scope, ?sender, ?outgoing[send_items], 3 - send_items, 131,
+                );
+                if (result.is_err[io_runtime.Token, io_error.Error](resumed)) { completed = false; }
+            }
+        } or {
+            completed = false;
+        }
+        attempts = attempts + 1;
+    }
+
+    var modeled_steps: [3]script.Step;
+    i = 0;
+    for (i < 3) {
+        modeled_steps[i] = script.Step{kind: datagram.DATAGRAM, flags: 0, value0: 0,
+            value1: 0, value2: 0, value3: 0, value4: 0};
+        i = i + 1;
+    }
+    var modeled_script: script.Script = script.Script{seed: 0x49905, steps: ?modeled_steps[0], len: 3};
+    var modeled_packets: [3]datagram.Packet;
+    var modeled_storage: [24]u8;
+    var modeled: datagram.Network;
+    val modeled_initialized: bool = datagram.init_scripted(?modeled, ?modeled_packets[0], 3, ?modeled_storage[0], 8, ?modeled_script);
+    val modeled_sent: bool = modeled_initialized
+        && datagram.send(?modeled, sender_endpoint.port::u64, receiver_endpoint.port::u64, ?first_out[0], 3)
+        && datagram.send(?modeled, sender_endpoint.port::u64, receiver_endpoint.port::u64, nil, 0)
+        && datagram.send(?modeled, sender_endpoint.port::u64, receiver_endpoint.port::u64, ?third_out[0], 8);
+    var modeled_first: [3]u8;
+    var modeled_zero: u8 = 0;
+    var modeled_third: [4]u8;
+    var deliveries: [3]datagram.Delivery;
+    val modeled_received: bool = modeled_sent
+        && datagram.receive(?modeled, ?modeled_first[0], 3, ?deliveries[0])
+        && datagram.receive(?modeled, ?modeled_zero, 1, ?deliveries[1])
+        && datagram.receive(?modeled, ?modeled_third[0], 4, ?deliveries[2]);
+
+    val completion_valid: bool = completed
+        && receive_bytes == 7 && receive_items == 3
+        && send_bytes == 11 && send_items == 3;
+    val packet_valid: bool = incoming[0].peer.port == sender_endpoint.port
+        && incoming[1].peer.port == sender_endpoint.port && incoming[2].peer.port == sender_endpoint.port
+        && incoming[0].has_local_destination && incoming[0].local_destination.is_v6 == 0
+        && incoming[0].local_destination.v4.octets[0] == 127
+        && incoming[0].local_destination.v4.octets[3] == 1
+        && incoming[0].interface_index != 0
+        && incoming[0].length == 3 && !incoming[0].zero_length && !incoming[0].truncated
+        && incoming[1].length == 0 && incoming[1].zero_length && !incoming[1].truncated
+        && incoming[2].length == 4 && !incoming[2].zero_length && incoming[2].truncated;
+    val model_valid: bool = modeled_received
+        && deliveries[0].len == incoming[0].length && !deliveries[0].truncated
+        && deliveries[1].len == incoming[1].length && !deliveries[1].truncated
+        && deliveries[2].len == incoming[2].length && deliveries[2].original_len == 8 && deliveries[2].truncated
+        && modeled_first[0] == first_in[0] && modeled_first[2] == first_in[2]
+        && modeled_third[0] == third_in[0] && modeled_third[3] == third_in[3];
+    val sender_closed: bool = !result.is_err[bool, io_error.Error](udp.socket_close(?sender));
+    val receiver_closed: bool = !result.is_err[bool, io_error.Error](udp.socket_close(?receiver));
+    val scope_closed: bool = cancel.destroy(?scope);
+    val harness_closed: bool = harness_close(?h);
+    if (!completion_valid || !packet_valid || !model_valid
+     || !sender_closed || !receiver_closed || !scope_closed || !harness_closed) { ret 4; }
+    ret 0;
+}
+
+test "fault native: shutdown and close preserve submitted order" {
+    var h: Harness;
+    if (!harness_make(?h, 8)) { ret 1; }
+    var pair: StreamPair;
+    if (!stream_pair_make(?pair)) { harness_close(?h); ret 1; }
+    var scope: cancel.Scope;
+    if (!scope_make(?scope)) { stream_pair_close(?pair); harness_close(?h); ret 1; }
+    var first: u8 = 'a';
+    var second: u8 = 'b';
+    val first_result: result.Result[io_runtime.Token, io_error.Error] = network.submit_write(?h.driver, ?scope, ?pair.server, ?first, 1, 140);
+    val second_result: result.Result[io_runtime.Token, io_error.Error] = network.submit_write(?h.driver, ?scope, ?pair.server, ?second, 1, 141);
+    val shutdown_result: result.Result[io_runtime.Token, io_error.Error] = network.submit_shutdown_write(?h.driver, ?scope, ?pair.server, 142);
+    var completions: [4]io_runtime.Completion;
+    var completed: bool = !result.is_err[io_runtime.Token, io_error.Error](first_result)
+        && !result.is_err[io_runtime.Token, io_error.Error](second_result)
+        && !result.is_err[io_runtime.Token, io_error.Error](shutdown_result)
+        && collect(?h, ?completions[0], 3, 3);
+    var received: [2]u8;
+    val data_received: bool = sync_read(?pair.client, ?received[0], 2);
+    var eof_byte: u8 = 0;
+    val eof_result: result.Result[usize, io_error.Error] = tcp.stream_read(?pair.client, ?eof_byte, 1);
+    val close_result: result.Result[io_runtime.Token, io_error.Error] = network.submit_stream_close(?h.driver, ?scope, ?pair.server, 143);
+    completed = completed
+        && !result.is_err[io_runtime.Token, io_error.Error](close_result)
+        && collect(?h, ?completions[3], 1, 1);
+    var actual: [4]script.Step;
+    var i: usize = 0;
+    for (i < 4) { actual[i] = operation_step(completions[i]); i = i + 1; }
+    var expected_steps: [4]script.Step;
+    expected_steps[0] = script.Step{kind: io_runtime.WRITE, flags: 0, value0: 140, value1: 1, value2: 0, value3: io_error.OTHER::u64, value4: 0};
+    expected_steps[1] = script.Step{kind: io_runtime.WRITE, flags: 0, value0: 141, value1: 1, value2: 0, value3: io_error.OTHER::u64, value4: 0};
+    expected_steps[2] = script.Step{kind: io_runtime.SHUTDOWN, flags: 0, value0: 142, value1: 0, value2: 0, value3: io_error.OTHER::u64, value4: 0};
+    expected_steps[3] = script.Step{kind: io_runtime.CLOSE, flags: 0, value0: 143, value1: 0, value2: 0, value3: io_error.OTHER::u64, value4: 0};
+    var expected: script.Script = script.Script{seed: 0x49906, steps: ?expected_steps[0], len: 4};
+    val eof_valid: bool = !result.is_err[usize, io_error.Error](eof_result)
+        && result.unwrap_ok[usize, io_error.Error](eof_result) == 0;
+    var failure: u8 = 0;
+    if (!completed) { failure = 11; }
+    if (failure == 0 && !data_received) { failure = 12; }
+    if (failure == 0 && (received[0] != 'a' || received[1] != 'b')) { failure = 13; }
+    if (failure == 0 && !eof_valid) { failure = 14; }
+    if (failure == 0 && handle.socket_is_valid(pair.server.handle)) { failure = 15; }
+    if (failure == 0 && !steps_match(?expected, ?actual[0], 4)) { failure = 16; }
+    val scope_closed: bool = cancel.destroy(?scope);
+    val pair_closed: bool = stream_pair_close(?pair);
+    val harness_closed: bool = harness_close(?h);
+    if (failure != 0) { ret failure::i32; }
+    if (!scope_closed || !pair_closed || !harness_closed) { ret 17; }
+    ret 0;
+}
+
+test "fault native: runtime close matches the scripted step order" {
+    var h: Harness;
+    if (!harness_make(?h, 4)) { ret 1; }
+    var pair: StreamPair;
+    if (!stream_pair_make(?pair)) { harness_close(?h); ret 1; }
+    var scope: cancel.Scope;
+    if (!scope_make(?scope)) { stream_pair_close(?pair); harness_close(?h); ret 1; }
+    var byte: u8 = 0x5a;
+    var actions: [4]script.Step;
+    actions[0].kind = race.SUBMIT;
+    actions[1].kind = race.CLOSE;
+    actions[2].kind = race.SUBMIT;
+    actions[3].kind = race.COMPLETE;
+    var replay: script.Script = script.Script{seed: 0x49907, steps: ?actions[0], len: 4};
+    var modeled_runtime: race.Runtime = race.runtime();
+    var modeled_operation: race.Operation = race.operation();
+    var expected: [4]u8;
+    race.drive(?modeled_runtime, ?modeled_operation, ?replay, ?expected[0], 4);
+
+    var actual: [4]u8;
+    val submitted: result.Result[io_runtime.Token, io_error.Error] = network.submit_read(?h.driver, ?scope, ?pair.server, ?byte, 1, 150);
+    if (!result.is_err[io_runtime.Token, io_error.Error](submitted)) { actual[0] = race.APPLIED; }
+    or { actual[0] = race.REJECTED; }
+    val closed: result.Result[bool, io_error.Error] = io_runtime.close(?h.runtime);
+    if (!result.is_err[bool, io_error.Error](closed)
+     && result.unwrap_ok[bool, io_error.Error](closed)) { actual[1] = race.APPLIED; }
+    or { actual[1] = race.TOO_LATE; }
+    val rejected: result.Result[io_runtime.Token, io_error.Error] = network.submit_read(?h.driver, ?scope, ?pair.server, ?byte, 1, 151);
+    if (result.is_err[io_runtime.Token, io_error.Error](rejected)) { actual[2] = race.REJECTED; }
+    or { actual[2] = race.APPLIED; }
+    var completion: io_runtime.Completion;
+    if (wait_one(?h, ?completion)) { actual[3] = race.APPLIED; }
+    or { actual[3] = race.INVALID; }
+    val trace_valid: bool = actual[0] == expected[0] && actual[1] == expected[1]
+        && actual[2] == expected[2] && actual[3] == expected[3]
+        && completion.context == 150 && completion.has_error
+        && completion.error.kind == io_error.CLOSED && completion.error.operation == io_error.OP_CLOSE
+        && io_runtime.pending(?h.runtime) == 0
+        && modeled_runtime.state == race.RUNTIME_CLOSED && modeled_runtime.inflight == 0;
+    val scope_closed: bool = cancel.destroy(?scope);
+    val pair_closed: bool = stream_pair_close(?pair);
+    val harness_closed: bool = harness_close(?h);
+    if (!trace_valid || !scope_closed || !pair_closed || !harness_closed) { ret 2; }
     ret 0;
 }
