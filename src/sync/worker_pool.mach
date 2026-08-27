@@ -1,0 +1,457 @@
+# bounded caller-owned worker pool
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.chrono.time;
+use std.sync.atomic;
+use std.sync.cancel;
+use std.sync.channel;
+use std.sync.condition;
+use std.sync.mutex;
+use std.sync.thread;
+use std.system.os;
+
+$if ($mach.build.os == $mach.os.windows) {
+    use std.system.os.windows;
+}
+
+pub def TaskFun: fun(ptr) bool;
+
+# context is borrowed after acceptance and returned by completion or abort
+pub rec Task {
+    context: ptr;
+    run:     TaskFun;
+}
+
+pub def Status: u8;
+pub val ACCEPTED:     Status = 0;
+pub val QUEUE_FULL:   Status = 1;
+pub val POOL_CLOSED:  Status = 2;
+pub val TIMED_OUT:    Status = 3;
+pub val CANCELLED:    Status = 4;
+pub val INVALID:      Status = 5;
+pub val SPAWN_FAILED: Status = 6;
+pub val DRAINING:     Status = 7;
+pub val ABORTING:     Status = 8;
+pub val JOINED:       Status = 9;
+pub val JOIN_FAILED:  Status = 10;
+pub val JOINING:      Status = 11;
+
+val STATE_OPEN:     u8 = 0;
+val STATE_DRAINING: u8 = 1;
+val STATE_ABORTING: u8 = 2;
+val STATE_JOINED:   u8 = 3;
+val STATE_JOIN_FAILED: u8 = 4;
+val STATE_JOINING:     u8 = 5;
+
+pub rec Worker {
+    pool:  *Pool;
+    index: usize;
+}
+
+# all backing arrays and task contexts are caller-owned
+pub rec Pool {
+    queue:        channel.Channel[Task];
+    threads:      *thread.Thread;
+    workers:      *Worker;
+    worker_count: usize;
+    started:      usize;
+    state:        u8;
+    completed:    i64;
+    failed:       i64;
+    thread_error: i64;
+    initialized:  bool;
+    lock:         mutex.Mutex;
+    joined:       condition.Condition;
+}
+
+pub rec Stats {
+    completed: usize;
+    failed:    usize;
+    queued:    usize;
+}
+
+fun worker_entry(arg: *u8) {
+    val worker: *Worker = arg::*Worker;
+    val pool: *Pool = worker.pool;
+    var task: Task;
+    var status: channel.Status = channel.receive[Task](?pool.queue, ?task);
+    for (status == channel.RECEIVED) {
+        val succeeded: bool = task.run(task.context);
+        atomic.fetch_add(?pool.completed, 1);
+        if (!succeeded) { atomic.fetch_add(?pool.failed, 1); }
+        status = channel.receive[Task](?pool.queue, ?task);
+    }
+}
+
+fun task_valid(task: Task) bool {
+    ret task.run::usize != 0;
+}
+
+fun channel_status(status: channel.Status) Status {
+    if (status == channel.SENT) { ret ACCEPTED; }
+    if (status == channel.FULL) { ret QUEUE_FULL; }
+    if (status == channel.CLOSED) { ret POOL_CLOSED; }
+    if (status == channel.TIMED_OUT) { ret TIMED_OUT; }
+    if (status == channel.CANCELLED) { ret CANCELLED; }
+    ret INVALID;
+}
+
+# workers are unfair, task failure is counted, and the worker continues
+# callbacks must not unwind or reclaim their context before pool ownership ends
+pub fun make_with_config(pool: *Pool, queue_storage: *Task, queue_capacity: usize, threads: *thread.Thread, workers: *Worker, worker_count: usize, config: *thread.Config) Status {
+    if (pool == nil || queue_storage == nil || queue_capacity == 0 || threads == nil || workers == nil || worker_count == 0 || config == nil) { ret INVALID; }
+    if (!channel.make[Task](?pool.queue, queue_storage, queue_capacity)) { ret INVALID; }
+    pool.threads = threads;
+    pool.workers = workers;
+    pool.worker_count = worker_count;
+    pool.started = 0;
+    pool.state = STATE_OPEN;
+    pool.completed = 0;
+    pool.failed = 0;
+    pool.thread_error = 0;
+    pool.initialized = true;
+    pool.lock = mutex.make();
+    pool.joined = condition.make();
+
+    var i: usize = 0;
+    for (i < worker_count) {
+        pool.workers[i] = Worker{pool: pool, index: i};
+        val spawn_result: i64 = thread.spawn_with_config(worker_entry, (?pool.workers[i])::*u8, config, ?pool.threads[i]);
+        if (spawn_result < 0) {
+            channel.close[Task](?pool.queue);
+            var joined: usize = 0;
+            var join_error: i64 = 0;
+            for (joined < i) {
+                val result: i64 = thread.join_result(?pool.threads[joined]);
+                if (result < 0 && join_error == 0) { join_error = result; }
+                joined = joined + 1;
+            }
+            pool.started = i;
+            pool.thread_error = pool.threads[i].tid;
+            if (join_error < 0) { pool.thread_error = join_error; }
+            if (join_error == 0) { pool.state = STATE_JOINED; }
+            or { pool.state = STATE_JOIN_FAILED; }
+            ret SPAWN_FAILED;
+        }
+        pool.started = i + 1;
+        i = i + 1;
+    }
+    ret ACCEPTED;
+}
+
+pub fun make(pool: *Pool, queue_storage: *Task, queue_capacity: usize, threads: *thread.Thread, workers: *Worker, worker_count: usize) Status {
+    var config: thread.Config;
+    thread.config_default(?config);
+    ret make_with_config(pool, queue_storage, queue_capacity, threads, workers, worker_count, ?config);
+}
+
+# rejected tasks and their contexts remain submitter-owned
+pub fun try_submit(pool: *Pool, task: Task) Status {
+    if (pool == nil || !pool.initialized || !task_valid(task)) { ret INVALID; }
+    ret channel_status(channel.try_send[Task](?pool.queue, task));
+}
+
+pub fun submit(pool: *Pool, task: Task) Status {
+    if (pool == nil || !pool.initialized || !task_valid(task)) { ret INVALID; }
+    ret channel_status(channel.send[Task](?pool.queue, task));
+}
+
+pub fun submit_until(pool: *Pool, task: Task, deadline: time.Time) Status {
+    if (pool == nil || !pool.initialized || !task_valid(task)) { ret INVALID; }
+    ret channel_status(channel.send_until[Task](?pool.queue, task, deadline));
+}
+
+pub fun submit_scoped(pool: *Pool, scope: *cancel.Scope, task: Task) Status {
+    if (pool == nil || !pool.initialized || !task_valid(task)) { ret INVALID; }
+    ret channel_status(channel.send_scoped[Task](?pool.queue, scope, task));
+}
+
+# drain rejects new work while workers finish every accepted task
+pub fun close_drain(pool: *Pool) Status {
+    if (pool == nil || !pool.initialized) { ret INVALID; }
+    mutex.lock(?pool.lock);
+    if (pool.state != STATE_OPEN) {
+        val status: Status = state_locked(pool);
+        mutex.unlock(?pool.lock);
+        ret status;
+    }
+    pool.state = STATE_DRAINING;
+    channel.close[Task](?pool.queue);
+    mutex.unlock(?pool.lock);
+    ret DRAINING;
+}
+
+# abort returns every task still owned by the queue in fifo order
+# a task already owned by a worker runs to completion before join returns
+pub fun close_abort(pool: *Pool, rejected: *Task, rejected_capacity: usize, rejected_len: *usize) Status {
+    if (pool == nil || rejected_len == nil || !pool.initialized) { ret INVALID; }
+    mutex.lock(?pool.lock);
+    if (pool.state == STATE_ABORTING || pool.state == STATE_JOINED || pool.state == STATE_JOIN_FAILED || pool.state == STATE_JOINING) {
+        val status: Status = state_locked(pool);
+        mutex.unlock(?pool.lock);
+        ret status;
+    }
+    val result: channel.Status = channel.close_abort[Task](?pool.queue, rejected, rejected_capacity, rejected_len);
+    if (result != channel.ABORTED) {
+        mutex.unlock(?pool.lock);
+        ret INVALID;
+    }
+    pool.state = STATE_ABORTING;
+    mutex.unlock(?pool.lock);
+    ret ABORTING;
+}
+
+# join is valid after drain or abort and releases every worker resource
+# callbacks must not join their own pool
+pub fun join(pool: *Pool) Status {
+    if (pool == nil || !pool.initialized) { ret INVALID; }
+    mutex.lock(?pool.lock);
+    for (pool.state == STATE_JOINING) {
+        condition.wait(?pool.joined, ?pool.lock);
+    }
+    if (pool.state == STATE_OPEN) {
+        mutex.unlock(?pool.lock);
+        ret INVALID;
+    }
+    if (pool.state == STATE_JOINED) {
+        mutex.unlock(?pool.lock);
+        ret JOINED;
+    }
+    pool.state = STATE_JOINING;
+    mutex.unlock(?pool.lock);
+
+    var thread_error: i64 = 0;
+    var i: usize = 0;
+    for (i < pool.started) {
+        if (pool.threads[i].done == 0) {
+            val result: i64 = thread.join_result(?pool.threads[i]);
+            if (result < 0 && thread_error == 0) { thread_error = result; }
+        }
+        i = i + 1;
+    }
+    mutex.lock(?pool.lock);
+    pool.thread_error = thread_error;
+    if (thread_error < 0) {
+        pool.state = STATE_JOIN_FAILED;
+        condition.broadcast(?pool.joined);
+        mutex.unlock(?pool.lock);
+        ret JOIN_FAILED;
+    }
+    pool.state = STATE_JOINED;
+    condition.broadcast(?pool.joined);
+    mutex.unlock(?pool.lock);
+    ret JOINED;
+}
+
+pub fun shutdown_drain(pool: *Pool) Status {
+    val closing: Status = close_drain(pool);
+    if (closing != DRAINING && closing != ABORTING && closing != JOINED) { ret closing; }
+    ret join(pool);
+}
+
+pub fun shutdown_abort(pool: *Pool, rejected: *Task, rejected_capacity: usize, rejected_len: *usize) Status {
+    val closing: Status = close_abort(pool, rejected, rejected_capacity, rejected_len);
+    if (closing != ABORTING && closing != JOINED) { ret closing; }
+    ret join(pool);
+}
+
+fun state_locked(pool: *Pool) Status {
+    if (pool.state == STATE_DRAINING) { ret DRAINING; }
+    if (pool.state == STATE_ABORTING) { ret ABORTING; }
+    if (pool.state == STATE_JOINED) { ret JOINED; }
+    if (pool.state == STATE_JOIN_FAILED) { ret JOIN_FAILED; }
+    if (pool.state == STATE_JOINING) { ret JOINING; }
+    ret ACCEPTED;
+}
+
+pub fun state(pool: *Pool) Status {
+    if (pool == nil || !pool.initialized) { ret INVALID; }
+    mutex.lock(?pool.lock);
+    val result: Status = state_locked(pool);
+    mutex.unlock(?pool.lock);
+    ret result;
+}
+
+pub fun last_thread_error(pool: *Pool) i64 {
+    if (pool == nil || !pool.initialized) { ret thread.ERROR_INVALID; }
+    mutex.lock(?pool.lock);
+    val result: i64 = pool.thread_error;
+    mutex.unlock(?pool.lock);
+    ret result;
+}
+
+pub fun stats(pool: *Pool) Stats {
+    if (pool == nil || !pool.initialized) { ret Stats{completed: 0, failed: 0, queued: 0}; }
+    ret Stats{
+        completed: atomic.load(?pool.completed)::usize,
+        failed: atomic.load(?pool.failed)::usize,
+        queued: channel.count[Task](?pool.queue),
+    };
+}
+
+# destruction is valid only after join and does not own caller storage
+pub fun destroy(pool: *Pool) bool {
+    if (pool == nil || !pool.initialized) { ret false; }
+    mutex.lock(?pool.lock);
+    if (pool.state != STATE_JOINED || condition.waiter_count(?pool.joined) != 0 || !channel.destroy[Task](?pool.queue)) {
+        mutex.unlock(?pool.lock);
+        ret false;
+    }
+    pool.threads = nil;
+    pool.workers = nil;
+    pool.worker_count = 0;
+    pool.started = 0;
+    pool.initialized = false;
+    mutex.unlock(?pool.lock);
+    ret true;
+}
+
+fun native_threads_supported() bool {
+    $if ($mach.build.os == $mach.os.windows) {
+        if (windows.running_under_wine()) { ret false; }
+    }
+    ret true;
+}
+
+rec CountTask {
+    count:   *i64;
+    succeed: bool;
+}
+
+fun count_task(context: ptr) bool {
+    val task: *CountTask = context::*CountTask;
+    atomic.fetch_add(task.count, 1);
+    ret task.succeed;
+}
+
+test "worker pool: drain runs every accepted task and records failures" {
+    if (!native_threads_supported()) { ret 0; }
+    var queue_storage: [4]Task;
+    var threads: [2]thread.Thread;
+    var workers: [2]Worker;
+    var pool: Pool;
+    if (make(?pool, (?queue_storage)::*Task, 4, (?threads)::*thread.Thread, (?workers)::*Worker, 2) != ACCEPTED) { ret 1; }
+
+    var count: i64 = 0;
+    var contexts: [6]CountTask;
+    var i: usize = 0;
+    for (i < 6) {
+        contexts[i] = CountTask{count: ?count, succeed: i != 3};
+        val task: Task = Task{context: ?contexts[i], run: count_task};
+        if (submit(?pool, task) != ACCEPTED) { ret 2; }
+        i = i + 1;
+    }
+    if (shutdown_drain(?pool) != JOINED) { ret 3; }
+    val result: Stats = stats(?pool);
+    if (atomic.load(?count) != 6 || result.completed != 6 || result.failed != 1 || result.queued != 0) { ret 4; }
+    if (!destroy(?pool)) { ret 5; }
+    ret 0;
+}
+
+test "worker pool: spawn failure retains an initialized pool for destruction" {
+    var queue_storage: [1]Task;
+    var threads: [1]thread.Thread;
+    var workers: [1]Worker;
+    var config: thread.Config;
+    thread.config_default(?config);
+    config.stack_reserve = 1;
+    var pool: Pool;
+    if (make_with_config(?pool, (?queue_storage)::*Task, 1, (?threads)::*thread.Thread, (?workers)::*Worker, 1, ?config) != SPAWN_FAILED) { ret 1; }
+    if (state(?pool) != JOINED || last_thread_error(?pool) != thread.ERROR_INVALID) { ret 2; }
+    if (!destroy(?pool)) { ret 3; }
+    ret 0;
+}
+
+rec BlockingTask {
+    entered: *i64;
+    release: *i64;
+}
+
+fun blocking_task(context: ptr) bool {
+    val task: *BlockingTask = context::*BlockingTask;
+    atomic.store(task.entered, 1);
+    os.thread_wake(task.entered);
+    for (atomic.load(task.release) == 0) { os.thread_wait(task.release, 0); }
+    ret true;
+}
+
+rec JoinStateTask {
+    pool:     *Pool;
+    observed: *i64;
+}
+
+fun observe_joining_task(context: ptr) bool {
+    val task: *JoinStateTask = context::*JoinStateTask;
+    for (state(task.pool) != JOINING) { os.sleep(1000000); }
+    atomic.store(task.observed, 1);
+    ret true;
+}
+
+test "worker pool: join releases the pool lock while callbacks finish" {
+    if (!native_threads_supported()) { ret 0; }
+    var queue_storage: [1]Task;
+    var threads: [1]thread.Thread;
+    var workers: [1]Worker;
+    var pool: Pool;
+    if (make(?pool, (?queue_storage)::*Task, 1, (?threads)::*thread.Thread, (?workers)::*Worker, 1) != ACCEPTED) { ret 1; }
+
+    var observed: i64 = 0;
+    var context: JoinStateTask = JoinStateTask{pool: ?pool, observed: ?observed};
+    if (submit(?pool, Task{context: ?context, run: observe_joining_task}) != ACCEPTED) { ret 2; }
+    if (close_drain(?pool) != DRAINING || join(?pool) != JOINED) { ret 3; }
+    if (atomic.load(?observed) != 1) { ret 4; }
+    if (!destroy(?pool)) { ret 5; }
+    ret 0;
+}
+
+test "worker pool: abort returns queued tasks while in-flight work completes" {
+    if (!native_threads_supported()) { ret 0; }
+    var queue_storage: [3]Task;
+    var threads: [1]thread.Thread;
+    var workers: [1]Worker;
+    var pool: Pool;
+    if (make(?pool, (?queue_storage)::*Task, 3, (?threads)::*thread.Thread, (?workers)::*Worker, 1) != ACCEPTED) { ret 1; }
+
+    var entered: i64 = 0;
+    var release: i64 = 0;
+    var blocker: BlockingTask = BlockingTask{entered: ?entered, release: ?release};
+    if (submit(?pool, Task{context: ?blocker, run: blocking_task}) != ACCEPTED) { ret 2; }
+    for (atomic.load(?entered) == 0) { os.thread_wait(?entered, 0); }
+
+    var count: i64 = 0;
+    var contexts: [4]CountTask;
+    var i: usize = 0;
+    for (i < 3) {
+        contexts[i] = CountTask{count: ?count, succeed: true};
+        if (try_submit(?pool, Task{context: ?contexts[i], run: count_task}) != ACCEPTED) { ret 3; }
+        i = i + 1;
+    }
+    contexts[3] = CountTask{count: ?count, succeed: true};
+    if (try_submit(?pool, Task{context: ?contexts[3], run: count_task}) != QUEUE_FULL) { ret 4; }
+    val deadline: time.Time = time.time_add(time.monotonic(), 1000000);
+    if (submit_until(?pool, Task{context: ?contexts[3], run: count_task}, deadline) != TIMED_OUT) { ret 4; }
+    var scope: cancel.Scope;
+    val none: time.Time = time.Time{sec: 0, nsec: 0};
+    if (!cancel.make_root(?scope, false, none) || !cancel.cancel(?scope)) { ret 4; }
+    if (submit_scoped(?pool, ?scope, Task{context: ?contexts[3], run: count_task}) != CANCELLED) { ret 4; }
+    if (!cancel.destroy(?scope)) { ret 4; }
+
+    var rejected: [3]Task;
+    var rejected_len: usize = 0;
+    if (close_abort(?pool, (?rejected)::*Task, 3, ?rejected_len) != ABORTING || rejected_len != 3) { ret 5; }
+    i = 0;
+    for (i < 3) {
+        if (rejected[i].context != (?contexts[i])::ptr) { ret 6; }
+        i = i + 1;
+    }
+    atomic.store(?release, 1);
+    os.thread_wake(?release);
+    if (join(?pool) != JOINED || atomic.load(?count) != 0) { ret 7; }
+    val result: Stats = stats(?pool);
+    if (result.completed != 1 || result.failed != 0 || result.queued != 0) { ret 8; }
+    if (!destroy(?pool)) { ret 9; }
+    ret 0;
+}

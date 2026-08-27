@@ -232,15 +232,20 @@ fun resource_acquire(backend: *Backend, native: usize, created: *bool) *Resource
     ret resource;
 }
 
-fun resource_release(backend: *Backend, resource: *Resource) {
+fun resource_release_unwatched(backend: *Backend, resource: *Resource) {
     val index: u32 = ((resource::usize - backend.resources::usize) / $size_of(Resource))::u32;
-    darwin.io_queue_unwatch(backend.queue, resource.resource);
     resource_map_remove(backend, index);
     resource.state = RESOURCE_FREE;
     resource.armed = false;
     resource.next_free = backend.free_resource;
     backend.free_resource = index;
     backend.resource_count = backend.resource_count - 1;
+}
+
+fun resource_release(backend: *Backend, resource: *Resource) {
+    darwin.io_queue_unwatch(backend.queue, resource.resource);
+    resource.armed = false;
+    resource_release_unwatched(backend, resource);
 }
 
 fun operation_claim(backend: *Backend, kind: runtime.Kind, native: usize, context: usize, token: *types.Token) *Operation {
@@ -413,26 +418,30 @@ fun arm_resource(backend: *Backend, resource: *Resource) {
     if (resource.read_head != NONE) { events = events | darwin.IO_EVENT_READ; }
     if (resource.write_head != NONE) { events = events | darwin.IO_EVENT_WRITE; }
     if (events == 0) {
+        darwin.io_queue_unwatch(backend.queue, resource.resource);
+        resource.armed = false;
         if (resource.close_index != NONE) {
             val close_operation: *Operation = ?backend.operations[resource.close_index::usize];
             resource.close_index = NONE;
             val closed: i64 = socket_close(resource.resource);
             finish(backend, resource, close_operation, closed, 0, 0, resource.resource, false);
         }
-        resource_release(backend, resource);
+        resource_release_unwatched(backend, resource);
         ret;
     }
     val token: types.Token = types.Token{index: resource_index(backend, resource), generation: resource.generation};
     val status: i64 = darwin.io_queue_watch(backend.queue, resource.resource, token_context(token), events);
     if (status < 0) {
         fail_resource(backend, resource, status);
+        darwin.io_queue_unwatch(backend.queue, resource.resource);
+        resource.armed = false;
         if (resource.close_index != NONE) {
             val close_operation: *Operation = ?backend.operations[resource.close_index::usize];
             resource.close_index = NONE;
             val closed: i64 = socket_close(resource.resource);
             finish(backend, resource, close_operation, closed, 0, 0, resource.resource, false);
         }
-        resource_release(backend, resource);
+        resource_release_unwatched(backend, resource);
         ret;
     }
     resource.armed = true;
@@ -766,8 +775,10 @@ pub fun cancel(backend: *Backend, token: types.Token) i64 {
         unlink(backend, resource, operation);
         operation_release(backend, token.index);
         fail_resource(backend, resource, darwin.ECANCELED);
+        darwin.io_queue_unwatch(backend.queue, resource.resource);
+        resource.armed = false;
         socket_close(resource.resource);
-        resource_release(backend, resource);
+        resource_release_unwatched(backend, resource);
         mutex.unlock(?backend.lock);
         darwin.io_queue_wake(backend.queue);
         ret 0;
@@ -1097,6 +1108,49 @@ fun test_client(endpoint: ip.Endpoint, client: *usize) i64 {
     ret status;
 }
 
+fun test_send_exact(socket: usize, buffer: *u8, length: usize) i64 {
+    var sent: usize = 0;
+    for (sent < length) {
+        val result: i64 = darwin.sock_send(socket, (buffer::usize + sent)::*u8, length - sent);
+        if (result < 0) { ret result; }
+        if (result == 0) { ret darwin.EIO; }
+        sent = sent + result::usize;
+    }
+    ret sent::i64;
+}
+
+fun test_receive_exact(socket: usize, buffer: *u8, length: usize) i64 {
+    var received: usize = 0;
+    for (received < length) {
+        val result: i64 = darwin.sock_recv(socket, (buffer::usize + received)::*u8, length - received);
+        if (result < 0) { ret result; }
+        if (result == 0) { ret received::i64; }
+        received = received + result::usize;
+    }
+    ret received::i64;
+}
+
+fun test_await_completion(backend: *Backend, context: usize, out: *types.NativeCompletion) i64 {
+    var attempts: usize = 0;
+    for (attempts < 6) {
+        val count: i64 = poll(backend, 1000);
+        if (count < 0) { ret count; }
+        var i: usize = 0;
+        for (i < count::usize) {
+            var native: types.NativeCompletion;
+            val read: i64 = completion(backend, i, ?native);
+            if (read < 0) { ret read; }
+            if (native.context == context) {
+                @out = native;
+                ret 0;
+            }
+            i = i + 1;
+        }
+        attempts = attempts + 1;
+    }
+    ret darwin.ETIMEDOUT;
+}
+
 fun test_datagram(socket: *usize, endpoint: *ip.Endpoint) i64 {
     @socket = (-1)::usize;
     val created: i64 = darwin.sock_create_flags(darwin.AF_INET, darwin.SOCK_DGRAM, 0, true, true, socket);
@@ -1227,33 +1281,30 @@ test "async darwin: vectored writes and fragmented reads report progress" {
     vectors[2] = types.Vector{data: ?suffix[0], length: 3};
     var vector_token: types.Token;
     val vector_submitted: i64 = submit_write_vector(?backend, server, ?vectors[0], 3, 83, ?vector_token);
-    var vector_input: [5]u8;
-    val vector_bytes: i64 = darwin.sock_recv(client, ?vector_input[0], 5);
-    val vector_count: i64 = poll(?backend, 0);
     var vector_completion: types.NativeCompletion;
-    if (vector_count == 1) { completion(?backend, 0, ?vector_completion); }
+    val vector_completed: i64 = test_await_completion(?backend, 83, ?vector_completion);
+    var vector_input: [5]u8;
+    val vector_bytes: i64 = test_receive_exact(client, ?vector_input[0], 5);
 
     var assembled: [4]u8;
     var first_read_token: types.Token;
     val first_read_submitted: i64 = submit_read(?backend, server, ?assembled[0], 4, 84, ?first_read_token);
     var first_fragment: [2]u8;
     first_fragment[0] = 'a'; first_fragment[1] = 'b';
-    val first_sent: i64 = darwin.sock_send(client, ?first_fragment[0], 2);
-    val first_count: i64 = poll(?backend, 1000);
+    val first_sent: i64 = test_send_exact(client, ?first_fragment[0], 2);
     var first_completion: types.NativeCompletion;
-    if (first_count == 1) { completion(?backend, 0, ?first_completion); }
+    val first_completed: i64 = test_await_completion(?backend, 84, ?first_completion);
 
     var second_read_token: types.Token;
     val second_read_submitted: i64 = submit_read(?backend, server, ?assembled[2], 2, 85, ?second_read_token);
     var second_fragment: [2]u8;
     second_fragment[0] = 'c'; second_fragment[1] = 'd';
-    val second_sent: i64 = darwin.sock_send(client, ?second_fragment[0], 2);
-    val second_count: i64 = poll(?backend, 1000);
+    val second_sent: i64 = test_send_exact(client, ?second_fragment[0], 2);
     var second_completion: types.NativeCompletion;
-    if (second_count == 1) { completion(?backend, 0, ?second_completion); }
+    val second_completed: i64 = test_await_completion(?backend, 85, ?second_completion);
 
-    val vector_valid: bool = vector_submitted == 0 && vector_bytes == 5 && vector_count == 1 && vector_completion.context == 83 && vector_completion.kind == runtime.WRITE && vector_completion.status == 0 && vector_completion.bytes == 5 && vector_completion.items == 0 && vector_input[0] == 'h' && vector_input[1] == 'i' && vector_input[2] == '!' && vector_input[4] == '!';
-    val fragments_valid: bool = first_read_submitted == 0 && first_sent == 2 && first_count == 1 && first_completion.context == 84 && first_completion.status == 0 && first_completion.bytes == 2 && first_completion.items == 0 && !first_completion.end_of_stream && second_read_submitted == 0 && second_sent == 2 && second_count == 1 && second_completion.context == 85 && second_completion.status == 0 && second_completion.bytes == 2 && second_completion.items == 0 && assembled[0] == 'a' && assembled[1] == 'b' && assembled[2] == 'c' && assembled[3] == 'd';
+    val vector_valid: bool = vector_submitted == 0 && vector_completed == 0 && vector_bytes == 5 && vector_completion.context == 83 && vector_completion.kind == runtime.WRITE && vector_completion.status == 0 && vector_completion.bytes == 5 && vector_completion.items == 0 && vector_input[0] == 'h' && vector_input[1] == 'i' && vector_input[2] == '!' && vector_input[4] == '!';
+    val fragments_valid: bool = first_read_submitted == 0 && first_sent == 2 && first_completed == 0 && first_completion.context == 84 && first_completion.status == 0 && first_completion.bytes == 2 && first_completion.items == 0 && !first_completion.end_of_stream && second_read_submitted == 0 && second_sent == 2 && second_completed == 0 && second_completion.context == 85 && second_completion.status == 0 && second_completion.bytes == 2 && second_completion.items == 0 && assembled[0] == 'a' && assembled[1] == 'b' && assembled[2] == 'c' && assembled[3] == 'd';
     val valid: bool = vector_valid && fragments_valid && backend.live == 0 && backend.resource_count == 0;
     darwin.sock_close(server); darwin.sock_close(client); darwin.sock_close(listener);
     val destroyed: i64 = destroy(?backend);
@@ -1279,22 +1330,20 @@ test "async darwin: remote half-close reports EOF and preserves writes" {
     var read_token: types.Token;
     val read_submitted: i64 = submit_read(?backend, server, ?input, 1, 86, ?read_token);
     val half_closed: i64 = darwin.sock_shutdown(client, darwin.SHUT_WR);
-    val read_count: i64 = poll(?backend, 1000);
     var read_completion: types.NativeCompletion;
-    if (read_count == 1) { completion(?backend, 0, ?read_completion); }
+    val read_completed: i64 = test_await_completion(?backend, 86, ?read_completion);
 
     var output: [2]u8;
     output[0] = 'o'; output[1] = 'k';
     var write_token: types.Token;
     val write_submitted: i64 = submit_write(?backend, server, ?output[0], 2, 87, ?write_token);
-    var response: [2]u8;
-    val response_bytes: i64 = darwin.sock_recv(client, ?response[0], 2);
-    val write_count: i64 = poll(?backend, 0);
     var write_completion: types.NativeCompletion;
-    if (write_count == 1) { completion(?backend, 0, ?write_completion); }
+    val write_completed: i64 = test_await_completion(?backend, 87, ?write_completion);
+    var response: [2]u8;
+    val response_bytes: i64 = test_receive_exact(client, ?response[0], 2);
 
-    val eof_valid: bool = read_submitted == 0 && half_closed == 0 && read_count == 1 && read_completion.context == 86 && read_completion.kind == runtime.READ && read_completion.status == 0 && read_completion.bytes == 0 && read_completion.items == 0 && read_completion.end_of_stream;
-    val write_valid: bool = write_submitted == 0 && response_bytes == 2 && response[0] == 'o' && response[1] == 'k' && write_count == 1 && write_completion.context == 87 && write_completion.status == 0 && write_completion.bytes == 2 && write_completion.items == 0;
+    val eof_valid: bool = read_submitted == 0 && half_closed == 0 && read_completed == 0 && read_completion.context == 86 && read_completion.kind == runtime.READ && read_completion.status == 0 && read_completion.bytes == 0 && read_completion.items == 0 && read_completion.end_of_stream;
+    val write_valid: bool = write_submitted == 0 && write_completed == 0 && response_bytes == 2 && response[0] == 'o' && response[1] == 'k' && write_completion.context == 87 && write_completion.status == 0 && write_completion.bytes == 2 && write_completion.items == 0;
     val valid: bool = eof_valid && write_valid && backend.live == 0 && backend.resource_count == 0;
     darwin.sock_close(server); darwin.sock_close(client); darwin.sock_close(listener);
     val destroyed: i64 = destroy(?backend);
@@ -1378,13 +1427,55 @@ test "async darwin: timeout cancellation releases saturated storage" {
     val cancel_second: i64 = cancel(?backend, tokens[1]);
     val cancel_replacement: i64 = cancel(?backend, tokens[2]);
     var byte: u8 = 'x';
-    val sent: i64 = darwin.sock_send(client, ?byte, 1);
+    val sent: i64 = test_send_exact(client, ?byte, 1);
     val after: i64 = poll(?backend, 0);
     val valid: bool = first == 0 && second == 0 && timed_out == 0 && saturated == darwin.ENOMEM && cancel_first == 0 && replacement == 0 && generation_changed && cancel_second == 0 && cancel_replacement == 0 && sent == 1 && after == 0 && storage[0] == 0xa1 && storage[1] == 0xb2 && storage[2] == 0xc3 && backend.live == 0 && backend.resource_count == 0;
     darwin.sock_close(server); darwin.sock_close(client); darwin.sock_close(listener);
     val destroyed: i64 = destroy(?backend);
     darwin.io_queue_close(?queue);
     if (!valid || destroyed < 0) { ret 1; }
+    ret 0;
+}
+
+test "async darwin: wake-only poll preserves an armed read" {
+    var queue: shared.IoQueue;
+    if (darwin.io_queue_create(?queue) < 0) { ret 1; }
+    var backend: Backend;
+    if (make(?backend, ?queue, 4) < 0) { darwin.io_queue_close(?queue); ret 1; }
+    var listener: usize;
+    var endpoint: ip.Endpoint;
+    if (test_listener(?listener, ?endpoint) < 0) { destroy(?backend); darwin.io_queue_close(?queue); ret 1; }
+    var client: usize;
+    if (test_client(endpoint, ?client) < 0) { darwin.sock_close(listener); destroy(?backend); darwin.io_queue_close(?queue); ret 1; }
+    var server: usize = (-1)::usize;
+    if (stream_accept(listener, nil, ?server) < 0) { darwin.sock_close(client); darwin.sock_close(listener); destroy(?backend); darwin.io_queue_close(?queue); ret 1; }
+
+    var input: u8 = 0;
+    var token: types.Token;
+    val submitted: i64 = submit_read(?backend, server, ?input, 1, 96, ?token);
+    val wake_only: i64 = poll(?backend, 0);
+    var output: u8 = 'w';
+    val sent: i64 = test_send_exact(client, ?output, 1);
+    var native: types.NativeCompletion;
+    val completed: i64 = test_await_completion(?backend, 96, ?native);
+    var failure: i32 = 0;
+    if (submitted != 0) { failure = 2; }
+    or (wake_only != 0) { failure = 3; }
+    or (sent != 1) { failure = 4; }
+    or (completed != 0) { failure = 5; }
+    or (native.kind != runtime.READ) { failure = 6; }
+    or (native.status != 0) { failure = 7; }
+    or (native.bytes != 1) { failure = 8; }
+    or (native.items != 0) { failure = 9; }
+    or (native.end_of_stream) { failure = 10; }
+    or (input != 'w') { failure = 11; }
+    or (backend.live != 0) { failure = 12; }
+    or (backend.resource_count != 0) { failure = 13; }
+    darwin.sock_close(server); darwin.sock_close(client); darwin.sock_close(listener);
+    val destroyed: i64 = destroy(?backend);
+    darwin.io_queue_close(?queue);
+    if (failure == 0 && destroyed < 0) { failure = 14; }
+    if (failure != 0) { ret failure; }
     ret 0;
 }
 
@@ -1403,19 +1494,36 @@ test "async darwin: canceling close preserves handle ownership" {
 
     var send_buffer: i32 = 4096;
     val configured: i64 = darwin.sock_setopt(server, darwin.SOL_SOCKET, darwin.SO_SNDBUF, (?send_buffer)::*u8, 4);
+    var receive_buffer: i32 = 4096;
+    val peer_configured: i64 = darwin.sock_setopt(client, darwin.SOL_SOCKET, darwin.SO_RCVBUF, (?receive_buffer)::*u8, 4);
     var fill: [4096]u8;
-    var blocked: bool = false;
-    var attempts: usize = 0;
-    for (attempts < 2048 && !blocked) {
-        val result: i64 = darwin.sock_send(server, ?fill[0], 4096);
-        if (result == darwin.EAGAIN) { blocked = true; }
-        or (result < 0) { attempts = 2048; }
-        attempts = attempts + 1;
-    }
+    var fill_error: i64 = 0;
     var pending_byte: u8 = 'z';
     var write_token: types.Token;
+    var write_submitted: i64 = darwin.EIO;
+    var write_active: bool = false;
+    var pending_attempts: usize = 0;
+    for (pending_attempts < 64 && !write_active && fill_error == 0) {
+        var blocked: bool = false;
+        for (!blocked && fill_error == 0) {
+            val result: i64 = darwin.sock_send(server, ?fill[0], 4096);
+            if (result == darwin.EAGAIN) { blocked = true; }
+            or (result <= 0) {
+                fill_error = result;
+                if (result == 0) { fill_error = darwin.EIO; }
+            }
+        }
+        if (fill_error == 0) {
+            write_submitted = submit_write(?backend, server, ?pending_byte, 1, 93, ?write_token);
+            if (write_submitted < 0) { fill_error = write_submitted; }
+            or {
+                write_active = operation_for(?backend, write_token) != nil;
+                if (!write_active && poll(?backend, 0) != 1) { fill_error = darwin.EIO; }
+            }
+        }
+        pending_attempts = pending_attempts + 1;
+    }
     var close_token: types.Token;
-    val write_submitted: i64 = submit_write(?backend, server, ?pending_byte, 1, 93, ?write_token);
     val close_submitted: i64 = submit_close(?backend, server, 94, ?close_token);
     val close_active: bool = operation_for(?backend, close_token) != nil;
     val canceled: i64 = cancel(?backend, close_token);
@@ -1423,7 +1531,7 @@ test "async darwin: canceling close preserves handle ownership" {
     val count: i64 = poll(?backend, 0);
     var displaced: types.NativeCompletion;
     if (count == 1) { completion(?backend, 0, ?displaced); }
-    val active_valid: bool = configured == 0 && blocked && write_submitted == 0 && close_submitted == 0 && close_active && canceled == 0 && raw_close == darwin.EBADF && count == 1 && displaced.context == 93 && displaced.kind == runtime.WRITE && displaced.status == darwin.ECANCELED && displaced.bytes == 0 && displaced.items == 0 && backend.live == 0 && backend.resource_count == 0;
+    val active_valid: bool = configured == 0 && peer_configured == 0 && write_active && fill_error == 0 && write_submitted == 0 && close_submitted == 0 && close_active && canceled == 0 && raw_close == darwin.EBADF && count == 1 && displaced.context == 93 && displaced.kind == runtime.WRITE && displaced.status == darwin.ECANCELED && displaced.bytes == 0 && displaced.items == 0 && backend.live == 0 && backend.resource_count == 0;
     darwin.sock_close(client);
 
     var second_client: usize;
@@ -1502,7 +1610,7 @@ test "async darwin: shutdown and close follow prior writes" {
     val write_second: i64 = submit_write(?backend, server, ?second, 1, 72, ?tokens[1]);
     val shutdown: i64 = submit_shutdown_write(?backend, server, 73, ?tokens[2]);
     var received: [2]u8;
-    val received_bytes: i64 = darwin.sock_recv(client, ?received[0], 2);
+    val received_bytes: i64 = test_receive_exact(client, ?received[0], 2);
     var eof_byte: u8 = 0;
     val eof: i64 = darwin.sock_recv(client, ?eof_byte, 1);
     var pending: u8 = 0;
@@ -1576,10 +1684,10 @@ test "async darwin: one stream drives concurrent read and write" {
     val read_submitted: i64 = submit_read(?backend, server, ?input[0], 4, 51, ?read_token);
     val write_submitted: i64 = submit_write(?backend, server, ?output[0], 4, 52, ?write_token);
     var response: [4]u8;
-    val response_bytes: i64 = darwin.sock_recv(client, ?response[0], 4);
+    val response_bytes: i64 = test_receive_exact(client, ?response[0], 4);
     var request: [4]u8;
     request[0] = 'p'; request[1] = 'i'; request[2] = 'n'; request[3] = 'g';
-    val request_bytes: i64 = darwin.sock_send(client, ?request[0], 4);
+    val request_bytes: i64 = test_send_exact(client, ?request[0], 4);
     var saw_read: bool = false;
     var saw_write: bool = false;
     var attempts: usize = 0;
@@ -1598,11 +1706,21 @@ test "async darwin: one stream drives concurrent read and write" {
             attempts = attempts + 1;
         }
     }
-    val valid: bool = read_submitted == 0 && write_submitted == 0 && response_bytes == 4 && request_bytes == 4 && saw_read && saw_write && input[0] == 'p' && input[3] == 'g' && response[0] == 'p' && response[3] == 'g' && backend.resource_count == 0;
+    var failure: i32 = 0;
+    if (read_submitted != 0) { failure = 2; }
+    or (write_submitted != 0) { failure = 3; }
+    or (response_bytes != 4) { failure = 4; }
+    or (request_bytes != 4) { failure = 5; }
+    or (!saw_read) { failure = 6; }
+    or (!saw_write) { failure = 7; }
+    or (input[0] != 'p' || input[3] != 'g') { failure = 8; }
+    or (response[0] != 'p' || response[3] != 'g') { failure = 9; }
+    or (backend.resource_count != 0) { failure = 10; }
     darwin.sock_close(server); darwin.sock_close(client); darwin.sock_close(listener);
     val destroyed: i64 = destroy(?backend);
     darwin.io_queue_close(?queue);
-    if (!valid || destroyed < 0) { ret 1; }
+    if (failure == 0 && destroyed < 0) { failure = 11; }
+    if (failure != 0) { ret failure; }
     ret 0;
 }
 
