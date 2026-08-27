@@ -35,6 +35,7 @@ required=(
     'src/sync/thread.mach'
     'src/process/exec.mach'
     'src/filesystem.mach'
+    'src/io/file/tests.mach'
     'src/net/tcp.mach'
     'src/net/udp.mach'
     'src/chrono/time.mach'
