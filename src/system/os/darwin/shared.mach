@@ -49,6 +49,9 @@ val SYS_GETPEERNAME:      usize = 31;
 val SYS_GETSOCKNAME:      usize = 32;
 val SYS_SENDTO:           usize = 133;
 val SYS_RECVFROM:         usize = 29;
+val SYS_SENDMSG:          usize = 28;
+val SYS_RECVMSG:          usize = 27;
+val SYS_WRITEV:           usize = 121;
 val SYS_SHUTDOWN:         usize = 134;
 val SYS_BIND:             usize = 104;
 val SYS_LISTEN:           usize = 106;
@@ -1976,18 +1979,43 @@ pub fun thread_wake(addr: *i64) i64 {
 
 # completion wait queue
 
+pub val IO_EVENT_READ:    u32 = 0x01;
+pub val IO_EVENT_WRITE:   u32 = 0x02;
+pub val IO_EVENT_ERROR:   u32 = 0x04;
+pub val IO_EVENT_HANGUP:  u32 = 0x08;
+pub val IO_EVENT_WAKE:    u32 = 0x10;
+
+# context is opaque to the OS and zero is reserved for the runtime wake source
+pub rec IoCompletion {
+    context: usize;
+    events: u32;
+    status: i64;
+    flags: u64;
+}
+
+val EVFILT_READ: i16 = -1;
+val EVFILT_WRITE: i16 = -2;
 val EVFILT_USER: i16 = -10;
 val EV_ADD: u16 = 0x0001;
+val EV_DELETE: u16 = 0x0002;
+val EV_ONESHOT: u16 = 0x0010;
 val EV_CLEAR: u16 = 0x0020;
+val EV_EOF: u16 = 0x8000;
+val EV_ERROR: u16 = 0x4000;
 val NOTE_TRIGGER: u32 = 0x01000000;
 
-fun user_kevent(event: *u8, flags: u16, fflags: u32) {
+fun native_kevent(event: *u8, ident: usize, filter: i16, flags: u16, fflags: u32, context: usize) {
     var i: usize = 0;
     for (i < 32) { event[i] = 0; i = i + 1; }
-    @(event::*usize) = 1;
-    @((event::usize + 8)::*i16) = EVFILT_USER;
+    @(event::*usize) = ident;
+    @((event::usize + 8)::*i16) = filter;
     @((event::usize + 10)::*u16) = flags;
     @((event::usize + 12)::*u32) = fflags;
+    @((event::usize + 24)::*usize) = context;
+}
+
+fun user_kevent(event: *u8, flags: u16, fflags: u32) {
+    native_kevent(event, 1, EVFILT_USER, flags, fflags, 0);
 }
 
 pub fun io_queue_create(queue: *os_shared.IoQueue) i64 {
@@ -2008,8 +2036,42 @@ pub fun io_queue_create(queue: *os_shared.IoQueue) i64 {
     ret 0;
 }
 
-pub fun io_queue_wait(queue: *os_shared.IoQueue, timeout_ms: i32) i64 {
-    var event: [32]u8;
+pub fun io_queue_watch(queue: *os_shared.IoQueue, resource: usize, context: usize, events: u32) i64 {
+    if (queue == nil || context == 0 || (events & (IO_EVENT_READ | IO_EVENT_WRITE)) == 0) { ret EINVAL; }
+    var changes: [64]u8;
+    var count: usize = 0;
+    if ((events & IO_EVENT_READ) != 0) {
+        native_kevent(?changes[count * 32], resource, EVFILT_READ, EV_ADD | EV_ONESHOT, 0, context);
+        count = count + 1;
+    }
+    if ((events & IO_EVENT_WRITE) != 0) {
+        native_kevent(?changes[count * 32], resource, EVFILT_WRITE, EV_ADD | EV_ONESHOT, 0, context);
+        count = count + 1;
+    }
+    val registered: i64 = syscall6(SYS_KEVENT, queue.handle, (?changes[0])::usize, count, 0, 0, 0);
+    if (registered < 0) { ret registered; }
+    ret 0;
+}
+
+fun io_queue_delete_filter(queue: *os_shared.IoQueue, resource: usize, filter: i16) i64 {
+    var change: [32]u8;
+    native_kevent(?change[0], resource, filter, EV_DELETE, 0, 0);
+    val removed: i64 = syscall6(SYS_KEVENT, queue.handle, (?change[0])::usize, 1, 0, 0, 0);
+    if (removed == ENOENT) { ret 0; }
+    if (removed < 0) { ret removed; }
+    ret 0;
+}
+
+pub fun io_queue_unwatch(queue: *os_shared.IoQueue, resource: usize) i64 {
+    if (queue == nil) { ret EINVAL; }
+    val read_result: i64 = io_queue_delete_filter(queue, resource, EVFILT_READ);
+    val write_result: i64 = io_queue_delete_filter(queue, resource, EVFILT_WRITE);
+    if (read_result < 0) { ret read_result; }
+    ret write_result;
+}
+
+pub fun io_queue_poll(queue: *os_shared.IoQueue, completions: *IoCompletion, capacity: usize, timeout_ms: i32) i64 {
+    if (queue == nil || completions == nil || capacity == 0 || capacity > 0x7fffffff) { ret EINVAL; }
     var timeout: timespec;
     var timeout_ptr: usize = 0;
     if (timeout_ms >= 0) {
@@ -2017,7 +2079,43 @@ pub fun io_queue_wait(queue: *os_shared.IoQueue, timeout_ms: i32) i64 {
         timeout.tv_nsec = ((timeout_ms % 1000) * 1000000)::i64;
         timeout_ptr = (?timeout)::usize;
     }
-    ret syscall6(SYS_KEVENT, queue.handle, 0, 0, (?event[0])::usize, 1, timeout_ptr);
+    val result: i64 = syscall6(SYS_KEVENT, queue.handle, 0, 0, completions::usize, capacity, timeout_ptr);
+    if (result <= 0) { ret result; }
+
+    var remaining: usize = result::usize;
+    for (remaining > 0) {
+        remaining = remaining - 1;
+        val raw: usize = completions::usize + remaining * 32;
+        val ident: usize = @(raw::*usize);
+        val filter: i16 = @((raw + 8)::*i16);
+        val native_flags: u16 = @((raw + 10)::*u16);
+        val fflags: u32 = @((raw + 12)::*u32);
+        val data: i64 = @((raw + 16)::*i64);
+        val context: usize = @((raw + 24)::*usize);
+        var events: u32 = 0;
+        var status: i64 = data;
+        if (filter == EVFILT_USER && ident == 1) {
+            events = IO_EVENT_WAKE;
+        } or {
+            if (filter == EVFILT_READ) { events = events | IO_EVENT_READ; }
+            if (filter == EVFILT_WRITE) { events = events | IO_EVENT_WRITE; }
+            if ((native_flags & EV_EOF) != 0) { events = events | IO_EVENT_HANGUP; }
+            if ((native_flags & EV_ERROR) != 0) {
+                events = events | IO_EVENT_ERROR;
+                if (data > 0) { status = -data; }
+            }
+        }
+        completions[remaining].context = context;
+        completions[remaining].events = events;
+        completions[remaining].status = status;
+        completions[remaining].flags = native_flags::u64 | (fflags::u64 << 16);
+    }
+    ret result;
+}
+
+pub fun io_queue_wait(queue: *os_shared.IoQueue, timeout_ms: i32) i64 {
+    var completion: IoCompletion;
+    ret io_queue_poll(queue, ?completion, 1, timeout_ms);
 }
 
 pub fun io_queue_wake(queue: *os_shared.IoQueue) i64 {
@@ -2241,6 +2339,7 @@ pub val SO_REUSEADDR: i32 = 4;
 pub val SO_REUSEPORT: i32 = 0x0200;
 pub val SO_EXCLUSIVEADDRUSE: i32 = SO_UNSUPPORTED;
 pub val SO_KEEPALIVE: i32 = 0x0008;
+val SO_ERROR:         i32 = 0x1007;
 pub val SO_SNDBUF:    i32 = 0x1001;
 pub val SO_RCVBUF:    i32 = 0x1002;
 pub val SO_LINGER:    i32 = 0x0080;
@@ -2317,6 +2416,58 @@ pub fun sock_send(fd: usize, buf: *u8, len: usize) i64 {
 
 pub fun sock_recv(fd: usize, buf: *u8, len: usize) i64 {
     ret read(fd::i32, buf, len);
+}
+
+pub rec IoVector {
+    data: *u8;
+    length: usize;
+}
+
+pub fun sock_write_vector(fd: usize, vectors: *IoVector, count: usize) i64 {
+    if (vectors == nil || count == 0 || count > 1024) { ret EINVAL; }
+    ret syscall3(SYS_WRITEV, fd, vectors::usize, count);
+}
+
+fun message_init(message: *u8, address: *u8, address_length: u32, vectors: *IoVector, vector_count: usize, control: *u8, control_length: usize) {
+    var i: usize = 0;
+    for (i < 48) { message[i] = 0; i = i + 1; }
+    val base: usize = message::usize;
+    @(base::*usize) = address::usize;
+    @((base + 8)::*u32) = address_length;
+    @((base + 16)::*usize) = vectors::usize;
+    @((base + 24)::*i32) = vector_count::i32;
+    @((base + 32)::*usize) = control::usize;
+    @((base + 40)::*u32) = control_length::u32;
+}
+
+pub fun sock_send_message(fd: usize, vectors: *IoVector, vector_count: usize, address: *u8, address_length: u32, control: *u8, control_length: usize) i64 {
+    if (vectors == nil || vector_count == 0 || vector_count > 1024 || control_length > 0xffffffff) { ret EINVAL; }
+    var message: [48]u8;
+    message_init(?message[0], address, address_length, vectors, vector_count, control, control_length);
+    ret syscall3(SYS_SENDMSG, fd, (?message[0])::usize, 0);
+}
+
+pub fun sock_receive_message(fd: usize, vectors: *IoVector, vector_count: usize, address: *u8, address_length: *u32, control: *u8, control_length: *usize, flags: *i32) i64 {
+    if (vectors == nil || vector_count == 0 || vector_count > 1024 || address_length == nil || control_length == nil || flags == nil || @control_length > 0xffffffff) { ret EINVAL; }
+    var message: [48]u8;
+    message_init(?message[0], address, @address_length, vectors, vector_count, control, @control_length);
+    val result: i64 = syscall3(SYS_RECVMSG, fd, (?message[0])::usize, 0);
+    if (result < 0) { ret result; }
+    val base: usize = (?message[0])::usize;
+    @address_length = @((base + 8)::*u32);
+    val native_control_length: u32 = @((base + 40)::*u32);
+    @control_length = native_control_length::usize;
+    @flags = @((base + 44)::*i32);
+    ret result;
+}
+
+pub fun sock_connect_status(fd: usize) i64 {
+    var code: i32 = 0;
+    var length: u32 = 4;
+    val result: i64 = sock_getopt(fd, SOL_SOCKET, SO_ERROR, (?code)::*u8, ?length);
+    if (result < 0) { ret result; }
+    if (code == 0) { ret 0; }
+    ret -(code::i64);
 }
 
 pub fun sock_close(fd: usize) i64 {
