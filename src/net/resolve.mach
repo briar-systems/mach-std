@@ -69,6 +69,7 @@ fwd types.TIMED_OUT;
 fwd types.Error;
 fwd types.Token;
 fwd types.Query;
+fwd types.ResultLimits;
 fwd types.Resolution;
 fwd types.Completion;
 fwd types.AdapterFun;
@@ -96,6 +97,7 @@ rec Operation {
     scope: *cancellation.Scope;
     registration: cancellation.Registration;
     cancellation_reason: i64;
+    scope_use_done: i64;
     registration_done: i64;
     resolution: types.Resolution;
 }
@@ -107,6 +109,8 @@ pub rec Resolver {
     pool: *worker_pool.Pool;
     allocator: *allocator.Allocator;
     adapter: types.AdapterFun;
+    adapter_context: ptr;
+    result_limits: types.ResultLimits;
     operations: *Operation;
     completions: *types.Completion;
     capacity: usize;
@@ -120,8 +124,8 @@ pub rec Resolver {
     ready: condition.Condition;
 }
 
-fun system_adapter(query: *types.Query, owner: *allocator.Allocator, output: *types.Resolution) types.Error {
-    ret target.resolve(query, owner, output);
+fun system_adapter(context: ptr, query: *types.Query, owner: *allocator.Allocator, limits: types.ResultLimits, output: *types.Resolution) types.Error {
+    ret target.resolve(query, owner, limits, output);
 }
 
 fun cancellation_error(reason: cancellation.Reason) types.Error {
@@ -138,9 +142,11 @@ fun pool_error(status: worker_pool.Status) types.Error {
     ret shared.error(types.SYSTEM_FAILURE, status::i64);
 }
 
-pub fun make_with_adapter(resolver: *Resolver, pool: *worker_pool.Pool, owner: *allocator.Allocator, capacity: usize, adapter: types.AdapterFun) types.Error {
+pub fun make_with_adapter(resolver: *Resolver, pool: *worker_pool.Pool, owner: *allocator.Allocator,
+    capacity: usize, result_limits: types.ResultLimits, adapter_context: ptr, adapter: types.AdapterFun) types.Error {
     if (resolver == nil || pool == nil || owner == nil || capacity == 0
-     || capacity > 0xffffffff || adapter::usize == 0) {
+     || capacity > 0xffffffff || result_limits.max_endpoints == 0
+     || result_limits.max_canonical_name_bytes == 0 || adapter::usize == 0) {
         ret shared.error(types.INVALID, 0);
     }
     val pool_state: worker_pool.Status = worker_pool.state(pool);
@@ -161,6 +167,8 @@ pub fun make_with_adapter(resolver: *Resolver, pool: *worker_pool.Pool, owner: *
     resolver.pool = pool;
     resolver.allocator = owner;
     resolver.adapter = adapter;
+    resolver.adapter_context = adapter_context;
+    resolver.result_limits = result_limits;
     resolver.capacity = capacity;
     resolver.next_slot = 0;
     resolver.head = 0;
@@ -179,6 +187,7 @@ pub fun make_with_adapter(resolver: *Resolver, pool: *worker_pool.Pool, owner: *
         operation.resolver = resolver;
         operation.scope = nil;
         operation.cancellation_reason = cancellation.ACTIVE;
+        operation.scope_use_done = 1;
         operation.registration_done = 1;
         cancellation.init_registration(?operation.registration);
         shared.clear(?operation.resolution, owner);
@@ -187,8 +196,9 @@ pub fun make_with_adapter(resolver: *Resolver, pool: *worker_pool.Pool, owner: *
     ret shared.error(types.NO_ERROR, 0);
 }
 
-pub fun make(resolver: *Resolver, pool: *worker_pool.Pool, owner: *allocator.Allocator, capacity: usize) types.Error {
-    ret make_with_adapter(resolver, pool, owner, capacity, system_adapter);
+pub fun make(resolver: *Resolver, pool: *worker_pool.Pool, owner: *allocator.Allocator,
+    capacity: usize, result_limits: types.ResultLimits) types.Error {
+    ret make_with_adapter(resolver, pool, owner, capacity, result_limits, nil, system_adapter);
 }
 
 fun valid_query(query: *types.Query) bool {
@@ -216,6 +226,7 @@ fun claim_locked(resolver: *Resolver) *Operation {
             operation.context = 0;
             operation.scope = nil;
             operation.cancellation_reason = cancellation.ACTIVE;
+            operation.scope_use_done = 1;
             operation.registration_done = 1;
             cancellation.init_registration(?operation.registration);
             shared.clear(?operation.resolution, resolver.allocator);
@@ -231,6 +242,7 @@ fun release_locked(resolver: *Resolver, operation: *Operation) {
     operation.state = SLOT_FREE;
     operation.scope = nil;
     operation.cancellation_reason = cancellation.ACTIVE;
+    operation.scope_use_done = 1;
     operation.registration_done = 1;
     cancellation.init_registration(?operation.registration);
     shared.clear(?operation.resolution, resolver.allocator);
@@ -287,22 +299,58 @@ fun enqueue_locked(resolver: *Resolver, operation: *Operation, failure: types.Er
     condition.signal(?resolver.ready);
 }
 
+fun claim_reason(operation: *Operation, reason: cancellation.Reason) bool {
+    var expected: i64 = cancellation.ACTIVE;
+    val changed: bool = atomic.cas(?operation.cancellation_reason, ?expected, reason);
+    if (changed) { os.thread_wake(?operation.cancellation_reason); }
+    ret changed;
+}
+
 fun cancel_callback(context: ptr, reason: cancellation.Reason) {
     val operation: *Operation = context::*Operation;
-    atomic.store(?operation.cancellation_reason, reason);
+    claim_reason(operation, reason);
 }
 
 fun cancel_complete(context: ptr, reason: cancellation.Reason) {
     val operation: *Operation = context::*Operation;
+    for (atomic.load(?operation.scope_use_done) == 0) {
+        os.thread_wait(?operation.scope_use_done, 0);
+    }
     if (!cancellation.finish(?operation.registration)) {
-        atomic.store(?operation.cancellation_reason, cancellation.INVALID);
+        claim_reason(operation, cancellation.INVALID);
     }
     atomic.store(?operation.registration_done, 1);
+    os.thread_wake(?operation.registration_done);
 }
 
 fun wait_for_cancellation(operation: *Operation) cancellation.Reason {
-    for (atomic.load(?operation.registration_done) == 0) { atomic.spin_hint(); }
+    for (atomic.load(?operation.registration_done) == 0) {
+        os.thread_wait(?operation.registration_done, 0);
+    }
     ret atomic.load(?operation.cancellation_reason);
+}
+
+fun finish_scope_use(operation: *Operation) {
+    atomic.store(?operation.scope_use_done, 1);
+    os.thread_wake(?operation.scope_use_done);
+}
+
+fun read_deadline(scope: *cancellation.Scope, deadline: *time.Time) bool {
+    var owner: *cancellation.Scope = nil;
+    ret cancellation.get_deadline(scope, deadline, ?owner);
+}
+
+fun deadline_reached(has_deadline: bool, deadline: time.Time) bool {
+    ret has_deadline && !time.time_before(time.monotonic(), deadline);
+}
+
+fun settle_registration(operation: *Operation) cancellation.Reason {
+    if (cancellation.unregister(?operation.registration)) {
+        atomic.store(?operation.registration_done, 1);
+        os.thread_wake(?operation.registration_done);
+        ret atomic.load(?operation.cancellation_reason);
+    }
+    ret wait_for_cancellation(operation);
 }
 
 fun cleanup_failed_result(operation: *Operation) {
@@ -316,30 +364,23 @@ fun cleanup_failed_result(operation: *Operation) {
 fun run_operation(context: ptr) bool {
     val operation: *Operation = context::*Operation;
     val resolver: *Resolver = operation.resolver;
-    cancellation.expire(operation.scope, time.monotonic());
-    var reason: cancellation.Reason = atomic.load(?operation.cancellation_reason);
     var failure: types.Error = shared.error(types.NO_ERROR, 0);
-    if (reason == cancellation.ACTIVE) {
-        failure = resolver.adapter(?operation.query, resolver.allocator, ?operation.resolution);
-        cancellation.expire(operation.scope, time.monotonic());
-        reason = atomic.load(?operation.cancellation_reason);
+    var deadline: time.Time = time.Time{sec: 0, nsec: 0};
+    val has_deadline: bool = read_deadline(operation.scope, ?deadline);
+    if (deadline_reached(has_deadline, deadline)) {
+        claim_reason(operation, cancellation.TIMED_OUT);
     }
+    if (atomic.load(?operation.cancellation_reason) == cancellation.ACTIVE) {
+        failure = resolver.adapter(resolver.adapter_context, ?operation.query, resolver.allocator,
+            resolver.result_limits, ?operation.resolution);
+    }
+    if (deadline_reached(has_deadline, deadline)) {
+        claim_reason(operation, cancellation.TIMED_OUT);
+    }
+    finish_scope_use(operation);
 
-    if (reason == cancellation.ACTIVE) {
-        if (!cancellation.unregister(?operation.registration)) {
-            reason = wait_for_cancellation(operation);
-        } or {
-            atomic.store(?operation.registration_done, 1);
-            reason = atomic.load(?operation.cancellation_reason);
-        }
-    } or {
-        if (cancellation.unregister(?operation.registration)) {
-            atomic.store(?operation.registration_done, 1);
-            reason = atomic.load(?operation.cancellation_reason);
-        } or {
-            reason = wait_for_cancellation(operation);
-        }
-    }
+    mutex.lock(?resolver.lock);
+    val reason: cancellation.Reason = settle_registration(operation);
 
     if (reason != cancellation.ACTIVE) {
         cleanup_failed_result(operation);
@@ -353,8 +394,11 @@ fun run_operation(context: ptr) bool {
         cleanup_failed_result(operation);
         failure = shared.error(types.MALFORMED, 0);
     }
+    or (!shared.within_limits(?operation.resolution, resolver.result_limits)) {
+        cleanup_failed_result(operation);
+        failure = shared.error(types.OVERLOADED, 0);
+    }
 
-    mutex.lock(?resolver.lock);
     enqueue_locked(resolver, operation, failure);
     mutex.unlock(?resolver.lock);
     ret failure.kind == types.NO_ERROR;
@@ -384,10 +428,9 @@ fun build_numeric_locked(resolver: *Resolver, operation: *Operation, addr: ip.Ad
 
 fun complete_immediate_locked(resolver: *Resolver, operation: *Operation, failure: types.Error) {
     var final_error: types.Error = failure;
-    if (cancellation.unregister(?operation.registration)) {
-        atomic.store(?operation.registration_done, 1);
-    } or {
-        val reason: cancellation.Reason = wait_for_cancellation(operation);
+    finish_scope_use(operation);
+    val reason: cancellation.Reason = settle_registration(operation);
+    if (reason != cancellation.ACTIVE) {
         cleanup_failed_result(operation);
         final_error = cancellation_error(reason);
     }
@@ -418,6 +461,7 @@ pub fun submit(resolver: *Resolver, scope: *cancellation.Scope, query: *types.Qu
     val token: types.Token = types.Token{index: operation.index, generation: operation.generation};
 
     operation.scope = scope;
+    atomic.store(?operation.scope_use_done, 0);
     atomic.store(?operation.registration_done, 0);
     val attached: cancellation.Reason = cancellation.attach_with_completion(scope, ?operation.registration, cancel_callback, cancel_complete, operation::ptr);
     if (attached != cancellation.ACTIVE) {
@@ -443,7 +487,10 @@ pub fun submit(resolver: *Resolver, scope: *cancellation.Scope, query: *types.Qu
     }
     val status: worker_pool.Status = worker_pool.try_submit(resolver.pool, worker_pool.Task{context: operation::ptr, run: run_operation});
     if (status != worker_pool.ACCEPTED) {
+        finish_scope_use(operation);
         if (cancellation.unregister(?operation.registration)) {
+            atomic.store(?operation.registration_done, 1);
+            os.thread_wake(?operation.registration_done);
             release_locked(resolver, operation);
             mutex.unlock(?resolver.lock);
             ret err[types.Token, types.Error](pool_error(status));
@@ -464,15 +511,7 @@ pub fun cancel(resolver: *Resolver, token: types.Token) bool {
         mutex.unlock(?resolver.lock);
         ret false;
     }
-    var expected: i64 = cancellation.ACTIVE;
-    val changed: bool = atomic.cas(?operation.cancellation_reason, ?expected, cancellation.CANCELLED);
-    if (changed) {
-        if (cancellation.unregister(?operation.registration)) {
-            atomic.store(?operation.registration_done, 1);
-        } or {
-            wait_for_cancellation(operation);
-        }
-    }
+    val changed: bool = claim_reason(operation, cancellation.CANCELLED);
     mutex.unlock(?resolver.lock);
     ret changed;
 }
@@ -572,6 +611,15 @@ rec Gate {
     release: i64;
 }
 
+rec ScopeTransition {
+    scope: *cancellation.Scope;
+    deadline: time.Time;
+    expire: bool;
+    entered: i64;
+    done: i64;
+    result: i64;
+}
+
 fun resolver_threads_supported() bool {
     $if ($mach.build.os == $mach.os.windows) {
         if (windows.running_under_wine()) { ret false; }
@@ -592,14 +640,58 @@ fun test_pool_destroy(value: *TestPool) bool {
 fun gate_run(context: ptr) bool {
     val gate: *Gate = context::*Gate;
     atomic.store(?gate.entered, 1);
-    for (atomic.load(?gate.release) == 0) { atomic.spin_hint(); }
+    os.thread_wake(?gate.entered);
+    for (atomic.load(?gate.release) == 0) { os.thread_wait(?gate.release, 0); }
     ret true;
 }
 
-fun fake_adapter(query: *types.Query, owner: *allocator.Allocator, output: *types.Resolution) types.Error {
+fun transition_run(argument: *u8) {
+    val transition: *ScopeTransition = argument::*ScopeTransition;
+    atomic.store(?transition.entered, 1);
+    os.thread_wake(?transition.entered);
+    var changed: bool = false;
+    if (transition.expire) {
+        changed = cancellation.expire(transition.scope, transition.deadline);
+    } or {
+        changed = cancellation.cancel(transition.scope);
+    }
+    if (changed) { atomic.store(?transition.result, 1); }
+    atomic.store(?transition.done, 1);
+    os.thread_wake(?transition.done);
+}
+
+fun transition_wait_entered(transition: *ScopeTransition) {
+    for (atomic.load(?transition.entered) == 0) { os.thread_wait(?transition.entered, 0); }
+}
+
+fun operation_wait_reason(operation: *Operation) cancellation.Reason {
+    var reason: cancellation.Reason = atomic.load(?operation.cancellation_reason);
+    for (reason == cancellation.ACTIVE) {
+        os.thread_wait(?operation.cancellation_reason, cancellation.ACTIVE);
+        reason = atomic.load(?operation.cancellation_reason);
+    }
+    ret reason;
+}
+
+fun gate_wait_entered(gate: *Gate) {
+    for (atomic.load(?gate.entered) == 0) { os.thread_wait(?gate.entered, 0); }
+}
+
+fun gate_release(gate: *Gate) {
+    atomic.store(?gate.release, 1);
+    os.thread_wake(?gate.release);
+}
+
+fun test_limits() types.ResultLimits {
+    ret types.ResultLimits{max_endpoints: 8, max_canonical_name_bytes: 256};
+}
+
+fun fake_adapter(context: ptr, query: *types.Query, owner: *allocator.Allocator,
+    limits: types.ResultLimits, output: *types.Resolution) types.Error {
     shared.clear(output, owner);
     if (query.protocol == 1) { ret shared.error(types.TEMPORARY, 71); }
     if (query.protocol == 2) { ret shared.error(types.NO_NAME, 72); }
+    if (limits.max_endpoints < 4) { ret shared.error(types.OVERLOADED, 0); }
     if (!shared.allocate_endpoints(output, 4)) { ret shared.error(types.OUT_OF_MEMORY, 0); }
     output.endpoints[0] = ip.endpoint(192, 0, 2, 2, 443);
     output.endpoints[1] = ip.endpoint_v6(ip.ipv6_loopback(), 443, 0);
@@ -610,11 +702,21 @@ fun fake_adapter(query: *types.Query, owner: *allocator.Allocator, output: *type
         output.len = 5;
         ret shared.error(types.NO_ERROR, 0);
     }
+    if (!shared.canonical_fits(query.host, limits.max_canonical_name_bytes)) {
+        shared.destroy(output);
+        ret shared.error(types.OVERLOADED, 0);
+    }
     if (!shared.set_canonical(output, query.host)) {
         shared.destroy(output);
         ret shared.error(types.OUT_OF_MEMORY, 0);
     }
     ret shared.error(types.NO_ERROR, 0);
+}
+
+fun gated_adapter(context: ptr, query: *types.Query, owner: *allocator.Allocator,
+    limits: types.ResultLimits, output: *types.Resolution) types.Error {
+    gate_run(context);
+    ret fake_adapter(nil, query, owner, limits, output);
 }
 
 fun test_query(host: *u8, service: *u8, protocol: i32) types.Query {
@@ -656,7 +758,7 @@ test "resolver: numeric fast paths own results and preserve token generations" {
     var pool: TestPool;
     if (!test_pool_make(?pool, 1)) { ret 1; }
     var resolver: Resolver;
-    if (make(?resolver, ?pool.pool, ?owner, 1).kind != types.NO_ERROR) { ret 1; }
+    if (make(?resolver, ?pool.pool, ?owner, 1, test_limits()).kind != types.NO_ERROR) { ret 1; }
     var scope: cancellation.Scope;
     if (!cancellation.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 2; }
 
@@ -693,11 +795,8 @@ test "resolver: worker adapter preserves target order, removes duplicates, and o
     var pool: TestPool;
     if (!test_pool_make(?pool, 4)) { ret 1; }
     var gate: Gate = Gate{entered: 0, release: 0};
-    if (worker_pool.try_submit(?pool.pool, worker_pool.Task{context: (?gate)::ptr, run: gate_run}) != worker_pool.ACCEPTED) { ret 2; }
-    for (atomic.load(?gate.entered) == 0) { atomic.spin_hint(); }
-
     var resolver: Resolver;
-    if (make_with_adapter(?resolver, ?pool.pool, ?owner, 2, fake_adapter).kind != types.NO_ERROR) { ret 3; }
+    if (make_with_adapter(?resolver, ?pool.pool, ?owner, 2, test_limits(), (?gate)::ptr, gated_adapter).kind != types.NO_ERROR) { ret 3; }
     var scope: cancellation.Scope;
     cancellation.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
     var host: [8]u8;
@@ -706,8 +805,9 @@ test "resolver: worker adapter preserves target order, removes duplicates, and o
     var query: types.Query = test_query(?host[0], nil, 0);
     val submitted: Result[types.Token, types.Error] = submit(?resolver, ?scope, ?query, 99);
     if (is_err[types.Token, types.Error](submitted)) { ret 4; }
+    gate_wait_entered(?gate);
     host[0] = 'X';
-    atomic.store(?gate.release, 1);
+    gate_release(?gate);
     var completion: types.Completion;
     if (wait(?resolver, ?completion, 1) != 1 || completion.has_error || completion.context != 99
      || completion.resolution.len != 3 || completion.resolution.endpoints[0].addr.v4.octets[3] != 2
@@ -726,7 +826,7 @@ test "resolver: deterministic adapter failures and malformed results remain dist
     var pool: TestPool;
     if (!test_pool_make(?pool, 4)) { ret 1; }
     var resolver: Resolver;
-    if (make_with_adapter(?resolver, ?pool.pool, ?owner, 3, fake_adapter).kind != types.NO_ERROR) { ret 2; }
+    if (make_with_adapter(?resolver, ?pool.pool, ?owner, 3, test_limits(), nil, fake_adapter).kind != types.NO_ERROR) { ret 2; }
     var scopes: [3]cancellation.Scope;
     var i: usize = 0;
     for (i < 3) { cancellation.make_root(?scopes[i], false, time.Time{sec: 0, nsec: 0}); i = i + 1; }
@@ -770,10 +870,8 @@ test "resolver: queued scope and token cancellation complete distinctly" {
     var pool: TestPool;
     if (!test_pool_make(?pool, 4)) { ret 1; }
     var gate: Gate = Gate{entered: 0, release: 0};
-    worker_pool.try_submit(?pool.pool, worker_pool.Task{context: (?gate)::ptr, run: gate_run});
-    for (atomic.load(?gate.entered) == 0) { atomic.spin_hint(); }
     var resolver: Resolver;
-    if (make_with_adapter(?resolver, ?pool.pool, ?owner, 2, fake_adapter).kind != types.NO_ERROR) { ret 2; }
+    if (make_with_adapter(?resolver, ?pool.pool, ?owner, 2, test_limits(), (?gate)::ptr, gated_adapter).kind != types.NO_ERROR) { ret 2; }
     var scopes: [2]cancellation.Scope;
     cancellation.make_root(?scopes[0], false, time.Time{sec: 0, nsec: 0});
     cancellation.make_root(?scopes[1], false, time.Time{sec: 0, nsec: 0});
@@ -781,15 +879,25 @@ test "resolver: queued scope and token cancellation complete distinctly" {
     val first: Result[types.Token, types.Error] = submit(?resolver, ?scopes[0], ?query, 10);
     val second: Result[types.Token, types.Error] = submit(?resolver, ?scopes[1], ?query, 11);
     if (is_err[types.Token, types.Error](first) || is_err[types.Token, types.Error](second)) { ret 3; }
-    if (!cancellation.cancel(?scopes[0]) || !cancel(?resolver, unwrap_ok[types.Token, types.Error](second))) { ret 4; }
-    atomic.store(?gate.release, 1);
+    gate_wait_entered(?gate);
+    if (!cancel(?resolver, unwrap_ok[types.Token, types.Error](second))) { ret 4; }
+    var transition: ScopeTransition = ScopeTransition{
+        scope: ?scopes[0], deadline: time.Time{sec: 0, nsec: 0}, expire: false,
+        entered: 0, done: 0, result: 0,
+    };
+    var transition_thread: thread.Thread;
+    thread.spawn_with(transition_run, (?transition)::*u8, ?transition_thread);
+    if (transition_thread.tid < 0) { ret 5; }
+    transition_wait_entered(?transition);
+    gate_release(?gate);
+    if (thread.join_result(?transition_thread) != 0 || atomic.load(?transition.result) == 0) { ret 6; }
     var completions: [2]types.Completion;
     var count: usize = wait(?resolver, (?completions)::*types.Completion, 2);
     if (count < 2) { count = count + wait(?resolver, ?completions[count], 2 - count); }
     if (count != 2 || !completions[0].has_error || !completions[1].has_error
-     || completions[0].error.kind != types.CANCELLED || completions[1].error.kind != types.CANCELLED) { ret 5; }
+     || completions[0].error.kind != types.CANCELLED || completions[1].error.kind != types.CANCELLED) { ret 7; }
     if (!cancellation.destroy(?scopes[0]) || !cancellation.destroy(?scopes[1])
-     || !test_resolver_cleanup(?resolver, ?pool)) { ret 6; }
+     || !test_resolver_cleanup(?resolver, ?pool)) { ret 8; }
     ret 0;
 }
 
@@ -800,21 +908,109 @@ test "resolver: queued deadlines produce timed out completions" {
     var pool: TestPool;
     if (!test_pool_make(?pool, 2)) { ret 1; }
     var gate: Gate = Gate{entered: 0, release: 0};
-    worker_pool.try_submit(?pool.pool, worker_pool.Task{context: (?gate)::ptr, run: gate_run});
-    for (atomic.load(?gate.entered) == 0) { atomic.spin_hint(); }
     var resolver: Resolver;
-    if (make_with_adapter(?resolver, ?pool.pool, ?owner, 1, fake_adapter).kind != types.NO_ERROR) { ret 2; }
+    if (make_with_adapter(?resolver, ?pool.pool, ?owner, 1, test_limits(), (?gate)::ptr, gated_adapter).kind != types.NO_ERROR) { ret 2; }
     var scope: cancellation.Scope;
     val deadline: time.Time = time.time_add(time.monotonic(), 20000000);
     cancellation.make_root(?scope, true, deadline);
     var query: types.Query = test_query("deadline", nil, 0);
     if (is_err[types.Token, types.Error](submit(?resolver, ?scope, ?query, 17))) { ret 3; }
-    if (!cancellation.expire(?scope, time.time_add(deadline, 1))) { ret 4; }
-    atomic.store(?gate.release, 1);
+    gate_wait_entered(?gate);
+    var transition: ScopeTransition = ScopeTransition{
+        scope: ?scope, deadline: time.time_add(deadline, 1), expire: true,
+        entered: 0, done: 0, result: 0,
+    };
+    var transition_thread: thread.Thread;
+    thread.spawn_with(transition_run, (?transition)::*u8, ?transition_thread);
+    if (transition_thread.tid < 0) { ret 4; }
+    transition_wait_entered(?transition);
+    gate_release(?gate);
+    if (thread.join_result(?transition_thread) != 0 || atomic.load(?transition.result) == 0) { ret 5; }
     var completion: types.Completion;
     if (wait(?resolver, ?completion, 1) != 1 || !completion.has_error
-     || completion.error.kind != types.TIMED_OUT || completion.context != 17) { ret 5; }
-    if (!cancellation.destroy(?scope) || !test_resolver_cleanup(?resolver, ?pool)) { ret 6; }
+     || completion.error.kind != types.TIMED_OUT || completion.context != 17) { ret 6; }
+    if (!cancellation.destroy(?scope) || !test_resolver_cleanup(?resolver, ?pool)) { ret 7; }
+    ret 0;
+}
+
+test "resolver: token cancellation retains the scope through a running adapter" {
+    if (!resolver_threads_supported()) { ret 0; }
+    var owner: allocator.Allocator;
+    page.make(?owner);
+    var pool: TestPool;
+    if (!test_pool_make(?pool, 1)) { ret 1; }
+    var gate: Gate = Gate{entered: 0, release: 0};
+    var resolver: Resolver;
+    if (make_with_adapter(?resolver, ?pool.pool, ?owner, 1, test_limits(), (?gate)::ptr, gated_adapter).kind != types.NO_ERROR) { ret 2; }
+    var scope: cancellation.Scope;
+    if (!cancellation.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 3; }
+    var query: types.Query = test_query("running", nil, 0);
+    val submitted: Result[types.Token, types.Error] = submit(?resolver, ?scope, ?query, 31);
+    if (is_err[types.Token, types.Error](submitted)) { ret 4; }
+    gate_wait_entered(?gate);
+    if (!cancel(?resolver, unwrap_ok[types.Token, types.Error](submitted)) || cancellation.destroy(?scope)) { ret 5; }
+    gate_release(?gate);
+    var completion: types.Completion;
+    if (wait(?resolver, ?completion, 1) != 1 || !completion.has_error
+     || completion.error.kind != types.CANCELLED || completion.context != 31) { ret 6; }
+    if (!cancellation.destroy(?scope) || !test_resolver_cleanup(?resolver, ?pool)) { ret 7; }
+    ret 0;
+}
+
+test "resolver: token cancellation and deadline preserve the first reason" {
+    if (!resolver_threads_supported()) { ret 0; }
+    var owner: allocator.Allocator;
+    page.make(?owner);
+    var pool: TestPool;
+    if (!test_pool_make(?pool, 1)) { ret 1; }
+    var gate: Gate = Gate{entered: 0, release: 0};
+    var resolver: Resolver;
+    if (make_with_adapter(?resolver, ?pool.pool, ?owner, 1, test_limits(), (?gate)::ptr, gated_adapter).kind != types.NO_ERROR) { ret 2; }
+    var query: types.Query = test_query("race", nil, 0);
+    var scope: cancellation.Scope;
+    val deadline: time.Time = time.time_add(time.monotonic(), 1000000000);
+    if (!cancellation.make_root(?scope, true, deadline)) { ret 3; }
+    val token_first_submission: Result[types.Token, types.Error] = submit(?resolver, ?scope, ?query, 41);
+    if (is_err[types.Token, types.Error](token_first_submission)) { ret 4; }
+    gate_wait_entered(?gate);
+    if (!cancel(?resolver, unwrap_ok[types.Token, types.Error](token_first_submission))) { ret 5; }
+    var transition: ScopeTransition = ScopeTransition{
+        scope: ?scope, deadline: time.time_add(deadline, 1), expire: true,
+        entered: 0, done: 0, result: 0,
+    };
+    var transition_thread: thread.Thread;
+    thread.spawn_with(transition_run, (?transition)::*u8, ?transition_thread);
+    if (transition_thread.tid < 0) { ret 6; }
+    transition_wait_entered(?transition);
+    if (cancellation.wait(?scope) != cancellation.TIMED_OUT) { ret 7; }
+    gate_release(?gate);
+    if (thread.join_result(?transition_thread) != 0 || atomic.load(?transition.result) == 0) { ret 8; }
+    var completion: types.Completion;
+    if (wait(?resolver, ?completion, 1) != 1 || !completion.has_error
+     || completion.error.kind != types.CANCELLED || completion.context != 41) { ret 9; }
+    if (!cancellation.destroy(?scope)) { ret 10; }
+
+    gate = Gate{entered: 0, release: 0};
+    val second_deadline: time.Time = time.time_add(time.monotonic(), 1000000000);
+    if (!cancellation.make_root(?scope, true, second_deadline)) { ret 11; }
+    val deadline_first_submission: Result[types.Token, types.Error] = submit(?resolver, ?scope, ?query, 42);
+    if (is_err[types.Token, types.Error](deadline_first_submission)) { ret 12; }
+    val deadline_token: types.Token = unwrap_ok[types.Token, types.Error](deadline_first_submission);
+    gate_wait_entered(?gate);
+    transition = ScopeTransition{
+        scope: ?scope, deadline: time.time_add(second_deadline, 1), expire: true,
+        entered: 0, done: 0, result: 0,
+    };
+    thread.spawn_with(transition_run, (?transition)::*u8, ?transition_thread);
+    if (transition_thread.tid < 0) { ret 13; }
+    transition_wait_entered(?transition);
+    if (operation_wait_reason(?resolver.operations[deadline_token.index::usize]) != cancellation.TIMED_OUT
+     || cancel(?resolver, deadline_token)) { ret 14; }
+    gate_release(?gate);
+    if (thread.join_result(?transition_thread) != 0 || atomic.load(?transition.result) == 0) { ret 15; }
+    if (wait(?resolver, ?completion, 1) != 1 || !completion.has_error
+     || completion.error.kind != types.TIMED_OUT || completion.context != 42) { ret 16; }
+    if (!cancellation.destroy(?scope) || !test_resolver_cleanup(?resolver, ?pool)) { ret 17; }
     ret 0;
 }
 
@@ -825,24 +1021,64 @@ test "resolver: worker queue saturation is a fixed overload error" {
     var pool: TestPool;
     if (!test_pool_make(?pool, 1)) { ret 1; }
     var gate: Gate = Gate{entered: 0, release: 0};
-    worker_pool.try_submit(?pool.pool, worker_pool.Task{context: (?gate)::ptr, run: gate_run});
-    for (atomic.load(?gate.entered) == 0) { atomic.spin_hint(); }
     var resolver: Resolver;
-    if (make_with_adapter(?resolver, ?pool.pool, ?owner, 2, fake_adapter).kind != types.NO_ERROR) { ret 2; }
-    var scopes: [2]cancellation.Scope;
+    if (make_with_adapter(?resolver, ?pool.pool, ?owner, 3, test_limits(), (?gate)::ptr, gated_adapter).kind != types.NO_ERROR) { ret 2; }
+    var scopes: [3]cancellation.Scope;
     cancellation.make_root(?scopes[0], false, time.Time{sec: 0, nsec: 0});
     cancellation.make_root(?scopes[1], false, time.Time{sec: 0, nsec: 0});
+    cancellation.make_root(?scopes[2], false, time.Time{sec: 0, nsec: 0});
     var query: types.Query = test_query("queued", nil, 0);
-    val accepted: Result[types.Token, types.Error] = submit(?resolver, ?scopes[0], ?query, 0);
-    val rejected: Result[types.Token, types.Error] = submit(?resolver, ?scopes[1], ?query, 0);
-    if (is_err[types.Token, types.Error](accepted) || !is_err[types.Token, types.Error](rejected)
+    val running: Result[types.Token, types.Error] = submit(?resolver, ?scopes[0], ?query, 0);
+    if (is_err[types.Token, types.Error](running)) { ret 3; }
+    gate_wait_entered(?gate);
+    val queued: Result[types.Token, types.Error] = submit(?resolver, ?scopes[1], ?query, 0);
+    val rejected: Result[types.Token, types.Error] = submit(?resolver, ?scopes[2], ?query, 0);
+    if (is_err[types.Token, types.Error](queued) || !is_err[types.Token, types.Error](rejected)
      || unwrap_err[types.Token, types.Error](rejected).kind != types.OVERLOADED) { ret 3; }
-    cancellation.cancel(?scopes[0]);
-    atomic.store(?gate.release, 1);
+    if (!cancel(?resolver, unwrap_ok[types.Token, types.Error](running))
+     || !cancel(?resolver, unwrap_ok[types.Token, types.Error](queued))) { ret 4; }
+    gate_release(?gate);
+    var completions: [2]types.Completion;
+    var count: usize = wait(?resolver, (?completions)::*types.Completion, 2);
+    if (count < 2) { count = count + wait(?resolver, ?completions[count], 2 - count); }
+    if (count != 2 || completions[0].error.kind != types.CANCELLED
+     || completions[1].error.kind != types.CANCELLED) { ret 5; }
+    if (!cancellation.destroy(?scopes[0]) || !cancellation.destroy(?scopes[1]) || !cancellation.destroy(?scopes[2])
+     || !test_resolver_cleanup(?resolver, ?pool)) { ret 6; }
+    ret 0;
+}
+
+test "resolver: result limits reject endpoint and canonical name overflow" {
+    if (!resolver_threads_supported()) { ret 0; }
+    var owner: allocator.Allocator;
+    page.make(?owner);
+    var pool: TestPool;
+    if (!test_pool_make(?pool, 2)) { ret 1; }
+    var resolver: Resolver;
+    if (make_with_adapter(?resolver, ?pool.pool, ?owner, 1,
+        types.ResultLimits{max_endpoints: 0, max_canonical_name_bytes: 256}, nil, fake_adapter).kind != types.INVALID) { ret 2; }
+    if (make_with_adapter(?resolver, ?pool.pool, ?owner, 1,
+        types.ResultLimits{max_endpoints: 3, max_canonical_name_bytes: 256}, nil, fake_adapter).kind != types.NO_ERROR) { ret 3; }
+    var scope: cancellation.Scope;
+    cancellation.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    var query: types.Query = test_query("endpoint-overflow", nil, 0);
+    if (is_err[types.Token, types.Error](submit(?resolver, ?scope, ?query, 51))) { ret 4; }
     var completion: types.Completion;
-    if (wait(?resolver, ?completion, 1) != 1 || completion.error.kind != types.CANCELLED) { ret 4; }
-    if (!cancellation.destroy(?scopes[0]) || !cancellation.destroy(?scopes[1])
-     || !test_resolver_cleanup(?resolver, ?pool)) { ret 5; }
+    if (wait(?resolver, ?completion, 1) != 1 || !completion.has_error
+     || completion.error.kind != types.OVERLOADED || completion.resolution.endpoints != nil
+     || completion.resolution.canonical_name != nil) { ret 5; }
+    if (!cancellation.destroy(?scope) || !close(?resolver) || !destroy(?resolver)) { ret 6; }
+
+    if (make_with_adapter(?resolver, ?pool.pool, ?owner, 1,
+        types.ResultLimits{max_endpoints: 8, max_canonical_name_bytes: 4}, nil, fake_adapter).kind != types.NO_ERROR) { ret 7; }
+    cancellation.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    query = test_query("canonical-overflow", nil, 0);
+    if (is_err[types.Token, types.Error](submit(?resolver, ?scope, ?query, 52))) { ret 8; }
+    if (wait(?resolver, ?completion, 1) != 1 || !completion.has_error
+     || completion.error.kind != types.OVERLOADED || completion.resolution.endpoints != nil
+     || completion.resolution.canonical_name != nil) { ret 9; }
+    if (!cancellation.destroy(?scope) || !close(?resolver) || !destroy(?resolver)
+     || !test_pool_destroy(?pool)) { ret 10; }
     ret 0;
 }
 
@@ -853,7 +1089,7 @@ test "resolver: native localhost uses service policy without truncating results"
     var pool: TestPool;
     if (!test_pool_make(?pool, 2)) { ret 1; }
     var resolver: Resolver;
-    if (make(?resolver, ?pool.pool, ?owner, 1).kind != types.NO_ERROR) { ret 2; }
+    if (make(?resolver, ?pool.pool, ?owner, 1, test_limits()).kind != types.NO_ERROR) { ret 2; }
     var scope: cancellation.Scope;
     cancellation.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
     var query: types.Query = test_query("localhost", "http", 0);
