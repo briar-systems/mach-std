@@ -1,0 +1,446 @@
+# portable process lifecycle events
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.system.os;
+use std.sync.atomic;
+use io_runtime: std.io.runtime;
+use io_error: std.io.error;
+
+$if ($mach.build.os == $mach.os.linux) {
+    use std.system.os.linux;
+}
+$or ($mach.build.os == $mach.os.darwin) {
+    use std.system.os.darwin.libsystem;
+}
+$or ($mach.build.os == $mach.os.windows) {
+    #[library("kernel32.dll")]
+    ext fun SetConsoleCtrlHandler(handler: usize, add: i32) i32;
+}
+$or {
+    $error("std.process.events: unsupported target");
+}
+
+pub def Kind: u8;
+pub val SERVICE_STOP: Kind = 0;
+pub val CONSOLE_CLOSE: Kind = 1;
+pub val TERMINATE: Kind = 2;
+pub val INTERRUPT: Kind = 3;
+pub val RELOAD: Kind = 4;
+
+pub rec Event {
+    kind: Kind;
+}
+
+pub rec Capabilities {
+    terminate: bool;
+    interrupt: bool;
+    reload: bool;
+    console_close: bool;
+    service_stop: bool;
+}
+
+pub rec Source {
+    generation: i64;
+    owns_queue: bool;
+}
+
+val STATE_IDLE: i64 = 0;
+val STATE_CONFIGURING: i64 = 1;
+val STATE_OPEN: i64 = 2;
+val STATE_CLOSING: i64 = 3;
+
+val BIT_SERVICE_STOP: i64 = 1;
+val BIT_CONSOLE_CLOSE: i64 = 2;
+val BIT_TERMINATE: i64 = 4;
+val BIT_INTERRUPT: i64 = 8;
+val BIT_RELOAD: i64 = 16;
+
+var global_state: i64 = STATE_IDLE;
+var global_generation: i64 = 0;
+var global_pending: i64 = 0;
+var global_handlers: i64 = 0;
+var global_queue: i64 = 0;
+var global_owned_queue: os.IoQueue;
+var global_native: [12]usize;
+
+fun source_open(source: *Source) bool {
+    if (source == nil || atomic.load(?global_state) != STATE_OPEN) { ret false; }
+    ret source.generation == atomic.load(?global_generation);
+}
+
+fun event_bit(code: i32) i64 {
+    $if ($mach.build.os == $mach.os.windows) {
+        if (code == 0) { ret BIT_INTERRUPT; }
+        if (code == 1) { ret BIT_TERMINATE; }
+        if (code == 2 || code == 5 || code == 6) { ret BIT_CONSOLE_CLOSE; }
+        ret 0;
+    }
+    $or {
+        if (code == 1) { ret BIT_RELOAD; }
+        if (code == 2) { ret BIT_INTERRUPT; }
+        if (code == 15) { ret BIT_TERMINATE; }
+        ret 0;
+    }
+}
+
+fun publish_bit(bit: i64) bool {
+    var current: i64 = atomic.load(?global_pending);
+    for ((current & bit) == 0) {
+        var expected: i64 = current;
+        if (atomic.cas(?global_pending, ?expected, current | bit)) { ret current == 0; }
+        current = expected;
+    }
+    ret false;
+}
+
+# native handlers only publish bits and wake the configured wait queue
+fun native_event(code: i32) i32 {
+    if (atomic.load(?global_state) != STATE_OPEN) { ret 0; }
+    atomic.fetch_add(?global_handlers, 1);
+    if (atomic.load(?global_state) != STATE_OPEN) {
+        atomic.fetch_add(?global_handlers, -1);
+        ret 0;
+    }
+    val bit: i64 = event_bit(code);
+    if (bit != 0) {
+        if (publish_bit(bit)) {
+            val queue: i64 = atomic.load(?global_queue);
+            if (queue != 0) { os.io_queue_wake(queue::*os.IoQueue); }
+        }
+    }
+    atomic.fetch_add(?global_handlers, -1);
+    if (bit != 0) { ret 1; }
+    ret 0;
+}
+
+$if ($mach.build.os == $mach.os.linux && $mach.build.arch == $mach.arch.x86_64) {
+    #[symbol("_std_process_rt_sigreturn")]
+    fun linux_sigreturn() {
+        asm x86_64 {
+            mov rax, 15
+            syscall
+        }
+    }
+}
+
+fun native_install() i64 {
+    $if ($mach.build.os == $mach.os.linux) {
+        var syscall_number: usize = 134;
+        var mask_index: usize = 2;
+        var flags: usize = 0;
+        var restorer: usize = 0;
+        $if ($mach.build.arch == $mach.arch.x86_64) {
+            syscall_number = 13;
+            mask_index = 3;
+            flags = 0x04000000;
+            restorer = linux_sigreturn::usize;
+        }
+        $or ($mach.build.arch == $mach.arch.aarch64) {
+            mask_index = 3;
+        }
+        var action: [4]usize;
+        action[0] = native_event::usize;
+        action[1] = flags;
+        action[2] = restorer;
+        action[3] = 0;
+        action[mask_index] = (1 << (1 - 1)) | (1 << (2 - 1)) | (1 << (15 - 1));
+        var installed: usize = 0;
+        var signals: [3]usize;
+        signals[0] = 15;
+        signals[1] = 2;
+        signals[2] = 1;
+        var i: usize = 0;
+        for (i < 3) {
+            val result: i64 = linux.syscall4(syscall_number, signals[i], (?action[0])::usize, (?global_native[i * 4])::usize, 8);
+            if (result < 0) {
+                for (installed > 0) {
+                    installed = installed - 1;
+                    linux.syscall4(syscall_number, signals[installed], (?global_native[installed * 4])::usize, 0, 8);
+                }
+                ret result;
+            }
+            installed = installed + 1;
+            i = i + 1;
+        }
+        ret 0;
+    }
+    $or ($mach.build.os == $mach.os.darwin) {
+        var action: [2]usize;
+        action[0] = native_event::usize;
+        action[1] = ((1 << (1 - 1)) | (1 << (2 - 1)) | (1 << (15 - 1)))::usize;
+        var signals: [3]i32;
+        signals[0] = 15;
+        signals[1] = 2;
+        signals[2] = 1;
+        var installed: usize = 0;
+        var i: usize = 0;
+        for (i < 3) {
+            if (libsystem.sigaction(signals[i], ?action[0], ?global_native[i * 2]) != 0) {
+                val result: i64 = libsystem.fail_errno();
+                for (installed > 0) {
+                    installed = installed - 1;
+                    libsystem.sigaction(signals[installed], ?global_native[installed * 2], nil);
+                }
+                ret result;
+            }
+            installed = installed + 1;
+            i = i + 1;
+        }
+        ret 0;
+    }
+    $or {
+        if (SetConsoleCtrlHandler(native_event::usize, 1) == 0) { ret os.EINVAL; }
+        ret 0;
+    }
+}
+
+fun native_restore() i64 {
+    $if ($mach.build.os == $mach.os.linux) {
+        var syscall_number: usize = 134;
+        $if ($mach.build.arch == $mach.arch.x86_64) { syscall_number = 13; }
+        var signals: [3]usize;
+        signals[0] = 15;
+        signals[1] = 2;
+        signals[2] = 1;
+        var result: i64 = 0;
+        var i: usize = 3;
+        for (i > 0) {
+            i = i - 1;
+            val restored: i64 = linux.syscall4(syscall_number, signals[i], (?global_native[i * 4])::usize, 0, 8);
+            if (restored < 0 && result == 0) { result = restored; }
+        }
+        ret result;
+    }
+    $or ($mach.build.os == $mach.os.darwin) {
+        var signals: [3]i32;
+        signals[0] = 15;
+        signals[1] = 2;
+        signals[2] = 1;
+        var result: i64 = 0;
+        var i: usize = 3;
+        for (i > 0) {
+            i = i - 1;
+            if (libsystem.sigaction(signals[i], ?global_native[i * 2], nil) != 0 && result == 0) { result = libsystem.fail_errno(); }
+        }
+        ret result;
+    }
+    $or {
+        if (SetConsoleCtrlHandler(native_event::usize, 0) == 0) { ret os.EINVAL; }
+        ret 0;
+    }
+}
+
+fun native_raise(code: i32) i64 {
+    $if ($mach.build.os == $mach.os.linux) {
+        var syscall_number: usize = 129;
+        $if ($mach.build.arch == $mach.arch.x86_64) { syscall_number = 62; }
+        ret linux.syscall2(syscall_number, os.getpid()::usize, code::usize);
+    }
+    $or ($mach.build.os == $mach.os.darwin) {
+        if (libsystem.raise(code) != 0) { ret libsystem.fail_errno(); }
+        ret 0;
+    }
+    $or {
+        ret native_event(code)::i64 - 1;
+    }
+}
+
+fun configure_claimed(source: *Source, queue: *os.IoQueue, owned: bool) i64 {
+    if (source == nil || queue == nil) { ret os.EINVAL; }
+    atomic.store(?global_pending, 0);
+    atomic.store(?global_handlers, 0);
+    atomic.store(?global_queue, queue::i64);
+    val generation: i64 = atomic.fetch_add(?global_generation, 1) + 1;
+    source.generation = generation;
+    source.owns_queue = owned;
+    atomic.store(?global_state, STATE_OPEN);
+    val installed: i64 = native_install();
+    if (installed < 0) {
+        atomic.store(?global_state, STATE_CLOSING);
+        for (atomic.load(?global_handlers) != 0) { atomic.spin_hint(); }
+        atomic.store(?global_queue, 0);
+        atomic.store(?global_state, STATE_IDLE);
+        ret installed;
+    }
+    ret 0;
+}
+
+pub fun make(source: *Source) i64 {
+    if (source == nil) { ret os.EINVAL; }
+    var expected: i64 = STATE_IDLE;
+    if (!atomic.cas(?global_state, ?expected, STATE_CONFIGURING)) { ret os.EBUSY; }
+    val created: i64 = os.io_queue_create(?global_owned_queue);
+    if (created < 0) {
+        atomic.store(?global_state, STATE_IDLE);
+        ret created;
+    }
+    val configured: i64 = configure_claimed(source, ?global_owned_queue, true);
+    if (configured < 0) { os.io_queue_close(?global_owned_queue); }
+    ret configured;
+}
+
+# the source must close before the runtime whose queue it borrows
+pub fun make_runtime(source: *Source, runtime: *io_runtime.Runtime) i64 {
+    if (source == nil || runtime == nil) { ret os.EINVAL; }
+    if (runtime.state != io_runtime.OPEN) { ret os.EBADF; }
+    var expected: i64 = STATE_IDLE;
+    if (!atomic.cas(?global_state, ?expected, STATE_CONFIGURING)) { ret os.EBUSY; }
+    ret configure_claimed(source, ?runtime.queue, false);
+}
+
+pub fun capabilities() Capabilities {
+    $if ($mach.build.os == $mach.os.windows) {
+        ret Capabilities{terminate: true, interrupt: true, reload: false, console_close: true, service_stop: true};
+    }
+    $or {
+        ret Capabilities{terminate: true, interrupt: true, reload: true, console_close: false, service_stop: false};
+    }
+}
+
+# windows service handlers call this for stop, shutdown, or preshutdown control
+pub fun notify_service_stop(source: *Source) i64 {
+    $if ($mach.build.os == $mach.os.windows) {
+        if (!source_open(source)) { ret os.EBADF; }
+        if (publish_bit(BIT_SERVICE_STOP)) {
+            val queue: i64 = atomic.load(?global_queue);
+            if (queue != 0) { ret os.io_queue_wake(queue::*os.IoQueue); }
+        }
+        ret 0;
+    }
+    $or {
+        ret os.ENOTSUP;
+    }
+}
+
+fun take_bit(bit: i64) bool {
+    var current: i64 = atomic.load(?global_pending);
+    for ((current & bit) != 0) {
+        var expected: i64 = current;
+        if (atomic.cas(?global_pending, ?expected, current & ~bit)) { ret true; }
+        current = expected;
+    }
+    ret false;
+}
+
+# events are coalesced by kind and drained in service-to-reload priority order
+pub fun next(source: *Source, event: *Event) i64 {
+    if (!source_open(source) || event == nil) { ret os.EBADF; }
+    if (take_bit(BIT_SERVICE_STOP)) { event.kind = SERVICE_STOP; ret 1; }
+    if (take_bit(BIT_CONSOLE_CLOSE)) { event.kind = CONSOLE_CLOSE; ret 1; }
+    if (take_bit(BIT_TERMINATE)) { event.kind = TERMINATE; ret 1; }
+    if (take_bit(BIT_INTERRUPT)) { event.kind = INTERRUPT; ret 1; }
+    if (take_bit(BIT_RELOAD)) { event.kind = RELOAD; ret 1; }
+    ret 0;
+}
+
+# standalone sources may wait directly, runtime-attached sources use runtime wait
+pub fun wait(source: *Source, timeout_ms: i32) i64 {
+    if (!source_open(source) || !source.owns_queue || timeout_ms < -1) { ret os.EINVAL; }
+    if (atomic.load(?global_pending) != 0) { ret 1; }
+    val waited: i64 = os.io_queue_wait(?global_owned_queue, timeout_ms);
+    if (waited < 0) { ret waited; }
+    if (atomic.load(?global_pending) != 0) { ret 1; }
+    ret 0;
+}
+
+pub fun close(source: *Source) i64 {
+    if (!source_open(source)) { ret os.EBADF; }
+    var expected: i64 = STATE_OPEN;
+    if (!atomic.cas(?global_state, ?expected, STATE_CLOSING)) { ret os.EBUSY; }
+    val restored: i64 = native_restore();
+    for (atomic.load(?global_handlers) != 0) { atomic.spin_hint(); }
+    atomic.store(?global_queue, 0);
+    atomic.store(?global_pending, 0);
+    var queue_result: i64 = 0;
+    if (source.owns_queue) { queue_result = os.io_queue_close(?global_owned_queue); }
+    source.owns_queue = false;
+    atomic.store(?global_state, STATE_IDLE);
+    if (restored < 0) { ret restored; }
+    ret queue_result;
+}
+
+test "process events: coalescing and priority are deterministic" {
+    var source: Source;
+    if (make(?source) < 0) { ret 1; }
+    publish_bit(BIT_RELOAD);
+    publish_bit(BIT_INTERRUPT);
+    publish_bit(BIT_TERMINATE);
+    publish_bit(BIT_TERMINATE);
+    publish_bit(BIT_CONSOLE_CLOSE);
+    publish_bit(BIT_SERVICE_STOP);
+    var event: Event;
+    if (next(?source, ?event) != 1 || event.kind != SERVICE_STOP) { close(?source); ret 1; }
+    if (next(?source, ?event) != 1 || event.kind != CONSOLE_CLOSE) { close(?source); ret 1; }
+    if (next(?source, ?event) != 1 || event.kind != TERMINATE) { close(?source); ret 1; }
+    if (next(?source, ?event) != 1 || event.kind != INTERRUPT) { close(?source); ret 1; }
+    if (next(?source, ?event) != 1 || event.kind != RELOAD) { close(?source); ret 1; }
+    if (next(?source, ?event) != 0) { close(?source); ret 1; }
+    if (close(?source) < 0) { ret 1; }
+    ret 0;
+}
+
+test "process events: only one process owner can register" {
+    var first: Source;
+    var second: Source;
+    if (make(?first) < 0) { ret 1; }
+    if (make(?second) != os.EBUSY) { close(?first); ret 1; }
+    if (close(?first) < 0) { ret 1; }
+    ret 0;
+}
+
+test "process events: native delivery wakes a standalone source" {
+    var source: Source;
+    if (make(?source) < 0) { ret 1; }
+    var signals: [3]i32;
+    var kinds: [3]Kind;
+    var count: usize = 3;
+    signals[0] = 15;
+    signals[1] = 2;
+    signals[2] = 1;
+    kinds[0] = TERMINATE;
+    kinds[1] = INTERRUPT;
+    kinds[2] = RELOAD;
+    $if ($mach.build.os == $mach.os.windows) {
+        count = 2;
+        signals[0] = 1;
+        signals[1] = 0;
+    }
+    var i: usize = 0;
+    for (i < count) {
+        if (native_raise(signals[i]) < 0 || wait(?source, 1000) != 1) { close(?source); ret 1; }
+        var event: Event;
+        if (next(?source, ?event) != 1 || event.kind != kinds[i]) { close(?source); ret 1; }
+        i = i + 1;
+    }
+    $if ($mach.build.os == $mach.os.windows) {
+        if (notify_service_stop(?source) < 0 || wait(?source, 1000) != 1) { close(?source); ret 1; }
+        var service: Event;
+        if (next(?source, ?service) != 1 || service.kind != SERVICE_STOP) { close(?source); ret 1; }
+    }
+    if (close(?source) < 0) { ret 1; }
+    ret 0;
+}
+
+test "process events: native delivery wakes the standard runtime" {
+    var runtime: io_runtime.Runtime;
+    val made: Result[bool, io_error.Error] = io_runtime.make(?runtime, 2);
+    if (is_err[bool, io_error.Error](made)) { ret 1; }
+    var source: Source;
+    if (make_runtime(?source, ?runtime) < 0) { io_runtime.close(?runtime); io_runtime.destroy(?runtime); ret 1; }
+    var native_code: i32 = 15;
+    $if ($mach.build.os == $mach.os.windows) { native_code = 1; }
+    if (native_raise(native_code) < 0) { close(?source); io_runtime.close(?runtime); io_runtime.destroy(?runtime); ret 1; }
+    var completions: [2]io_runtime.Completion;
+    val waited: Result[usize, io_error.Error] = io_runtime.wait(?runtime, ?completions[0], 2, 1000);
+    if (is_err[usize, io_error.Error](waited) || unwrap_ok[usize, io_error.Error](waited) != 0) { close(?source); io_runtime.close(?runtime); io_runtime.destroy(?runtime); ret 1; }
+    var event: Event;
+    if (next(?source, ?event) != 1 || event.kind != TERMINATE) { close(?source); io_runtime.close(?runtime); io_runtime.destroy(?runtime); ret 1; }
+    if (close(?source) < 0 || is_err[bool, io_error.Error](io_runtime.close(?runtime)) || is_err[bool, io_error.Error](io_runtime.destroy(?runtime))) { ret 1; }
+    ret 0;
+}
