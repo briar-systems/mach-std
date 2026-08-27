@@ -5,6 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.29.0] - 2026-08-27
+
+### Added
+
+#### io: a bounded production completion runtime
+
+- Native resource handles and normalized I/O errors establish one ownership and
+  failure contract across supported targets (#484).
+- The operation-completion runtime provides bounded submission, completion
+  dequeue, native source composition, monotonic timers, wakeups, hierarchical
+  cancellation, and explicit close and drain behavior (#487, #488, #489, #495).
+- Asynchronous file operations report transfer metadata and preserve buffer
+  ownership through cancellation and teardown (#491).
+
+#### net: transport-neutral asynchronous networking
+
+- IP endpoints are dual-stack and transport-neutral, with atomic socket flags and
+  production socket options (#485, #486).
+- TCP and UDP use the shared completion runtime on Linux, Darwin, and Windows
+  (#490).
+- System name resolution is asynchronous, bounded, cancellable, and attached to
+  runtime lifecycle ownership (#501).
+- Local byte streams provide tagged filesystem and Linux abstract endpoints,
+  managed listeners and streams, peer identity capabilities, owned path cleanup,
+  and completion-driven operation across Linux, Darwin, and Windows (#502).
+
+#### sync and process: reusable concurrent services
+
+- Sleeping mutexes, conditions, semaphores, and once initialization avoid
+  spin-based waiting (#492).
+- Bounded channels and worker pools provide reusable backpressure and worker
+  ownership contracts (#493).
+- Portable process events expose termination and reload requests (#494).
+
+#### encoding and output: transactional bounded writes
+
+- Structured record output is atomic, so concurrent writers cannot publish
+  partial records (#497).
+- Bounded byte cursors and transactional builders preserve their position and
+  output on failure (#498).
+
+#### test and CI: deterministic native acceptance
+
+- Deterministic I/O and allocation fault facilities exercise failure ownership in
+  debug and optimized builds (#499).
+- The complete runtime suite runs natively on supported Linux, Darwin, and Windows
+  targets, with cross-riscv64 and cross-backend coverage (#500).
+
+### Fixed
+
+- Thread resources are reclaimed on every target, including process-local Windows
+  rollback checks (#496, #520).
+- Darwin asynchronous backend tests are completion-driven and close cancellation
+  has deterministic ownership (#524, #527).
+- The thread-resource fixture uses Mach's default project-local output path (#529).
+
 ## [0.28.2] - 2026-08-25
 
 ### Fixed
