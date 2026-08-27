@@ -58,6 +58,11 @@ pub rec Completion {
     end_of_stream: bool;
 }
 
+pub rec WaitPlan {
+    wait: bool;
+    timeout_ms: i32;
+}
+
 val SLOT_FREE: u8 = 0;
 val SLOT_ACTIVE: u8 = 1;
 val SLOT_QUEUED: u8 = 2;
@@ -606,44 +611,72 @@ fun drain(runtime: *Runtime, output: *Completion, output_capacity: usize) usize 
     ret written;
 }
 
-# timeout_ms is relative and uses -1 for an unbounded wait
-# the caller owns output and may reuse it after this call returns
-pub fun wait(runtime: *Runtime, output: *Completion, output_capacity: usize, timeout_ms: i32) Result[usize, io_error.Error] {
-    if (runtime == nil || output == nil || output_capacity == 0 || timeout_ms < -1) {
-        ret err[usize, io_error.Error](invalid(io_error.OP_WAIT));
-    }
-    mutex.lock(?runtime.lock);
-    var before: time.Time = time.monotonic();
-    var expired_scope: *cancel.Scope = timers_expire(runtime, before);
-    for (expired_scope != nil) {
-        mutex.unlock(?runtime.lock);
-        cancel.timeout(expired_scope);
-        mutex.lock(?runtime.lock);
-        before = time.monotonic();
-        expired_scope = timers_expire(runtime, before);
-    }
-    var written: usize = drain(runtime, output, output_capacity);
-    if (written > 0 || runtime.state != OPEN) {
-        mutex.unlock(?runtime.lock);
-        ret ok[usize, io_error.Error](written);
-    }
-    val native_timeout: i32 = timer_timeout(runtime, timeout_ms, before);
-    mutex.unlock(?runtime.lock);
-
-    val waited: i64 = os.io_queue_wait(?runtime.queue, native_timeout);
-    if (waited < 0) { ret err[usize, io_error.Error](io_error.from_code(waited, io_error.OP_WAIT)); }
-
-    mutex.lock(?runtime.lock);
-    expired_scope = timers_expire(runtime, time.monotonic());
+fun settle_expired_locked(runtime: *Runtime) {
+    var expired_scope: *cancel.Scope = timers_expire(runtime, time.monotonic());
     for (expired_scope != nil) {
         mutex.unlock(?runtime.lock);
         cancel.timeout(expired_scope);
         mutex.lock(?runtime.lock);
         expired_scope = timers_expire(runtime, time.monotonic());
     }
-    written = drain(runtime, output, output_capacity);
+}
+
+# drains completions and expires due deadlines without entering the native wait
+pub fun poll(runtime: *Runtime, output: *Completion, output_capacity: usize) Result[usize, io_error.Error] {
+    if (runtime == nil || output == nil || output_capacity == 0) {
+        ret err[usize, io_error.Error](invalid(io_error.OP_WAIT));
+    }
+    mutex.lock(?runtime.lock);
+    if (runtime.state == DESTROYED) {
+        mutex.unlock(?runtime.lock);
+        ret err[usize, io_error.Error](invalid(io_error.OP_WAIT));
+    }
+    settle_expired_locked(runtime);
+    val written: usize = drain(runtime, output, output_capacity);
     mutex.unlock(?runtime.lock);
     ret ok[usize, io_error.Error](written);
+}
+
+# prepares another subsystem to wait on the runtime's native queue
+pub fun prepare_wait(runtime: *Runtime, timeout_ms: i32) Result[WaitPlan, io_error.Error] {
+    if (runtime == nil || timeout_ms < -1) {
+        ret err[WaitPlan, io_error.Error](invalid(io_error.OP_WAIT));
+    }
+    mutex.lock(?runtime.lock);
+    if (runtime.state == DESTROYED) {
+        mutex.unlock(?runtime.lock);
+        ret err[WaitPlan, io_error.Error](invalid(io_error.OP_WAIT));
+    }
+    settle_expired_locked(runtime);
+    if (runtime.state != OPEN || runtime.count != 0) {
+        mutex.unlock(?runtime.lock);
+        ret ok[WaitPlan, io_error.Error](WaitPlan{wait: false, timeout_ms: 0});
+    }
+    val native_timeout: i32 = timer_timeout(runtime, timeout_ms, time.monotonic());
+    mutex.unlock(?runtime.lock);
+    ret ok[WaitPlan, io_error.Error](WaitPlan{wait: true, timeout_ms: native_timeout});
+}
+
+# timeout_ms is relative and uses -1 for an unbounded wait
+# the caller owns output and may reuse it after this call returns
+pub fun wait(runtime: *Runtime, output: *Completion, output_capacity: usize, timeout_ms: i32) Result[usize, io_error.Error] {
+    if (runtime == nil || output == nil || output_capacity == 0 || timeout_ms < -1) {
+        ret err[usize, io_error.Error](invalid(io_error.OP_WAIT));
+    }
+    val initial: Result[usize, io_error.Error] = poll(runtime, output, output_capacity);
+    if (is_err[usize, io_error.Error](initial)) { ret initial; }
+    val initial_count: usize = unwrap_ok[usize, io_error.Error](initial);
+    if (initial_count > 0) { ret initial; }
+    val prepared: Result[WaitPlan, io_error.Error] = prepare_wait(runtime, timeout_ms);
+    if (is_err[WaitPlan, io_error.Error](prepared)) {
+        ret err[usize, io_error.Error](unwrap_err[WaitPlan, io_error.Error](prepared));
+    }
+    val plan: WaitPlan = unwrap_ok[WaitPlan, io_error.Error](prepared);
+    if (!plan.wait) { ret ok[usize, io_error.Error](0); }
+
+    val waited: i64 = os.io_queue_wait(?runtime.queue, plan.timeout_ms);
+    if (waited < 0) { ret err[usize, io_error.Error](io_error.from_code(waited, io_error.OP_WAIT)); }
+    ret poll(runtime, output, output_capacity);
 }
 
 # interrupts a blocked wait, with notifications coalesced by the native queue
@@ -748,6 +781,26 @@ test "runtime: bounded submission preserves caller ownership" {
     var output: [2]Completion;
     val waited: Result[usize, io_error.Error] = wait(?runtime, ?output[0], 2, 0);
     if (is_err[usize, io_error.Error](waited) || unwrap_ok[usize, io_error.Error](waited) != 2) { ret 1; }
+    if (is_err[bool, io_error.Error](destroy(?runtime))) { ret 1; }
+    ret 0;
+}
+
+test "runtime: external wait preparation never consumes completions" {
+    var runtime: Runtime;
+    if (is_err[bool, io_error.Error](make(?runtime, 1))) { ret 1; }
+    val submitted: Result[Token, io_error.Error] = submit(?runtime, test_operation(READ, 41));
+    if (is_err[Token, io_error.Error](submitted)) { ret 1; }
+    if (is_err[bool, io_error.Error](complete(?runtime, unwrap_ok[Token, io_error.Error](submitted), 3, 0, false))) { ret 1; }
+    val blocked: Result[WaitPlan, io_error.Error] = prepare_wait(?runtime, 7);
+    if (is_err[WaitPlan, io_error.Error](blocked) || unwrap_ok[WaitPlan, io_error.Error](blocked).wait) { ret 1; }
+    var output: Completion;
+    val drained: Result[usize, io_error.Error] = poll(?runtime, ?output, 1);
+    if (is_err[usize, io_error.Error](drained) || unwrap_ok[usize, io_error.Error](drained) != 1 || output.bytes != 3 || output.context != 41) { ret 1; }
+    val ready: Result[WaitPlan, io_error.Error] = prepare_wait(?runtime, 7);
+    if (is_err[WaitPlan, io_error.Error](ready) || !unwrap_ok[WaitPlan, io_error.Error](ready).wait || unwrap_ok[WaitPlan, io_error.Error](ready).timeout_ms != 7) { ret 1; }
+    close(?runtime);
+    val closed: Result[WaitPlan, io_error.Error] = prepare_wait(?runtime, -1);
+    if (is_err[WaitPlan, io_error.Error](closed) || unwrap_ok[WaitPlan, io_error.Error](closed).wait) { ret 1; }
     if (is_err[bool, io_error.Error](destroy(?runtime))) { ret 1; }
     ret 0;
 }
