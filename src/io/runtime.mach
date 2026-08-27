@@ -48,6 +48,9 @@ pub val PROCESS_WAIT:Kind = 9;
 pub val USER_WAKE:   Kind = 10;
 pub val SHUTDOWN:    Kind = 11;
 pub val CLOSE:       Kind = 12;
+pub val BIND:        Kind = 13;
+pub val LISTEN:      Kind = 14;
+pub val RESOLVE:     Kind = 15;
 
 pub rec Token {
     index: u32;
@@ -90,7 +93,7 @@ pub rec SourceToken {
 }
 
 pub def DispatchFun: fun(ptr, usize, u32, i64, u64) bool;
-pub def CancelFun: fun(ptr, Token) i64;
+pub def CancelFun: fun(ptr, Token, io_error.Error) i64;
 pub def ReleaseFun: fun(ptr, *Completion);
 pub val CANCELLATION_PENDING: i64 = 1;
 
@@ -132,6 +135,7 @@ rec Slot {
     deadline_timer_index: usize;
     cancellation_active: bool;
     cancellation_pending: bool;
+    lifecycle_cancellation: bool;
     cancellation: cancel.Registration;
     terminal_error: io_error.Error;
     attachment: lifecycle.Attachment;
@@ -268,6 +272,7 @@ pub fun make(runtime: *Runtime, capacity: usize) Result[bool, io_error.Error] {
         runtime.slots[i].deadline_timer_index = timer_capacity;
         runtime.slots[i].cancellation_active = false;
         runtime.slots[i].cancellation_pending = false;
+        runtime.slots[i].lifecycle_cancellation = false;
         runtime.slots[i].terminal_error = io_error.from_code(0, io_error.OP_UNKNOWN);
         runtime.slots[i].attachment.owner = nil;
         runtime.slots[i].attachment.generation = 0;
@@ -417,6 +422,7 @@ fun claim_locked(runtime: *Runtime, operation: Operation, source_index: u32, tok
     runtime.slots[index].deadline_timer_index = timer_capacity(runtime);
     runtime.slots[index].cancellation_active = false;
     runtime.slots[index].cancellation_pending = false;
+    runtime.slots[index].lifecycle_cancellation = false;
     runtime.slots[index].terminal_error = io_error.from_code(0, io_error.OP_UNKNOWN);
     runtime.slots[index].source_index = source_index;
     cancel.init_registration(?runtime.slots[index].cancellation);
@@ -578,6 +584,13 @@ fun cancellation_error(reason: cancel.Reason) io_error.Error {
     ret io_error.from_code(os.EBADF, io_error.OP_SUBMIT);
 }
 
+fun close_error(cause: lifecycle.Cause) io_error.Error {
+    if (cause == lifecycle.DEADLINE) { ret io_error.from_code(os.ETIMEDOUT, io_error.OP_CLOSE); }
+    if (cause == lifecycle.CANCELLATION) { ret io_error.from_code(os.ECANCELED, io_error.OP_CLOSE); }
+    if (cause == lifecycle.FAILURE) { ret io_error.from_code(os.EIO, io_error.OP_CLOSE); }
+    ret io_error.from_code(os.EBADF, io_error.OP_CLOSE);
+}
+
 fun remove_slot_timers(runtime: *Runtime, token: Token) {
     timer_remove_token(runtime, token, TIMER_OPERATION);
     timer_remove_token(runtime, token, TIMER_SCOPE_DEADLINE);
@@ -593,14 +606,16 @@ fun scope_cancel_callback(context: ptr, reason: cancel.Reason) {
     val token: Token = Token{index: slot.index, generation: slot.generation};
     remove_slot_timers(runtime, token);
     slot.state = SLOT_CANCELLING;
+    slot.lifecycle_cancellation = false;
     slot.terminal_error = cancellation_error(reason);
     val source_index: u32 = slot.source_index;
+    val terminal_error: io_error.Error = slot.terminal_error;
     slot.cancellation_pending = source_index != NO_SOURCE;
     mutex.unlock(?runtime.lock);
     var code: i64 = 0;
     if (source_index != NO_SOURCE) {
         val source: *Source = ?runtime.sources[source_index::usize];
-        code = source.cancel(source.context, token);
+        code = source.cancel(source.context, token, terminal_error);
     }
     mutex.lock(?runtime.lock);
     if (code < 0) {
@@ -648,6 +663,7 @@ fun release_claim_locked(runtime: *Runtime, token: Token) {
     slot.state = SLOT_FREE;
     slot.cancellation_active = false;
     slot.cancellation_pending = false;
+    slot.lifecycle_cancellation = false;
     slot.source_index = NO_SOURCE;
     cancel.init_registration(?slot.cancellation);
     runtime.live = runtime.live - 1;
@@ -798,6 +814,10 @@ pub fun complete_cancellation(runtime: *Runtime, token: Token) Result[bool, io_e
         ret err[bool, io_error.Error](io_error.from_code(os.EBADF, io_error.OP_SUBMIT));
     }
     slot.cancellation_pending = false;
+    if (slot.cancellation_active) {
+        mutex.unlock(?runtime.lock);
+        ret ok[bool, io_error.Error](true);
+    }
     enqueue(runtime, token, slot, 0, 0, 0, true, slot.terminal_error, false);
     val wake_result: i64 = os.io_queue_wake(?runtime.queue);
     mutex.unlock(?runtime.lock);
@@ -943,6 +963,7 @@ fun drain(runtime: *Runtime, output: *Completion, output_capacity: usize) usize 
         slot.state = SLOT_FREE;
         slot.cancellation_active = false;
         slot.cancellation_pending = false;
+        slot.lifecycle_cancellation = false;
         slot.source_index = NO_SOURCE;
         cancel.init_registration(?slot.cancellation);
         runtime.live = runtime.live - 1;
@@ -1145,12 +1166,18 @@ pub fun begin_close(runtime: *Runtime, mode: lifecycle.Mode, cause: lifecycle.Ca
         mutex.unlock(?runtime.lock);
         ret ok[lifecycle.CloseResult, io_error.Error](closing);
     }
+    val closed_error: io_error.Error = close_error(closing.snapshot.terminal_cause);
+    if (closing.escalated) {
+        var i: usize = 0;
+        for (i < runtime.capacity) {
+            val slot: *Slot = ?runtime.slots[i];
+            if (slot.state == SLOT_CANCELLING && slot.cancellation_pending && slot.lifecycle_cancellation) {
+                slot.terminal_error = closed_error;
+            }
+            i = i + 1;
+        }
+    }
     if (closing.started) {
-        var code: i64 = os.EBADF;
-        if (cause == lifecycle.DEADLINE) { code = os.ETIMEDOUT; }
-        or (cause == lifecycle.CANCELLATION) { code = os.ECANCELED; }
-        or (cause == lifecycle.FAILURE) { code = os.EIO; }
-        val closed_error: io_error.Error = io_error.from_code(code, io_error.OP_CLOSE);
         var i: usize = 0;
         for (i < runtime.capacity) {
             val slot: *Slot = ?runtime.slots[i];
@@ -1160,14 +1187,16 @@ pub fun begin_close(runtime: *Runtime, mode: lifecycle.Mode, cause: lifecycle.Ca
                     slot.cancellation_active = false;
                     remove_slot_timers(runtime, token);
                     slot.state = SLOT_CANCELLING;
+                    slot.lifecycle_cancellation = true;
                     slot.terminal_error = closed_error;
                     val source_index: u32 = slot.source_index;
+                    val terminal_error: io_error.Error = slot.terminal_error;
                     slot.cancellation_pending = source_index != NO_SOURCE;
                     mutex.unlock(?runtime.lock);
                     var cancel_code: i64 = 0;
                     if (source_index != NO_SOURCE) {
                         val source: *Source = ?runtime.sources[source_index::usize];
-                        cancel_code = source.cancel(source.context, token);
+                        cancel_code = source.cancel(source.context, token, terminal_error);
                     }
                     mutex.lock(?runtime.lock);
                     if (cancel_code < 0) {
@@ -1969,7 +1998,7 @@ fun test_source_dispatch(context: ptr, native_context: usize, events: u32, statu
     ret false;
 }
 
-fun test_source_cancel(context: ptr, token: Token) i64 {
+fun test_source_cancel(context: ptr, token: Token, reason: io_error.Error) i64 {
     val source: *TestSource = context::*TestSource;
     source.cancelled = token;
     if (source.cancellation_pending) { ret CANCELLATION_PENDING; }
@@ -2077,7 +2106,13 @@ test "runtime: asynchronous source cancellation publishes after quiescence" {
     var output: Completion;
     val early: Result[usize, io_error.Error] = poll(?runtime, ?output, 1);
     if (is_err[usize, io_error.Error](early) || unwrap_ok[usize, io_error.Error](early) != 0) { ret 6; }
-    if (is_err[bool, io_error.Error](complete_cancellation(?runtime, token))) { ret 7; }
+    val draining: Result[lifecycle.CloseResult, io_error.Error] = begin_close(?runtime, lifecycle.GRACEFUL, lifecycle.PROCESS_TERMINATION);
+    val deadline: Result[lifecycle.CloseResult, io_error.Error] = begin_close(?runtime, lifecycle.ABORTIVE, lifecycle.DEADLINE);
+    if (is_err[lifecycle.CloseResult, io_error.Error](draining)
+        || is_err[lifecycle.CloseResult, io_error.Error](deadline)
+        || is_err[bool, io_error.Error](complete_cancellation(?runtime, token))) {
+        ret 7;
+    }
     val settled: Result[usize, io_error.Error] = wait(?runtime, ?output, 1, 1000);
     if (is_err[usize, io_error.Error](settled)
         || unwrap_ok[usize, io_error.Error](settled) != 1
@@ -2091,6 +2126,46 @@ test "runtime: asynchronous source cancellation publishes after quiescence" {
         || is_err[bool, io_error.Error](close(?runtime))
         || is_err[bool, io_error.Error](destroy(?runtime))) {
         ret 9;
+    }
+    ret 0;
+}
+
+test "runtime: first abortive escalation updates unresolved source work" {
+    var runtime: Runtime;
+    if (is_err[bool, io_error.Error](make(?runtime, 2))) { ret 1; }
+    var context: TestSource = TestSource{released: 0, cancellation_pending: true, cancelled: Token{index: 0, generation: 0}};
+    val source_result: Result[SourceToken, io_error.Error] = register_source(?runtime, (?context)::ptr, test_source_dispatch, test_source_cancel, test_source_release);
+    if (is_err[SourceToken, io_error.Error](source_result)) { ret 2; }
+    val source: SourceToken = unwrap_ok[SourceToken, io_error.Error](source_result);
+    val submitted: Result[Token, io_error.Error] = submit_owned(?runtime, source, test_operation(RESOLVE, 94));
+    if (is_err[Token, io_error.Error](submitted)) { ret 3; }
+    val token: Token = unwrap_ok[Token, io_error.Error](submitted);
+    val graceful: Result[lifecycle.CloseResult, io_error.Error] = begin_close(?runtime, lifecycle.GRACEFUL, lifecycle.PROCESS_TERMINATION);
+    val deadline: Result[lifecycle.CloseResult, io_error.Error] = begin_close(?runtime, lifecycle.ABORTIVE, lifecycle.DEADLINE);
+    val cancelled: Result[lifecycle.CloseResult, io_error.Error] = begin_close(?runtime, lifecycle.ABORTIVE, lifecycle.CANCELLATION);
+    if (is_err[lifecycle.CloseResult, io_error.Error](graceful)
+        || is_err[lifecycle.CloseResult, io_error.Error](deadline)
+        || is_err[lifecycle.CloseResult, io_error.Error](cancelled)
+        || !unwrap_ok[lifecycle.CloseResult, io_error.Error](deadline).escalated
+        || unwrap_ok[lifecycle.CloseResult, io_error.Error](cancelled).escalated) {
+        ret 4;
+    }
+    var output: Completion;
+    val early: Result[usize, io_error.Error] = poll(?runtime, ?output, 1);
+    if (is_err[usize, io_error.Error](early) || unwrap_ok[usize, io_error.Error](early) != 0) { ret 5; }
+    if (is_err[bool, io_error.Error](complete_cancellation(?runtime, token))) { ret 6; }
+    val settled: Result[usize, io_error.Error] = wait(?runtime, ?output, 1, 1000);
+    if (is_err[usize, io_error.Error](settled)
+        || unwrap_ok[usize, io_error.Error](settled) != 1
+        || !output.has_error
+        || output.error.kind != io_error.TIMEOUT) {
+        ret 7;
+    }
+    val state: lifecycle.Snapshot = snapshot(?runtime);
+    if (state.terminal_cause != lifecycle.DEADLINE
+        || is_err[bool, io_error.Error](unregister_source(?runtime, source))
+        || is_err[bool, io_error.Error](destroy(?runtime))) {
+        ret 8;
     }
     ret 0;
 }
