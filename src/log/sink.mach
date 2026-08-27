@@ -13,13 +13,22 @@ use io_handle: std.io.handle;
 use std.filesystem;
 use std.system.os;
 use std.sync.atomic;
+use std.sync.channel;
+use std.sync.condition;
 use std.sync.mutex;
 use std.sync.thread;
 use std.log.record;
 
 pub val ERR_INVALID_SINK: str = "ERR_INVALID_SINK";
 pub val ERR_INVALID_REPORT: str = "ERR_INVALID_REPORT";
+pub val ERR_QUEUE_FULL: str = "ERR_QUEUE_FULL";
+pub val ERR_QUEUE_CLOSED: str = "ERR_QUEUE_CLOSED";
+pub val ERR_QUEUE_SPAWN_FAILED: str = "ERR_QUEUE_SPAWN_FAILED";
 val ERR_DIRECT_WRITE_FAILED: str = "ERR_DIRECT_WRITE_FAILED";
+val QUEUE_JOIN_OPEN: i64 = 0;
+val QUEUE_JOINING:   i64 = 1;
+val QUEUE_JOINED:    i64 = 2;
+val QUEUE_JOIN_FAILED: i64 = 3;
 
 pub def WriteStatus: u8;
 pub val WRITE_PERSISTED:  WriteStatus = 0;
@@ -89,6 +98,44 @@ pub rec Direct {
     initialized: bool;
 }
 
+pub rec QueuedRecord {
+    data: [record.MAX_RECORD_BYTES]u8;
+    len:  usize;
+}
+
+pub rec QueueStats {
+    enqueued:  usize;
+    persisted: usize;
+    partial:   usize;
+    failed:    usize;
+    rejected:  usize;
+    dropped:   usize;
+    aborted:   usize;
+    last:      WriteReport;
+}
+
+# queued and its caller-owned records remain stable through join
+pub rec Queued {
+    queue:       channel.Channel[QueuedRecord];
+    downstream:  *Sink;
+    worker:      thread.Thread;
+    overload:    OverloadPolicy;
+    enqueued:    i64;
+    persisted:   i64;
+    partial:     i64;
+    failed:      i64;
+    rejected:    i64;
+    dropped:     i64;
+    aborted:     i64;
+    last:        WriteReport;
+    lock:        mutex.Mutex;
+    state_lock:  mutex.Mutex;
+    joined:      condition.Condition;
+    initialized: bool;
+    join_state:  i64;
+    thread_error: i64;
+}
+
 pub fun report(status: WriteStatus, offered: usize, persisted: usize, truncated: bool, error: str) WriteReport {
     ret WriteReport{
         status: status,
@@ -141,7 +188,7 @@ fun direct_contract(max_record: usize, oversize: record.OversizePolicy, adapter:
     ret R.ok[Contract, str](contract);
 }
 
-# this is the extension contract for issue 493, not a queue implementation
+# describe a bounded queued delivery contract
 pub fun queued_contract(max_record: usize, oversize: record.OversizePolicy, capacity: usize, overload: OverloadPolicy, adapter: AdapterKind, target_atomic_limit: usize) R.Result[Contract, str] {
     val contract: Contract = Contract{
         delivery: DELIVERY_BOUNDED_QUEUED,
@@ -174,10 +221,18 @@ pub fun publish(sink: *Sink, data: *u8, len: usize) WriteReport {
     }
     val result: WriteReport = sink.f_publish(sink.ctx, data, len);
     if (sink.contract.delivery == DELIVERY_DIRECT) { ret validate_direct(result, len); }
-    if (result.status > WRITE_SUPPRESSED || result.offered != len || result.persisted > len) {
+    if (!validate_queued(result, len)) {
         ret failed(len, 0, ERR_INVALID_REPORT);
     }
     ret result;
+}
+
+fun validate_queued(result: WriteReport, len: usize) bool {
+    if (result.offered != len || result.persisted != 0 || result.truncated) { ret false; }
+    if (result.status == WRITE_ENQUEUED) { ret result.error == nil; }
+    if (result.status == WRITE_DROPPED) { ret result.error == nil; }
+    if (result.status == WRITE_REJECTED) { ret result.error != nil; }
+    ret false;
 }
 
 # direct atomicity is one callback while confirmed short-write bytes remain observable
@@ -307,6 +362,173 @@ pub fun pipe(direct: *Direct, output: filesystem.File, max_record: usize, oversi
     if (R.is_err[Contract, str](cr)) { ret R.err[Sink, str](R.unwrap_err[Contract, str](cr)); }
     init_writer(direct, filesystem.writer(output));
     ret direct_sink(direct, R.unwrap_ok[Contract, str](cr));
+}
+
+fun queued_result(status: channel.Status, len: usize, overload: OverloadPolicy) WriteReport {
+    if (status == channel.SENT) { ret report(WRITE_ENQUEUED, len, 0, false, nil); }
+    if (status == channel.FULL) {
+        if (overload == OVERLOAD_DROP_NEW) { ret report(WRITE_DROPPED, len, 0, false, nil); }
+        ret report(WRITE_REJECTED, len, 0, false, ERR_QUEUE_FULL);
+    }
+    ret report(WRITE_REJECTED, len, 0, false, ERR_QUEUE_CLOSED);
+}
+
+fun queued_publish(ctx: ptr, data: *u8, len: usize) WriteReport {
+    val queued: *Queued = ctx::*Queued;
+    if (!queued.initialized || atomic.load(?queued.join_state) != QUEUE_JOIN_OPEN) { ret report(WRITE_REJECTED, len, 0, false, ERR_QUEUE_CLOSED); }
+    var entry: QueuedRecord;
+    entry.len = len;
+    var i: usize = 0;
+    for (i < len) {
+        entry.data[i] = data[i];
+        i = i + 1;
+    }
+
+    var status: channel.Status = channel.FULL;
+    if (queued.overload == OVERLOAD_BLOCK) {
+        status = channel.send[QueuedRecord](?queued.queue, entry);
+    }
+    or {
+        status = channel.try_send[QueuedRecord](?queued.queue, entry);
+    }
+    val result: WriteReport = queued_result(status, len, queued.overload);
+    if (result.status == WRITE_ENQUEUED) { atomic.fetch_add(?queued.enqueued, 1); }
+    or (result.status == WRITE_DROPPED) { atomic.fetch_add(?queued.dropped, 1); }
+    or { atomic.fetch_add(?queued.rejected, 1); }
+    ret result;
+}
+
+fun queued_worker(arg: *u8) {
+    val queued: *Queued = arg::*Queued;
+    var entry: QueuedRecord;
+    var status: channel.Status = channel.receive[QueuedRecord](?queued.queue, ?entry);
+    for (status == channel.RECEIVED) {
+        val result: WriteReport = publish(queued.downstream, (?entry.data)::*u8, entry.len);
+        if (result.status == WRITE_PERSISTED) { atomic.fetch_add(?queued.persisted, 1); }
+        or (result.status == WRITE_PARTIAL) { atomic.fetch_add(?queued.partial, 1); }
+        or { atomic.fetch_add(?queued.failed, 1); }
+        mutex.lock(?queued.lock);
+        queued.last = result;
+        mutex.unlock(?queued.lock);
+        status = channel.receive[QueuedRecord](?queued.queue, ?entry);
+    }
+}
+
+# the downstream sink and every borrowed adapter context outlive queued join
+# downstream publication failure is recorded and does not stop queue service
+pub fun queued_with_config(queued: *Queued, storage: *QueuedRecord, capacity: usize, downstream: *Sink, max_record: usize, oversize: record.OversizePolicy, overload: OverloadPolicy, config: *thread.Config) R.Result[Sink, str] {
+    if (queued == nil || storage == nil || capacity == 0 || downstream == nil || !contract_valid(downstream.contract) || downstream.f_publish::usize == 0 || downstream.contract.delivery != DELIVERY_DIRECT || max_record > downstream.contract.max_record || config == nil) {
+        ret R.err[Sink, str](ERR_INVALID_SINK);
+    }
+    val cr: R.Result[Contract, str] = queued_contract(max_record, oversize, capacity, overload, downstream.contract.adapter, downstream.contract.target_atomic_limit);
+    if (R.is_err[Contract, str](cr) || !channel.make[QueuedRecord](?queued.queue, storage, capacity)) {
+        ret R.err[Sink, str](ERR_INVALID_SINK);
+    }
+    queued.downstream = downstream;
+    queued.overload = overload;
+    queued.enqueued = 0;
+    queued.persisted = 0;
+    queued.partial = 0;
+    queued.failed = 0;
+    queued.rejected = 0;
+    queued.dropped = 0;
+    queued.aborted = 0;
+    queued.last = suppressed();
+    queued.lock = mutex.make();
+    queued.state_lock = mutex.make();
+    queued.joined = condition.make();
+    queued.initialized = true;
+    queued.join_state = QUEUE_JOIN_OPEN;
+    queued.thread_error = 0;
+    val spawn_result: i64 = thread.spawn_with_config(queued_worker, queued::*u8, config, ?queued.worker);
+    if (spawn_result < 0) {
+        channel.close[QueuedRecord](?queued.queue);
+        channel.destroy[QueuedRecord](?queued.queue);
+        queued.initialized = false;
+        ret R.err[Sink, str](ERR_QUEUE_SPAWN_FAILED);
+    }
+    ret make(queued::ptr, queued_publish, R.unwrap_ok[Contract, str](cr));
+}
+
+pub fun queued(queued: *Queued, storage: *QueuedRecord, capacity: usize, downstream: *Sink, max_record: usize, oversize: record.OversizePolicy, overload: OverloadPolicy) R.Result[Sink, str] {
+    var config: thread.Config;
+    thread.config_default(?config);
+    ret queued_with_config(queued, storage, capacity, downstream, max_record, oversize, overload, ?config);
+}
+
+pub fun queued_close_drain(queued: *Queued) bool {
+    if (queued == nil || !queued.initialized) { ret false; }
+    ret channel.close[QueuedRecord](?queued.queue);
+}
+
+# abort transfers every unpublished record to caller storage
+pub fun queued_close_abort(queued: *Queued, rejected: *QueuedRecord, rejected_capacity: usize, rejected_len: *usize) bool {
+    if (queued == nil || !queued.initialized || rejected_len == nil) { ret false; }
+    val status: channel.Status = channel.close_abort[QueuedRecord](?queued.queue, rejected, rejected_capacity, rejected_len);
+    if (status != channel.ABORTED) { ret false; }
+    atomic.fetch_add(?queued.aborted, (@rejected_len)::i64);
+    ret true;
+}
+
+# downstream callbacks must not join their own queue
+pub fun queued_join(queued: *Queued) bool {
+    if (queued == nil || !queued.initialized || !channel.is_closed[QueuedRecord](?queued.queue)) { ret false; }
+    mutex.lock(?queued.state_lock);
+    for (atomic.load(?queued.join_state) == QUEUE_JOINING) {
+        condition.wait(?queued.joined, ?queued.state_lock);
+    }
+    if (atomic.load(?queued.join_state) == QUEUE_JOINED) {
+        mutex.unlock(?queued.state_lock);
+        ret true;
+    }
+    atomic.store(?queued.join_state, QUEUE_JOINING);
+    mutex.unlock(?queued.state_lock);
+
+    val result: i64 = thread.join_result(?queued.worker);
+    mutex.lock(?queued.state_lock);
+    atomic.store(?queued.thread_error, result);
+    if (result == 0) { atomic.store(?queued.join_state, QUEUE_JOINED); }
+    or { atomic.store(?queued.join_state, QUEUE_JOIN_FAILED); }
+    condition.broadcast(?queued.joined);
+    mutex.unlock(?queued.state_lock);
+    ret result == 0;
+}
+
+pub fun queued_stats(queued: *Queued) QueueStats {
+    if (queued == nil || !queued.initialized) {
+        ret QueueStats{enqueued: 0, persisted: 0, partial: 0, failed: 0, rejected: 0, dropped: 0, aborted: 0, last: failed(0, 0, ERR_INVALID_SINK)};
+    }
+    mutex.lock(?queued.lock);
+    val last: WriteReport = queued.last;
+    mutex.unlock(?queued.lock);
+    ret QueueStats{
+        enqueued: atomic.load(?queued.enqueued)::usize,
+        persisted: atomic.load(?queued.persisted)::usize,
+        partial: atomic.load(?queued.partial)::usize,
+        failed: atomic.load(?queued.failed)::usize,
+        rejected: atomic.load(?queued.rejected)::usize,
+        dropped: atomic.load(?queued.dropped)::usize,
+        aborted: atomic.load(?queued.aborted)::usize,
+        last: last,
+    };
+}
+
+pub fun queued_thread_error(queued: *Queued) i64 {
+    if (queued == nil || !queued.initialized) { ret thread.ERROR_INVALID; }
+    ret atomic.load(?queued.thread_error);
+}
+
+pub fun queued_destroy(queued: *Queued) bool {
+    if (queued == nil || !queued.initialized) { ret false; }
+    mutex.lock(?queued.state_lock);
+    if (atomic.load(?queued.join_state) != QUEUE_JOINED || condition.waiter_count(?queued.joined) != 0 || !channel.destroy[QueuedRecord](?queued.queue)) {
+        mutex.unlock(?queued.state_lock);
+        ret false;
+    }
+    queued.downstream = nil;
+    queued.initialized = false;
+    mutex.unlock(?queued.state_lock);
+    ret true;
 }
 
 rec Capture {
@@ -580,5 +802,174 @@ test "log.sink: queued extension requires capacity and overload policy" {
     if (R.is_err[Contract, str](valid)) { ret 2; }
     val contract: Contract = R.unwrap_ok[Contract, str](valid);
     if (contract.delivery != DELIVERY_BOUNDED_QUEUED || contract.queue_capacity != 64 || contract.overload != OVERLOAD_REJECT_NEW) { ret 3; }
+    ret 0;
+}
+
+test "log.sink: queued sink drains records and reports downstream failure" {
+    var capture: Capture;
+    capture.len = 0;
+    capture.calls = 0;
+    capture.fail_calls = 1;
+    capture.partial_at = 256;
+    var direct: Direct;
+    val dr: R.Result[Sink, str] = custom(?direct, ?capture, capture_write, 128, record.OVERSIZE_REJECT, 0);
+    if (R.is_err[Sink, str](dr)) { ret 1; }
+    var downstream: Sink = R.unwrap_ok[Sink, str](dr);
+
+    var storage: [2]QueuedRecord;
+    var queue: Queued;
+    val qr: R.Result[Sink, str] = queued(?queue, (?storage)::*QueuedRecord, 2, ?downstream, 128, record.OVERSIZE_REJECT, OVERLOAD_BLOCK);
+    if (R.is_err[Sink, str](qr)) { ret 2; }
+    var output: Sink = R.unwrap_ok[Sink, str](qr);
+    if (publish(?output, "failed", 6).status != WRITE_ENQUEUED || publish(?output, "persisted", 9).status != WRITE_ENQUEUED) { ret 3; }
+    if (!queued_close_drain(?queue) || !queued_join(?queue)) { ret 4; }
+    val result: QueueStats = queued_stats(?queue);
+    if (result.enqueued != 2 || result.failed != 1 || result.persisted != 1 || result.last.status != WRITE_PERSISTED) { ret 5; }
+    if (!bytes_equal((?capture.data)::*u8, capture.len, "persisted")) { ret 6; }
+    if (!queued_destroy(?queue)) { ret 7; }
+    ret 0;
+}
+
+test "log.sink: queued spawn failure releases channel ownership" {
+    var capture: Capture;
+    capture.len = 0;
+    capture.calls = 0;
+    capture.fail_calls = 0;
+    capture.partial_at = 256;
+    var direct: Direct;
+    val dr: R.Result[Sink, str] = custom(?direct, ?capture, capture_write, 128, record.OVERSIZE_REJECT, 0);
+    if (R.is_err[Sink, str](dr)) { ret 1; }
+    var downstream: Sink = R.unwrap_ok[Sink, str](dr);
+    var storage: [1]QueuedRecord;
+    var queue: Queued;
+    var config: thread.Config;
+    thread.config_default(?config);
+    config.stack_reserve = 1;
+    val result: R.Result[Sink, str] = queued_with_config(?queue, (?storage)::*QueuedRecord, 1, ?downstream, 128, record.OVERSIZE_REJECT, OVERLOAD_BLOCK, ?config);
+    if (R.is_ok[Sink, str](result) || R.unwrap_err[Sink, str](result) != ERR_QUEUE_SPAWN_FAILED) { ret 2; }
+    if (queue.initialized || queued_destroy(?queue)) { ret 3; }
+    ret 0;
+}
+
+rec BlockingCapture {
+    entered: *i64;
+    release: *i64;
+    calls:   i64;
+}
+
+fun blocking_write(ctx: ptr, data: *u8, len: usize) WriteReport {
+    val capture: *BlockingCapture = ctx::*BlockingCapture;
+    atomic.fetch_add(?capture.calls, 1);
+    atomic.store(capture.entered, 1);
+    os.thread_wake(capture.entered);
+    for (atomic.load(capture.release) == 0) { os.thread_wait(capture.release, 0); }
+    ret persisted(len);
+}
+
+test "log.sink: queued overload rejects new records without consuming them" {
+    var entered: i64 = 0;
+    var release: i64 = 0;
+    var capture: BlockingCapture = BlockingCapture{entered: ?entered, release: ?release, calls: 0};
+    var direct: Direct;
+    val dr: R.Result[Sink, str] = custom(?direct, ?capture, blocking_write, 128, record.OVERSIZE_REJECT, 0);
+    if (R.is_err[Sink, str](dr)) { ret 1; }
+    var downstream: Sink = R.unwrap_ok[Sink, str](dr);
+
+    var storage: [1]QueuedRecord;
+    var queue: Queued;
+    val qr: R.Result[Sink, str] = queued(?queue, (?storage)::*QueuedRecord, 1, ?downstream, 128, record.OVERSIZE_REJECT, OVERLOAD_REJECT_NEW);
+    if (R.is_err[Sink, str](qr)) { ret 2; }
+    var output: Sink = R.unwrap_ok[Sink, str](qr);
+    if (publish(?output, "active", 6).status != WRITE_ENQUEUED) { ret 3; }
+    for (atomic.load(?entered) == 0) { os.thread_wait(?entered, 0); }
+    if (publish(?output, "queued", 6).status != WRITE_ENQUEUED) { ret 4; }
+    val rejected_result: WriteReport = publish(?output, "caller-retains", 14);
+    if (rejected_result.status != WRITE_REJECTED || rejected_result.error != ERR_QUEUE_FULL) { ret 5; }
+
+    atomic.store(?release, 1);
+    os.thread_wake(?release);
+    if (!queued_close_drain(?queue) || !queued_join(?queue)) { ret 6; }
+    val result: QueueStats = queued_stats(?queue);
+    if (result.enqueued != 2 || result.persisted != 2 || result.rejected != 1 || atomic.load(?capture.calls) != 2) { ret 7; }
+    if (!queued_destroy(?queue)) { ret 8; }
+    ret 0;
+}
+
+rec QueuedJoinContext {
+    queue:     *Queued;
+    succeeded: *i64;
+}
+
+fun queued_join_worker(arg: *u8) {
+    val context: *QueuedJoinContext = arg::*QueuedJoinContext;
+    if (queued_join(context.queue)) { atomic.fetch_add(context.succeeded, 1); }
+}
+
+test "log.sink: concurrent queued joins share one native join" {
+    var entered: i64 = 0;
+    var release: i64 = 0;
+    var capture: BlockingCapture = BlockingCapture{entered: ?entered, release: ?release, calls: 0};
+    var direct: Direct;
+    val dr: R.Result[Sink, str] = custom(?direct, ?capture, blocking_write, 128, record.OVERSIZE_REJECT, 0);
+    if (R.is_err[Sink, str](dr)) { ret 1; }
+    var downstream: Sink = R.unwrap_ok[Sink, str](dr);
+
+    var storage: [1]QueuedRecord;
+    var queue: Queued;
+    val qr: R.Result[Sink, str] = queued(?queue, (?storage)::*QueuedRecord, 1, ?downstream, 128, record.OVERSIZE_REJECT, OVERLOAD_BLOCK);
+    if (R.is_err[Sink, str](qr)) { ret 2; }
+    var output: Sink = R.unwrap_ok[Sink, str](qr);
+    if (publish(?output, "active", 6).status != WRITE_ENQUEUED) { ret 3; }
+    for (atomic.load(?entered) == 0) { os.thread_wait(?entered, 0); }
+    if (!queued_close_drain(?queue)) { ret 4; }
+
+    var succeeded: i64 = 0;
+    var context: QueuedJoinContext = QueuedJoinContext{queue: ?queue, succeeded: ?succeeded};
+    var joins: [2]thread.Thread;
+    thread.spawn_with(queued_join_worker, (?context)::*u8, ?joins[0]);
+    thread.spawn_with(queued_join_worker, (?context)::*u8, ?joins[1]);
+    if (joins[0].tid < 0 || joins[1].tid < 0) { ret 5; }
+    var attempts: usize = 0;
+    for (condition.waiter_count(?queue.joined) == 0 && attempts < 1000) {
+        os.sleep(1000000);
+        attempts = attempts + 1;
+    }
+    atomic.store(?release, 1);
+    os.thread_wake(?release);
+    thread.join(?joins[0]);
+    thread.join(?joins[1]);
+    if (condition.waiter_count(?queue.joined) != 0 || atomic.load(?succeeded) != 2) { ret 6; }
+    if (!queued_destroy(?queue)) { ret 7; }
+    ret 0;
+}
+
+test "log.sink: queued abort returns unpublished records in fifo order" {
+    var entered: i64 = 0;
+    var release: i64 = 0;
+    var capture: BlockingCapture = BlockingCapture{entered: ?entered, release: ?release, calls: 0};
+    var direct: Direct;
+    val dr: R.Result[Sink, str] = custom(?direct, ?capture, blocking_write, 128, record.OVERSIZE_REJECT, 0);
+    if (R.is_err[Sink, str](dr)) { ret 1; }
+    var downstream: Sink = R.unwrap_ok[Sink, str](dr);
+
+    var storage: [2]QueuedRecord;
+    var queue: Queued;
+    val qr: R.Result[Sink, str] = queued(?queue, (?storage)::*QueuedRecord, 2, ?downstream, 128, record.OVERSIZE_REJECT, OVERLOAD_BLOCK);
+    if (R.is_err[Sink, str](qr)) { ret 2; }
+    var output: Sink = R.unwrap_ok[Sink, str](qr);
+    if (publish(?output, "active", 6).status != WRITE_ENQUEUED) { ret 3; }
+    for (atomic.load(?entered) == 0) { os.thread_wait(?entered, 0); }
+    if (publish(?output, "first", 5).status != WRITE_ENQUEUED || publish(?output, "second", 6).status != WRITE_ENQUEUED) { ret 4; }
+
+    var rejected: [2]QueuedRecord;
+    var rejected_len: usize = 0;
+    if (!queued_close_abort(?queue, (?rejected)::*QueuedRecord, 2, ?rejected_len) || rejected_len != 2) { ret 5; }
+    if (!bytes_equal((?rejected[0].data)::*u8, rejected[0].len, "first") || !bytes_equal((?rejected[1].data)::*u8, rejected[1].len, "second")) { ret 6; }
+    atomic.store(?release, 1);
+    os.thread_wake(?release);
+    if (!queued_join(?queue)) { ret 7; }
+    val result: QueueStats = queued_stats(?queue);
+    if (result.aborted != 2 || result.persisted != 1 || atomic.load(?capture.calls) != 1) { ret 8; }
+    if (!queued_destroy(?queue)) { ret 9; }
     ret 0;
 }
