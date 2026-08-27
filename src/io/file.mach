@@ -1,0 +1,402 @@
+# bounded asynchronous and handle-relative file operations
+
+use R: std.types.result;
+use O: std.types.option;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.path.Path;
+use std.chrono.time;
+use std.filesystem;
+use std.system.os;
+use std.sync.condition;
+use std.sync.mutex;
+use io_error: std.io.error;
+use io_handle: std.io.handle;
+
+$if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
+    use platform: std.io.file.posix;
+}
+$or ($mach.build.os == $mach.os.windows) {
+    use platform: std.io.file.windows;
+}
+
+pub def Access: u8;
+pub val READ_ONLY:  Access = 0;
+pub val WRITE_ONLY: Access = 1;
+pub val READ_WRITE: Access = 2;
+val MAX_FILE_OFFSET: u64 = 0x7fffffffffffffff;
+
+fun span_valid(offset: u64, length: usize) bool {
+    ret offset <= MAX_FILE_OFFSET && length::u64 <= MAX_FILE_OFFSET - offset;
+}
+
+pub rec OpenOptions {
+    access:    Access;
+    create:    bool;
+    exclusive: bool;
+    truncate:  bool;
+    directory: bool;
+    mode:      i32;
+}
+
+pub fun read_options() OpenOptions {
+    ret OpenOptions{access: READ_ONLY, create: false, exclusive: false, truncate: false, directory: false, mode: 0};
+}
+
+pub fun write_options(mode: i32) OpenOptions {
+    ret OpenOptions{access: WRITE_ONLY, create: true, exclusive: false, truncate: false, directory: false, mode: mode};
+}
+
+pub rec Root {
+    directory:   filesystem.File;
+    identity:    filesystem.Identity;
+    active:      usize;
+    initialized: bool;
+    closing:     bool;
+    lock:        mutex.Mutex;
+    idle:        condition.Condition;
+}
+
+pub rec Capabilities {
+    positioned_io:       bool;
+    native_async:        bool;
+    bounded_workers:     bool;
+    confined_open:       bool;
+    replacement_flush_request: bool;
+    replacement_persistence_guaranteed: bool;
+    mapping:             bool;
+    watching:            bool;
+    accelerated_transfer: bool;
+}
+
+pub fun capabilities() Capabilities {
+    ret Capabilities{
+        positioned_io: true,
+        native_async: false,
+        bounded_workers: true,
+        confined_open: true,
+        replacement_flush_request: true,
+        replacement_persistence_guaranteed: false,
+        mapping: true,
+        watching: true,
+        accelerated_transfer: false,
+    };
+}
+
+fun failure(code: i64, operation: io_error.Operation) io_error.Error {
+    ret io_error.from_code(code, operation);
+}
+
+fun options_valid(options: OpenOptions) bool {
+    if (options.access > READ_WRITE) { ret false; }
+    if (options.directory && (options.create || options.truncate || options.access != READ_ONLY)) { ret false; }
+    if (options.exclusive && !options.create) { ret false; }
+    ret true;
+}
+
+fun options_flags(options: OpenOptions) i32 {
+    var flags: i32 = os.O_RDONLY;
+    if (options.access == WRITE_ONLY) { flags = os.O_WRONLY; }
+    or (options.access == READ_WRITE) { flags = os.O_RDWR; }
+    if (options.create) { flags = flags | os.O_CREAT; }
+    if (options.exclusive) { flags = flags | os.O_EXCL; }
+    if (options.truncate) { flags = flags | os.O_TRUNC; }
+    if (options.directory) { flags = flags | os.O_DIRECTORY; }
+    ret flags;
+}
+
+# the root path is trusted once and every later resolution starts from its handle
+pub fun root_open(path: Path) R.Result[Root, io_error.Error] {
+    if (path == nil) { ret R.err[Root, io_error.Error](failure(os.EINVAL, io_error.OP_OPEN)); }
+    val raw: i64 = platform.open_root(path::*u8);
+    if (raw < 0) { ret R.err[Root, io_error.Error](failure(raw, io_error.OP_OPEN)); }
+    var directory: filesystem.File = filesystem.File{handle: io_handle.FileHandle{value: raw::usize}};
+    val metadata: R.Result[filesystem.Metadata, io_error.Error] = filesystem.stat_of_error(directory);
+    if (R.is_err[filesystem.Metadata, io_error.Error](metadata)) {
+        filesystem.close(?directory);
+        ret R.err[Root, io_error.Error](R.unwrap_err[filesystem.Metadata, io_error.Error](metadata));
+    }
+    val value: filesystem.Metadata = R.unwrap_ok[filesystem.Metadata, io_error.Error](metadata);
+    ret R.ok[Root, io_error.Error](Root{
+        directory: directory,
+        identity: value.identity,
+        active: 0,
+        initialized: true,
+        closing: false,
+        lock: mutex.make(),
+        idle: condition.make(),
+    });
+}
+
+fun root_enter(root: *Root) bool {
+    if (root == nil) { ret false; }
+    mutex.lock(?root.lock);
+    if (!root.initialized || root.closing) {
+        mutex.unlock(?root.lock);
+        ret false;
+    }
+    root.active = root.active + 1;
+    mutex.unlock(?root.lock);
+    ret true;
+}
+
+fun root_leave(root: *Root) {
+    mutex.lock(?root.lock);
+    root.active = root.active - 1;
+    if (root.active == 0) { condition.broadcast(?root.idle); }
+    mutex.unlock(?root.lock);
+}
+
+# close rejects new resolution and waits for admitted handle-relative work
+pub fun root_close(root: *Root) R.Result[bool, io_error.Error] {
+    if (root == nil) { ret R.err[bool, io_error.Error](failure(os.EBADF, io_error.OP_CLOSE)); }
+    mutex.lock(?root.lock);
+    if (!root.initialized || root.closing) {
+        mutex.unlock(?root.lock);
+        ret R.err[bool, io_error.Error](failure(os.EBADF, io_error.OP_CLOSE));
+    }
+    root.closing = true;
+    for (root.active != 0) { condition.wait(?root.idle, ?root.lock); }
+    val closed: O.Option[io_error.Error] = filesystem.close(?root.directory);
+    root.initialized = false;
+    root.closing = false;
+    mutex.unlock(?root.lock);
+    if (O.is_some[io_error.Error](closed)) { ret R.err[bool, io_error.Error](O.unwrap[io_error.Error](closed)); }
+    ret R.ok[bool, io_error.Error](true);
+}
+
+# relative components are opened one at a time from pinned directory handles
+pub fun open_confined(root: *Root, path: Path, options: OpenOptions) R.Result[filesystem.File, io_error.Error] {
+    if (root == nil || path == nil || !options_valid(options)) {
+        ret R.err[filesystem.File, io_error.Error](failure(os.EINVAL, io_error.OP_OPEN));
+    }
+    if (!root_enter(root)) { ret R.err[filesystem.File, io_error.Error](failure(os.EBADF, io_error.OP_OPEN)); }
+    val raw: i64 = platform.open_confined(root.directory.handle.value::i32, path::*u8, options_flags(options), options.mode);
+    root_leave(root);
+    if (raw < 0) { ret R.err[filesystem.File, io_error.Error](failure(raw, io_error.OP_OPEN)); }
+    ret R.ok[filesystem.File, io_error.Error](filesystem.File{handle: io_handle.FileHandle{value: raw::usize}});
+}
+
+# success confirms os data and namespace flush requests, not media persistence
+pub fun replace_confined(root: *Root, temporary: Path, destination: Path) R.Result[bool, io_error.Error] {
+    if (root == nil || temporary == nil || destination == nil || !root_enter(root)) {
+        ret R.err[bool, io_error.Error](failure(os.EBADF, io_error.OP_OPTION));
+    }
+    var sync_options: OpenOptions = read_options();
+    sync_options.access = WRITE_ONLY;
+    val raw: i64 = platform.open_confined(root.directory.handle.value::i32, temporary::*u8, options_flags(sync_options), 0);
+    if (raw < 0) {
+        root_leave(root);
+        ret R.err[bool, io_error.Error](failure(raw, io_error.OP_OPEN));
+    }
+    var file: filesystem.File = filesystem.File{handle: io_handle.FileHandle{value: raw::usize}};
+    val synced: O.Option[io_error.Error] = filesystem.sync(file);
+    val closed: O.Option[io_error.Error] = filesystem.close(?file);
+    if (O.is_some[io_error.Error](synced)) {
+        root_leave(root);
+        ret R.err[bool, io_error.Error](O.unwrap[io_error.Error](synced));
+    }
+    if (O.is_some[io_error.Error](closed)) {
+        root_leave(root);
+        ret R.err[bool, io_error.Error](O.unwrap[io_error.Error](closed));
+    }
+    val result: i64 = platform.rename_confined(root.directory.handle.value::i32, temporary::*u8, destination::*u8);
+    root_leave(root);
+    if (result < 0) { ret R.err[bool, io_error.Error](failure(result, io_error.OP_OPTION)); }
+    ret R.ok[bool, io_error.Error](true);
+}
+
+pub fun read_at(file: filesystem.File, buffer: *u8, length: usize, offset: u64) R.Result[usize, io_error.Error] {
+    if (!io_handle.file_is_valid(file.handle) || (buffer == nil && length != 0) || offset > MAX_FILE_OFFSET) { ret R.err[usize, io_error.Error](failure(os.EINVAL, io_error.OP_READ)); }
+    val result: i64 = platform.read_at(file.handle.value::i32, buffer, length, offset);
+    if (result < 0) { ret R.err[usize, io_error.Error](failure(result, io_error.OP_READ)); }
+    ret R.ok[usize, io_error.Error](result::usize);
+}
+
+pub fun write_at(file: filesystem.File, buffer: *u8, length: usize, offset: u64) R.Result[usize, io_error.Error] {
+    if (!io_handle.file_is_valid(file.handle) || (buffer == nil && length != 0) || offset > MAX_FILE_OFFSET) { ret R.err[usize, io_error.Error](failure(os.EINVAL, io_error.OP_WRITE)); }
+    val result: i64 = platform.write_at(file.handle.value::i32, buffer, length, offset);
+    if (result < 0) { ret R.err[usize, io_error.Error](failure(result, io_error.OP_WRITE)); }
+    ret R.ok[usize, io_error.Error](result::usize);
+}
+
+use std.io.file.adapter;
+
+fwd adapter.Request;
+fwd adapter.Adapter;
+fwd adapter.make;
+fwd adapter.submit_read;
+fwd adapter.submit_write;
+fwd adapter.shutdown_drain;
+fwd adapter.shutdown_abort;
+fwd adapter.active;
+fwd adapter.destroy;
+pub rec Mapping {
+    data:        ptr;
+    length:      usize;
+    offset:      u64;
+    writable:    bool;
+    initialized: bool;
+}
+
+# mappings own their virtual region independently of the file handle
+pub fun map(file: filesystem.File, offset: u64, length: usize, writable: bool) R.Result[Mapping, io_error.Error] {
+    var alignment: usize = os.page_size();
+    $if ($mach.build.os == $mach.os.windows) { alignment = 65536; }
+    if (!io_handle.file_is_valid(file.handle) || length == 0 || offset > (-1)::usize::u64 || !span_valid(offset, length) || offset::usize % alignment != 0) {
+        ret R.err[Mapping, io_error.Error](failure(os.EINVAL, io_error.OP_OPTION));
+    }
+    var protection: u32 = os.PROT_READ;
+    if (writable) { protection = protection | os.PROT_WRITE; }
+    val data: ptr = os.map_file(file.handle.value::i32, offset::usize, length, protection);
+    if (data == nil) { ret R.err[Mapping, io_error.Error](failure(os.EIO, io_error.OP_OPTION)); }
+    ret R.ok[Mapping, io_error.Error](Mapping{data: data, length: length, offset: offset, writable: writable, initialized: true});
+}
+
+pub fun mapping_sync(mapping: *Mapping) R.Result[bool, io_error.Error] {
+    if (mapping == nil || !mapping.initialized || !mapping.writable) { ret R.err[bool, io_error.Error](failure(os.EINVAL, io_error.OP_SYNC)); }
+    val result: i64 = os.sync_file(mapping.data, mapping.length);
+    if (result < 0) { ret R.err[bool, io_error.Error](failure(result, io_error.OP_SYNC)); }
+    ret R.ok[bool, io_error.Error](true);
+}
+
+pub fun mapping_close(mapping: *Mapping) R.Result[bool, io_error.Error] {
+    if (mapping == nil || !mapping.initialized) { ret R.err[bool, io_error.Error](failure(os.EINVAL, io_error.OP_CLOSE)); }
+    val result: i64 = platform.unmap_file(mapping.data, mapping.length);
+    if (result < 0) { ret R.err[bool, io_error.Error](failure(result, io_error.OP_CLOSE)); }
+    mapping.data = nil;
+    mapping.length = 0;
+    mapping.initialized = false;
+    ret R.ok[bool, io_error.Error](true);
+}
+
+pub rec TransferReport {
+    bytes:       usize;
+    end_of_file: bool;
+    accelerated: bool;
+}
+
+# the portable transfer uses fixed stack storage and preserves both file offsets
+pub fun transfer(source: filesystem.File, destination: filesystem.File, source_offset: u64, destination_offset: u64, length: usize) R.Result[TransferReport, io_error.Error] {
+    if (!span_valid(source_offset, length) || !span_valid(destination_offset, length)) {
+        ret R.err[TransferReport, io_error.Error](failure(os.EINVAL, io_error.OP_OPTION));
+    }
+    var buffer: [16384]u8;
+    var transferred: usize = 0;
+    var eof: bool = false;
+    for (transferred < length && !eof) {
+        var chunk: usize = length - transferred;
+        if (chunk > 16384) { chunk = 16384; }
+        val read_result: R.Result[usize, io_error.Error] = read_at(source, (?buffer)::*u8, chunk, source_offset + transferred::u64);
+        if (R.is_err[usize, io_error.Error](read_result)) { ret R.err[TransferReport, io_error.Error](R.unwrap_err[usize, io_error.Error](read_result)); }
+        val read_count: usize = R.unwrap_ok[usize, io_error.Error](read_result);
+        if (read_count == 0) { eof = true; }
+        var written: usize = 0;
+        for (written < read_count) {
+            val write_result: R.Result[usize, io_error.Error] = write_at(destination, ((?buffer)::usize + written)::*u8, read_count - written, destination_offset + transferred::u64 + written::u64);
+            if (R.is_err[usize, io_error.Error](write_result)) { ret R.err[TransferReport, io_error.Error](R.unwrap_err[usize, io_error.Error](write_result)); }
+            val count: usize = R.unwrap_ok[usize, io_error.Error](write_result);
+            if (count == 0) { ret R.err[TransferReport, io_error.Error](failure(os.EIO, io_error.OP_WRITE)); }
+            written = written + count;
+        }
+        transferred = transferred + read_count;
+    }
+    ret R.ok[TransferReport, io_error.Error](TransferReport{bytes: transferred, end_of_file: eof, accelerated: false});
+}
+
+pub rec WatchCapabilities {
+    supported:     bool;
+    recursive:     bool;
+    native:        bool;
+    requires_scan: bool;
+}
+
+pub fun watch_capabilities() WatchCapabilities {
+    ret WatchCapabilities{supported: true, recursive: false, native: false, requires_scan: true};
+}
+
+pub def WatchEvent: u8;
+pub val WATCH_UNCHANGED: WatchEvent = 0;
+pub val WATCH_CREATED:   WatchEvent = 1;
+pub val WATCH_REMOVED:   WatchEvent = 2;
+pub val WATCH_REPLACED:  WatchEvent = 3;
+pub val WATCH_MODIFIED:  WatchEvent = 4;
+pub val WATCH_METADATA:  WatchEvent = 5;
+
+pub rec Watch {
+    root:        *Root;
+    path:        Path;
+    metadata:    filesystem.Metadata;
+    exists:      bool;
+    initialized: bool;
+}
+
+fun watch_observe(root: *Root, path: Path, metadata: *filesystem.Metadata) R.Result[bool, io_error.Error] {
+    val opened: R.Result[filesystem.File, io_error.Error] = open_confined(root, path, read_options());
+    if (R.is_err[filesystem.File, io_error.Error](opened)) {
+        val open_error: io_error.Error = R.unwrap_err[filesystem.File, io_error.Error](opened);
+        if (open_error.code == os.ENOENT) { ret R.ok[bool, io_error.Error](false); }
+        ret R.err[bool, io_error.Error](open_error);
+    }
+    var file: filesystem.File = R.unwrap_ok[filesystem.File, io_error.Error](opened);
+    val observed: R.Result[filesystem.Metadata, io_error.Error] = filesystem.stat_of_error(file);
+    val closed: O.Option[io_error.Error] = filesystem.close(?file);
+    if (R.is_err[filesystem.Metadata, io_error.Error](observed)) {
+        ret R.err[bool, io_error.Error](R.unwrap_err[filesystem.Metadata, io_error.Error](observed));
+    }
+    if (O.is_some[io_error.Error](closed)) { ret R.err[bool, io_error.Error](O.unwrap[io_error.Error](closed)); }
+    @metadata = R.unwrap_ok[filesystem.Metadata, io_error.Error](observed);
+    ret R.ok[bool, io_error.Error](true);
+}
+
+# the root and path remain borrowed until watch_close
+pub fun watch_open(watch: *Watch, root: *Root, path: Path) R.Result[bool, io_error.Error] {
+    if (watch == nil || root == nil || path == nil) {
+        ret R.err[bool, io_error.Error](failure(os.EINVAL, io_error.OP_OPEN));
+    }
+    var metadata: filesystem.Metadata;
+    val observed: R.Result[bool, io_error.Error] = watch_observe(root, path, ?metadata);
+    if (R.is_err[bool, io_error.Error](observed)) { ret R.err[bool, io_error.Error](R.unwrap_err[bool, io_error.Error](observed)); }
+    watch.root = root;
+    watch.path = path;
+    watch.exists = R.unwrap_ok[bool, io_error.Error](observed);
+    if (watch.exists) { watch.metadata = metadata; }
+    watch.initialized = true;
+    ret R.ok[bool, io_error.Error](watch.exists);
+}
+
+# scans are synchronous and may be scheduled through the bounded worker pool
+pub fun watch_scan(watch: *Watch) R.Result[WatchEvent, io_error.Error] {
+    if (watch == nil || !watch.initialized) { ret R.err[WatchEvent, io_error.Error](failure(os.EINVAL, io_error.OP_WAIT)); }
+    var metadata: filesystem.Metadata;
+    val observed: R.Result[bool, io_error.Error] = watch_observe(watch.root, watch.path, ?metadata);
+    if (R.is_err[bool, io_error.Error](observed)) { ret R.err[WatchEvent, io_error.Error](R.unwrap_err[bool, io_error.Error](observed)); }
+    val exists: bool = R.unwrap_ok[bool, io_error.Error](observed);
+    if (!watch.exists && !exists) { ret R.ok[WatchEvent, io_error.Error](WATCH_UNCHANGED); }
+    if (!watch.exists && exists) {
+        watch.metadata = metadata;
+        watch.exists = true;
+        ret R.ok[WatchEvent, io_error.Error](WATCH_CREATED);
+    }
+    if (watch.exists && !exists) {
+        watch.exists = false;
+        ret R.ok[WatchEvent, io_error.Error](WATCH_REMOVED);
+    }
+    var event: WatchEvent = WATCH_UNCHANGED;
+    if (!filesystem.identity_equal(watch.metadata.identity, metadata.identity)) { event = WATCH_REPLACED; }
+    or (watch.metadata.size != metadata.size || !time.time_equal(watch.metadata.modified, metadata.modified)) { event = WATCH_MODIFIED; }
+    or (watch.metadata.kind != metadata.kind || watch.metadata.mode != metadata.mode) { event = WATCH_METADATA; }
+    watch.metadata = metadata;
+    ret R.ok[WatchEvent, io_error.Error](event);
+}
+
+pub fun watch_close(watch: *Watch) bool {
+    if (watch == nil || !watch.initialized) { ret false; }
+    watch.root = nil;
+    watch.path = nil;
+    watch.exists = false;
+    watch.initialized = false;
+    ret true;
+}

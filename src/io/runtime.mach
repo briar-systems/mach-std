@@ -12,6 +12,7 @@ use std.types.result.unwrap_ok;
 use std.types.result.unwrap_err;
 use std.system.os;
 use std.system.panic;
+use std.memory;
 use std.chrono.time;
 use std.sync.atomic;
 use std.sync.cancel;
@@ -448,7 +449,7 @@ pub fun submit_scoped(runtime: *Runtime, scope: *cancel.Scope, operation: Operat
     ret ok[Token, io_error.Error](token);
 }
 
-fun resolve(runtime: *Runtime, token: Token, bytes: usize, items: usize, resource: usize, has_error: bool, failure: io_error.Error, eof: bool) Result[bool, io_error.Error] {
+fun resolve_with_copy(runtime: *Runtime, token: Token, source: *u8, copy: bool, bytes: usize, items: usize, resource: usize, has_error: bool, failure: io_error.Error, eof: bool) Result[bool, io_error.Error] {
     if (runtime == nil) { ret err[bool, io_error.Error](invalid(io_error.OP_SUBMIT)); }
     mutex.lock(?runtime.lock);
     val slot: *Slot = slot_for(runtime, token);
@@ -456,12 +457,17 @@ fun resolve(runtime: *Runtime, token: Token, bytes: usize, items: usize, resourc
         mutex.unlock(?runtime.lock);
         ret err[bool, io_error.Error](io_error.from_code(os.EBADF, io_error.OP_SUBMIT));
     }
+    if (copy && (slot.operation.kind != FILE_READ || bytes > slot.operation.length || (bytes > 0 && (source == nil || slot.operation.buffer == nil)))) {
+        mutex.unlock(?runtime.lock);
+        ret err[bool, io_error.Error](invalid(io_error.OP_READ));
+    }
     if (slot.cancellation_active && !cancel.unregister(?slot.cancellation)) {
         mutex.unlock(?runtime.lock);
         ret err[bool, io_error.Error](io_error.from_code(os.EBADF, io_error.OP_SUBMIT));
     }
     slot.cancellation_active = false;
     remove_slot_timers(runtime, token);
+    if (copy && bytes > 0) { memory.raw_copy(slot.operation.buffer::ptr, source::ptr, bytes); }
     enqueue(runtime, token, slot, bytes, items, resource, has_error, failure, eof);
     val wake_result: i64 = os.io_queue_wake(?runtime.queue);
     mutex.unlock(?runtime.lock);
@@ -471,8 +477,17 @@ fun resolve(runtime: *Runtime, token: Token, bytes: usize, items: usize, resourc
     ret ok[bool, io_error.Error](true);
 }
 
+fun resolve(runtime: *Runtime, token: Token, bytes: usize, items: usize, resource: usize, has_error: bool, failure: io_error.Error, eof: bool) Result[bool, io_error.Error] {
+    ret resolve_with_copy(runtime, token, nil, false, bytes, items, resource, has_error, failure, eof);
+}
+
 pub fun complete(runtime: *Runtime, token: Token, bytes: usize, resource: usize, end_of_stream: bool) Result[bool, io_error.Error] {
     ret resolve(runtime, token, bytes, 0, resource, false, io_error.from_code(0, io_error.OP_UNKNOWN), end_of_stream);
+}
+
+# copy is atomic with terminal publication and loses cleanly to close or cancellation
+pub fun complete_copy(runtime: *Runtime, token: Token, source: *u8, bytes: usize, resource: usize, end_of_stream: bool) Result[bool, io_error.Error] {
+    ret resolve_with_copy(runtime, token, source, true, bytes, 0, resource, false, io_error.from_code(0, io_error.OP_UNKNOWN), end_of_stream);
 }
 
 # batch completions report byte progress and completed item count separately
@@ -828,6 +843,76 @@ test "runtime: one token resolves exactly once" {
     if (output[0].context != 77 || output[0].bytes != 9 || output[0].resource != 42 || !output[0].end_of_stream) { ret 1; }
     close(?runtime);
     destroy(?runtime);
+    ret 0;
+}
+
+test "runtime: copy completion publishes bytes atomically" {
+    var runtime: Runtime;
+    if (is_err[bool, io_error.Error](make(?runtime, 1))) { ret 1; }
+    var destination: [4]u8;
+    var source: [4]u8;
+    source[0] = 1;
+    source[1] = 2;
+    source[2] = 3;
+    source[3] = 4;
+    val operation: Operation = Operation{kind: FILE_READ, resource: 7, buffer: (?destination)::*u8, length: 4, offset: 12, context: 31};
+    val submitted: Result[Token, io_error.Error] = submit(?runtime, operation);
+    if (is_err[Token, io_error.Error](submitted)) { ret 1; }
+    if (is_err[bool, io_error.Error](complete_copy(?runtime, unwrap_ok[Token, io_error.Error](submitted), (?source)::*u8, 4, 7, false))) { ret 1; }
+    var output: Completion;
+    val completed: Result[usize, io_error.Error] = poll(?runtime, ?output, 1);
+    if (is_err[usize, io_error.Error](completed) || unwrap_ok[usize, io_error.Error](completed) != 1 || output.bytes != 4 || output.has_error) { ret 1; }
+    if (destination[0] != 1 || destination[1] != 2 || destination[2] != 3 || destination[3] != 4) { ret 1; }
+    close(?runtime);
+    if (is_err[bool, io_error.Error](destroy(?runtime))) { ret 1; }
+    ret 0;
+}
+
+test "runtime: close wins copy completion without touching caller bytes" {
+    var runtime: Runtime;
+    if (is_err[bool, io_error.Error](make(?runtime, 1))) { ret 1; }
+    var destination: [2]u8;
+    destination[0] = 9;
+    destination[1] = 9;
+    var source: [2]u8;
+    source[0] = 1;
+    source[1] = 2;
+    val operation: Operation = Operation{kind: FILE_READ, resource: 7, buffer: (?destination)::*u8, length: 2, offset: 0, context: 41};
+    val submitted: Result[Token, io_error.Error] = submit(?runtime, operation);
+    if (is_err[Token, io_error.Error](submitted)) { ret 1; }
+    val token: Token = unwrap_ok[Token, io_error.Error](submitted);
+    if (is_err[bool, io_error.Error](close(?runtime))) { ret 1; }
+    if (!is_err[bool, io_error.Error](complete_copy(?runtime, token, (?source)::*u8, 2, 7, false))) { ret 1; }
+    if (destination[0] != 9 || destination[1] != 9) { ret 1; }
+    var output: Completion;
+    val completed: Result[usize, io_error.Error] = poll(?runtime, ?output, 1);
+    if (is_err[usize, io_error.Error](completed) || unwrap_ok[usize, io_error.Error](completed) != 1 || !output.has_error || output.error.kind != io_error.CLOSED) { ret 1; }
+    if (is_err[bool, io_error.Error](destroy(?runtime))) { ret 1; }
+    ret 0;
+}
+
+test "runtime: cancellation wins copy completion without touching caller bytes" {
+    var runtime: Runtime;
+    var scope: cancel.Scope;
+    if (is_err[bool, io_error.Error](make(?runtime, 1)) || !cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 1; }
+    var destination: [2]u8;
+    destination[0] = 8;
+    destination[1] = 8;
+    var source: [2]u8;
+    source[0] = 3;
+    source[1] = 4;
+    val operation: Operation = Operation{kind: FILE_READ, resource: 7, buffer: (?destination)::*u8, length: 2, offset: 0, context: 51};
+    val submitted: Result[Token, io_error.Error] = submit_scoped(?runtime, ?scope, operation);
+    if (is_err[Token, io_error.Error](submitted) || !cancel.cancel(?scope)) { ret 1; }
+    val token: Token = unwrap_ok[Token, io_error.Error](submitted);
+    if (!is_err[bool, io_error.Error](complete_copy(?runtime, token, (?source)::*u8, 2, 7, false))) { ret 1; }
+    if (destination[0] != 8 || destination[1] != 8) { ret 1; }
+    var output: Completion;
+    val completed: Result[usize, io_error.Error] = poll(?runtime, ?output, 1);
+    if (is_err[usize, io_error.Error](completed) || unwrap_ok[usize, io_error.Error](completed) != 1 || !output.has_error || output.error.kind != io_error.CANCELLED) { ret 1; }
+    if (!cancel.destroy(?scope)) { ret 1; }
+    close(?runtime);
+    if (is_err[bool, io_error.Error](destroy(?runtime))) { ret 1; }
     ret 0;
 }
 
