@@ -178,6 +178,15 @@ val EXTENDED_STARTUPINFO_PRESENT: u32 = 0x00080000;
 val PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x20002;
 val STARTUPINFOA_SIZE:   usize = 104;
 val STARTUPINFOEXA_SIZE: usize = 112;
+# the primary thread starts parked so AssignProcessToJobObject runs before the
+# child (or any grandchild it could otherwise race to spawn) executes a
+# single instruction; register_child_grouped resumes it once assigned.
+val CREATE_SUSPENDED: u32 = 0x00000004;
+
+# job objects (process groups)
+val JobObjectExtendedLimitInformation:    u32 = 9;
+val JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE:   u32 = 0x00002000;
+val JOBOBJECT_EXTENDED_LIMIT_INFORMATION_SIZE: usize = 144;
 
 # FILETIME epoch offset (100-ns intervals from 1601-01-01 to 1970-01-01)
 val FILETIME_UNIX_EPOCH: i64 = 116444736000000000;
@@ -422,6 +431,20 @@ ext fun WaitForMultipleObjects(p0: u32, p1: ptr, p2: i32, p3: u32) u32;
 #[library("kernel32.dll")]
 ext fun GetExitCodeProcess(p0: isize, p1: *u32) i32;
 #[library("kernel32.dll")]
+ext fun ResumeThread(p0: isize) u32;
+
+# job objects (process groups): a job is a separate kernel object from the
+# process it groups, with its own handle and its own close discipline (see
+# register_child_grouped / close_proc).
+#[library("kernel32.dll")]
+ext fun CreateJobObjectW(p0: ptr, p1: *u16) isize;
+#[library("kernel32.dll")]
+ext fun AssignProcessToJobObject(p0: isize, p1: isize) i32;
+#[library("kernel32.dll")]
+ext fun TerminateJobObject(p0: isize, p1: u32) i32;
+#[library("kernel32.dll")]
+ext fun SetInformationJobObject(p0: isize, p1: u32, p2: ptr, p3: u32) i32;
+#[library("kernel32.dll")]
 ext fun CreatePipe(p0: *isize, p1: *isize, p2: ptr, p3: u32) i32;
 #[library("kernel32.dll")]
 ext fun GetHandleInformation(p0: isize, p1: *u32) i32;
@@ -544,6 +567,43 @@ rec STARTUPINFOA {
 rec STARTUPINFOEXA {
     StartupInfo:     STARTUPINFOA;
     lpAttributeList: ptr;
+}
+
+# JOBOBJECT_BASIC_LIMIT_INFORMATION: explicit padding pins the win64 layout
+# (64 bytes) the same way STARTUPINFOA does above.
+rec JOBOBJECT_BASIC_LIMIT_INFORMATION {
+    PerProcessUserTimeLimit: i64;
+    PerJobUserTimeLimit:     i64;
+    LimitFlags:              u32;
+    _pad0:                   u32;
+    MinimumWorkingSetSize:   usize;
+    MaximumWorkingSetSize:   usize;
+    ActiveProcessLimit:      u32;
+    _pad1:                   u32;
+    Affinity:                usize;
+    PriorityClass:           u32;
+    SchedulingClass:         u32;
+}
+
+# IO_COUNTERS: unused (reserved) by every field we set, carried only because
+# JOBOBJECT_EXTENDED_LIMIT_INFORMATION embeds it and its size affects the
+# offset of the fields after it.
+rec IO_COUNTERS {
+    ReadOperationCount:  u64;
+    WriteOperationCount: u64;
+    OtherOperationCount: u64;
+    ReadTransferCount:   u64;
+    WriteTransferCount:  u64;
+    OtherTransferCount:  u64;
+}
+
+rec JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+    BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION;
+    IoInfo:                IO_COUNTERS;
+    ProcessMemoryLimit:    usize;
+    JobMemoryLimit:        usize;
+    PeakProcessMemoryUsed: usize;
+    PeakJobMemoryUsed:     usize;
 }
 
 # kernel ABI types (POSIX-compatible layout for os.mach interface)
@@ -750,6 +810,10 @@ fun free_fd(fd: i32) {
 val MAX_PROCS: usize = 64;
 var _proc_handles: [MAX_PROCS]isize;
 var _proc_pids: [MAX_PROCS]u32;
+# job object handle for a grouped child's slot, or 0 for an ungrouped one
+# (or a slot that hasn't reached register_child_grouped yet). closed
+# alongside the process handle in close_proc - see register_child_grouped.
+var _job_handles: [MAX_PROCS]isize;
 var _procs_init: u8 = 0;
 var _proc_lock: i64 = 0;
 
@@ -781,6 +845,7 @@ fun init_procs() {
     for (i < MAX_PROCS) {
         _proc_handles[i] = INVALID_HANDLE_VALUE;
         _proc_pids[i] = 0;
+        _job_handles[i] = 0;
         i = i + 1;
     }
     _procs_init = 1;
@@ -858,6 +923,15 @@ fun close_proc(pid: u32, handle: isize) {
             _proc_handles[i] = INVALID_HANDLE_VALUE;
             _proc_pids[i] = 0;
             CloseHandle(handle);
+            # the job (if any) is JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: closing
+            # it here, at the same point the process handle is closed, also
+            # terminates any surviving group members if the caller reaped
+            # without ever calling terminate_group - the same abandoned-
+            # handle safety net a job object exists to provide.
+            if (_job_handles[i] != 0) {
+                CloseHandle(_job_handles[i]);
+                _job_handles[i] = 0;
+            }
             proc_spin_unlock();
             ret;
         }
@@ -2125,6 +2199,74 @@ fun register_child(pi: PROCESS_INFORMATION, slot: i32) i64 {
     ret pi.dwProcessId::i64;
 }
 
+# tear down a CREATE_SUSPENDED child whose job-object setup failed partway
+#
+# the process already exists but was never resumed, so leaving it alone
+# would strand it frozen forever rather than merely leaking a handle;
+# TerminateProcess (matching terminate_child's own exit code) plus closing
+# both its handles returns the slot to the same state a failed CreateProcess
+# would have left it in. `job` is 0 when the failure happened before the job
+# was created (nothing to close there).
+#
+# last_error() is read first, before any cleanup call can overwrite it.
+# ---
+# ret: negative errno describing the failure
+fun abort_grouped_spawn(pi: PROCESS_INFORMATION, job: isize) i64 {
+    val e: i64 = last_error();
+    if (job != 0) { CloseHandle(job); }
+    TerminateProcess(pi.hProcess, TERMINATE_CHILD_EXIT_CODE);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    ret e;
+}
+
+# bind a freshly created, CREATE_SUSPENDED child to its own new job object
+# (process group) and to its pre-reserved process-table slot, then resume it
+#
+# unlike register_child this can fail after the process already exists -
+# CreateJobObjectW, the KILL_ON_JOB_CLOSE limit, AssignProcessToJobObject, or
+# ResumeThread can each fail independently - so every step is checked and any
+# failure tears the suspended child down via abort_grouped_spawn rather than
+# leaving it parked. KILL_ON_JOB_CLOSE means the job itself needs no explicit
+# per-member cleanup later: closing its last handle (in close_proc, on reap)
+# terminates whatever is still in the group even if the caller never called
+# terminate_group.
+# ---
+# pi:      the freshly created (CREATE_SUSPENDED) process
+# slot:    pre-reserved process-table slot
+# job_out: receives the job object handle on success
+# ret:     the child pid on success (slot committed, job registered), or
+#          negative errno (slot left reserved for the caller to release_proc)
+fun register_child_grouped(pi: PROCESS_INFORMATION, slot: i32, job_out: *isize) i64 {
+    val job: isize = CreateJobObjectW(nil, nil);
+    if (job == 0) { ret abort_grouped_spawn(pi, 0); }
+
+    var info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
+    zero_bytes((?info)::*u8, JOBOBJECT_EXTENDED_LIMIT_INFORMATION_SIZE);
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (SetInformationJobObject(job, JobObjectExtendedLimitInformation, (?info)::ptr, JOBOBJECT_EXTENDED_LIMIT_INFORMATION_SIZE::u32) == 0) {
+        ret abort_grouped_spawn(pi, job);
+    }
+    if (AssignProcessToJobObject(job, pi.hProcess) == 0) {
+        ret abort_grouped_spawn(pi, job);
+    }
+    if (ResumeThread(pi.hThread) == 0xFFFFFFFF::u32) {
+        ret abort_grouped_spawn(pi, job);
+    }
+
+    CloseHandle(pi.hThread);
+    # the job handle is recorded before commit_proc publishes the pid/handle
+    # pair that makes this slot reapable: close_proc only ever inspects
+    # _job_handles[slot] once _proc_pids[slot] matches a live pid, so this
+    # order rules out a reap racing in and finding a still-zero job handle.
+    proc_spin_lock();
+    _job_handles[slot::usize] = job;
+    proc_spin_unlock();
+    commit_proc(slot, pi.dwProcessId, pi.hProcess);
+    @job_out = job;
+    ret pi.dwProcessId::i64;
+}
+
 # restore the inherit flag of the first n handles to its saved state
 fun restore_inherit(list: *isize, prev: *u32, n: usize) {
     var i: usize = 0;
@@ -2145,9 +2287,9 @@ fun restore_inherit(list: *isize, prev: *u32, n: usize) {
 # but is excluded from the inherit list.
 #
 # slot is a reserved process-table entry owned by the caller: success
-# commits it via register_child; on any failure return the caller must
-# release_proc it.
-fun create_redirected(pathname: *u8, cmdline: *u8, env_block: ptr, cwd: *u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32, slot: i32) i64 {
+# commits it via register_child (or register_child_grouped when grouped != 0,
+# via job_out); on any failure return the caller must release_proc it.
+fun create_redirected(pathname: *u8, cmdline: *u8, env_block: ptr, cwd: *u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32, slot: i32, grouped: i32, job_out: *isize) i64 {
     var fds: [3]i32;
     fds[0] = stdin_fd;
     fds[1] = stdout_fd;
@@ -2246,11 +2388,14 @@ fun create_redirected(pathname: *u8, cmdline: *u8, env_block: ptr, cwd: *u8, std
     six.StartupInfo.hStdError = hs[2];
     six.lpAttributeList = (?attr_buf[0])::ptr;
 
+    var flags: u32 = EXTENDED_STARTUPINFO_PRESENT;
+    if (grouped != 0) { flags = flags | CREATE_SUSPENDED; }
+
     var pi: PROCESS_INFORMATION;
     val ok: i32 = CreateProcessA(
         pathname, cmdline,
         nil, nil,
-        1, EXTENDED_STARTUPINFO_PRESENT,
+        1, flags,
         env_block, cwd::ptr,
         (?six)::*u8, (?pi)::*u8
     );
@@ -2261,6 +2406,7 @@ fun create_redirected(pathname: *u8, cmdline: *u8, env_block: ptr, cwd: *u8, std
     if (ok == 0) {
         ret spawn_err;
     }
+    if (grouped != 0) { ret register_child_grouped(pi, slot, job_out); }
     ret register_child(pi, slot);
 }
 
@@ -2272,19 +2418,22 @@ fun create_redirected(pathname: *u8, cmdline: *u8, env_block: ptr, cwd: *u8, std
 # this create out of a concurrent redirected spawn's mark→restore window.
 #
 # slot is a reserved process-table entry owned by the caller: success
-# commits it via register_child; on any failure return the caller must
-# release_proc it.
-fun create_inherit(pathname: *u8, cmdline: *u8, env_block: ptr, cwd: *u8, slot: i32) i64 {
+# commits it via register_child (or register_child_grouped when grouped != 0,
+# via job_out); on any failure return the caller must release_proc it.
+fun create_inherit(pathname: *u8, cmdline: *u8, env_block: ptr, cwd: *u8, slot: i32, grouped: i32, job_out: *isize) i64 {
     var si: STARTUPINFOA;
     zero_bytes((?si)::*u8, STARTUPINFOA_SIZE);
     si.cb = STARTUPINFOA_SIZE::u32;
+
+    var flags: u32 = 0;
+    if (grouped != 0) { flags = CREATE_SUSPENDED; }
 
     var pi: PROCESS_INFORMATION;
     spawn_spin_lock();
     val ok: i32 = CreateProcessA(
         pathname, cmdline,
         nil, nil,
-        1, 0,
+        1, flags,
         env_block, cwd::ptr,
         (?si)::*u8, (?pi)::*u8
     );
@@ -2292,6 +2441,7 @@ fun create_inherit(pathname: *u8, cmdline: *u8, env_block: ptr, cwd: *u8, slot: 
     if (ok == 0) {
         ret last_error();
     }
+    if (grouped != 0) { ret register_child_grouped(pi, slot, job_out); }
     ret register_child(pi, slot);
 }
 
@@ -2305,6 +2455,18 @@ fun create_inherit(pathname: *u8, cmdline: *u8, env_block: ptr, cwd: *u8, slot: 
 # ret:      child PID on success, or negative errno
 pub fun spawn(pathname: *u8, argv: **u8, envp: **u8) i64 {
     ret spawn_redirected(pathname, argv, envp, -1, -1, -1);
+}
+
+# create a child process running the given program, placed in its own new
+# job object (see spawn_redirected_in_grouped)
+# ---
+# pathname: path to executable
+# argv:     null-terminated argument array
+# envp:     null-terminated environment array
+# job_out:  receives the job object handle on success
+# ret:      child PID on success, or negative errno
+pub fun spawn_grouped(pathname: *u8, argv: **u8, envp: **u8, job_out: *isize) i64 {
+    ret spawn_redirected_grouped(pathname, argv, envp, -1, -1, -1, job_out);
 }
 
 # create a child process running the given program from `cwd`
@@ -2338,6 +2500,22 @@ pub fun spawn_in(pathname: *u8, argv: **u8, envp: **u8, cwd: *u8) i64 {
 # ret:       child PID on success, or negative errno
 pub fun spawn_redirected(pathname: *u8, argv: **u8, envp: **u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) i64 {
     ret spawn_redirected_in(pathname, argv, envp, nil, stdin_fd, stdout_fd, stderr_fd);
+}
+
+# spawn a child with its standard streams bound to caller-supplied
+# descriptors, placed in its own new job object (see
+# spawn_redirected_in_grouped)
+# ---
+# pathname:  path to executable
+# argv:      null-terminated argument array
+# envp:      null-terminated environment array
+# stdin_fd:  descriptor to install as the child's stdin, or -1 to inherit
+# stdout_fd: descriptor to install as the child's stdout, or -1 to inherit
+# stderr_fd: descriptor to install as the child's stderr, or -1 to inherit
+# job_out:   receives the job object handle on success
+# ret:       child PID on success, or negative errno
+pub fun spawn_redirected_grouped(pathname: *u8, argv: **u8, envp: **u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32, job_out: *isize) i64 {
+    ret spawn_redirected_in_grouped(pathname, argv, envp, nil, stdin_fd, stdout_fd, stderr_fd, job_out);
 }
 
 # spawn a child with redirected streams and an explicit working directory
@@ -2385,9 +2563,9 @@ pub fun spawn_redirected_in(pathname: *u8, argv: **u8, envp: **u8, cwd: *u8, std
 
     var r: i64 = 0;
     if (stdin_fd == -1 && stdout_fd == -1 && stderr_fd == -1) {
-        r = create_inherit(pathname, ?cmdline[0], env_block, cwd, slot);
+        r = create_inherit(pathname, ?cmdline[0], env_block, cwd, slot, 0, nil);
     } or {
-        r = create_redirected(pathname, ?cmdline[0], env_block, cwd, stdin_fd, stdout_fd, stderr_fd, slot);
+        r = create_redirected(pathname, ?cmdline[0], env_block, cwd, stdin_fd, stdout_fd, stderr_fd, slot, 0, nil);
     }
     if (env_block != nil) {
         deallocate(env_block, env_size);
@@ -2395,6 +2573,65 @@ pub fun spawn_redirected_in(pathname: *u8, argv: **u8, envp: **u8, cwd: *u8, std
     if (r < 0) {
         release_proc(slot);
     }
+    ret r;
+}
+
+# spawn a child with redirected streams and an explicit working directory,
+# placed in its own new job object (process group)
+#
+# identical to spawn_redirected_in except the child is created CREATE_SUSPENDED
+# so it (and anything it might otherwise race to spawn before the group
+# exists) cannot run before AssignProcessToJobObject completes; see
+# register_child_grouped for the assign-then-resume sequence and its own
+# failure cleanup. the job carries JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
+# ---
+# pathname:  path to executable
+# argv:      null-terminated argument array
+# envp:      null-terminated environment array, or nil to inherit
+# cwd:       working directory for the child, or nil to inherit
+# stdin_fd:  descriptor to install as the child's stdin, or -1 to inherit
+# stdout_fd: descriptor to install as the child's stdout, or -1 to inherit
+# stderr_fd: descriptor to install as the child's stderr, or -1 to inherit
+# job_out:   receives the job object handle on success
+# ret:       child PID on success, or negative errno (job_out untouched)
+pub fun spawn_redirected_in_grouped(pathname: *u8, argv: **u8, envp: **u8, cwd: *u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32, job_out: *isize) i64 {
+    var cmdline: [32768]u8;
+    if (!build_cmdline(argv, ?cmdline[0], 32768)) {
+        ret E2BIG;
+    }
+
+    var env_size: usize = 0;
+    var env_block: ptr = nil;
+    if (envp != nil) {
+        env_block = build_env_block(envp, ?env_size);
+        if (env_block == nil) {
+            ret ENOMEM;
+        }
+    }
+
+    val slot: i32 = reserve_proc();
+    if (slot < 0) {
+        if (env_block != nil) {
+            deallocate(env_block, env_size);
+        }
+        ret EAGAIN;
+    }
+
+    var job: isize = 0;
+    var r: i64 = 0;
+    if (stdin_fd == -1 && stdout_fd == -1 && stderr_fd == -1) {
+        r = create_inherit(pathname, ?cmdline[0], env_block, cwd, slot, 1, ?job);
+    } or {
+        r = create_redirected(pathname, ?cmdline[0], env_block, cwd, stdin_fd, stdout_fd, stderr_fd, slot, 1, ?job);
+    }
+    if (env_block != nil) {
+        deallocate(env_block, env_size);
+    }
+    if (r < 0) {
+        release_proc(slot);
+        ret r;
+    }
+    @job_out = job;
     ret r;
 }
 
@@ -2482,7 +2719,7 @@ pub fun spawn_shell(command: *u8, envp: **u8, cwd: *u8) i64 {
         ret EAGAIN;
     }
 
-    val r: i64 = create_inherit(?shell[0], ?cmdline[0], env_block, cwd, slot);
+    val r: i64 = create_inherit(?shell[0], ?cmdline[0], env_block, cwd, slot, 0, nil);
     if (env_block != nil) { deallocate(env_block, env_size); }
     if (r < 0) { release_proc(slot); }
     ret r;
@@ -2520,6 +2757,25 @@ pub fun terminate_child(pid: i64) i64 {
     }
     proc_spin_unlock();
     ret ECHILD;
+}
+
+# terminate every process currently associated with a job object
+#
+# unlike terminate_child there is no process-table lookup: `job` is the raw
+# handle spawn_grouped/spawn_redirected_grouped already returned to the
+# caller, exactly as a posix caller already holds the raw pgid. the handle
+# stays open and registered afterward (see close_proc): reaping the group's
+# direct child through wait/wait_pid remains the caller's responsibility, and
+# is what eventually closes it.
+# ---
+# job: job object handle from spawn_grouped or spawn_redirected_grouped
+# ret: 0 on success, or negative errno
+pub fun terminate_group(job: i64) i64 {
+    if (job == 0) { ret EINVAL; }
+    if (TerminateJobObject(job::isize, TERMINATE_CHILD_EXIT_CODE) == 0) {
+        ret last_error();
+    }
+    ret 0;
 }
 
 # return the current process ID
