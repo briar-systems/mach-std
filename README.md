@@ -9,13 +9,13 @@ To use the standard library in your Mach project, you can include it as a depend
 ```toml
 [deps.mach-std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v0.32.0"
+ref = "tag/v0.33.0"
 ```
 
 You can also use the Mach dependency manager to add it to your project:
 
 ```bash
-mach dep add mach-std --git https://github.com/briar-systems/mach-std --ref tag/v0.32.0
+mach dep add mach-std --git https://github.com/briar-systems/mach-std --ref tag/v0.33.0
 ```
 
 ## Documentation
