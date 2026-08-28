@@ -1,4 +1,12 @@
-# linux libc system resolver adapter
+# linux native resolver adapter
+#
+# resolution policy, in order: numeric addresses, RFC 6761 localhost names,
+# the hosts file, then DNS over the resolv.conf nameservers with search-domain
+# and ndots handling. results are ordered per RFC 6724. this speaks to the
+# kernel directly; no libc is involved, so nsswitch plugin modules do not
+# apply. systems routing resolution policy through a local stub resolver
+# (systemd-resolved and peers) keep that policy, since the stub sits behind
+# the nameserver interface.
 
 $if ($mach.build.os != $mach.os.linux) {
     $error("std.net.resolve.linux: requires linux target");
@@ -8,134 +16,275 @@ use std.types.bool.bool;
 use std.types.bool.true;
 use std.types.bool.false;
 use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
 use std.allocator;
+use std.allocator.page;
 use std.system.os;
 use std.net.ip;
 use std.net.resolve.types;
 use std.net.resolve.shared;
+use std.net.resolve.conf;
+use std.net.resolve.hosts;
+use std.net.resolve.lookup;
+use std.net.resolve.order;
+use service_names: std.net.resolve.service;
 
-rec AddrInfo {
-    flags: i32;
-    family: i32;
-    socket_kind: i32;
-    protocol: i32;
-    address_length: u32;
-    address: *u8;
-    canonical_name: *u8;
-    next: *AddrInfo;
+fun lower(byte: u8) u8 {
+    if (byte >= 'A' && byte <= 'Z') { ret byte + 32; }
+    ret byte;
 }
 
-val AI_PASSIVE: i32 = 0x0001;
-val AI_CANONNAME: i32 = 0x0002;
-val AI_NUMERICHOST: i32 = 0x0004;
-val AI_NUMERICSERV: i32 = 0x0400;
-
-val EAI_NONAME: i32 = -2;
-val EAI_AGAIN: i32 = -3;
-val EAI_FAIL: i32 = -4;
-val EAI_FAMILY: i32 = -6;
-val EAI_SOCKTYPE: i32 = -7;
-val EAI_SERVICE: i32 = -8;
-val EAI_MEMORY: i32 = -10;
-val EAI_SYSTEM: i32 = -11;
-val EAI_OVERFLOW: i32 = -12;
-val EAI_BADFLAGS: i32 = -1;
-
-#[library("libc")]
-ext fun getaddrinfo(node: *u8, service: *u8, hints: *AddrInfo, output: **AddrInfo) i32;
-
-#[library("libc")]
-ext fun freeaddrinfo(value: *AddrInfo);
-
-fun failure(code: i32) types.Error {
-    if (code == EAI_NONAME) { ret shared.error(types.NO_NAME, code::i64); }
-    if (code == EAI_AGAIN) { ret shared.error(types.TEMPORARY, code::i64); }
-    if (code == EAI_MEMORY) { ret shared.error(types.OUT_OF_MEMORY, code::i64); }
-    if (code == EAI_FAIL || code == EAI_OVERFLOW) { ret shared.error(types.MALFORMED, code::i64); }
-    if (code == EAI_BADFLAGS || code == EAI_FAMILY || code == EAI_SOCKTYPE) { ret shared.error(types.INVALID, code::i64); }
-    if (code == EAI_SERVICE) { ret shared.error(types.NO_NAME, code::i64); }
-    if (code == EAI_SYSTEM) { ret shared.error(types.SYSTEM_FAILURE, code::i64); }
-    ret shared.error(types.SYSTEM_FAILURE, code::i64);
-}
-
-fun family(query: *types.Query) i32 {
-    if (query.family == types.IPV4_ONLY) { ret os.AF_INET; }
-    if (query.family == types.IPV6_ONLY) { ret os.AF_INET6; }
-    ret 0;
-}
-
-fun socket_kind(query: *types.Query) i32 {
-    if (query.socket_kind == types.STREAM_SOCKET) { ret os.SOCK_STREAM; }
-    if (query.socket_kind == types.DATAGRAM_SOCKET) { ret os.SOCK_DGRAM; }
-    ret 0;
-}
-
-fun flags(query: *types.Query) i32 {
-    var output: i32 = 0;
-    if ((query.flags & types.PASSIVE) != 0) { output = output | AI_PASSIVE; }
-    if ((query.flags & types.CANONICAL_NAME) != 0) { output = output | AI_CANONNAME; }
-    if ((query.flags & types.NUMERIC_HOST) != 0) { output = output | AI_NUMERICHOST; }
-    if ((query.flags & types.NUMERIC_SERVICE) != 0) { output = output | AI_NUMERICSERV; }
-    ret output;
-}
-
-pub fun resolve(query: *types.Query, owner: *allocator.Allocator, limits: types.ResultLimits, output: *types.Resolution) types.Error {
-    if (query == nil || owner == nil || output == nil) { ret shared.error(types.INVALID, os.EINVAL); }
-    shared.clear(output, owner);
-    var hints: AddrInfo;
-    hints.flags = flags(query);
-    hints.family = family(query);
-    hints.socket_kind = socket_kind(query);
-    hints.protocol = query.protocol;
-    hints.address_length = 0;
-    hints.address = nil;
-    hints.canonical_name = nil;
-    hints.next = nil;
-    var first: *AddrInfo = nil;
-    val code: i32 = getaddrinfo(query.host, query.service, ?hints, ?first);
-    if (code != 0) { ret failure(code); }
-    if (first == nil) { ret shared.error(types.NO_NAME, EAI_NONAME::i64); }
-
-    var count: usize = 0;
-    var current: *AddrInfo = first;
-    for (current != nil) {
-        if (count == limits.max_endpoints) { freeaddrinfo(first); ret shared.error(types.OVERLOADED, 0); }
-        count = count + 1;
-        current = current.next;
+# an RFC 6761 localhost name: `localhost` or any name under `.localhost`,
+# case-insensitively, with an optional trailing dot
+fun is_localhost(hostname: str) bool {
+    var length: usize = str_len(hostname);
+    if (length != 0 && hostname[length - 1] == '.') { length = length - 1; }
+    if (length < 9) { ret false; }
+    val suffix: usize = length - 9;
+    var i: usize = 0;
+    for (i < 9) {
+        if (lower(hostname[suffix + i]) != "localhost"[i]) { ret false; }
+        i = i + 1;
     }
-    if (!shared.allocate_endpoints(output, count)) {
-        freeaddrinfo(first);
+    ret length == 9 || hostname[suffix - 1] == '.';
+}
+
+# resolve the query's service to a port; a nil service means port zero
+fun service_port(query: *types.Query, port: *u16) bool {
+    @port = 0;
+    if (query.service == nil) { ret true; }
+    if (service_names.numeric(query.service, port)) { ret true; }
+    if ((query.flags & types.NUMERIC_SERVICE) != 0) { ret false; }
+    ret service_names.lookup(query.service, query.socket_kind, port);
+}
+
+fun set_canonical_checked(query: *types.Query, limits: types.ResultLimits,
+    output: *types.Resolution, name: str) types.Error {
+    if ((query.flags & types.CANONICAL_NAME) == 0 || name == nil) {
+        ret shared.error(types.NO_ERROR, 0);
+    }
+    if (!shared.canonical_fits(name, limits.max_canonical_name_bytes)) {
+        ret shared.error(types.OVERLOADED, 0);
+    }
+    if (!shared.set_canonical(output, name)) {
         ret shared.error(types.OUT_OF_MEMORY, os.ENOMEM);
     }
+    ret shared.error(types.NO_ERROR, 0);
+}
 
-    current = first;
-    var malformed: bool = false;
-    for (current != nil) {
-        if ((current.family == os.AF_INET || current.family == os.AF_INET6)
-         && current.address != nil) {
-            var endpoint: ip.Endpoint;
-            if (!ip.from_sockaddr(current.address, ?endpoint)
-             || !shared.append_unique(output, endpoint)) { malformed = true; }
-        }
-        if (output.canonical_name == nil && current.canonical_name != nil
-         && !shared.canonical_fits(current.canonical_name, limits.max_canonical_name_bytes)) {
-            freeaddrinfo(first);
-            shared.destroy(output);
-            ret shared.error(types.OVERLOADED, 0);
-        }
-        if (output.canonical_name == nil && current.canonical_name != nil
-         && !shared.set_canonical(output, current.canonical_name)) {
-            freeaddrinfo(first);
-            shared.destroy(output);
-            ret shared.error(types.OUT_OF_MEMORY, os.ENOMEM);
-        }
-        current = current.next;
+fun deliver(query: *types.Query, limits: types.ResultLimits, output: *types.Resolution,
+    addrs: *ip.Addr, count: usize, port: u16, canonical: str) types.Error {
+    if (count == 0) {
+        ret shared.error(types.NO_NAME, 0);
     }
-    freeaddrinfo(first);
-    if (output.len == 0) {
+    if (count > limits.max_endpoints) {
+        ret shared.error(types.OVERLOADED, 0);
+    }
+    if (!shared.allocate_endpoints(output, count)) {
+        ret shared.error(types.OUT_OF_MEMORY, os.ENOMEM);
+    }
+    var i: usize = 0;
+    for (i < count) {
+        shared.append_unique(output, ip.Endpoint{addr: addrs[i], port: port, scope: 0});
+        i = i + 1;
+    }
+    val canonical_failure: types.Error = set_canonical_checked(query, limits, output, canonical);
+    if (canonical_failure.kind != types.NO_ERROR) {
         shared.destroy(output);
-        if (malformed) { ret shared.error(types.MALFORMED, EAI_FAIL::i64); }
-        ret shared.error(types.NO_NAME, EAI_NONAME::i64);
+        ret canonical_failure;
     }
     ret shared.error(types.NO_ERROR, 0);
+}
+
+fun fixed_pair(want_v4: bool, want_v6: bool, v4: ip.IPv4, v6: ip.IPv6, addrs: *ip.Addr) usize {
+    var count: usize = 0;
+    if (want_v6) {
+        addrs[count] = ip.addr_v6(v6);
+        count = count + 1;
+    }
+    if (want_v4) {
+        addrs[count] = ip.addr_v4(v4);
+        count = count + 1;
+    }
+    ret count;
+}
+
+fun outcome_error(outcome: lookup.Outcome) types.Error {
+    if (outcome == lookup.NO_NAME) { ret shared.error(types.NO_NAME, 0); }
+    if (outcome == lookup.TEMPORARY) { ret shared.error(types.TEMPORARY, 0); }
+    ret shared.error(types.SYSTEM_FAILURE, 0);
+}
+
+# the adapter body with an injected resolver policy, split out so tests can
+# aim the lookup at a deterministic local nameserver
+pub fun resolve_with_config(query: *types.Query, owner: *allocator.Allocator,
+    limits: types.ResultLimits, output: *types.Resolution, config: *conf.Config) types.Error {
+    if (query == nil || owner == nil || output == nil) { ret shared.error(types.INVALID, os.EINVAL); }
+    shared.clear(output, owner);
+
+    var port: u16 = 0;
+    if (!service_port(query, ?port)) { ret shared.error(types.NO_NAME, 0); }
+    val want_v4: bool = query.family != types.IPV6_ONLY;
+    val want_v6: bool = query.family != types.IPV4_ONLY;
+    var addrs: [32]ip.Addr;
+
+    if (query.host == nil) {
+        # the engine admits a nil host only for passive queries: wildcards
+        val count: usize = fixed_pair(want_v4, want_v6, ip.ipv4_any(), ip.ipv6_any(), ?addrs[0]);
+        ret deliver(query, limits, output, ?addrs[0], count, port, nil);
+    }
+
+    val numeric: Result[ip.Addr, str] = ip.addr_parse(query.host);
+    if (!is_err[ip.Addr, str](numeric)) {
+        val addr: ip.Addr = unwrap_ok[ip.Addr, str](numeric);
+        if ((addr.is_v6 != 0 && !want_v6) || (addr.is_v6 == 0 && !want_v4)) {
+            ret shared.error(types.NO_NAME, 0);
+        }
+        addrs[0] = addr;
+        ret deliver(query, limits, output, ?addrs[0], 1, port, query.host);
+    }
+    if ((query.flags & types.NUMERIC_HOST) != 0) { ret shared.error(types.NO_NAME, 0); }
+
+    if (is_localhost(query.host)) {
+        val count: usize = fixed_pair(want_v4, want_v6, ip.ipv4_loopback(), ip.ipv6_loopback(), ?addrs[0]);
+        ret deliver(query, limits, output, ?addrs[0], count, port, query.host);
+    }
+
+    var canonical: [254]u8;
+    canonical[0] = 0;
+    var hosts_lookup: hosts.Lookup = hosts.Lookup{
+        hostname: query.host,
+        want_v4: want_v4,
+        want_v6: want_v6,
+        addrs: ?addrs[0],
+        capacity: 32,
+        count: 0,
+        canonical: ?canonical[0],
+        canonical_capacity: 254,
+    };
+    val hosts_count: usize = hosts.collect(?hosts_lookup);
+    if (hosts_count != 0) {
+        order.sort(?addrs[0], hosts_count);
+        var name: str = query.host;
+        if (canonical[0] != 0) { name = ?canonical[0]; }
+        ret deliver(query, limits, output, ?addrs[0], hosts_count, port, name);
+    }
+
+    var answer: lookup.Answer;
+    val outcome: lookup.Outcome = lookup.resolve_name(config, query.host, want_v4, want_v6, ?answer);
+    if (outcome != lookup.FOUND) { ret outcome_error(outcome); }
+    order.sort(?answer.addrs[0], answer.count);
+    var name: str = query.host;
+    if (answer.canonical_length != 0) { name = ?answer.canonical[0]; }
+    ret deliver(query, limits, output, ?answer.addrs[0], answer.count, port, name);
+}
+
+pub fun resolve(query: *types.Query, owner: *allocator.Allocator, limits: types.ResultLimits,
+    output: *types.Resolution) types.Error {
+    var config: conf.Config;
+    conf.load(?config);
+    ret resolve_with_config(query, owner, limits, output, ?config);
+}
+
+test "resolve.linux: localhost names" {
+    if (!is_localhost("localhost")) { ret 1; }
+    if (!is_localhost("LOCALHOST.")) { ret 1; }
+    if (!is_localhost("web.localhost")) { ret 1; }
+    if (is_localhost("not-localhost")) { ret 1; }
+    if (is_localhost("localhost.example")) { ret 1; }
+    ret 0;
+}
+
+fun test_query(host: str, service: str, family: types.Family, flags: u32) types.Query {
+    ret types.Query{
+        host: host,
+        service: service,
+        family: family,
+        socket_kind: types.ANY_SOCKET,
+        protocol: 0,
+        flags: flags,
+    };
+}
+
+fun test_limits() types.ResultLimits {
+    ret types.ResultLimits{max_endpoints: 8, max_canonical_name_bytes: 256};
+}
+
+test "resolve.linux: localhost resolves to both loopbacks with canonical" {
+    var owner: allocator.Allocator;
+    page.make(?owner);
+    var config: conf.Config;
+    conf.defaults(?config);
+    var output: types.Resolution;
+    var query: types.Query = test_query("localhost", "443", types.ANY_FAMILY, types.CANONICAL_NAME);
+    val failure: types.Error = resolve_with_config(?query, ?owner, test_limits(), ?output, ?config);
+    if (failure.kind != types.NO_ERROR) { ret 1; }
+    if (output.len != 2) { ret 1; }
+    if (output.endpoints[0].addr.is_v6 == 0 || !ip.addr_is_loopback(output.endpoints[0].addr)) { ret 1; }
+    if (output.endpoints[1].addr.is_v6 != 0 || !ip.addr_is_loopback(output.endpoints[1].addr)) { ret 1; }
+    if (output.endpoints[0].port != 443 || output.endpoints[1].port != 443) { ret 1; }
+    if (output.canonical_name == nil || output.canonical_name[0] != 'l') { ret 1; }
+    if (!shared.destroy(?output)) { ret 1; }
+    ret 0;
+}
+
+test "resolve.linux: family filter narrows localhost" {
+    var owner: allocator.Allocator;
+    page.make(?owner);
+    var config: conf.Config;
+    conf.defaults(?config);
+    var output: types.Resolution;
+    var query: types.Query = test_query("web.localhost", nil, types.IPV4_ONLY, 0);
+    val failure: types.Error = resolve_with_config(?query, ?owner, test_limits(), ?output, ?config);
+    if (failure.kind != types.NO_ERROR) { ret 1; }
+    if (output.len != 1) { ret 1; }
+    if (output.endpoints[0].addr.is_v6 != 0 || output.endpoints[0].addr.v4.octets[0] != 127) { ret 1; }
+    if (output.canonical_name != nil) { ret 1; }
+    if (!shared.destroy(?output)) { ret 1; }
+    ret 0;
+}
+
+test "resolve.linux: passive nil host yields wildcards" {
+    var owner: allocator.Allocator;
+    page.make(?owner);
+    var config: conf.Config;
+    conf.defaults(?config);
+    var output: types.Resolution;
+    var query: types.Query = test_query(nil, "8080", types.ANY_FAMILY, types.PASSIVE);
+    val failure: types.Error = resolve_with_config(?query, ?owner, test_limits(), ?output, ?config);
+    if (failure.kind != types.NO_ERROR) { ret 1; }
+    if (output.len != 2) { ret 1; }
+    if (!ip.addr_is_unspecified(output.endpoints[0].addr)) { ret 1; }
+    if (!ip.addr_is_unspecified(output.endpoints[1].addr)) { ret 1; }
+    if (output.endpoints[0].port != 8080) { ret 1; }
+    if (!shared.destroy(?output)) { ret 1; }
+    ret 0;
+}
+
+test "resolve.linux: numeric host with mismatched family is a name miss" {
+    var owner: allocator.Allocator;
+    page.make(?owner);
+    var config: conf.Config;
+    conf.defaults(?config);
+    var output: types.Resolution;
+    var query: types.Query = test_query("192.0.2.1", nil, types.IPV6_ONLY, 0);
+    val failure: types.Error = resolve_with_config(?query, ?owner, test_limits(), ?output, ?config);
+    if (failure.kind != types.NO_NAME) { ret 1; }
+    ret 0;
+}
+
+test "resolve.linux: unknown service name is a name miss" {
+    var owner: allocator.Allocator;
+    page.make(?owner);
+    var config: conf.Config;
+    conf.defaults(?config);
+    var output: types.Resolution;
+    var query: types.Query = test_query("localhost", "no-such-service-name", types.ANY_FAMILY, types.NUMERIC_SERVICE);
+    val failure: types.Error = resolve_with_config(?query, ?owner, test_limits(), ?output, ?config);
+    if (failure.kind != types.NO_NAME) { ret 1; }
+    ret 0;
 }

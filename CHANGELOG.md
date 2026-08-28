@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.31.0] - 2026-08-28
+
+### Added
+
+#### net: native DNS resolution on linux
+
+- Native resolver modules under `std.net.resolve`: resolv.conf policy, hosts-file
+  lookup, `/etc/services` names, an RFC 1035 wire codec with bounded
+  decompression, RFC 6724 destination ordering, and nameserver transport with
+  per-server timeouts, attempts, rotation, search-domain and ndots handling, and
+  TCP fallback on truncation (#538).
+- `udp.socket_set_recv_timeout` bounds blocking receives, matching the TCP
+  stream surface (#538).
+
+### Changed
+
+- The linux resolver adapter composes numeric, RFC 6761 localhost, hosts-file,
+  and DNS resolution natively; glibc `getaddrinfo` is no longer called, the
+  linux libc link requirement is gone, and linux binaries are statically linked
+  with no `PT_INTERP` (#538).
+- `net.dns` reuses the resolver modules, gaining multi-nameserver retry and
+  search-domain handling on its DNS path (#538).
+
+### Removed
+
+- The `[link.libc-*]` manifest entries, the CI libc sysroots and toolchain
+  wrappers, and the `os.dns_nameserver` primitive on all targets (#538).
+
 ## [0.30.0] - 2026-08-28
 
 ### Added

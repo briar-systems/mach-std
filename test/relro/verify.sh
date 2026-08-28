@@ -24,18 +24,14 @@ mach="${1:-mach}"
 target="${2:-linux}"
 runner="${3:-}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-root="$(cd "$here/../.." && pwd)"
 cd "$here"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 run()  { if [ -n "$runner" ]; then "$runner" "$@"; else "$@"; fi; }
 
-# the probes exercise the production static runtime, not the full std surface whose
-# system resolver intentionally exports libc as a dynamic dependency.
-rm -rf dep/std
-mkdir -p dep/std
-cp runtime-std.toml dep/std/mach.toml
-ln -s "$root/src" dep/std/src
+# vendor this checkout's std as the path dependency (dep/std -> repo root).
+mkdir -p dep
+ln -sfn "$(cd ../.. && pwd)" dep/std
 
 echo "building the RELRO probes --pie with $mach (target $target)"
 rm -rf out
