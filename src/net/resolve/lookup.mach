@@ -1,0 +1,593 @@
+# DNS lookup over the target's configured nameservers
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+use std.sync.thread;
+use std.chrono.time;
+use std.chrono.duration;
+use std.crypto.rand;
+use std.net.ip;
+use std.net.udp;
+use std.net.tcp;
+use std.net.resolve.conf;
+use std.net.resolve.wire;
+use io_error: std.io.error;
+
+pub val MAX_ADDRS: usize = 32;
+
+pub def Outcome: u8;
+pub val FOUND:     Outcome = 0;
+pub val NO_NAME:   Outcome = 1;
+pub val TEMPORARY: Outcome = 2;
+pub val FAILED:    Outcome = 3;
+
+# a completed lookup: addresses in response order, A before AAAA merge order
+# preserved per query, and the final CNAME target when a chain was followed
+pub rec Answer {
+    addrs: [32]ip.Addr;
+    count: usize;
+    canonical: [254]u8;
+    canonical_length: usize;
+}
+
+rec Pending {
+    qtype: u16;
+    id: u16;
+    message: [320]u8;
+    message_length: usize;
+    answered: bool;
+    found_name: bool;
+}
+
+fun endpoint_matches(a: ip.Endpoint, b: ip.Endpoint) bool {
+    if (a.port != b.port || a.addr.is_v6 != b.addr.is_v6) { ret false; }
+    var i: usize = 0;
+    if (a.addr.is_v6 == 0) {
+        for (i < 4) {
+            if (a.addr.v4.octets[i] != b.addr.v4.octets[i]) { ret false; }
+            i = i + 1;
+        }
+        ret true;
+    }
+    for (i < 16) {
+        if (a.addr.v6.octets[i] != b.addr.v6.octets[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun collect(answer: *Answer, addrs: *ip.Addr, count: usize) {
+    var i: usize = 0;
+    for (i < count && answer.count < MAX_ADDRS) {
+        answer.addrs[answer.count] = addrs[i];
+        answer.count = answer.count + 1;
+        i = i + 1;
+    }
+}
+
+# absorb one parsed response into the pending query and the answer.
+# ---
+# ret: false when the server answered with a failure code and the query
+#      should move to the next server
+fun absorb(pending: *Pending, parsed: *wire.Parsed, addrs: *ip.Addr, answer: *Answer) bool {
+    if (parsed.rcode == wire.RCODE_OK) {
+        pending.answered = true;
+        pending.found_name = true;
+        collect(answer, addrs, parsed.addr_count);
+        if (parsed.canonical_length != 0) { answer.canonical_length = parsed.canonical_length; }
+        ret true;
+    }
+    if (parsed.rcode == wire.RCODE_NXDOMAIN) {
+        pending.answered = true;
+        ret true;
+    }
+    ret false;
+}
+
+# retry one truncated query over TCP against the same server
+fun exchange_tcp(server: ip.Endpoint, pending: *Pending, timeout_ms: u64, answer: *Answer) bool {
+    val connected: Result[tcp.Stream, io_error.Error] = tcp.connect(server);
+    if (is_err[tcp.Stream, io_error.Error](connected)) { ret false; }
+    var stream: tcp.Stream = unwrap_ok[tcp.Stream, io_error.Error](connected);
+    tcp.stream_set_read_timeout(?stream, timeout_ms);
+
+    var framed: [322]u8;
+    framed[0] = (pending.message_length >> 8)::u8;
+    framed[1] = pending.message_length::u8;
+    var i: usize = 0;
+    for (i < pending.message_length) { framed[i + 2] = pending.message[i]; i = i + 1; }
+    var sent: usize = 0;
+    for (sent < pending.message_length + 2) {
+        val wrote: Result[usize, io_error.Error] = tcp.stream_write(?stream, ?framed[sent], pending.message_length + 2 - sent);
+        if (is_err[usize, io_error.Error](wrote)) { tcp.stream_close(?stream); ret false; }
+        val n: usize = unwrap_ok[usize, io_error.Error](wrote);
+        if (n == 0) { tcp.stream_close(?stream); ret false; }
+        sent = sent + n;
+    }
+
+    var response: [4096]u8;
+    var received: usize = 0;
+    var expected: usize = 2;
+    for (received < expected) {
+        val got: Result[usize, io_error.Error] = tcp.stream_read(?stream, ?response[received], expected - received);
+        if (is_err[usize, io_error.Error](got)) { tcp.stream_close(?stream); ret false; }
+        val n: usize = unwrap_ok[usize, io_error.Error](got);
+        if (n == 0) { tcp.stream_close(?stream); ret false; }
+        received = received + n;
+        if (received == 2 && expected == 2) {
+            val body: usize = (response[0]::usize << 8) | response[1]::usize;
+            if (body < wire.HEADER_LENGTH || body > wire.MAX_MESSAGE - 2) { tcp.stream_close(?stream); ret false; }
+            expected = body + 2;
+        }
+    }
+    tcp.stream_close(?stream);
+
+    var addrs: [32]ip.Addr;
+    var parsed: wire.Parsed;
+    if (!wire.parse(?response[2], received - 2, pending.id, pending.qtype, ?addrs[0], 32,
+        ?answer.canonical[0], 254, ?parsed)) { ret false; }
+    if (parsed.truncated) { ret false; }
+    ret absorb(pending, ?parsed, ?addrs[0], answer);
+}
+
+# one UDP visit to a server: send the unanswered queries, then absorb
+# matching responses until all are answered or the timeout lapses
+fun exchange(server: ip.Endpoint, pending: *Pending, pending_count: usize, timeout_ms: u64, answer: *Answer) {
+    var created: Result[udp.Socket, io_error.Error];
+    if (server.addr.is_v6 != 0) {
+        created = udp.create_v6();
+    } or {
+        created = udp.create();
+    }
+    if (is_err[udp.Socket, io_error.Error](created)) { ret; }
+    var socket: udp.Socket = unwrap_ok[udp.Socket, io_error.Error](created);
+
+    var outstanding: usize = 0;
+    var i: usize = 0;
+    for (i < pending_count) {
+        if (!pending[i].answered) {
+            val sent: Result[usize, io_error.Error] = udp.send_to(?socket,
+                ?pending[i].message[0], pending[i].message_length, server);
+            if (is_err[usize, io_error.Error](sent)) {
+                udp.socket_close(?socket);
+                ret;
+            }
+            outstanding = outstanding + 1;
+        }
+        i = i + 1;
+    }
+    if (outstanding == 0) {
+        udp.socket_close(?socket);
+        ret;
+    }
+
+    val deadline: time.Time = time.time_add(time.monotonic(), (timeout_ms::i64) * duration.MILLISECOND);
+    for (outstanding != 0) {
+        val remaining: i64 = duration.duration_msec(time.time_sub(deadline, time.monotonic()));
+        if (remaining <= 0) { brk; }
+        udp.socket_set_recv_timeout(?socket, remaining::u64);
+
+        var response: [4096]u8;
+        var source: ip.Endpoint;
+        val got: Result[usize, io_error.Error] = udp.recv_from(?socket, ?response[0], 4096, ?source);
+        if (is_err[usize, io_error.Error](got)) { brk; }
+        val length: usize = unwrap_ok[usize, io_error.Error](got);
+        if (!endpoint_matches(source, server)) { cnt; }
+
+        i = 0;
+        for (i < pending_count) {
+            if (pending[i].answered) { i = i + 1; cnt; }
+            var addrs: [32]ip.Addr;
+            var parsed: wire.Parsed;
+            if (!wire.parse(?response[0], length, pending[i].id, pending[i].qtype, ?addrs[0], 32,
+                ?answer.canonical[0], 254, ?parsed)) { i = i + 1; cnt; }
+            if (parsed.truncated && parsed.rcode == wire.RCODE_OK) {
+                if (exchange_tcp(server, ?pending[i], timeout_ms, answer)) { outstanding = outstanding - 1; }
+                brk;
+            }
+            if (absorb(?pending[i], ?parsed, ?addrs[0], answer)) { outstanding = outstanding - 1; }
+            brk;
+        }
+    }
+    udp.socket_close(?socket);
+}
+
+# query one fully-composed name (hostname, optionally suffixed by a search
+# domain) for the requested families across the configured nameservers
+pub fun query_name(config: *conf.Config, hostname: str, domain: *u8,
+    want_v4: bool, want_v6: bool, answer: *Answer) Outcome {
+    answer.count = 0;
+    answer.canonical[0] = 0;
+    answer.canonical_length = 0;
+    if (config.nameserver_count == 0 || (!want_v4 && !want_v6)) { ret FAILED; }
+
+    var pending: [2]Pending;
+    var pending_count: usize = 0;
+    if (want_v4) {
+        pending[pending_count].qtype = wire.TYPE_A;
+        pending_count = pending_count + 1;
+    }
+    if (want_v6) {
+        pending[pending_count].qtype = wire.TYPE_AAAA;
+        pending_count = pending_count + 1;
+    }
+    var i: usize = 0;
+    for (i < pending_count) {
+        pending[i].id = (rand.u32() & 0xFFFF)::u16;
+        if (i != 0 && pending[i].id == pending[0].id) { pending[i].id = pending[i].id ^ 0x5A5A; }
+        pending[i].answered = false;
+        pending[i].found_name = false;
+        pending[i].message_length = wire.build_query(pending[i].id, hostname, domain,
+            pending[i].qtype, ?pending[i].message[0], 320);
+        if (pending[i].message_length == 0) { ret NO_NAME; }
+        i = i + 1;
+    }
+
+    var start: usize = 0;
+    if (config.rotate && config.nameserver_count > 1) {
+        start = (rand.u32()::usize) % config.nameserver_count;
+    }
+    var attempt: u32 = 0;
+    for (attempt < config.attempts) {
+        var server: usize = 0;
+        for (server < config.nameserver_count) {
+            var outstanding: bool = false;
+            i = 0;
+            for (i < pending_count) {
+                if (!pending[i].answered) { outstanding = true; }
+                i = i + 1;
+            }
+            if (!outstanding) { brk; }
+            val index: usize = (start + server) % config.nameserver_count;
+            exchange(config.nameservers[index], ?pending[0], pending_count, config.timeout_ms, answer);
+            server = server + 1;
+        }
+        attempt = attempt + 1;
+    }
+
+    if (answer.count != 0) { ret FOUND; }
+    var all_answered: bool = true;
+    i = 0;
+    for (i < pending_count) {
+        if (!pending[i].answered) { all_answered = false; }
+        i = i + 1;
+    }
+    if (all_answered) { ret NO_NAME; }
+    ret TEMPORARY;
+}
+
+fun count_dots(hostname: str, length: usize) usize {
+    var dots: usize = 0;
+    var i: usize = 0;
+    for (i < length) {
+        if (hostname[i] == '.') { dots = dots + 1; }
+        i = i + 1;
+    }
+    ret dots;
+}
+
+fun compose_canonical(answer: *Answer, hostname: str, domain: *u8) {
+    if (answer.canonical_length != 0) { ret; }
+    val host_length: usize = str_len(hostname);
+    var length: usize = host_length;
+    if (hostname[host_length - 1] == '.') { length = length - 1; }
+    var total: usize = length;
+    var domain_length: usize = 0;
+    if (domain != nil && domain[0] != 0) {
+        domain_length = str_len(domain);
+        total = total + 1 + domain_length;
+    }
+    if (total + 1 > 254) { ret; }
+    var i: usize = 0;
+    for (i < length) { answer.canonical[i] = hostname[i]; i = i + 1; }
+    if (domain_length != 0) {
+        answer.canonical[length] = '.';
+        i = 0;
+        for (i < domain_length) { answer.canonical[length + 1 + i] = domain[i]; i = i + 1; }
+    }
+    answer.canonical[total] = 0;
+    answer.canonical_length = total;
+}
+
+# resolve a hostname applying the search-domain and ndots policy: a name at
+# or above the dot threshold (or fully qualified) tries the literal name
+# first, otherwise the search list is tried first. the first name that
+# resolves wins; a temporary or system failure aborts the search.
+pub fun resolve_name(config: *conf.Config, hostname: str, want_v4: bool, want_v6: bool, answer: *Answer) Outcome {
+    val length: usize = str_len(hostname);
+    if (length == 0) { ret NO_NAME; }
+    val qualified: bool = hostname[length - 1] == '.';
+    val literal_first: bool = qualified || count_dots(hostname, length) >= config.ndots::usize
+        || config.search_count == 0;
+
+    var outcome: Outcome = NO_NAME;
+    if (literal_first) {
+        outcome = query_name(config, hostname, nil, want_v4, want_v6, answer);
+        if (outcome == FOUND) { compose_canonical(answer, hostname, nil); }
+        if (outcome != NO_NAME || qualified) { ret outcome; }
+    }
+    var i: usize = 0;
+    for (i < config.search_count) {
+        val domain: *u8 = conf.search_domain(config, i);
+        if (length + 1 + str_len(domain) <= 253) {
+            outcome = query_name(config, hostname, domain, want_v4, want_v6, answer);
+            if (outcome == FOUND) { compose_canonical(answer, hostname, domain); }
+            if (outcome != NO_NAME) { ret outcome; }
+        }
+        i = i + 1;
+    }
+    if (!literal_first) {
+        outcome = query_name(config, hostname, nil, want_v4, want_v6, answer);
+        if (outcome == FOUND) { compose_canonical(answer, hostname, nil); }
+        ret outcome;
+    }
+    ret NO_NAME;
+}
+
+# deterministic loopback nameserver used by the transport tests
+rec Stub {
+    socket: udp.Socket;
+    requests: usize;
+    rcode: u8;
+    truncate: bool;
+}
+
+fun stub_answer(request: *u8, length: usize, response: *u8, rcode: u8, truncate: bool) usize {
+    var i: usize = 0;
+    for (i < length) { response[i] = request[i]; i = i + 1; }
+    response[2] = 0x81;
+    if (truncate) { response[2] = 0x83; }
+    response[3] = 0x80 | rcode;
+    if (rcode != 0 || truncate) { ret length; }
+    val qtype: u16 = (request[length - 4]::u16 << 8) | request[length - 3]::u16;
+    response[7] = 1;
+    var pos: usize = length;
+    response[pos] = 0xC0; response[pos + 1] = 12;
+    response[pos + 2] = (qtype >> 8)::u8; response[pos + 3] = qtype::u8;
+    response[pos + 4] = 0; response[pos + 5] = 1;
+    response[pos + 6] = 0; response[pos + 7] = 0; response[pos + 8] = 0; response[pos + 9] = 60;
+    pos = pos + 10;
+    if (qtype == wire.TYPE_A) {
+        response[pos] = 0; response[pos + 1] = 4;
+        response[pos + 2] = 192; response[pos + 3] = 0;
+        response[pos + 4] = 2; response[pos + 5] = 55;
+        ret pos + 6;
+    }
+    response[pos] = 0; response[pos + 1] = 16;
+    var j: usize = 0;
+    for (j < 16) { response[pos + 2 + j] = 0; j = j + 1; }
+    response[pos + 2] = 0x20; response[pos + 3] = 0x01;
+    response[pos + 4] = 0x0D; response[pos + 5] = 0xB8;
+    response[pos + 17] = 0x55;
+    ret pos + 18;
+}
+
+fun stub_run(argument: *u8) {
+    val stub: *Stub = argument::*Stub;
+    var served: usize = 0;
+    for (served < stub.requests) {
+        var request: [512]u8;
+        var source: ip.Endpoint;
+        val got: Result[usize, io_error.Error] = udp.recv_from(?stub.socket, ?request[0], 512, ?source);
+        if (is_err[usize, io_error.Error](got)) { ret; }
+        val length: usize = unwrap_ok[usize, io_error.Error](got);
+        if (length < wire.HEADER_LENGTH) { ret; }
+        var response: [512]u8;
+        val response_length: usize = stub_answer(?request[0], length, ?response[0], stub.rcode, stub.truncate);
+        udp.send_to(?stub.socket, ?response[0], response_length, source);
+        served = served + 1;
+    }
+}
+
+fun stub_start(stub: *Stub, requests: usize, rcode: u8, truncate: bool, worker: *thread.Thread) Result[conf.Config, io_error.Error] {
+    val bound: Result[udp.Socket, io_error.Error] = udp.bind(ip.endpoint(127, 0, 0, 1, 0));
+    if (is_err[udp.Socket, io_error.Error](bound)) {
+        ret err[conf.Config, io_error.Error](unwrap_err[udp.Socket, io_error.Error](bound));
+    }
+    stub.socket = unwrap_ok[udp.Socket, io_error.Error](bound);
+    stub.requests = requests;
+    stub.rcode = rcode;
+    stub.truncate = truncate;
+    udp.socket_set_recv_timeout(?stub.socket, 5000);
+    val local: Result[ip.Endpoint, io_error.Error] = udp.local_endpoint(?stub.socket);
+    if (is_err[ip.Endpoint, io_error.Error](local)) {
+        udp.socket_close(?stub.socket);
+        ret err[conf.Config, io_error.Error](unwrap_err[ip.Endpoint, io_error.Error](local));
+    }
+    var config: conf.Config;
+    conf.defaults(?config);
+    config.nameservers[0] = unwrap_ok[ip.Endpoint, io_error.Error](local);
+    config.nameserver_count = 1;
+    config.attempts = 1;
+    config.timeout_ms = 5000;
+    thread.spawn_with(stub_run, stub::*u8, worker);
+    ret ok[conf.Config, io_error.Error](config);
+}
+
+test "resolve.lookup: stub nameserver answers both families" {
+    var stub: Stub;
+    var worker: thread.Thread;
+    val started: Result[conf.Config, io_error.Error] = stub_start(?stub, 2, 0, false, ?worker);
+    if (is_err[conf.Config, io_error.Error](started)) { ret 1; }
+    var config: conf.Config = unwrap_ok[conf.Config, io_error.Error](started);
+    var answer: Answer;
+    val outcome: Outcome = query_name(?config, "native.example", nil, true, true, ?answer);
+    thread.join(?worker);
+    udp.socket_close(?stub.socket);
+    if (outcome != FOUND) { ret 1; }
+    if (answer.count != 2) { ret 1; }
+    var seen_v4: bool = false;
+    var seen_v6: bool = false;
+    var i: usize = 0;
+    for (i < answer.count) {
+        if (answer.addrs[i].is_v6 == 0 && answer.addrs[i].v4.octets[3] == 55) { seen_v4 = true; }
+        if (answer.addrs[i].is_v6 != 0 && answer.addrs[i].v6.octets[15] == 0x55) { seen_v6 = true; }
+        i = i + 1;
+    }
+    if (!seen_v4 || !seen_v6) { ret 1; }
+    ret 0;
+}
+
+test "resolve.lookup: stub nameserver nxdomain" {
+    var stub: Stub;
+    var worker: thread.Thread;
+    val started: Result[conf.Config, io_error.Error] = stub_start(?stub, 2, wire.RCODE_NXDOMAIN, false, ?worker);
+    if (is_err[conf.Config, io_error.Error](started)) { ret 1; }
+    var config: conf.Config = unwrap_ok[conf.Config, io_error.Error](started);
+    var answer: Answer;
+    val outcome: Outcome = query_name(?config, "missing.example", nil, true, true, ?answer);
+    thread.join(?worker);
+    udp.socket_close(?stub.socket);
+    if (outcome != NO_NAME) { ret 1; }
+    ret 0;
+}
+
+test "resolve.lookup: search domain applies before literal for bare names" {
+    var stub: Stub;
+    var worker: thread.Thread;
+    val started: Result[conf.Config, io_error.Error] = stub_start(?stub, 2, 0, false, ?worker);
+    if (is_err[conf.Config, io_error.Error](started)) { ret 1; }
+    var config: conf.Config = unwrap_ok[conf.Config, io_error.Error](started);
+    val slot: *u8 = conf.search_domain(?config, 0);
+    slot[0] = 'c'; slot[1] = 'o'; slot[2] = 'r'; slot[3] = 'p'; slot[4] = 0;
+    config.search_count = 1;
+    var answer: Answer;
+    val outcome: Outcome = resolve_name(?config, "bare", true, true, ?answer);
+    thread.join(?worker);
+    udp.socket_close(?stub.socket);
+    if (outcome != FOUND) { ret 1; }
+    # the canonical name reflects the search domain that resolved
+    if (answer.canonical_length != 9) { ret 1; }
+    if (answer.canonical[4] != '.' || answer.canonical[5] != 'c') { ret 1; }
+    ret 0;
+}
+
+rec TcpStub {
+    udp_socket: udp.Socket;
+    listener: tcp.Listener;
+}
+
+fun tcp_stub_run(argument: *u8) {
+    val stub: *TcpStub = argument::*TcpStub;
+    # truncate both UDP queries, then serve both over TCP
+    var served: usize = 0;
+    for (served < 2) {
+        var request: [512]u8;
+        var source: ip.Endpoint;
+        val got: Result[usize, io_error.Error] = udp.recv_from(?stub.udp_socket, ?request[0], 512, ?source);
+        if (is_err[usize, io_error.Error](got)) { ret; }
+        val length: usize = unwrap_ok[usize, io_error.Error](got);
+        var response: [512]u8;
+        val response_length: usize = stub_answer(?request[0], length, ?response[0], 0, true);
+        udp.send_to(?stub.udp_socket, ?response[0], response_length, source);
+        served = served + 1;
+    }
+    served = 0;
+    for (served < 2) {
+        val accepted: Result[tcp.Stream, io_error.Error] = tcp.accept(?stub.listener);
+        if (is_err[tcp.Stream, io_error.Error](accepted)) { ret; }
+        var stream: tcp.Stream = unwrap_ok[tcp.Stream, io_error.Error](accepted);
+        tcp.stream_set_read_timeout(?stream, 5000);
+        var framed: [512]u8;
+        var received: usize = 0;
+        var expected: usize = 2;
+        for (received < expected) {
+            val got: Result[usize, io_error.Error] = tcp.stream_read(?stream, ?framed[received], expected - received);
+            if (is_err[usize, io_error.Error](got)) { brk; }
+            val n: usize = unwrap_ok[usize, io_error.Error](got);
+            if (n == 0) { brk; }
+            received = received + n;
+            if (received == 2 && expected == 2) {
+                expected = ((framed[0]::usize << 8) | framed[1]::usize) + 2;
+            }
+        }
+        if (received == expected) {
+            var response: [512]u8;
+            val body: usize = stub_answer(?framed[2], received - 2, ?response[2], 0, false);
+            response[0] = (body >> 8)::u8;
+            response[1] = body::u8;
+            var written: usize = 0;
+            for (written < body + 2) {
+                val wrote: Result[usize, io_error.Error] = tcp.stream_write(?stream, ?response[written], body + 2 - written);
+                if (is_err[usize, io_error.Error](wrote)) { brk; }
+                written = written + unwrap_ok[usize, io_error.Error](wrote);
+            }
+        }
+        tcp.stream_close(?stream);
+        served = served + 1;
+    }
+}
+
+test "resolve.lookup: truncation falls back to tcp" {
+    # the resolver connects to the same port over TCP, so the UDP socket must
+    # share the listener's port number; retry a few ephemeral ports
+    var stub: TcpStub;
+    var have_pair: bool = false;
+    var tries: usize = 0;
+    var port: u16 = 0;
+    for (!have_pair && tries < 8) {
+        val listening: Result[tcp.Listener, io_error.Error] = tcp.listen(ip.endpoint(127, 0, 0, 1, 0), 4);
+        if (is_err[tcp.Listener, io_error.Error](listening)) { ret 1; }
+        stub.listener = unwrap_ok[tcp.Listener, io_error.Error](listening);
+        val local: Result[ip.Endpoint, io_error.Error] = tcp.listener_local_endpoint(?stub.listener);
+        if (is_err[ip.Endpoint, io_error.Error](local)) { ret 1; }
+        port = unwrap_ok[ip.Endpoint, io_error.Error](local).port;
+        val bound: Result[udp.Socket, io_error.Error] = udp.bind(ip.endpoint(127, 0, 0, 1, port));
+        if (is_err[udp.Socket, io_error.Error](bound)) {
+            tcp.listener_close(?stub.listener);
+            tries = tries + 1;
+            cnt;
+        }
+        stub.udp_socket = unwrap_ok[udp.Socket, io_error.Error](bound);
+        have_pair = true;
+    }
+    if (!have_pair) { ret 0; }
+    udp.socket_set_recv_timeout(?stub.udp_socket, 5000);
+
+    var worker: thread.Thread;
+    thread.spawn_with(tcp_stub_run, (?stub)::*u8, ?worker);
+
+    var config: conf.Config;
+    conf.defaults(?config);
+    config.nameservers[0] = ip.endpoint(127, 0, 0, 1, port);
+    config.nameserver_count = 1;
+    config.attempts = 1;
+    config.timeout_ms = 5000;
+    var answer: Answer;
+    val outcome: Outcome = query_name(?config, "large.example", nil, true, true, ?answer);
+    thread.join(?worker);
+    udp.socket_close(?stub.udp_socket);
+    tcp.listener_close(?stub.listener);
+    if (outcome != FOUND) { ret 1; }
+    if (answer.count != 2) { ret 1; }
+    ret 0;
+}
+
+test "resolve.lookup: canonical composition" {
+    var answer: Answer;
+    answer.canonical_length = 0;
+    answer.canonical[0] = 0;
+    compose_canonical(?answer, "web", "example.test");
+    if (answer.canonical_length != 16) { ret 1; }
+    if (answer.canonical[3] != '.' || answer.canonical[15] != 't') { ret 1; }
+    answer.canonical_length = 0;
+    compose_canonical(?answer, "host.example.", nil);
+    if (answer.canonical_length != 12 || answer.canonical[11] != 'e') { ret 1; }
+    ret 0;
+}
+
+test "resolve.lookup: dot counting drives search order" {
+    if (count_dots("plain", 5) != 0) { ret 1; }
+    if (count_dots("a.b.c", 5) != 2) { ret 1; }
+    ret 0;
+}
