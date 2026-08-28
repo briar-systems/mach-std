@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.32.0] - 2026-08-28
+
+### Added
+
+#### io: complete owned-region alias queries
+
+- Maximum-address-safe public range validation, inclusive overlap comparison,
+  and checked array-size calculation establish one fail-closed ownership
+  vocabulary (#542).
+- `std.io.runtime.aliases` covers the runtime descriptor and all completion,
+  timer, source, and native-event allocations (#542).
+- `std.net.async.aliases` and `std.net.async.local.aliases` cover driver state,
+  every Linux, Darwin, Windows, and local backend allocation, and the borrowed
+  runtime (#542).
+
+### Changed
+
+- Cross-backend probes now instantiate asynchronous network modules in debug
+  and release with verified IR and emitted assembly (#542).
+- Native CI runs ownership tests through the optimized pipeline on every
+  supported architecture (#542).
+
 ## [0.31.0] - 2026-08-28
 
 ### Added
