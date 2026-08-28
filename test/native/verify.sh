@@ -36,9 +36,11 @@ required=(
     'src/process/exec.mach'
     'src/filesystem.mach'
     'src/io/file/tests.mach'
+    'src/io/runtime.mach'
     'src/net/tcp.mach'
     'src/net/udp.mach'
     'src/net/local.mach'
+    'src/net/async.mach'
     'src/net/async/local.mach'
     'src/chrono/time.mach'
     'src/sync/channel.mach'
@@ -89,3 +91,11 @@ fi
 expected_count="$(wc -l < "$expected_file" | tr -d '[:space:]')"
 echo "OK: $target ran the complete native suite with $expected_count known failures"
 echo "OK: thread, process, file, socket, and timer coverage is present"
+
+release_result="$here/results/$target-ownership-release.log"
+"$mach" test . --target "$target" --profile release --include-deps \
+    --filter 'ownership query' 2>&1 | tee "$release_result" \
+    || fail "$target release ownership suite failed"
+grep -qE '[0-9]+ passed, 0 failed, [0-9]+ total' "$release_result" \
+    || fail "$target release ownership suite produced no clean result"
+echo "OK: $target release ownership tests passed"
