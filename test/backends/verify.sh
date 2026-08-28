@@ -79,12 +79,22 @@ for target in "${targets[@]}"; do
                 fi
                 ;;
             darwin-*)
-                grep -q 'calloc' "$secret_asm" \
+                grep -q '_calloc' "$secret_asm" \
                     || fail "$target $profile: secret allocator omitted libSystem calloc"
-                grep -q 'getentropy' "$secret_asm" \
+                grep -q '_getentropy' "$secret_asm" \
                     || fail "$target $profile: secret entropy omitted libSystem getentropy"
-                grep -q 'free' "$secret_asm" \
+                grep -q '_free' "$secret_asm" \
                     || fail "$target $profile: secret release omitted libSystem free"
+                undefined="$(llvm-nm -u "$exe")"
+                echo "$undefined" | grep -Eq '(^|[[:space:]])_calloc$' \
+                    || fail "$target $profile: Mach-O calloc import is misspelled"
+                echo "$undefined" | grep -Eq '(^|[[:space:]])_getentropy$' \
+                    || fail "$target $profile: Mach-O getentropy import is misspelled"
+                echo "$undefined" | grep -Eq '(^|[[:space:]])_free$' \
+                    || fail "$target $profile: Mach-O free import is misspelled"
+                if echo "$undefined" | grep -Eq '(^|[[:space:]])(calloc|getentropy|free)$'; then
+                    fail "$target $profile: unprefixed Mach-O secret import remains"
+                fi
                 ;;
             windows-*)
                 grep -q 'VirtualAlloc' "$secret_asm" \
@@ -104,7 +114,7 @@ for target in "${targets[@]}"; do
                     release_line="$(echo "$release_body" | grep -n -m1 -E 'syscall|ecall|svc' | cut -d: -f1 || true)"
                     ;;
                 darwin-*)
-                    release_line="$(echo "$release_body" | grep -n -m1 'free' | cut -d: -f1 || true)"
+                    release_line="$(echo "$release_body" | grep -n -m1 '_free' | cut -d: -f1 || true)"
                     ;;
                 windows-*)
                     release_line="$(echo "$release_body" | grep -n -m1 'VirtualFree' | cut -d: -f1 || true)"
