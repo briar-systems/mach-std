@@ -9,13 +9,13 @@ To use the standard library in your Mach project, you can include it as a depend
 ```toml
 [deps.mach-std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v0.32.0"
+ref = "tag/v0.33.0"
 ```
 
 You can also use the Mach dependency manager to add it to your project:
 
 ```bash
-mach dep add mach-std --git https://github.com/briar-systems/mach-std --ref tag/v0.32.0
+mach dep add mach-std --git https://github.com/briar-systems/mach-std --ref tag/v0.33.0
 ```
 
 ## Documentation
@@ -43,6 +43,27 @@ partially torn-down owner, or destroyed owner reports overlap. An empty range
 owns no bytes and reports no overlap. Range validation uses inclusive endpoints,
 so a one-byte range at `usize::MAX` is valid while any range extending beyond it
 is malformed and reports overlap.
+
+### Secret-welded operating-system storage
+
+`std.system.os.secret_allocate`, `secret_deallocate`, and
+`secret_random_fill` keep storage typed as `*^u8` across the complete native
+boundary. They never create a public pointer or integer alias to the secret
+bytes. Linux uses direct syscalls without libc, Darwin uses libSystem, and
+Windows uses the stable virtual-memory and system-entropy APIs.
+The Windows entropy boundary requires Vista SP2 or later for
+`BCRYPT_USE_SYSTEM_PREFERRED_RNG`.
+
+Allocation returns zero-initialized storage, or nil for zero bytes or failure.
+Deallocation wipes the complete logical span before native release and returns
+zero only after releasing the original allocation, except that `(nil, 0)` is a
+successful no-op. A failed release leaves zeroed storage owned by the caller.
+Random fill returns zero only after initializing the complete requested range
+and wipes that complete range before returning any error.
+
+The `^` qualifier enforces secret data flow. These primitives do not lock pages,
+exclude them from swap or process dumps, isolate them across process creation,
+add guard pages, or resist a debugger with process access.
 
 ## Contributing
 

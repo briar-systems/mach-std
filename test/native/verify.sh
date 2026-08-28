@@ -32,6 +32,7 @@ trap 'rm -f "$expected_file" "$actual_file"' EXIT
     || fail "$target suite could not be listed"
 
 required=(
+    'src/system/os/secret.mach'
     'src/sync/thread.mach'
     'src/process/exec.mach'
     'src/filesystem.mach'
