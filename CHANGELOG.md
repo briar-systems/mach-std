@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.0] - 2026-08-28
+
+### Added
+
+#### process: whole-tree child termination
+
+- `spawn_grouped` and `spawn_redirected_grouped` place a child in its own
+  containment group at spawn; `Child.pgid` carries the group token and
+  `terminate_group` signals the entire tree, so a child's own descendants no
+  longer outlive its termination (#534).
+- Unix backends use process groups: the child claims its group before exec, and
+  the parent claims it again from its side, a double-set that also holds under
+  emulators that downgrade vfork suspension. Darwin's real fork uses the same
+  mitigation (#534).
+- Windows uses a job object with kill-on-close, assigned while the child is
+  created suspended and resumed only after assignment, so no grandchild can be
+  spawned outside the job. The job handle closes exactly where the process
+  handle closes, on reap (#534).
+
 ## [0.29.0] - 2026-08-27
 
 ### Added
