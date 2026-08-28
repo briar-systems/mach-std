@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+#### system: secret-welded storage primitives
+
+- `std.system.os.secret_allocate`, `secret_deallocate`, and
+  `secret_random_fill` preserve `*^u8` from zero-initialized native allocation
+  through failure-atomic entropy initialization and wipe-before-release without
+  constructing a public pointer alias (#546).
+- Linux uses direct native syscalls without libc, Darwin uses supported
+  libSystem entry points, and Windows uses VirtualAlloc, VirtualFree, and
+  BCryptGenRandom (#546).
+- The existing Windows `std.system.os.random_fill` now uses checked,
+  chunked BCryptGenRandom calls instead of a mismatched legacy BOOLEAN ABI
+  declaration (#546).
+- Native lifecycle tests, compile-time pointer-erasure refusals, and six-target
+  debug and release IR and assembly gates cover the new boundary (#546).
+
 ## [0.32.0] - 2026-08-28
 
 ### Added
