@@ -19,22 +19,27 @@ mkdir -p dep
 ln -sfn "$(cd ../.. && pwd)" dep/std
 
 targets=(windows-x86_64 darwin-x86_64 darwin-aarch64)
+profiles=(debug release)
 
 for target in "${targets[@]}"; do
-    echo "cross-compiling the backend smoke test for $target with $mach"
     rm -rf "out/$target"
-    log="$("$mach" build . --target "$target" --profile debug -vv 2>&1)" \
-        || { echo "$log" >&2; fail "$target failed to compile"; }
+    for profile in "${profiles[@]}"; do
+        echo "cross-compiling the $profile backend smoke test for $target with $mach"
+        log="$("$mach" build . --target "$target" --profile "$profile" \
+            --emit-ir --emit-asm --verify-ir -vv 2>&1)" \
+            || { echo "$log" >&2; fail "$target $profile failed to compile"; }
 
-    exe="$(find "out/$target" -name backends -type f -print -quit)"
-    [ -n "$exe" ] || fail "$target: no backends binary produced"
+        exe="$(find "out/$target/$profile" -name backends -type f -print -quit)"
+        [ -n "$exe" ] || fail "$target $profile: no backends binary produced"
 
-    # confirm the backend's shared module was actually compiled, not skipped
-    # as a target-gated dead branch.
-    echo "$log" | grep -q "skipped .* target-gated modules" \
-        && fail "$target: target-gated modules were skipped"
-    echo "$log" | grep -q "std.system.os.${target%%-*}.shared" \
-        || fail "$target: std.system.os.${target%%-*}.shared was never compiled"
+        # confirm the backend's shared module was actually compiled
+        echo "$log" | grep -q "skipped .* target-gated modules" \
+            && fail "$target $profile: target-gated modules were skipped"
+        echo "$log" | grep -q "std.system.os.${target%%-*}.shared" \
+            || fail "$target $profile: os backend was never compiled"
+        echo "$log" | grep -q "std.net.async.${target%%-*}" \
+            || fail "$target $profile: network backend was never compiled"
 
-    echo "OK: $target backend compiles ($exe)"
+        echo "OK: $target $profile backends compile ($exe)"
+    done
 done

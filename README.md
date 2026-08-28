@@ -25,6 +25,24 @@ The documentation for the Mach Standard Library can be found in the [doc](./doc)
 > NOTE: The documentation is currently a work in progress and the API is rapidly changing.
 > Please refer to the source code for the most up-to-date information.
 
+### I/O ownership queries
+
+`std.io.runtime.aliases`, `std.net.async.aliases`, and
+`std.net.async.local.aliases` report whether a public byte range overlaps an
+owner descriptor or any backing storage reachable through it. Network driver
+queries include the selected platform backend and the borrowed runtime.
+
+The queries are read-only and allocation-free. The owner and all range
+descriptors must remain immutable for the duration of a query. A caller may
+query while ordinary operations are active because backing addresses and
+capacities do not change, but must synchronize initialization and destruction.
+
+A non-empty malformed range, uninitialized owner, partially initialized owner,
+partially torn-down owner, or destroyed owner reports overlap. An empty range
+owns no bytes and reports no overlap. Range validation uses inclusive endpoints,
+so a one-byte range at `usize::MAX` is valid while any range extending beyond it
+is malformed and reports overlap.
+
 ## Contributing
 
 Contributions are welcome! If you find a bug or have a feature request, please open an issue on GitHub. If you'd like to contribute code, please fork the repository and submit a pull request.
