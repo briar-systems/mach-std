@@ -1,6 +1,6 @@
 # Mach Standard Library
 
-This repository contains the cannonical standard library for the Mach programming language.
+This repository contains the canonical standard library for the Mach programming language.
 
 ## Installation
 
@@ -9,13 +9,13 @@ To use the standard library in your Mach project, you can include it as a depend
 ```toml
 [deps.mach-std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "branch/main"
+ref = "tag/v0.32.0"
 ```
 
 You can also use the Mach dependency manager to add it to your project:
 
 ```bash
-mach dep add mach-std --git https://github.com/briar-systems/mach-std --ref branch/main
+mach dep add mach-std --git https://github.com/briar-systems/mach-std --ref tag/v0.32.0
 ```
 
 ## Documentation
@@ -24,6 +24,25 @@ The documentation for the Mach Standard Library can be found in the [doc](./doc)
 
 > NOTE: The documentation is currently a work in progress and the API is rapidly changing.
 > Please refer to the source code for the most up-to-date information.
+
+### I/O ownership queries
+
+`std.io.runtime.aliases`, `std.net.async.aliases`, and
+`std.net.async.local.aliases` report whether a public byte range overlaps an
+owner descriptor or any backing storage reachable through it. Network driver
+queries include the selected platform backend and the borrowed runtime.
+
+The queries are read-only and allocation-free. Ownership-defining pointers and
+capacities, plus the queried range descriptor, must remain immutable for the
+duration of a query. A caller may query while ordinary operations are active
+because those fields do not change, but must synchronize initialization and
+destruction.
+
+A non-empty malformed range, uninitialized owner, partially initialized owner,
+partially torn-down owner, or destroyed owner reports overlap. An empty range
+owns no bytes and reports no overlap. Range validation uses inclusive endpoints,
+so a one-byte range at `usize::MAX` is valid while any range extending beyond it
+is malformed and reports overlap.
 
 ## Contributing
 
