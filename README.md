@@ -1,6 +1,6 @@
 # Mach Standard Library
 
-This repository contains the cannonical standard library for the Mach programming language.
+This repository contains the canonical standard library for the Mach programming language.
 
 ## Installation
 
@@ -32,10 +32,11 @@ The documentation for the Mach Standard Library can be found in the [doc](./doc)
 owner descriptor or any backing storage reachable through it. Network driver
 queries include the selected platform backend and the borrowed runtime.
 
-The queries are read-only and allocation-free. The owner and all range
-descriptors must remain immutable for the duration of a query. A caller may
-query while ordinary operations are active because backing addresses and
-capacities do not change, but must synchronize initialization and destruction.
+The queries are read-only and allocation-free. Ownership-defining pointers and
+capacities, plus the queried range descriptor, must remain immutable for the
+duration of a query. A caller may query while ordinary operations are active
+because those fields do not change, but must synchronize initialization and
+destruction.
 
 A non-empty malformed range, uninitialized owner, partially initialized owner,
 partially torn-down owner, or destroyed owner reports overlap. An empty range
