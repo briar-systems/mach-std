@@ -13,6 +13,9 @@ cd "$here"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
+command -v llvm-nm >/dev/null || fail "llvm-nm is required"
+command -v llvm-readobj >/dev/null || fail "llvm-readobj is required"
+
 # vendor this checkout's std as the path dependency (dep/std -> repo root).
 mkdir -p dep
 ln -sfn "$(cd ../.. && pwd)" dep/std
@@ -58,6 +61,9 @@ for target in "${targets[@]}"; do
             || fail "$target $profile: secret entropy boundary missing"
         if grep -Eq 'ptrtoint|inttoptr' "$secret_ir"; then
             fail "$target $profile: secret boundary materialized an integer pointer alias"
+        fi
+        if grep -Eq 'std[.]system[.]os[.]secret[.](scripted_fill|all_zero|reset_probe_fill|interrupted_fill|probe_release)' "$secret_ir"; then
+            fail "$target $profile: secret test-only inspection entered the production artifact"
         fi
         release_ir="$(sed -n '/fn @std.system.os.secret.release_all/,/^  fn /p' "$secret_ir")"
         if [ "$profile" = debug ]; then
