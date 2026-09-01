@@ -20,4 +20,6 @@ echo "$log" | grep -q 'expected ptr, found \*\^u8' \
     || { echo "$log" >&2; fail "pointer erasure failed for the wrong reason"; }
 echo "$log" | grep -q 'cannot add or drop the secret qualifier' \
     || { echo "$log" >&2; fail "integer erasure failed for the wrong reason"; }
-echo "OK: pointer and integer erasures preserve the welded-pointer boundary"
+echo "$log" | grep -q 'expected ptr, found \*SecretRecord' \
+    || { echo "$log" >&2; fail "typed pointer erasure failed for the wrong reason"; }
+echo "OK: byte and typed pointer erasures preserve secret storage boundaries"
