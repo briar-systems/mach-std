@@ -9,13 +9,13 @@ To use the standard library in your Mach project, you can include it as a depend
 ```toml
 [deps.mach-std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v0.33.0"
+ref = "tag/v0.34.0"
 ```
 
 You can also use the Mach dependency manager to add it to your project:
 
 ```bash
-mach dep add mach-std --git https://github.com/briar-systems/mach-std --ref tag/v0.33.0
+mach dep add mach-std --git https://github.com/briar-systems/mach-std --ref tag/v0.34.0
 ```
 
 ## Documentation
@@ -49,8 +49,10 @@ is malformed and reports overlap.
 `std.system.os.secret_allocate`, `secret_deallocate`, and
 `secret_random_fill` keep storage typed as `*^u8` across the complete native
 boundary. They never create a public pointer or integer alias to the secret
-bytes. Linux uses direct syscalls without libc, Darwin uses libSystem, and
-Windows uses the stable virtual-memory and system-entropy APIs.
+bytes. `secret_allocate_typed[T]` and `secret_deallocate_typed[T]` preserve the
+exact `*T` shape for records with deeply secret fields. Linux uses direct
+syscalls without libc, Darwin uses libSystem, and Windows uses the stable
+virtual-memory and system-entropy APIs.
 The Windows entropy boundary requires Vista SP2 or later for
 `BCRYPT_USE_SYSTEM_PREFERRED_RNG`.
 
@@ -60,6 +62,11 @@ zero only after releasing the original allocation, except that `(nil, 0)` is a
 successful no-op. A failed release leaves zeroed storage owned by the caller.
 Random fill returns zero only after initializing the complete requested range
 and wipes that complete range before returning any error.
+
+Typed allocation checks the complete `count * $size_of(T)` geometry and honors
+`$align_of(T)`, including over-aligned records. Typed deallocation requires the
+original element count, validates the stored allocation geometry, and wipes all
+bytes in every element, including padding, before native release.
 
 The `^` qualifier enforces secret data flow. These primitives do not lock pages,
 exclude them from swap or process dumps, isolate them across process creation,
