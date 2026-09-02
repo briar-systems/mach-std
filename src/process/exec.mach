@@ -2,6 +2,7 @@
 
 use std.types.bool.bool;
 use std.types.bool.true;
+use std.types.bool.false;
 use std.types.size.usize;
 use std.types.size.isize;
 use std.types.string.str;
@@ -17,6 +18,7 @@ use std.allocator.fixed;
 
 use A: std.allocator;
 use R: std.types.result;
+use O: std.types.option;
 
 use std.types.path;
 use std.process.env;
@@ -26,6 +28,9 @@ use m_reader: std.io.reader;
 use io_handle: std.io.handle;
 
 use std.system.os;
+use cancel: std.sync.cancel;
+use tm: std.chrono.time;
+use duration: std.chrono.duration;
 
 # spawn_grouped, spawn_redirected_grouped, and terminate_group below give
 # every target the same signature; the underlying primitive is platform-
@@ -269,6 +274,81 @@ pub fun spawn_redirected_grouped(pathname: str, argv: **u8, envp: **u8, stdout_f
     }
 }
 
+# the spawn primitives take a nil cwd to mean "inherit this process's", and a
+# caller with nothing to say is far more likely to have an empty string in hand
+# than a nil pointer. chdir("") fails, so passing the empty string straight
+# through would kill the child with a 126 rather than inheriting.
+fun cwd_or_inherit(cwd: str) *u8 {
+    if (str_empty(cwd)) { ret nil; }
+    ret cwd::*u8;
+}
+
+# start a process in a given working directory without waiting
+#
+# the directory is applied in the CHILD after the fork and before the exec, so
+# this process's own working directory is never disturbed and two spawns into
+# different directories cannot race each other.
+# ---
+# pathname: path to executable
+# argv:     null-terminated argument array
+# envp:     null-terminated environment array
+# cwd:      directory to run in, or empty to inherit this process's
+# ret:      child handle, or an error message
+pub fun spawn_in(pathname: str, argv: **u8, envp: **u8, cwd: str) R.Result[Child, str] {
+    val pid: i64 = os.spawn_in(pathname, argv, envp, cwd_or_inherit(cwd));
+    if (pid < 0) { ret R.err[Child, str]("spawn failed"); }
+    ret R.ok[Child, str](Child{pid: pid, pgid: 0});
+}
+
+# start a process in a given working directory with its standard streams bound
+# to caller-supplied descriptors
+# ---
+# cwd:       directory to run in, or empty to inherit this process's
+# stdin_fd:  descriptor for the child's stdin, or -1 to inherit
+# stdout_fd: descriptor for the child's stdout, or -1 to inherit
+# stderr_fd: descriptor for the child's stderr, or -1 to inherit
+# ret:       child handle, or an error message
+pub fun spawn_redirected_in(pathname: str, argv: **u8, envp: **u8, cwd: str,
+                            stdin_fd: i32, stdout_fd: i32,
+                            stderr_fd: i32) R.Result[Child, str] {
+    val pid: i64 = os.spawn_redirected_in(pathname, argv, envp, cwd_or_inherit(cwd), stdin_fd, stdout_fd, stderr_fd);
+    if (pid < 0) { ret R.err[Child, str]("spawn failed"); }
+    ret R.ok[Child, str](Child{pid: pid, pgid: 0});
+}
+
+# start a process in a given working directory, with redirected streams, as the
+# leader of its own group
+#
+# this is the form to reach for when the child may spawn children of its own: a
+# build step running a shell that runs a compiler. terminate_group then reaches
+# the whole tree, where terminate_child would leave the grandchildren orphaned
+# and still running.
+# ---
+# ret: child handle whose pgid identifies the group, or an error message
+pub fun spawn_redirected_in_grouped(pathname: str, argv: **u8, envp: **u8, cwd: str,
+                                    stdin_fd: i32, stdout_fd: i32,
+                                    stderr_fd: i32) R.Result[Child, str] {
+    $if ($mach.build.os == $mach.os.linux) {
+        val pid: i64 = linux.spawn_redirected_in_grouped(pathname, argv, envp, cwd_or_inherit(cwd), stdin_fd, stdout_fd, stderr_fd);
+        if (pid < 0) { ret R.err[Child, str]("spawn failed"); }
+        ret R.ok[Child, str](Child{pid: pid, pgid: pid});
+    }
+    $or ($mach.build.os == $mach.os.darwin) {
+        val pid: i64 = darwin.spawn_redirected_in_grouped(pathname, argv, envp, cwd_or_inherit(cwd), stdin_fd, stdout_fd, stderr_fd);
+        if (pid < 0) { ret R.err[Child, str]("spawn failed"); }
+        ret R.ok[Child, str](Child{pid: pid, pgid: pid});
+    }
+    $or ($mach.build.os == $mach.os.windows) {
+        var job: isize = 0;
+        val pid: i64 = windows.spawn_redirected_in_grouped(pathname, argv, envp, cwd_or_inherit(cwd), stdin_fd, stdout_fd, stderr_fd, ?job);
+        if (pid < 0) { ret R.err[Child, str]("spawn failed"); }
+        ret R.ok[Child, str](Child{pid: pid, pgid: job::i64});
+    }
+    $or {
+        ret R.err[Child, str]("process groups are not supported on this platform");
+    }
+}
+
 # forcefully stop a child without reaping it
 #
 # the child remains waitable after this succeeds. callers must still pass it
@@ -335,6 +415,25 @@ pub fun wait(child: Child) R.Result[ExitStatus, str] {
     ret R.ok[ExitStatus, str](ExitStatus{raw: wstatus});
 }
 
+# reap a child if it has already exited, without blocking
+#
+# this is the piece a caller needs to enforce a deadline: blocking in wait
+# gives up the ability to notice that a scope expired, so a supervisor polls
+# with this instead and keeps its own timing.
+#
+# a child that is still running is not an error; the result is simply absent.
+# ---
+# child: child handle from any spawn
+# ret:   the exit status if it has terminated, absent if it is still running,
+#        or an error message
+pub fun try_wait(child: Child) R.Result[O.Option[ExitStatus], str] {
+    var wstatus: i32 = 0;
+    val r: i64 = os.wait_pid(child.pid, ?wstatus, os.WNOHANG);
+    if (r < 0) { ret R.err[O.Option[ExitStatus], str]("wait failed"); }
+    if (r == 0) { ret R.ok[O.Option[ExitStatus], str](O.none[ExitStatus]()); }
+    ret R.ok[O.Option[ExitStatus], str](O.some[ExitStatus](ExitStatus{raw: wstatus}));
+}
+
 # block until any child of this process exits
 #
 # POSIX wait(-1) semantics on every platform (the windows layer emulates the
@@ -353,6 +452,70 @@ pub fun wait_any() R.Result[Reaped, str] {
     if (pid <= 0) { ret R.err[Reaped, str]("wait failed"); }
 
     ret R.ok[Reaped, str](Reaped{child: Child{pid: pid, pgid: 0}, status: ExitStatus{raw: wstatus}});
+}
+
+# how a supervised child ended
+pub rec Supervised {
+    status: ExitStatus;
+    # true when the deadline or a cancellation ended it rather than the child
+    # finishing on its own
+    terminated: bool;
+    # the reason the scope carried when it ended, ACTIVE when the child won
+    reason: cancel.Reason;
+}
+
+# how often a supervised wait looks at the child and the clock
+val SUPERVISE_POLL_NSEC: i64 = 2000000;
+
+# run a child to completion under a cancellation scope, terminating its whole
+# group if the scope ends first
+#
+# this is the piece that makes a deadline mean something for a process. a scope
+# with a deadline is only a promise until somebody enforces it, and enforcing it
+# on a single child is not enough when that child spawned children of its own: a
+# build step that runs a shell that runs a compiler leaves the compiler running
+# if only the shell is signalled. so the group is what gets terminated, which is
+# why the child should come from one of the grouped spawns.
+#
+# the child is always reaped, including when the deadline is what ended it, so a
+# terminated child never becomes a zombie. the caller learns which happened from
+# the returned reason.
+#
+# a child that is not in a group is still supervised; expiry then terminates
+# just that child, and any grandchildren it started survive. that is a weaker
+# guarantee, not a silent one: prefer a grouped spawn when the child may spawn.
+# ---
+# child: child handle, ideally from a grouped spawn
+# scope: the scope whose deadline or cancellation bounds the child
+# ret:   how it ended, or an error message
+pub fun wait_within(child: Child, scope: *cancel.Scope) R.Result[Supervised, str] {
+    if (scope == nil) { ret R.err[Supervised, str]("supervision scope is nil"); }
+
+    var terminated: bool = false;
+    for {
+        val probe: R.Result[O.Option[ExitStatus], str] = try_wait(child);
+        if (R.is_err[O.Option[ExitStatus], str](probe)) {
+            ret R.err[Supervised, str](R.unwrap_err[O.Option[ExitStatus], str](probe));
+        }
+        val got: O.Option[ExitStatus] = R.unwrap_ok[O.Option[ExitStatus], str](probe);
+        if (O.is_some[ExitStatus](got)) {
+            ret R.ok[Supervised, str](Supervised{
+                status: O.unwrap[ExitStatus](got),
+                terminated: terminated,
+                reason: cancel.reason(scope)});
+        }
+
+        # the child is still running, so ask whether it is still allowed to
+        cancel.expire(scope, tm.monotonic());
+        val why: cancel.Reason = cancel.reason(scope);
+        if (why != cancel.ACTIVE && !terminated) {
+            terminated = true;
+            if (child.pgid != 0) { terminate_group(child); }
+            or { terminate_child(child); }
+            # fall through and keep polling: the child still has to be reaped
+        }
+        os.sleep(SUPERVISE_POLL_NSEC);
+    }
 }
 
 # check if the process exited normally
@@ -1212,3 +1375,191 @@ fun list_of(a: *A.Allocator, first: str, second: str) str {
 # empty entry around a directory that does not hold the leaf
 fun sep1(a: *A.Allocator) str { ret list_of(a, "", ""); }
 fun sep2(a: *A.Allocator) str { ret list_of(a, "", scratch_dir()); }
+
+
+# a command that runs long enough to still be alive when the deadline fires,
+# spelled for whichever shell the platform has
+fun long_running_argv() [4]usize {
+    $if ($mach.build.os == $mach.os.windows) {
+        ret make_shell_argv("ping -n 30 127.0.0.1 >NUL");
+    }
+    $or {
+        var buf: [4]usize;
+        buf[0] = ("/bin/sh")::usize;
+        buf[1] = ("-c")::usize;
+        buf[2] = ("sleep 30")::usize;
+        buf[3] = 0;
+        ret buf;
+    }
+}
+
+fun long_running_path() str {
+    $if ($mach.build.os == $mach.os.windows) { ret shell_path(); }
+    $or { ret "/bin/sh"; }
+}
+
+fun exit_seven_argv() [4]usize {
+    $if ($mach.build.os == $mach.os.windows) {
+        ret make_shell_argv("exit 7");
+    }
+    $or {
+        var buf: [4]usize;
+        buf[0] = ("/bin/sh")::usize;
+        buf[1] = ("-c")::usize;
+        buf[2] = ("exit 7")::usize;
+        buf[3] = 0;
+        ret buf;
+    }
+}
+
+# try_wait must not block on a live child, and must report the same termination
+# wait would once the child is gone
+test "std.process.exec.try_wait:absent_while_running_then_present" {
+    var argv: [4]usize = long_running_argv();
+    val sr: R.Result[Child, str] = spawn(long_running_path(), (?argv[0])::**u8, nil);
+    if (R.is_err[Child, str](sr)) { ret 1; }
+    val child: Child = R.unwrap_ok[Child, str](sr);
+
+    # the child is still running, so the answer is absent rather than a block
+    val first: R.Result[O.Option[ExitStatus], str] = try_wait(child);
+    if (R.is_err[O.Option[ExitStatus], str](first)) { terminate_child(child); wait(child); ret 2; }
+    if (O.is_some[ExitStatus](R.unwrap_ok[O.Option[ExitStatus], str](first))) {
+        terminate_child(child); wait(child); ret 3;
+    }
+
+    terminate_child(child);
+    var seen: bool = false;
+    var spins: i32 = 0;
+    for (spins < 500 && !seen) {
+        val probe: R.Result[O.Option[ExitStatus], str] = try_wait(child);
+        if (R.is_err[O.Option[ExitStatus], str](probe)) { ret 4; }
+        if (O.is_some[ExitStatus](R.unwrap_ok[O.Option[ExitStatus], str](probe))) { seen = true; }
+        or { os.sleep(2000000); }
+        spins = spins + 1;
+    }
+    if (!seen) { ret 5; }
+    ret 0;
+}
+
+# a child that finishes inside its deadline is reported as its own outcome, not
+# as a termination
+test "std.process.exec.wait_within:a_child_that_finishes_first_is_not_terminated" {
+    var scope: cancel.Scope;
+    val deadline: tm.Time = tm.time_add(tm.monotonic(), 30000 * duration.MILLISECOND);
+    if (!cancel.make_root(?scope, true, deadline)) { ret 1; }
+
+    var argv: [4]usize = exit_seven_argv();
+    val sr: R.Result[Child, str] =
+        spawn_redirected_in_grouped(long_running_path(), (?argv[0])::**u8, nil, "", -1, -1, -1);
+    if (R.is_err[Child, str](sr)) { cancel.destroy(?scope); ret 2; }
+    val child: Child = R.unwrap_ok[Child, str](sr);
+
+    val wr: R.Result[Supervised, str] = wait_within(child, ?scope);
+    cancel.destroy(?scope);
+    if (R.is_err[Supervised, str](wr)) { ret 3; }
+    val sup: Supervised = R.unwrap_ok[Supervised, str](wr);
+
+    if (sup.terminated) { ret 4; }
+    if (sup.reason != cancel.ACTIVE) { ret 5; }
+    if (!exited(sup.status) || code(sup.status) != 7) { ret 6; }
+    ret 0;
+}
+
+# the deadline is what makes a scope mean anything for a process: a child that
+# outlives it is terminated, is still reaped rather than left a zombie, and on
+# a grouped spawn takes its grandchildren with it
+test "std.process.exec.wait_within:an_expired_deadline_terminates_and_reaps" {
+    var scope: cancel.Scope;
+    val deadline: tm.Time = tm.time_add(tm.monotonic(), 50 * duration.MILLISECOND);
+    if (!cancel.make_root(?scope, true, deadline)) { ret 1; }
+
+    var argv: [4]usize = long_running_argv();
+    val sr: R.Result[Child, str] =
+        spawn_redirected_in_grouped(long_running_path(), (?argv[0])::**u8, nil, "", -1, -1, -1);
+    if (R.is_err[Child, str](sr)) { cancel.destroy(?scope); ret 2; }
+    val child: Child = R.unwrap_ok[Child, str](sr);
+    if (child.pgid == 0) { cancel.destroy(?scope); terminate_child(child); wait(child); ret 3; }
+
+    # the child would run for 30 seconds; the deadline is 50ms, so returning at
+    # all is the first half of the claim
+    val wr: R.Result[Supervised, str] = wait_within(child, ?scope);
+    cancel.destroy(?scope);
+    if (R.is_err[Supervised, str](wr)) { ret 4; }
+    val sup: Supervised = R.unwrap_ok[Supervised, str](wr);
+    if (!sup.terminated) { ret 5; }
+    if (sup.reason != cancel.TIMED_OUT) { ret 6; }
+
+    # and it was reaped on the way out, so a second wait finds nothing rather
+    # than a zombie
+    var wstatus: i32 = 0;
+    if (os.wait_pid(child.pid, ?wstatus, os.WNOHANG) > 0) { ret 7; }
+    ret 0;
+}
+
+# the grandchild half of the same claim: a shell that backgrounds another
+# process and then blocks is not individually reachable, so only terminating
+# the GROUP on expiry reaches the process the deadline was really about
+test "std.process.exec.wait_within:an_expired_deadline_reaches_a_grandchild" {
+    $if ($mach.build.os == $mach.os.windows) {
+        # cmd.exe has no `&` backgrounding with a `$!`-style way to recover the
+        # new pid, so the windows leg is covered by the group test above
+        ret 0;
+    }
+    $or {
+        var out_buf: [32]u8;
+        var fds: [2]i32;
+        if (os.pipe(?fds[0]) < 0) { ret 1; }
+
+        var argv: [4]usize;
+        argv[0] = ("/bin/sh")::usize;
+        argv[1] = ("-c")::usize;
+        argv[2] = ("sleep 30 & echo $!; wait")::usize;
+        argv[3] = 0;
+
+        val sr: R.Result[Child, str] =
+            spawn_redirected_in_grouped("/bin/sh", (?argv[0])::**u8, nil, "", -1, fds[1], -1);
+        if (R.is_err[Child, str](sr)) { os.close(fds[0]); os.close(fds[1]); ret 2; }
+        os.close(fds[1]);
+        val shell: Child = R.unwrap_ok[Child, str](sr);
+        if (shell.pgid == 0) { os.close(fds[0]); terminate_child(shell); wait(shell); ret 3; }
+
+        val n: i64 = os.read(fds[0], ?out_buf[0], 32);
+        os.close(fds[0]);
+        if (n <= 0) { terminate_group(shell); wait(shell); ret 4; }
+        var grandchild: i64 = 0;
+        var i: usize = 0;
+        for (i < n::usize) {
+            val c: u8 = out_buf[i];
+            if (c >= '0'::u8 && c <= '9'::u8) { grandchild = grandchild * 10 + (c - '0'::u8)::i64; }
+            i = i + 1;
+        }
+        if (grandchild <= 0) { terminate_group(shell); wait(shell); ret 5; }
+
+        var scope: cancel.Scope;
+        val deadline: tm.Time = tm.time_add(tm.monotonic(), 50 * duration.MILLISECOND);
+        if (!cancel.make_root(?scope, true, deadline)) { terminate_group(shell); wait(shell); ret 6; }
+
+        val wr: R.Result[Supervised, str] = wait_within(shell, ?scope);
+        cancel.destroy(?scope);
+        if (R.is_err[Supervised, str](wr)) { ret 7; }
+        val sup: Supervised = R.unwrap_ok[Supervised, str](wr);
+        if (!sup.terminated || sup.reason != cancel.TIMED_OUT) { ret 8; }
+
+        # the grandchild was never our own child, so its disappearance is proof
+        # the whole group was signalled and not just the process we waited on
+        var gone: bool = false;
+        var spins: i32 = 0;
+        for (spins < 500 && !gone) {
+            $if ($mach.build.os == $mach.os.linux) {
+                if (linux.getpgid(grandchild) < 0) { gone = true; }
+            }
+            $or ($mach.build.os == $mach.os.darwin) {
+                if (darwin.getpgid(grandchild) < 0) { gone = true; }
+            }
+            if (!gone) { os.sleep(2000000); }
+            spins = spins + 1;
+        }
+        if (!gone) { ret 9; }
+        ret 0;
+    }
+}
