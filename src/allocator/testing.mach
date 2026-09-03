@@ -1,0 +1,464 @@
+# an allocator built to make memory bugs fail loudly in tests
+#
+# the production allocators are forgiving in ways that hide defects. a page
+# allocator hands back kernel-zeroed memory, so reading an uninitialized field
+# looks like reading a zero. it rounds every request up to a page, so reading
+# one byte past the end of a small object lands in slack that is still mapped
+# and still readable. and it never runs out, so the failure path of every
+# allocating function goes untested. this allocator removes all three
+# forgivenesses.
+#
+# ## strict sizes
+#
+# an allocation is placed so that its LAST byte is the last byte of a mapped
+# page, and the page immediately after it is mapped unreadable. reading or
+# writing even one byte past the end of an allocation therefore faults at the
+# exact moment it happens, rather than silently returning slack that happens to
+# be mapped. the cost is one guard page per live allocation, which is why this
+# belongs in tests and not in production.
+#
+# ## poison
+#
+# fresh memory is filled with `POISON_NEW` rather than left zeroed, so code that
+# reads a field it never wrote sees an implausible value instead of a plausible
+# zero. freed memory is overwritten with `POISON_FREE` before the mapping is
+# torn down, so a use-after-free that happens to reach still-mapped memory reads
+# an implausible value too.
+#
+# ## fail at N
+#
+# `fail_at` makes the Nth allocation from this allocator fail, counting from
+# one. a test that runs the same operation once per ordinal, from one to the
+# number of allocations the operation makes, exercises every allocation-failure
+# path in it. `live` and `leaked` then say whether the operation cleaned up
+# after itself on each of those paths, which is the property that matters and
+# the one that is otherwise almost impossible to check.
+#
+# ## accounting
+#
+# every allocation is recorded until it is freed. `live` is how many are
+# outstanding, `leaked` is whether any are, and a free of a pointer this
+# allocator did not hand out, or handed out and already took back, is counted
+# as a double free rather than being ignored.
+
+use O: std.types.option;
+use R: std.types.result;
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.allocator;
+use std.system.os;
+
+# filled into memory as it is handed out, so an uninitialized read is visible
+pub val POISON_NEW:  u8 = 0xAA;
+# written over memory as it is taken back, so a use-after-free is visible
+pub val POISON_FREE: u8 = 0xDE;
+
+# how many live allocations one instance can track at once
+pub val MAX_TRACKED: usize = 4096;
+
+rec Block {
+    # the address handed to the caller
+    base:  ptr;
+    # what the caller asked for
+    size:  usize;
+    # the start of the whole mapping, which is where the guard lives
+    map:   ptr;
+    # the total mapped length, payload pages plus the guard page
+    span:  usize;
+    live:  bool;
+}
+
+# a tracking, guarding, failing allocator
+#
+# create with `make`, hand `?state.a` to the code under test, and read the
+# counters afterwards. one instance is not safe to share across threads.
+pub rec Testing {
+    # the interface to hand to code under test
+    a: allocator.Allocator;
+
+    # the ordinal of the allocation that must fail, counting from one; zero
+    # means never fail
+    fail_at: usize;
+    # how many allocation requests have been made
+    attempts: usize;
+
+    # how many allocations are outstanding
+    live: usize;
+    # how many allocations have ever been made
+    total: usize;
+    # frees of a pointer this allocator did not currently own
+    double_frees: usize;
+    # allocations refused because tracking is full rather than because of
+    # `fail_at`; a test that trips this needs a bigger `MAX_TRACKED`
+    exhausted: usize;
+
+    blocks: [4096]Block;
+    used:   usize;
+}
+
+fun page_span(size: usize) usize {
+    val ps: usize = os.page_size();
+    var pages: usize = size / ps;
+    if (size % ps != 0) { pages = pages + 1; }
+    if (pages == 0) { pages = 1; }
+    ret pages * ps;
+}
+
+fun fill(p: ptr, len: usize, b: u8) {
+    val bytes: *u8 = p::*u8;
+    var i: usize = 0;
+    for (i < len) { bytes[i] = b; i = i + 1; }
+}
+
+# map payload pages followed by one unreadable guard page, and return the
+# address whose end is flush with the last payload byte
+fun map_guarded(size: usize, out_map: *ptr, out_span: *usize) ptr {
+    val ps:      usize = os.page_size();
+    val payload: usize = page_span(size);
+    val span:    usize = payload + ps;
+
+    val map: ptr = os.allocate(span);
+    if (map == nil) { ret nil; }
+
+    # the trailing page is the guard: unreadable, so a one-byte overrun faults
+    if (os.protect((map::usize + payload)::ptr, ps, os.PROT_NONE::u32) < 0) {
+        os.deallocate(map, span);
+        ret nil;
+    }
+
+    @out_map  = map;
+    @out_span = span;
+    # flush the END of the allocation against the guard
+    ret (map::usize + payload - size)::ptr;
+}
+
+fun find_block(t: *Testing, p: ptr) usize {
+    var i: usize = 0;
+    for (i < t.used) {
+        if (t.blocks[i].live && t.blocks[i].base == p) { ret i; }
+        i = i + 1;
+    }
+    ret t.used;
+}
+
+fun record(t: *Testing, base: ptr, size: usize, map: ptr, span: usize) bool {
+    var i: usize = 0;
+    for (i < t.used) {
+        if (!t.blocks[i].live) {
+            t.blocks[i] = Block{base: base, size: size, map: map, span: span, live: true};
+            ret true;
+        }
+        i = i + 1;
+    }
+    if (t.used >= MAX_TRACKED) { ret false; }
+    t.blocks[t.used] = Block{base: base, size: size, map: map, span: span, live: true};
+    t.used = t.used + 1;
+    ret true;
+}
+
+fun do_allocate(ctx: ptr, size: usize, align: usize) O.Option[ptr] {
+    val t: *Testing = ctx::*Testing;
+    if (size == 0) { ret O.none[ptr](); }
+
+    t.attempts = t.attempts + 1;
+    if (t.fail_at != 0 && t.attempts == t.fail_at) { ret O.none[ptr](); }
+
+    var map:  ptr   = nil;
+    var span: usize = 0;
+    val base: ptr = map_guarded(size, ?map, ?span);
+    if (base == nil) { ret O.none[ptr](); }
+
+    if (!record(t, base, size, map, span)) {
+        os.deallocate(map, span);
+        t.exhausted = t.exhausted + 1;
+        ret O.none[ptr]();
+    }
+
+    fill(base, size, POISON_NEW);
+    t.live  = t.live + 1;
+    t.total = t.total + 1;
+    ret O.some[ptr](base);
+}
+
+fun do_deallocate(ctx: ptr, p: ptr, size: usize, align: usize) i64 {
+    val t: *Testing = ctx::*Testing;
+    if (p == nil) { ret 0; }
+
+    val idx: usize = find_block(t, p);
+    if (idx == t.used) {
+        # either never handed out, or handed out and already taken back
+        t.double_frees = t.double_frees + 1;
+        ret -1;
+    }
+
+    val b: Block = t.blocks[idx];
+    fill(b.base, b.size, POISON_FREE);
+    t.blocks[idx].live = false;
+    t.live = t.live - 1;
+    os.deallocate(b.map, b.span);
+    ret 0;
+}
+
+fun do_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) O.Option[ptr] {
+    val t: *Testing = ctx::*Testing;
+    if (p == nil) { ret do_allocate(ctx, new_size, align); }
+    if (new_size == 0) {
+        do_deallocate(ctx, p, old_size, align);
+        ret O.none[ptr]();
+    }
+
+    # a fresh mapping every time: growing in place would silently widen the
+    # gap to the guard page and lose the overrun check
+    val fresh: O.Option[ptr] = do_allocate(ctx, new_size, align);
+    if (O.is_none[ptr](fresh)) { ret fresh; }
+    val dst: ptr = O.unwrap[ptr](fresh);
+
+    var copy: usize = old_size;
+    if (new_size < copy) { copy = new_size; }
+    val s: *u8 = p::*u8;
+    val d: *u8 = dst::*u8;
+    var i: usize = 0;
+    for (i < copy) { d[i] = s[i]; i = i + 1; }
+
+    do_deallocate(ctx, p, old_size, align);
+    ret O.some[ptr](dst);
+}
+
+# initialize a testing allocator
+#
+# the instance owns the mappings it hands out, so it must outlive every
+# allocation made through it, and `dnit` must run while those are still
+# reachable.
+# ---
+# t: the instance to initialize
+pub fun make(t: *Testing) O.Option[str] {
+    if (t == nil) { ret O.some[str]("testing allocator is nil"); }
+
+    t.fail_at      = 0;
+    t.attempts     = 0;
+    t.live         = 0;
+    t.total        = 0;
+    t.double_frees = 0;
+    t.exhausted    = 0;
+    t.used         = 0;
+
+    t.a.ctx           = (t)::ptr;
+    t.a.fn_allocate   = do_allocate;
+    t.a.fn_reallocate = do_reallocate;
+    t.a.fn_deallocate = do_deallocate;
+    ret O.none[str]();
+}
+
+# the allocator interface to hand to the code under test
+pub fun allocator_of(t: *Testing) *allocator.Allocator {
+    ret ?t.a;
+}
+
+# make the `n`th allocation from now fail, counting the allocations this
+# instance has already served
+#
+# passing zero disables failure injection.
+pub fun fail_at_ordinal(t: *Testing, n: usize) {
+    t.fail_at = n;
+}
+
+# stop failing allocations
+pub fun clear_failure(t: *Testing) {
+    t.fail_at = 0;
+}
+
+# how many allocations are outstanding
+pub fun live_count(t: *Testing) usize { ret t.live; }
+
+# how many allocations this instance has ever served
+pub fun total_count(t: *Testing) usize { ret t.total; }
+
+# how many allocation requests have been made, including the refused ones
+pub fun attempt_count(t: *Testing) usize { ret t.attempts; }
+
+# true when anything allocated through this instance was never freed
+pub fun leaked(t: *Testing) bool { ret t.live != 0; }
+
+# how many frees named a pointer this instance did not currently own
+pub fun double_free_count(t: *Testing) usize { ret t.double_frees; }
+
+# true when tracking filled up, which makes the other counters unreliable
+pub fun tracking_exhausted(t: *Testing) bool { ret t.exhausted != 0; }
+
+# release everything still outstanding and reset the counters
+#
+# leaks are reported by `leaked` before this runs; afterwards the instance is
+# clean and can be reused.
+# ---
+# ret: how many live allocations had to be reclaimed, which is the leak count
+pub fun dnit(t: *Testing) usize {
+    if (t == nil) { ret 0; }
+    var reclaimed: usize = 0;
+    var i: usize = 0;
+    for (i < t.used) {
+        if (t.blocks[i].live) {
+            os.deallocate(t.blocks[i].map, t.blocks[i].span);
+            t.blocks[i].live = false;
+            reclaimed = reclaimed + 1;
+        }
+        i = i + 1;
+    }
+    t.used = 0;
+    t.live = 0;
+    ret reclaimed;
+}
+
+test "std.allocator.testing: fail_at refuses exactly the named ordinal" {
+    var t: Testing;
+    if (O.is_some[str](make(?t))) { ret 1; }
+    fail_at_ordinal(?t, 2);
+
+    val first: R.Result[*u8, *u8] = allocator.allocate[u8](?t.a, 8);
+    if (R.is_err[*u8, *u8](first)) { dnit(?t); ret 2; }
+
+    val second: R.Result[*u8, *u8] = allocator.allocate[u8](?t.a, 8);
+    if (R.is_ok[*u8, *u8](second)) { dnit(?t); ret 3; }
+
+    val third: R.Result[*u8, *u8] = allocator.allocate[u8](?t.a, 8);
+    if (R.is_err[*u8, *u8](third)) { dnit(?t); ret 4; }
+
+    # the refused request counts as an attempt but not as an allocation
+    if (attempt_count(?t) != 3) { dnit(?t); ret 5; }
+    if (total_count(?t) != 2)   { dnit(?t); ret 6; }
+    if (live_count(?t) != 2)    { dnit(?t); ret 7; }
+
+    if (dnit(?t) != 2) { ret 8; }
+    ret 0;
+}
+
+test "std.allocator.testing: live count and leak report track every block" {
+    var t: Testing;
+    if (O.is_some[str](make(?t))) { ret 1; }
+
+    val a: R.Result[*u8, *u8] = allocator.allocate[u8](?t.a, 32);
+    val b: R.Result[*u8, *u8] = allocator.allocate[u8](?t.a, 64);
+    if (R.is_err[*u8, *u8](a) || R.is_err[*u8, *u8](b)) { dnit(?t); ret 2; }
+    if (live_count(?t) != 2) { dnit(?t); ret 3; }
+    if (!leaked(?t)) { dnit(?t); ret 4; }
+
+    allocator.deallocate[u8](?t.a, R.unwrap_ok[*u8, *u8](a), 32);
+    if (live_count(?t) != 1) { dnit(?t); ret 5; }
+    allocator.deallocate[u8](?t.a, R.unwrap_ok[*u8, *u8](b), 64);
+    if (live_count(?t) != 0) { dnit(?t); ret 6; }
+    if (leaked(?t)) { dnit(?t); ret 7; }
+
+    # nothing outstanding, so nothing to reclaim
+    if (dnit(?t) != 0) { ret 8; }
+    ret 0;
+}
+
+test "std.allocator.testing: freeing a block twice is reported, not ignored" {
+    var t: Testing;
+    if (O.is_some[str](make(?t))) { ret 1; }
+
+    val a: R.Result[*u8, *u8] = allocator.allocate[u8](?t.a, 16);
+    if (R.is_err[*u8, *u8](a)) { dnit(?t); ret 2; }
+    val p: *u8 = R.unwrap_ok[*u8, *u8](a);
+
+    allocator.deallocate[u8](?t.a, p, 16);
+    if (double_free_count(?t) != 0) { dnit(?t); ret 3; }
+
+    allocator.deallocate[u8](?t.a, p, 16);
+    if (double_free_count(?t) != 1) { dnit(?t); ret 4; }
+
+    dnit(?t);
+    ret 0;
+}
+
+test "std.allocator.testing: fresh memory is poisoned, not zeroed" {
+    var t: Testing;
+    if (O.is_some[str](make(?t))) { ret 1; }
+
+    val a: R.Result[*u8, *u8] = allocator.allocate[u8](?t.a, 8);
+    if (R.is_err[*u8, *u8](a)) { dnit(?t); ret 2; }
+    val p: *u8 = R.unwrap_ok[*u8, *u8](a);
+
+    # a page allocator would hand back zeroes here and hide an uninitialized read
+    var i: usize = 0;
+    for (i < 8) {
+        if (p[i] != POISON_NEW) { dnit(?t); ret 3; }
+        i = i + 1;
+    }
+    dnit(?t);
+    ret 0;
+}
+
+test "std.allocator.testing: an allocation ends flush against its guard page" {
+    var t: Testing;
+    if (O.is_some[str](make(?t))) { ret 1; }
+
+    val a: R.Result[*u8, *u8] = allocator.allocate[u8](?t.a, 24);
+    if (R.is_err[*u8, *u8](a)) { dnit(?t); ret 2; }
+    val p: *u8 = R.unwrap_ok[*u8, *u8](a);
+
+    # the byte after the last one belongs to the guard page, so the allocation
+    # must end exactly on a page boundary for an overrun to fault
+    val ps:  usize = os.page_size();
+    val end: usize = (p::usize) + 24;
+    if (end % ps != 0) { dnit(?t); ret 3; }
+
+    dnit(?t);
+    ret 0;
+}
+
+# reallocate takes a fresh block, so it must be refusable the same way a plain
+# allocation is: a caller growing a buffer has an allocation-failure path too,
+# and a fail_at that only reached allocate would leave it untested.
+test "std.allocator.testing: reallocate honors fail_at" {
+    var t: Testing;
+    if (O.is_some[str](make(?t))) { ret 1; }
+
+    val a: R.Result[*u8, *u8] = allocator.allocate[u8](?t.a, 1);
+    if (R.is_err[*u8, *u8](a)) { dnit(?t); ret 2; }
+    val p: *u8 = R.unwrap_ok[*u8, *u8](a);
+
+    # the next request is the one that must be refused
+    fail_at_ordinal(?t, attempt_count(?t) + 1);
+    val g: R.Result[*u8, *u8] = allocator.reallocate[u8](?t.a, p, 1, 2);
+    if (R.is_ok[*u8, *u8](g)) { dnit(?t); ret 3; }
+
+    # a refused growth leaves the original block alone, not freed
+    if (live_count(?t) != 1) { dnit(?t); ret 4; }
+    if (double_free_count(?t) != 0) { dnit(?t); ret 5; }
+
+    clear_failure(?t);
+    allocator.deallocate[u8](?t.a, p, 1);
+    if (leaked(?t)) { dnit(?t); ret 6; }
+
+    dnit(?t);
+    ret 0;
+}
+
+test "std.allocator.testing: reallocate preserves content and keeps the guard" {
+    var t: Testing;
+    if (O.is_some[str](make(?t))) { ret 1; }
+
+    val a: R.Result[*u8, *u8] = allocator.allocate[u8](?t.a, 4);
+    if (R.is_err[*u8, *u8](a)) { dnit(?t); ret 2; }
+    val p: *u8 = R.unwrap_ok[*u8, *u8](a);
+    p[0] = 1; p[1] = 2; p[2] = 3; p[3] = 4;
+
+    val g: R.Result[*u8, *u8] = allocator.reallocate[u8](?t.a, p, 4, 16);
+    if (R.is_err[*u8, *u8](g)) { dnit(?t); ret 3; }
+    val q: *u8 = R.unwrap_ok[*u8, *u8](g);
+    if (q[0] != 1 || q[1] != 2 || q[2] != 3 || q[3] != 4) { dnit(?t); ret 4; }
+
+    val ps:  usize = os.page_size();
+    if (((q::usize) + 16) % ps != 0) { dnit(?t); ret 5; }
+
+    # the old block was handed back as part of the move
+    if (live_count(?t) != 1) { dnit(?t); ret 6; }
+
+    dnit(?t);
+    ret 0;
+}
