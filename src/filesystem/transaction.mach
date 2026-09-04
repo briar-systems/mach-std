@@ -932,13 +932,13 @@ fun make_staging_dir(alloc: *A.Allocator, dirfd: i32, leaf: str, mode: i32,
 # r:           the root to publish into
 # leaf:        the destination name, a single path component
 # write_ctx:   context handed back to `write_cb`
-# write_cb:    produces the content; false or an error aborts the prepare
+# write_cb:    produces the content; an error aborts the prepare
 # mode:        permission bits for the staged file
 # want_digest: compute the sha-256 of what was written
 # ret:         a transaction awaiting commit or abort
 pub fun prepare[W](alloc: *A.Allocator, r: *Root, leaf: str,
                    write_ctx: *W,
-                   write_cb: fun(*W, *m_writer.Writer) R.Result[bool, str],
+                   write_cb: fun(*W, *m_writer.Writer) R.Result[R.Void, str],
                    mode: i32, want_digest: bool) R.Result[Transaction, Error] {
     if (alloc == nil || r == nil || r.dirfd < 0) {
         ret R.err[Transaction, Error](error(INVALID, OP_PREPARE));
@@ -971,8 +971,8 @@ pub fun prepare[W](alloc: *A.Allocator, r: *Root, leaf: str,
     w.ctx     = (?sink)::ptr;
     w.f_write = sink_write;
 
-    val wr: R.Result[bool, str] = write_cb(write_ctx, ?w);
-    if (R.is_err[bool, str](wr) || !R.unwrap_ok[bool, str](wr)) {
+    val wr: R.Result[R.Void, str] = write_cb(write_ctx, ?w);
+    if (R.is_err[R.Void, str](wr)) {
         var e: Error = error(REJECTED, OP_PREPARE);
         if (sink.failed_code < 0) { e = io_error(OP_PREPARE, sink.failed_code); }
         os.close(staging_fd);
@@ -1020,11 +1020,11 @@ rec BytesSource {
     len:  usize;
 }
 
-fun bytes_write_cb(b: *BytesSource, w: *m_writer.Writer) R.Result[bool, str] {
-    if (b.len == 0) { ret R.ok[bool, str](true); }
+fun bytes_write_cb(b: *BytesSource, w: *m_writer.Writer) R.Result[R.Void, str] {
+    if (b.len == 0) { ret R.ok_void[str](); }
     val e: O.Option[str] = m_writer.write_all(w, b.data, b.len);
-    if (O.is_some[str](e)) { ret R.err[bool, str](O.unwrap[str](e)); }
-    ret R.ok[bool, str](true);
+    if (O.is_some[str](e)) { ret R.err[R.Void, str](O.unwrap[str](e)); }
+    ret R.ok_void[str]();
 }
 
 # prepare a file publication from bytes already in memory
@@ -1875,10 +1875,10 @@ fun accept_all(c: *Accepting, data: *u8, len: usize) R.Result[bool, str] {
 # a writer that writes some bytes and then reports failure, standing in for a
 # producer that dies partway through
 rec PartialThenFail { wrote: usize; }
-fun partial_then_fail(p: *PartialThenFail, w: *m_writer.Writer) R.Result[bool, str] {
+fun partial_then_fail(p: *PartialThenFail, w: *m_writer.Writer) R.Result[R.Void, str] {
     m_writer.write_all(w, "partial", 7);
     p.wrote = 7;
-    ret R.err[bool, str]("producer failed");
+    ret R.err[R.Void, str]("producer failed");
 }
 
 test "std.filesystem.transaction.root_open: refuses a symlinked ancestor" {
@@ -2193,6 +2193,62 @@ test "std.filesystem.transaction.prepare: a producer that fails partway leaves n
         # destination never existed
         if (bad == 0 && p.wrote != 7) { bad = 4; }
         if (bad == 0 && entry_count(?alloc, root) != 0) { bad = 5; }
+        root_dnit(?g);
+    }
+
+    fs.remove_all(?alloc, root);
+    str_free(?alloc, root);
+    ret bad;
+}
+
+# a producer that fails partway leaves an EXISTING destination untouched
+#
+# the callback used to be able to abort two ways, an error or an ok carrying
+# false, and the false arm is gone now that the contract returns Void. this
+# pins what actually matters about that arm: the error still aborts, and it
+# aborts without touching a destination that was already there. the existing
+# partial-write test covers the case where nothing existed yet.
+test "std.filesystem.transaction.prepare: a failed producer leaves a prior file whole" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val root_r: R.Result[str, str] = scratch_root(?alloc);
+    if (R.is_err[str, str](root_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+    val opened: R.Result[Root, Error] = root_open(root, "");
+    if (R.is_err[Root, Error](opened)) { bad = 2; }
+    or {
+        var g: Root = R.unwrap_ok[Root, Error](opened);
+
+        # publish a first version the failed attempt must not disturb
+        val first: R.Result[Transaction, Error] =
+            prepare_bytes(?alloc, ?g, "out", "original", 8, 0o644, false);
+        if (R.is_err[Transaction, Error](first)) { bad = 3; }
+        or {
+            var f: Transaction = R.unwrap_ok[Transaction, Error](first);
+            if (R.is_err[Outcome, Error](commit(?f, PRE_ABSENT_AT_COMMIT, durability_none()))) { bad = 4; }
+        }
+
+        # now a producer that writes some bytes and then reports failure
+        if (bad == 0) {
+            var p: PartialThenFail;
+            p.wrote = 0;
+            val t: R.Result[Transaction, Error] =
+                prepare[PartialThenFail](?alloc, ?g, "out", ?p, partial_then_fail, 0o644, false);
+            if (R.is_ok[Transaction, Error](t)) { bad = 5; }
+            if (bad == 0 && p.wrote != 7) { bad = 6; }
+        }
+
+        # the destination still holds the first version, whole
+        if (bad == 0) {
+            val back: O.Option[str] = read_back(?alloc, root, "out");
+            if (O.is_none[str](back)) { bad = 7; }
+            or (!str_equals(O.unwrap[str](back), "original")) { bad = 8; }
+        }
+
+        # and the staging entry is gone, so the directory holds only the file
+        if (bad == 0 && entry_count(?alloc, root) != 1) { bad = 9; }
         root_dnit(?g);
     }
 
