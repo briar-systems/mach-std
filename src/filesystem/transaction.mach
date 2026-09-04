@@ -144,6 +144,7 @@ pub val OP_VALIDATE:  Op = 3;
 pub val OP_COMMIT:    Op = 4;
 pub val OP_ABORT:     Op = 5;
 pub val OP_RECOVER:   Op = 6;
+pub val OP_REMOVE:    Op = 7;
 
 pub rec Error {
     kind: ErrorKind;
@@ -193,6 +194,7 @@ pub fun error_op_name(e: Error) str {
     or (e.op == OP_VALIDATE)  { ret "validating the staged content"; }
     or (e.op == OP_COMMIT)    { ret "committing the publication"; }
     or (e.op == OP_ABORT)     { ret "aborting the publication"; }
+    or (e.op == OP_REMOVE)    { ret "removing a tree under the root"; }
     ret "recovering the publication root";
 }
 
@@ -433,6 +435,122 @@ pub fun entry_rmdir_if_empty(r: *Root, leaf: str) O.Option[Error] {
         ret O.some[Error](io_error(OP_ABORT, raw));
     }
     ret O.none[Error]();
+}
+
+# remove a tree under a root, by a path relative to it
+#
+# this is the removal a caller reaches for instead of validating a path with a
+# string prefix check. containment is by construction rather than by comparison:
+# `rel` is walked one component at a time against the root's own descriptor, so
+# there is no absolute path to compare and no prefix to get wrong.
+#
+# every way out of the root is refused rather than silently ignored, and each
+# comes back as CONTAINMENT:
+#
+#   - an absolute path, a `..` component, a `.` component, or an empty one,
+#     none of which are canonical
+#   - a symlink at any component of `rel`, its last included. one named by the
+#     caller is refused rather than unlinked: removing the link itself would be
+#     safe enough, but refusing means the capability never has to reason about
+#     where a link points, and a caller that meant the link can unlink it by
+#     name. a symlink FOUND INSIDE the tree during the descent is a different
+#     thing and is unlinked, which removes the link and never its target
+#   - a directory swapped for a symlink between the check and the descent,
+#     caught by comparing the identity of what was opened against what was
+#     measured
+#   - a tree deeper than MAX_REMOVE_DEPTH, since depth is input too
+#
+# what it removed is reported only on success. a failure part-way returns the
+# error and no count, because a partial count invites a caller to treat a
+# failed removal as a smaller successful one. the entries removed before the
+# failure stay removed: this reports what happened, it does not roll back.
+# ---
+# r:   the root the removal is anchored to
+# rel: canonical path beneath the root, naming the file or directory to remove
+# ret: how many entries were removed, or why the removal was refused
+pub fun root_remove_tree(r: *Root, rel: Path) R.Result[usize, Error] {
+    if (r == nil || r.dirfd < 0)  { ret R.err[usize, Error](error(INVALID, OP_REMOVE)); }
+    if (!rel_is_canonical(rel))   { ret R.err[usize, Error](error(CONTAINMENT, OP_REMOVE)); }
+
+    # walk to the parent of the last component, holding a descriptor at each
+    # step so no part of the path is ever resolved as a string
+    var fd:   i32  = r.dirfd;
+    var held: bool = false;
+    val n: usize = str_len(rel);
+    var start: usize = 0;
+
+    for (start < n) {
+        var end: usize = start;
+        for (end < n && rel[end] != '/'::u8) { end = end + 1; }
+
+        var comp: [256]u8;
+        val clen: usize = end - start;
+        if (clen >= 256) {
+            if (held) { os.close(fd); }
+            ret R.err[usize, Error](error(CONTAINMENT, OP_REMOVE));
+        }
+        var k: usize = 0;
+        for (k < clen) { comp[k] = rel[start + k]; k = k + 1; }
+        comp[clen] = 0;
+
+        # the last component is what gets removed, not descended into
+        if (end >= n) {
+            var removed: usize = 0;
+            val e: O.Option[Error] = remove_entry_checked(fd, (?comp[0])::str, ?removed);
+            if (held) { os.close(fd); }
+            if (O.is_some[Error](e)) { ret R.err[usize, Error](O.unwrap[Error](e)); }
+            ret R.ok[usize, Error](removed);
+        }
+
+        var st: os.stat_t;
+        val sr: i64 = os.stat_path(fd, (?comp[0])::str, ?st, os.AT_SYMLINK_NOFOLLOW);
+        if (sr < 0) {
+            if (held) { os.close(fd); }
+            ret R.err[usize, Error](io_error(OP_REMOVE, sr));
+        }
+        if ((os.stat_mode(?st) & os.S_IFMT) != os.S_IFDIR) {
+            if (held) { os.close(fd); }
+            ret R.err[usize, Error](error(CONTAINMENT, OP_REMOVE));
+        }
+        val before: Identity = Identity{device: st.st_dev::u64, file: st.st_ino};
+
+        val next_raw: i64 = os.open(fd, (?comp[0])::str, os.O_RDONLY | os.O_DIRECTORY, 0);
+        if (held) { os.close(fd); }
+        if (next_raw < 0) { ret R.err[usize, Error](io_error(OP_REMOVE, next_raw)); }
+        fd   = next_raw::i32;
+        held = true;
+
+        var opened: os.stat_t;
+        if (os.stat(fd, ?opened) < 0) {
+            os.close(fd);
+            ret R.err[usize, Error](error(IO, OP_REMOVE));
+        }
+        val after: Identity = Identity{device: opened.st_dev::u64, file: opened.st_ino};
+        if (!identity_equal(before, after)) {
+            os.close(fd);
+            ret R.err[usize, Error](error(CONTAINMENT, OP_REMOVE));
+        }
+
+        start = end + 1;
+    }
+
+    if (held) { os.close(fd); }
+    ret R.err[usize, Error](error(CONTAINMENT, OP_REMOVE));
+}
+
+# remove one named entry, refusing a symlink rather than unlinking it
+fun remove_entry_checked(dirfd: i32, name: str, removed: *usize) O.Option[Error] {
+    var st: os.stat_t;
+    val sr: i64 = os.stat_path(dirfd, name, ?st, os.AT_SYMLINK_NOFOLLOW);
+    if (sr < 0) {
+        if (sr == os.ENOENT) { ret O.none[Error](); }
+        ret O.some[Error](io_error(OP_REMOVE, sr));
+    }
+    val kind: u32 = os.stat_mode(?st) & os.S_IFMT;
+    if (kind != os.S_IFDIR && kind != os.S_IFREG) {
+        ret O.some[Error](error(CONTAINMENT, OP_REMOVE));
+    }
+    ret remove_counted(dirfd, name, removed, 0);
 }
 
 # create a directory under a root
@@ -821,6 +939,20 @@ fun free_names(alloc: *A.Allocator, v: *Vector[str]) {
 # an entry that is already gone is success: removal is idempotent, so a sweep
 # racing another sweep does not fail.
 fun remove_recursive(dirfd: i32, name: str) O.Option[Error] {
+    var ignored: usize = 0;
+    ret remove_counted(dirfd, name, ?ignored, 0);
+}
+
+# how deep a removal will descend before refusing
+#
+# depth here is a property of the tree on disk, which is input like any other:
+# without a bound the only limit is the stack, and a tree deep enough to
+# exhaust it would kill the caller rather than being refused by it.
+val MAX_REMOVE_DEPTH: usize = 256;
+
+fun remove_counted(dirfd: i32, name: str, removed: *usize, depth: usize) O.Option[Error] {
+    if (depth > MAX_REMOVE_DEPTH) { ret O.some[Error](error(CONTAINMENT, OP_REMOVE)); }
+
     var st: os.stat_t;
     val sr: i64 = os.stat_path(dirfd, name, ?st, os.AT_SYMLINK_NOFOLLOW);
     if (sr < 0) {
@@ -830,12 +962,29 @@ fun remove_recursive(dirfd: i32, name: str) O.Option[Error] {
     if ((os.stat_mode(?st) & os.S_IFMT) != os.S_IFDIR) {
         val raw: i64 = os.unlink(dirfd, name, 0);
         if (raw < 0 && raw != os.ENOENT) { ret O.some[Error](io_error(OP_RECOVER, raw)); }
+        @removed = removed[0] + 1;
         ret O.none[Error]();
     }
+    val before: Identity = Identity{device: st.st_dev::u64, file: st.st_ino};
 
     val child_raw: i64 = os.open(dirfd, name, os.O_RDONLY | os.O_DIRECTORY, 0);
     if (child_raw < 0) { ret O.some[Error](io_error(OP_RECOVER, child_raw)); }
     val child_fd: i32 = child_raw::i32;
+
+    # the entry was a real directory when it was stat'd, but the open is a
+    # second lookup: between the two it could have become a symlink into
+    # another tree. comparing what we opened against what we measured closes
+    # that window without needing O_NOFOLLOW, which is not on every platform.
+    var opened: os.stat_t;
+    if (os.stat(child_fd, ?opened) < 0) {
+        os.close(child_fd);
+        ret O.some[Error](error(IO, OP_REMOVE));
+    }
+    val after: Identity = Identity{device: opened.st_dev::u64, file: opened.st_ino};
+    if (!identity_equal(before, after)) {
+        os.close(child_fd);
+        ret O.some[Error](error(CONTAINMENT, OP_REMOVE));
+    }
 
     var dbuf: [8192]u8;
     var failure: O.Option[Error] = O.none[Error]();
@@ -855,7 +1004,7 @@ fun remove_recursive(dirfd: i32, name: str) O.Option[Error] {
             val reclen: usize        = ent.d_reclen::usize;
             val child:  *u8          = ?ent.d_name[0];
             if (!dot_entry(child)) {
-                val e: O.Option[Error] = remove_recursive(child_fd, child::str);
+                val e: O.Option[Error] = remove_counted(child_fd, child::str, removed, depth + 1);
                 if (O.is_some[Error](e)) { failure = e; }
                 or { removed_any = true; }
             }
@@ -869,6 +1018,7 @@ fun remove_recursive(dirfd: i32, name: str) O.Option[Error] {
 
     val rm: i64 = os.unlink(dirfd, name, os.AT_REMOVEDIR);
     if (rm < 0 && rm != os.ENOENT) { ret O.some[Error](io_error(OP_RECOVER, rm)); }
+    @removed = removed[0] + 1;
     ret O.none[Error]();
 }
 
@@ -3424,6 +3574,135 @@ test "std.filesystem.transaction.entry_read_all: reads a record and refuses one 
     }
 
     str_free(?alloc, f);
+    fs.remove_all(?alloc, root);
+    str_free(?alloc, root);
+    ret bad;
+}
+
+fun t_mkfile(root: str, alloc: *A.Allocator, rel: str, body: str) bool {
+    val abs: str = abs_of(alloc, root, rel);
+    val parent_r: R.Result[str, str] = path.parent(alloc, abs);
+    if (R.is_err[str, str](parent_r)) { ret false; }
+    val parent: str = R.unwrap_ok[str, str](parent_r);
+    if (O.is_some[str](fs.create_dir_all(alloc, parent, 0o755))) { ret false; }
+    ret O.is_none[str](fs.write_bytes(abs, body::*u8, str_len(body), 0o644));
+}
+
+# a nested tree goes away whole, and the count is what was actually removed
+test "std.filesystem.transaction.root_remove_tree: removes a nested tree" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val root_r: R.Result[str, str] = scratch_root(?alloc);
+    if (R.is_err[str, str](root_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+    # tree/ a  b/ c  d/ e     -> 3 files + 3 directories = 6 entries
+    if (!t_mkfile(root, ?alloc, "tree/a", "a")) { bad = 2; }
+    if (bad == 0 && !t_mkfile(root, ?alloc, "tree/b/c", "c")) { bad = 3; }
+    if (bad == 0 && !t_mkfile(root, ?alloc, "tree/b/d/e", "e")) { bad = 4; }
+    # a sibling the removal must not touch
+    if (bad == 0 && !t_mkfile(root, ?alloc, "keep", "keep")) { bad = 5; }
+
+    if (bad == 0) {
+        val opened: R.Result[Root, Error] = root_open(root, "");
+        if (R.is_err[Root, Error](opened)) { bad = 6; }
+        or {
+            var g: Root = R.unwrap_ok[Root, Error](opened);
+            val rr: R.Result[usize, Error] = root_remove_tree(?g, "tree");
+            if (R.is_err[usize, Error](rr)) { bad = 7; }
+            or (R.unwrap_ok[usize, Error](rr) != 6) { bad = 8; }
+            root_dnit(?g);
+        }
+    }
+
+    # the tree is gone and the sibling is untouched
+    if (bad == 0 && entry_count(?alloc, root) != 1) { bad = 9; }
+    if (bad == 0) {
+        val back: O.Option[str] = read_back(?alloc, root, "keep");
+        if (O.is_none[str](back)) { bad = 10; }
+        or (!str_equals(O.unwrap[str](back), "keep")) { bad = 11; }
+    }
+
+    fs.remove_all(?alloc, root);
+    str_free(?alloc, root);
+    ret bad;
+}
+
+# every way out of the root is refused, and a refusal removes nothing
+#
+# the tree is rebuilt for nothing: each case must leave it exactly as it was,
+# which is the property that makes a refusal safe to retry.
+test "std.filesystem.transaction.root_remove_tree: refuses every escape and removes nothing" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val root_r: R.Result[str, str] = scratch_root(?alloc);
+    if (R.is_err[str, str](root_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    # an "outside" directory the escapes would reach, with a file in it
+    val outside: str = abs_of(?alloc, root, "outside");
+    if (O.is_some[str](fs.create_dir_all(?alloc, outside, 0o755))) { bad = 2; }
+    val victim: str = abs_of(?alloc, outside, "victim");
+    if (bad == 0 && O.is_some[str](fs.write_bytes(victim, "victim"::*u8, 6, 0o644))) { bad = 3; }
+
+    # the root the capability is anchored to is a subdirectory of that
+    val inner: str = abs_of(?alloc, root, "inner");
+    if (bad == 0 && O.is_some[str](fs.create_dir_all(?alloc, inner, 0o755))) { bad = 4; }
+    if (bad == 0 && !t_mkfile(inner, ?alloc, "kept", "kept")) { bad = 5; }
+
+    # a symlink inside the root pointing at the outside directory
+    val link: str = abs_of(?alloc, inner, "link");
+    if (bad == 0 && O.is_some[str](fs.symlink(outside, link))) { bad = 6; }
+
+    if (bad == 0) {
+        val opened: R.Result[Root, Error] = root_open(inner, "");
+        if (R.is_err[Root, Error](opened)) { bad = 7; }
+        or {
+            var g: Root = R.unwrap_ok[Root, Error](opened);
+
+            # a `..` component never resolves
+            val up: R.Result[usize, Error] = root_remove_tree(?g, "../outside");
+            if (R.is_ok[usize, Error](up)) { bad = 8; }
+            or (R.unwrap_err[usize, Error](up).kind != CONTAINMENT) { bad = 9; }
+
+            # nor does an absolute path
+            if (bad == 0) {
+                val abs_try: R.Result[usize, Error] = root_remove_tree(?g, outside);
+                if (R.is_ok[usize, Error](abs_try)) { bad = 10; }
+                or (R.unwrap_err[usize, Error](abs_try).kind != CONTAINMENT) { bad = 11; }
+            }
+
+            # nor a symlink named as the last component
+            if (bad == 0) {
+                val via_link: R.Result[usize, Error] = root_remove_tree(?g, "link");
+                if (R.is_ok[usize, Error](via_link)) { bad = 12; }
+                or (R.unwrap_err[usize, Error](via_link).kind != CONTAINMENT) { bad = 13; }
+            }
+
+            # nor a path descending THROUGH that symlink
+            if (bad == 0) {
+                val through: R.Result[usize, Error] = root_remove_tree(?g, "link/victim");
+                if (R.is_ok[usize, Error](through)) { bad = 14; }
+                or (R.unwrap_err[usize, Error](through).kind != CONTAINMENT) { bad = 15; }
+            }
+
+            root_dnit(?g);
+        }
+    }
+
+    # nothing was removed by any of them: the outside file, the symlink and the
+    # file inside the root are all still there
+    if (bad == 0 && !fs.exists(victim)) { bad = 16; }
+    if (bad == 0 && !fs.exists(link))   { bad = 17; }
+    if (bad == 0) {
+        val back: O.Option[str] = read_back(?alloc, inner, "kept");
+        if (O.is_none[str](back)) { bad = 18; }
+        or (!str_equals(O.unwrap[str](back), "kept")) { bad = 19; }
+    }
+
     fs.remove_all(?alloc, root);
     str_free(?alloc, root);
     ret bad;
