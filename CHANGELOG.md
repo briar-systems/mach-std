@@ -12,6 +12,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Subtree publication retains its held root after ancestor renames. Staged
   directories and files are created through directory descriptors, and staged
   symlinks cannot redirect inventory writes (#575).
+- Windows symbolic links preserve UTF-8 link names and relative targets through
+  UTF-16 conversion. Target normalization and directory probing use the actual
+  converted lengths instead of fixed byte buffers (#580).
+- Windows filesystem transactions honor directory descriptors for publication,
+  metadata, rename, directory creation, and removal. Operations use native
+  handles and retain their root when its pathname is renamed or replaced
+  (#574).
+- Windows file creation, metadata, rename, and removal accept UTF-8 paths
+  consistently with handle-based directory enumeration (#574).
+- Windows directory enumeration remains attached to its open handle, preserves
+  every entry across output-buffer boundaries, supports full Unicode component
+  lengths, and supports rewind for
+  transaction recovery and recursive cleanup (#574).
+- Native Windows relative path components reject alternate-stream syntax and
+  path separators. Metadata and deletion inspect reparse points without
+  following their targets (#574).
+
+## [0.37.2] - 2026-09-04
+
+### Fixed
+
+- TOML table cleanup stores the value in a local before taking its address,
+  complying with Mach's refusal of addresses of call temporaries (#571).
+
+## [0.37.1] - 2026-09-04
+
+### Added
+
+- `std.filesystem.transaction.root_remove_tree` removes a subtree through
+  its root directory capability (#569).
+
+## [0.37.0] - 2026-09-04
+
+### Changed
+
+- The producer callback passed to `std.filesystem.transaction.prepare` returns
+  `Result[Void, str]`. Return an error to abort production. Callbacks returning
+  `Result[bool, str]` must migrate to the new signature (#567).
+
+## [0.36.1] - 2026-09-04
+
+### Added
+
+- `std.types.result.void_of[T, E]` discards a successful payload while
+  preserving the error, adapting a result to `Result[Void, E]` (#565).
+
+## [0.36.0] - 2026-09-03
+
+### Added
+
+- `std.types.result.Void` and `ok_void[E]` represent success without a
+  payload (#563).
+
+## [0.35.2] - 2026-09-02
+
+### Fixed
+
+- TOML parsing bounds nested values and reports excessive nesting rather
+  than exhausting the stack (#561).
+
+## [0.35.1] - 2026-09-02
+
+### Fixed
+
+- Darwin external imports explicitly name libSystem, whose exported manifest
+  requirement uses `/usr/lib/libSystem.B.dylib` (#559).
+
+## [0.35.0] - 2026-09-02
+
+### Added
+
+- Filesystem transactions provide staged publication, validation, commit,
+  abort, recovery, root directory capabilities and contained entry operations
+  (#557).
+- Advisory whole-file locks support coordinating filesystem publishers (#557).
+- The allocator fault harness can refuse a chosen allocation or reallocation
+  to exercise failure cleanup (#557).
+- Process supervision supports deadlines and reports spawn failures (#557).
+
+### Fixed
+
+- Process waits retry an interrupted wait instead of reporting failure (#557).
 
 ## [0.34.0] - 2026-09-01
 
