@@ -9,8 +9,8 @@ census = runpy.run_path('.github/scripts/std-607-census.py')['census']
 snapshot = Path('test/native/dep/std')
 snapshot.mkdir(parents=True, exist_ok=True)
 shutil.copy2('mach.toml', snapshot / 'mach.toml')
-windows = Path('src/system/os/windows/shared.mach').read_text()
-filesystem = Path('src/filesystem.mach').read_text()
+windows = Path('src/system/os/windows/shared.mach').read_text(encoding="utf-8")
+filesystem = Path('src/filesystem.mach').read_text(encoding="utf-8")
 fixture = '''
 fun audit607_dirlink(existing: bool) i32 {
     val target: str = "mach_607_dirlink_target";
@@ -52,12 +52,12 @@ try:
         body = fixture
         if remote:
             body = body.replace('"mach_607_dirlink_', '"//localhost/MachStd607/mach_607_dirlink_')
-        (snapshot / 'src/filesystem.mach').write_text(filesystem + body, newline='')
-        (snapshot / 'src/system/os/windows/shared.mach').write_text(modified, newline='')
+        (snapshot / 'src/filesystem.mach').write_text(filesystem + body, newline='', encoding="utf-8")
+        (snapshot / 'src/system/os/windows/shared.mach').write_text(modified, newline='', encoding="utf-8")
         census(name, 'windows')
         result = subprocess.run(['mach', 'test', 'test/native', '--target', 'windows-x86_64', '--include-deps', '--filter', 'std.filesystem.audit607_dirlink:'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         log = result.stdout.decode('utf-8', errors='replace')
-        Path('std-607-evidence/' + name + '.log').write_text(log)
+        Path('std-607-evidence/' + name + '.log').write_text(log, encoding="utf-8")
         clean = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', log)
         counts = re.findall(r'(\d+) passed, (\d+) failed, (\d+) total', clean)
         counts = list(map(int, counts[-1])) if counts else None
@@ -65,7 +65,7 @@ try:
         record = dict(name=name, counts=counts, exits=exits, compiler_exit=result.returncode)
         print(json.dumps(record), flush=True)
         results.append(record)
-        Path('std-607-evidence/dirlink-summary.json').write_text(json.dumps(results, indent=2))
+        Path('std-607-evidence/dirlink-summary.json').write_text(json.dumps(results, indent=2), encoding="utf-8")
         assert counts is not None and counts[2] == 2 and result.returncode in (0,1), record
 finally:
     shutil.copytree('src', snapshot / 'src', dirs_exist_ok=True)
