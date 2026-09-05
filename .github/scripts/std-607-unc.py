@@ -35,18 +35,19 @@ test "std.filesystem.audit607_unc: held destination replacement" {
         "//localhost/MachStd607/mach_607_unc_held_to");
 }
 '''
+text = text.replace('    val raw: i64 = os.rename(os.AT_FDCWD, from, os.AT_FDCWD, to);', '''    val parent: i64 = os.open(os.AT_FDCWD, "//localhost/MachStd607", os.O_RDONLY | os.O_DIRECTORY, 0);
+    if (parent < 0) { ret (0 - parent)::i32; }
+    val raw: i64 = os.rename(os.AT_FDCWD, from, parent::i32, path.filename(to));
+    os.close(parent::i32);''')
 source.write_text(text, encoding='utf-8', newline='')
 census = runpy.run_path('.github/scripts/std-607-census.py')['census']
 windows_path = snapshot / 'src/system/os/windows/shared.mach'
 base_windows = windows_path.read_text(encoding='utf-8')
 results = []
 for name, info_class, flags, basename in [
-    ('extended-posix-full', 65, 3, False),
-    ('extended-replace-full', 65, 1, False),
-    ('legacy-replace-full', 10, 1, False),
-    ('extended-posix-basename', 65, 3, True),
-    ('extended-replace-basename', 65, 1, True),
-    ('legacy-replace-basename', 10, 1, True),
+    ('extended-posix-parent', 65, 3, False),
+    ('extended-replace-parent', 65, 1, False),
+    ('legacy-replace-parent', 10, 1, False),
 ]:
     modified = base_windows.replace('val FILE_RENAME_INFORMATION_EX_CLASS:   u32 = 65;',
         'val FILE_RENAME_INFORMATION_EX_CLASS:   u32 = ' + str(info_class) + ';')
