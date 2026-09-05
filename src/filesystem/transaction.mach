@@ -24,41 +24,23 @@
 # validated. that is containment by construction rather than by path checking,
 # which is why no function here accepts a leaf with a separator in it.
 #
-# ## the journal
+# staging entries use `.machtxn.<16 hex digits>`, independent of the destination
+# length. owned replacement lazily creates `.machtxn.backup` with private
+# permissions and stores the previous directory beneath it under its complete
+# destination leaf. every operation uses the verified open container descriptor.
+# the empty container persists as internal metadata, like the lock sentinel.
+# ordinary file publication does not create it.
 #
-# there is no separate journal file. the residue itself is the journal: every
-# entry this module creates while a transaction is in flight is named with the
-# `STAGING_TAG` prefix, and the name records the entry's role, so recovery is a
-# deterministic function of what residue is present.
+# a missing destination with a backup means the first rename landed alone, so
+# recovery restores the backup. a directory destination with a backup means
+# publication landed, so recovery removes that backup. a non-directory backup
+# or destination is a conflict and remains untouched.
 #
-#   `.machtxn1.<leaf>.<16 hex digits>`   staging for a prepare that has not
-#                                        committed. the hex is random, so
-#                                        concurrent writers never collide.
-#   `.machtxn1.<leaf>.backup`            the previous content of `<leaf>`,
-#                                        moved aside during a replace and
-#                                        removed once the new content is in
-#                                        place.
-#
-# a commit is a single `rename`, which is atomic. a replace is two renames with
-# the backup name in between, so exactly three crash states are possible and
-# each is distinguishable:
-#
-#   backup absent                     the replace had not started, or had
-#                                     finished and cleaned up. nothing to do.
-#   backup present, destination gone  the crash landed between the two
-#                                     renames. `recover` renames the backup
-#                                     back and the previous content returns.
-#   backup present, destination there the crash landed after the second
-#                                     rename but before cleanup. `recover`
-#                                     removes the backup.
-#
-# ## the sweep
-#
-# `recover(root)` performs both jobs: it resolves any backup state as above and
-# removes every remaining `STAGING_TAG` entry. it removes nothing else. an
-# entry this module did not create cannot carry the tag, so a sweep can never
-# delete a caller's file, and residue from a crashed writer is always removed
-# rather than mistaken for live content.
+# recovery resolves only the requested destination and removes recognized staging
+# entries, retaining other destinations' backups and malformed names.
+# publication reserves the journal prefix and lock sentinel with ASCII
+# case-insensitive matching on every platform, including casefold filesystems.
+# callers must not place unrelated content in those reserved namespaces.
 #
 # ## liveness
 #
@@ -100,6 +82,8 @@ use std.format;
 use std.crypto.rand;
 use std.crypto.hash.sha256;
 use std.system.os;
+$if ($mach.build.os == $mach.os.linux) { use nofollow_os: std.system.os.linux; }
+$or ($mach.build.os == $mach.os.darwin) { use nofollow_os: std.system.os.darwin; }
 use std.collections.vector;
 use std.collections.vector.Vector;
 use ehex: std.encoding.hex;
@@ -232,6 +216,26 @@ fun leaf_is_component(name: str) bool {
     ret true;
 }
 
+fun journal_prefix(name: str, prefix: str) bool {
+    val size: usize = str_len(prefix);
+    if (str_len(name) < size) { ret false; }
+    var i: usize = 0;
+    for (i < size) {
+        var byte: u8 = name[i];
+        if (byte >= 'A' && byte <= 'Z') { byte = byte + 32; }
+        if (byte != prefix[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun publication_leaf(name: str) bool {
+    if (!leaf_is_component(name)) { ret false; }
+    if (journal_prefix(name, STAGING_TAG)) { ret false; }
+    if (str_len(name) == str_len(LOCK_LEAF) && journal_prefix(name, LOCK_LEAF)) { ret false; }
+    ret true;
+}
+
 # true when `rel` is a canonical relative path: no leading or trailing
 # separator, no empty, `.` or `..` component, no backslash
 fun rel_is_canonical(rel: str) bool {
@@ -268,6 +272,28 @@ pub rec Root {
     dirfd: i32;
 }
 
+rec ComponentScratch {
+    name: str;
+    size: usize;
+}
+
+fun copy_component(rel: str, start: usize, end: usize, op: Op) R.Result[ComponentScratch, Error] {
+    val length: usize = end - start;
+    val size: usize = length + 1;
+    val bytes: *u8 = os.allocate(size)::*u8;
+    if (bytes == nil) { ret R.err[ComponentScratch, Error](error(MEMORY, op)); }
+    var i: usize = 0;
+    for (i < length) { bytes[i] = rel[start + i]; i = i + 1; }
+    bytes[length] = 0;
+    ret R.ok[ComponentScratch, Error](ComponentScratch{name: bytes::str, size: size});
+}
+
+fun free_component(component: *ComponentScratch) {
+    os.deallocate(component.name::ptr, component.size);
+    component.name = nil;
+    component.size = 0;
+}
+
 # open a publication root
 #
 # walks `rel` beneath `base` one component at a time. each component must
@@ -299,33 +325,17 @@ pub fun root_open(base: Path, rel: Path) R.Result[Root, Error] {
         var end: usize = start;
         for (end < n && rel[end] != '/'::u8) { end = end + 1; }
 
-        # a component is walked by name against the descriptor we already hold,
-        # so the step cannot escape even if the tree changes under us.
-        var comp: [256]u8;
-        val clen: usize = end - start;
-        if (clen >= 256) { os.close(fd); ret R.err[Root, Error](error(CONTAINMENT, OP_ROOT_OPEN)); }
-        var k: usize = 0;
-        for (k < clen) { comp[k] = rel[start + k]; k = k + 1; }
-        comp[clen] = 0;
-
-        var st: os.stat_t;
-        val stat_raw: i64 = os.stat_path(fd, (?comp[0])::str, ?st, os.AT_SYMLINK_NOFOLLOW);
-        if (stat_raw < 0) {
+        val copied: R.Result[ComponentScratch, Error] = copy_component(rel, start, end, OP_ROOT_OPEN);
+        if (R.is_err[ComponentScratch, Error](copied)) {
             os.close(fd);
-            ret R.err[Root, Error](io_error(OP_ROOT_OPEN, stat_raw));
+            ret R.err[Root, Error](R.unwrap_err[ComponentScratch, Error](copied));
         }
-        if ((os.stat_mode(?st) & os.S_IFMT) != os.S_IFDIR) {
-            os.close(fd);
-            ret R.err[Root, Error](error(CONTAINMENT, OP_ROOT_OPEN));
-        }
-
-        val next_raw: i64 = os.open(fd, (?comp[0])::str, os.O_RDONLY | os.O_DIRECTORY, 0);
-        if (next_raw < 0) {
-            os.close(fd);
-            ret R.err[Root, Error](io_error(OP_ROOT_OPEN, next_raw));
-        }
+        var component: ComponentScratch = R.unwrap_ok[ComponentScratch, Error](copied);
+        val next: R.Result[i32, Error] = verified_directory(fd, component.name, OP_ROOT_OPEN);
+        free_component(?component);
         os.close(fd);
-        fd = next_raw::i32;
+        if (R.is_err[i32, Error](next)) { ret R.err[Root, Error](R.unwrap_err[i32, Error](next)); }
+        fd = R.unwrap_ok[i32, Error](next);
         start = end + 1;
     }
 
@@ -486,54 +496,26 @@ pub fun root_remove_tree(r: *Root, rel: Path) R.Result[usize, Error] {
         var end: usize = start;
         for (end < n && rel[end] != '/'::u8) { end = end + 1; }
 
-        var comp: [256]u8;
-        val clen: usize = end - start;
-        if (clen >= 256) {
+        val copied: R.Result[ComponentScratch, Error] = copy_component(rel, start, end, OP_REMOVE);
+        if (R.is_err[ComponentScratch, Error](copied)) {
             if (held) { os.close(fd); }
-            ret R.err[usize, Error](error(CONTAINMENT, OP_REMOVE));
+            ret R.err[usize, Error](R.unwrap_err[ComponentScratch, Error](copied));
         }
-        var k: usize = 0;
-        for (k < clen) { comp[k] = rel[start + k]; k = k + 1; }
-        comp[clen] = 0;
-
-        # the last component is what gets removed, not descended into
+        var component: ComponentScratch = R.unwrap_ok[ComponentScratch, Error](copied);
         if (end >= n) {
             var removed: usize = 0;
-            val e: O.Option[Error] = remove_entry_checked(fd, (?comp[0])::str, ?removed);
+            val result: O.Option[Error] = remove_entry_checked(fd, component.name, ?removed);
+            free_component(?component);
             if (held) { os.close(fd); }
-            if (O.is_some[Error](e)) { ret R.err[usize, Error](O.unwrap[Error](e)); }
+            if (O.is_some[Error](result)) { ret R.err[usize, Error](O.unwrap[Error](result)); }
             ret R.ok[usize, Error](removed);
         }
-
-        var st: os.stat_t;
-        val sr: i64 = os.stat_path(fd, (?comp[0])::str, ?st, os.AT_SYMLINK_NOFOLLOW);
-        if (sr < 0) {
-            if (held) { os.close(fd); }
-            ret R.err[usize, Error](io_error(OP_REMOVE, sr));
-        }
-        if ((os.stat_mode(?st) & os.S_IFMT) != os.S_IFDIR) {
-            if (held) { os.close(fd); }
-            ret R.err[usize, Error](error(CONTAINMENT, OP_REMOVE));
-        }
-        val before: Identity = Identity{device: st.st_dev::u64, file: st.st_ino};
-
-        val next_raw: i64 = os.open(fd, (?comp[0])::str, os.O_RDONLY | os.O_DIRECTORY, 0);
+        val next: R.Result[i32, Error] = verified_directory(fd, component.name, OP_REMOVE);
+        free_component(?component);
         if (held) { os.close(fd); }
-        if (next_raw < 0) { ret R.err[usize, Error](io_error(OP_REMOVE, next_raw)); }
-        fd   = next_raw::i32;
+        if (R.is_err[i32, Error](next)) { ret R.err[usize, Error](R.unwrap_err[i32, Error](next)); }
+        fd = R.unwrap_ok[i32, Error](next);
         held = true;
-
-        var opened: os.stat_t;
-        if (os.stat(fd, ?opened) < 0) {
-            os.close(fd);
-            ret R.err[usize, Error](error(IO, OP_REMOVE));
-        }
-        val after: Identity = Identity{device: opened.st_dev::u64, file: opened.st_ino};
-        if (!identity_equal(before, after)) {
-            os.close(fd);
-            ret R.err[usize, Error](error(CONTAINMENT, OP_REMOVE));
-        }
-
         start = end + 1;
     }
 
@@ -723,7 +705,8 @@ pub val ENTRY_SUBTREE: EntryKind = 2;
 
 # the prefix on every entry this module creates while a transaction is in
 # flight. it is the journal: see the module comment.
-pub val STAGING_TAG: str = ".machtxn1.";
+pub val STAGING_TAG: str = ".machtxn.";
+val BACKUP_CONTAINER: str = ".machtxn.backup";
 
 # a staging name collides only if the random suffix repeats, so a bounded
 # retry is enough; exhausting it means the entropy source is broken.
@@ -738,22 +721,16 @@ fun hex_of(alloc: *A.Allocator, bytes: *u8, len: usize) R.Result[str, Error] {
     ret R.ok[str, Error](buf::str);
 }
 
-fun make_staging_name(alloc: *A.Allocator, leaf: str) R.Result[str, Error] {
+fun make_staging_name(alloc: *A.Allocator) R.Result[str, Error] {
     var rnd: [8]u8;
     if (rand.fill(?rnd[0], 8) < 0) { ret R.err[str, Error](error(ENTROPY, OP_PREPARE)); }
     val hex_r: R.Result[str, Error] = hex_of(alloc, ?rnd[0], 8);
     if (R.is_err[str, Error](hex_r)) { ret hex_r; }
     val hex: str = R.unwrap_ok[str, Error](hex_r);
-    val name_r: R.Result[str, str] = format.sprint(alloc, "{}{}.{}", STAGING_TAG, leaf, hex);
+    val name_r: R.Result[str, str] = format.sprint(alloc, "{}{}", STAGING_TAG, hex);
     str_free(alloc, hex);
     if (R.is_err[str, str](name_r)) { ret R.err[str, Error](error(MEMORY, OP_PREPARE)); }
     ret R.ok[str, Error](R.unwrap_ok[str, str](name_r));
-}
-
-fun backup_name(alloc: *A.Allocator, leaf: str) R.Result[str, Error] {
-    val r: R.Result[str, str] = format.sprint(alloc, "{}{}.backup", STAGING_TAG, leaf);
-    if (R.is_err[str, str](r)) { ret R.err[str, Error](error(MEMORY, OP_COMMIT)); }
-    ret R.ok[str, Error](R.unwrap_ok[str, str](r));
 }
 
 # the identity of `leaf` under `dirfd`, or none when it does not exist
@@ -812,8 +789,6 @@ pub rec Transaction {
     kind:         EntryKind;
     # open for ENTRY_FILE until commit or abort, -1 otherwise
     staging_fd:   i32;
-    # the absolute path of a staged subtree, so it can be removed wholesale
-    staging_abs:  str;
     had_prior:    bool;
     prior:        Identity;
     len:          usize;
@@ -866,10 +841,8 @@ pub fun transaction_staged_identity(t: *Transaction) R.Result[Identity, Error] {
 fun transaction_free_names(t: *Transaction) {
     str_free(t.alloc, t.leaf);
     str_free(t.alloc, t.staging_name);
-    str_free(t.alloc, t.staging_abs);
     t.leaf         = nil;
     t.staging_name = nil;
-    t.staging_abs  = nil;
 }
 
 # discard staging without touching the destination
@@ -1029,11 +1002,11 @@ fun remove_counted(dirfd: i32, name: str, removed: *usize, depth: usize) O.Optio
 #
 # `O_EXCL` is what makes the name ours: two processes preparing the same leaf
 # at the same moment get different staging entries and neither sees the other.
-fun open_staging(alloc: *A.Allocator, dirfd: i32, leaf: str, mode: i32,
+fun open_staging(alloc: *A.Allocator, dirfd: i32, mode: i32,
                  out_name: *str, out_fd: *i32) O.Option[Error] {
     var attempt: usize = 0;
     for (attempt < MAX_STAGING_ATTEMPTS) {
-        val name_r: R.Result[str, Error] = make_staging_name(alloc, leaf);
+        val name_r: R.Result[str, Error] = make_staging_name(alloc);
         if (R.is_err[str, Error](name_r)) { ret O.some[Error](R.unwrap_err[str, Error](name_r)); }
         val candidate: str = R.unwrap_ok[str, Error](name_r);
 
@@ -1051,11 +1024,11 @@ fun open_staging(alloc: *A.Allocator, dirfd: i32, leaf: str, mode: i32,
 }
 
 # create a staging directory with a name nothing else holds
-fun make_staging_dir(alloc: *A.Allocator, dirfd: i32, leaf: str, mode: i32,
+fun make_staging_dir(alloc: *A.Allocator, dirfd: i32, mode: i32,
                      out_name: *str) O.Option[Error] {
     var attempt: usize = 0;
     for (attempt < MAX_STAGING_ATTEMPTS) {
-        val name_r: R.Result[str, Error] = make_staging_name(alloc, leaf);
+        val name_r: R.Result[str, Error] = make_staging_name(alloc);
         if (R.is_err[str, Error](name_r)) { ret O.some[Error](R.unwrap_err[str, Error](name_r)); }
         val candidate: str = R.unwrap_ok[str, Error](name_r);
 
@@ -1099,7 +1072,7 @@ pub fun prepare[W](alloc: *A.Allocator, r: *Root, leaf: str,
     if (write_ctx == nil || write_cb == nil) {
         ret R.err[Transaction, Error](error(INVALID, OP_PREPARE));
     }
-    if (!leaf_is_component(leaf)) {
+    if (!publication_leaf(leaf)) {
         ret R.err[Transaction, Error](error(CONTAINMENT, OP_PREPARE));
     }
 
@@ -1111,7 +1084,7 @@ pub fun prepare[W](alloc: *A.Allocator, r: *Root, leaf: str,
 
     var staging_name: str = nil;
     var staging_fd:   i32 = -1;
-    val oe: O.Option[Error] = open_staging(alloc, r.dirfd, leaf, mode, ?staging_name, ?staging_fd);
+    val oe: O.Option[Error] = open_staging(alloc, r.dirfd, mode, ?staging_name, ?staging_fd);
     if (O.is_some[Error](oe)) { ret R.err[Transaction, Error](O.unwrap[Error](oe)); }
 
     var sink: Sink;
@@ -1157,7 +1130,6 @@ pub fun prepare[W](alloc: *A.Allocator, r: *Root, leaf: str,
     t.staging_name = staging_name;
     t.kind         = ENTRY_FILE;
     t.staging_fd   = staging_fd;
-    t.staging_abs  = nil;
     t.had_prior    = O.is_some[Identity](prior_opt);
     if (t.had_prior) { t.prior = O.unwrap[Identity](prior_opt); }
     t.len        = st.st_size::usize;
@@ -1467,35 +1439,60 @@ fun join_rel(alloc: *A.Allocator, a: str, b: str) R.Result[str, Error] {
     ret R.ok[str, Error](R.unwrap_ok[str, str](r2));
 }
 
-# write the inventory into an already-created private directory
-fun build_subtree(alloc: *A.Allocator, root_abs: str, inv: *Inventory) O.Option[Error] {
-    var i: usize = 0;
-    for (i < inv.entries.len) {
-        val e: *Entry = ?inv.entries.data[i];
-        val abs_r: R.Result[str, str] = format.sprint(alloc, "{}/{}", root_abs, e.rel);
-        if (R.is_err[str, str](abs_r)) { ret O.some[Error](error(MEMORY, OP_PREPARE)); }
-        val abs: str = R.unwrap_ok[str, str](abs_r);
-
-        if (e.kind == ENTRY_DIR) {
-            val err: O.Option[str] = fs.create_dir_all(alloc, abs, e.mode);
-            str_free(alloc, abs);
-            if (O.is_some[str](err)) { ret O.some[Error](error(IO, OP_PREPARE)); }
+fun write_subtree_entry(alloc: *A.Allocator, staging_fd: i32, e: *Entry) O.Option[Error] {
+    if (!rel_is_canonical(e.rel)) { ret O.some[Error](error(CONTAINMENT, OP_PREPARE)); }
+    if (e.kind != ENTRY_DIR && e.kind != ENTRY_FILE) { ret O.some[Error](error(INVALID, OP_PREPARE)); }
+    var parent_fd: i32 = staging_fd;
+    var held: bool = false;
+    fin { if (held) { os.close(parent_fd); } }
+    val n: usize = str_len(e.rel);
+    var start: usize = 0;
+    for (start < n) {
+        var end: usize = start;
+        for (end < n && e.rel[end] != '/') { end = end + 1; }
+        val component_r: R.Result[str, str] = str_copy_slice(alloc, e.rel, start, end - start);
+        if (R.is_err[str, str](component_r)) { ret O.some[Error](error(MEMORY, OP_PREPARE)); }
+        val name: str = R.unwrap_ok[str, str](component_r);
+        fin { str_free(alloc, name); }
+        if (end < n || e.kind == ENTRY_DIR) {
+            var mode: i32 = 0o755;
+            if (e.kind == ENTRY_DIR) { mode = e.mode; }
+            val made: i64 = os.make_dir(parent_fd, name, mode);
+            if (made < 0 && made != os.EEXIST) { ret O.some[Error](io_error(OP_PREPARE, made)); }
+            val opened: R.Result[i32, Error] = verified_directory(parent_fd, name, OP_PREPARE);
+            if (R.is_err[i32, Error](opened)) { ret O.some[Error](R.unwrap_err[i32, Error](opened)); }
+            if (held) { os.close(parent_fd); }
+            parent_fd = R.unwrap_ok[i32, Error](opened);
+            held = true;
         }
         or {
-            val parent_r: R.Result[str, str] = path.parent(alloc, abs);
-            if (R.is_ok[str, str](parent_r)) {
-                val parent: str = R.unwrap_ok[str, str](parent_r);
-                val perr: O.Option[str] = fs.create_dir_all(alloc, parent, 0o755);
-                str_free(alloc, parent);
-                if (O.is_some[str](perr)) {
-                    str_free(alloc, abs);
-                    ret O.some[Error](error(IO, OP_PREPARE));
-                }
+            val raw: i64 = os.open(parent_fd, name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, e.mode);
+            if (raw < 0) { ret O.some[Error](io_error(OP_PREPARE, raw)); }
+            val fd: i32 = raw::i32;
+            var sink: Sink;
+            sink.fd = fd;
+            var writer: m_writer.Writer;
+            writer.ctx = (?sink)::ptr;
+            writer.f_write = sink_write;
+            val written: O.Option[str] = m_writer.write_all(?writer, e.data, e.len);
+            val closed: i64 = os.close(fd);
+            if (O.is_some[str](written)) {
+                if (sink.failed_code < 0) { ret O.some[Error](io_error(OP_PREPARE, sink.failed_code)); }
+                ret O.some[Error](error(IO, OP_PREPARE));
             }
-            val werr: O.Option[str] = fs.write_bytes(abs, e.data, e.len, e.mode);
-            str_free(alloc, abs);
-            if (O.is_some[str](werr)) { ret O.some[Error](error(IO, OP_PREPARE)); }
+            if (closed < 0) { ret O.some[Error](io_error(OP_PREPARE, closed)); }
         }
+        start = end + 1;
+    }
+    ret O.none[Error]();
+}
+
+# write every inventory entry relative to the held staging directory
+fun build_subtree(alloc: *A.Allocator, staging_fd: i32, inv: *Inventory) O.Option[Error] {
+    var i: usize = 0;
+    for (i < inv.entries.len) {
+        val result: O.Option[Error] = write_subtree_entry(alloc, staging_fd, ?inv.entries.data[i]);
+        if (O.is_some[Error](result)) { ret result; }
         i = i + 1;
     }
     ret O.none[Error]();
@@ -1505,23 +1502,20 @@ fun build_subtree(alloc: *A.Allocator, root_abs: str, inv: *Inventory) O.Option[
 #
 # builds the whole subtree privately beside its destination, so the commit is
 # one rename of the subtree root and the destination never exists in a partial
-# state. `root_abs` must be the absolute path the root capability refers to,
-# because the contents are written through ordinary path operations.
+# state. every descendant is created through held directory descriptors.
 # ---
 # alloc:    allocator for the transaction's own strings
 # r:        the root to publish into
-# root_abs: the absolute path of `r`, used to reach the staged contents
 # leaf:     the destination name, a single path component
 # inv:      everything the subtree contains
 # mode:     permission bits for the subtree root directory
 # ret:      a transaction awaiting commit or abort
-pub fun prepare_subtree(alloc: *A.Allocator, r: *Root, root_abs: Path, leaf: str,
+pub fun prepare_subtree(alloc: *A.Allocator, r: *Root, leaf: str,
                         inv: *Inventory, mode: i32) R.Result[Transaction, Error] {
     if (alloc == nil || r == nil || r.dirfd < 0 || inv == nil) {
         ret R.err[Transaction, Error](error(INVALID, OP_PREPARE));
     }
-    if (str_empty(root_abs)) { ret R.err[Transaction, Error](error(INVALID, OP_PREPARE)); }
-    if (!leaf_is_component(leaf)) {
+    if (!publication_leaf(leaf)) {
         ret R.err[Transaction, Error](error(CONTAINMENT, OP_PREPARE));
     }
 
@@ -1532,22 +1526,22 @@ pub fun prepare_subtree(alloc: *A.Allocator, r: *Root, root_abs: Path, leaf: str
     val prior_opt: O.Option[Identity] = R.unwrap_ok[O.Option[Identity], Error](prior_r);
 
     var staging_name: str = nil;
-    val me: O.Option[Error] = make_staging_dir(alloc, r.dirfd, leaf, mode, ?staging_name);
+    val me: O.Option[Error] = make_staging_dir(alloc, r.dirfd, mode, ?staging_name);
     if (O.is_some[Error](me)) { ret R.err[Transaction, Error](O.unwrap[Error](me)); }
 
-    val abs_r: R.Result[str, str] = format.sprint(alloc, "{}/{}", root_abs, staging_name);
-    if (R.is_err[str, str](abs_r)) {
+    val opened: R.Result[i32, Error] = verified_directory(r.dirfd, staging_name, OP_PREPARE);
+    if (R.is_err[i32, Error](opened)) {
         remove_recursive(r.dirfd, staging_name);
         str_free(alloc, staging_name);
-        ret R.err[Transaction, Error](error(MEMORY, OP_PREPARE));
+        ret R.err[Transaction, Error](R.unwrap_err[i32, Error](opened));
     }
-    val staging_abs: str = R.unwrap_ok[str, str](abs_r);
-
-    val be: O.Option[Error] = build_subtree(alloc, staging_abs, inv);
+    val staging_fd: i32 = R.unwrap_ok[i32, Error](opened);
+    var be: O.Option[Error] = build_subtree(alloc, staging_fd, inv);
+    val closed: i64 = os.close(staging_fd);
+    if (O.is_none[Error](be) && closed < 0) { be = O.some[Error](io_error(OP_PREPARE, closed)); }
     if (O.is_some[Error](be)) {
         remove_recursive(r.dirfd, staging_name);
         str_free(alloc, staging_name);
-        str_free(alloc, staging_abs);
         ret R.err[Transaction, Error](O.unwrap[Error](be));
     }
 
@@ -1555,7 +1549,6 @@ pub fun prepare_subtree(alloc: *A.Allocator, r: *Root, root_abs: Path, leaf: str
     if (R.is_err[str, str](leaf_r)) {
         remove_recursive(r.dirfd, staging_name);
         str_free(alloc, staging_name);
-        str_free(alloc, staging_abs);
         ret R.err[Transaction, Error](error(MEMORY, OP_PREPARE));
     }
 
@@ -1565,7 +1558,6 @@ pub fun prepare_subtree(alloc: *A.Allocator, r: *Root, root_abs: Path, leaf: str
     t.staging_name = staging_name;
     t.kind         = ENTRY_SUBTREE;
     t.staging_fd   = -1;
-    t.staging_abs  = staging_abs;
     t.had_prior    = O.is_some[Identity](prior_opt);
     if (t.had_prior) { t.prior = O.unwrap[Identity](prior_opt); }
     t.len        = inv.entries.len;
@@ -1583,7 +1575,7 @@ pub fun prepare_dir(alloc: *A.Allocator, r: *Root, leaf: str,
     if (alloc == nil || r == nil || r.dirfd < 0) {
         ret R.err[Transaction, Error](error(INVALID, OP_PREPARE));
     }
-    if (!leaf_is_component(leaf)) {
+    if (!publication_leaf(leaf)) {
         ret R.err[Transaction, Error](error(CONTAINMENT, OP_PREPARE));
     }
 
@@ -1594,7 +1586,7 @@ pub fun prepare_dir(alloc: *A.Allocator, r: *Root, leaf: str,
     val prior_opt: O.Option[Identity] = R.unwrap_ok[O.Option[Identity], Error](prior_r);
 
     var staging_name: str = nil;
-    val me: O.Option[Error] = make_staging_dir(alloc, r.dirfd, leaf, mode, ?staging_name);
+    val me: O.Option[Error] = make_staging_dir(alloc, r.dirfd, mode, ?staging_name);
     if (O.is_some[Error](me)) { ret R.err[Transaction, Error](O.unwrap[Error](me)); }
 
     val leaf_r: R.Result[str, str] = str_dup(alloc, leaf);
@@ -1610,7 +1602,6 @@ pub fun prepare_dir(alloc: *A.Allocator, r: *Root, leaf: str,
     t.staging_name = staging_name;
     t.kind         = ENTRY_DIR;
     t.staging_fd   = -1;
-    t.staging_abs  = nil;
     t.had_prior    = O.is_some[Identity](prior_opt);
     if (t.had_prior) { t.prior = O.unwrap[Identity](prior_opt); }
     t.len        = 0;
@@ -1672,171 +1663,167 @@ fun walk_owned[T](alloc: *A.Allocator, dirfd: i32, prefix: str, ctx: *T,
     ret failure;
 }
 
-# resolve whatever a previous crash left behind for `leaf`
-#
-# the three states in the module comment, decided by what is present. returns
-# true when a backup was found and dealt with.
-fun resolve_backup(alloc: *A.Allocator, dirfd: i32, leaf: str, backup: str) R.Result[bool, Error] {
-    if (entry_absent(dirfd, backup)) { ret R.ok[bool, Error](false); }
-
-    if (!entry_absent(dirfd, leaf)) {
-        # the second rename had landed; the backup is finished business
-        val e: O.Option[Error] = remove_recursive(dirfd, backup);
-        if (O.is_some[Error](e)) { ret R.err[bool, Error](O.unwrap[Error](e)); }
-        ret R.ok[bool, Error](true);
+fun verified_directory(dirfd: i32, name: str, op: Op) R.Result[i32, Error] {
+    var before: os.stat_t;
+    val probed: i64 = os.stat_path(dirfd, name, ?before, os.AT_SYMLINK_NOFOLLOW);
+    if (probed < 0) { ret R.err[i32, Error](io_error(op, probed)); }
+    if ((os.stat_mode(?before) & os.S_IFMT) != os.S_IFDIR) {
+        ret R.err[i32, Error](error(CONTAINMENT, op));
     }
+    var flags: i32 = os.O_RDONLY | os.O_DIRECTORY;
+    $if ($mach.build.os != $mach.os.windows) { flags = flags | nofollow_os.O_NOFOLLOW; }
+    val opened: i64 = os.open(dirfd, name, flags, 0);
+    if (opened < 0) { ret R.err[i32, Error](io_error(op, opened)); }
+    val fd: i32 = opened::i32;
+    var after: os.stat_t;
+    val checked: i64 = os.stat(fd, ?after);
+    if (checked < 0) { os.close(fd); ret R.err[i32, Error](io_error(op, checked)); }
+    if ((os.stat_mode(?after) & os.S_IFMT) != os.S_IFDIR
+        || before.st_dev != after.st_dev || before.st_ino != after.st_ino) {
+        os.close(fd);
+        ret R.err[i32, Error](error(CONTAINMENT, op));
+    }
+    ret R.ok[i32, Error](fd);
+}
 
-    # the crash landed between the two renames; put the old content back
-    val rn: i64 = os.rename(dirfd, backup, dirfd, leaf);
-    if (rn < 0) { ret R.err[bool, Error](io_error(OP_RECOVER, rn)); }
+# the container is persistent metadata and is created only when a replace needs it
+fun open_backup_container(dirfd: i32, create: bool) R.Result[i32, Error] {
+    var st: os.stat_t;
+    val probed: i64 = os.stat_path(dirfd, BACKUP_CONTAINER, ?st, os.AT_SYMLINK_NOFOLLOW);
+    if (probed == os.ENOENT) {
+        if (!create) { ret R.ok[i32, Error](-1); }
+        val made: i64 = os.make_dir(dirfd, BACKUP_CONTAINER, 0o700);
+        if (made < 0 && made != os.EEXIST) { ret R.err[i32, Error](io_error(OP_COMMIT, made)); }
+    }
+    or (probed < 0) { ret R.err[i32, Error](io_error(OP_RECOVER, probed)); }
+    ret verified_directory(dirfd, BACKUP_CONTAINER, OP_RECOVER);
+}
+
+fun resolve_backup(dirfd: i32, leaf: str, backupfd: i32) R.Result[bool, Error] {
+    if (backupfd < 0) { ret R.ok[bool, Error](false); }
+    var backup: os.stat_t;
+    val found: i64 = os.stat_path(backupfd, leaf, ?backup, os.AT_SYMLINK_NOFOLLOW);
+    if (found == os.ENOENT) { ret R.ok[bool, Error](false); }
+    if (found < 0) { ret R.err[bool, Error](io_error(OP_RECOVER, found)); }
+    if ((os.stat_mode(?backup) & os.S_IFMT) != os.S_IFDIR) {
+        ret R.err[bool, Error](error(CONFLICT, OP_RECOVER));
+    }
+    var destination: os.stat_t;
+    val present: i64 = os.stat_path(dirfd, leaf, ?destination, os.AT_SYMLINK_NOFOLLOW);
+    if (present == os.ENOENT) {
+        val restored: i64 = os.rename(backupfd, leaf, dirfd, leaf);
+        if (restored < 0) { ret R.err[bool, Error](io_error(OP_RECOVER, restored)); }
+    }
+    or (present < 0) { ret R.err[bool, Error](io_error(OP_RECOVER, present)); }
+    or {
+        if ((os.stat_mode(?destination) & os.S_IFMT) != os.S_IFDIR) {
+            ret R.err[bool, Error](error(CONFLICT, OP_RECOVER));
+        }
+        val removed: O.Option[Error] = remove_recursive(backupfd, leaf);
+        if (O.is_some[Error](removed)) { ret R.err[bool, Error](O.unwrap[Error](removed)); }
+    }
     ret R.ok[bool, Error](true);
 }
 
-# replace an existing tree the caller owns with the staged one
-#
-# unlike `commit`, the destination is expected to exist. every entry already
-# there is offered to `owns`, and a single unrecognized one refuses the whole
-# replacement, so a tree that has acquired a file this caller did not put there
-# is never destroyed. the swap itself is two renames through a backup name, and
-# a crash between them is repaired by `recover`.
-#
-# the transaction is spent afterwards either way.
-# ---
-# t:    the prepared subtree or directory transaction
-# ctx:  context handed back to `owns`
-# owns: true when the caller recognizes an entry it is about to destroy
-# ret:  what was achieved, or why nothing was
+fun owned_replace_failed(t: *Transaction, backupfd: i32, failure: Error) R.Result[Outcome, Error] {
+    if (backupfd >= 0) { os.close(backupfd); }
+    discard_staging(t);
+    transaction_free_names(t);
+    ret R.err[Outcome, Error](failure);
+}
+
+# replace an owned tree through a persistent descriptor-relative backup container
 pub fun commit_replacing_owned[T](t: *Transaction, ctx: *T,
                                   owns: fun(*T, str, bool) bool) R.Result[Outcome, Error] {
-    if (t == nil)  { ret R.err[Outcome, Error](error(INVALID, OP_COMMIT)); }
-    if (t.spent)   { ret R.err[Outcome, Error](error(INVALID, OP_COMMIT)); }
-    if (ctx == nil || owns == nil) { ret R.err[Outcome, Error](error(INVALID, OP_COMMIT)); }
-    if (t.kind == ENTRY_FILE) { ret R.err[Outcome, Error](error(INVALID, OP_COMMIT)); }
+    if (t == nil || t.spent || ctx == nil || owns == nil || t.kind == ENTRY_FILE) {
+        ret R.err[Outcome, Error](error(INVALID, OP_COMMIT));
+    }
     t.spent = true;
-
-    val alloc: *A.Allocator = t.alloc;
-    val dirfd: i32 = t.dirfd;
-
-    val backup_r: R.Result[str, Error] = backup_name(alloc, t.leaf);
-    if (R.is_err[str, Error](backup_r)) {
-        discard_staging(t);
-        transaction_free_names(t);
-        ret R.err[Outcome, Error](R.unwrap_err[str, Error](backup_r));
+    val opened: R.Result[i32, Error] = open_backup_container(t.dirfd, false);
+    if (R.is_err[i32, Error](opened)) { ret owned_replace_failed(t, -1, R.unwrap_err[i32, Error](opened)); }
+    var backupfd: i32 = R.unwrap_ok[i32, Error](opened);
+    val resolved: R.Result[bool, Error] = resolve_backup(t.dirfd, t.leaf, backupfd);
+    if (R.is_err[bool, Error](resolved)) { ret owned_replace_failed(t, backupfd, R.unwrap_err[bool, Error](resolved)); }
+    val recovered: bool = R.unwrap_ok[bool, Error](resolved);
+    if (entry_absent(t.dirfd, t.leaf)) {
+        ret owned_replace_failed(t, backupfd, error(PRECONDITION, OP_COMMIT));
     }
-    val backup: str = R.unwrap_ok[str, Error](backup_r);
-
-    val rec_r: R.Result[bool, Error] = resolve_backup(alloc, dirfd, t.leaf, backup);
-    if (R.is_err[bool, Error](rec_r)) {
-        val e: Error = R.unwrap_err[bool, Error](rec_r);
-        str_free(alloc, backup);
-        discard_staging(t);
-        transaction_free_names(t);
-        ret R.err[Outcome, Error](e);
+    val target: R.Result[i32, Error] = verified_directory(t.dirfd, t.leaf, OP_COMMIT);
+    if (R.is_err[i32, Error](target)) { ret owned_replace_failed(t, backupfd, R.unwrap_err[i32, Error](target)); }
+    val targetfd: i32 = R.unwrap_ok[i32, Error](target);
+    val checked: O.Option[Error] = walk_owned[T](t.alloc, targetfd, "", ctx, owns);
+    os.close(targetfd);
+    if (O.is_some[Error](checked)) { ret owned_replace_failed(t, backupfd, O.unwrap[Error](checked)); }
+    if (backupfd < 0) {
+        val created: R.Result[i32, Error] = open_backup_container(t.dirfd, true);
+        if (R.is_err[i32, Error](created)) { ret owned_replace_failed(t, -1, R.unwrap_err[i32, Error](created)); }
+        backupfd = R.unwrap_ok[i32, Error](created);
     }
-    val recovered: bool = R.unwrap_ok[bool, Error](rec_r);
-
-    if (entry_absent(dirfd, t.leaf)) {
-        str_free(alloc, backup);
-        discard_staging(t);
-        transaction_free_names(t);
-        ret R.err[Outcome, Error](error(PRECONDITION, OP_COMMIT));
+    val vacated: i64 = os.rename(t.dirfd, t.leaf, backupfd, t.leaf);
+    if (vacated < 0) { ret owned_replace_failed(t, backupfd, io_error(OP_COMMIT, vacated)); }
+    val placed: i64 = os.rename(t.dirfd, t.staging_name, t.dirfd, t.leaf);
+    if (placed < 0) {
+        val restored: i64 = os.rename(backupfd, t.leaf, t.dirfd, t.leaf);
+        if (restored < 0) { ret owned_replace_failed(t, backupfd, io_error(OP_COMMIT, restored)); }
+        ret owned_replace_failed(t, backupfd, io_error(OP_COMMIT, placed));
     }
-
-    val target: i64 = os.open(dirfd, t.leaf, os.O_RDONLY | os.O_DIRECTORY, 0);
-    if (target < 0) {
-        str_free(alloc, backup);
-        discard_staging(t);
-        transaction_free_names(t);
-        ret R.err[Outcome, Error](io_error(OP_COMMIT, target));
-    }
-    val we: O.Option[Error] = walk_owned[T](alloc, target::i32, "", ctx, owns);
-    os.close(target::i32);
-    if (O.is_some[Error](we)) {
-        val e: Error = O.unwrap[Error](we);
-        str_free(alloc, backup);
-        discard_staging(t);
-        transaction_free_names(t);
-        ret R.err[Outcome, Error](e);
-    }
-
-    val vacate: i64 = os.rename(dirfd, t.leaf, dirfd, backup);
-    if (vacate < 0) {
-        str_free(alloc, backup);
-        discard_staging(t);
-        transaction_free_names(t);
-        ret R.err[Outcome, Error](io_error(OP_COMMIT, vacate));
-    }
-
-    val place: i64 = os.rename(dirfd, t.staging_name, dirfd, t.leaf);
-    if (place < 0) {
-        # roll back to the content we moved aside; the destination must not be
-        # left missing just because the new tree could not be placed.
-        val restore: i64 = os.rename(dirfd, backup, dirfd, t.leaf);
-        discard_staging(t);
-        str_free(alloc, backup);
-        transaction_free_names(t);
-        if (restore < 0) { ret R.err[Outcome, Error](io_error(OP_COMMIT, restore)); }
-        ret R.err[Outcome, Error](io_error(OP_COMMIT, place));
-    }
-
-    remove_recursive(dirfd, backup);
-    str_free(alloc, backup);
+    val removed: O.Option[Error] = remove_recursive(backupfd, t.leaf);
+    val closed: i64 = os.close(backupfd);
     transaction_free_names(t);
-
+    if (O.is_some[Error](removed)) { ret R.err[Outcome, Error](O.unwrap[Error](removed)); }
+    if (closed < 0) { ret R.err[Outcome, Error](io_error(OP_COMMIT, closed)); }
     var out: Outcome;
     out.committed = true;
-    out.achieved  = DUR_NONE;
+    out.achieved = DUR_NONE;
     out.shortfall = false;
     out.recovered = recovered;
     ret R.ok[Outcome, Error](out);
 }
 
-# undo whatever a crashed writer left in this root
-#
-# resolves any backup left mid-swap for `leaf` and then removes every staging
-# entry present. only entries carrying `STAGING_TAG` are touched, so a caller's
-# own files are never at risk, and the sentinel `lock` file is left alone
-# because it is not residue.
-#
-# a caller should hold `lock` while sweeping. without it, staging entries
-# belonging to a live writer look exactly like a dead one's and would be
-# removed underneath them.
-# ---
-# alloc: allocator for the listing
-# r:     the root to sweep
-# leaf:  the destination whose backup state to resolve, or empty to skip that
-# ret:   how many staging entries were removed
+fun staging_residue(name: str) bool {
+    val length: usize = str_len(name);
+    val suffix: usize = str_len(STAGING_TAG);
+    if (!str_starts_with(name, STAGING_TAG) || length != suffix + 16) { ret false; }
+    var i: usize = suffix;
+    for (i < length) {
+        val byte: u8 = name[i];
+        if (!((byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f'))) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# resolve only the requested backup and sweep recognized staging under the root lock
 pub fun recover(alloc: *A.Allocator, r: *Root, leaf: str) R.Result[usize, Error] {
-    if (alloc == nil || r == nil || r.dirfd < 0) {
-        ret R.err[usize, Error](error(INVALID, OP_RECOVER));
-    }
-
+    if (alloc == nil || r == nil || r.dirfd < 0) { ret R.err[usize, Error](error(INVALID, OP_RECOVER)); }
     if (!str_empty(leaf)) {
-        if (!leaf_is_component(leaf)) { ret R.err[usize, Error](error(CONTAINMENT, OP_RECOVER)); }
-        val backup_r: R.Result[str, Error] = backup_name(alloc, leaf);
-        if (R.is_err[str, Error](backup_r)) { ret R.err[usize, Error](R.unwrap_err[str, Error](backup_r)); }
-        val backup: str = R.unwrap_ok[str, Error](backup_r);
-        val rr: R.Result[bool, Error] = resolve_backup(alloc, r.dirfd, leaf, backup);
-        str_free(alloc, backup);
-        if (R.is_err[bool, Error](rr)) { ret R.err[usize, Error](R.unwrap_err[bool, Error](rr)); }
+        if (!publication_leaf(leaf)) { ret R.err[usize, Error](error(CONTAINMENT, OP_RECOVER)); }
+        val opened: R.Result[i32, Error] = open_backup_container(r.dirfd, false);
+        if (R.is_err[i32, Error](opened)) { ret R.err[usize, Error](R.unwrap_err[i32, Error](opened)); }
+        val backupfd: i32 = R.unwrap_ok[i32, Error](opened);
+        val resolved: R.Result[bool, Error] = resolve_backup(r.dirfd, leaf, backupfd);
+        var closed: i64 = 0;
+        if (backupfd >= 0) { closed = os.close(backupfd); }
+        if (R.is_err[bool, Error](resolved)) { ret R.err[usize, Error](R.unwrap_err[bool, Error](resolved)); }
+        if (closed < 0) { ret R.err[usize, Error](io_error(OP_RECOVER, closed)); }
     }
-
+    val rewound: i64 = os.seek(r.dirfd, 0, os.SEEK_SET);
+    if (rewound < 0) { ret R.err[usize, Error](io_error(OP_RECOVER, rewound)); }
     var names: Vector[str] = vector.init[str](alloc);
-    val le: O.Option[Error] = list_entries(alloc, r.dirfd, ?names);
-    if (O.is_some[Error](le)) {
+    val listed: O.Option[Error] = list_entries(alloc, r.dirfd, ?names);
+    if (O.is_some[Error](listed)) {
         free_names(alloc, ?names);
-        ret R.err[usize, Error](O.unwrap[Error](le));
+        ret R.err[usize, Error](O.unwrap[Error](listed));
     }
-
     var removed: usize = 0;
     var failure: O.Option[Error] = O.none[Error]();
     var i: usize = 0;
     for (i < names.len && O.is_none[Error](failure)) {
         val name: str = names.data[i];
         i = i + 1;
-        if (!str_starts_with(name, STAGING_TAG)) { cnt; }
-        val e: O.Option[Error] = remove_recursive(r.dirfd, name);
-        if (O.is_some[Error](e)) { failure = e; cnt; }
+        if (!staging_residue(name)) { cnt; }
+        val result: O.Option[Error] = remove_recursive(r.dirfd, name);
+        if (O.is_some[Error](result)) { failure = result; cnt; }
         removed = removed + 1;
     }
     free_names(alloc, ?names);
@@ -1857,8 +1844,6 @@ pub rec Descent {
     first_missing: str;
     # the rest of the requested path below `first_missing`, possibly empty
     remainder: str;
-    # the absolute path `root` refers to
-    root_abs: str;
 }
 
 # find where an existing tree stops along `rel`
@@ -1885,13 +1870,6 @@ pub fun descend(alloc: *A.Allocator, base: Path, rel: Path) R.Result[O.Option[De
     if (base_raw < 0) { ret R.err[O.Option[Descent], Error](io_error(OP_ROOT_OPEN, base_raw)); }
     var fd: i32 = base_raw::i32;
 
-    val abs_r: R.Result[str, str] = str_dup(alloc, base);
-    if (R.is_err[str, str](abs_r)) {
-        os.close(fd);
-        ret R.err[O.Option[Descent], Error](error(MEMORY, OP_ROOT_OPEN));
-    }
-    var abs: str = R.unwrap_ok[str, str](abs_r);
-
     val n: usize = str_len(rel);
     var start: usize = 0;
     for (start < n) {
@@ -1900,7 +1878,7 @@ pub fun descend(alloc: *A.Allocator, base: Path, rel: Path) R.Result[O.Option[De
 
         val comp_r: R.Result[str, str] = str_copy_slice(alloc, rel, start, end - start);
         if (R.is_err[str, str](comp_r)) {
-            os.close(fd); str_free(alloc, abs);
+            os.close(fd);
             ret R.err[O.Option[Descent], Error](error(MEMORY, OP_ROOT_OPEN));
         }
         val comp: str = R.unwrap_ok[str, str](comp_r);
@@ -1912,7 +1890,7 @@ pub fun descend(alloc: *A.Allocator, base: Path, rel: Path) R.Result[O.Option[De
             if (end < n) {
                 val rem_r: R.Result[str, str] = str_copy_slice(alloc, rel, end + 1, n - end - 1);
                 if (R.is_err[str, str](rem_r)) {
-                    os.close(fd); str_free(alloc, abs); str_free(alloc, comp);
+                    os.close(fd); str_free(alloc, comp);
                     ret R.err[O.Option[Descent], Error](error(MEMORY, OP_ROOT_OPEN));
                 }
                 remainder = R.unwrap_ok[str, str](rem_r);
@@ -1921,39 +1899,28 @@ pub fun descend(alloc: *A.Allocator, base: Path, rel: Path) R.Result[O.Option[De
             d.root          = Root{dirfd: fd};
             d.first_missing = comp;
             d.remainder     = remainder;
-            d.root_abs      = abs;
             ret R.ok[O.Option[Descent], Error](O.some[Descent](d));
         }
         if (sr < 0) {
-            os.close(fd); str_free(alloc, abs); str_free(alloc, comp);
+            os.close(fd); str_free(alloc, comp);
             ret R.err[O.Option[Descent], Error](io_error(OP_ROOT_OPEN, sr));
         }
         if ((os.stat_mode(?st) & os.S_IFMT) != os.S_IFDIR) {
-            os.close(fd); str_free(alloc, abs); str_free(alloc, comp);
+            os.close(fd); str_free(alloc, comp);
             ret R.err[O.Option[Descent], Error](error(CONTAINMENT, OP_ROOT_OPEN));
         }
 
-        val next: i64 = os.open(fd, comp, os.O_RDONLY | os.O_DIRECTORY, 0);
-        if (next < 0) {
-            os.close(fd); str_free(alloc, abs); str_free(alloc, comp);
-            ret R.err[O.Option[Descent], Error](io_error(OP_ROOT_OPEN, next));
-        }
-        os.close(fd);
-        fd = next::i32;
-
-        val joined_r: R.Result[str, str] = format.sprint(alloc, "{}/{}", abs, comp);
-        str_free(alloc, abs);
+        val next: R.Result[i32, Error] = verified_directory(fd, comp, OP_ROOT_OPEN);
         str_free(alloc, comp);
-        if (R.is_err[str, str](joined_r)) {
-            os.close(fd);
-            ret R.err[O.Option[Descent], Error](error(MEMORY, OP_ROOT_OPEN));
+        os.close(fd);
+        if (R.is_err[i32, Error](next)) {
+            ret R.err[O.Option[Descent], Error](R.unwrap_err[i32, Error](next));
         }
-        abs = R.unwrap_ok[str, str](joined_r);
+        fd = R.unwrap_ok[i32, Error](next);
         start = end + 1;
     }
 
     os.close(fd);
-    str_free(alloc, abs);
     ret R.ok[O.Option[Descent], Error](O.none[Descent]());
 }
 
@@ -1963,10 +1930,8 @@ pub fun descent_dnit(alloc: *A.Allocator, d: *Descent) {
     root_dnit(?d.root);
     str_free(alloc, d.first_missing);
     str_free(alloc, d.remainder);
-    str_free(alloc, d.root_abs);
     d.first_missing = nil;
     d.remainder     = nil;
-    d.root_abs      = nil;
 }
 
 use page: std.allocator.page;
@@ -2613,9 +2578,9 @@ test "std.filesystem.transaction.recover: removes only this module's residue" {
     # one file the caller owns, one that merely looks similar, and two real
     # pieces of residue
     val keep:      str = abs_of(?alloc, root, "keep.txt");
-    val lookalike: str = abs_of(?alloc, root, "machtxn1.not-ours");
-    val residue1:  str = abs_of(?alloc, root, ".machtxn1.out.0011223344556677");
-    val residue2:  str = abs_of(?alloc, root, ".machtxn1.other.8899aabbccddeeff");
+    val lookalike: str = abs_of(?alloc, root, "machtxn.not-ours");
+    val residue1:  str = abs_of(?alloc, root, ".machtxn.0011223344556677");
+    val residue2:  str = abs_of(?alloc, root, ".machtxn.8899aabbccddeeff");
     fs.write_bytes(keep, "keep", 4, 0o644);
     fs.write_bytes(lookalike, "keep", 4, 0o644);
     fs.write_bytes(residue1, "junk", 4, 0o644);
@@ -2631,8 +2596,8 @@ test "std.filesystem.transaction.recover: removes only this module's residue" {
             if (R.unwrap_ok[usize, Error](swept) != 2) { bad = 4; }
         }
         if (bad == 0 && O.is_none[str](read_back(?alloc, root, "keep.txt"))) { bad = 5; }
-        if (bad == 0 && O.is_none[str](read_back(?alloc, root, "machtxn1.not-ours"))) { bad = 6; }
-        if (bad == 0 && O.is_some[str](read_back(?alloc, root, ".machtxn1.out.0011223344556677"))) { bad = 7; }
+        if (bad == 0 && O.is_none[str](read_back(?alloc, root, "machtxn.not-ours"))) { bad = 6; }
+        if (bad == 0 && O.is_some[str](read_back(?alloc, root, ".machtxn.0011223344556677"))) { bad = 7; }
         if (bad == 0 && entry_count(?alloc, root) != 2) { bad = 8; }
         root_dnit(?g);
     }
@@ -2825,7 +2790,7 @@ test "std.filesystem.transaction.prepare_subtree: publishes a whole tree in one 
         var g: Root = R.unwrap_ok[Root, Error](opened);
         var inv: Inventory = sample_inventory(?alloc);
 
-        val t: R.Result[Transaction, Error] = prepare_subtree(?alloc, ?g, root, "project", ?inv, 0o755);
+        val t: R.Result[Transaction, Error] = prepare_subtree(?alloc, ?g, "project", ?inv, 0o755);
         if (R.is_err[Transaction, Error](t)) { bad = 3; }
         or {
             var a: Transaction = R.unwrap_ok[Transaction, Error](t);
@@ -2873,7 +2838,7 @@ test "std.filesystem.transaction.prepare_subtree: a concurrent appearance confli
         var g: Root = R.unwrap_ok[Root, Error](opened);
         var inv: Inventory = sample_inventory(?alloc);
 
-        val t: R.Result[Transaction, Error] = prepare_subtree(?alloc, ?g, root, "project", ?inv, 0o755);
+        val t: R.Result[Transaction, Error] = prepare_subtree(?alloc, ?g, "project", ?inv, 0o755);
         if (R.is_err[Transaction, Error](t)) { bad = 3; }
         or {
             var a: Transaction = R.unwrap_ok[Transaction, Error](t);
@@ -2921,7 +2886,7 @@ test "std.filesystem.transaction.abort: removes a staged subtree entirely" {
     or {
         var g: Root = R.unwrap_ok[Root, Error](opened);
         var inv: Inventory = sample_inventory(?alloc);
-        val t: R.Result[Transaction, Error] = prepare_subtree(?alloc, ?g, root, "project", ?inv, 0o755);
+        val t: R.Result[Transaction, Error] = prepare_subtree(?alloc, ?g, "project", ?inv, 0o755);
         if (R.is_err[Transaction, Error](t)) { bad = 3; }
         or {
             var a: Transaction = R.unwrap_ok[Transaction, Error](t);
@@ -3030,7 +2995,7 @@ test "std.filesystem.transaction.commit_replacing_owned: replaces recognized con
     or {
         var g: Root = R.unwrap_ok[Root, Error](opened);
         var inv: Inventory = sample_inventory(?alloc);
-        val t: R.Result[Transaction, Error] = prepare_subtree(?alloc, ?g, root, "site", ?inv, 0o755);
+        val t: R.Result[Transaction, Error] = prepare_subtree(?alloc, ?g, "site", ?inv, 0o755);
         if (R.is_err[Transaction, Error](t)) { bad = 3; }
         or {
             var a: Transaction = R.unwrap_ok[Transaction, Error](t);
@@ -3046,7 +3011,7 @@ test "std.filesystem.transaction.commit_replacing_owned: replaces recognized con
         # and the page the new tree does not have is gone rather than surviving
         if (bad == 0 && O.is_some[str](read_back(?alloc, root, "site/stale.html"))) { bad = 7; }
         # no backup and no staging left behind
-        if (bad == 0 && entry_count(?alloc, root) != 1) { bad = 8; }
+        if (bad == 0 && entry_count(?alloc, root) != 2) { bad = 8; }
 
         inventory_dnit(?inv);
         root_dnit(?g);
@@ -3086,7 +3051,7 @@ test "std.filesystem.transaction.commit_replacing_owned: refuses an unrecognized
     or {
         var g: Root = R.unwrap_ok[Root, Error](opened);
         var inv: Inventory = sample_inventory(?alloc);
-        val t: R.Result[Transaction, Error] = prepare_subtree(?alloc, ?g, root, "site", ?inv, 0o755);
+        val t: R.Result[Transaction, Error] = prepare_subtree(?alloc, ?g, "site", ?inv, 0o755);
         if (R.is_err[Transaction, Error](t)) { bad = 3; }
         or {
             var a: Transaction = R.unwrap_ok[Transaction, Error](t);
@@ -3139,7 +3104,7 @@ test "std.filesystem.transaction.commit_replacing_owned: refuses when the target
     or {
         var g: Root = R.unwrap_ok[Root, Error](opened);
         var inv: Inventory = sample_inventory(?alloc);
-        val t: R.Result[Transaction, Error] = prepare_subtree(?alloc, ?g, root, "site", ?inv, 0o755);
+        val t: R.Result[Transaction, Error] = prepare_subtree(?alloc, ?g, "site", ?inv, 0o755);
         if (R.is_err[Transaction, Error](t)) { bad = 3; }
         or {
             var a: Transaction = R.unwrap_ok[Transaction, Error](t);
@@ -3171,9 +3136,9 @@ test "std.filesystem.transaction.recover: every backup crash state resolves dete
     val r1_r: R.Result[str, str] = scratch_root(?alloc);
     if (R.is_err[str, str](r1_r)) { ret 1; }
     val r1: str = R.unwrap_ok[str, str](r1_r);
-    val b1: str = abs_of(?alloc, r1, ".machtxn1.site.backup");
-    fs.create_dir(b1, 0o755);
-    val b1f: str = abs_of(?alloc, r1, ".machtxn1.site.backup/keep.txt");
+    val b1: str = abs_of(?alloc, r1, ".machtxn.backup/site");
+    fs.create_dir_all(?alloc, b1, 0o755);
+    val b1f: str = abs_of(?alloc, r1, ".machtxn.backup/site/keep.txt");
     fs.write_bytes(b1f, "restored", 8, 0o644);
 
     val o1: R.Result[Root, Error] = root_open(r1, "");
@@ -3186,7 +3151,7 @@ test "std.filesystem.transaction.recover: every backup crash state resolves dete
         or {
             if (bad == 0 && !str_equals(O.unwrap[str](back), "restored")) { bad = 5; }
         }
-        if (bad == 0 && entry_count(?alloc, r1) != 1) { bad = 6; }
+        if (bad == 0 && entry_count(?alloc, r1) != 2) { bad = 6; }
         root_dnit(?g);
     }
     str_free(?alloc, b1); str_free(?alloc, b1f);
@@ -3200,11 +3165,11 @@ test "std.filesystem.transaction.recover: every backup crash state resolves dete
     val r2: str = R.unwrap_ok[str, str](r2_r);
     val d2:  str = abs_of(?alloc, r2, "site");
     val d2f: str = abs_of(?alloc, r2, "site/keep.txt");
-    val b2:  str = abs_of(?alloc, r2, ".machtxn1.site.backup");
-    val b2f: str = abs_of(?alloc, r2, ".machtxn1.site.backup/keep.txt");
+    val b2:  str = abs_of(?alloc, r2, ".machtxn.backup/site");
+    val b2f: str = abs_of(?alloc, r2, ".machtxn.backup/site/keep.txt");
     fs.create_dir(d2, 0o755);
     fs.write_bytes(d2f, "current", 7, 0o644);
-    fs.create_dir(b2, 0o755);
+    fs.create_dir_all(?alloc, b2, 0o755);
     fs.write_bytes(b2f, "previous", 8, 0o644);
 
     val o2: R.Result[Root, Error] = root_open(r2, "");
@@ -3217,7 +3182,7 @@ test "std.filesystem.transaction.recover: every backup crash state resolves dete
         or {
             if (bad == 0 && !str_equals(O.unwrap[str](kept), "current")) { bad = 10; }
         }
-        if (bad == 0 && entry_count(?alloc, r2) != 1) { bad = 11; }
+        if (bad == 0 && entry_count(?alloc, r2) != 2) { bad = 11; }
         root_dnit(?g);
     }
     str_free(?alloc, d2); str_free(?alloc, d2f);
@@ -3265,9 +3230,9 @@ test "std.filesystem.transaction.commit_replacing_owned: self-heals a stale back
 
     var bad: i32 = 0;
     # a previous run crashed between the renames: only the backup exists
-    val b:  str = abs_of(?alloc, root, ".machtxn1.site.backup");
-    val bf: str = abs_of(?alloc, root, ".machtxn1.site.backup/mach.toml");
-    fs.create_dir(b, 0o755);
+    val b:  str = abs_of(?alloc, root, ".machtxn.backup/site");
+    val bf: str = abs_of(?alloc, root, ".machtxn.backup/site/mach.toml");
+    fs.create_dir_all(?alloc, b, 0o755);
     fs.write_bytes(bf, "old", 3, 0o644);
 
     var names: [1]str;
@@ -3281,7 +3246,7 @@ test "std.filesystem.transaction.commit_replacing_owned: self-heals a stale back
     or {
         var g: Root = R.unwrap_ok[Root, Error](opened);
         var inv: Inventory = sample_inventory(?alloc);
-        val t: R.Result[Transaction, Error] = prepare_subtree(?alloc, ?g, root, "site", ?inv, 0o755);
+        val t: R.Result[Transaction, Error] = prepare_subtree(?alloc, ?g, "site", ?inv, 0o755);
         if (R.is_err[Transaction, Error](t)) { bad = 3; }
         or {
             var a: Transaction = R.unwrap_ok[Transaction, Error](t);
@@ -3298,7 +3263,7 @@ test "std.filesystem.transaction.commit_replacing_owned: self-heals a stale back
         or {
             if (bad == 0 && !str_equals(O.unwrap[str](m), "[project]")) { bad = 7; }
         }
-        if (bad == 0 && entry_count(?alloc, root) != 1) { bad = 8; }
+        if (bad == 0 && entry_count(?alloc, root) != 2) { bad = 8; }
         inventory_dnit(?inv);
         root_dnit(?g);
     }
@@ -3397,7 +3362,7 @@ test "std.filesystem.transaction.prepare_subtree: failing at every allocation or
             inventory_push(?inv, entry_file("src/main.mach", "fun main() {}", 13, 0o644));
 
             testing.fail_at_ordinal(?t, ordinal);
-            val txn: R.Result[Transaction, Error] = prepare_subtree(ta, ?g, root, "project", ?inv, 0o755);
+            val txn: R.Result[Transaction, Error] = prepare_subtree(ta, ?g, "project", ?inv, 0o755);
             if (R.is_ok[Transaction, Error](txn)) {
                 var a: Transaction = R.unwrap_ok[Transaction, Error](txn);
                 abort(?a);
@@ -3716,6 +3681,357 @@ test "std.filesystem.transaction.root_remove_tree: refuses every escape and remo
     ret bad;
 }
 
+test "std.filesystem.transaction.prepare_subtree: a renamed root keeps every staged descendant" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val base_r: R.Result[str, str] = scratch_root(?alloc);
+    if (R.is_err[str, str](base_r)) { ret 2; }
+    val base: str = R.unwrap_ok[str, str](base_r);
+    fin { fs.remove_all(?alloc, base); str_free(?alloc, base); }
+    val original: str = abs_of(?alloc, base, "original");
+    val moved: str = abs_of(?alloc, base, "moved");
+    val marker: str = abs_of(?alloc, base, "original/marker");
+    fin { str_free(?alloc, original); str_free(?alloc, moved); str_free(?alloc, marker); }
+    if (O.is_some[str](fs.create_dir(original, 0o755))) { ret 3; }
+    val opened: R.Result[Root, Error] = root_open(original, "");
+    if (R.is_err[Root, Error](opened)) { ret 4; }
+    var r: Root = R.unwrap_ok[Root, Error](opened);
+    fin { root_dnit(?r); }
+    if (os.rename(os.AT_FDCWD, original, os.AT_FDCWD, moved) < 0) { ret 5; }
+    if (O.is_some[str](fs.create_dir(original, 0o755))) { ret 6; }
+    if (O.is_some[str](fs.write_bytes(marker, "untouched", 9, 0o644))) { ret 7; }
+    var inv: Inventory = inventory_init(?alloc);
+    fin { inventory_dnit(?inv); }
+    if (O.is_some[Error](inventory_push(?inv, entry_file("implicit/deep/data", "nested", 6, 0o640)))) { ret 8; }
+    if (O.is_some[Error](inventory_push(?inv, entry_dir("explicit/empty", 0o750)))) { ret 9; }
+    if (O.is_some[Error](inventory_push(?inv, entry_file("manifest", "complete", 8, 0o644)))) { ret 10; }
+    val prepared: R.Result[Transaction, Error] = prepare_subtree(?alloc, ?r, "project", ?inv, 0o755);
+    if (R.is_err[Transaction, Error](prepared)) { ret 11; }
+    var t: Transaction = R.unwrap_ok[Transaction, Error](prepared);
+    val committed: R.Result[Outcome, Error] = commit(?t, PRE_ABSENT_AT_COMMIT, durability_none());
+    if (R.is_err[Outcome, Error](committed)) { ret 12; }
+    val nested: O.Option[str] = read_back(?alloc, moved, "project/implicit/deep/data");
+    if (O.is_none[str](nested)) { ret 13; }
+    val nested_text: str = O.unwrap[str](nested);
+    fin { str_free(?alloc, nested_text); }
+    if (!str_equals(nested_text, "nested")) { ret 14; }
+    val manifest: O.Option[str] = read_back(?alloc, moved, "project/manifest");
+    if (O.is_none[str](manifest)) { ret 15; }
+    val manifest_text: str = O.unwrap[str](manifest);
+    fin { str_free(?alloc, manifest_text); }
+    if (!str_equals(manifest_text, "complete")) { ret 16; }
+    val empty: str = abs_of(?alloc, moved, "project/explicit/empty");
+    fin { str_free(?alloc, empty); }
+    if (!fs.is_dir(empty)) { ret 17; }
+    val kept: O.Option[str] = read_back(?alloc, original, "marker");
+    if (O.is_none[str](kept)) { ret 18; }
+    val kept_text: str = O.unwrap[str](kept);
+    fin { str_free(?alloc, kept_text); }
+    if (!str_equals(kept_text, "untouched")) { ret 19; }
+    if (entry_count(?alloc, original) != 1 || entry_count(?alloc, moved) != 1) { ret 20; }
+    ret 0;
+}
+
+test "std.filesystem.transaction.prepare_subtree: staged symlinks cannot redirect inventory writes" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val base_r: R.Result[str, str] = scratch_root(?alloc);
+    if (R.is_err[str, str](base_r)) { ret 2; }
+    val base: str = R.unwrap_ok[str, str](base_r);
+    fin { fs.remove_all(?alloc, base); str_free(?alloc, base); }
+    val staging: str = abs_of(?alloc, base, "staging");
+    val outside: str = abs_of(?alloc, base, "outside");
+    val marker: str = abs_of(?alloc, base, "outside/marker");
+    val directory_link: str = abs_of(?alloc, base, "staging/redirect");
+    val file_link: str = abs_of(?alloc, base, "staging/linked-file");
+    fin {
+        str_free(?alloc, staging); str_free(?alloc, outside); str_free(?alloc, marker);
+        str_free(?alloc, directory_link); str_free(?alloc, file_link);
+    }
+    if (O.is_some[str](fs.create_dir(staging, 0o755))) { ret 3; }
+    if (O.is_some[str](fs.create_dir(outside, 0o755))) { ret 4; }
+    if (O.is_some[str](fs.write_bytes(marker, "untouched", 9, 0o644))) { ret 5; }
+    if (O.is_some[str](fs.symlink(outside, directory_link))) { ret 6; }
+    if (O.is_some[str](fs.symlink(marker, file_link))) { ret 7; }
+    val opened: R.Result[Root, Error] = root_open(staging, "");
+    if (R.is_err[Root, Error](opened)) { ret 8; }
+    var r: Root = R.unwrap_ok[Root, Error](opened);
+    fin { root_dnit(?r); }
+    var nested: Entry = entry_file("redirect/new-file", "escaped", 7, 0o644);
+    val nested_error: O.Option[Error] = write_subtree_entry(?alloc, r.dirfd, ?nested);
+    if (O.is_none[Error](nested_error)) { ret 9; }
+    if (O.unwrap[Error](nested_error).kind != CONTAINMENT) { ret 10; }
+    var linked: Entry = entry_file("linked-file", "corrupt", 7, 0o644);
+    if (O.is_none[Error](write_subtree_entry(?alloc, r.dirfd, ?linked))) { ret 11; }
+    val kept: O.Option[str] = read_back(?alloc, outside, "marker");
+    if (O.is_none[str](kept)) { ret 12; }
+    val text: str = O.unwrap[str](kept);
+    fin { str_free(?alloc, text); }
+    if (!str_equals(text, "untouched")) { ret 13; }
+    if (entry_count(?alloc, outside) != 1) { ret 14; }
+    ret 0;
+}
+fun t_journal_max_leaf(name: *u8) {
+    var i: usize = 0;
+    $if ($mach.build.os == $mach.os.windows) {
+        for (i < 255) {
+            name[i * 3] = 0xe7;
+            name[i * 3 + 1] = 0x95;
+            name[i * 3 + 2] = 0x8c;
+            i = i + 1;
+        }
+        name[765] = 0;
+    }
+    $or {
+        for (i < 255) { name[i] = 'a'; i = i + 1; }
+        name[255] = 0;
+    }
+}
+
+fun t_journal_publish(a: *A.Allocator, root: *Root, leaf: str, content: str) i32 {
+    val prepared: R.Result[Transaction, Error] = prepare_bytes(a, root, leaf, content,
+        str_len(content), 0o644, false);
+    if (R.is_err[Transaction, Error](prepared)) { ret 1; }
+    var t: Transaction = R.unwrap_ok[Transaction, Error](prepared);
+    val committed: R.Result[Outcome, Error] = commit(?t, PRE_UNCHANGED_SINCE_PREPARE, durability_none());
+    if (R.is_err[Outcome, Error](committed)) { ret 2; }
+    ret 0;
+}
+
+fun t_journal_run(body: fun(*A.Allocator, *Root, str) i32) i32 {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+    val scratch: R.Result[str, str] = scratch_root(?a);
+    if (R.is_err[str, str](scratch)) { ret 2; }
+    val base: str = R.unwrap_ok[str, str](scratch);
+    var bad: i32 = 0;
+    val opened: R.Result[Root, Error] = root_open(base, "");
+    if (R.is_err[Root, Error](opened)) { bad = 3; }
+    or {
+        var root: Root = R.unwrap_ok[Root, Error](opened);
+        bad = body(?a, ?root, base);
+        root_dnit(?root);
+    }
+    fs.remove_all(?a, base);
+    str_free(?a, base);
+    ret bad;
+}
+
+fun t_journal_max_file(a: *A.Allocator, root: *Root, base: str) i32 {
+    var name: [766]u8;
+    t_journal_max_leaf(?name[0]);
+    val leaf: str = (?name[0])::str;
+    if (t_journal_publish(a, root, leaf, "before") != 0) { ret 4; }
+    if (t_journal_publish(a, root, leaf, "after") != 0) { ret 5; }
+    var content: [16]u8;
+    val read: R.Result[O.Option[usize], Error] = entry_read_all(root, leaf, ?content[0], 16);
+    if (R.is_err[O.Option[usize], Error](read)) { ret 6; }
+    if (!str_equals((?content[0])::str, "after")) { ret 7; }
+    val swept: R.Result[usize, Error] = recover(a, root, leaf);
+    if (R.is_err[usize, Error](swept)) { ret 8; }
+    if (R.unwrap_ok[usize, Error](swept) != 0) { ret 9; }
+    if (O.is_some[Error](entry_unlink(root, leaf))) { ret 10; }
+    if (entry_count(a, base) != 0) { ret 11; }
+    ret 0;
+}
+
+test "std.filesystem.transaction: maximum native destination names publish replace and recover" {
+    ret t_journal_run(t_journal_max_file);
+}
+
+fun t_journal_child_write(a: *A.Allocator, root: *Root, leaf: str, content: str) i32 {
+    val opened: i64 = os.open(root.dirfd, leaf, os.O_RDONLY | os.O_DIRECTORY, 0);
+    if (opened < 0) { ret 1; }
+    var child: Root = Root{dirfd: opened::i32};
+    val result: i32 = t_journal_publish(a, ?child, "entry", content);
+    root_dnit(?child);
+    ret result;
+}
+
+fun t_journal_child_has(root: *Root, leaf: str, content: str) bool {
+    val opened: i64 = os.open(root.dirfd, leaf, os.O_RDONLY | os.O_DIRECTORY, 0);
+    if (opened < 0) { ret false; }
+    var child: Root = Root{dirfd: opened::i32};
+    var bytes: [16]u8;
+    val read: R.Result[O.Option[usize], Error] = entry_read_all(?child, "entry", ?bytes[0], 16);
+    root_dnit(?child);
+    if (R.is_err[O.Option[usize], Error](read)) { ret false; }
+    val count: O.Option[usize] = R.unwrap_ok[O.Option[usize], Error](read);
+    ret O.is_some[usize](count) && O.unwrap[usize](count) == str_len(content)
+        && str_equals((?bytes[0])::str, content);
+}
+
+fun t_journal_owns(ctx: *i32, name: str, directory: bool) bool {
+    ret str_equals(name, "entry") && !directory;
+}
+
+fun t_journal_empty_directory(a: *A.Allocator, root: *Root, leaf: str) i32 {
+    val prepared: R.Result[Transaction, Error] = prepare_dir(a, root, leaf, 0o755);
+    if (R.is_err[Transaction, Error](prepared)) { ret 1; }
+    var t: Transaction = R.unwrap_ok[Transaction, Error](prepared);
+    val committed: R.Result[Outcome, Error] = commit(?t, PRE_ABSENT_AT_COMMIT, durability_none());
+    if (R.is_err[Outcome, Error](committed)) { ret 2; }
+    ret 0;
+}
+
+fun t_journal_directory_states(a: *A.Allocator, root: *Root) i32 {
+    var name: [766]u8;
+    t_journal_max_leaf(?name[0]);
+    val leaf: str = (?name[0])::str;
+    if (t_journal_empty_directory(a, root, leaf) != 0) { ret 4; }
+    if (t_journal_child_write(a, root, leaf, "before") != 0) { ret 5; }
+    val opened: R.Result[i32, Error] = open_backup_container(root.dirfd, true);
+    if (R.is_err[i32, Error](opened)) { ret 6; }
+    var backup: Root = Root{dirfd: R.unwrap_ok[i32, Error](opened)};
+    var bad: i32 = 0;
+    if (t_journal_empty_directory(a, ?backup, "other") != 0) { bad = 7; }
+    if (bad == 0 && t_journal_child_write(a, ?backup, "other", "keep") != 0) { bad = 8; }
+    if (bad == 0 && os.rename(root.dirfd, leaf, backup.dirfd, leaf) < 0) { bad = 9; }
+    if (bad == 0 && R.is_err[usize, Error](recover(a, root, leaf))) { bad = 10; }
+    if (bad == 0 && !t_journal_child_has(root, leaf, "before")) { bad = 11; }
+    if (bad == 0 && !t_journal_child_has(?backup, "other", "keep")) { bad = 12; }
+    if (bad == 0 && os.rename(root.dirfd, leaf, backup.dirfd, leaf) < 0) { bad = 13; }
+    if (bad == 0 && t_journal_empty_directory(a, root, leaf) != 0) { bad = 14; }
+    if (bad == 0 && t_journal_child_write(a, root, leaf, "after") != 0) { bad = 15; }
+    if (bad == 0 && R.is_err[usize, Error](recover(a, root, leaf))) { bad = 16; }
+    if (bad == 0 && !entry_absent(backup.dirfd, leaf)) { bad = 17; }
+    if (bad == 0 && !t_journal_child_has(root, leaf, "after")) { bad = 18; }
+    if (bad == 0 && os.rename(root.dirfd, leaf, backup.dirfd, leaf) < 0) { bad = 19; }
+    if (bad == 0) {
+        val prepared: R.Result[Transaction, Error] = prepare_dir(a, root, leaf, 0o755);
+        if (R.is_err[Transaction, Error](prepared)) { bad = 20; }
+        or {
+            var t: Transaction = R.unwrap_ok[Transaction, Error](prepared);
+            var ctx: i32 = 0;
+            val committed: R.Result[Outcome, Error] = commit_replacing_owned[i32](?t, ?ctx, t_journal_owns);
+            if (R.is_err[Outcome, Error](committed)) { bad = 21; }
+            or (!R.unwrap_ok[Outcome, Error](committed).recovered) { bad = 22; }
+        }
+    }
+    if (bad == 0 && !entry_absent(backup.dirfd, leaf)) { bad = 23; }
+    if (bad == 0 && !t_journal_child_has(?backup, "other", "keep")) { bad = 24; }
+    if (bad == 0 && R.is_err[usize, Error](recover(a, root, ""))) { bad = 25; }
+    if (bad == 0 && !t_journal_child_has(?backup, "other", "keep")) { bad = 26; }
+    root_dnit(?backup);
+    ret bad;
+}
+
+fun t_journal_renamed_root(a: *A.Allocator, root: *Root, base: str) i32 {
+    if (R.is_err[bool, Error](entry_make_dir(root, "original", 0o755))) { ret 4; }
+    val opened: R.Result[Root, Error] = root_open(base, "original");
+    if (R.is_err[Root, Error](opened)) { ret 5; }
+    var held: Root = R.unwrap_ok[Root, Error](opened);
+    var bad: i32 = 0;
+    if (O.is_some[Error](entry_rename(root, "original", "moved"))) { bad = 6; }
+    if (bad == 0 && R.is_err[bool, Error](entry_make_dir(root, "original", 0o755))) { bad = 7; }
+    if (bad == 0 && t_journal_child_write(a, root, "original", "untouched") != 0) { bad = 8; }
+    if (bad == 0) { bad = t_journal_directory_states(a, ?held); }
+    root_dnit(?held);
+    if (bad == 0 && !t_journal_child_has(root, "original", "untouched")) { bad = 9; }
+    ret bad;
+}
+
+test "std.filesystem.transaction: maximum directory backups recover and self-heal through a renamed root" {
+    ret t_journal_run(t_journal_renamed_root);
+}
+
+fun t_journal_reserved_and_sweep(a: *A.Allocator, root: *Root, base: str) i32 {
+    var reserved: [4]str = [4]str{".machtxn.out", ".machtxn.backup", ".MACHTXN.0011223344556677", ".MACH-TXN-LOCK"};
+    var i: usize = 0;
+    var inv: Inventory = inventory_init(a);
+    for (i < 4) {
+        val file: R.Result[Transaction, Error] = prepare_bytes(a, root, reserved[i], "x", 1, 0o644, false);
+        if (R.is_ok[Transaction, Error](file)) {
+            var t: Transaction = R.unwrap_ok[Transaction, Error](file);
+            abort(?t);
+            inventory_dnit(?inv);
+            ret 4;
+        }
+        if (R.unwrap_err[Transaction, Error](file).kind != CONTAINMENT) { inventory_dnit(?inv); ret 5; }
+        val directory: R.Result[Transaction, Error] = prepare_dir(a, root, reserved[i], 0o755);
+        if (R.is_ok[Transaction, Error](directory)) {
+            var t: Transaction = R.unwrap_ok[Transaction, Error](directory);
+            abort(?t);
+            inventory_dnit(?inv);
+            ret 6;
+        }
+        val subtree: R.Result[Transaction, Error] = prepare_subtree(a, root, reserved[i], ?inv, 0o755);
+        if (R.is_ok[Transaction, Error](subtree)) {
+            var t: Transaction = R.unwrap_ok[Transaction, Error](subtree);
+            abort(?t);
+            inventory_dnit(?inv);
+            ret 7;
+        }
+        i = i + 1;
+    }
+    inventory_dnit(?inv);
+    if (entry_count(a, base) != 0) { ret 8; }
+    if (!t_mkfile(base, a, ".machtxn.0011223344556677", "staging one")) { ret 9; }
+    if (!t_mkfile(base, a, ".machtxn.8899aabbccddeeff", "staging two")) { ret 10; }
+    if (!t_mkfile(base, a, ".machtxn.not-a-nonce", "foreign")) { ret 11; }
+    if (!t_mkfile(base, a, ".machtxn.unrecognized", "foreign")) { ret 12; }
+    if (os.make_dir(root.dirfd, "other-backup-guard", 0o755) < 0) { ret 13; }
+    if (t_journal_child_write(a, root, "other-backup-guard", "keep") != 0) { ret 14; }
+    val recovered: R.Result[usize, Error] = recover(a, root, "chosen");
+    if (R.is_err[usize, Error](recovered)) { ret 15; }
+    if (R.unwrap_ok[usize, Error](recovered) != 2) { ret 16; }
+    if (entry_count(a, base) != 3 || !t_journal_child_has(root, "other-backup-guard", "keep")) { ret 17; }
+    val again: R.Result[usize, Error] = recover(a, root, "");
+    if (R.is_err[usize, Error](again) || R.unwrap_ok[usize, Error](again) != 0) { ret 18; }
+    if (entry_count(a, base) != 3) { ret 19; }
+    ret 0;
+}
+
+test "std.filesystem.transaction: reserved publication names and exact staging recognition protect other content" {
+    ret t_journal_run(t_journal_reserved_and_sweep);
+}
+
+fun t_journal_container_refusal(a: *A.Allocator, root: *Root, base: str) i32 {
+    val outside_result: R.Result[str, str] = scratch_root(a);
+    if (R.is_err[str, str](outside_result)) { ret 4; }
+    val outside: str = R.unwrap_ok[str, str](outside_result);
+    val container: str = abs_of(a, base, BACKUP_CONTAINER);
+    var bad: i32 = 0;
+    if (!t_mkfile(outside, a, "guard", "keep")) { bad = 5; }
+    if (bad == 0 && O.is_some[str](fs.symlink(outside, container))) { bad = 6; }
+    if (bad == 0) {
+        val recovered: R.Result[usize, Error] = recover(a, root, "chosen");
+        if (R.is_ok[usize, Error](recovered)) { bad = 7; }
+        or (R.unwrap_err[usize, Error](recovered).kind != CONTAINMENT) { bad = 8; }
+    }
+    if (bad == 0 && O.is_none[str](read_back(a, outside, "guard"))) { bad = 9; }
+    entry_unlink(root, BACKUP_CONTAINER);
+    fs.remove_all(a, outside);
+    str_free(a, outside);
+    str_free(a, container);
+    if (bad != 0) { ret bad; }
+    val opened: R.Result[i32, Error] = open_backup_container(root.dirfd, true);
+    if (R.is_err[i32, Error](opened)) { ret 10; }
+    var backup: Root = Root{dirfd: R.unwrap_ok[i32, Error](opened)};
+    if (t_journal_publish(a, ?backup, "chosen", "foreign") != 0) { bad = 11; }
+    if (bad == 0) {
+        val recovered: R.Result[usize, Error] = recover(a, root, "chosen");
+        if (R.is_ok[usize, Error](recovered)) { bad = 12; }
+        or (R.unwrap_err[usize, Error](recovered).kind != CONFLICT) { bad = 13; }
+    }
+    if (bad == 0 && entry_absent(backup.dirfd, "chosen")) { bad = 14; }
+    entry_unlink(?backup, "chosen");
+    if (bad == 0 && os.make_dir(backup.dirfd, "chosen", 0o755) < 0) { bad = 15; }
+    if (bad == 0 && t_journal_publish(a, root, "chosen", "foreign") != 0) { bad = 16; }
+    if (bad == 0) {
+        val recovered: R.Result[usize, Error] = recover(a, root, "chosen");
+        if (R.is_ok[usize, Error](recovered)) { bad = 17; }
+        or (R.unwrap_err[usize, Error](recovered).kind != CONFLICT) { bad = 18; }
+    }
+    if (bad == 0 && (entry_absent(backup.dirfd, "chosen") || entry_absent(root.dirfd, "chosen"))) { bad = 19; }
+    root_dnit(?backup);
+    ret bad;
+}
+
+test "std.filesystem.transaction: backup containers reject symlinks malformed children and foreign destinations" {
+    ret t_journal_run(t_journal_container_refusal);
+}
+
 fun t_publish(a: *A.Allocator, root: *Root, leaf: str, content: str) i32 {
     val prepared: R.Result[Transaction, Error] = prepare_bytes(a, root, leaf,
         content, str_len(content), 0o644, false);
@@ -3990,5 +4306,114 @@ $if ($mach.build.os == $mach.os.windows) {
         fs.remove_all(?a, base);
         str_free(?a, base);
         ret bad;
+    }
+}
+
+$if ($mach.build.os == $mach.os.windows) {
+    fun t_root_unicode_case(check_open: bool) i32 {
+        var a: A.Allocator;
+        if (O.is_some[str](page.make(?a))) { ret 1; }
+        val scratch: R.Result[str, str] = scratch_root(?a);
+        if (R.is_err[str, str](scratch)) { ret 2; }
+        val base: str = R.unwrap_ok[str, str](scratch);
+        var name: [766]u8;
+        var i: usize = 0;
+        for (i < 255) {
+            name[i * 3] = 0xe7;
+            name[i * 3 + 1] = 0x95;
+            name[i * 3 + 2] = 0x8c;
+            i = i + 1;
+        }
+        name[765] = 0;
+        val leaf: str = (?name[0])::str;
+        val opened: R.Result[Root, Error] = root_open(base, "");
+        if (R.is_err[Root, Error](opened)) { str_free(?a, base); ret 3; }
+        var root: Root = R.unwrap_ok[Root, Error](opened);
+        var bad: i32 = 0;
+        if (os.make_dir(root.dirfd, leaf, 0o755) < 0) { bad = 4; }
+        if (bad == 0) {
+            val child: i64 = os.open(root.dirfd, leaf, os.O_RDONLY | os.O_DIRECTORY, 0);
+            if (child < 0) { bad = 5; }
+            or {
+                if (os.make_dir(child::i32, "inner", 0o755) < 0) { bad = 6; }
+                val inner: i64 = os.open(child::i32, "inner", os.O_RDONLY | os.O_DIRECTORY, 0);
+                if (inner < 0) { bad = 7; }
+                or {
+                    val file: i64 = os.open(inner::i32, "payload", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644);
+                    if (file < 0) { bad = 8; }
+                    or {
+                        if (os.write(file::i32, "x", 1) != 1) { bad = 9; }
+                        os.close(file::i32);
+                    }
+                    os.close(inner::i32);
+                }
+                os.close(child::i32);
+            }
+        }
+        if (bad == 0 && check_open) {
+            val relative: R.Result[str, str] = format.sprint(?a, "{}/inner", leaf);
+            if (R.is_err[str, str](relative)) { bad = 10; }
+            or {
+                val rel: str = R.unwrap_ok[str, str](relative);
+                val nested: R.Result[Root, Error] = root_open(base, rel);
+                if (R.is_err[Root, Error](nested)) { bad = 11; }
+                or {
+                    var inner: Root = R.unwrap_ok[Root, Error](nested);
+                    var bytes: [2]u8;
+                    val read: R.Result[O.Option[usize], Error] = entry_read_all(?inner, "payload", ?bytes[0], 2);
+                    if (R.is_err[O.Option[usize], Error](read)) { bad = 12; }
+                    or (bytes[0] != 'x') { bad = 13; }
+                    root_dnit(?inner);
+                }
+                str_free(?a, rel);
+            }
+            val missing: R.Result[str, str] = format.sprint(?a, "{}/missing", leaf);
+            if (R.is_err[str, str](missing)) { bad = 14; }
+            or {
+                val rel: str = R.unwrap_ok[str, str](missing);
+                i = 0;
+                for (i < 512 && bad == 0) {
+                    val absent: R.Result[Root, Error] = root_open(base, rel);
+                    if (R.is_ok[Root, Error](absent)) {
+                        var unexpected: Root = R.unwrap_ok[Root, Error](absent);
+                        root_dnit(?unexpected);
+                        bad = 15;
+                    }
+                    or (R.unwrap_err[Root, Error](absent).code != os.ENOENT) { bad = 16; }
+                    i = i + 1;
+                }
+                str_free(?a, rel);
+            }
+        }
+        if (bad == 0 && !check_open) {
+            val relative: R.Result[str, str] = format.sprint(?a, "{}/inner", leaf);
+            if (R.is_err[str, str](relative)) { bad = 20; }
+            or {
+                val rel: str = R.unwrap_ok[str, str](relative);
+                val nested: R.Result[usize, Error] = root_remove_tree(?root, rel);
+                if (R.is_err[usize, Error](nested)) { bad = 21; }
+                or (R.unwrap_ok[usize, Error](nested) != 2) { bad = 22; }
+                str_free(?a, rel);
+            }
+            if (bad == 0) {
+                val removed: R.Result[usize, Error] = root_remove_tree(?root, leaf);
+                if (R.is_err[usize, Error](removed)) { bad = 17; }
+                or (R.unwrap_ok[usize, Error](removed) != 1) { bad = 18; }
+                if (bad == 0 && !entry_absent(root.dirfd, leaf)) { bad = 19; }
+            }
+        }
+        remove_recursive(root.dirfd, leaf);
+        root_dnit(?root);
+        fs.remove_all(?a, base);
+        str_free(?a, base);
+        ret bad;
+    }
+
+    test "std.filesystem.transaction.root_open: full Unicode components open nested roots and release failed walks" {
+        ret t_root_unicode_case(true);
+    }
+
+    test "std.filesystem.transaction.root_remove_tree: full Unicode components remove nested content" {
+        ret t_root_unicode_case(false);
     }
 }
