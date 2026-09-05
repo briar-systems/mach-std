@@ -16,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Windows file creation, metadata, rename, and removal accept UTF-8 paths
   consistently with handle-based directory enumeration (#574).
 - Windows directory enumeration remains attached to its open handle, preserves
-  every entry across output-buffer boundaries, and supports rewind for
+  every entry across output-buffer boundaries, supports full Unicode component
+  lengths, and supports rewind for
   transaction recovery and recursive cleanup (#574).
 - Native Windows relative path components reject alternate-stream syntax and
   path separators. Metadata and deletion inspect reparse points without
