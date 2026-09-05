@@ -42,6 +42,8 @@ base_windows = windows_path.read_text(encoding='utf-8')
 results = []
 types = text[text.index('fun rename_type_conflicts('):text.index('test "std.filesystem.rename: type conflicts')]
 types = types.replace('rename_type_conflicts', 'audit607_unc_types')
+types = types.replace('"mach_std_rename_rooted_type_file"', '"//localhost/MachStd607/mach_std_rename_rooted_type_file"')
+types = types.replace('"mach_std_rename_rooted_type_directory"', '"//localhost/MachStd607/mach_std_rename_rooted_type_directory"')
 types = types.replace('"mach_std_rename_type_file"', '"//localhost/MachStd607/mach_std_rename_type_file"')
 types = types.replace('"mach_std_rename_type_directory"', '"//localhost/MachStd607/mach_std_rename_type_directory"')
 types = types.replace('os.AT_FDCWD, ".",', 'os.AT_FDCWD, "//localhost/MachStd607",')
@@ -55,13 +57,20 @@ test "std.filesystem.audit607_unc: public type conflicts" { ret audit607_unc_typ
 test "std.filesystem.audit607_unc: rooted type conflicts" { ret audit607_unc_types(true); }
 '''
 text += types
-diagnostic = base_windows.replace('if (device_status < 0) { ret ntstatus_error(device_status); }', 'if (device_status < 0) { ret -101; }').replace('if (attribute_status < 0 && attribute_status != 0x80000005::u32::i32) { ret ntstatus_error(attribute_status); }', 'if (attribute_status < 0 && attribute_status != 0x80000005::u32::i32) { ret -103; }')
-diagnostic = diagnostic.replace('GetFileInformationByHandleEx(source, FILE_REMOTE_PROTOCOL_INFO_CLASS, (?remote)::ptr, $size_of(FILE_REMOTE_PROTOCOL_INFO)::u32) == 0) {\n            ret last_error();', 'GetFileInformationByHandleEx(source, FILE_REMOTE_PROTOCOL_INFO_CLASS, (?remote)::ptr, $size_of(FILE_REMOTE_PROTOCOL_INFO)::u32) == 0) {\n            ret -102;')
-owned = diagnostic.replace('var remote: FILE_REMOTE_PROTOCOL_INFO;', 'val remote: *FILE_REMOTE_PROTOCOL_INFO = allocate($size_of(FILE_REMOTE_PROTOCOL_INFO))::*FILE_REMOTE_PROTOCOL_INFO; if (remote == nil) { ret ENOMEM; } fin { deallocate(remote::ptr, $size_of(FILE_REMOTE_PROTOCOL_INFO)); }')
-owned = owned.replace('(?remote)::ptr', 'remote::ptr')
+parent_text = text.replace('    val raw: i64 = os.rename(os.AT_FDCWD, from, os.AT_FDCWD, to);\n    if (raw < 0) { ret (0 - raw)::i32; }', '''    val parent: i64 = os.open(os.AT_FDCWD, "//localhost/MachStd607", os.O_RDONLY | os.O_DIRECTORY, 0);
+    if (parent < 0) { ret (0 - parent)::i32; }
+    val raw: i64 = os.rename(os.AT_FDCWD, from, parent::i32, path.filename(to));
+    os.close(parent::i32);
+    if (raw < 0) { ret (0 - raw)::i32; }''')
+false_bit = base_windows.replace('if ((attributes.attributes & FILE_SUPPORTS_POSIX_UNLINK_RENAME) != 0)', 'if (true)')
+miss_smb = false_bit.replace('if (remote.protocol == WNNC_NET_SMB) { ret FILE_RENAME_INFORMATION_CLASS::i64; }', '')
+unaligned = base_windows.replace('val remote: *FILE_REMOTE_PROTOCOL_INFO = ?buffer.info;', 'val remote: *FILE_REMOTE_PROTOCOL_INFO = ((?buffer)::usize + 4)::*FILE_REMOTE_PROTOCOL_INFO;')
 for name, source_text, modified, expected, expected_exits in [
-    ('query-failure-phase', text, diagnostic, None, None),
-    ('owned-remote-record', text, owned, None, None),
+    ('selected-unc-path-operation', text, base_windows, [3,1,4], ['13']),
+    ('selected-unc-parent-operation', parent_text, base_windows, [3,1,4], ['13']),
+    ('advertised-server-posix-bit', text, false_bit, [3,1,4], ['13']),
+    ('trust-server-bit-without-protocol', text, miss_smb, [2,2,4], ['22','22']),
+    ('misalign-remote-query-buffer', text, unaligned, [2,2,4], ['5','5']),
 ]:
     source.write_text(source_text, encoding='utf-8', newline='')
     windows_path.write_text(modified, encoding='utf-8', newline='')
@@ -78,6 +87,6 @@ for name, source_text, modified, expected, expected_exits in [
     print(json.dumps(record), flush=True)
     results.append(record)
     Path('std-607-evidence/unc-summary.json').write_text(json.dumps(results, indent=2))
-    assert counts is not None and counts[2] == 4, record
+    assert counts == expected and sorted(exits) == sorted(expected_exits) and result.returncode == 1, record
 shutil.copytree('src', snapshot / 'src', dirs_exist_ok=True)
-subprocess.run(['git', 'diff', '--exit-code', '7e02b68', '--', 'src', 'mach.toml'], check=True)
+subprocess.run(['git', 'diff', '--exit-code', 'c7e59c4', '--', 'src', 'mach.toml'], check=True)

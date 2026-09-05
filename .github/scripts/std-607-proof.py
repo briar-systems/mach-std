@@ -85,12 +85,42 @@ test "std.filesystem.audit607: directory flush error is reported after publicati
 }
 '''
 
+capability_test = '''
+test "std.filesystem.audit607_capability: failed query preserves both entries" {
+    val from: str = "mach_607_query_error_from";
+    val to: str = "mach_607_query_error_to";
+    if (O.is_some[str](write_bytes(from, "new", 3, 0o600))) { ret 79; }
+    fin { remove_file(from); }
+    if (O.is_some[str](write_bytes(to, "old", 3, 0o600))) { ret 80; }
+    fin { remove_file(to); }
+    if (os.rename(os.AT_FDCWD, from, os.AT_FDCWD, to) != os.EIO) { ret 81; }
+    val source: R.Result[File, io_error.Error] = open(from);
+    if (R.is_err[File, io_error.Error](source)) { ret 82; }
+    var source_file: File = R.unwrap_ok[File, io_error.Error](source);
+    fin { close(?source_file); }
+    if (!rename_held_contents(source_file, "new")) { ret 83; }
+    val target: R.Result[File, io_error.Error] = open(to);
+    if (R.is_err[File, io_error.Error](target)) { ret 84; }
+    var target_file: File = R.unwrap_ok[File, io_error.Error](target);
+    fin { close(?target_file); }
+    if (!rename_held_contents(target_file, "old")) { ret 85; }
+    ret 0;
+}
+'''
+
 try:
     count = 8 if host == 'windows' else 7
     run('baseline-public-paths-and-invariants', 'std.filesystem.rename:', [count,0,count], [])
     run('baseline-rooted-one-character-publication', 'held destinations retain', [1,0,1], [])
     run('baseline-atomic-byte-durability', 'std.filesystem.replace_bytes_atomic:', [2,0,2], [])
     if host == 'windows':
+        query_error = once(windows, 'fun native_rename_class(source: isize) i64 {',
+            'fun native_rename_class(source: isize) i64 {\n    ret EIO;')
+        run('baseline-injected-capability-query-failure', 'std.filesystem.audit607_capability:', [1,0,1], [],
+            {windows_path: query_error, filesystem_path: filesystem + capability_test})
+        swallow_query = once(query_error, '    if (information_class < 0) { ret information_class; }\n', '')
+        run('ignore-capability-query-failure', 'std.filesystem.audit607_capability:', [0,1,1], ['81'],
+            {windows_path: swallow_query, filesystem_path: filesystem + capability_test})
         basic = once(windows, 'fun native_rename_class(source: isize) i64 {', 'fun native_rename_class(source: isize) i64 {\n    ret FILE_RENAME_INFORMATION_CLASS::i64;')
         run('basic-rename-type-invariants', 'type conflicts preserve', [2,0,2], [], {windows_path: basic})
         replace_dirs = once(basic, '    if ((source_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) { info.flags = 0; }\n', '')
@@ -121,4 +151,4 @@ try:
             {windows_path: flush_failure, filesystem_path: skip_sync})
 finally:
     shutil.copytree('src', snapshot / 'src', dirs_exist_ok=True)
-    subprocess.run(['git', 'diff', '--exit-code', '7e02b68', '--', 'src', 'mach.toml'], check=True)
+    subprocess.run(['git', 'diff', '--exit-code', 'c7e59c4', '--', 'src', 'mach.toml'], check=True)
