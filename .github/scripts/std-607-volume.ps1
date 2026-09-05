@@ -9,6 +9,8 @@ public static class Volume607 {
     public static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
     [DllImport("ntdll.dll")]
     public static extern int NtQueryVolumeInformationFile(SafeFileHandle handle, out IoStatus io, IntPtr data, uint size, uint kind);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, uint kind, IntPtr data, uint size);
     public static string Probe(string path) {
         using (var handle = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
             if (handle.IsInvalid) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
@@ -25,7 +27,18 @@ public static class Volume607 {
                 status = NtQueryVolumeInformationFile(handle, out io, data, 4096, 4);
                 if (status < 0) throw new Exception("device query status " + status.ToString("X8"));
                 uint characteristics = unchecked((uint)Marshal.ReadInt32(data, 4));
-                return String.Format("path={0} filesystem={1} attributes=0x{2:X8} posix={3} maximum={4} characteristics=0x{5:X8} remote={6}", path, name, attributes, (attributes & 0x400) != 0, maximum, characteristics, (characteristics & 0x10) != 0);
+                status = NtQueryVolumeInformationFile(handle, out io, data, 16, 5);
+                uint prefixAttributes = unchecked((uint)Marshal.ReadInt32(data));
+                string prefix = String.Format("prefix_status=0x{0:X8} prefix_bytes={1} prefix_attributes=0x{2:X8}", status, io.Information, prefixAttributes);
+                string protocol = "local";
+                if ((characteristics & 0x10) != 0) {
+                    for (int i = 0; i < 116; i++) Marshal.WriteByte(data, i, 0);
+                    Marshal.WriteInt16(data, 0, 2);
+                    Marshal.WriteInt16(data, 2, 116);
+                    if (!GetFileInformationByHandleEx(handle, 13, data, 116)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+                    protocol = unchecked((uint)Marshal.ReadInt32(data, 4)).ToString("X8");
+                }
+                return String.Format("path={0} filesystem={1} attributes=0x{2:X8} posix={3} maximum={4} characteristics=0x{5:X8} remote={6} protocol={7} {8}", path, name, attributes, (attributes & 0x400) != 0, maximum, characteristics, (characteristics & 0x10) != 0, protocol, prefix);
             } finally { Marshal.FreeHGlobal(data); }
         }
     }
