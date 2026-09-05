@@ -55,12 +55,13 @@ test "std.filesystem.audit607_unc: public type conflicts" { ret audit607_unc_typ
 test "std.filesystem.audit607_unc: rooted type conflicts" { ret audit607_unc_types(true); }
 '''
 text += types
-diagnostic = base_windows.replace('if (status_block.information < $size_of(FILE_FS_DEVICE_INFORMATION)) { ret EIO; }', 'if (status_block.information < $size_of(FILE_FS_DEVICE_INFORMATION)) { ret -91; }').replace('if (status_block.information < 12) { ret EIO; }', 'if (status_block.information < 12) { ret -92; }')
-diagnostic = diagnostic.replace('if (device_status < 0) { ret ntstatus_error(device_status); }', 'if (device_status < 0) { ret 0 - (device_status::u32 & 0xffff)::i64; }')
-diagnostic = diagnostic.replace('if (attribute_status < 0 && attribute_status != 0x80000005::u32::i32) { ret ntstatus_error(attribute_status); }', 'if (attribute_status < 0 && attribute_status != 0x80000005::u32::i32) { ret 0 - (attribute_status::u32 & 0xffff)::i64; }')
-diagnostic = diagnostic.replace('GetFileInformationByHandleEx(source, FILE_REMOTE_PROTOCOL_INFO_CLASS, (?remote)::ptr, $size_of(FILE_REMOTE_PROTOCOL_INFO)::u32) == 0) {\n            ret last_error();', 'GetFileInformationByHandleEx(source, FILE_REMOTE_PROTOCOL_INFO_CLASS, (?remote)::ptr, $size_of(FILE_REMOTE_PROTOCOL_INFO)::u32) == 0) {\n            ret 0 - GetLastError()::i64;')
+diagnostic = base_windows.replace('if (device_status < 0) { ret ntstatus_error(device_status); }', 'if (device_status < 0) { ret -101; }').replace('if (attribute_status < 0 && attribute_status != 0x80000005::u32::i32) { ret ntstatus_error(attribute_status); }', 'if (attribute_status < 0 && attribute_status != 0x80000005::u32::i32) { ret -103; }')
+diagnostic = diagnostic.replace('GetFileInformationByHandleEx(source, FILE_REMOTE_PROTOCOL_INFO_CLASS, (?remote)::ptr, $size_of(FILE_REMOTE_PROTOCOL_INFO)::u32) == 0) {\n            ret last_error();', 'GetFileInformationByHandleEx(source, FILE_REMOTE_PROTOCOL_INFO_CLASS, (?remote)::ptr, $size_of(FILE_REMOTE_PROTOCOL_INFO)::u32) == 0) {\n            ret -102;')
+owned = diagnostic.replace('var remote: FILE_REMOTE_PROTOCOL_INFO;', 'val remote: *FILE_REMOTE_PROTOCOL_INFO = allocate($size_of(FILE_REMOTE_PROTOCOL_INFO))::*FILE_REMOTE_PROTOCOL_INFO; if (remote == nil) { ret ENOMEM; } fin { deallocate(remote::ptr, $size_of(FILE_REMOTE_PROTOCOL_INFO)); }')
+owned = owned.replace('(?remote)::ptr', 'remote::ptr')
 for name, source_text, modified, expected, expected_exits in [
-    ('source-query-native-errors', text, diagnostic, None, None),
+    ('query-failure-phase', text, diagnostic, None, None),
+    ('owned-remote-record', text, owned, None, None),
 ]:
     source.write_text(source_text, encoding='utf-8', newline='')
     windows_path.write_text(modified, encoding='utf-8', newline='')
