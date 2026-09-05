@@ -35,10 +35,11 @@ test "std.filesystem.audit607_unc: held destination replacement" {
         "//localhost/MachStd607/mach_607_unc_held_to");
 }
 '''
-text = text.replace('    val raw: i64 = os.rename(os.AT_FDCWD, from, os.AT_FDCWD, to);', '''    val parent: i64 = os.open(os.AT_FDCWD, "//localhost/MachStd607", os.O_RDONLY | os.O_DIRECTORY, 0);
+text = text.replace('    val raw: i64 = os.rename(os.AT_FDCWD, from, os.AT_FDCWD, to);\n    if (raw < 0) { ret (0 - raw)::i32; }', '''    val parent: i64 = os.open(os.AT_FDCWD, "//localhost/MachStd607", os.O_RDONLY | os.O_DIRECTORY, 0);
     if (parent < 0) { ret (0 - parent)::i32; }
     val raw: i64 = os.rename(os.AT_FDCWD, from, parent::i32, path.filename(to));
-    os.close(parent::i32);''')
+    os.close(parent::i32);
+    if (raw < 0) { ret (0 - raw)::i32; }''')
 source.write_text(text, encoding='utf-8', newline='')
 census = runpy.run_path('.github/scripts/std-607-census.py')['census']
 windows_path = snapshot / 'src/system/os/windows/shared.mach'
