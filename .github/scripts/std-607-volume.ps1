@@ -12,7 +12,7 @@ public static class Volume607 {
     [DllImport("kernel32.dll", SetLastError=true)]
     public static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, uint kind, IntPtr data, uint size);
     public static string Probe(string path) {
-        using (var handle = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+        using (var handle = CreateFileW(path, 0x00010080, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero)) {
             if (handle.IsInvalid) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
             IntPtr data = Marshal.AllocHGlobal(4096);
             try {
@@ -27,6 +27,7 @@ public static class Volume607 {
                 status = NtQueryVolumeInformationFile(handle, out io, data, 4096, 4);
                 if (status < 0) throw new Exception("device query status " + status.ToString("X8"));
                 uint characteristics = unchecked((uint)Marshal.ReadInt32(data, 4));
+                string device = String.Format("device_status=0x{0:X8} device_bytes={1}", status, io.Information);
                 status = NtQueryVolumeInformationFile(handle, out io, data, 16, 5);
                 uint prefixAttributes = unchecked((uint)Marshal.ReadInt32(data));
                 string prefix = String.Format("prefix_status=0x{0:X8} prefix_bytes={1} prefix_attributes=0x{2:X8}", status, io.Information, prefixAttributes);
@@ -38,7 +39,7 @@ public static class Volume607 {
                     if (!GetFileInformationByHandleEx(handle, 13, data, 116)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
                     protocol = unchecked((uint)Marshal.ReadInt32(data, 4)).ToString("X8");
                 }
-                return String.Format("path={0} filesystem={1} attributes=0x{2:X8} posix={3} maximum={4} characteristics=0x{5:X8} remote={6} protocol={7} {8}", path, name, attributes, (attributes & 0x400) != 0, maximum, characteristics, (characteristics & 0x10) != 0, protocol, prefix);
+                return String.Format("path={0} filesystem={1} attributes=0x{2:X8} posix={3} maximum={4} characteristics=0x{5:X8} remote={6} protocol={7} {8} {9}", path, name, attributes, (attributes & 0x400) != 0, maximum, characteristics, (characteristics & 0x10) != 0, protocol, prefix, device);
             } finally { Marshal.FreeHGlobal(data); }
         }
     }
@@ -46,4 +47,8 @@ public static class Volume607 {
 '@
 [Volume607]::Probe($env:GITHUB_WORKSPACE)
 [Volume607]::Probe('\\localhost\MachStd607')
+$ownedFile = Join-Path $env:GITHUB_WORKSPACE 'mach_607_capability_file'
+[IO.File]::WriteAllText($ownedFile, 'probe')
+try { [Volume607]::Probe('\\localhost\MachStd607\mach_607_capability_file') }
+finally { [IO.File]::Delete($ownedFile) }
 Get-SmbConnection | Format-List ServerName, ShareName, Dialect

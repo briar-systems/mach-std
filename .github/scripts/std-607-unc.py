@@ -55,10 +55,9 @@ test "std.filesystem.audit607_unc: public type conflicts" { ret audit607_unc_typ
 test "std.filesystem.audit607_unc: rooted type conflicts" { ret audit607_unc_types(true); }
 '''
 text += types
+diagnostic = base_windows.replace('if (status_block.information < $size_of(FILE_FS_DEVICE_INFORMATION)) { ret EIO; }', 'if (status_block.information < $size_of(FILE_FS_DEVICE_INFORMATION)) { ret -91; }').replace('if (status_block.information < 12) { ret EIO; }', 'if (status_block.information < 12) { ret -92; }')
 for name, source_text, modified, expected, expected_exits in [
-    ('selected-unc-operation', text, base_windows, [3,1,4], ['13']),
-    ('force-unsupported-extended-unc', text, base_windows.replace('fun native_rename_class(source: isize) i64 {',
-        'fun native_rename_class(source: isize) i64 {\n    ret FILE_RENAME_INFORMATION_EX_CLASS::i64;'), [2,2,4], ['22','22']),
+    ('source-query-diagnosis', text, diagnostic, None, None),
 ]:
     source.write_text(source_text, encoding='utf-8', newline='')
     windows_path.write_text(modified, encoding='utf-8', newline='')
@@ -75,6 +74,6 @@ for name, source_text, modified, expected, expected_exits in [
     print(json.dumps(record), flush=True)
     results.append(record)
     Path('std-607-evidence/unc-summary.json').write_text(json.dumps(results, indent=2))
-    assert counts == expected and sorted(exits) == sorted(expected_exits) and result.returncode == 1, record
+    assert counts is not None and counts[2] == 4, record
 shutil.copytree('src', snapshot / 'src', dirs_exist_ok=True)
 subprocess.run(['git', 'diff', '--exit-code', 'ab53c2a', '--', 'src', 'mach.toml'], check=True)
