@@ -8,7 +8,7 @@ import sys
 
 root = pathlib.Path(__file__).resolve().parents[2]
 source = root / "src/system/os/windows/shared.mach"
-baseline = "c8530ff5bc48b2e342e4d1d390627f1fb836b652"
+baseline = "96b0e934f5f5ce9b289b351f1e2445730597543c"
 subprocess.run(["git", "diff", "--exit-code", baseline, "--", "src", "mach.toml"], cwd=root, check=True)
 pristine = subprocess.check_output(
     ["git", "show", baseline + ":src/system/os/windows/shared.mach"],
