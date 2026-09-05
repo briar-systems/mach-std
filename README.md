@@ -7,23 +7,22 @@ This repository contains the canonical standard library for the Mach programming
 To use the standard library in your Mach project, you can include it as a dependency in your project's configuration file:
 
 ```toml
-[deps.mach-std]
+[dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v0.34.0"
+ref = "tag/v0.37.2"
 ```
 
 You can also use the Mach dependency manager to add it to your project:
 
 ```bash
-mach dep add mach-std --git https://github.com/briar-systems/mach-std --ref tag/v0.34.0
+mach dep add std --git https://github.com/briar-systems/mach-std --ref tag/v0.37.2
 ```
 
 ## Documentation
 
-The documentation for the Mach Standard Library can be found in the [doc](./doc) directory.
+API documentation lives alongside the implementation in [src](./src).
 
-> NOTE: The documentation is currently a work in progress and the API is rapidly changing.
-> Please refer to the source code for the most up-to-date information.
+The API is evolving. See the [changelog](./CHANGELOG.md) for release changes.
 
 ### I/O ownership queries
 
