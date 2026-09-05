@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Windows filesystem transactions honor directory descriptors for publication,
+  metadata, rename, directory creation, and removal. Operations use native
+  handles and retain their root when its pathname is renamed or replaced
+  (#574).
+- Windows file creation, metadata, rename, and removal accept UTF-8 paths
+  consistently with handle-based directory enumeration (#574).
+- Windows directory enumeration remains attached to its open handle, preserves
+  every entry across output-buffer boundaries, and supports rewind for
+  transaction recovery and recursive cleanup (#574).
+- Native Windows relative path components reject alternate-stream syntax and
+  path separators. Metadata and deletion inspect reparse points without
+  following their targets (#574).
+
 ## [0.34.0] - 2026-09-01
 
 ### Added
