@@ -11,8 +11,8 @@ public static class Volume607 {
     public static extern int NtQueryVolumeInformationFile(SafeFileHandle handle, out IoStatus io, IntPtr data, uint size, uint kind);
     [DllImport("kernel32.dll", SetLastError=true)]
     public static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, uint kind, IntPtr data, uint size);
-    public static string Probe(string path) {
-        using (var handle = CreateFileW(path, 0x00010080, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero)) {
+    public static string Probe(string path, uint access) {
+        using (var handle = CreateFileW(path, access, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero)) {
             if (handle.IsInvalid) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
             IntPtr data = Marshal.AllocHGlobal(4096);
             try {
@@ -45,10 +45,10 @@ public static class Volume607 {
     }
 }
 '@
-[Volume607]::Probe($env:GITHUB_WORKSPACE)
-[Volume607]::Probe('\\localhost\MachStd607')
+[Volume607]::Probe($env:GITHUB_WORKSPACE, 0)
+[Volume607]::Probe('\\localhost\MachStd607', 0)
 $ownedFile = Join-Path $env:GITHUB_WORKSPACE 'mach_607_capability_file'
 [IO.File]::WriteAllText($ownedFile, 'probe')
-try { [Volume607]::Probe('\\localhost\MachStd607\mach_607_capability_file') }
+try { [Volume607]::Probe('\\localhost\MachStd607\mach_607_capability_file', 0x00010080) }
 finally { [IO.File]::Delete($ownedFile) }
 Get-SmbConnection | Format-List ServerName, ShareName, Dialect
