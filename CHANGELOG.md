@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Filesystem transaction directory listing releases a copied entry name when
+  vector growth fails, preserving exact allocation ownership under memory
+  pressure (#605).
 - Public filesystem Root opening and removal allocate each path component from
   its exact UTF-8 length and verify opened directory identities. Valid Unicode
   names are no longer rejected by a fixed byte buffer (#601).
