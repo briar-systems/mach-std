@@ -292,6 +292,12 @@ ext fun WriteFile(p0: isize, p1: *u8, p2: u32, p3: *u32, p4: ptr) i32;
 #[library("kernel32.dll")]
 ext fun FlushFileBuffers(p0: isize) i32;
 #[library("kernel32.dll")]
+ext fun ReOpenFile(p0: isize, p1: u32, p2: u32, p3: u32) isize;
+#[library("kernel32.dll")]
+ext fun GetVolumeInformationByHandleW(p0: isize, p1: *u16, p2: u32, p3: *u32, p4: *u32, p5: *u32, p6: *u16, p7: u32) i32;
+#[library("kernel32.dll")]
+ext fun GetProcessHandleCount(p0: isize, p1: *u32) i32;
+#[library("kernel32.dll")]
 ext fun LockFileEx(p0: isize, p1: u32, p2: u32, p3: u32, p4: u32, p5: ptr) i32;
 #[library("kernel32.dll")]
 ext fun UnlockFileEx(p0: isize, p1: u32, p2: u32, p3: u32, p4: ptr) i32;
@@ -1750,12 +1756,60 @@ pub fun lock_fd(fd: i32, op: i32) i64 {
     ret 0;
 }
 
-# flush an open file's buffered data to its backing storage
-pub fun sync_fd(fd: i32) i64 {
-    val h: isize = get_handle(fd);
-    if (h == INVALID_HANDLE_VALUE) { ret EBADF; }
-    if (FlushFileBuffers(h) == 0) { ret last_error(); }
+fun finish_directory_sync(handle: isize, flushed: i64) i64 {
+    var closed: i64 = 0;
+    if (CloseHandle(handle) == 0) { closed = last_error(); }
+    if (flushed < 0) { ret flushed; }
+    ret closed;
+}
+
+fun flush_owned_directory(handle: isize) i64 {
+    var flushed: i64 = 0;
+    if (FlushFileBuffers(handle) == 0) { flushed = last_error(); }
+    ret finish_directory_sync(handle, flushed);
+}
+
+fun sync_directory(handle: isize, filesystem: *u16) i64 {
+    # ms-fsa 2.1.5.7 footnote 80 guarantees directory persistence only on ntfs
+    if (filesystem[0] != 'N'::u16 || filesystem[1] != 'T'::u16
+     || filesystem[2] != 'F'::u16 || filesystem[3] != 'S'::u16
+     || filesystem[4] != 0) { ret ENOTSUP; }
+    val writable: isize = ReOpenFile(
+        handle, GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+    );
+    if (writable == INVALID_HANDLE_VALUE) { ret last_error(); }
+    ret flush_owned_directory(writable);
+}
+
+fun sync_directory_handle(handle: isize) i64 {
+    var filesystem: [261]u16;
+    if (GetVolumeInformationByHandleW(handle, nil, 0, nil, nil, nil, ?filesystem[0], 261) == 0) {
+        ret last_error();
+    }
+    ret sync_directory(handle, ?filesystem[0]);
+}
+
+fun sync_handle(handle: isize) i64 {
+    var info: BY_HANDLE_FILE_INFORMATION;
+    if (GetFileInformationByHandle(handle, (?info)::*u8) == 0) { ret last_error(); }
+    if ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        ret sync_directory_handle(handle);
+    }
+    if (FlushFileBuffers(handle) == 0) { ret last_error(); }
     ret 0;
+}
+
+# flush file data or ntfs directory metadata through the pinned object
+# other windows filesystems cannot certify directory persistence and return enotsup
+pub fun sync_fd(fd: i32) i64 {
+    if (!handle_lock(fd)) { ret EBADF; }
+    val handle: isize = get_handle(fd);
+    var synced: i64 = EBADF;
+    if (handle != INVALID_HANDLE_VALUE) { synced = sync_handle(handle); }
+    handle_unlock(fd);
+    ret synced;
 }
 
 pub fun stat(fd: i32, st: *stat_t) i64 {
@@ -4102,4 +4156,128 @@ pub fun error_message(code: i64) str {
     or (code == ENOTEMPTY) { ret "directory not empty"; }
     or (code == ENOTSUP) { ret "operation not supported"; }
     or { ret "unknown error"; }
+}
+
+test "std.system.os.windows.sync_fd: refuses unsupported filesystems and preserves native failures" {
+    if (sync_fd(-1) != EBADF || sync_fd(MAX_FDS::i32) != EBADF) { ret 1; }
+    if (sync_handle(INVALID_HANDLE_VALUE) != win32_error(ERROR_INVALID_HANDLE)) { ret 2; }
+    if (sync_directory_handle(INVALID_HANDLE_VALUE) != win32_error(ERROR_INVALID_HANDLE)) { ret 3; }
+    var filesystem: [6]u16;
+    filesystem[0] = 'N'::u16;
+    filesystem[1] = 'T'::u16;
+    filesystem[2] = 'F'::u16;
+    filesystem[3] = 'S'::u16;
+    filesystem[4] = 0;
+    filesystem[5] = 0;
+    if (sync_directory(INVALID_HANDLE_VALUE, ?filesystem[0]) != win32_error(ERROR_INVALID_HANDLE)) { ret 4; }
+    var i: usize = 0;
+    for (i < 5) {
+        val saved: u16 = filesystem[i];
+        filesystem[i] = 'X'::u16;
+        if (sync_directory(INVALID_HANDLE_VALUE, ?filesystem[0]) != ENOTSUP) { ret 5; }
+        filesystem[i] = saved;
+        i = i + 1;
+    }
+    if (finish_directory_sync(INVALID_HANDLE_VALUE, 0) != win32_error(ERROR_INVALID_HANDLE)) { ret 6; }
+    if (finish_directory_sync(INVALID_HANDLE_VALUE, ECANCELED) != ECANCELED) { ret 7; }
+    ret 0;
+}
+
+test "std.system.os.windows.sync_fd: flushes the pinned NTFS directory and releases temporary handles" {
+    var root: [40]u8;
+    var moved: [40]u8;
+    var nonce: [8]u8;
+    if (random_fill(?nonce[0], 8) < 0) { ret 1; }
+    val prefix: str = "mach-sync-";
+    val hex: str = "0123456789abcdef";
+    var i: usize = 0;
+    for (i < 10) { root[i] = prefix[i]; i = i + 1; }
+    i = 0;
+    for (i < 8) {
+        root[10 + i * 2] = hex[(nonce[i] >> 4)::usize];
+        root[11 + i * 2] = hex[(nonce[i] & 15)::usize];
+        i = i + 1;
+    }
+    root[26] = 0;
+    i = 0;
+    for (i < 26) { moved[i] = root[i]; i = i + 1; }
+    moved[26] = '-'; moved[27] = 'm'; moved[28] = 0;
+    if (make_dir_utf8(?root[0]) < 0) { ret 2; }
+    val opened: i64 = open_root_utf8(?root[0]);
+    if (opened < 0) { remove_dir_utf8(?root[0]); ret 3; }
+    val fd: i32 = opened::i32;
+    val original: isize = get_handle(fd);
+    var bad: i32 = 0;
+    var before: BY_HANDLE_FILE_INFORMATION;
+    var after: BY_HANDLE_FILE_INFORMATION;
+    if (GetFileInformationByHandle(original, (?before)::*u8) == 0) { bad = 4; }
+    var count_before: u32 = 0;
+    var count_after: u32 = 0;
+    if (GetProcessHandleCount(-1, ?count_before) == 0) { bad = 5; }
+    i = 0;
+    for (bad == 0 && i < 300) {
+        if (sync_fd(fd) != 0) { bad = 6; }
+        i = i + 1;
+    }
+    if (GetProcessHandleCount(-1, ?count_after) == 0 || count_after != count_before) { bad = 7; }
+    var renamed: bool = false;
+    if (bad == 0) {
+        if (rename(AT_FDCWD, ?root[0], AT_FDCWD, ?moved[0]) < 0) { bad = 8; }
+        or { renamed = true; }
+    }
+    var replacement: i32 = -1;
+    if (bad == 0) {
+        val created: i64 = open(AT_FDCWD, ?root[0], O_CREAT | O_EXCL | O_WRONLY, 0o600);
+        if (created < 0) { bad = 9; }
+        or {
+            replacement = created::i32;
+            if (write(replacement, "x", 1) != 1 || sync_fd(replacement) != 0) { bad = 10; }
+        }
+    }
+    if (replacement >= 0) {
+        if (close(replacement) < 0) { bad = 11; }
+        replacement = -1;
+    }
+    if (bad == 0) {
+        val reader: i64 = open(AT_FDCWD, ?root[0], O_RDONLY, 0);
+        if (reader < 0) { bad = 12; }
+        or {
+            if (sync_fd(reader::i32) != EACCES) { bad = 13; }
+            if (close(reader::i32) < 0) { bad = 14; }
+        }
+    }
+    if (bad == 0 && sync_fd(fd) != 0) { bad = 15; }
+    if (GetFileInformationByHandle(original, (?after)::*u8) == 0
+     || get_handle(fd) != original
+     || before.dwVolumeSerialNumber != after.dwVolumeSerialNumber
+     || before.nFileIndexHigh != after.nFileIndexHigh
+     || before.nFileIndexLow != after.nFileIndexLow) { bad = 16; }
+    if (bad == 0) {
+        val readonly: isize = ReOpenFile(original, GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_FLAG_BACKUP_SEMANTICS);
+        if (readonly == INVALID_HANDLE_VALUE) { bad = 23; }
+        or {
+            if (flush_owned_directory(readonly) != EACCES) { bad = 24; }
+            var flags: u32 = 0;
+            if (GetHandleInformation(readonly, ?flags) != 0) { bad = 25; CloseHandle(readonly); }
+        }
+    }
+    if (bad == 0) {
+        val temporary: isize = ReOpenFile(original, GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_FLAG_BACKUP_SEMANTICS);
+        if (temporary == INVALID_HANDLE_VALUE) { bad = 17; }
+        or {
+            if (finish_directory_sync(temporary, ECANCELED) != ECANCELED) { bad = 18; }
+            var flags: u32 = 0;
+            if (GetHandleInformation(temporary, ?flags) != 0) { bad = 19; CloseHandle(temporary); }
+        }
+    }
+    if (close(fd) < 0) { bad = 20; }
+    if (sync_fd(fd) != EBADF) { bad = 21; }
+    if (renamed) {
+        remove_file_utf8(?root[0]);
+        if (remove_dir_utf8(?moved[0]) < 0) { bad = 22; }
+    }
+    or { remove_dir_utf8(?root[0]); }
+    ret bad;
 }
