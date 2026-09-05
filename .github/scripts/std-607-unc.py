@@ -35,28 +35,32 @@ test "std.filesystem.audit607_unc: held destination replacement" {
         "//localhost/MachStd607/mach_607_unc_held_to");
 }
 '''
-text = text.replace('    val raw: i64 = os.rename(os.AT_FDCWD, from, os.AT_FDCWD, to);\n    if (raw < 0) { ret (0 - raw)::i32; }', '''    val parent: i64 = os.open(os.AT_FDCWD, "//localhost/MachStd607", os.O_RDONLY | os.O_DIRECTORY, 0);
-    if (parent < 0) { ret (0 - parent)::i32; }
-    val raw: i64 = os.rename(os.AT_FDCWD, from, parent::i32, path.filename(to));
-    os.close(parent::i32);
-    if (raw < 0) { ret (0 - raw)::i32; }''')
 source.write_text(text, encoding='utf-8', newline='')
 census = runpy.run_path('.github/scripts/std-607-census.py')['census']
 windows_path = snapshot / 'src/system/os/windows/shared.mach'
 base_windows = windows_path.read_text(encoding='utf-8')
 results = []
-for name, info_class, flags, basename in [
-    ('extended-posix-parent', 65, 3, False),
-    ('extended-replace-parent', 65, 1, False),
-    ('legacy-replace-parent', 10, 1, False),
+types = text[text.index('fun rename_type_conflicts('):text.index('test "std.filesystem.rename: type conflicts')]
+types = types.replace('rename_type_conflicts', 'audit607_unc_types')
+types = types.replace('"mach_std_rename_type_file"', '"//localhost/MachStd607/mach_std_rename_type_file"')
+types = types.replace('"mach_std_rename_type_directory"', '"//localhost/MachStd607/mach_std_rename_type_directory"')
+types = types.replace('os.AT_FDCWD, ".",', 'os.AT_FDCWD, "//localhost/MachStd607",')
+types = types.replace('    if (os.rename(dirfd, file_path, dirfd, dir_path)', '''    var source_name: str = file_path;
+    var target_name: str = dir_path;
+    if (rooted) { source_name = path.filename(file_path); target_name = path.filename(dir_path); }
+    if (os.rename(dirfd, source_name, dirfd, target_name)''')
+types = types.replace('os.rename(dirfd, dir_path, dirfd, file_path)', 'os.rename(dirfd, target_name, dirfd, source_name)')
+types += '''
+test "std.filesystem.audit607_unc: public type conflicts" { ret audit607_unc_types(false); }
+test "std.filesystem.audit607_unc: rooted type conflicts" { ret audit607_unc_types(true); }
+'''
+text += types
+for name, source_text, modified, expected, expected_exits in [
+    ('selected-unc-operation', text, base_windows, [3,1,4], ['13']),
+    ('force-unsupported-extended-unc', text, base_windows.replace('fun native_rename_class(source: isize) i64 {',
+        'fun native_rename_class(source: isize) i64 {\n    ret FILE_RENAME_INFORMATION_EX_CLASS::i64;'), [2,2,4], ['22','22']),
 ]:
-    modified = base_windows.replace('val FILE_RENAME_INFORMATION_EX_CLASS:   u32 = 65;',
-        'val FILE_RENAME_INFORMATION_EX_CLASS:   u32 = ' + str(info_class) + ';')
-    modified = modified.replace('info.flags = FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS;',
-        'info.flags = ' + str(flags) + ';')
-    if basename:
-        modified = modified.replace('or { result = native_rename_handle(source, 0, native.buffer, native.length::usize / 2); }',
-            'or { var start: usize = 0; var i: usize = 0; val length: usize = native.length::usize / 2; for (i < length) { if (native.buffer[i] == 92) { start = i + 1; } i = i + 1; } result = native_rename_handle(source, 0, ?native.buffer[start], length - start); }')
+    source.write_text(source_text, encoding='utf-8', newline='')
     windows_path.write_text(modified, encoding='utf-8', newline='')
     census(name, 'windows')
     result = subprocess.run(['mach', 'test', 'test/native', '--target', 'windows-x86_64',
@@ -71,6 +75,6 @@ for name, info_class, flags, basename in [
     print(json.dumps(record), flush=True)
     results.append(record)
     Path('std-607-evidence/unc-summary.json').write_text(json.dumps(results, indent=2))
-    assert counts is not None and counts[2] == 2 and result.returncode in (0, 1), record
+    assert counts == expected and sorted(exits) == sorted(expected_exits) and result.returncode == 1, record
 shutil.copytree('src', snapshot / 'src', dirs_exist_ok=True)
-subprocess.run(['git', 'diff', '--exit-code', 'e0eee1164491c003f774dc8318f23fd72eefb130', '--', 'src', 'mach.toml'], check=True)
+subprocess.run(['git', 'diff', '--exit-code', 'ab53c2a', '--', 'src', 'mach.toml'], check=True)

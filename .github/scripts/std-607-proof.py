@@ -86,11 +86,13 @@ test "std.filesystem.audit607: directory flush error is reported after publicati
 '''
 
 try:
-    count = 7 if host == 'windows' else 6
+    count = 8 if host == 'windows' else 7
     run('baseline-public-paths-and-invariants', 'std.filesystem.rename:', [count,0,count], [])
     run('baseline-rooted-one-character-publication', 'held destinations retain', [1,0,1], [])
     run('baseline-atomic-byte-durability', 'std.filesystem.replace_bytes_atomic:', [2,0,2], [])
     if host == 'windows':
+        basic = once(windows, 'fun native_rename_class(source: isize) i64 {', 'fun native_rename_class(source: isize) i64 {\n    ret FILE_RENAME_INFORMATION_CLASS::i64;')
+        run('basic-rename-type-invariants', 'type conflicts preserve', [2,0,2], [], {windows_path: basic})
         no_posix = once(windows, 'info.flags = FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS;',
             'info.flags = FILE_RENAME_REPLACE_IF_EXISTS;')
         run('omit-posix-replacement-semantics', 'held destinations', [0,3,3], ['73','73','74'],
@@ -117,4 +119,4 @@ try:
             {windows_path: flush_failure, filesystem_path: skip_sync})
 finally:
     shutil.copytree('src', snapshot / 'src', dirs_exist_ok=True)
-    subprocess.run(['git', 'diff', '--exit-code', 'e0eee1164491c003f774dc8318f23fd72eefb130', '--', 'src', 'mach.toml'], check=True)
+    subprocess.run(['git', 'diff', '--exit-code', 'ab53c2a', '--', 'src', 'mach.toml'], check=True)
