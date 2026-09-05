@@ -28,6 +28,8 @@ public static class Volume607 {
                 if (status < 0) throw new Exception("device query status " + status.ToString("X8"));
                 uint characteristics = unchecked((uint)Marshal.ReadInt32(data, 4));
                 string device = String.Format("device_status=0x{0:X8} device_bytes={1}", status, io.Information);
+                int exactDeviceStatus = NtQueryVolumeInformationFile(handle, out io, data, 8, 4);
+                device += String.Format(" exact_device_status=0x{0:X8} exact_device_bytes={1}", exactDeviceStatus, io.Information);
                 status = NtQueryVolumeInformationFile(handle, out io, data, 16, 5);
                 uint prefixAttributes = unchecked((uint)Marshal.ReadInt32(data));
                 string prefix = String.Format("prefix_status=0x{0:X8} prefix_bytes={1} prefix_attributes=0x{2:X8}", status, io.Information, prefixAttributes);
