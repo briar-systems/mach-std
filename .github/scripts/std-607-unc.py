@@ -116,4 +116,4 @@ for name, source_text, modified, expected, expected_exits in [
     Path('std-607-evidence/unc-summary.json').write_text(json.dumps(results, indent=2))
     assert counts == expected and sorted(exits) == sorted(expected_exits) and result.returncode == (1 if expected[1] else 0), record
 shutil.copytree('src', snapshot / 'src', dirs_exist_ok=True)
-subprocess.run(['git', 'diff', '--exit-code', 'e430a14', '--', 'src', 'mach.toml'], check=True)
+subprocess.run(['git', 'diff', '--exit-code', '4b473bd', '--', 'src', 'mach.toml'], check=True)
