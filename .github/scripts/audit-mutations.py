@@ -1,6 +1,7 @@
 import json
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 
@@ -14,6 +15,9 @@ pristine = subprocess.check_output(
 text = pristine.decode()
 evidence = root / "mutation-evidence"
 evidence.mkdir(exist_ok=True)
+fixture = root / "test/native"
+dependency = fixture / "dep/std"
+dependency.mkdir(parents=True, exist_ok=True)
 prefix = "std.filesystem.transaction: "
 publication = prefix + "publication and mutations retain a renamed root"
 directory = prefix + "directory batches retain every entry and rewind before cleanup"
@@ -42,7 +46,9 @@ results = []
 
 
 def run(name, selected, expected):
-    command = [sys.argv[1], "test", ".", "--filter", selected]
+    shutil.copy2(root / "mach.toml", dependency / "mach.toml")
+    shutil.copytree(root / "src", dependency / "src", dirs_exist_ok=True)
+    command = [sys.argv[1], "test", str(fixture), "--target", "windows-x86_64", "--include-deps", "--filter", selected]
     process = subprocess.Popen(command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     timed_out = False
     try:
@@ -57,7 +63,7 @@ def run(name, selected, expected):
     counts = list(map(int, counts[-1])) if counts else None
     exits = re.findall(r"\(exit ([^)]+)\)", log)
     valid = not timed_out and counts == expected
-    valid = valid and ((process.returncode == 0) if name == "baseline" else (process.returncode != 0 and bool(exits)))
+    valid = valid and ((process.returncode == 0) if name.startswith("baseline") else (process.returncode != 0 and bool(exits)))
     result = dict(name=name, selected=selected, counts=counts, exits=exits,
                   compiler_exit=process.returncode, timeout=timed_out, verified=valid)
     results.append(result)
@@ -68,8 +74,11 @@ def run(name, selected, expected):
 
 try:
     source.write_bytes(pristine)
-    if not run("baseline", prefix.rstrip(), [4, 0, 4]):
-        raise SystemExit("baseline must select and pass all four new regressions")
+    if not run("baseline-prefix", prefix.rstrip(), [5, 0, 5]):
+        raise SystemExit("prefix baseline must pass the four new and one existing test")
+    for index, selected in enumerate([publication, directory, unicode, streams]):
+        if not run(f"baseline-new-{index + 1}", selected, [1, 0, 1]):
+            raise SystemExit("each new regression must pass independently")
     for name, selected, before, after in variants:
         if text.count(before) != 1:
             raise SystemExit(f"{name}: mutation anchor is not unique")
