@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Subtree publication retains its held root after ancestor renames. Staged
+  directories and files are created through directory descriptors, and staged
+  symlinks cannot redirect inventory writes (#575). The subtree API and descent
+  state no longer carry unused absolute path metadata.
 - Filesystem transactions publish valid maximum-length destination names using
   short staging names and a persistent descriptor-relative backup directory.
   Recovery resolves only the requested destination, preserving other backups
