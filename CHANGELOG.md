@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Public filesystem Root opening and removal allocate each path component from
+  its exact UTF-8 length and verify opened directory identities. Valid Unicode
+  names are no longer rejected by a fixed byte buffer (#601).
+
 - Subtree publication retains its held root after ancestor renames. Staged
   directories and files are created through directory descriptors, and staged
   symlinks cannot redirect inventory writes (#575). The subtree API and descent
