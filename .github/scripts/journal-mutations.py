@@ -27,7 +27,7 @@ variants = [
     ('reserve-lock', paths[0], reserved, 4, '    if (str_len(name) == str_len(LOCK_LEAF) && journal_prefix(name, LOCK_LEAF)) { ret false; }', ''),
     ('case-fold-reservations', paths[0], reserved, 4, "        if (byte >= 'A' && byte <= 'Z') { byte = byte + 32; }", ''),
     ('exact-staging', paths[0], reserved, 16, 'fun staging_residue(name: str) bool {', 'fun staging_residue(name: str) bool {\n    ret str_starts_with(name, STAGING_TAG);'),
-    ('backup-container-follow', paths[0], container, 7, '    ret verified_directory(dirfd, BACKUP_CONTAINER, OP_RECOVER);', '    val raw: i64 = os.open(dirfd, BACKUP_CONTAINER, os.O_RDONLY | os.O_DIRECTORY, 0);\n    if (raw < 0) { ret R.err[i32, Error](io_error(OP_RECOVER, raw)); }\n    ret R.ok[i32, Error](raw::i32);'),
+    ('backup-container-follow', paths[0], container, 8 if os.name == 'nt' else 7, '    ret verified_directory(dirfd, BACKUP_CONTAINER, OP_RECOVER);', '    val raw: i64 = os.open(dirfd, BACKUP_CONTAINER, os.O_RDONLY | os.O_DIRECTORY, 0);\n    if (raw < 0) { ret R.err[i32, Error](io_error(OP_RECOVER, raw)); }\n    ret R.ok[i32, Error](raw::i32);'),
     ('backup-kind', paths[0], container, 12, '    if ((os.stat_mode(?backup) & os.S_IFMT) != os.S_IFDIR) {\n        ret R.err[bool, Error](error(CONFLICT, OP_RECOVER));\n    }', ''),
     ('destination-kind', paths[0], container, 17, '        if ((os.stat_mode(?destination) & os.S_IFMT) != os.S_IFDIR) {\n            ret R.err[bool, Error](error(CONFLICT, OP_RECOVER));\n        }', ''),
 ]
