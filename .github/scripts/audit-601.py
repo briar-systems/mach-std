@@ -98,7 +98,7 @@ opening = 'root_open: full Unicode components'
 removal = 'root_remove_tree: full Unicode components'
 release = '    os.deallocate(component.name::ptr, component.size);'
 variants = [
-    ('omit-native-release', replace_once(instrumented, release, ''), both, [0, 2, 2], ['40', '42']),
+    ('omit-native-release', replace_once(instrumented, release, ''), both, [1, 2, 3], ['40', '42']),
     ('omit-open-release', replace_once(instrumented,
         '        free_component(?component);\n        os.close(fd);',
         '        os.close(fd);'), opening, [0, 1, 1], ['40']),
@@ -113,11 +113,11 @@ variants = [
         '            if (held) { os.close(fd); }'), removal, [0, 1, 1], ['42']),
 ]
 try:
-    if not run('baseline-uninstrumented', text, both, [2, 0, 2], []):
+    if not run('baseline-uninstrumented', text, both, [3, 0, 3], []):
         raise SystemExit('production baseline failed')
-    if not run('uninstrumented-release-leak', replace_once(text, release, ''), both, [2, 0, 2], []):
+    if not run('uninstrumented-release-leak', replace_once(text, release, ''), both, [3, 0, 3], []):
         raise SystemExit('unexpected uninstrumented behavior')
-    if not run('baseline-allocation-oracle', instrumented, both, [2, 0, 2], []):
+    if not run('baseline-allocation-oracle', instrumented, both, [3, 0, 3], []):
         raise SystemExit('allocation oracle baseline failed')
     for args in variants:
         run(*args)
