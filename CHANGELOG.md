@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Filesystem transactions publish valid maximum-length destination names using
+  short staging names and a persistent descriptor-relative backup directory.
+  Recovery resolves only the requested destination, preserving other backups
+  and malformed residue (#581).
+- Publication rejects reserved journal and lock names with portable ASCII
+  case-insensitive matching, preventing recovery from deleting published content
+  under an internal name (#581).
+- The OS boundary reports filename overflow as `ENAMETOOLONG` on every target,
+  including Windows UTF-16 component validation (#581).
 - Windows symbolic links preserve UTF-8 link names and relative targets through
   UTF-16 conversion. Target normalization and directory probing use the actual
   converted lengths instead of fixed byte buffers (#580).
