@@ -109,7 +109,7 @@ test "std.filesystem.audit607_capability: failed query preserves both entries" {
 '''
 
 try:
-    count = 8 if host == 'windows' else 7
+    count = 10 if host == 'windows' else 9
     run('baseline-public-paths-and-invariants', 'std.filesystem.rename:', [count,0,count], [])
     run('baseline-rooted-one-character-publication', 'held destinations retain', [1,0,1], [])
     run('baseline-atomic-byte-durability', 'std.filesystem.replace_bytes_atomic:', [2,0,2], [])
@@ -123,7 +123,10 @@ try:
             {windows_path: swallow_query, filesystem_path: filesystem + capability_test})
         basic = once(windows, 'fun native_rename_class(source: isize) i64 {', 'fun native_rename_class(source: isize) i64 {\n    ret FILE_RENAME_INFORMATION_CLASS::i64;')
         run('basic-rename-type-invariants', 'type conflicts preserve', [2,0,2], [], {windows_path: basic})
-        replace_dirs = once(basic, '    if ((source_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) { info.flags = 0; }\n', '')
+        run('basic-directory-symlink-replacement', 'directory symlink source to', [2,0,2], [], {windows_path: basic})
+        forbid_directory_links = once(basic, '(source_info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == FILE_ATTRIBUTE_DIRECTORY', '(source_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0')
+        run('treat-directory-symlinks-as-directories', 'directory symlink source to', [1,1,2], ['17'], {windows_path: forbid_directory_links})
+        replace_dirs = once(basic, '    if ((source_info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == FILE_ATTRIBUTE_DIRECTORY) { info.flags = 0; }\n', '')
         run('replace-directory-over-file-in-basic-mode', 'type conflicts preserve', [0,2,2], ['5','5'], {windows_path: replace_dirs})
         no_posix = once(windows, 'info.flags = FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS;',
             'info.flags = FILE_RENAME_REPLACE_IF_EXISTS;')
@@ -151,4 +154,4 @@ try:
             {windows_path: flush_failure, filesystem_path: skip_sync})
 finally:
     shutil.copytree('src', snapshot / 'src', dirs_exist_ok=True)
-    subprocess.run(['git', 'diff', '--exit-code', 'c7e59c4', '--', 'src', 'mach.toml'], check=True)
+    subprocess.run(['git', 'diff', '--exit-code', 'e430a14', '--', 'src', 'mach.toml'], check=True)

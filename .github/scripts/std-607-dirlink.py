@@ -13,9 +13,14 @@ windows = Path('src/system/os/windows/shared.mach').read_text(encoding="utf-8")
 filesystem = Path('src/filesystem.mach').read_text(encoding="utf-8")
 fixture = '''
 fun audit607_dirlink(existing: bool) i32 {
-    val target: str = "mach_607_dirlink_target";
-    val from: str = "mach_607_dirlink_from";
-    val to: str = "mach_607_dirlink_to";
+    var target: str = "mach_607_dirlink_absent_target";
+    var from: str = "mach_607_dirlink_absent_from";
+    var to: str = "mach_607_dirlink_absent_to";
+    if (existing) {
+        target = "mach_607_dirlink_existing_target";
+        from = "mach_607_dirlink_existing_from";
+        to = "mach_607_dirlink_existing_to";
+    }
     if (O.is_some[str](create_dir(target, 0o700))) { ret 97; }
     fin { remove_dir(target); }
     if (O.is_some[str](symlink(target, from))) { ret 98; }
@@ -41,11 +46,11 @@ replacement = '(source_info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_
 results = []
 try:
     for name, modified, remote in [
-        ('local-extended-directory-bit', windows, False),
-        ('local-basic-directory-bit', basic, False),
+        ('local-extended-directory-bit', windows.replace(replacement, condition), False),
+        ('local-basic-directory-bit', basic.replace(replacement, condition), False),
         ('local-extended-real-directory', windows.replace(condition, replacement), False),
         ('local-basic-real-directory', basic.replace(condition, replacement), False),
-        ('unc-selected-directory-bit', windows, True),
+        ('unc-selected-directory-bit', windows.replace(replacement, condition), True),
         ('unc-selected-real-directory', windows.replace(condition, replacement), True),
     ]:
         shutil.copytree('src', snapshot / 'src', dirs_exist_ok=True)
@@ -66,7 +71,10 @@ try:
         print(json.dumps(record), flush=True)
         results.append(record)
         Path('std-607-evidence/dirlink-summary.json').write_text(json.dumps(results, indent=2), encoding="utf-8")
-        assert counts is not None and counts[2] == 2 and result.returncode in (0,1), record
+        if name.endswith('directory-bit'):
+            assert counts == [1,1,2] and exits == ['17'] and result.returncode == 1, record
+        else:
+            assert counts == [2,0,2] and exits == [] and result.returncode == 0, record
 finally:
     shutil.copytree('src', snapshot / 'src', dirs_exist_ok=True)
-    subprocess.run(['git', 'diff', '--exit-code', 'c7e59c4', '--', 'src', 'mach.toml'], check=True)
+    subprocess.run(['git', 'diff', '--exit-code', 'e430a14', '--', 'src', 'mach.toml'], check=True)
