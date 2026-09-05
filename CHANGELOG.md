@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.3] - 2026-09-05
+
+### Added
+
+- `log.record.field_text(key, data, len)`: a text field with an explicit
+  length, rendered quoted and escaped exactly like `field_string`, for text
+  borrowed from a buffer without a terminator. A nil pointer with a length is
+  rejected the way `field_bytes` rejects it (#599).
+
 ## [0.34.0] - 2026-09-01
 
 ### Added
