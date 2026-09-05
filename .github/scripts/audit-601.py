@@ -83,7 +83,7 @@ def run(name, body, selected, expected, expected_exits):
     (evidence / (name + '.log')).write_text(log, encoding='utf-8')
     counts = re.findall(r'(\d+) passed, (\d+) failed, (\d+) total', log)
     counts = list(map(int, counts[-1])) if counts else None
-    exits = re.findall(r'\(exit ([^)]+)\)', log)
+    exits = re.findall(r'^\s*FAIL\s+.*\(exit ([^)]+)\)', log, re.MULTILINE)
     valid = counts == expected and sorted(exits) == sorted(expected_exits)
     valid = valid and ((process.returncode == 0) == (expected[1] == 0))
     result = dict(name=name, counts=counts, exits=exits, compiler_exit=process.returncode, verified=valid)
