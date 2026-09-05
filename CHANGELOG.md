@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Path segment depth excludes Windows drive and UNC root units, including
+  drive-relative paths and parent climbs below their anchor (#609).
 - Windows process environments, executable names, arguments, working directories,
   and directory queries preserve UTF-8 through native UTF-16 APIs. Environment
   name comparison follows host identity and Windows blocks use native name order
