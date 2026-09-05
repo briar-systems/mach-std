@@ -117,4 +117,4 @@ try:
             {windows_path: flush_failure, filesystem_path: skip_sync})
 finally:
     shutil.copytree('src', snapshot / 'src', dirs_exist_ok=True)
-    subprocess.run(['git', 'diff', '--exit-code', '4349839c8c8d5dce054b7c8e94a059351d26acf3', '--', 'src', 'mach.toml'], check=True)
+    subprocess.run(['git', 'diff', '--exit-code', 'e0eee1164491c003f774dc8318f23fd72eefb130', '--', 'src', 'mach.toml'], check=True)
