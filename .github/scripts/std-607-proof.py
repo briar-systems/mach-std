@@ -93,6 +93,8 @@ try:
     if host == 'windows':
         basic = once(windows, 'fun native_rename_class(source: isize) i64 {', 'fun native_rename_class(source: isize) i64 {\n    ret FILE_RENAME_INFORMATION_CLASS::i64;')
         run('basic-rename-type-invariants', 'type conflicts preserve', [2,0,2], [], {windows_path: basic})
+        replace_dirs = once(basic, '    if ((source_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) { info.flags = 0; }\n', '')
+        run('replace-directory-over-file-in-basic-mode', 'type conflicts preserve', [0,2,2], ['5','5'], {windows_path: replace_dirs})
         no_posix = once(windows, 'info.flags = FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS;',
             'info.flags = FILE_RENAME_REPLACE_IF_EXISTS;')
         run('omit-posix-replacement-semantics', 'held destinations', [0,3,3], ['73','73','74'],
@@ -119,4 +121,4 @@ try:
             {windows_path: flush_failure, filesystem_path: skip_sync})
 finally:
     shutil.copytree('src', snapshot / 'src', dirs_exist_ok=True)
-    subprocess.run(['git', 'diff', '--exit-code', 'ab53c2a', '--', 'src', 'mach.toml'], check=True)
+    subprocess.run(['git', 'diff', '--exit-code', '7e02b68', '--', 'src', 'mach.toml'], check=True)
