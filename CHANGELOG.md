@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under an internal name (#581).
 - The OS boundary reports filename overflow as `ENAMETOOLONG` on every target,
   including Windows UTF-16 component validation (#581).
+- Windows symbolic links preserve UTF-8 link names and relative targets through
+  UTF-16 conversion. Target normalization and directory probing use the actual
+  converted lengths instead of fixed byte buffers (#580).
 - Windows filesystem transactions honor directory descriptors for publication,
   metadata, rename, directory creation, and removal. Operations use native
   handles and retain their root when its pathname is renamed or replaced
