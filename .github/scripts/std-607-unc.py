@@ -56,8 +56,11 @@ test "std.filesystem.audit607_unc: rooted type conflicts" { ret audit607_unc_typ
 '''
 text += types
 diagnostic = base_windows.replace('if (status_block.information < $size_of(FILE_FS_DEVICE_INFORMATION)) { ret EIO; }', 'if (status_block.information < $size_of(FILE_FS_DEVICE_INFORMATION)) { ret -91; }').replace('if (status_block.information < 12) { ret EIO; }', 'if (status_block.information < 12) { ret -92; }')
+diagnostic = diagnostic.replace('if (device_status < 0) { ret ntstatus_error(device_status); }', 'if (device_status < 0) { ret 0 - (device_status::u32 & 0xffff)::i64; }')
+diagnostic = diagnostic.replace('if (attribute_status < 0 && attribute_status != 0x80000005::u32::i32) { ret ntstatus_error(attribute_status); }', 'if (attribute_status < 0 && attribute_status != 0x80000005::u32::i32) { ret 0 - (attribute_status::u32 & 0xffff)::i64; }')
+diagnostic = diagnostic.replace('GetFileInformationByHandleEx(source, FILE_REMOTE_PROTOCOL_INFO_CLASS, (?remote)::ptr, $size_of(FILE_REMOTE_PROTOCOL_INFO)::u32) == 0) {\n            ret last_error();', 'GetFileInformationByHandleEx(source, FILE_REMOTE_PROTOCOL_INFO_CLASS, (?remote)::ptr, $size_of(FILE_REMOTE_PROTOCOL_INFO)::u32) == 0) {\n            ret 0 - GetLastError()::i64;')
 for name, source_text, modified, expected, expected_exits in [
-    ('source-query-diagnosis', text, diagnostic, None, None),
+    ('source-query-native-errors', text, diagnostic, None, None),
 ]:
     source.write_text(source_text, encoding='utf-8', newline='')
     windows_path.write_text(modified, encoding='utf-8', newline='')
@@ -76,4 +79,4 @@ for name, source_text, modified, expected, expected_exits in [
     Path('std-607-evidence/unc-summary.json').write_text(json.dumps(results, indent=2))
     assert counts is not None and counts[2] == 4, record
 shutil.copytree('src', snapshot / 'src', dirs_exist_ok=True)
-subprocess.run(['git', 'diff', '--exit-code', 'ab53c2a', '--', 'src', 'mach.toml'], check=True)
+subprocess.run(['git', 'diff', '--exit-code', '7e02b68', '--', 'src', 'mach.toml'], check=True)
