@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Filesystem transactions publish valid maximum-length destination names using
+  short staging names and a persistent descriptor-relative backup directory.
+  Recovery resolves only the requested destination, preserving other backups
+  and malformed residue (#581).
+- Publication rejects reserved journal and lock names with portable ASCII
+  case-insensitive matching, preventing recovery from deleting published content
+  under an internal name (#581).
+- The OS boundary reports filename overflow as `ENAMETOOLONG` on every target,
+  including Windows UTF-16 component validation (#581).
+
 ## [0.34.0] - 2026-09-01
 
 ### Added
