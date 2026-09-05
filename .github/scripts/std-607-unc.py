@@ -30,9 +30,31 @@ test "std.filesystem.audit607_unc: closed destination replacement" {
     if (!rename_held_contents(file, "new")) { ret 64; }
     ret 0;
 }
-test "std.filesystem.audit607_unc: held destination replacement" {
-    ret rename_held_pair("//localhost/MachStd607/mach_607_unc_held_from",
-        "//localhost/MachStd607/mach_607_unc_held_to");
+test "std.filesystem.audit607_unc: held destination refusal preserves both entries" {
+    val from: str = "//localhost/MachStd607/mach_607_unc_held_from";
+    val to: str = "//localhost/MachStd607/mach_607_unc_held_to";
+    if (O.is_some[str](write_bytes(from, "new", 3, 0o600))) { ret 65; }
+    fin { remove_file(from); }
+    if (O.is_some[str](write_bytes(to, "old", 3, 0o600))) { ret 66; }
+    fin { remove_file(to); }
+    val original: R.Result[File, io_error.Error] = open(to);
+    if (R.is_err[File, io_error.Error](original)) { ret 67; }
+    var held: File = R.unwrap_ok[File, io_error.Error](original);
+    fin { close(?held); }
+    val raw: i64 = os.rename(os.AT_FDCWD, from, os.AT_FDCWD, to);
+    if (raw != os.EACCES) { if (raw < 0) { ret (0 - raw)::i32; } ret 68; }
+    if (!rename_held_contents(held, "old")) { ret 69; }
+    val source: R.Result[File, io_error.Error] = open(from);
+    if (R.is_err[File, io_error.Error](source)) { ret 70; }
+    var source_file: File = R.unwrap_ok[File, io_error.Error](source);
+    fin { close(?source_file); }
+    if (!rename_held_contents(source_file, "new")) { ret 71; }
+    val target: R.Result[File, io_error.Error] = open(to);
+    if (R.is_err[File, io_error.Error](target)) { ret 72; }
+    var target_file: File = R.unwrap_ok[File, io_error.Error](target);
+    fin { close(?target_file); }
+    if (!rename_held_contents(target_file, "old")) { ret 73; }
+    ret 0;
 }
 '''
 source.write_text(text, encoding='utf-8', newline='')
@@ -62,13 +84,18 @@ parent_text = text.replace('    val raw: i64 = os.rename(os.AT_FDCWD, from, os.A
     val raw: i64 = os.rename(os.AT_FDCWD, from, parent::i32, path.filename(to));
     os.close(parent::i32);
     if (raw < 0) { ret (0 - raw)::i32; }''')
+parent_text = parent_text.replace('    val raw: i64 = os.rename(os.AT_FDCWD, from, os.AT_FDCWD, to);\n    if (raw != os.EACCES)', '''    val parent: i64 = os.open(os.AT_FDCWD, "//localhost/MachStd607", os.O_RDONLY | os.O_DIRECTORY, 0);
+    if (parent < 0) { ret (0 - parent)::i32; }
+    val raw: i64 = os.rename(os.AT_FDCWD, from, parent::i32, path.filename(to));
+    os.close(parent::i32);
+    if (raw != os.EACCES)''')
 false_bit = base_windows.replace('if ((attributes.attributes & FILE_SUPPORTS_POSIX_UNLINK_RENAME) != 0)', 'if (true)')
 miss_smb = false_bit.replace('if (remote.protocol == WNNC_NET_SMB) { ret FILE_RENAME_INFORMATION_CLASS::i64; }', '')
 unaligned = base_windows.replace('val remote: *FILE_REMOTE_PROTOCOL_INFO = ?buffer.info;', 'val remote: *FILE_REMOTE_PROTOCOL_INFO = ((?buffer)::usize + 4)::*FILE_REMOTE_PROTOCOL_INFO;')
 for name, source_text, modified, expected, expected_exits in [
-    ('selected-unc-path-operation', text, base_windows, [3,1,4], ['13']),
-    ('selected-unc-parent-operation', parent_text, base_windows, [3,1,4], ['13']),
-    ('advertised-server-posix-bit', text, false_bit, [3,1,4], ['13']),
+    ('selected-unc-path-operation', text, base_windows, [4,0,4], []),
+    ('selected-unc-parent-operation', parent_text, base_windows, [4,0,4], []),
+    ('advertised-server-posix-bit', text, false_bit, [4,0,4], []),
     ('trust-server-bit-without-protocol', text, miss_smb, [2,2,4], ['22','22']),
     ('misalign-remote-query-buffer', text, unaligned, [2,2,4], ['5','5']),
 ]:
@@ -87,6 +114,6 @@ for name, source_text, modified, expected, expected_exits in [
     print(json.dumps(record), flush=True)
     results.append(record)
     Path('std-607-evidence/unc-summary.json').write_text(json.dumps(results, indent=2))
-    assert counts == expected and sorted(exits) == sorted(expected_exits) and result.returncode == 1, record
+    assert counts == expected and sorted(exits) == sorted(expected_exits) and result.returncode == (1 if expected[1] else 0), record
 shutil.copytree('src', snapshot / 'src', dirs_exist_ok=True)
 subprocess.run(['git', 'diff', '--exit-code', 'c7e59c4', '--', 'src', 'mach.toml'], check=True)
