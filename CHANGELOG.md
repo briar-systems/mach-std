@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Atomic byte replacement flushes the parent directory on Windows through the
+  native NTFS durability backend. Unsupported directory persistence and flush
+  failures remain errors after publication (#607).
+
 - Windows rename atomically replaces destinations with open handles. Existing
   handles retain the old file while new opens see the replacement, through both
   public path operations and rooted filesystem publication (#607).
