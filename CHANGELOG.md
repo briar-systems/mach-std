@@ -18,6 +18,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under an internal name (#581).
 - The OS boundary reports filename overflow as `ENAMETOOLONG` on every target,
   including Windows UTF-16 component validation (#581).
+- Windows filesystem transactions honor directory descriptors for publication,
+  metadata, rename, directory creation, and removal. Operations use native
+  handles and retain their root when its pathname is renamed or replaced
+  (#574).
+- Windows file creation, metadata, rename, and removal accept UTF-8 paths
+  consistently with handle-based directory enumeration (#574).
+- Windows directory enumeration remains attached to its open handle, preserves
+  every entry across output-buffer boundaries, supports full Unicode component
+  lengths, and supports rewind for
+  transaction recovery and recursive cleanup (#574).
+- Native Windows relative path components reject alternate-stream syntax and
+  path separators. Metadata and deletion inspect reparse points without
+  following their targets (#574).
 
 ## [0.37.2] - 2026-09-04
 
