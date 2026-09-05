@@ -8,7 +8,7 @@ import sys
 
 root = pathlib.Path(__file__).resolve().parents[2]
 source = root / "src/system/os/windows/shared.mach"
-baseline = "96b0e934f5f5ce9b289b351f1e2445730597543c"
+baseline = "4fdc04e48c07fe4d78f31273bb9894bd0cb29584"
 subprocess.run(["git", "diff", "--exit-code", baseline, "--", "src", "mach.toml"], cwd=root, check=True)
 pristine = subprocess.check_output(
     ["git", "show", baseline + ":src/system/os/windows/shared.mach"],
@@ -50,8 +50,10 @@ variants = [
     ("native-directory-length", temporary,
      "val result: i64 = process_utf8_read(data, units::usize, buf, cap);",
      "val ignored: i64 = process_utf8_read(data, units::usize, buf, cap);\n    val result: i64 = units::i64;"),
+    ("command-terminator-limit", capacity,
+     "if (command.units >= 32767)", "if (command.units >= 32768)"),
     ("byte-command-limit", capacity,
-     "if (command.units >= 32768)", "if (str_len(cmdline) >= 32768)"),
+     "if (command.units >= 32767)", "if (str_len(cmdline) >= 32767)"),
 ]
 results = []
 
