@@ -40,6 +40,13 @@ public static class Volume607 {
                     Marshal.WriteInt16(data, 2, 116);
                     if (!GetFileInformationByHandleEx(handle, 13, data, 116)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
                     protocol = unchecked((uint)Marshal.ReadInt32(data, 4)).ToString("X8");
+                    IntPtr shifted = IntPtr.Add(data, 4);
+                    for (int i = 0; i < 116; i++) Marshal.WriteByte(shifted, i, 0);
+                    Marshal.WriteInt16(shifted, 0, 2);
+                    Marshal.WriteInt16(shifted, 2, 116);
+                    bool shiftedOk = GetFileInformationByHandleEx(handle, 13, shifted, 116);
+                    int shiftedError = shiftedOk ? 0 : Marshal.GetLastWin32Error();
+                    protocol += String.Format(" shifted4_ok={0} shifted4_error={1}", shiftedOk, shiftedError);
                 }
                 return String.Format("path={0} filesystem={1} attributes=0x{2:X8} posix={3} maximum={4} characteristics=0x{5:X8} remote={6} protocol={7} {8} {9}", path, name, attributes, (attributes & 0x400) != 0, maximum, characteristics, (characteristics & 0x10) != 0, protocol, prefix, device);
             } finally { Marshal.FreeHGlobal(data); }
