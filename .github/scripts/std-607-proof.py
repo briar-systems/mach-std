@@ -23,9 +23,9 @@ clean = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', log)
 counts = re.findall(r'(\d+) passed, (\d+) failed, (\d+) total', clean)
 counts = list(map(int, counts[-1])) if counts else None
 exits = re.findall(r'^\s*FAIL\s+.*\(exit ([^)]+)\)', clean, re.MULTILINE)
-expected = [0,3,3] if host == 'windows' else [3,0,3]
-expected_exits = ['73','73','74'] if host == 'windows' else []
+expected = [3,0,3]
+expected_exits = []
 record = dict(counts=counts, exits=exits, compiler_exit=result.returncode)
 Path('std-607-evidence/summary.json').write_text(json.dumps(record, indent=2))
 assert counts == expected and sorted(exits) == expected_exits, record
-assert (result.returncode == 0) == (host != 'windows'), record
+assert result.returncode == 0, record
