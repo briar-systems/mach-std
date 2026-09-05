@@ -10,7 +10,7 @@ source = root / 'src/filesystem/transaction.mach'
 baseline = '7742cf4'
 subprocess.run(['git', 'diff', '--exit-code', baseline, '--', 'src', 'mach.toml'], cwd=root, check=True)
 pristine = source.read_bytes()
-text = pristine.decode()
+text = source.read_text(encoding='utf-8')
 evidence = root / 'mutation-evidence'
 evidence.mkdir(exist_ok=True)
 fixture = root / 'test/native'
