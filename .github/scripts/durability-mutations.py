@@ -7,6 +7,7 @@ import sys
 
 
 root = pathlib.Path(__file__).resolve().parents[2]
+fixture = root / "test/native"
 integrated = "f8632e3c41d3b99ca738ec678014d8d908278915"
 paths = ["src/system/os/windows/shared.mach", "src/filesystem/transaction.mach"]
 pristine = {
@@ -66,9 +67,15 @@ def restore():
 
 
 def run(name, selected, expected, runtime_exit=None):
-    shutil.rmtree(root / "out", ignore_errors=True)
-    command = [sys.argv[1], "test", ".", "--filter", selected]
-    process = subprocess.Popen(command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    dependency = fixture / "dep/std"
+    shutil.rmtree(dependency, ignore_errors=True)
+    dependency.mkdir(parents=True)
+    shutil.copy2(root / "mach.toml", dependency / "mach.toml")
+    shutil.copytree(root / "src", dependency / "src")
+    shutil.rmtree(fixture / "out", ignore_errors=True)
+    command = [sys.argv[1], "test", ".", "--target", "windows-x86_64",
+               "--include-deps", "--filter", selected]
+    process = subprocess.Popen(command, cwd=fixture, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     timed_out = False
     try:
         output, _ = process.communicate(timeout=120)
