@@ -309,8 +309,8 @@ pub fun write_bytes(p: Path, data: *u8, len: usize, mode: i32) O.Option[str] {
 # missing parent directories are created before the temporary. the temporary is
 # created beside the destination with O_EXCL, flushed, and closed before rename,
 # so readers see either the old file or the complete replacement and a
-# cross-device rename cannot occur. after rename, posix also flushes the parent
-# directory so the new namespace entry survives a crash. if that final flush
+# cross-device rename cannot occur. after rename, the parent directory is
+# flushed through the platform durability contract. if that final flush
 # fails, the replacement is already visible even though this function reports
 # the durability failure.
 # ---
@@ -543,6 +543,8 @@ pub fun remove_dir(p: Path) O.Option[str] {
 # existing *directory* is not portable: POSIX allows it when the destination is
 # an empty directory and windows refuses it outright, so callers should not rely
 # on it.
+# windows retains open destination handles on supporting local filesystems,
+# while smb refuses replacement until destination handles close.
 # ---
 # from: source path
 # to:   destination path
@@ -910,21 +912,14 @@ fun sibling_temp_name(a: *A.Allocator, name: str, rnd: *u8) R.Result[Path, str] 
     ret R.ok[Path, str](buf::Path);
 }
 
-# flush a directory entry update on posix; MoveFileEx is write-through on windows
 fun sync_directory(p: Path) O.Option[str] {
-    $if ($mach.build.os == $mach.os.windows) {
-        ret O.none[str]();
-    }
-    $or {
-        val raw: i64 = os.open(os.AT_FDCWD, p, os.O_RDONLY | os.O_DIRECTORY, 0);
-        if (raw < 0) { ret O.some[str](os.message(raw)); }
-        var f: File = File{handle: io_handle.FileHandle{value: raw::usize}};
-
-        val se: O.Option[str] = error_option_text(sync(f));
-        val ce: O.Option[str] = error_option_text(close(?f));
-        if (O.is_some[str](se)) { ret se; }
-        ret ce;
-    }
+    val raw: i64 = os.open(os.AT_FDCWD, p, os.O_RDONLY | os.O_DIRECTORY, 0);
+    if (raw < 0) { ret O.some[str](os.message(raw)); }
+    var f: File = File{handle: io_handle.FileHandle{value: raw::usize}};
+    val se: O.Option[str] = error_option_text(sync(f));
+    val ce: O.Option[str] = error_option_text(close(?f));
+    if (O.is_some[str](se)) { ret se; }
+    ret ce;
 }
 
 fun atomic_paths_free(a: *A.Allocator, parent: Path, temp: Path) {
@@ -1110,11 +1105,7 @@ test "std.filesystem.rename:moves_entry" {
     ret bad;
 }
 
-# rename replaces an existing destination file rather than refusing
-#
-# the POSIX parity the docstring promises. windows needed MoveFileEx with
-# REPLACE_EXISTING for this: bare MoveFile fails whenever the destination
-# exists, which is the common case for write-a-temp-then-rename (#414)
+# replacing a closed destination retains the source bytes
 test "std.filesystem.rename:replaces_existing_destination" {
     val from: Path = "mach_std_fs_ren_r_a";
     val to:   Path = "mach_std_fs_ren_r_b";
@@ -1237,4 +1228,173 @@ test "std.filesystem.symlink:link_vs_target" {
     remove_file(link);
     remove_file(target);
     ret bad;
+}
+
+fun rename_held_contents(file: File, expected: str) bool {
+    if (R.is_err[i64, io_error.Error](seek(file, 0, os.SEEK_SET))) { ret false; }
+    var bytes: [3]u8;
+    val got: R.Result[usize, io_error.Error] = read(file, ?bytes[0], 3);
+    if (R.is_err[usize, io_error.Error](got)) { ret false; }
+    if (R.unwrap_ok[usize, io_error.Error](got) != 3) { ret false; }
+    ret bytes[0] == expected[0] && bytes[1] == expected[1] && bytes[2] == expected[2];
+}
+
+fun rename_held_pair(from: Path, to: Path) i32 {
+    if (O.is_some[str](write_bytes(from, "new", 3, 0o600))) { ret 1; }
+    fin { remove_file(from); }
+    if (O.is_some[str](write_bytes(to, "old", 3, 0o600))) { ret 2; }
+    fin { remove_file(to); }
+    val sr: R.Result[File, io_error.Error] = open(from);
+    if (R.is_err[File, io_error.Error](sr)) { ret 3; }
+    var source: File = R.unwrap_ok[File, io_error.Error](sr);
+    fin { close(?source); }
+    val dr: R.Result[File, io_error.Error] = open(to);
+    if (R.is_err[File, io_error.Error](dr)) { ret 4; }
+    var destination: File = R.unwrap_ok[File, io_error.Error](dr);
+    fin { close(?destination); }
+    if (O.is_some[str](rename(from, to))) { ret 73; }
+    if (exists(from)) { ret 6; }
+    if (!rename_held_contents(destination, "old")) { ret 7; }
+    if (!rename_held_contents(source, "new")) { ret 8; }
+    val nr: R.Result[File, io_error.Error] = open(to);
+    if (R.is_err[File, io_error.Error](nr)) { ret 9; }
+    var next: File = R.unwrap_ok[File, io_error.Error](nr);
+    fin { close(?next); }
+    if (!rename_held_contents(next, "new")) { ret 10; }
+    ret 0;
+}
+
+test "std.filesystem.rename: held destinations preserve old handles with relative paths" {
+    ret rename_held_pair("mach_std_held_é_from", "mach_std_held_é_to");
+}
+
+test "std.filesystem.rename: held destinations preserve old handles with absolute paths" {
+    var bytes: [8192]u8;
+    var state: fixed.FixedState;
+    var alloc: A.Allocator;
+    if (O.is_some[*u8](fixed.make(?alloc, ?state, ?bytes[0], 8192))) { ret 1; }
+    val sr: R.Result[TempFile, str] = temp_create(?alloc, "mach_held_source");
+    if (R.is_err[TempFile, str](sr)) { ret 2; }
+    var source: TempFile = R.unwrap_ok[TempFile, str](sr);
+    fin { temp_close_and_remove(?source); A.deallocate[u8](?alloc, source.path, str_len(source.path) + 1); }
+    val dr: R.Result[TempFile, str] = temp_create(?alloc, "mach_held_destination");
+    if (R.is_err[TempFile, str](dr)) { ret 3; }
+    var destination: TempFile = R.unwrap_ok[TempFile, str](dr);
+    fin { temp_close_and_remove(?destination); A.deallocate[u8](?alloc, destination.path, str_len(destination.path) + 1); }
+    if (!path.is_abs(source.path) || !path.is_abs(destination.path)) { ret 4; }
+    ret rename_held_pair(source.path, destination.path);
+}
+
+test "std.filesystem.rename: source symlinks move without moving their targets" {
+    val target: str = "mach_std_rename_symlink_target";
+    val from: str = "mach_std_rename_symlink_from";
+    val to: str = "mach_std_rename_symlink_to";
+    if (O.is_some[str](write_bytes(target, "old", 3, 0o600))) { ret 1; }
+    fin { remove_file(target); }
+    if (O.is_some[str](symlink(target, from))) { ret 2; }
+    fin { remove_file(from); remove_file(to); }
+    if (O.is_some[str](rename(from, to))) { ret 3; }
+    val moved: R.Result[Metadata, str] = metadata_link(to);
+    if (R.is_err[Metadata, str](moved)) { ret 4; }
+    if (R.unwrap_ok[Metadata, str](moved).kind != KIND_SYMLINK) { ret 5; }
+    if (!is_file(target) || exists(from)) { ret 6; }
+    val opened: R.Result[File, io_error.Error] = open(to);
+    if (R.is_err[File, io_error.Error](opened)) { ret 7; }
+    var file: File = R.unwrap_ok[File, io_error.Error](opened);
+    fin { close(?file); }
+    if (!rename_held_contents(file, "old")) { ret 8; }
+    ret 0;
+}
+
+fun rename_type_conflicts(rooted: bool) i32 {
+    var file_path: str = "mach_std_rename_type_file";
+    var dir_path: str = "mach_std_rename_type_directory";
+    if (rooted) {
+        file_path = "mach_std_rename_rooted_type_file";
+        dir_path = "mach_std_rename_rooted_type_directory";
+    }
+    if (O.is_some[str](write_bytes(file_path, "old", 3, 0o600))) { ret 1; }
+    fin { remove_file(file_path); remove_dir(file_path); }
+    if (O.is_some[str](create_dir(dir_path, 0o700))) { ret 2; }
+    fin { remove_dir(dir_path); remove_file(dir_path); }
+    var dirfd: i32 = os.AT_FDCWD;
+    if (rooted) {
+        val opened: i64 = os.open(os.AT_FDCWD, ".", os.O_RDONLY | os.O_DIRECTORY, 0);
+        if (opened < 0) { ret 9; }
+        dirfd = opened::i32;
+    }
+    fin { if (rooted) { os.close(dirfd); } }
+    if (os.rename(dirfd, file_path, dirfd, dir_path) >= 0) { ret 3; }
+    if (!is_file(file_path) || !is_dir(dir_path)) { ret 4; }
+    if (os.rename(dirfd, dir_path, dirfd, file_path) >= 0) { ret 5; }
+    if (!is_file(file_path) || !is_dir(dir_path)) { ret 6; }
+    val opened: R.Result[File, io_error.Error] = open(file_path);
+    if (R.is_err[File, io_error.Error](opened)) { ret 7; }
+    var file: File = R.unwrap_ok[File, io_error.Error](opened);
+    fin { close(?file); }
+    if (!rename_held_contents(file, "old")) { ret 8; }
+    ret 0;
+}
+
+test "std.filesystem.rename: type conflicts preserve both entries" {
+    ret rename_type_conflicts(false);
+}
+
+test "std.filesystem.rename: rooted type conflicts preserve both entries" {
+    ret rename_type_conflicts(true);
+}
+
+
+fun rename_directory_symlink(existing: bool) i32 {
+    var target: str = "mach_607_dirlink_absent_target";
+    var from: str = "mach_607_dirlink_absent_from";
+    var to: str = "mach_607_dirlink_absent_to";
+    if (existing) {
+        target = "mach_607_dirlink_existing_target";
+        from = "mach_607_dirlink_existing_from";
+        to = "mach_607_dirlink_existing_to";
+    }
+    if (O.is_some[str](create_dir(target, 0o700))) { ret 97; }
+    fin { remove_dir(target); }
+    if (O.is_some[str](symlink(target, from))) { ret 98; }
+    fin { remove_dir(from); remove_file(from); remove_dir(to); remove_file(to); }
+    val before: R.Result[Metadata, str] = metadata_link(from);
+    if (R.is_err[Metadata, str](before)) { ret 96; }
+    if (R.unwrap_ok[Metadata, str](before).kind != KIND_SYMLINK) { ret 95; }
+    if (existing && O.is_some[str](write_bytes(to, "old", 3, 0o600))) { ret 94; }
+    val raw: i64 = os.rename(os.AT_FDCWD, from, os.AT_FDCWD, to);
+    if (raw < 0) { ret (0 - raw)::i32; }
+    val moved: R.Result[Metadata, str] = metadata_link(to);
+    if (R.is_err[Metadata, str](moved)) { ret 93; }
+    if (R.unwrap_ok[Metadata, str](moved).kind != KIND_SYMLINK) { ret 92; }
+    if (!is_dir(target) || exists(from)) { ret 91; }
+    ret 0;
+}
+test "std.filesystem.rename: directory symlink source to absent destination" { ret rename_directory_symlink(false); }
+test "std.filesystem.rename: directory symlink source to regular file destination" { ret rename_directory_symlink(true); }
+
+$if ($mach.build.os == $mach.os.windows) {
+    test "std.filesystem.rename: drive-relative destinations preserve held handles" {
+        var bytes: [8192]u8;
+        var state: fixed.FixedState;
+        var alloc: A.Allocator;
+        if (O.is_some[*u8](fixed.make(?alloc, ?state, ?bytes[0], 8192))) { ret 1; }
+        val sr: R.Result[TempFile, str] = temp_create(?alloc, "mach_held_drive_source");
+        if (R.is_err[TempFile, str](sr)) { ret 2; }
+        var source: TempFile = R.unwrap_ok[TempFile, str](sr);
+        fin { temp_close_and_remove(?source); A.deallocate[u8](?alloc, source.path, str_len(source.path) + 1); }
+        if (source.path[1] != ':') { ret 3; }
+        val leaf: str = path.filename(source.path);
+        val length: usize = str_len(leaf) + 7;
+        val ar: R.Result[*u8, str] = A.allocate[u8](?alloc, length);
+        if (R.is_err[*u8, str](ar)) { ret 4; }
+        val to: *u8 = R.unwrap_ok[*u8, str](ar);
+        fin { A.deallocate[u8](?alloc, to, length); }
+        to[0] = source.path[0];
+        to[1] = ':';
+        memory.raw_copy(?to[2], leaf, length - 7);
+        memory.raw_copy(?to[length - 5], ".dst", 4);
+        to[length - 1] = 0;
+        ret rename_held_pair(source.path, to);
+    }
 }
