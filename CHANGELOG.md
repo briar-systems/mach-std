@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `std.types.path.root` borrows an indivisible root prefix through the existing
+  `std.types.view.View`, preserving native drive and UNC spelling without
+  allocating or splitting the root (#608).
+
 ### Fixed
 
 - Windows process environments, executable names, arguments, working directories,
