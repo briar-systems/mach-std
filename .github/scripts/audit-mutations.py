@@ -8,8 +8,10 @@ import sys
 
 root = pathlib.Path(__file__).resolve().parents[2]
 source = root / "src/system/os/windows/shared.mach"
+baseline = "555fa9a3c9ca14e31218c798799b0016b596cc7d"
+subprocess.run(["git", "diff", "--exit-code", baseline, "--", "src", "mach.toml"], cwd=root, check=True)
 pristine = subprocess.check_output(
-    ["git", "show", "71c703da2bed04666a37c30f255d64239cdd8aa9:src/system/os/windows/shared.mach"],
+    ["git", "show", baseline + ":src/system/os/windows/shared.mach"],
     cwd=root,
 )
 text = pristine.decode()
