@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Windows process environments, executable names, arguments, working directories,
+  and directory queries preserve UTF-8 through native UTF-16 APIs. Environment
+  name comparison follows host identity and Windows blocks use native name order
+  (#603).
+
 - Windows symbolic links preserve UTF-8 link names and relative targets through
   UTF-16 conversion. Target normalization and directory probing use the actual
   converted lengths instead of fixed byte buffers (#580).
