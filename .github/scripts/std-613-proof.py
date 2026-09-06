@@ -25,7 +25,7 @@ def run(name, selected, counts, edits=None):
         (snapshot / path).write_text(body, encoding='utf-8', newline='')
     census(name, host)
     result = subprocess.run(['mach', 'test', 'test/native', '--target', host + '-x86_64',
-        '--include-deps', '--timeout_seconds', '30', '--filter', selected], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        '--include-deps', '--filter', selected], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
     log = result.stdout.decode('utf-8', errors='replace')
     (evidence / (name + '.log')).write_text(log, encoding='utf-8')
     clean = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', log)
@@ -33,6 +33,7 @@ def run(name, selected, counts, edits=None):
     actual = list(map(int, found[-1])) if found else None
     exits = re.findall(r'^\s*FAIL\s+.*\(exit ([^)]+)\)', clean, re.MULTILINE)
     valid = actual == counts and ((result.returncode == 0) == (counts[1] == 0))
+    valid = valid and len(exits) == counts[1] and all(x.isdigit() and int(x) != 0 for x in exits)
     record = dict(name=name, counts=actual, exits=exits, code=result.returncode, verified=valid)
     results.append(record)
     print(json.dumps(record), flush=True)
