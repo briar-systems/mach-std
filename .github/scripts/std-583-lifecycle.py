@@ -39,4 +39,4 @@ for profile in profiles:
                     (evidence/(profile+'-codesign.txt')).write_bytes(signature.stdout+signature.stderr)
         print(log,flush=True)
         (evidence/'lifecycle-summary.json').write_text(json.dumps(results,indent=2))
-assert all(item['code']==0 and item['counts'] and item['counts'][0]>=50 and item['counts'][1]==0 for item in results),results
+assert all(item['code']==0 and item['counts'] and item['counts']==([60,0,60] if host=='windows' else [56,0,56]) for item in results),results

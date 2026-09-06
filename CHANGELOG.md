@@ -36,6 +36,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Transaction preparation selects preconditions and durability before retaining
+  any prior object or creating staging. Commit and abort consume final-storage
+  transactions and release their active destination borrow on every path.
+  Mutation helpers require the same planned Claim capabilities, recovery rejects
+  live claims and workers, and failed recovery keeps admission closed (#583).
+- Subtree preparation flushes file data through its original writable handles
+  and completes directory modes and barriers in child-first order. Explicit
+  directory modes apply even when files introduce their parents first. Private
+  mode `000` trees remain abortable and recoverable without granting content-read
+  access to files or changing public objects. Permissive durability reports every
+  missing child barrier instead of allowing an outer directory flush to hide it
+  (#612).
+
 - Recursive removal shares a rooted nofollow walker with transaction cleanup.
   Windows force deletion removes read-only entries without changing surviving
   hardlink attributes on supporting filesystems. SMB read-only entries report
