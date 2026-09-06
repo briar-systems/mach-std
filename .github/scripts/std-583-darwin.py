@@ -4,6 +4,10 @@ import shutil
 import subprocess
 import runpy
 import os
+import sys
+
+arch = sys.argv[1]
+target = "darwin-" + arch
 
 root = Path.cwd()
 evidence = root / 'std-583-evidence'
@@ -14,9 +18,9 @@ snapshot.mkdir(parents=True, exist_ok=True)
 shutil.copy2('mach.toml', snapshot / 'mach.toml')
 shutil.copytree('src', snapshot / 'src', dirs_exist_ok=True)
 census('released-seed-image', 'darwin')
-result = subprocess.run(['mach', 'test', 'test/native', '--target', 'darwin-aarch64', '--include-deps', '--filter', 'std.system.file_identity:'], capture_output=True, timeout=180)
+result = subprocess.run(['mach', 'test', 'test/native', '--target', target, '--include-deps', '--filter', 'std.system.file_identity:'], capture_output=True, timeout=180)
 (evidence / 'released-seed-image.log').write_bytes(result.stdout + result.stderr)
-image = root / 'test/native/out/darwin-aarch64/debug/test/native-suite'
+image = root / ('test/native/out/' + target + '/debug/test/native-suite')
 if not image.is_file(): raise AssertionError('seed emitted no test image')
 shutil.copy2(image, evidence / 'released-seed-native-suite')
 headers = subprocess.run(['otool', '-l', str(image)], check=True, capture_output=True)
@@ -39,7 +43,7 @@ if actual_std != '3ee8e709a8ed7baff6e93780ce9b3582a907a91f': raise AssertionErro
 shutil.rmtree(root / 'test/native/out', ignore_errors=True)
 shutil.rmtree(root / 'test/native/.cache', ignore_errors=True)
 census('audited-debug-image', 'darwin')
-result = subprocess.run([str(compiler / 'b'), 'test', 'test/native', '--target', 'darwin-aarch64', '--profile', 'debug', '--include-deps', '--filter', 'std.system.file_identity:'], capture_output=True, timeout=180)
+result = subprocess.run([str(compiler / 'b'), 'test', 'test/native', '--target', target, '--profile', 'debug', '--include-deps', '--filter', 'std.system.file_identity:'], capture_output=True, timeout=180)
 (evidence / 'audited-debug-image.log').write_bytes(result.stdout + result.stderr)
 if not image.is_file(): raise AssertionError('audited compiler emitted no test image')
 shutil.copy2(image, evidence / 'audited-debug-native-suite')
