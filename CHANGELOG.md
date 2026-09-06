@@ -21,7 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity domains remain distinct from presence and type observations.
   `filesystem.Metadata` no longer carries an implicit truncated identity.
   `identity_of` and `identity_link` query it explicitly, and portable watch
-  scans retain the complete observation separately (#583).
+  scans retain the complete observation separately. Transaction entry probes
+  report presence and type without identity queries, and explicit root, entry
+  and staging identity APIs use the same complete representation. Rooted
+  containment relies on nofollow opens instead of truncated identity checks
+  between unretained observations (#583).
 
 - `std.types.path.root` borrows an indivisible root prefix through the existing
   `std.types.view.View`, preserving native drive and UNC spelling without
