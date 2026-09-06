@@ -20,6 +20,10 @@ assert region.count('syscall1(SYS_EXIT, 126);')==5
 for code in range(141,146):
     region=region.replace('syscall1(SYS_EXIT, 126);','syscall1(SYS_EXIT, '+str(code)+');',1)
 source.write_text(original[:start]+region+original[end:])
+manifest=compiler/'mach.toml'
+original_manifest=manifest.read_text()
+assert '[dep.std]\ngit = "https://github.com/briar-systems/mach-std"\nref = "commit/3ee8e709a8ed7baff6e93780ce9b3582a907a91f"' in original_manifest
+manifest.write_text(original_manifest.replace('[dep.std]\ngit = "https://github.com/briar-systems/mach-std"\nref = "commit/3ee8e709a8ed7baff6e93780ce9b3582a907a91f"', '[dep.std]\npath = "dep/std"'))
 try:
     census('diagnostic-compiler-build','darwin')
     build=subprocess.run(['./B','build','.','-o','D'],cwd=compiler,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=600)
@@ -27,6 +31,7 @@ try:
     assert build.returncode==0,build.returncode
 finally:
     source.write_text(original)
+    manifest.write_text(original_manifest)
 (evidence/'preexec-codes.json').write_text(json.dumps(dict(source='2e9bef5e57838f4a81321c1da6c5070a45e3afb0',std='3ee8e709a8ed7baff6e93780ce9b3582a907a91f',codes={141:'setpgid',142:'stdin dup2',143:'stdout dup2',144:'stderr dup2',145:'chdir'},restored=True),indent=2))
 snapshot=root/'test/native/dep/std'
 shutil.copytree('src',snapshot/'src',dirs_exist_ok=True)
