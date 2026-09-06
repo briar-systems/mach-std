@@ -44,6 +44,8 @@ def run(name, selected, counts, changed=None, extra=None):
         'file-mode-expansion': ['14'],
         'follow-mode-mutant': ['10'],
         'duplicate-claim-mutant': ['13'],
+        'release-live-claim': ['12'],
+        'share-active-claim': ['13'],
     }
     for suffix, expected in expected_exits.items():
         if name.endswith(suffix):
@@ -100,6 +102,15 @@ try:
         assert owner.count(before) == 1
         run(profile + '-duplicate-claim-mutant', 'std.filesystem.transaction.ownership: admitted sibling', [0, 1, 1], extra={owner_path: owner.replace(before, 'os.open(held.claims_fd, name,\n        nofollow(os.O_CREAT | os.O_WRONLY), 0o600);')})
         run(profile + '-public-lock', 'std.filesystem.transaction.lock:', [2, 0, 2])
+        run(profile + '-planned-claims', 'std.filesystem.transaction.claim:', [1, 0, 1])
+        transaction_path = 'src/filesystem/transaction.mach'
+        transaction = (root / transaction_path).read_text(encoding='utf-8')
+        before = 'if (destination.active || destination.closing) {'
+        assert transaction.count(before) == 1
+        run(profile + '-release-live-claim', 'std.filesystem.transaction.claim:', [0, 1, 1], extra={transaction_path: transaction.replace(before, 'if (destination.closing) {')})
+        before = 'destination.owner == nil || destination.active || destination.closing'
+        assert transaction.count(before) == 1
+        run(profile + '-share-active-claim', 'std.filesystem.transaction.claim:', [0, 1, 1], extra={transaction_path: transaction.replace(before, 'destination.owner == nil || destination.closing')})
         run(profile + '-file-observations', 'io.file:', [13, 0, 13])
         run(profile + '-serialization', 'std.system.file_identity:', [2, 0, 2])
         run(profile + '-native-observation', 'std.system.os.file_identity:', [2, 0, 2])
