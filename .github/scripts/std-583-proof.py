@@ -63,9 +63,9 @@ try:
         run(profile + '-sibling-workers', 'std.filesystem.transaction.ownership: admitted sibling', [1, 0, 1])
         owner_path = 'src/filesystem/transaction/ownership.mach'
         owner = (root / owner_path).read_text(encoding='utf-8')
-        before = 'nofollow(os.O_CREAT | os.O_EXCL | os.O_WRONLY), 0o600);'
+        before = 'os.open(held.claims_fd, name,\n        nofollow(os.O_CREAT | os.O_EXCL | os.O_WRONLY), 0o600);'
         assert owner.count(before) == 1
-        run(profile + '-duplicate-claim-mutant', 'std.filesystem.transaction.ownership: admitted sibling', [0, 1, 1], extra={owner_path: owner.replace(before, 'nofollow(os.O_CREAT | os.O_WRONLY), 0o600);')})
+        run(profile + '-duplicate-claim-mutant', 'std.filesystem.transaction.ownership: admitted sibling', [0, 1, 1], extra={owner_path: owner.replace(before, 'os.open(held.claims_fd, name,\n        nofollow(os.O_CREAT | os.O_WRONLY), 0o600);')})
         run(profile + '-public-lock', 'std.filesystem.transaction.lock:', [2, 0, 2])
         run(profile + '-file-observations', 'io.file:', [13, 0, 13])
         run(profile + '-serialization', 'std.system.file_identity:', [2, 0, 2])
