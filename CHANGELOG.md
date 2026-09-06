@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Whole-file string reads reject unrepresentable sizes before allocation and
+  release the exact buffer on read or close failure.
+
 - The native Windows harness selects optimization level 0 without requesting
   unsupported COFF debug symbols. ELF and Mach-O debug runs retain symbols, and
   release ownership coverage remains at optimization level 2 (#615).
