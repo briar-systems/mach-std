@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Same-object preparation explicitly selects maximum prior access. Metadata-only
+  remains the default. Read-authorized Darwin callers retain event-only references
+  on supported local filesystems without reading content or changing permissions.
+
 - Cooperative publication ownership primitives keep roots, locks and borrowers
   in final storage, reject copied owners, and exclude recovery while borrowers
   remain live. Fresh claim directories use native destination-name equivalence
