@@ -78,6 +78,10 @@ val FILE_REMOTE_DEVICE:                u32 = 0x10;
 val FILE_SUPPORTS_POSIX_UNLINK_RENAME:  u32 = 0x00000400;
 val WNNC_NET_SMB:                      u32 = 0x00020000;
 val FILE_DISPOSITION_INFORMATION_CLASS: u32 = 13;
+val FILE_DISPOSITION_INFORMATION_EX_CLASS: u32 = 64;
+val FILE_DISPOSITION_DELETE: u32 = 1;
+val FILE_DISPOSITION_POSIX_SEMANTICS: u32 = 2;
+val FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE: u32 = 16;
 val OBJ_CASE_INSENSITIVE:            u32 = 0x40;
 val STATUS_END_OF_FILE:              i32 = 0xc0000011::u32::i32;
 val STATUS_NO_MORE_FILES:            i32 = 0x80000006::u32::i32;
@@ -1684,7 +1688,7 @@ pub fun write_at(fd: i32, buffer: *u8, count: usize, offset: u64) i64 {
     ret status_block.information::i64;
 }
 
-fun native_rename_class(source: isize) i64 {
+fun native_posix_unlink_rename(source: isize) i64 {
     val procedure: ptr = ntdll_procedure("NtQueryVolumeInformationFile");
     if (procedure == nil) { ret ENOTSUP; }
     val query: fun(isize, *IO_STATUS_BLOCK, ptr, u32, u32) i32 = procedure::usize::fun(isize, *IO_STATUS_BLOCK, ptr, u32, u32) i32;
@@ -1703,22 +1707,24 @@ fun native_rename_class(source: isize) i64 {
             ret last_error();
         }
         # smb can advertise the server volume's posix bit without supporting the operation
-        if (remote.protocol == WNNC_NET_SMB) { ret FILE_RENAME_INFORMATION_CLASS::i64; }
+        if (remote.protocol == WNNC_NET_SMB) { ret 0; }
     }
     var attributes: FILE_FS_ATTRIBUTE_INFORMATION;
     val attribute_status: i32 = query(source, ?status_block, (?attributes)::ptr, $size_of(FILE_FS_ATTRIBUTE_INFORMATION)::u32, FILE_FS_ATTRIBUTE_INFORMATION_CLASS);
     # buffer overflow leaves the fixed attributes valid and truncates only the unused name
     if (attribute_status < 0 && attribute_status != 0x80000005::u32::i32) { ret ntstatus_error(attribute_status); }
     if (status_block.information < 12) { ret EIO; }
-    if ((attributes.attributes & FILE_SUPPORTS_POSIX_UNLINK_RENAME) != 0) { ret FILE_RENAME_INFORMATION_EX_CLASS::i64; }
-    ret FILE_RENAME_INFORMATION_CLASS::i64;
+    if ((attributes.attributes & FILE_SUPPORTS_POSIX_UNLINK_RENAME) != 0) { ret 1; }
+    ret 0;
 }
 
 fun native_rename_handle(source: isize, root: isize, name: *u16, name_length: usize) i64 {
     val minimum: usize = $size_of(FILE_RENAME_INFORMATION);
     if (name_length > (0xffffffff - FILE_RENAME_NAME_OFFSET) / 2) { ret ENAMETOOLONG; }
-    val information_class: i64 = native_rename_class(source);
-    if (information_class < 0) { ret information_class; }
+    val supported: i64 = native_posix_unlink_rename(source);
+    if (supported < 0) { ret supported; }
+    var information_class: u32 = FILE_RENAME_INFORMATION_CLASS;
+    if (supported != 0) { information_class = FILE_RENAME_INFORMATION_EX_CLASS; }
     var source_info: BY_HANDLE_FILE_INFORMATION;
     if (GetFileInformationByHandle(source, (?source_info)::*u8) == 0) { ret last_error(); }
     val procedure: ptr = ntdll_procedure("NtSetInformationFile");
@@ -1729,7 +1735,7 @@ fun native_rename_handle(source: isize, root: isize, name: *u16, name_length: us
     if (storage == nil) { ret ENOMEM; }
     val info: *FILE_RENAME_INFORMATION = storage::*FILE_RENAME_INFORMATION;
     info.flags = FILE_RENAME_REPLACE_IF_EXISTS;
-    if (information_class == FILE_RENAME_INFORMATION_EX_CLASS::i64) {
+    if (information_class == FILE_RENAME_INFORMATION_EX_CLASS) {
         info.flags = FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS;
     }
     if ((source_info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == FILE_ATTRIBUTE_DIRECTORY) { info.flags = 0; }
@@ -2162,37 +2168,56 @@ pub fun local_endpoint_identity(path: *u8, device: *u64, file: *u64) i64 {
     ret code;
 }
 
-pub fun unlink(dirfd: i32, path: *u8, flags: i32) i64 {
-    if (dirfd != AT_FDCWD) {
-        var parent: NativeParent;
-        val located: i64 = native_parent(dirfd, path, ?parent);
-        if (located < 0) { ret located; }
-        var handle: isize = INVALID_HANDLE_VALUE;
-        val opened: i64 = native_open_relative_kind(get_handle(parent.fd), parent.leaf, parent.length,
-            O_RDONLY, DELETE_ACCESS | FILE_READ_ATTRIBUTES, false, 0, false, ?handle);
-        native_parent_close(?parent);
-        if (opened < 0) { ret opened; }
-        var info: BY_HANDLE_FILE_INFORMATION;
-        if (GetFileInformationByHandle(handle, (?info)::*u8) == 0) {
-            val stat_error: i64 = last_error();
-            CloseHandle(handle);
-            ret stat_error;
+fun unlink_relative(dirfd: i32, path: *u8, flags: i32, force: bool) i64 {
+    if (dirfd == AT_FDCWD || (flags != 0 && flags != AT_REMOVEDIR)) { ret EINVAL; }
+    var parent: NativeParent;
+    val located: i64 = native_parent(dirfd, path, ?parent);
+    if (located < 0) { ret located; }
+    var handle: isize = INVALID_HANDLE_VALUE;
+    val opened: i64 = native_open_relative_kind(get_handle(parent.fd), parent.leaf, parent.length,
+        O_RDONLY, DELETE_ACCESS | FILE_READ_ATTRIBUTES, false, 0, false, ?handle);
+    native_parent_close(?parent);
+    if (opened < 0) { ret opened; }
+    var code: i64 = unlink_handle(handle, flags, force);
+    if (CloseHandle(handle) == 0 && code >= 0) { code = last_error(); }
+    ret code;
+}
+
+fun unlink_handle(handle: isize, flags: i32, force: bool) i64 {
+    var info: BY_HANDLE_FILE_INFORMATION;
+    if (GetFileInformationByHandle(handle, (?info)::*u8) == 0) { ret last_error(); }
+    val directory: bool = (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+        && (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
+    if ((flags & AT_REMOVEDIR) != 0 && !directory) { ret ENOTDIR; }
+    if ((flags & AT_REMOVEDIR) == 0 && directory) { ret EISDIR; }
+    var information_class: u32 = FILE_DISPOSITION_INFORMATION_CLASS;
+    var size: u32 = 1;
+    var disposition: u32 = FILE_DISPOSITION_DELETE;
+    if (force) {
+        val supported: i64 = native_posix_unlink_rename(handle);
+        if (supported < 0) { ret supported; }
+        if (supported != 0) {
+            information_class = FILE_DISPOSITION_INFORMATION_EX_CLASS;
+            size = 4;
+            disposition = disposition | FILE_DISPOSITION_POSIX_SEMANTICS | FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE;
         }
-        val directory: bool = (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
-            && (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
-        if ((flags & AT_REMOVEDIR) != 0 && !directory) { CloseHandle(handle); ret ENOTDIR; }
-        if ((flags & AT_REMOVEDIR) == 0 && directory) { CloseHandle(handle); ret EISDIR; }
-        val procedure: ptr = ntdll_procedure("NtSetInformationFile");
-        if (procedure == nil) { CloseHandle(handle); ret ENOTSUP; }
-        val set_information: fun(isize, *IO_STATUS_BLOCK, ptr, u32, u32) i32 = procedure::usize::fun(isize, *IO_STATUS_BLOCK, ptr, u32, u32) i32;
-        var status_block: IO_STATUS_BLOCK;
-        var disposition: u8 = 1;
-        val status: i32 = set_information(handle, ?status_block, (?disposition)::ptr, 1, FILE_DISPOSITION_INFORMATION_CLASS);
-        val closed: i32 = CloseHandle(handle);
-        if (status < 0) { ret ntstatus_error(status); }
-        if (closed == 0) { ret last_error(); }
-        ret 0;
+        or ((info.dwFileAttributes & FILE_ATTRIBUTE_READONLY) != 0) { ret ENOTSUP; }
     }
+    val procedure: ptr = ntdll_procedure("NtSetInformationFile");
+    if (procedure == nil) { ret ENOTSUP; }
+    val set_information: fun(isize, *IO_STATUS_BLOCK, ptr, u32, u32) i32 = procedure::usize::fun(isize, *IO_STATUS_BLOCK, ptr, u32, u32) i32;
+    var status_block: IO_STATUS_BLOCK;
+    val status: i32 = set_information(handle, ?status_block, (?disposition)::ptr, size, information_class);
+    if (status < 0) { ret ntstatus_error(status); }
+    ret 0;
+}
+
+pub fun unlink_force(dirfd: i32, path: *u8, flags: i32) i64 {
+    ret unlink_relative(dirfd, path, flags, true);
+}
+
+pub fun unlink(dirfd: i32, path: *u8, flags: i32) i64 {
+    if (dirfd != AT_FDCWD) { ret unlink_relative(dirfd, path, flags, false); }
     var wide: WIDE_PATH;
     val converted: i64 = utf8_path(path, ?wide);
     if (converted < 0) { ret converted; }
