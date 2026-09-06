@@ -39,8 +39,8 @@ def run(label,text,selected,profile,expected_count,expected_exit=None):
         assert result.returncode!=0 and counts==[0,1,1] and re.search(r'exit(?: code)?\s*[:=]?\s*'+str(expected_exit)+r'\b',clean),item
 try:
     for profile in profiles:
-        run(profile+'-all',original,'std.filesystem.transaction',profile,69 if host=='windows' else 65)
-    run('read-authorized-identity',original,'std.system.os.file_identity:',profiles[0],5 if host=='darwin' else 4)
+        run(profile+'-all',original,'std.filesystem.transaction',profile,70 if host=='windows' else 66)
+    run('read-authorized-identity',original,'std.system.os.file_identity:',profiles[0],4 if host=='darwin' else 3)
     mutations=[
       ('hide-prior-move', 'out.prior_moved = true;', 'out.prior_moved = false;', 'prior identity and contents remain caller-owned',18),
       ('skip-prior-check','if (!R.unwrap_ok[bool, Error](holds)) { ret fail_backup_commit(t, ?out, error(PRECONDITION, OP_COMMIT)); }','', 'changed prior is preserved without any rename',27),
