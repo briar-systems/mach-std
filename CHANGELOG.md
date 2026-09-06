@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Recursive removal shares a rooted nofollow walker with transaction cleanup.
+  Windows force deletion removes read-only entries without changing surviving
+  hardlink attributes on supporting filesystems. SMB read-only entries report
+  unsupported, ordinary file removal remains strict, and root or dot removal
+  requests are rejected before mutation (#613).
+
 - Atomic byte replacement flushes the parent directory on Windows through the
   native NTFS durability backend. Unsupported directory persistence and flush
   failures remain errors after publication (#607).
