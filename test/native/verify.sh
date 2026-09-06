@@ -3,6 +3,10 @@ set -euo pipefail
 
 mach="${1:-mach}"
 target="${2:-linux-x86_64}"
+profile=debug
+case "$target" in
+    windows-*) profile=windows-opt0 ;;
+esac
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 known="${3:-$here/known-failures/$target.txt}"
 root="$(cd "$here/../.." && pwd)"
@@ -27,7 +31,7 @@ expected_file="$(mktemp)"
 actual_file="$(mktemp)"
 trap 'rm -f "$expected_file" "$actual_file"' EXIT
 
-"$mach" test "$here" --target "$target" --include-deps --list \
+"$mach" test "$here" --target "$target" --profile "$profile" --include-deps --list \
     | tr '\134' '/' > "$list" \
     || fail "$target suite could not be listed"
 
@@ -55,7 +59,7 @@ done
     | sed 's/[[:space:]]*$//' | sort -u > "$expected_file"
 
 set +e
-"$mach" test "$here" --target "$target" --include-deps 2>&1 | tee "$result"
+"$mach" test "$here" --target "$target" --profile "$profile" --include-deps 2>&1 | tee "$result"
 code=${PIPESTATUS[0]}
 set -e
 

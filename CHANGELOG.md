@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The native Windows harness selects optimization level 0 without requesting
+  unsupported COFF debug symbols. ELF and Mach-O debug runs retain symbols, and
+  release ownership coverage remains at optimization level 2 (#615).
+
 - Recursive removal shares a rooted nofollow walker with transaction cleanup.
   Windows force deletion removes read-only entries without changing surviving
   hardlink attributes on supporting filesystems. SMB read-only entries report
