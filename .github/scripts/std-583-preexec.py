@@ -21,6 +21,7 @@ region=original[start:end]
 assert region.count('syscall1(SYS_EXIT, 126);')==5
 for code in range(141,146):
     region=region.replace('syscall1(SYS_EXIT, 126);','syscall1(SYS_EXIT, '+str(code)+');',1)
+region=region.replace('if (grouped != 0 && syscall2(SYS_SETPGID, 0, 0) < 0) {\n            syscall1(SYS_EXIT, 141);\n        }', 'if (grouped != 0) {\n            val group_result: i64 = syscall2(SYS_SETPGID, 0, 0);\n            if (group_result < 0) { syscall1(SYS_EXIT, (160 - group_result)::usize); }\n        }')
 source.write_text(original[:start]+region+original[end:])
 manifest=compiler/'mach.toml'
 original_manifest=manifest.read_text()
@@ -36,7 +37,7 @@ try:
 finally:
     source.write_text(original)
     manifest.write_text(original_manifest)
-(evidence/'preexec-codes.json').write_text(json.dumps(dict(source='2e9bef5e57838f4a81321c1da6c5070a45e3afb0',std='3ee8e709a8ed7baff6e93780ce9b3582a907a91f',codes={141:'setpgid',142:'stdin dup2',143:'stdout dup2',144:'stderr dup2',145:'chdir'},restored=True),indent=2))
+(evidence/'preexec-codes.json').write_text(json.dumps(dict(source='2e9bef5e57838f4a81321c1da6c5070a45e3afb0',std='3ee8e709a8ed7baff6e93780ce9b3582a907a91f',codes={141:'setpgid replaced by 160+errno',142:'stdin dup2',143:'stdout dup2',144:'stderr dup2',145:'chdir'},restored=True),indent=2))
 snapshot=root/'test/native/dep/std'
 shutil.copytree('src',snapshot/'src',dirs_exist_ok=True)
 results=[]
@@ -46,7 +47,7 @@ for iteration in range(3):
     log=run.stdout.decode('utf-8',errors='replace')
     (evidence/('preexec-suite-'+str(iteration)+'.log')).write_text(log)
     print(log,flush=True)
-    codes=re.findall(r'\(exit (14[1-5])\)',log)
+    codes=re.findall(r'\(exit (1[6-9][0-9]|2[0-5][0-9])\)',log)
     results.append(dict(iteration=iteration,code=run.returncode,preexec_codes=codes))
     (evidence/'preexec-summary.json').write_text(json.dumps(results,indent=2))
     if codes:
