@@ -26,6 +26,8 @@ manifest=compiler/'mach.toml'
 original_manifest=manifest.read_text()
 assert '[dep.std]\ngit = "https://github.com/briar-systems/mach-std"\nref = "commit/3ee8e709a8ed7baff6e93780ce9b3582a907a91f"' in original_manifest
 manifest.write_text(original_manifest.replace('[dep.std]\ngit = "https://github.com/briar-systems/mach-std"\nref = "commit/3ee8e709a8ed7baff6e93780ce9b3582a907a91f"', '[dep.std]\npath = "dep/std"'))
+subprocess.run(['git','init','--quiet'],cwd=compiler,check=True)
+subprocess.run(['git','add','-f','mach.toml','src','dep/std'],cwd=compiler,check=True)
 try:
     census('diagnostic-compiler-build','darwin')
     build=subprocess.run(['./B','build','.','-o','D'],cwd=compiler,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=600)
