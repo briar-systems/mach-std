@@ -19,8 +19,9 @@ with tarfile.open(archive) as source:
 wrapper=root/'std-615-census-compiler.sh'
 wrapper.write_text('#!/usr/bin/env bash\nset -euo pipefail\npython3 "$MACH_583_CENSUS" wrapper-compiler "$MACH_583_HOST"\nexec "$MACH_583_COMPILER" "$@"\n')
 wrapper.chmod(0o755)
-environment=dict(os.environ,MACH_583_CENSUS=str(root/'.github/scripts/std-583-census.py'),MACH_583_HOST=host)
-run=subprocess.run(['bash','test/native/verify.sh',str(wrapper),host+'-'+arch],cwd=project,env=environment,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=420)
+environment=dict(os.environ,MACH_583_CENSUS=(root/'.github/scripts/std-583-census.py').as_posix(),MACH_583_HOST=host)
+bash=str(Path(os.environ.get('ProgramFiles','C:/Program Files'))/'Git/bin/bash.exe') if host=='windows' else 'bash'
+run=subprocess.run([bash,'test/native/verify.sh',wrapper.as_posix(),host+'-'+arch],cwd=project,env=environment,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=420)
 log=run.stdout.decode('utf-8',errors='replace')
 (evidence/'std-615-wrapper.log').write_text(log)
 print(log,flush=True)
