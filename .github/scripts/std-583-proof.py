@@ -19,10 +19,12 @@ identity_path = 'src/system/file_identity.mach'
 identity = (root / identity_path).read_text(encoding='utf-8')
 results = []
 
-def run(name, selected, counts, changed=None):
+def run(name, selected, counts, changed=None, extra=None):
     shutil.copytree('src', snapshot / 'src', dirs_exist_ok=True)
     if changed is not None:
         (snapshot / identity_path).write_text(changed, encoding='utf-8', newline='')
+    for path, body in (extra or {}).items():
+        (snapshot / path).write_text(body, encoding='utf-8', newline='')
     shutil.rmtree(root / 'test/native/out', ignore_errors=True)
     shutil.rmtree(root / 'test/native/.cache', ignore_errors=True)
     census(name, host)
@@ -48,14 +50,14 @@ try:
     for profile in (['debug', 'release'] if host == 'darwin' else ['debug']):
         os.environ['MACH_583_PROFILE'] = profile
         run(profile + '-serialization', 'std.system.file_identity:', [2, 0, 2])
-        run(profile + '-native-observation', 'std.system.os.file_identity:', [1, 0, 1])
+        run(profile + '-native-observation', 'std.system.os.file_identity:', [2, 0, 2])
         before = 'for (i < 41) {\n        if (a.representation[i] != b.representation[i])'
         assert identity.count(before) == 1
         run(profile + '-truncated-file-id', 'std.system.file_identity:', [1, 1, 2], identity.replace(before,
             'for (i < 33) {\n        if (a.representation[i] != b.representation[i])'))
         before = 'var i: usize = 0;\n    for (i < 41) {\n        if (a.representation[i] != b.representation[i])'
         assert identity.count(before) == 1
-        run(profile + '-missing-volume-domain', 'std.system.file_identity:', [1, 1, 2], identity.replace(before,
+        run(profile + '-missing-backend-domain', 'std.system.file_identity:', [1, 1, 2], identity.replace(before,
             'var i: usize = 17;\n    for (i < 41) {\n        if (a.representation[i] != b.representation[i])'))
 finally:
     shutil.copytree('src', snapshot / 'src', dirs_exist_ok=True)
