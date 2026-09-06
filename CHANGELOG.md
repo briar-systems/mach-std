@@ -15,8 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and admit work only after successful initialization (#583).
 
 - Explicit filesystem identity observations preserve complete native identifiers
-  and serialize one backend-qualified representation. Windows local identities
-  include the volume GUID, 64-bit volume serial and 128-bit file ID. Unsupported
+  and serialize one backend-qualified local representation. Windows identities
+  retain the full 64-bit volume serial and 128-bit file ID without a pathname
+  query, including while an unlinked object remains open. Unsupported
   identity domains remain distinct from presence and type observations (#583).
 
 - `std.types.path.root` borrows an indivisible root prefix through the existing
