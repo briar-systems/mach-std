@@ -18,7 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and serialize one backend-qualified local representation. Windows identities
   retain the full 64-bit volume serial and 128-bit file ID without a pathname
   query, including while an unlinked object remains open. Unsupported
-  identity domains remain distinct from presence and type observations (#583).
+  identity domains remain distinct from presence and type observations.
+  `filesystem.Metadata` no longer carries an implicit truncated identity.
+  `identity_of` and `identity_link` query it explicitly, and portable watch
+  scans retain the complete observation separately (#583).
 
 - `std.types.path.root` borrows an indivisible root prefix through the existing
   `std.types.view.View`, preserving native drive and UNC spelling without
