@@ -16,7 +16,11 @@ snapshot.mkdir(parents=True,exist_ok=True)
 shutil.copy2('mach.toml',snapshot/'mach.toml')
 shutil.copytree('src',snapshot/'src',dirs_exist_ok=True)
 results=[]
-for profile in ['debug','release']:
+if host=='windows':
+    manifest=root/'test/native/mach.toml'
+    manifest.write_text(manifest.read_text()+'\n[profile.proof-opt0]\nopt = 0\ndebug = false\nsimd = "scalarize"\n')
+profiles=['proof-opt0','release'] if host=='windows' else ['debug','release']
+for profile in profiles:
     for name,selected in [('lifecycle','std.filesystem.transaction')]:
         shutil.rmtree(root/'test/native/out',ignore_errors=True)
         shutil.rmtree(root/'test/native/.cache',ignore_errors=True)
@@ -28,6 +32,14 @@ for profile in ['debug','release']:
         counts=re.findall(r'(\d+) passed, (\d+) failed, (\d+) total',clean)
         counts=list(map(int,counts[-1])) if counts else None
         results.append(dict(profile=profile,name=name,code=run.returncode,counts=counts))
+        for emitted in (root/'test/native/out').rglob('*'):
+            if emitted.is_file() and emitted.name in ['native-suite','native-suite.exe']:
+                shutil.copy2(emitted,evidence/(profile+'-native-suite'+emitted.suffix))
+                if host=='darwin':
+                    headers=subprocess.run(['otool','-l',str(emitted)],capture_output=True,check=True)
+                    (evidence/(profile+'-otool.txt')).write_bytes(headers.stdout)
+                    signature=subprocess.run(['codesign','-d','--verbose=4',str(emitted)],capture_output=True)
+                    (evidence/(profile+'-codesign.txt')).write_bytes(signature.stdout+signature.stderr)
         print(log,flush=True)
         (evidence/'lifecycle-summary.json').write_text(json.dumps(results,indent=2))
 assert all(item['code']==0 and item['counts'] and item['counts'][0]>=50 and item['counts'][1]==0 for item in results),results

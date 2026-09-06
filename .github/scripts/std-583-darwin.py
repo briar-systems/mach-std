@@ -30,7 +30,7 @@ seed_info = subprocess.run(['mach', 'info'], check=True, capture_output=True)
 (evidence / 'profiles.txt').write_text('seed identity test: opt=0 debug=true\naudited compiler bootstrap: opt=0 debug=false\naudited identity test: opt=0 debug=true\n')
 compiler = root / '.identity-compiler'
 subprocess.run(['git', 'clone', '--quiet', 'https://github.com/briar-systems/mach', str(compiler)], check=True)
-subprocess.run(['git', '-C', str(compiler), 'checkout', '--detach', '09af0c8da66b4b01501efd6f7732a6b4e111fe81'], check=True)
+subprocess.run(['git', '-C', str(compiler), 'checkout', '--detach', '2e9bef5e57838f4a81321c1da6c5070a45e3afb0'], check=True)
 for label, args in [('dependencies', ['mach', 'dep', 'pull']), ('seed-build-a', ['mach', 'build', '.', '-o', 'a']), ('a-build-b', ['./a', 'build', '.', '-o', 'b']), ('b-build-c', ['./b', 'build', '.', '-o', 'c'])]:
     census(label, 'darwin')
     result = subprocess.run(args, cwd=compiler, capture_output=True, timeout=600)
@@ -39,7 +39,7 @@ for label, args in [('dependencies', ['mach', 'dep', 'pull']), ('seed-build-a', 
 if (compiler / 'b').read_bytes() != (compiler / 'c').read_bytes(): raise AssertionError('compiler fixpoint differs')
 actual_std = subprocess.check_output(['git', '-C', str(compiler / 'dep/std'), 'rev-parse', 'HEAD'], text=True).strip()
 if actual_std != '3ee8e709a8ed7baff6e93780ce9b3582a907a91f': raise AssertionError(actual_std)
-(evidence / 'audited-source.json').write_text(json.dumps(dict(mach='09af0c8da66b4b01501efd6f7732a6b4e111fe81', std=actual_std, fixpoint=True)))
+(evidence / 'audited-source.json').write_text(json.dumps(dict(mach='2e9bef5e57838f4a81321c1da6c5070a45e3afb0', std=actual_std, fixpoint=True)))
 shutil.rmtree(root / 'test/native/out', ignore_errors=True)
 shutil.rmtree(root / 'test/native/.cache', ignore_errors=True)
 census('audited-debug-image', 'darwin')
@@ -52,7 +52,7 @@ headers = subprocess.run(['otool', '-l', str(image)], check=True, capture_output
 signature = subprocess.run(['codesign', '-d', '--verbose=4', str(image)], capture_output=True)
 (evidence / 'audited-debug-codesign.txt').write_bytes(signature.stdout + signature.stderr)
 if result.returncode != 0: raise AssertionError('corrected audited compiler did not execute debug tests')
-(evidence / 'debug-image-status.json').write_text(json.dumps(dict(returncode=result.returncode, compiler='09af0c8da66b4b01501efd6f7732a6b4e111fe81', profile='debug', opt=0, debug=True)))
+(evidence / 'debug-image-status.json').write_text(json.dumps(dict(returncode=result.returncode, compiler='2e9bef5e57838f4a81321c1da6c5070a45e3afb0', profile='debug', opt=0, debug=True)))
 with Path(os.environ['GITHUB_ENV']).open('a') as output:
     output.write('MACH_583_COMPILER=' + str(compiler / 'b') + '\n')
     output.write('MACH_583_PROFILE=debug\n')

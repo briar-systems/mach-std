@@ -19,7 +19,7 @@ run=subprocess.run(['mach','test','test/native','--target',host+'-'+arch,'--incl
 (evidence/'released-seed-lifecycle.log').write_bytes(run.stdout+run.stderr)
 compiler=root/'.identity-compiler'
 subprocess.run(['git','clone','--quiet','https://github.com/briar-systems/mach',str(compiler)],check=True)
-sha='09af0c8da66b4b01501efd6f7732a6b4e111fe81'
+sha='2e9bef5e57838f4a81321c1da6c5070a45e3afb0'
 subprocess.run(['git','-C',str(compiler),'checkout','--detach',sha],check=True)
 suffix='.exe' if host=='windows' else ''
 for label,argv in [('dependencies',['mach','dep','pull']),('seed-build-a',['mach','build','.','-o','a'+suffix]),('a-build-b',[str(compiler/('a'+suffix)),'build','.','-o','b'+suffix]),('b-build-c',[str(compiler/('b'+suffix)),'build','.','-o','c'+suffix])]:
