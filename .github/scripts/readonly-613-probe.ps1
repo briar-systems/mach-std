@@ -41,7 +41,7 @@ try {
           $attributesBefore = [IO.File]::GetAttributes($alias)
           $reader = [IntPtr]::Zero
           if ($held) {
-            $reader = [ForceDelete]::CreateFileW($file, 0x80000000, 7, [IntPtr]::Zero, 3, 0x02200000, [IntPtr]::Zero)
+            $reader = [ForceDelete]::CreateFileW($file, 2147483648, 7, [IntPtr]::Zero, 3, 0x02200000, [IntPtr]::Zero)
             if ($reader -eq [IntPtr](-1)) { throw "held setup failed $label" }
           }
           $handle = [ForceDelete]::CreateFileW($file, 0x00110080, 7, [IntPtr]::Zero, 3, 0x02200000, [IntPtr]::Zero)
