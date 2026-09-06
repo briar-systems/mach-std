@@ -49,6 +49,10 @@ def run(name, selected, counts, changed=None, extra=None):
 try:
     for profile in (['debug', 'release'] if host == 'darwin' else ['debug']):
         os.environ['MACH_583_PROFILE'] = profile
+        run(profile + '-root-containment', 'std.filesystem.transaction.root_open:', [3, 0, 3] if host == 'windows' else [2, 0, 2])
+        run(profile + '-descent', 'std.filesystem.transaction.descend:', [1, 0, 1])
+        run(profile + '-public-ownership', 'std.filesystem.transaction.ownership: public descent', [1, 0, 1])
+        run(profile + '-public-lock', 'std.filesystem.transaction.lock:', [2, 0, 2])
         run(profile + '-file-observations', 'io.file:', [13, 0, 13])
         run(profile + '-serialization', 'std.system.file_identity:', [2, 0, 2])
         run(profile + '-native-observation', 'std.system.os.file_identity:', [2, 0, 2])
