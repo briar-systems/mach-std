@@ -85,6 +85,7 @@ use std.system.os;
 use removal: std.filesystem.removal;
 use ownership: std.filesystem.transaction.ownership;
 use identities: std.system.file_identity;
+use std.sync.mutex;
 fwd identities.Identity;
 fwd ownership.Root;
 fwd ownership.Lock;
@@ -646,6 +647,116 @@ pub fun lock(out: *Lock, r: *Root) O.Option[Error] {
 pub fun unlock(held: *Lock) O.Option[Error] {
     val released: i64 = ownership.release_lock(held);
     if (released == os.EINVAL) { ret O.some[Error](error(INVALID, OP_LOCK)); }
+    if (released < 0) { ret O.some[Error](io_error(OP_LOCK, released)); }
+    ret O.none[Error]();
+}
+
+# planned reservations remain owned by the session until its workers have joined
+pub rec Claim {
+    address: usize;
+    owner: *Lock;
+    leaf: str;
+    alloc: *A.Allocator;
+    reservation: ownership.Borrow;
+    gate: mutex.Mutex;
+    active: bool;
+    closing: bool;
+}
+
+pub rec Worker {
+    admission: ownership.Borrow;
+}
+
+pub fun borrow_worker(out: *Worker, held: *Lock) O.Option[Error] {
+    if (out == nil) { ret O.some[Error](error(INVALID, OP_LOCK)); }
+    val admitted: i64 = ownership.borrow_worker(?out.admission, held);
+    if (admitted == os.EINVAL) { ret O.some[Error](error(INVALID, OP_LOCK)); }
+    if (admitted < 0) { ret O.some[Error](io_error(OP_LOCK, admitted)); }
+    ret O.none[Error]();
+}
+
+pub fun release_worker(worker: *Worker) O.Option[Error] {
+    if (worker == nil) { ret O.some[Error](error(INVALID, OP_LOCK)); }
+    val released: i64 = ownership.release_borrow(?worker.admission);
+    if (released == os.EINVAL) { ret O.some[Error](error(INVALID, OP_LOCK)); }
+    if (released < 0) { ret O.some[Error](io_error(OP_LOCK, released)); }
+    ret O.none[Error]();
+}
+
+# reserves one complete destination spelling before workers or staging are admitted
+pub fun claim(out: *Claim, alloc: *A.Allocator, held: *Lock, leaf: str) O.Option[Error] {
+    if (out == nil || alloc == nil || !ownership.lock_valid(held)) { ret O.some[Error](error(INVALID, OP_PREPARE)); }
+    if (out.address != 0 && (out.address != out::usize || out.owner != nil)) {
+        ret O.some[Error](error(INVALID, OP_PREPARE));
+    }
+    if (!publication_leaf(leaf)) { ret O.some[Error](error(CONTAINMENT, OP_PREPARE)); }
+    val copied: R.Result[str, str] = str_dup(alloc, leaf);
+    if (R.is_err[str, str](copied)) { ret O.some[Error](error(MEMORY, OP_PREPARE)); }
+    val name: str = R.unwrap_ok[str, str](copied);
+    val reserved: i64 = ownership.borrow_leaf(?out.reservation, held, name);
+    if (reserved < 0) {
+        str_free(alloc, name);
+        if (reserved == os.EINVAL) { ret O.some[Error](error(INVALID, OP_PREPARE)); }
+        if (reserved == os.EEXIST) { ret O.some[Error](error(CONFLICT, OP_PREPARE)); }
+        ret O.some[Error](io_error(OP_PREPARE, reserved));
+    }
+    out.address = out::usize;
+    out.owner = held;
+    out.leaf = name;
+    out.alloc = alloc;
+    out.gate = mutex.make();
+    out.active = false;
+    out.closing = false;
+    ret O.none[Error]();
+}
+
+# borrowed names remain stable through an active transaction or mutation
+pub fun claim_leaf(destination: *Claim) str {
+    if (destination == nil || destination.address != destination::usize) { ret nil; }
+    mutex.lock(?destination.gate);
+    val name: str = destination.leaf;
+    mutex.unlock(?destination.gate);
+    ret name;
+}
+
+fun borrow_claim(destination: *Claim, op: Op) O.Option[Error] {
+    if (destination == nil || destination.address != destination::usize) { ret O.some[Error](error(INVALID, op)); }
+    mutex.lock(?destination.gate);
+    if (destination.owner == nil || destination.active || destination.closing) {
+        mutex.unlock(?destination.gate);
+        ret O.some[Error](error(INVALID, op));
+    }
+    destination.active = true;
+    mutex.unlock(?destination.gate);
+    ret O.none[Error]();
+}
+
+fun return_claim(destination: *Claim) {
+    mutex.lock(?destination.gate);
+    destination.active = false;
+    mutex.unlock(?destination.gate);
+}
+
+# release refuses copied owners and active borrowers without changing their claim
+pub fun release_claim(destination: *Claim) O.Option[Error] {
+    if (destination == nil) { ret O.some[Error](error(INVALID, OP_LOCK)); }
+    if (destination.address == 0) { ret O.none[Error](); }
+    if (destination.address != destination::usize) { ret O.some[Error](error(INVALID, OP_LOCK)); }
+    mutex.lock(?destination.gate);
+    if (destination.active || destination.closing) {
+        mutex.unlock(?destination.gate);
+        ret O.some[Error](error(INVALID, OP_LOCK));
+    }
+    if (destination.owner == nil) { mutex.unlock(?destination.gate); ret O.none[Error](); }
+    destination.closing = true;
+    mutex.unlock(?destination.gate);
+    val released: i64 = ownership.release_borrow(?destination.reservation);
+    str_free(destination.alloc, destination.leaf);
+    mutex.lock(?destination.gate);
+    destination.owner = nil;
+    destination.leaf = nil;
+    destination.closing = false;
+    mutex.unlock(?destination.gate);
     if (released < 0) { ret O.some[Error](io_error(OP_LOCK, released)); }
     ret O.none[Error]();
 }
@@ -4570,5 +4681,50 @@ test "std.filesystem.transaction.ownership: public descent refuses destruction w
     if (root_fd(?descent.root) < 0) { ret 8; }
     if (O.is_some[Error](unlock(?held)) || O.is_some[Error](descent_dnit(?alloc, ?descent))) { ret 9; }
     if (descent.first_missing != nil || descent.remainder != nil || root_fd(?descent.root) >= 0) { ret 10; }
+    ret 0;
+}
+
+test "std.filesystem.transaction.claim: planning owns reservations across active use and failed competitors" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val base: str = "mach_583_planned_claims";
+    if (os.make_dir(os.AT_FDCWD, base, 0o700) < 0) { ret 2; }
+    fin { fs.remove_all(?alloc, base); }
+    var root: Root;
+    if (O.is_some[Error](root_open(?root, base, ""))) { ret 3; }
+    fin { root_dnit(?root); }
+    var held: Lock;
+    if (O.is_some[Error](lock(?held, ?root))) { ret 4; }
+    fin { unlock(?held); }
+    if (ownership.begin_recovery(?held) < 0) { ret 5; }
+    val initialized: i64 = ownership.initialize_claims(?held);
+    ownership.end_recovery(?held);
+    if (initialized < 0) { ret 6; }
+    var first: Claim;
+    var second: Claim;
+    if (O.is_some[Error](claim(?first, ?alloc, ?held, "first"))) { ret 7; }
+    fin { release_claim(?first); }
+    if (O.is_some[Error](claim(?second, ?alloc, ?held, "second"))) { ret 8; }
+    fin { release_claim(?second); }
+    var competitor: Claim;
+    val refused: O.Option[Error] = claim(?competitor, ?alloc, ?held, "first");
+    if (O.is_none[Error](refused) || O.unwrap[Error](refused).kind != CONFLICT || held.borrowers != 2) { ret 9; }
+    var copied: Claim = first;
+    val refused_copy: O.Option[Error] = release_claim(?copied);
+    if (O.is_none[Error](refused_copy) || O.unwrap[Error](refused_copy).kind != INVALID) { ret 10; }
+    if (O.is_some[Error](borrow_claim(?first, OP_PREPARE))) { ret 11; }
+    val refused_live: O.Option[Error] = release_claim(?first);
+    if (O.is_none[Error](refused_live) || O.unwrap[Error](refused_live).kind != INVALID) { ret 12; }
+    if (O.is_none[Error](borrow_claim(?first, OP_PREPARE))) { ret 13; }
+    return_claim(?first);
+    if (!str_equals(claim_leaf(?first), "first") || !str_equals(claim_leaf(?second), "second") || held.borrowers != 2) { ret 14; }
+    var worker: Worker;
+    if (O.is_some[Error](borrow_worker(?worker, ?held))) { ret 15; }
+    if (ownership.begin_recovery(?held) != os.EINVAL) { release_worker(?worker); ret 16; }
+    if (O.is_some[Error](release_worker(?worker))) { ret 17; }
+    if (O.is_some[Error](release_claim(?first)) || held.borrowers != 1) { ret 18; }
+    if (O.is_some[Error](release_claim(?second)) || held.borrowers != 0) { ret 19; }
+    if (ownership.begin_recovery(?held) < 0) { ret 20; }
+    ownership.end_recovery(?held);
     ret 0;
 }

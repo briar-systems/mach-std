@@ -12,7 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cooperative publication ownership primitives keep roots, locks and borrowers
   in final storage, reject copied owners, and exclude recovery while borrowers
   remain live. Fresh claim directories use native destination-name equivalence
-  and admit work only after successful initialization (#583).
+  and admit work only after successful initialization. Sessions own stable
+  destination claims before worker admission. Active transaction or mutation
+  borrowers exclude simultaneous use without releasing the planned reservation
+  (#583).
 
 - Explicit filesystem identity observations preserve complete native identifiers
   and serialize one backend-qualified local representation. Windows identities
