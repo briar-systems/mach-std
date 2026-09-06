@@ -1,70 +1,51 @@
-# transactional filesystem publication
+# cooperative filesystem publication with explicit session ownership
 #
-# publishing a file means making a privately built artifact visible to other
-# processes with no observable intermediate state: a reader either sees the
-# previous content or the new content, never a truncated, half-written, or
-# missing destination. this module is the one way to do that, for a single
-# file, a single directory, or a whole subtree.
+# roots, locks, claims, workers and transactions remain at their initialized
+# addresses. a copied owner cannot consume the original owner's resources.
+# a caller supplies its authoritative coordinator scope, holds all root locks
+# through recovery and worker completion, and reserves every planned destination
+# before worker admission. independent claims can publish concurrently beneath
+# one held root lock. a claim permits one active transaction or mutation at a time.
+# commit, abort and failed preparation release that active use, while the session
+# retains the reservation until its workers have joined.
 #
-# the shape is always the same four steps. open a `Root` capability over the
-# directory that will receive the publication; `prepare` the content into
-# private staging beside the destination; optionally `validate` what was
-# staged; then `commit` it into place, or `abort` to discard it. a prepared
-# transaction that is never committed leaves nothing behind that a later
-# `recover` cannot identify and remove.
+# recovery requires the coordinator and root lock with no claims or workers.
+# it resolves only the requested backup and sweeps recognized staging, preserving
+# other destinations' backups and malformed content. successful recovery creates
+# a fresh claims directory that inherits the root's native name equivalence.
+# failed recovery leaves admission closed. the persistent lock sentinel is never
+# unlinked by unlock. journal and claim ownership covers process interruption,
+# not arbitrary noncooperative mutation, host restart or power-loss recovery.
 #
-# ## containment
+# `.machtxn.<16 hex digits>` names private staging independently of destination
+# length. owned replacement keeps the previous directory at `.machtxn.backup/leaf`.
+# `.machtxn.claims/leaf` reserves the exact native destination name exclusively.
+# the journal prefix and `.mach-txn-lock` are reserved case-insensitively on every
+# platform. callers never place unrelated content in these namespaces.
 #
-# a `Root` is a directory descriptor, not a path. it is built by walking the
-# requested relative path one component at a time from an anchor descriptor,
-# refusing any component that is not already a real directory. because every
-# later operation names a single leaf relative to that descriptor, no
-# publication can reach outside the root, and no ancestor swapped in after the
-# walk can redirect it: the descriptor still refers to the directory that was
-# validated. that is containment by construction rather than by path checking,
-# which is why no function here accepts a leaf with a separator in it.
+# descriptor-relative nofollow walks preserve containment when ancestor names
+# change. filesystem-qualified locks and claims enforce cooperative ownership.
+# presence and type queries are observations only. same-object preparation alone
+# retains the prior object and compares its complete local-domain identity at
+# commit. it detects replacement, not in-place writes or all content changes.
+# unsupported retention returns UNSUPPORTED without expanding read permissions.
 #
-# staging entries use `.machtxn.<16 hex digits>`, independent of the destination
-# length. owned replacement lazily creates `.machtxn.backup` with private
-# permissions and stores the previous directory beneath it under its complete
-# destination leaf. every operation uses the verified open container descriptor.
-# the empty container persists as internal metadata, like the lock sentinel.
-# ordinary file publication does not create it.
+# preparation selects both precondition and durability. DUR_NONE requests no
+# barriers. DUR_FILE flushes file content through the original writable handles
+# and flushes subtree directories after their children and final modes. DUR_FULL
+# additionally flushes the publication parent after rename. required preparation
+# barriers fail before publication, while a required parent-flush failure occurs
+# after publication and does not undo it. permissive requests report aggregate
+# shortfall without allowing an outer flush to hide a missing child barrier.
+# windows directory persistence requires supported local ntfs and writable access.
+# journal recovery does not infer a power-durable multi-root transaction from these
+# per-publication barriers. callers serialize their own multi-root journal under
+# the supplied coordinator and recover it before planning or recording baselines.
 #
-# a missing destination with a backup means the first rename landed alone, so
-# recovery restores the backup. a directory destination with a backup means
-# publication landed, so recovery removes that backup. a non-directory backup
-# or destination is a conflict and remains untouched.
-#
-# recovery resolves only the requested destination and removes recognized staging
-# entries, retaining other destinations' backups and malformed names.
-# publication reserves the journal prefix and lock sentinel with ASCII
-# case-insensitive matching on every platform, including casefold filesystems.
-# callers must not place unrelated content in those reserved namespaces.
-#
-# ## liveness
-#
-# residue alone cannot distinguish a crashed writer from a running one, because
-# a running writer's staging entry looks exactly like a dead one's. `lock`
-# closes that gap. it takes an advisory exclusive lock on a sentinel file inside
-# the root, and every supported operating system releases such a lock when the
-# holding process dies, however it dies. a caller holding the lock therefore
-# knows that any residue it finds belongs to a process that is gone, and may
-# sweep it. a caller that cannot take the lock knows a live writer holds the
-# root and must not.
-#
-# ## durability
-#
-# durability is requested at commit, not at prepare, and the outcome reports
-# what was actually achieved rather than what was asked for. `DUR_NONE` orders
-# nothing. `DUR_FILE` flushes the staged content before the rename, so a
-# destination that exists after a crash has complete content. `DUR_FULL` also
-# flushes the directory, so the destination's existence itself survives. a
-# request marked `required` fails the commit when the flush fails; an
-# unrequired one records the shortfall in the outcome and proceeds.
-# windows directory persistence requires ntfs and writable access to the pinned
-# directory. other filesystems report a durability shortfall or required error.
-# a required directory-flush error occurs after publication and does not undo it.
+# ordinary commit uses one native rename. owned directory replacement uses two
+# renames and may temporarily leave the destination absent. it never runs recovery
+# while claims are live. every valid prepared transaction is consumed by commit,
+# including an invalid owned-replacement request. failed validation leaves it owned.
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -431,43 +412,69 @@ pub fun entry_identity(r: *Root, leaf: str) R.Result[O.Option[Identity], Error] 
     ret query_entry_identity(r.dirfd, leaf, OP_ROOT_OPEN);
 }
 
-# rename one name to another within a root
-#
-# both names are resolved against the root's descriptor, so this can never move
-# anything into or out of the root.
-pub fun entry_rename(r: *Root, from: str, to: str) O.Option[Error] {
-    if (!ownership.root_valid(r)) { ret O.some[Error](error(INVALID, OP_COMMIT)); }
-    if (!leaf_is_component(from) || !leaf_is_component(to)) {
-        ret O.some[Error](error(CONTAINMENT, OP_COMMIT));
+# both distinct reservations are borrowed before native effects begin
+pub fun entry_rename(from: *Claim, to: *Claim) O.Option[Error] {
+    val source: O.Option[Error] = borrow_claim(from, OP_COMMIT);
+    if (O.is_some[Error](source)) { ret source; }
+    val target: O.Option[Error] = borrow_claim(to, OP_COMMIT);
+    if (O.is_some[Error](target)) { return_claim(from); ret target; }
+    val renamed: i64 = os.rename(from.owner.root.dirfd, from.leaf, to.owner.root.dirfd, to.leaf);
+    return_claim(to);
+    return_claim(from);
+    if (renamed < 0) { ret O.some[Error](io_error(OP_COMMIT, renamed)); }
+    ret O.none[Error]();
+}
+
+# a native same-entry rename may preserve the existing on-disk spelling
+pub fun entry_rename_alias(destination: *Claim, spelling: str) O.Option[Error] {
+    if (!publication_leaf(spelling)) { ret O.some[Error](error(CONTAINMENT, OP_COMMIT)); }
+    val borrowed: O.Option[Error] = borrow_claim(destination, OP_COMMIT);
+    if (O.is_some[Error](borrowed)) { ret borrowed; }
+    fin { return_claim(destination); }
+    var held_identity: Identity;
+    val held: i64 = os.file_identity(destination.reservation.claim_fd, ?held_identity);
+    if (held < 0) { ret O.some[Error](io_error(OP_COMMIT, held)); }
+    var alias_identity: Identity;
+    val alias: i64 = os.identity_at(destination.owner.claims_fd, spelling, ?alias_identity);
+    if (alias == os.ENOENT) { ret O.some[Error](error(CONFLICT, OP_COMMIT)); }
+    if (alias < 0) { ret O.some[Error](io_error(OP_COMMIT, alias)); }
+    if (!identity_equal(held_identity, alias_identity)) { ret O.some[Error](error(CONFLICT, OP_COMMIT)); }
+    val copied: R.Result[str, str] = str_dup(destination.alloc, spelling);
+    if (R.is_err[str, str](copied)) { ret O.some[Error](error(MEMORY, OP_COMMIT)); }
+    val name: str = R.unwrap_ok[str, str](copied);
+    val renamed: i64 = os.rename(destination.owner.root.dirfd, destination.leaf,
+                                   destination.owner.root.dirfd, name);
+    if (renamed < 0) {
+        str_free(destination.alloc, name);
+        ret O.some[Error](io_error(OP_COMMIT, renamed));
     }
-    val raw: i64 = os.rename(r.dirfd, from, r.dirfd, to);
-    if (raw < 0) { ret O.some[Error](io_error(OP_COMMIT, raw)); }
+    val previous: str = destination.leaf;
+    mutex.lock(?destination.gate);
+    destination.leaf = name;
+    destination.reservation.name = name;
+    mutex.unlock(?destination.gate);
+    str_free(destination.alloc, previous);
     ret O.none[Error]();
 }
 
-# remove a name under a root
-#
-# a name that is already gone is success, so removal can be repeated on a
-# cleanup path without having to check first.
-pub fun entry_unlink(r: *Root, leaf: str) O.Option[Error] {
-    if (!ownership.root_valid(r)) { ret O.some[Error](error(INVALID, OP_ABORT)); }
-    if (!leaf_is_component(leaf)) { ret O.some[Error](error(CONTAINMENT, OP_ABORT)); }
-    val raw: i64 = os.unlink(r.dirfd, leaf, 0);
-    if (raw < 0 && raw != os.ENOENT) { ret O.some[Error](io_error(OP_ABORT, raw)); }
+# ordinary unlink policy is retained, including readonly-file refusal
+pub fun entry_unlink(destination: *Claim) O.Option[Error] {
+    val borrowed: O.Option[Error] = borrow_claim(destination, OP_ABORT);
+    if (O.is_some[Error](borrowed)) { ret borrowed; }
+    val removed: i64 = os.unlink(destination.owner.root.dirfd, destination.leaf, 0);
+    return_claim(destination);
+    if (removed < 0 && removed != os.ENOENT) { ret O.some[Error](io_error(OP_ABORT, removed)); }
     ret O.none[Error]();
 }
 
-# remove a directory under a root only if it is empty
-#
-# a directory that is absent, or that has content, is left alone and reported
-# as success: this exists to undo a directory this process created, and must
-# not destroy one that has since been used.
-pub fun entry_rmdir_if_empty(r: *Root, leaf: str) O.Option[Error] {
-    if (!ownership.root_valid(r)) { ret O.some[Error](error(INVALID, OP_ABORT)); }
-    if (!leaf_is_component(leaf)) { ret O.some[Error](error(CONTAINMENT, OP_ABORT)); }
-    val raw: i64 = os.unlink(r.dirfd, leaf, os.AT_REMOVEDIR);
-    if (raw < 0 && raw != os.ENOENT && raw != os.ENOTEMPTY) {
-        ret O.some[Error](io_error(OP_ABORT, raw));
+# absent and nonempty directories remain successful cleanup no-ops
+pub fun entry_rmdir_if_empty(destination: *Claim) O.Option[Error] {
+    val borrowed: O.Option[Error] = borrow_claim(destination, OP_ABORT);
+    if (O.is_some[Error](borrowed)) { ret borrowed; }
+    val removed: i64 = os.unlink(destination.owner.root.dirfd, destination.leaf, os.AT_REMOVEDIR);
+    return_claim(destination);
+    if (removed < 0 && removed != os.ENOENT && removed != os.ENOTEMPTY) {
+        ret O.some[Error](io_error(OP_ABORT, removed));
     }
     ret O.none[Error]();
 }
@@ -499,16 +506,39 @@ pub fun entry_rmdir_if_empty(r: *Root, leaf: str) O.Option[Error] {
 # failed removal as a smaller successful one. the entries removed before the
 # failure stay removed: this reports what happened, it does not roll back.
 # ---
-# r:   the root the removal is anchored to
-# rel: canonical path beneath the root, naming the file or directory to remove
+# destination: reserved top-level leaf
+# rel: canonical path beneath that leaf, empty to remove the leaf itself
 # ret: how many entries were removed, or why the removal was refused
-pub fun root_remove_tree(r: *Root, rel: Path) R.Result[usize, Error] {
-    if (!ownership.root_valid(r))  { ret R.err[usize, Error](error(INVALID, OP_REMOVE)); }
-    if (!rel_is_canonical(rel))   { ret R.err[usize, Error](error(CONTAINMENT, OP_REMOVE)); }
+pub fun root_remove_tree(destination: *Claim, rel: Path) R.Result[usize, Error] {
+    if (!str_empty(rel) && !rel_is_canonical(rel)) { ret R.err[usize, Error](error(CONTAINMENT, OP_REMOVE)); }
+    val borrowed: O.Option[Error] = borrow_claim(destination, OP_REMOVE);
+    if (O.is_some[Error](borrowed)) { ret R.err[usize, Error](O.unwrap[Error](borrowed)); }
+    fin { return_claim(destination); }
+    val dirfd: i32 = destination.owner.root.dirfd;
+    if (str_empty(rel)) {
+        var removed: usize = 0;
+        val result: O.Option[Error] = remove_entry_checked(dirfd, destination.leaf, ?removed);
+        if (O.is_some[Error](result)) { ret R.err[usize, Error](O.unwrap[Error](result)); }
+        ret R.ok[usize, Error](removed);
+    }
+    val opened: R.Result[i32, Error] = verified_directory(dirfd, destination.leaf, OP_REMOVE);
+    if (R.is_err[i32, Error](opened)) {
+        val e: Error = R.unwrap_err[i32, Error](opened);
+        if (e.kind == IO && e.code == os.ENOENT) { ret R.ok[usize, Error](0); }
+        ret R.err[usize, Error](e);
+    }
+    val fd: i32 = R.unwrap_ok[i32, Error](opened);
+    val removed: R.Result[usize, Error] = remove_relative(fd, rel);
+    val closed: i64 = os.close(fd);
+    if (R.is_err[usize, Error](removed)) { ret removed; }
+    if (closed < 0) { ret R.err[usize, Error](io_error(OP_REMOVE, closed)); }
+    ret removed;
+}
 
+fun remove_relative(dirfd: i32, rel: Path) R.Result[usize, Error] {
     # walk to the parent of the last component, holding a descriptor at each
     # step so no part of the path is ever resolved as a string
-    var fd:   i32  = r.dirfd;
+    var fd:   i32  = dirfd;
     var held: bool = false;
     val n: usize = str_len(rel);
     var start: usize = 0;
@@ -562,14 +592,13 @@ fun remove_entry_checked(dirfd: i32, name: str, removed: *usize) O.Option[Error]
 # create a directory under a root
 # ---
 # ret: true when this call created it, false when it already existed
-pub fun entry_make_dir(r: *Root, leaf: str, mode: i32) R.Result[bool, Error] {
-    if (!ownership.root_valid(r)) { ret R.err[bool, Error](error(INVALID, OP_PREPARE)); }
-    if (!leaf_is_component(leaf)) { ret R.err[bool, Error](error(CONTAINMENT, OP_PREPARE)); }
-    val raw: i64 = os.make_dir(r.dirfd, leaf, mode);
-    if (raw < 0) {
-        if (raw == os.EEXIST) { ret R.ok[bool, Error](false); }
-        ret R.err[bool, Error](io_error(OP_PREPARE, raw));
-    }
+pub fun entry_make_dir(destination: *Claim, mode: i32) R.Result[bool, Error] {
+    val borrowed: O.Option[Error] = borrow_claim(destination, OP_PREPARE);
+    if (O.is_some[Error](borrowed)) { ret R.err[bool, Error](O.unwrap[Error](borrowed)); }
+    val made: i64 = os.make_dir(destination.owner.root.dirfd, destination.leaf, mode);
+    return_claim(destination);
+    if (made == os.EEXIST) { ret R.ok[bool, Error](false); }
+    if (made < 0) { ret R.err[bool, Error](io_error(OP_PREPARE, made)); }
     ret R.ok[bool, Error](true);
 }
 
@@ -710,7 +739,7 @@ pub fun claim(out: *Claim, alloc: *A.Allocator, held: *Lock, leaf: str) O.Option
     ret O.none[Error]();
 }
 
-# borrowed names remain stable through an active transaction or mutation
+# borrowed until successful alias rename or release, stable during active use
 pub fun claim_leaf(destination: *Claim) str {
     if (destination == nil || destination.address != destination::usize) { ret nil; }
     mutex.lock(?destination.gate);
@@ -774,7 +803,7 @@ pub val DUR_FULL: Durability = 2;
 
 pub rec DurabilityRequest {
     level: Durability;
-    # when true a flush failure fails the commit rather than being reported
+    # when true a failed barrier fails its preparation or commit step
     required: bool;
 }
 
@@ -794,13 +823,19 @@ pub fun durability_full(required: bool) DurabilityRequest {
 # allowed to land
 pub def Precondition: u8;
 
-# the destination must be exactly what it was when prepare ran, including
-# still being absent if it was absent. this is the replace case: it detects a
-# concurrent writer and refuses rather than overwriting their work.
-pub val PRE_UNCHANGED_SINCE_PREPARE: Precondition = 1;
+# replace without retaining or comparing an existing destination
+pub val PRE_REPLACE: Precondition = 0;
+# retain the prior object, or require continued absence when initially absent
+pub val PRE_SAME_OBJECT: Precondition = 1;
 # the destination must not exist. this is the create case: it detects a
 # concurrent creator and refuses rather than absorbing or destroying it.
-pub val PRE_ABSENT_AT_COMMIT: Precondition = 2;
+pub val PRE_ABSENT: Precondition = 2;
+
+# selected before any destination observation or staging work
+pub rec PrepareOptions {
+    precondition: Precondition;
+    durability: DurabilityRequest;
+}
 
 # what a transaction publishes
 pub def EntryKind: u8;
@@ -887,23 +922,107 @@ fun sink_write(ctx: ptr, buf: *u8, len: usize) R.Result[usize, str] {
 
 # one publication in flight
 #
-# created by a `prepare`, consumed by exactly one `commit` or `abort`. the
-# staging descriptor stays open until then so that `validate` can read what was
-# staged and `commit` can flush it before the rename.
+# created in final storage and consumed by commit or abort
+# the original staging descriptor remains owned for validation and observations
+val STATE_PREPARING: u8 = 1;
+val STATE_PREPARED: u8 = 2;
+val STATE_SPENT: u8 = 3;
+
 pub rec Transaction {
-    dirfd:        i32;
-    leaf:         str;
+    address: usize;
+    state: u8;
+    destination: *Claim;
+    dirfd: i32;
+    leaf: str;
     staging_name: str;
-    kind:         EntryKind;
-    # open for ENTRY_FILE until commit or abort, -1 otherwise
-    staging_fd:   i32;
-    had_prior:    bool;
-    prior:        Identity;
-    len:          usize;
-    has_digest:   bool;
-    digest:       [32]u8;
-    spent:        bool;
-    alloc:        *A.Allocator;
+    staging_fd: i32;
+    prior_fd: i32;
+    kind: EntryKind;
+    had_prior: bool;
+    prior: Identity;
+    len: usize;
+    has_digest: bool;
+    digest: [32]u8;
+    alloc: *A.Allocator;
+    options: PrepareOptions;
+    content_flushed: bool;
+}
+
+fun prepared(t: *Transaction) bool {
+    ret t != nil && t.address == t::usize && t.state == STATE_PREPARED;
+}
+
+# all owned resources are consumed before returning the claim's active borrow
+fun transaction_cleanup(t: *Transaction, remove: bool, op: Op) O.Option[Error] {
+    var failure: O.Option[Error] = O.none[Error]();
+    if (t.staging_fd >= 0) {
+        val closed: i64 = os.close(t.staging_fd);
+        t.staging_fd = -1;
+        if (closed < 0) { failure = O.some[Error](io_error(op, closed)); }
+    }
+    if (remove && t.staging_name != nil) {
+        if (t.kind == ENTRY_FILE) {
+            val removed: i64 = os.unlink_force(t.dirfd, t.staging_name, 0);
+            if (removed < 0 && removed != os.ENOENT && O.is_none[Error](failure)) {
+                failure = O.some[Error](io_error(op, removed));
+            }
+        }
+        or {
+            var count: usize = 0;
+            val removed: O.Option[removal.Error] = removal.private_tree(t.dirfd, t.staging_name, ?count, MAX_REMOVE_DEPTH);
+            if (O.is_some[removal.Error](removed) && O.is_none[Error](failure)) {
+                val e: removal.Error = O.unwrap[removal.Error](removed);
+                if (e.containment) { failure = O.some[Error](error(CONTAINMENT, op)); }
+                or { failure = O.some[Error](io_error(op, e.code)); }
+            }
+        }
+    }
+    if (t.prior_fd >= 0) {
+        val closed: i64 = os.close(t.prior_fd);
+        t.prior_fd = -1;
+        if (closed < 0 && O.is_none[Error](failure)) { failure = O.some[Error](io_error(op, closed)); }
+    }
+    str_free(t.alloc, t.staging_name);
+    t.staging_name = nil;
+    t.leaf = nil;
+    val destination: *Claim = t.destination;
+    t.destination = nil;
+    t.state = STATE_SPENT;
+    return_claim(destination);
+    ret failure;
+}
+
+fun prepare_failed(t: *Transaction, e: Error) O.Option[Error] {
+    val cleaned: O.Option[Error] = transaction_cleanup(t, true, OP_PREPARE);
+    if (O.is_some[Error](cleaned)) { ret cleaned; }
+    ret O.some[Error](e);
+}
+
+fun begin_prepare(out: *Transaction, alloc: *A.Allocator, destination: *Claim,
+                  kind: EntryKind, options: PrepareOptions) O.Option[Error] {
+    if (out == nil || alloc == nil || options.precondition > PRE_ABSENT || options.durability.level > DUR_FULL) {
+        ret O.some[Error](error(INVALID, OP_PREPARE));
+    }
+    if (out.address != 0 && (out.address != out::usize || out.state != STATE_SPENT)) {
+        ret O.some[Error](error(INVALID, OP_PREPARE));
+    }
+    val borrowed: O.Option[Error] = borrow_claim(destination, OP_PREPARE);
+    if (O.is_some[Error](borrowed)) { ret borrowed; }
+    @out = Transaction{address: out::usize, state: STATE_PREPARING, destination: destination,
+        dirfd: destination.owner.root.dirfd, leaf: destination.leaf, staging_fd: -1,
+        prior_fd: -1, kind: kind, alloc: alloc, options: options,
+        content_flushed: options.durability.level != DUR_NONE};
+    if (options.precondition == PRE_SAME_OBJECT) {
+        var st: os.stat_t;
+        val observed: i64 = os.stat_path(out.dirfd, out.leaf, ?st, os.AT_SYMLINK_NOFOLLOW);
+        if (observed < 0 && observed != os.ENOENT) { ret prepare_failed(out, io_error(OP_PREPARE, observed)); }
+        if (observed >= 0) {
+            val retained: i64 = os.retain_identity_at(out.dirfd, out.leaf, ?out.prior);
+            if (retained < 0 && retained != os.ENOENT) { ret prepare_failed(out, io_error(OP_PREPARE, retained)); }
+            if (retained >= 0) { out.prior_fd = retained::i32; out.had_prior = true; }
+        }
+    }
+    ret O.none[Error]();
 }
 
 pub fun transaction_len(t: *Transaction) usize { ret t.len; }
@@ -934,39 +1053,13 @@ pub fun transaction_prior_identity(t: *Transaction, out: *Identity) bool {
 # commit the staged name is gone, and the identity is the only thing that ties
 # the destination back to the transaction that produced it.
 pub fun transaction_staged_identity(t: *Transaction) R.Result[Identity, Error] {
-    if (t == nil || t.spent) { ret R.err[Identity, Error](error(INVALID, OP_PREPARE)); }
+    if (!prepared(t)) { ret R.err[Identity, Error](error(INVALID, OP_PREPARE)); }
     var identity: Identity;
     var raw: i64 = 0;
     if (t.staging_fd >= 0) { raw = os.file_identity(t.staging_fd, ?identity); }
     or { raw = os.identity_at(t.dirfd, t.staging_name, ?identity); }
     if (raw < 0) { ret R.err[Identity, Error](io_error(OP_PREPARE, raw)); }
     ret R.ok[Identity, Error](identity);
-}
-
-# release the transaction's own strings
-#
-# the fields are set to nil rather than to the empty string: str_free treats nil
-# as nothing to release, whereas the empty string is a literal, and handing a
-# literal to an allocator is a free of memory it never handed out.
-fun transaction_free_names(t: *Transaction) {
-    str_free(t.alloc, t.leaf);
-    str_free(t.alloc, t.staging_name);
-    t.leaf         = nil;
-    t.staging_name = nil;
-}
-
-# discard staging without touching the destination
-fun discard_staging(t: *Transaction) {
-    if (t.staging_fd >= 0) {
-        os.close(t.staging_fd);
-        t.staging_fd = -1;
-    }
-    if (t.kind == ENTRY_FILE) {
-        os.unlink(t.dirfd, t.staging_name, 0);
-    }
-    or {
-        remove_recursive(t.dirfd, t.staging_name);
-    }
 }
 
 fun dot_entry(name: *u8) bool {
@@ -1105,89 +1198,38 @@ fun make_staging_dir(alloc: *A.Allocator, dirfd: i32, mode: i32,
 # is removed and the destination is left exactly as it was.
 # ---
 # alloc:       allocator for the transaction's own strings
-# r:           the root to publish into
-# leaf:        the destination name, a single path component
+# destination: the session-owned reservation borrowed until commit or abort
 # write_ctx:   context handed back to `write_cb`
 # write_cb:    produces the content; an error aborts the prepare
 # mode:        permission bits for the staged file
 # want_digest: compute the sha-256 of what was written
-# ret:         a transaction awaiting commit or abort
-pub fun prepare[W](alloc: *A.Allocator, r: *Root, leaf: str,
-                   write_ctx: *W,
-                   write_cb: fun(*W, *m_writer.Writer) R.Result[R.Void, str],
-                   mode: i32, want_digest: bool) R.Result[Transaction, Error] {
-    if (alloc == nil || !ownership.root_valid(r)) {
-        ret R.err[Transaction, Error](error(INVALID, OP_PREPARE));
-    }
-    if (write_ctx == nil || write_cb == nil) {
-        ret R.err[Transaction, Error](error(INVALID, OP_PREPARE));
-    }
-    if (!publication_leaf(leaf)) {
-        ret R.err[Transaction, Error](error(CONTAINMENT, OP_PREPARE));
-    }
-
-    val prior_r: R.Result[O.Option[Identity], Error] = query_entry_identity(r.dirfd, leaf, OP_PREPARE);
-    if (R.is_err[O.Option[Identity], Error](prior_r)) {
-        ret R.err[Transaction, Error](R.unwrap_err[O.Option[Identity], Error](prior_r));
-    }
-    val prior_opt: O.Option[Identity] = R.unwrap_ok[O.Option[Identity], Error](prior_r);
-
-    var staging_name: str = nil;
-    var staging_fd:   i32 = -1;
-    val oe: O.Option[Error] = open_staging(alloc, r.dirfd, mode, ?staging_name, ?staging_fd);
-    if (O.is_some[Error](oe)) { ret R.err[Transaction, Error](O.unwrap[Error](oe)); }
-
+# ret:         none when out owns a prepared transaction
+pub fun prepare[W](out: *Transaction, alloc: *A.Allocator, destination: *Claim,
+                   write_ctx: *W, write_cb: fun(*W, *m_writer.Writer) R.Result[R.Void, str],
+                   mode: i32, want_digest: bool, options: PrepareOptions) O.Option[Error] {
+    if (write_ctx == nil || write_cb == nil) { ret O.some[Error](error(INVALID, OP_PREPARE)); }
+    val begun: O.Option[Error] = begin_prepare(out, alloc, destination, ENTRY_FILE, options);
+    if (O.is_some[Error](begun)) { ret begun; }
+    val opened: O.Option[Error] = open_staging(alloc, out.dirfd, mode, ?out.staging_name, ?out.staging_fd);
+    if (O.is_some[Error](opened)) { ret prepare_failed(out, O.unwrap[Error](opened)); }
     var sink: Sink;
-    sink.fd          = staging_fd;
-    sink.digesting   = want_digest;
-    sink.failed_code = 0;
+    sink.fd = out.staging_fd;
+    sink.digesting = want_digest;
     if (want_digest) { sink.digest_state = sha256.init(); }
-
-    var w: m_writer.Writer;
-    w.ctx     = (?sink)::ptr;
-    w.f_write = sink_write;
-
-    val wr: R.Result[R.Void, str] = write_cb(write_ctx, ?w);
-    if (R.is_err[R.Void, str](wr)) {
-        var e: Error = error(REJECTED, OP_PREPARE);
-        if (sink.failed_code < 0) { e = io_error(OP_PREPARE, sink.failed_code); }
-        os.close(staging_fd);
-        os.unlink(r.dirfd, staging_name, 0);
-        str_free(alloc, staging_name);
-        ret R.err[Transaction, Error](e);
-    }
-
+    var writer: m_writer.Writer = m_writer.Writer{ctx: (?sink)::ptr, f_write: sink_write};
+    val written: R.Result[R.Void, str] = write_cb(write_ctx, ?writer);
+    if (sink.failed_code < 0) { ret prepare_failed(out, io_error(OP_PREPARE, sink.failed_code)); }
+    if (R.is_err[R.Void, str](written)) { ret prepare_failed(out, error(REJECTED, OP_PREPARE)); }
     var st: os.stat_t;
-    val sr: i64 = os.stat(staging_fd, ?st);
-    if (sr < 0) {
-        os.close(staging_fd);
-        os.unlink(r.dirfd, staging_name, 0);
-        str_free(alloc, staging_name);
-        ret R.err[Transaction, Error](io_error(OP_PREPARE, sr));
-    }
-
-    val leaf_r: R.Result[str, str] = str_dup(alloc, leaf);
-    if (R.is_err[str, str](leaf_r)) {
-        os.close(staging_fd);
-        os.unlink(r.dirfd, staging_name, 0);
-        str_free(alloc, staging_name);
-        ret R.err[Transaction, Error](error(MEMORY, OP_PREPARE));
-    }
-
-    var t: Transaction;
-    t.dirfd        = r.dirfd;
-    t.leaf         = R.unwrap_ok[str, str](leaf_r);
-    t.staging_name = staging_name;
-    t.kind         = ENTRY_FILE;
-    t.staging_fd   = staging_fd;
-    t.had_prior    = O.is_some[Identity](prior_opt);
-    if (t.had_prior) { t.prior = O.unwrap[Identity](prior_opt); }
-    t.len        = st.st_size::usize;
-    t.has_digest = want_digest;
-    if (want_digest) { sha256.final(?sink.digest_state, ?t.digest[0]); }
-    t.spent = false;
-    t.alloc = alloc;
-    ret R.ok[Transaction, Error](t);
+    val observed: i64 = os.stat(out.staging_fd, ?st);
+    if (observed < 0) { ret prepare_failed(out, io_error(OP_PREPARE, observed)); }
+    out.len = st.st_size::usize;
+    out.has_digest = want_digest;
+    if (want_digest) { sha256.final(?sink.digest_state, ?out.digest[0]); }
+    val synced: O.Option[Error] = prepare_barrier(out, out.staging_fd);
+    if (O.is_some[Error](synced)) { ret prepare_failed(out, O.unwrap[Error](synced)); }
+    out.state = STATE_PREPARED;
+    ret O.none[Error]();
 }
 
 rec BytesSource {
@@ -1206,13 +1248,12 @@ fun bytes_write_cb(b: *BytesSource, w: *m_writer.Writer) R.Result[R.Void, str] {
 #
 # the trivial writer: everything `prepare` says applies, with the content
 # supplied as a buffer instead of a callback.
-pub fun prepare_bytes(alloc: *A.Allocator, r: *Root, leaf: str,
-                      data: *u8, len: usize, mode: i32,
-                      want_digest: bool) R.Result[Transaction, Error] {
-    var src: BytesSource;
-    src.data = data;
-    src.len  = len;
-    ret prepare[BytesSource](alloc, r, leaf, ?src, bytes_write_cb, mode, want_digest);
+pub fun prepare_bytes(out: *Transaction, alloc: *A.Allocator, destination: *Claim,
+                      data: *u8, len: usize, mode: i32, want_digest: bool,
+                      options: PrepareOptions) O.Option[Error] {
+    if (data == nil && len != 0) { ret O.some[Error](error(INVALID, OP_PREPARE)); }
+    var source: BytesSource = BytesSource{data: data, len: len};
+    ret prepare[BytesSource](out, alloc, destination, ?source, bytes_write_cb, mode, want_digest, options);
 }
 
 # check the staged content before committing it
@@ -1230,7 +1271,7 @@ pub fun prepare_bytes(alloc: *A.Allocator, r: *Root, leaf: str,
 # ret:       none when the content passed
 pub fun validate[V](t: *Transaction, ctx: *V,
                     validator: fun(*V, *u8, usize) R.Result[bool, str]) O.Option[Error] {
-    if (t == nil || t.spent)   { ret O.some[Error](error(INVALID, OP_VALIDATE)); }
+    if (!prepared(t))   { ret O.some[Error](error(INVALID, OP_VALIDATE)); }
     if (t.kind != ENTRY_FILE)  { ret O.some[Error](error(INVALID, OP_VALIDATE)); }
     if (ctx == nil || validator == nil) { ret O.some[Error](error(INVALID, OP_VALIDATE)); }
 
@@ -1272,128 +1313,82 @@ pub rec Outcome {
     achieved: Durability;
     # true when less was reached than was requested and the request allowed it
     shortfall: bool;
-    # true when the commit had to undo a previous crash's backup first
-    recovered: bool;
 }
 
 # true when the destination still satisfies `pre`
-fun precondition_holds(t: *Transaction, pre: Precondition) R.Result[bool, Error] {
-    val now_r: R.Result[O.Option[Identity], Error] = query_entry_identity(t.dirfd, t.leaf, OP_COMMIT);
-    if (R.is_err[O.Option[Identity], Error](now_r)) {
-        ret R.err[bool, Error](R.unwrap_err[O.Option[Identity], Error](now_r));
+fun precondition_holds(t: *Transaction) R.Result[bool, Error] {
+    val pre: Precondition = t.options.precondition;
+    if (pre == PRE_REPLACE) { ret R.ok[bool, Error](true); }
+    if (pre == PRE_ABSENT || (pre == PRE_SAME_OBJECT && !t.had_prior)) {
+        var st: os.stat_t;
+        val observed: i64 = os.stat_path(t.dirfd, t.leaf, ?st, os.AT_SYMLINK_NOFOLLOW);
+        if (observed == os.ENOENT) { ret R.ok[bool, Error](true); }
+        if (observed < 0) { ret R.err[bool, Error](io_error(OP_COMMIT, observed)); }
+        ret R.ok[bool, Error](false);
     }
-    val now: O.Option[Identity] = R.unwrap_ok[O.Option[Identity], Error](now_r);
-
-    if (pre == PRE_ABSENT_AT_COMMIT) {
-        ret R.ok[bool, Error](O.is_none[Identity](now));
-    }
-    if (pre == PRE_UNCHANGED_SINCE_PREPARE) {
-        if (!t.had_prior) { ret R.ok[bool, Error](O.is_none[Identity](now)); }
-        if (O.is_none[Identity](now)) { ret R.ok[bool, Error](false); }
-        ret R.ok[bool, Error](identity_equal(O.unwrap[Identity](now), t.prior));
-    }
-    ret R.err[bool, Error](error(INVALID, OP_COMMIT));
+    if (pre != PRE_SAME_OBJECT || t.prior_fd < 0) { ret R.err[bool, Error](error(INVALID, OP_COMMIT)); }
+    val current: R.Result[O.Option[Identity], Error] = query_entry_identity(t.dirfd, t.leaf, OP_COMMIT);
+    if (R.is_err[O.Option[Identity], Error](current)) { ret R.err[bool, Error](R.unwrap_err[O.Option[Identity], Error](current)); }
+    val observed: O.Option[Identity] = R.unwrap_ok[O.Option[Identity], Error](current);
+    ret R.ok[bool, Error](O.is_some[Identity](observed) && identity_equal(t.prior, O.unwrap[Identity](observed)));
 }
 
-# flush staged content, honouring whether the request was required
-fun flush_staging(t: *Transaction, dur: DurabilityRequest) R.Result[bool, Error] {
-    if (dur.level == DUR_NONE) { ret R.ok[bool, Error](false); }
-    if (t.kind == ENTRY_FILE && t.staging_fd >= 0) {
-        val raw: i64 = os.sync_fd(t.staging_fd);
-        if (raw < 0) {
-            if (dur.required) { ret R.err[bool, Error](error(DURABILITY, OP_COMMIT)); }
-            ret R.ok[bool, Error](false);
-        }
-        ret R.ok[bool, Error](true);
-    }
-    # a directory or subtree has no single descriptor whose flush covers its
-    # contents; the directory flush at DUR_FULL is what orders it.
-    ret R.ok[bool, Error](true);
+# barriers run while preparation still owns the original writable handles
+fun prepare_barrier(t: *Transaction, fd: i32) O.Option[Error] {
+    if (t.options.durability.level == DUR_NONE) { ret O.none[Error](); }
+    val synced: i64 = os.sync_fd(fd);
+    if (synced >= 0) { ret O.none[Error](); }
+    t.content_flushed = false;
+    if (t.options.durability.required) { ret O.some[Error](error(DURABILITY, OP_PREPARE)); }
+    ret O.none[Error]();
 }
 
-# publish the staged content
-#
-# the destination is checked against `pre` and then replaced by a single
-# rename, which is atomic: a reader sees the old content or the new one and
-# never anything between. when the precondition fails the staging entry is
-# discarded and the destination is left untouched, including a destination
-# another writer put there while this transaction was in flight.
-#
-# the transaction is spent afterwards either way. a failed commit does not
-# need, and must not receive, an abort.
-# ---
-# t:   the prepared transaction
-# pre: what the destination must look like for the commit to be allowed
-# dur: how much must reach stable storage first
-# ret: what was achieved, or a failure that may follow publication
-pub fun commit(t: *Transaction, pre: Precondition, dur: DurabilityRequest) R.Result[Outcome, Error] {
-    if (t == nil)  { ret R.err[Outcome, Error](error(INVALID, OP_COMMIT)); }
-    if (t.spent)   { ret R.err[Outcome, Error](error(INVALID, OP_COMMIT)); }
-    t.spent = true;
+# finish consumption after an effect, preserving cleanup failures
+fun commit_failed(t: *Transaction, remove: bool, failure: Error) R.Result[Outcome, Error] {
+    val cleaned: O.Option[Error] = transaction_cleanup(t, remove, OP_COMMIT);
+    if (O.is_some[Error](cleaned)) { ret R.err[Outcome, Error](O.unwrap[Error](cleaned)); }
+    ret R.err[Outcome, Error](failure);
+}
 
-    val holds_r: R.Result[bool, Error] = precondition_holds(t, pre);
-    if (R.is_err[bool, Error](holds_r)) {
-        val e: Error = R.unwrap_err[bool, Error](holds_r);
-        discard_staging(t);
-        transaction_free_names(t);
-        ret R.err[Outcome, Error](e);
-    }
-    if (!R.unwrap_ok[bool, Error](holds_r)) {
-        discard_staging(t);
-        transaction_free_names(t);
-        ret R.err[Outcome, Error](error(PRECONDITION, OP_COMMIT));
-    }
+fun close_staging(t: *Transaction) O.Option[Error] {
+    if (t.staging_fd < 0) { ret O.none[Error](); }
+    val closed: i64 = os.close(t.staging_fd);
+    t.staging_fd = -1;
+    if (closed < 0) { ret O.some[Error](io_error(OP_COMMIT, closed)); }
+    ret O.none[Error]();
+}
 
-    val flush_r: R.Result[bool, Error] = flush_staging(t, dur);
-    if (R.is_err[bool, Error](flush_r)) {
-        val e: Error = R.unwrap_err[bool, Error](flush_r);
-        discard_staging(t);
-        transaction_free_names(t);
-        ret R.err[Outcome, Error](e);
-    }
-    val flushed: bool = R.unwrap_ok[bool, Error](flush_r);
-
-    if (t.staging_fd >= 0) {
-        val cr: i64 = os.close(t.staging_fd);
-        t.staging_fd = -1;
-        if (cr < 0) {
-            os.unlink(t.dirfd, t.staging_name, 0);
-            transaction_free_names(t);
-            ret R.err[Outcome, Error](io_error(OP_COMMIT, cr));
-        }
-    }
-
-    val rn: i64 = os.rename(t.dirfd, t.staging_name, t.dirfd, t.leaf);
-    if (rn < 0) {
-        discard_staging(t);
-        transaction_free_names(t);
-        ret R.err[Outcome, Error](io_error(OP_COMMIT, rn));
-    }
-
-    var out: Outcome;
-    out.committed = true;
-    out.recovered = false;
-    out.achieved  = DUR_NONE;
+fun publication_finished(t: *Transaction, flushed: bool) R.Result[Outcome, Error] {
+    val dur: DurabilityRequest = t.options.durability;
+    var out: Outcome = Outcome{committed: true, achieved: DUR_NONE,
+        shortfall: dur.level != DUR_NONE && !flushed};
     if (flushed && dur.level != DUR_NONE) { out.achieved = DUR_FILE; }
-    out.shortfall = dur.level != DUR_NONE && !flushed;
-
     if (dur.level == DUR_FULL && flushed) {
-        val ds: i64 = os.sync_fd(t.dirfd);
-        if (ds >= 0) {
-            out.achieved  = DUR_FULL;
-            out.shortfall = false;
-        }
+        val synced: i64 = os.sync_fd(t.dirfd);
+        if (synced >= 0) { out.achieved = DUR_FULL; }
         or {
-            if (dur.required) {
-                transaction_free_names(t);
-                ret R.err[Outcome, Error](error(DURABILITY, OP_COMMIT));
-            }
+            if (dur.required) { ret commit_failed(t, false, error(DURABILITY, OP_COMMIT)); }
             out.shortfall = true;
         }
     }
-
-    transaction_free_names(t);
+    val cleaned: O.Option[Error] = transaction_cleanup(t, false, OP_COMMIT);
+    if (O.is_some[Error](cleaned)) { ret R.err[Outcome, Error](O.unwrap[Error](cleaned)); }
     ret R.ok[Outcome, Error](out);
+}
+
+# consumes the prepared transaction using its preparation-time policy
+# a failure after rename reports an error without claiming publication rolled back
+pub fun commit(t: *Transaction) R.Result[Outcome, Error] {
+    if (!prepared(t)) { ret R.err[Outcome, Error](error(INVALID, OP_COMMIT)); }
+    t.state = STATE_SPENT;
+    val holds: R.Result[bool, Error] = precondition_holds(t);
+    if (R.is_err[bool, Error](holds)) { ret commit_failed(t, true, R.unwrap_err[bool, Error](holds)); }
+    if (!R.unwrap_ok[bool, Error](holds)) { ret commit_failed(t, true, error(PRECONDITION, OP_COMMIT)); }
+    val closed: O.Option[Error] = close_staging(t);
+    if (O.is_some[Error](closed)) { ret commit_failed(t, true, O.unwrap[Error](closed)); }
+    val renamed: i64 = os.rename(t.dirfd, t.staging_name, t.dirfd, t.leaf);
+    if (renamed < 0) { ret commit_failed(t, true, io_error(OP_COMMIT, renamed)); }
+    ret publication_finished(t, t.content_flushed);
 }
 
 # discard the staged content without publishing it
@@ -1403,26 +1398,9 @@ pub fun commit(t: *Transaction, pre: Precondition, dur: DurabilityRequest) R.Res
 # ret: none on success; an error means residue may remain, which a later
 #      `recover` will remove
 pub fun abort(t: *Transaction) O.Option[Error] {
-    if (t == nil)  { ret O.some[Error](error(INVALID, OP_ABORT)); }
-    if (t.spent)   { ret O.some[Error](error(INVALID, OP_ABORT)); }
-    t.spent = true;
-
-    if (t.staging_fd >= 0) {
-        os.close(t.staging_fd);
-        t.staging_fd = -1;
-    }
-
-    var failure: O.Option[Error] = O.none[Error]();
-    if (t.kind == ENTRY_FILE) {
-        val raw: i64 = os.unlink(t.dirfd, t.staging_name, 0);
-        if (raw < 0 && raw != os.ENOENT) { failure = O.some[Error](io_error(OP_ABORT, raw)); }
-    }
-    or {
-        val e: O.Option[Error] = remove_recursive(t.dirfd, t.staging_name);
-        if (O.is_some[Error](e)) { failure = O.some[Error](error(IO, OP_ABORT)); }
-    }
-    transaction_free_names(t);
-    ret failure;
+    if (!prepared(t)) { ret O.some[Error](error(INVALID, OP_ABORT)); }
+    t.state = STATE_SPENT;
+    ret transaction_cleanup(t, true, OP_ABORT);
 }
 
 # one item in a subtree about to be published
@@ -1489,63 +1467,132 @@ fun join_rel(alloc: *A.Allocator, a: str, b: str) R.Result[str, Error] {
     ret R.ok[str, Error](R.unwrap_ok[str, str](r2));
 }
 
-fun write_subtree_entry(alloc: *A.Allocator, staging_fd: i32, e: *Entry) O.Option[Error] {
-    if (!rel_is_canonical(e.rel)) { ret O.some[Error](error(CONTAINMENT, OP_PREPARE)); }
-    if (e.kind != ENTRY_DIR && e.kind != ENTRY_FILE) { ret O.some[Error](error(INVALID, OP_PREPARE)); }
-    var parent_fd: i32 = staging_fd;
-    var held: bool = false;
-    fin { if (held) { os.close(parent_fd); } }
-    val n: usize = str_len(e.rel);
+# newly created directories record the umask-masked final mode before private access
+fun open_private_directory(dirfd: i32, name: str, final_mode: *i32) R.Result[i32, Error] {
+    var st: os.stat_t;
+    val observed: i64 = os.stat_path(dirfd, name, ?st, os.AT_SYMLINK_NOFOLLOW);
+    if (observed < 0) { ret R.err[i32, Error](io_error(OP_PREPARE, observed)); }
+    val mode: u32 = os.stat_mode(?st);
+    if ((mode & os.S_IFMT) != os.S_IFDIR) { ret R.err[i32, Error](error(CONTAINMENT, OP_PREPARE)); }
+    @final_mode = (mode & 0o7777)::i32;
+    $if ($mach.build.os != $mach.os.windows) {
+        if ((mode & 0o700) != 0o700) {
+            val accessible: i64 = os.set_mode_at(dirfd, name, @final_mode | 0o700);
+            if (accessible < 0) { ret R.err[i32, Error](io_error(OP_PREPARE, accessible)); }
+        }
+    }
+    ret verified_directory(dirfd, name, OP_PREPARE);
+}
+
+fun finish_private_directory(t: *Transaction, fd: i32, final_mode: i32) O.Option[Error] {
+    $if ($mach.build.os != $mach.os.windows) {
+        val finalized: i64 = os.set_mode(fd, final_mode);
+        if (finalized < 0) { ret O.some[Error](io_error(OP_PREPARE, finalized)); }
+    }
+    ret prepare_barrier(t, fd);
+}
+
+fun write_subtree_file(t: *Transaction, dirfd: i32, name: str, e: *Entry) O.Option[Error] {
+    val opened: i64 = os.open(dirfd, name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, e.mode);
+    if (opened < 0) { ret O.some[Error](io_error(OP_PREPARE, opened)); }
+    val fd: i32 = opened::i32;
+    var sink: Sink = Sink{fd: fd};
+    var writer: m_writer.Writer = m_writer.Writer{ctx: (?sink)::ptr, f_write: sink_write};
+    val written: O.Option[str] = m_writer.write_all(?writer, e.data, e.len);
+    var failure: O.Option[Error] = O.none[Error]();
+    if (sink.failed_code < 0) { failure = O.some[Error](io_error(OP_PREPARE, sink.failed_code)); }
+    or (O.is_some[str](written)) { failure = O.some[Error](error(IO, OP_PREPARE)); }
+    or { failure = prepare_barrier(t, fd); }
+    val closed: i64 = os.close(fd);
+    if (O.is_some[Error](failure)) { ret failure; }
+    if (closed < 0) { ret O.some[Error](io_error(OP_PREPARE, closed)); }
+    ret O.none[Error]();
+}
+
+# explicit modes are selected before implicit parents are created
+fun build_subtree_directory(t: *Transaction, dirfd: i32, prefix: str,
+                            inv: *Inventory, depth: usize) O.Option[Error] {
+    if (depth > MAX_REMOVE_DEPTH) { ret O.some[Error](error(CONTAINMENT, OP_PREPARE)); }
+    var seen: Vector[str] = vector.init[str](t.alloc);
+    fin { free_names(t.alloc, ?seen); }
+    val prefix_len: usize = str_len(prefix);
     var start: usize = 0;
-    for (start < n) {
+    if (prefix_len != 0) { start = prefix_len + 1; }
+    var i: usize = 0;
+    for (i < inv.entries.len) {
+        val e: *Entry = ?inv.entries.data[i];
+        i = i + 1;
+        val length: usize = str_len(e.rel);
+        if (length <= start) { cnt; }
+        if (prefix_len != 0 && (!str_starts_with(e.rel, prefix) || e.rel[prefix_len] != '/')) { cnt; }
+        if (depth >= MAX_REMOVE_DEPTH) { ret O.some[Error](error(CONTAINMENT, OP_PREPARE)); }
         var end: usize = start;
-        for (end < n && e.rel[end] != '/') { end = end + 1; }
-        val component_r: R.Result[str, str] = str_copy_slice(alloc, e.rel, start, end - start);
-        if (R.is_err[str, str](component_r)) { ret O.some[Error](error(MEMORY, OP_PREPARE)); }
-        val name: str = R.unwrap_ok[str, str](component_r);
-        fin { str_free(alloc, name); }
-        if (end < n || e.kind == ENTRY_DIR) {
-            var mode: i32 = 0o755;
-            if (e.kind == ENTRY_DIR) { mode = e.mode; }
-            val made: i64 = os.make_dir(parent_fd, name, mode);
-            if (made < 0 && made != os.EEXIST) { ret O.some[Error](io_error(OP_PREPARE, made)); }
-            val opened: R.Result[i32, Error] = verified_directory(parent_fd, name, OP_PREPARE);
-            if (R.is_err[i32, Error](opened)) { ret O.some[Error](R.unwrap_err[i32, Error](opened)); }
-            if (held) { os.close(parent_fd); }
-            parent_fd = R.unwrap_ok[i32, Error](opened);
-            held = true;
+        for (end < length && e.rel[end] != '/') { end = end + 1; }
+        val copied: R.Result[str, str] = str_copy_slice(t.alloc, e.rel, start, end - start);
+        if (R.is_err[str, str](copied)) { ret O.some[Error](error(MEMORY, OP_PREPARE)); }
+        val name: str = R.unwrap_ok[str, str](copied);
+        var known: bool = false;
+        var j: usize = 0;
+        for (j < seen.len) {
+            if (str_equals(seen.data[j], name)) { known = true; brk; }
+            j = j + 1;
         }
-        or {
-            val raw: i64 = os.open(parent_fd, name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, e.mode);
-            if (raw < 0) { ret O.some[Error](io_error(OP_PREPARE, raw)); }
-            val fd: i32 = raw::i32;
-            var sink: Sink;
-            sink.fd = fd;
-            var writer: m_writer.Writer;
-            writer.ctx = (?sink)::ptr;
-            writer.f_write = sink_write;
-            val written: O.Option[str] = m_writer.write_all(?writer, e.data, e.len);
-            val closed: i64 = os.close(fd);
-            if (O.is_some[str](written)) {
-                if (sink.failed_code < 0) { ret O.some[Error](io_error(OP_PREPARE, sink.failed_code)); }
-                ret O.some[Error](error(IO, OP_PREPARE));
+        if (known) { str_free(t.alloc, name); cnt; }
+        val recorded: R.Result[usize, str] = vector.push[str](?seen, name);
+        if (R.is_err[usize, str](recorded)) {
+            str_free(t.alloc, name);
+            ret O.some[Error](error(MEMORY, OP_PREPARE));
+        }
+        val joined: R.Result[str, Error] = join_rel(t.alloc, prefix, name);
+        if (R.is_err[str, Error](joined)) { ret O.some[Error](R.unwrap_err[str, Error](joined)); }
+        val rel: str = R.unwrap_ok[str, Error](joined);
+        fin { str_free(t.alloc, rel); }
+        var declared: *Entry = nil;
+        var descendants: bool = false;
+        j = 0;
+        for (j < inv.entries.len) {
+            val candidate: *Entry = ?inv.entries.data[j];
+            j = j + 1;
+            if (str_equals(candidate.rel, rel)) {
+                if (declared != nil) { ret O.some[Error](error(INVALID, OP_PREPARE)); }
+                declared = candidate;
             }
-            if (closed < 0) { ret O.some[Error](io_error(OP_PREPARE, closed)); }
+            or (str_starts_with(candidate.rel, rel) && candidate.rel[str_len(rel)] == '/') { descendants = true; }
         }
-        start = end + 1;
+        if (declared != nil && declared.kind == ENTRY_FILE) {
+            if (descendants) { ret O.some[Error](error(INVALID, OP_PREPARE)); }
+            val written: O.Option[Error] = write_subtree_file(t, dirfd, name, declared);
+            if (O.is_some[Error](written)) { ret written; }
+            cnt;
+        }
+        var mode: i32 = 0o755;
+        if (declared != nil) { mode = declared.mode; }
+        val made: i64 = os.make_dir(dirfd, name, mode);
+        if (made == os.EEXIST) { ret O.some[Error](error(CONTAINMENT, OP_PREPARE)); }
+        if (made < 0) { ret O.some[Error](io_error(OP_PREPARE, made)); }
+        var final_mode: i32 = 0;
+        val opened: R.Result[i32, Error] = open_private_directory(dirfd, name, ?final_mode);
+        if (R.is_err[i32, Error](opened)) { ret O.some[Error](R.unwrap_err[i32, Error](opened)); }
+        val child: i32 = R.unwrap_ok[i32, Error](opened);
+        var result: O.Option[Error] = build_subtree_directory(t, child, rel, inv, depth + 1);
+        if (O.is_none[Error](result)) { result = finish_private_directory(t, child, final_mode); }
+        val closed: i64 = os.close(child);
+        if (O.is_some[Error](result)) { ret result; }
+        if (closed < 0) { ret O.some[Error](io_error(OP_PREPARE, closed)); }
     }
     ret O.none[Error]();
 }
 
-# write every inventory entry relative to the held staging directory
-fun build_subtree(alloc: *A.Allocator, staging_fd: i32, inv: *Inventory) O.Option[Error] {
+fun build_subtree(t: *Transaction, inv: *Inventory) O.Option[Error] {
     var i: usize = 0;
     for (i < inv.entries.len) {
-        val result: O.Option[Error] = write_subtree_entry(alloc, staging_fd, ?inv.entries.data[i]);
-        if (O.is_some[Error](result)) { ret result; }
+        val e: *Entry = ?inv.entries.data[i];
+        if (!rel_is_canonical(e.rel)) { ret O.some[Error](error(CONTAINMENT, OP_PREPARE)); }
+        if (e.kind != ENTRY_DIR && e.kind != ENTRY_FILE) { ret O.some[Error](error(INVALID, OP_PREPARE)); }
+        if (e.kind == ENTRY_FILE && e.data == nil && e.len != 0) { ret O.some[Error](error(INVALID, OP_PREPARE)); }
         i = i + 1;
     }
-    ret O.none[Error]();
+    ret build_subtree_directory(t, t.staging_fd, "", inv, 0);
 }
 
 # prepare a subtree publication
@@ -1555,110 +1602,47 @@ fun build_subtree(alloc: *A.Allocator, staging_fd: i32, inv: *Inventory) O.Optio
 # state. every descendant is created through held directory descriptors.
 # ---
 # alloc:    allocator for the transaction's own strings
-# r:        the root to publish into
-# leaf:     the destination name, a single path component
+# destination: the session-owned reservation borrowed until commit or abort
 # inv:      everything the subtree contains
 # mode:     permission bits for the subtree root directory
-# ret:      a transaction awaiting commit or abort
-pub fun prepare_subtree(alloc: *A.Allocator, r: *Root, leaf: str,
-                        inv: *Inventory, mode: i32) R.Result[Transaction, Error] {
-    if (alloc == nil || !ownership.root_valid(r) || inv == nil) {
-        ret R.err[Transaction, Error](error(INVALID, OP_PREPARE));
-    }
-    if (!publication_leaf(leaf)) {
-        ret R.err[Transaction, Error](error(CONTAINMENT, OP_PREPARE));
-    }
-
-    val prior_r: R.Result[O.Option[Identity], Error] = query_entry_identity(r.dirfd, leaf, OP_PREPARE);
-    if (R.is_err[O.Option[Identity], Error](prior_r)) {
-        ret R.err[Transaction, Error](R.unwrap_err[O.Option[Identity], Error](prior_r));
-    }
-    val prior_opt: O.Option[Identity] = R.unwrap_ok[O.Option[Identity], Error](prior_r);
-
-    var staging_name: str = nil;
-    val me: O.Option[Error] = make_staging_dir(alloc, r.dirfd, mode, ?staging_name);
-    if (O.is_some[Error](me)) { ret R.err[Transaction, Error](O.unwrap[Error](me)); }
-
-    val opened: R.Result[i32, Error] = verified_directory(r.dirfd, staging_name, OP_PREPARE);
-    if (R.is_err[i32, Error](opened)) {
-        remove_recursive(r.dirfd, staging_name);
-        str_free(alloc, staging_name);
-        ret R.err[Transaction, Error](R.unwrap_err[i32, Error](opened));
-    }
-    val staging_fd: i32 = R.unwrap_ok[i32, Error](opened);
-    var be: O.Option[Error] = build_subtree(alloc, staging_fd, inv);
-    val closed: i64 = os.close(staging_fd);
-    if (O.is_none[Error](be) && closed < 0) { be = O.some[Error](io_error(OP_PREPARE, closed)); }
-    if (O.is_some[Error](be)) {
-        remove_recursive(r.dirfd, staging_name);
-        str_free(alloc, staging_name);
-        ret R.err[Transaction, Error](O.unwrap[Error](be));
-    }
-
-    val leaf_r: R.Result[str, str] = str_dup(alloc, leaf);
-    if (R.is_err[str, str](leaf_r)) {
-        remove_recursive(r.dirfd, staging_name);
-        str_free(alloc, staging_name);
-        ret R.err[Transaction, Error](error(MEMORY, OP_PREPARE));
-    }
-
-    var t: Transaction;
-    t.dirfd        = r.dirfd;
-    t.leaf         = R.unwrap_ok[str, str](leaf_r);
-    t.staging_name = staging_name;
-    t.kind         = ENTRY_SUBTREE;
-    t.staging_fd   = -1;
-    t.had_prior    = O.is_some[Identity](prior_opt);
-    if (t.had_prior) { t.prior = O.unwrap[Identity](prior_opt); }
-    t.len        = inv.entries.len;
-    t.has_digest = false;
-    t.spent      = false;
-    t.alloc      = alloc;
-    ret R.ok[Transaction, Error](t);
+# ret:      none when out owns a prepared transaction
+pub fun prepare_subtree(out: *Transaction, alloc: *A.Allocator, destination: *Claim,
+                        inv: *Inventory, mode: i32, options: PrepareOptions) O.Option[Error] {
+    if (inv == nil) { ret O.some[Error](error(INVALID, OP_PREPARE)); }
+    val begun: O.Option[Error] = begin_prepare(out, alloc, destination, ENTRY_SUBTREE, options);
+    if (O.is_some[Error](begun)) { ret begun; }
+    val made: O.Option[Error] = make_staging_dir(alloc, out.dirfd, mode, ?out.staging_name);
+    if (O.is_some[Error](made)) { ret prepare_failed(out, O.unwrap[Error](made)); }
+    var final_mode: i32 = 0;
+    val opened: R.Result[i32, Error] = open_private_directory(out.dirfd, out.staging_name, ?final_mode);
+    if (R.is_err[i32, Error](opened)) { ret prepare_failed(out, R.unwrap_err[i32, Error](opened)); }
+    out.staging_fd = R.unwrap_ok[i32, Error](opened);
+    val built: O.Option[Error] = build_subtree(out, inv);
+    if (O.is_some[Error](built)) { ret prepare_failed(out, O.unwrap[Error](built)); }
+    out.len = inv.entries.len;
+    val finalized: O.Option[Error] = finish_private_directory(out, out.staging_fd, final_mode);
+    if (O.is_some[Error](finalized)) { ret prepare_failed(out, O.unwrap[Error](finalized)); }
+    out.state = STATE_PREPARED;
+    ret O.none[Error]();
 }
 
 # prepare an empty directory publication
 #
 # the degenerate subtree: one directory and nothing in it.
-pub fun prepare_dir(alloc: *A.Allocator, r: *Root, leaf: str,
-                    mode: i32) R.Result[Transaction, Error] {
-    if (alloc == nil || !ownership.root_valid(r)) {
-        ret R.err[Transaction, Error](error(INVALID, OP_PREPARE));
-    }
-    if (!publication_leaf(leaf)) {
-        ret R.err[Transaction, Error](error(CONTAINMENT, OP_PREPARE));
-    }
-
-    val prior_r: R.Result[O.Option[Identity], Error] = query_entry_identity(r.dirfd, leaf, OP_PREPARE);
-    if (R.is_err[O.Option[Identity], Error](prior_r)) {
-        ret R.err[Transaction, Error](R.unwrap_err[O.Option[Identity], Error](prior_r));
-    }
-    val prior_opt: O.Option[Identity] = R.unwrap_ok[O.Option[Identity], Error](prior_r);
-
-    var staging_name: str = nil;
-    val me: O.Option[Error] = make_staging_dir(alloc, r.dirfd, mode, ?staging_name);
-    if (O.is_some[Error](me)) { ret R.err[Transaction, Error](O.unwrap[Error](me)); }
-
-    val leaf_r: R.Result[str, str] = str_dup(alloc, leaf);
-    if (R.is_err[str, str](leaf_r)) {
-        remove_recursive(r.dirfd, staging_name);
-        str_free(alloc, staging_name);
-        ret R.err[Transaction, Error](error(MEMORY, OP_PREPARE));
-    }
-
-    var t: Transaction;
-    t.dirfd        = r.dirfd;
-    t.leaf         = R.unwrap_ok[str, str](leaf_r);
-    t.staging_name = staging_name;
-    t.kind         = ENTRY_DIR;
-    t.staging_fd   = -1;
-    t.had_prior    = O.is_some[Identity](prior_opt);
-    if (t.had_prior) { t.prior = O.unwrap[Identity](prior_opt); }
-    t.len        = 0;
-    t.has_digest = false;
-    t.spent      = false;
-    t.alloc      = alloc;
-    ret R.ok[Transaction, Error](t);
+pub fun prepare_dir(out: *Transaction, alloc: *A.Allocator, destination: *Claim,
+                    mode: i32, options: PrepareOptions) O.Option[Error] {
+    val begun: O.Option[Error] = begin_prepare(out, alloc, destination, ENTRY_DIR, options);
+    if (O.is_some[Error](begun)) { ret begun; }
+    val made: O.Option[Error] = make_staging_dir(alloc, out.dirfd, mode, ?out.staging_name);
+    if (O.is_some[Error](made)) { ret prepare_failed(out, O.unwrap[Error](made)); }
+    var final_mode: i32 = 0;
+    val opened: R.Result[i32, Error] = open_private_directory(out.dirfd, out.staging_name, ?final_mode);
+    if (R.is_err[i32, Error](opened)) { ret prepare_failed(out, R.unwrap_err[i32, Error](opened)); }
+    out.staging_fd = R.unwrap_ok[i32, Error](opened);
+    val finalized: O.Option[Error] = finish_private_directory(out, out.staging_fd, final_mode);
+    if (O.is_some[Error](finalized)) { ret prepare_failed(out, O.unwrap[Error](finalized)); }
+    out.state = STATE_PREPARED;
+    ret O.none[Error]();
 }
 
 # walk everything under `dirfd`, refusing any entry the caller does not claim
@@ -1701,11 +1685,17 @@ fun walk_owned[T](alloc: *A.Allocator, dirfd: i32, prefix: str, ctx: *T,
             cnt;
         }
         if (is_dir) {
-            val child: i64 = os.open(dirfd, name, os.O_RDONLY | os.O_DIRECTORY, 0);
-            if (child < 0) { str_free(alloc, rel); failure = O.some[Error](io_error(OP_COMMIT, child)); cnt; }
-            val sub: O.Option[Error] = walk_owned[T](alloc, child::i32, rel, ctx, owns);
-            os.close(child::i32);
+            val opened: R.Result[i32, Error] = verified_directory(dirfd, name, OP_COMMIT);
+            if (R.is_err[i32, Error](opened)) {
+                str_free(alloc, rel);
+                failure = O.some[Error](R.unwrap_err[i32, Error](opened));
+                cnt;
+            }
+            val child: i32 = R.unwrap_ok[i32, Error](opened);
+            val sub: O.Option[Error] = walk_owned[T](alloc, child, rel, ctx, owns);
+            val closed: i64 = os.close(child);
             if (O.is_some[Error](sub)) { failure = sub; }
+            or (closed < 0) { failure = O.some[Error](io_error(OP_COMMIT, closed)); }
         }
         str_free(alloc, rel);
     }
@@ -1774,59 +1764,66 @@ fun resolve_backup(dirfd: i32, leaf: str, backupfd: i32) R.Result[bool, Error] {
     ret R.ok[bool, Error](true);
 }
 
-fun owned_replace_failed(t: *Transaction, backupfd: i32, failure: Error) R.Result[Outcome, Error] {
-    if (backupfd >= 0) { os.close(backupfd); }
-    discard_staging(t);
-    transaction_free_names(t);
-    ret R.err[Outcome, Error](failure);
+fun owned_replace_failed(t: *Transaction, backupfd: i32, remove: bool, failure: Error) R.Result[Outcome, Error] {
+    if (backupfd >= 0) {
+        val closed: i64 = os.close(backupfd);
+        if (closed < 0) { ret commit_failed(t, remove, io_error(OP_COMMIT, closed)); }
+    }
+    ret commit_failed(t, remove, failure);
 }
 
-# replace an owned tree through a persistent descriptor-relative backup container
+# consumes even invalid replacement requests and never recovers a live session
+# the destination may be temporarily absent between the backup and publication renames
 pub fun commit_replacing_owned[T](t: *Transaction, ctx: *T,
                                   owns: fun(*T, str, bool) bool) R.Result[Outcome, Error] {
-    if (t == nil || t.spent || ctx == nil || owns == nil || t.kind == ENTRY_FILE) {
-        ret R.err[Outcome, Error](error(INVALID, OP_COMMIT));
+    if (!prepared(t)) { ret R.err[Outcome, Error](error(INVALID, OP_COMMIT)); }
+    t.state = STATE_SPENT;
+    if (ctx == nil || owns == nil || t.kind == ENTRY_FILE || t.options.precondition == PRE_ABSENT) {
+        ret commit_failed(t, true, error(INVALID, OP_COMMIT));
     }
-    t.spent = true;
+    val holds: R.Result[bool, Error] = precondition_holds(t);
+    if (R.is_err[bool, Error](holds)) { ret commit_failed(t, true, R.unwrap_err[bool, Error](holds)); }
+    if (!R.unwrap_ok[bool, Error](holds)) { ret commit_failed(t, true, error(PRECONDITION, OP_COMMIT)); }
     val opened: R.Result[i32, Error] = open_backup_container(t.dirfd, false);
-    if (R.is_err[i32, Error](opened)) { ret owned_replace_failed(t, -1, R.unwrap_err[i32, Error](opened)); }
+    if (R.is_err[i32, Error](opened)) { ret commit_failed(t, true, R.unwrap_err[i32, Error](opened)); }
     var backupfd: i32 = R.unwrap_ok[i32, Error](opened);
-    val resolved: R.Result[bool, Error] = resolve_backup(t.dirfd, t.leaf, backupfd);
-    if (R.is_err[bool, Error](resolved)) { ret owned_replace_failed(t, backupfd, R.unwrap_err[bool, Error](resolved)); }
-    val recovered: bool = R.unwrap_ok[bool, Error](resolved);
-    if (entry_absent(t.dirfd, t.leaf)) {
-        ret owned_replace_failed(t, backupfd, error(PRECONDITION, OP_COMMIT));
+    if (backupfd >= 0) {
+        var st: os.stat_t;
+        val prior: i64 = os.stat_path(backupfd, t.leaf, ?st, os.AT_SYMLINK_NOFOLLOW);
+        if (prior >= 0) { ret owned_replace_failed(t, backupfd, true, error(CONFLICT, OP_COMMIT)); }
+        if (prior != os.ENOENT) { ret owned_replace_failed(t, backupfd, true, io_error(OP_COMMIT, prior)); }
     }
     val target: R.Result[i32, Error] = verified_directory(t.dirfd, t.leaf, OP_COMMIT);
-    if (R.is_err[i32, Error](target)) { ret owned_replace_failed(t, backupfd, R.unwrap_err[i32, Error](target)); }
+    if (R.is_err[i32, Error](target)) {
+        val e: Error = R.unwrap_err[i32, Error](target);
+        if (e.kind == IO && e.code == os.ENOENT) { ret owned_replace_failed(t, backupfd, true, error(PRECONDITION, OP_COMMIT)); }
+        ret owned_replace_failed(t, backupfd, true, e);
+    }
     val targetfd: i32 = R.unwrap_ok[i32, Error](target);
     val checked: O.Option[Error] = walk_owned[T](t.alloc, targetfd, "", ctx, owns);
-    os.close(targetfd);
-    if (O.is_some[Error](checked)) { ret owned_replace_failed(t, backupfd, O.unwrap[Error](checked)); }
+    val target_closed: i64 = os.close(targetfd);
+    if (O.is_some[Error](checked)) { ret owned_replace_failed(t, backupfd, true, O.unwrap[Error](checked)); }
+    if (target_closed < 0) { ret owned_replace_failed(t, backupfd, true, io_error(OP_COMMIT, target_closed)); }
+    val staging_closed: O.Option[Error] = close_staging(t);
+    if (O.is_some[Error](staging_closed)) { ret owned_replace_failed(t, backupfd, true, O.unwrap[Error](staging_closed)); }
     if (backupfd < 0) {
         val created: R.Result[i32, Error] = open_backup_container(t.dirfd, true);
-        if (R.is_err[i32, Error](created)) { ret owned_replace_failed(t, -1, R.unwrap_err[i32, Error](created)); }
+        if (R.is_err[i32, Error](created)) { ret commit_failed(t, true, R.unwrap_err[i32, Error](created)); }
         backupfd = R.unwrap_ok[i32, Error](created);
     }
     val vacated: i64 = os.rename(t.dirfd, t.leaf, backupfd, t.leaf);
-    if (vacated < 0) { ret owned_replace_failed(t, backupfd, io_error(OP_COMMIT, vacated)); }
+    if (vacated < 0) { ret owned_replace_failed(t, backupfd, true, io_error(OP_COMMIT, vacated)); }
     val placed: i64 = os.rename(t.dirfd, t.staging_name, t.dirfd, t.leaf);
     if (placed < 0) {
         val restored: i64 = os.rename(backupfd, t.leaf, t.dirfd, t.leaf);
-        if (restored < 0) { ret owned_replace_failed(t, backupfd, io_error(OP_COMMIT, restored)); }
-        ret owned_replace_failed(t, backupfd, io_error(OP_COMMIT, placed));
+        if (restored < 0) { ret owned_replace_failed(t, backupfd, true, io_error(OP_COMMIT, restored)); }
+        ret owned_replace_failed(t, backupfd, true, io_error(OP_COMMIT, placed));
     }
     val removed: O.Option[Error] = remove_recursive(backupfd, t.leaf);
+    if (O.is_some[Error](removed)) { ret owned_replace_failed(t, backupfd, false, O.unwrap[Error](removed)); }
     val closed: i64 = os.close(backupfd);
-    transaction_free_names(t);
-    if (O.is_some[Error](removed)) { ret R.err[Outcome, Error](O.unwrap[Error](removed)); }
-    if (closed < 0) { ret R.err[Outcome, Error](io_error(OP_COMMIT, closed)); }
-    var out: Outcome;
-    out.committed = true;
-    out.achieved = DUR_NONE;
-    out.shortfall = false;
-    out.recovered = recovered;
-    ret R.ok[Outcome, Error](out);
+    if (closed < 0) { ret commit_failed(t, false, io_error(OP_COMMIT, closed)); }
+    ret publication_finished(t, t.content_flushed);
 }
 
 fun staging_residue(name: str) bool {
@@ -1842,9 +1839,26 @@ fun staging_residue(name: str) bool {
     ret true;
 }
 
-# resolve only the requested backup and sweep recognized staging under the root lock
-pub fun recover(alloc: *A.Allocator, r: *Root, leaf: str) R.Result[usize, Error] {
-    if (alloc == nil || !ownership.root_valid(r)) { ret R.err[usize, Error](error(INVALID, OP_RECOVER)); }
+# requires the supplied coordinator lock and no live claims or workers
+# admission remains closed when any recovery or claims initialization step fails
+pub fun recover(alloc: *A.Allocator, held: *Lock, leaf: str) R.Result[usize, Error] {
+    if (alloc == nil) { ret R.err[usize, Error](error(INVALID, OP_RECOVER)); }
+    if (!str_empty(leaf) && !publication_leaf(leaf)) { ret R.err[usize, Error](error(CONTAINMENT, OP_RECOVER)); }
+    val begun: i64 = ownership.begin_recovery(held);
+    if (begun < 0) { ret R.err[usize, Error](error(INVALID, OP_RECOVER)); }
+    val swept: R.Result[usize, Error] = recover_entries(alloc, held.root, leaf);
+    if (R.is_err[usize, Error](swept)) {
+        ownership.end_recovery(held, false);
+        ret swept;
+    }
+    val initialized: i64 = ownership.initialize_claims(held);
+    val finished: i64 = ownership.end_recovery(held, initialized >= 0);
+    if (initialized < 0) { ret R.err[usize, Error](io_error(OP_RECOVER, initialized)); }
+    if (finished < 0) { ret R.err[usize, Error](error(INVALID, OP_RECOVER)); }
+    ret swept;
+}
+
+fun recover_entries(alloc: *A.Allocator, r: *Root, leaf: str) R.Result[usize, Error] {
     if (!str_empty(leaf)) {
         if (!publication_leaf(leaf)) { ret R.err[usize, Error](error(CONTAINMENT, OP_RECOVER)); }
         val opened: R.Result[i32, Error] = open_backup_container(r.dirfd, false);
@@ -1871,7 +1885,14 @@ pub fun recover(alloc: *A.Allocator, r: *Root, leaf: str) R.Result[usize, Error]
         val name: str = names.data[i];
         i = i + 1;
         if (!staging_residue(name)) { cnt; }
-        val result: O.Option[Error] = remove_recursive(r.dirfd, name);
+        var count: usize = 0;
+        val cleaned: O.Option[removal.Error] = removal.private_tree(r.dirfd, name, ?count, MAX_REMOVE_DEPTH);
+        var result: O.Option[Error] = O.none[Error]();
+        if (O.is_some[removal.Error](cleaned)) {
+            val e: removal.Error = O.unwrap[removal.Error](cleaned);
+            if (e.containment) { result = O.some[Error](error(CONTAINMENT, OP_RECOVER)); }
+            or { result = O.some[Error](io_error(OP_RECOVER, e.code)); }
+        }
         if (O.is_some[Error](result)) { failure = result; cnt; }
         removed = removed + 1;
     }
@@ -1997,6 +2018,68 @@ use page: std.allocator.page;
 use testing: std.allocator.testing;
 
 # a private directory to publish into, removed by the caller
+rec TestSession {
+    held: Lock;
+    alloc: *A.Allocator;
+    claims: Vector[*Claim];
+}
+
+fun t_session_init(out: *TestSession, alloc: *A.Allocator, root: *Root) O.Option[Error] {
+    out.alloc = alloc;
+    out.claims = vector.init[*Claim](alloc);
+    ret lock(?out.held, root);
+}
+
+fun t_session_release_claims(session: *TestSession) O.Option[Error] {
+    for (session.claims.len != 0) {
+        val owned: *Claim = session.claims.data[session.claims.len - 1];
+        val released: O.Option[Error] = release_claim(owned);
+        if (O.is_some[Error](released)) { ret released; }
+        session.claims.len = session.claims.len - 1;
+        A.deallocate[Claim](session.alloc, owned, 1);
+    }
+    ret O.none[Error]();
+}
+
+fun t_session_dnit(session: *TestSession) {
+    if (O.is_some[Error](t_session_release_claims(session))) { ret; }
+    vector.dnit[*Claim](?session.claims);
+    unlock(?session.held);
+}
+
+fun t_end_batch_and_recover(session: *TestSession, leaf: str) R.Result[usize, Error] {
+    val ended: O.Option[Error] = t_session_release_claims(session);
+    if (O.is_some[Error](ended)) { ret R.err[usize, Error](O.unwrap[Error](ended)); }
+    ret recover(session.alloc, ?session.held, leaf);
+}
+
+fun t_reserve(session: *TestSession, leaf: str) *Claim {
+    if (!session.held.initialized) {
+        if (R.is_err[usize, Error](recover(session.alloc, ?session.held, ""))) { ret nil; }
+    }
+    var i: usize = 0;
+    for (i < session.claims.len) {
+        val owned: *Claim = session.claims.data[i];
+        if (str_equals(claim_leaf(owned), leaf)) { ret owned; }
+        i = i + 1;
+    }
+    val allocated: R.Result[*Claim, str] = A.allocate[Claim](session.alloc, 1);
+    if (R.is_err[*Claim, str](allocated)) { ret nil; }
+    val owned: *Claim = R.unwrap_ok[*Claim, str](allocated);
+    @owned = Claim{};
+    if (O.is_some[Error](claim(owned, session.alloc, ?session.held, leaf))) {
+        A.deallocate[Claim](session.alloc, owned, 1);
+        ret nil;
+    }
+    val recorded: R.Result[usize, str] = vector.push[*Claim](?session.claims, owned);
+    if (R.is_err[usize, str](recorded)) {
+        release_claim(owned);
+        A.deallocate[Claim](session.alloc, owned, 1);
+        ret nil;
+    }
+    ret owned;
+}
+
 fun scratch_root(alloc: *A.Allocator) R.Result[str, str] {
     val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(alloc, "mach_txn_test");
     if (R.is_err[fs.TempFile, str](tf_r)) { ret R.err[str, str](R.unwrap_err[fs.TempFile, str](tf_r)); }
@@ -2028,13 +2111,17 @@ fun read_back(alloc: *A.Allocator, root: str, leaf: str) O.Option[str] {
     ret O.some[str](R.unwrap_ok[str, str](r));
 }
 
-fun entry_count(alloc: *A.Allocator, root: str) usize {
+fun payload_entry_count(alloc: *A.Allocator, root: str) usize {
     val r: R.Result[Vector[str], str] = fs.read_dir(alloc, root);
     if (R.is_err[Vector[str], str](r)) { ret 0; }
     var v: Vector[str] = R.unwrap_ok[Vector[str], str](r);
-    val n: usize = v.len;
+    var n: usize = 0;
     var i: usize = 0;
-    for (i < v.len) { str_free(alloc, v.data[i]); i = i + 1; }
+    for (i < v.len) {
+        if (!str_equals(v.data[i], LOCK_LEAF) && !str_equals(v.data[i], ownership.CLAIMS_LEAF)) { n = n + 1; }
+        str_free(alloc, v.data[i]);
+        i = i + 1;
+    }
     vector.dnit[str](?v);
     ret n;
 }
@@ -2138,7 +2225,7 @@ test "std.filesystem.transaction.root_open: a swapped ancestor cannot redirect a
     ret bad;
 }
 
-test "std.filesystem.transaction.prepare: refuses a leaf that is not one component" {
+test "std.filesystem.transaction.claim: refuses a leaf that is not one component" {
     var alloc: A.Allocator;
     if (O.is_some[str](page.make(?alloc))) { ret 1; }
     val root_r: R.Result[str, str] = scratch_root(?alloc);
@@ -2151,19 +2238,27 @@ test "std.filesystem.transaction.prepare: refuses a leaf that is not one compone
     if (O.is_some[Error](opened)) { bad = 2; }
     or {
         val g: *Root = ?root_storage_3;
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
         # every one of these would escape the root or name no entry at all
-        val t1: R.Result[Transaction, Error] = prepare_bytes(?alloc, g, "a/b", "x", 1, 0o644, false);
-        val t2: R.Result[Transaction, Error] = prepare_bytes(?alloc, g, "..", "x", 1, 0o644, false);
-        val t3: R.Result[Transaction, Error] = prepare_bytes(?alloc, g, ".", "x", 1, 0o644, false);
-        val t4: R.Result[Transaction, Error] = prepare_bytes(?alloc, g, "", "x", 1, 0o644, false);
-        if (R.is_ok[Transaction, Error](t1)) { bad = 3; }
-        if (R.is_ok[Transaction, Error](t2)) { bad = 4; }
-        if (R.is_ok[Transaction, Error](t3)) { bad = 5; }
-        if (R.is_ok[Transaction, Error](t4)) { bad = 6; }
-        if (bad == 0 && R.unwrap_err[Transaction, Error](t1).kind != CONTAINMENT) { bad = 7; }
+        var claim_1: Claim;
+        val t1: O.Option[Error] = claim(?claim_1, ?alloc, ?g_session.held, "a/b");
+        var claim_2: Claim;
+        val t2: O.Option[Error] = claim(?claim_2, ?alloc, ?g_session.held, "..");
+        var claim_3: Claim;
+        val t3: O.Option[Error] = claim(?claim_3, ?alloc, ?g_session.held, ".");
+        var claim_4: Claim;
+        val t4: O.Option[Error] = claim(?claim_4, ?alloc, ?g_session.held, "");
+        if (O.is_none[Error](t1)) { bad = 3; }
+        if (O.is_none[Error](t2)) { bad = 4; }
+        if (O.is_none[Error](t3)) { bad = 5; }
+        if (O.is_none[Error](t4)) { bad = 6; }
+        if (bad == 0 && O.unwrap[Error](t1).kind != CONTAINMENT) { bad = 7; }
         # nothing was created for any of them
-        if (bad == 0 && entry_count(?alloc, root) != 0) { bad = 8; }
-        root_dnit(g);
+        if (bad == 0 && payload_entry_count(?alloc, root) != 0) { bad = 8; }
+
     }
 
     fs.remove_all(?alloc, root);
@@ -2184,22 +2279,30 @@ test "std.filesystem.transaction.commit: absent-at-commit fills a vacancy once a
     if (O.is_some[Error](opened)) { bad = 2; }
     or {
         val g: *Root = ?root_storage_4;
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
 
-        val t1: R.Result[Transaction, Error] = prepare_bytes(?alloc, g, "out", "first", 5, 0o644, false);
-        if (R.is_err[Transaction, Error](t1)) { bad = 3; }
+        var t1_storage: Transaction;
+        val t1: O.Option[Error] = prepare_bytes(?t1_storage, ?alloc, t_reserve(?g_session, "out"), "first", 5, 0o644, false, PrepareOptions{precondition: PRE_ABSENT, durability: durability_none()});
+        fin { if (t1_storage.state == STATE_PREPARED) { abort(?t1_storage); } }
+        if (O.is_some[Error](t1)) { bad = 3; }
         or {
-            var a: Transaction = R.unwrap_ok[Transaction, Error](t1);
-            val c1: R.Result[Outcome, Error] = commit(?a, PRE_ABSENT_AT_COMMIT, durability_none());
+            val a: *Transaction = ?t1_storage;
+            val c1: R.Result[Outcome, Error] = commit(a);
             if (R.is_err[Outcome, Error](c1)) { bad = 4; }
         }
 
         # the destination now exists, so the same precondition must refuse and
         # must leave what is there alone
-        val t2: R.Result[Transaction, Error] = prepare_bytes(?alloc, g, "out", "second", 6, 0o644, false);
-        if (bad == 0 && R.is_err[Transaction, Error](t2)) { bad = 5; }
+        var t2_storage: Transaction;
+        val t2: O.Option[Error] = prepare_bytes(?t2_storage, ?alloc, t_reserve(?g_session, "out"), "second", 6, 0o644, false, PrepareOptions{precondition: PRE_ABSENT, durability: durability_none()});
+        fin { if (t2_storage.state == STATE_PREPARED) { abort(?t2_storage); } }
+        if (bad == 0 && O.is_some[Error](t2)) { bad = 5; }
         or {
-            var b: Transaction = R.unwrap_ok[Transaction, Error](t2);
-            val c2: R.Result[Outcome, Error] = commit(?b, PRE_ABSENT_AT_COMMIT, durability_none());
+            val b: *Transaction = ?t2_storage;
+            val c2: R.Result[Outcome, Error] = commit(b);
             if (bad == 0 && R.is_ok[Outcome, Error](c2)) { bad = 6; }
             or {
                 if (bad == 0 && R.unwrap_err[Outcome, Error](c2).kind != PRECONDITION) { bad = 7; }
@@ -2212,8 +2315,8 @@ test "std.filesystem.transaction.commit: absent-at-commit fills a vacancy once a
             if (bad == 0 && !str_equals(O.unwrap[str](got), "first")) { bad = 9; }
         }
         # the refused commit left no staging entry behind
-        if (bad == 0 && entry_count(?alloc, root) != 1) { bad = 10; }
-        root_dnit(g);
+        if (bad == 0 && payload_entry_count(?alloc, root) != 1) { bad = 10; }
+
     }
 
     fs.remove_all(?alloc, root);
@@ -2221,15 +2324,17 @@ test "std.filesystem.transaction.commit: absent-at-commit fills a vacancy once a
     ret bad;
 }
 
-test "std.filesystem.transaction.commit: unchanged-since-prepare detects a replacement and preserves it" {
+test "std.filesystem.transaction.commit: same-object-since-prepare detects a replacement and preserves it" {
     var alloc: A.Allocator;
     if (O.is_some[str](page.make(?alloc))) { ret 1; }
     val root_r: R.Result[str, str] = scratch_root(?alloc);
     if (R.is_err[str, str](root_r)) { ret 1; }
     val root: str = R.unwrap_ok[str, str](root_r);
+    fin { fs.remove_all(?alloc, root); str_free(?alloc, root); }
 
     var bad: i32 = 0;
     val dest: str = abs_of(?alloc, root, "out");
+    fin { str_free(?alloc, dest); }
     if (O.is_some[str](fs.write_bytes(dest, "original", 8, 0o644))) { bad = 2; }
     or {
         var root_storage_5: Root;
@@ -2237,16 +2342,27 @@ test "std.filesystem.transaction.commit: unchanged-since-prepare detects a repla
         if (O.is_some[Error](opened)) { bad = 3; }
         or {
             val g: *Root = ?root_storage_5;
-            val t: R.Result[Transaction, Error] = prepare_bytes(?alloc, g, "out", "ours", 4, 0o644, false);
-            if (R.is_err[Transaction, Error](t)) { bad = 4; }
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
+            var t_storage: Transaction;
+        val t: O.Option[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?g_session, "out"), "ours", 4, 0o644, false, PrepareOptions{precondition: PRE_SAME_OBJECT, durability: durability_none()});
+        fin { if (t_storage.state == STATE_PREPARED) { abort(?t_storage); } }
+            $if ($mach.build.os == $mach.os.darwin) {
+            if (O.is_none[Error](t)) { ret 94; }
+            if (O.unwrap[Error](t).kind != UNSUPPORTED) { ret 95; }
+            ret 0;
+        }
+        if (O.is_some[Error](t)) { bad = 4; }
             or {
-                var a: Transaction = R.unwrap_ok[Transaction, Error](t);
+                val a: *Transaction = ?t_storage;
 
                 # another writer replaces the destination while we hold staging
                 fs.remove_file(dest);
                 if (O.is_some[str](fs.write_bytes(dest, "theirs", 6, 0o644))) { bad = 5; }
 
-                val c: R.Result[Outcome, Error] = commit(?a, PRE_UNCHANGED_SINCE_PREPARE, durability_none());
+                val c: R.Result[Outcome, Error] = commit(a);
                 if (bad == 0 && R.is_ok[Outcome, Error](c)) { bad = 6; }
                 or {
                     if (bad == 0 && R.unwrap_err[Outcome, Error](c).kind != PRECONDITION) { bad = 7; }
@@ -2258,19 +2374,16 @@ test "std.filesystem.transaction.commit: unchanged-since-prepare detects a repla
                 or {
                     if (bad == 0 && !str_equals(O.unwrap[str](got), "theirs")) { bad = 9; }
                 }
-                if (bad == 0 && entry_count(?alloc, root) != 1) { bad = 10; }
+                if (bad == 0 && payload_entry_count(?alloc, root) != 1) { bad = 10; }
             }
-            root_dnit(g);
+
         }
     }
 
-    str_free(?alloc, dest);
-    fs.remove_all(?alloc, root);
-    str_free(?alloc, root);
     ret bad;
 }
 
-test "std.filesystem.transaction.commit: unchanged-since-prepare succeeds when absent stays absent" {
+test "std.filesystem.transaction.commit: same-object-since-prepare succeeds when absent stays absent" {
     var alloc: A.Allocator;
     if (O.is_some[str](page.make(?alloc))) { ret 1; }
     val root_r: R.Result[str, str] = scratch_root(?alloc);
@@ -2283,13 +2396,19 @@ test "std.filesystem.transaction.commit: unchanged-since-prepare succeeds when a
     if (O.is_some[Error](opened)) { bad = 2; }
     or {
         val g: *Root = ?root_storage_6;
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
         # nothing was there at prepare and nothing appeared, which is still
         # "unchanged" and must be allowed to land
-        val t: R.Result[Transaction, Error] = prepare_bytes(?alloc, g, "out", "fresh", 5, 0o644, false);
-        if (R.is_err[Transaction, Error](t)) { bad = 3; }
+        var t_storage: Transaction;
+        val t: O.Option[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?g_session, "out"), "fresh", 5, 0o644, false, PrepareOptions{precondition: PRE_SAME_OBJECT, durability: durability_none()});
+        fin { if (t_storage.state == STATE_PREPARED) { abort(?t_storage); } }
+        if (O.is_some[Error](t)) { bad = 3; }
         or {
-            var a: Transaction = R.unwrap_ok[Transaction, Error](t);
-            val c: R.Result[Outcome, Error] = commit(?a, PRE_UNCHANGED_SINCE_PREPARE, durability_none());
+            val a: *Transaction = ?t_storage;
+            val c: R.Result[Outcome, Error] = commit(a);
             if (R.is_err[Outcome, Error](c)) { bad = 4; }
         }
         val got: O.Option[str] = read_back(?alloc, root, "out");
@@ -2297,7 +2416,7 @@ test "std.filesystem.transaction.commit: unchanged-since-prepare succeeds when a
         or {
             if (bad == 0 && !str_equals(O.unwrap[str](got), "fresh")) { bad = 6; }
         }
-        root_dnit(g);
+
     }
 
     fs.remove_all(?alloc, root);
@@ -2311,10 +2430,13 @@ test "std.filesystem.transaction.commit: refuses a symlink swapped in at the des
     val root_r: R.Result[str, str] = scratch_root(?alloc);
     if (R.is_err[str, str](root_r)) { ret 1; }
     val root: str = R.unwrap_ok[str, str](root_r);
+    fin { fs.remove_all(?alloc, root); str_free(?alloc, root); }
 
     var bad: i32 = 0;
     val dest:    str = abs_of(?alloc, root, "out");
+    fin { str_free(?alloc, dest); }
     val outside: str = abs_of(?alloc, root, "elsewhere");
+    fin { str_free(?alloc, outside); }
     if (O.is_some[str](fs.write_bytes(dest, "original", 8, 0o644))) { bad = 2; }
     or {
         if (O.is_some[str](fs.write_bytes(outside, "victim", 6, 0o644))) { bad = 3; }
@@ -2324,10 +2446,21 @@ test "std.filesystem.transaction.commit: refuses a symlink swapped in at the des
             if (O.is_some[Error](opened)) { bad = 4; }
             or {
                 val g: *Root = ?root_storage_7;
-                val t: R.Result[Transaction, Error] = prepare_bytes(?alloc, g, "out", "ours", 4, 0o644, false);
-                if (R.is_err[Transaction, Error](t)) { bad = 5; }
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
+                var t_storage: Transaction;
+        val t: O.Option[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?g_session, "out"), "ours", 4, 0o644, false, PrepareOptions{precondition: PRE_SAME_OBJECT, durability: durability_none()});
+        fin { if (t_storage.state == STATE_PREPARED) { abort(?t_storage); } }
+                $if ($mach.build.os == $mach.os.darwin) {
+            if (O.is_none[Error](t)) { ret 94; }
+            if (O.unwrap[Error](t).kind != UNSUPPORTED) { ret 95; }
+            ret 0;
+        }
+        if (O.is_some[Error](t)) { bad = 5; }
                 or {
-                    var a: Transaction = R.unwrap_ok[Transaction, Error](t);
+                    val a: *Transaction = ?t_storage;
 
                     # the destination becomes a symlink pointing at another file;
                     # committing through it would corrupt a file outside the
@@ -2335,7 +2468,7 @@ test "std.filesystem.transaction.commit: refuses a symlink swapped in at the des
                     fs.remove_file(dest);
                     if (O.is_some[str](fs.symlink("elsewhere", dest))) { bad = 6; }
 
-                    val c: R.Result[Outcome, Error] = commit(?a, PRE_UNCHANGED_SINCE_PREPARE, durability_none());
+                    val c: R.Result[Outcome, Error] = commit(a);
                     if (bad == 0 && R.is_ok[Outcome, Error](c)) { bad = 7; }
 
                     val victim: O.Option[str] = read_back(?alloc, root, "elsewhere");
@@ -2344,15 +2477,11 @@ test "std.filesystem.transaction.commit: refuses a symlink swapped in at the des
                         if (bad == 0 && !str_equals(O.unwrap[str](victim), "victim")) { bad = 9; }
                     }
                 }
-                root_dnit(g);
+
             }
         }
     }
 
-    str_free(?alloc, dest);
-    str_free(?alloc, outside);
-    fs.remove_all(?alloc, root);
-    str_free(?alloc, root);
     ret bad;
 }
 
@@ -2369,16 +2498,21 @@ test "std.filesystem.transaction.prepare: a producer that fails partway leaves n
     if (O.is_some[Error](opened)) { bad = 2; }
     or {
         val g: *Root = ?root_storage_8;
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
         var p: PartialThenFail;
         p.wrote = 0;
-        val t: R.Result[Transaction, Error] =
-            prepare[PartialThenFail](?alloc, g, "out", ?p, partial_then_fail, 0o644, false);
-        if (R.is_ok[Transaction, Error](t)) { bad = 3; }
+        var t_storage: Transaction;
+        val t: O.Option[Error] = prepare[PartialThenFail](?t_storage, ?alloc, t_reserve(?g_session, "out"), ?p, partial_then_fail, 0o644, false, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
+        fin { if (t_storage.state == STATE_PREPARED) { abort(?t_storage); } }
+        if (O.is_none[Error](t)) { bad = 3; }
         # the bytes that were written are gone with the staging entry, and the
         # destination never existed
         if (bad == 0 && p.wrote != 7) { bad = 4; }
-        if (bad == 0 && entry_count(?alloc, root) != 0) { bad = 5; }
-        root_dnit(g);
+        if (bad == 0 && payload_entry_count(?alloc, root) != 0) { bad = 5; }
+
     }
 
     fs.remove_all(?alloc, root);
@@ -2386,13 +2520,6 @@ test "std.filesystem.transaction.prepare: a producer that fails partway leaves n
     ret bad;
 }
 
-# a producer that fails partway leaves an EXISTING destination untouched
-#
-# the callback used to be able to abort two ways, an error or an ok carrying
-# false, and the false arm is gone now that the contract returns Void. this
-# pins what actually matters about that arm: the error still aborts, and it
-# aborts without touching a destination that was already there. the existing
-# partial-write test covers the case where nothing existed yet.
 test "std.filesystem.transaction.prepare: a failed producer leaves a prior file whole" {
     var alloc: A.Allocator;
     if (O.is_some[str](page.make(?alloc))) { ret 1; }
@@ -2406,23 +2533,29 @@ test "std.filesystem.transaction.prepare: a failed producer leaves a prior file 
     if (O.is_some[Error](opened)) { bad = 2; }
     or {
         val g: *Root = ?root_storage_9;
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
 
         # publish a first version the failed attempt must not disturb
-        val first: R.Result[Transaction, Error] =
-            prepare_bytes(?alloc, g, "out", "original", 8, 0o644, false);
-        if (R.is_err[Transaction, Error](first)) { bad = 3; }
+        var first_storage: Transaction;
+        val first: O.Option[Error] = prepare_bytes(?first_storage, ?alloc, t_reserve(?g_session, "out"), "original", 8, 0o644, false, PrepareOptions{precondition: PRE_ABSENT, durability: durability_none()});
+        fin { if (first_storage.state == STATE_PREPARED) { abort(?first_storage); } }
+        if (O.is_some[Error](first)) { bad = 3; }
         or {
-            var f: Transaction = R.unwrap_ok[Transaction, Error](first);
-            if (R.is_err[Outcome, Error](commit(?f, PRE_ABSENT_AT_COMMIT, durability_none()))) { bad = 4; }
+            val f: *Transaction = ?first_storage;
+            if (R.is_err[Outcome, Error](commit(f))) { bad = 4; }
         }
 
         # now a producer that writes some bytes and then reports failure
         if (bad == 0) {
             var p: PartialThenFail;
             p.wrote = 0;
-            val t: R.Result[Transaction, Error] =
-                prepare[PartialThenFail](?alloc, g, "out", ?p, partial_then_fail, 0o644, false);
-            if (R.is_ok[Transaction, Error](t)) { bad = 5; }
+            var t_storage: Transaction;
+        val t: O.Option[Error] = prepare[PartialThenFail](?t_storage, ?alloc, t_reserve(?g_session, "out"), ?p, partial_then_fail, 0o644, false, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
+        fin { if (t_storage.state == STATE_PREPARED) { abort(?t_storage); } }
+            if (O.is_none[Error](t)) { bad = 5; }
             if (bad == 0 && p.wrote != 7) { bad = 6; }
         }
 
@@ -2434,8 +2567,8 @@ test "std.filesystem.transaction.prepare: a failed producer leaves a prior file 
         }
 
         # and the staging entry is gone, so the directory holds only the file
-        if (bad == 0 && entry_count(?alloc, root) != 1) { bad = 9; }
-        root_dnit(g);
+        if (bad == 0 && payload_entry_count(?alloc, root) != 1) { bad = 9; }
+
     }
 
     fs.remove_all(?alloc, root);
@@ -2456,24 +2589,30 @@ test "std.filesystem.transaction.validate: a rejection leaves staging for the ca
     if (O.is_some[Error](opened)) { bad = 2; }
     or {
         val g: *Root = ?root_storage_10;
-        val t: R.Result[Transaction, Error] = prepare_bytes(?alloc, g, "out", "content", 7, 0o644, false);
-        if (R.is_err[Transaction, Error](t)) { bad = 3; }
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
+        var t_storage: Transaction;
+        val t: O.Option[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?g_session, "out"), "content", 7, 0o644, false, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
+        fin { if (t_storage.state == STATE_PREPARED) { abort(?t_storage); } }
+        if (O.is_some[Error](t)) { bad = 3; }
         or {
-            var a: Transaction = R.unwrap_ok[Transaction, Error](t);
+            val a: *Transaction = ?t_storage;
             var rej: Rejecting;
-            val v: O.Option[Error] = validate[Rejecting](?a, ?rej, reject_all);
+            val v: O.Option[Error] = validate[Rejecting](a, ?rej, reject_all);
             if (O.is_none[Error](v)) { bad = 4; }
             or {
                 if (O.unwrap[Error](v).kind != REJECTED) { bad = 5; }
             }
             # validation does not consume the transaction: the staging entry is
             # still there and still ours
-            if (bad == 0 && entry_count(?alloc, root) != 1) { bad = 6; }
-            if (bad == 0 && O.is_some[Error](abort(?a))) { bad = 7; }
+            if (bad == 0 && payload_entry_count(?alloc, root) != 1) { bad = 6; }
+            if (bad == 0 && O.is_some[Error](abort(a))) { bad = 7; }
             # the destination never appeared and staging is gone
-            if (bad == 0 && entry_count(?alloc, root) != 0) { bad = 8; }
+            if (bad == 0 && payload_entry_count(?alloc, root) != 0) { bad = 8; }
         }
-        root_dnit(g);
+
     }
 
     fs.remove_all(?alloc, root);
@@ -2494,14 +2633,20 @@ test "std.filesystem.transaction.validate: acceptance sees exactly the staged by
     if (O.is_some[Error](opened)) { bad = 2; }
     or {
         val g: *Root = ?root_storage_11;
-        val t: R.Result[Transaction, Error] = prepare_bytes(?alloc, g, "out", "abcdefgh", 8, 0o644, false);
-        if (R.is_err[Transaction, Error](t)) { bad = 3; }
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
+        var t_storage: Transaction;
+        val t: O.Option[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?g_session, "out"), "abcdefgh", 8, 0o644, false, PrepareOptions{precondition: PRE_ABSENT, durability: durability_none()});
+        fin { if (t_storage.state == STATE_PREPARED) { abort(?t_storage); } }
+        if (O.is_some[Error](t)) { bad = 3; }
         or {
-            var a: Transaction = R.unwrap_ok[Transaction, Error](t);
-            if (transaction_len(?a) != 8) { bad = 4; }
+            val a: *Transaction = ?t_storage;
+            if (transaction_len(a) != 8) { bad = 4; }
             var acc: Accepting;
-            if (O.is_some[Error](validate[Accepting](?a, ?acc, accept_all))) { bad = 5; }
-            val c: R.Result[Outcome, Error] = commit(?a, PRE_ABSENT_AT_COMMIT, durability_none());
+            if (O.is_some[Error](validate[Accepting](a, ?acc, accept_all))) { bad = 5; }
+            val c: R.Result[Outcome, Error] = commit(a);
             if (bad == 0 && R.is_err[Outcome, Error](c)) { bad = 6; }
             val got: O.Option[str] = read_back(?alloc, root, "out");
             if (bad == 0 && O.is_none[str](got)) { bad = 7; }
@@ -2509,7 +2654,7 @@ test "std.filesystem.transaction.validate: acceptance sees exactly the staged by
                 if (bad == 0 && !str_equals(O.unwrap[str](got), "abcdefgh")) { bad = 8; }
             }
         }
-        root_dnit(g);
+
     }
 
     fs.remove_all(?alloc, root);
@@ -2530,12 +2675,18 @@ test "std.filesystem.transaction.commit: durability reports what was achieved" {
     if (O.is_some[Error](opened)) { bad = 2; }
     or {
         val g: *Root = ?root_storage_12;
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
 
-        val t1: R.Result[Transaction, Error] = prepare_bytes(?alloc, g, "full", "x", 1, 0o644, false);
-        if (R.is_err[Transaction, Error](t1)) { bad = 3; }
+        var t1_storage: Transaction;
+        val t1: O.Option[Error] = prepare_bytes(?t1_storage, ?alloc, t_reserve(?g_session, "full"), "x", 1, 0o644, false, PrepareOptions{precondition: PRE_ABSENT, durability: durability_full(true)});
+        fin { if (t1_storage.state == STATE_PREPARED) { abort(?t1_storage); } }
+        if (O.is_some[Error](t1)) { bad = 3; }
         or {
-            var a: Transaction = R.unwrap_ok[Transaction, Error](t1);
-            val c: R.Result[Outcome, Error] = commit(?a, PRE_ABSENT_AT_COMMIT, durability_full(true));
+            val a: *Transaction = ?t1_storage;
+            val c: R.Result[Outcome, Error] = commit(a);
             if (R.is_err[Outcome, Error](c)) { bad = 4; }
             or {
                 val out: Outcome = R.unwrap_ok[Outcome, Error](c);
@@ -2544,11 +2695,13 @@ test "std.filesystem.transaction.commit: durability reports what was achieved" {
             }
         }
 
-        val t2: R.Result[Transaction, Error] = prepare_bytes(?alloc, g, "none", "x", 1, 0o644, false);
-        if (bad == 0 && R.is_err[Transaction, Error](t2)) { bad = 7; }
+        var t2_storage: Transaction;
+        val t2: O.Option[Error] = prepare_bytes(?t2_storage, ?alloc, t_reserve(?g_session, "none"), "x", 1, 0o644, false, PrepareOptions{precondition: PRE_ABSENT, durability: durability_none()});
+        fin { if (t2_storage.state == STATE_PREPARED) { abort(?t2_storage); } }
+        if (bad == 0 && O.is_some[Error](t2)) { bad = 7; }
         or {
-            var b: Transaction = R.unwrap_ok[Transaction, Error](t2);
-            val c: R.Result[Outcome, Error] = commit(?b, PRE_ABSENT_AT_COMMIT, durability_none());
+            val b: *Transaction = ?t2_storage;
+            val c: R.Result[Outcome, Error] = commit(b);
             if (bad == 0 && R.is_err[Outcome, Error](c)) { bad = 8; }
             or {
                 val out: Outcome = R.unwrap_ok[Outcome, Error](c);
@@ -2557,7 +2710,7 @@ test "std.filesystem.transaction.commit: durability reports what was achieved" {
                 if (bad == 0 && out.shortfall) { bad = 10; }
             }
         }
-        root_dnit(g);
+
     }
 
     fs.remove_all(?alloc, root);
@@ -2578,15 +2731,20 @@ test "std.filesystem.transaction.prepare: the digest matches an independent sha-
     if (O.is_some[Error](opened)) { bad = 2; }
     or {
         val g: *Root = ?root_storage_13;
-        val t: R.Result[Transaction, Error] =
-            prepare_bytes(?alloc, g, "out", "the quick brown fox", 19, 0o644, true);
-        if (R.is_err[Transaction, Error](t)) { bad = 3; }
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
+        var t_storage: Transaction;
+        val t: O.Option[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?g_session, "out"), "the quick brown fox", 19, 0o644, true, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
+        fin { if (t_storage.state == STATE_PREPARED) { abort(?t_storage); } }
+        if (O.is_some[Error](t)) { bad = 3; }
         or {
-            var a: Transaction = R.unwrap_ok[Transaction, Error](t);
-            if (!transaction_has_digest(?a)) { bad = 4; }
+            val a: *Transaction = ?t_storage;
+            if (!transaction_has_digest(a)) { bad = 4; }
 
             var got: [32]u8;
-            if (bad == 0 && !transaction_digest(?a, ?got)) { bad = 5; }
+            if (bad == 0 && !transaction_digest(a, ?got)) { bad = 5; }
 
             var want: [32]u8;
             var st: sha256.State = sha256.init();
@@ -2598,9 +2756,9 @@ test "std.filesystem.transaction.prepare: the digest matches an independent sha-
                 if (got[i] != want[i]) { bad = 6; }
                 i = i + 1;
             }
-            abort(?a);
+            abort(a);
         }
-        root_dnit(g);
+
     }
 
     fs.remove_all(?alloc, root);
@@ -2621,18 +2779,24 @@ test "std.filesystem.transaction.abort: removes staging and leaves no destinatio
     if (O.is_some[Error](opened)) { bad = 2; }
     or {
         val g: *Root = ?root_storage_14;
-        val t: R.Result[Transaction, Error] = prepare_bytes(?alloc, g, "out", "discard", 7, 0o644, false);
-        if (R.is_err[Transaction, Error](t)) { bad = 3; }
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
+        var t_storage: Transaction;
+        val t: O.Option[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?g_session, "out"), "discard", 7, 0o644, false, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
+        fin { if (t_storage.state == STATE_PREPARED) { abort(?t_storage); } }
+        if (O.is_some[Error](t)) { bad = 3; }
         or {
-            var a: Transaction = R.unwrap_ok[Transaction, Error](t);
-            if (entry_count(?alloc, root) != 1) { bad = 4; }
-            if (bad == 0 && O.is_some[Error](abort(?a))) { bad = 5; }
-            if (bad == 0 && entry_count(?alloc, root) != 0) { bad = 6; }
+            val a: *Transaction = ?t_storage;
+            if (payload_entry_count(?alloc, root) != 1) { bad = 4; }
+            if (bad == 0 && O.is_some[Error](abort(a))) { bad = 5; }
+            if (bad == 0 && payload_entry_count(?alloc, root) != 0) { bad = 6; }
             # the transaction is spent: a second abort is a contract error, not
             # a second removal
-            if (bad == 0 && O.is_none[Error](abort(?a))) { bad = 7; }
+            if (bad == 0 && O.is_none[Error](abort(a))) { bad = 7; }
         }
-        root_dnit(g);
+
     }
 
     fs.remove_all(?alloc, root);
@@ -2664,7 +2828,11 @@ test "std.filesystem.transaction.recover: removes only this module's residue" {
     if (O.is_some[Error](opened)) { bad = 2; }
     or {
         val g: *Root = ?root_storage_15;
-        val swept: R.Result[usize, Error] = recover(?alloc, g, "");
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
+        val swept: R.Result[usize, Error] = t_end_batch_and_recover(?g_session, "");
         if (R.is_err[usize, Error](swept)) { bad = 3; }
         or {
             if (R.unwrap_ok[usize, Error](swept) != 2) { bad = 4; }
@@ -2672,8 +2840,8 @@ test "std.filesystem.transaction.recover: removes only this module's residue" {
         if (bad == 0 && O.is_none[str](read_back(?alloc, root, "keep.txt"))) { bad = 5; }
         if (bad == 0 && O.is_none[str](read_back(?alloc, root, "machtxn.not-ours"))) { bad = 6; }
         if (bad == 0 && O.is_some[str](read_back(?alloc, root, ".machtxn.0011223344556677"))) { bad = 7; }
-        if (bad == 0 && entry_count(?alloc, root) != 2) { bad = 8; }
-        root_dnit(g);
+        if (bad == 0 && payload_entry_count(?alloc, root) != 2) { bad = 8; }
+
     }
 
     str_free(?alloc, keep); str_free(?alloc, lookalike);
@@ -2699,16 +2867,21 @@ test "std.filesystem.transaction.recover: a crash between prepare and commit lea
     if (O.is_some[Error](opened)) { bad = 2; }
     or {
         val g: *Root = ?root_storage_16;
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
 
         # process death closes descriptors but leaves prepared entries on disk
-        val t: R.Result[Transaction, Error] = prepare_bytes(?alloc, g, "out", "unfinished", 10, 0o644, false);
-        if (R.is_err[Transaction, Error](t)) { bad = 3; }
+        var t_storage: Transaction;
+        val t: O.Option[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?g_session, "out"), "unfinished", 10, 0o644, false, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
+        fin { if (t_storage.state == STATE_PREPARED) { abort(?t_storage); } }
+        if (O.is_some[Error](t)) { bad = 3; }
         or {
-            var abandoned: Transaction = R.unwrap_ok[Transaction, Error](t);
+            val abandoned: *Transaction = ?t_storage;
             if (os.close(abandoned.staging_fd) < 0) { bad = 12; }
             abandoned.staging_fd = -1;
-            abandoned.spent = true;
-            transaction_free_names(?abandoned);
+            transaction_cleanup(abandoned, false, OP_ABORT);
 
             # the destination still holds the old content: a crash mid-flight
             # never exposes a partial publication
@@ -2717,22 +2890,22 @@ test "std.filesystem.transaction.recover: a crash between prepare and commit lea
             or {
                 if (!str_equals(O.unwrap[str](got), "published")) { bad = 5; }
             }
-            if (bad == 0 && entry_count(?alloc, root) != 2) { bad = 6; }
+            if (bad == 0 && payload_entry_count(?alloc, root) != 2) { bad = 6; }
 
             # a later run sweeps the residue and the destination is untouched
-            val swept: R.Result[usize, Error] = recover(?alloc, g, "out");
+            val swept: R.Result[usize, Error] = t_end_batch_and_recover(?g_session, "out");
             if (bad == 0 && R.is_err[usize, Error](swept)) { bad = 7; }
             or {
                 if (bad == 0 && R.unwrap_ok[usize, Error](swept) != 1) { bad = 8; }
             }
-            if (bad == 0 && entry_count(?alloc, root) != 1) { bad = 9; }
+            if (bad == 0 && payload_entry_count(?alloc, root) != 1) { bad = 9; }
             val after: O.Option[str] = read_back(?alloc, root, "out");
             if (bad == 0 && O.is_none[str](after)) { bad = 10; }
             or {
                 if (bad == 0 && !str_equals(O.unwrap[str](after), "published")) { bad = 11; }
             }
         }
-        root_dnit(g);
+
     }
 
     str_free(?alloc, dest);
@@ -2819,7 +2992,7 @@ test "std.filesystem.transaction.lock: the sentinel is not residue and survives 
         or {
             val held: *Lock = ?lock_storage_4;
             # sweeping while holding the lock must not remove the lock file
-            val swept: R.Result[usize, Error] = recover(?alloc, g, "");
+            val swept: R.Result[usize, Error] = recover(?alloc, held, "");
             if (R.is_err[usize, Error](swept)) { bad = 4; }
             or {
                 if (R.unwrap_ok[usize, Error](swept) != 0) { bad = 5; }
@@ -2871,17 +3044,23 @@ test "std.filesystem.transaction.prepare_subtree: publishes a whole tree in one 
     if (O.is_some[Error](opened)) { bad = 2; }
     or {
         val g: *Root = ?root_storage_20;
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
         var inv: Inventory = sample_inventory(?alloc);
 
-        val t: R.Result[Transaction, Error] = prepare_subtree(?alloc, g, "project", ?inv, 0o755);
-        if (R.is_err[Transaction, Error](t)) { bad = 3; }
+        var t_storage: Transaction;
+        val t: O.Option[Error] = prepare_subtree(?t_storage, ?alloc, t_reserve(?g_session, "project"), ?inv, 0o755, PrepareOptions{precondition: PRE_ABSENT, durability: durability_none()});
+        fin { if (t_storage.state == STATE_PREPARED) { abort(?t_storage); } }
+        if (O.is_some[Error](t)) { bad = 3; }
         or {
-            var a: Transaction = R.unwrap_ok[Transaction, Error](t);
+            val a: *Transaction = ?t_storage;
             # while staged, the destination does not exist at all: no reader can
             # observe a half-built tree
             if (O.is_some[str](read_back(?alloc, root, "project/mach.toml"))) { bad = 4; }
 
-            val c: R.Result[Outcome, Error] = commit(?a, PRE_ABSENT_AT_COMMIT, durability_none());
+            val c: R.Result[Outcome, Error] = commit(a);
             if (bad == 0 && R.is_err[Outcome, Error](c)) { bad = 5; }
         }
 
@@ -2896,10 +3075,10 @@ test "std.filesystem.transaction.prepare_subtree: publishes a whole tree in one 
             if (bad == 0 && !str_equals(O.unwrap[str](main), "fun main() {}")) { bad = 9; }
         }
         # exactly the destination, with no staging left over
-        if (bad == 0 && entry_count(?alloc, root) != 1) { bad = 10; }
+        if (bad == 0 && payload_entry_count(?alloc, root) != 1) { bad = 10; }
 
         inventory_dnit(?inv);
-        root_dnit(g);
+
     }
 
     fs.remove_all(?alloc, root);
@@ -2920,12 +3099,18 @@ test "std.filesystem.transaction.prepare_subtree: a concurrent appearance confli
     if (O.is_some[Error](opened)) { bad = 2; }
     or {
         val g: *Root = ?root_storage_21;
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
         var inv: Inventory = sample_inventory(?alloc);
 
-        val t: R.Result[Transaction, Error] = prepare_subtree(?alloc, g, "project", ?inv, 0o755);
-        if (R.is_err[Transaction, Error](t)) { bad = 3; }
+        var t_storage: Transaction;
+        val t: O.Option[Error] = prepare_subtree(?t_storage, ?alloc, t_reserve(?g_session, "project"), ?inv, 0o755, PrepareOptions{precondition: PRE_ABSENT, durability: durability_none()});
+        fin { if (t_storage.state == STATE_PREPARED) { abort(?t_storage); } }
+        if (O.is_some[Error](t)) { bad = 3; }
         or {
-            var a: Transaction = R.unwrap_ok[Transaction, Error](t);
+            val a: *Transaction = ?t_storage;
 
             # somebody else creates the destination while we were building
             val theirs: str = abs_of(?alloc, root, "project");
@@ -2933,7 +3118,7 @@ test "std.filesystem.transaction.prepare_subtree: a concurrent appearance confli
             val marker: str = abs_of(?alloc, root, "project/theirs.txt");
             fs.write_bytes(marker, "theirs", 6, 0o644);
 
-            val c: R.Result[Outcome, Error] = commit(?a, PRE_ABSENT_AT_COMMIT, durability_none());
+            val c: R.Result[Outcome, Error] = commit(a);
             if (R.is_ok[Outcome, Error](c)) { bad = 4; }
             or {
                 if (R.unwrap_err[Outcome, Error](c).kind != PRECONDITION) { bad = 5; }
@@ -2943,13 +3128,13 @@ test "std.filesystem.transaction.prepare_subtree: a concurrent appearance confli
             val kept: O.Option[str] = read_back(?alloc, root, "project/theirs.txt");
             if (bad == 0 && O.is_none[str](kept)) { bad = 6; }
             if (bad == 0 && O.is_some[str](read_back(?alloc, root, "project/mach.toml"))) { bad = 7; }
-            if (bad == 0 && entry_count(?alloc, root) != 1) { bad = 8; }
+            if (bad == 0 && payload_entry_count(?alloc, root) != 1) { bad = 8; }
 
             str_free(?alloc, theirs);
             str_free(?alloc, marker);
         }
         inventory_dnit(?inv);
-        root_dnit(g);
+
     }
 
     fs.remove_all(?alloc, root);
@@ -2970,19 +3155,25 @@ test "std.filesystem.transaction.abort: removes a staged subtree entirely" {
     if (O.is_some[Error](opened)) { bad = 2; }
     or {
         val g: *Root = ?root_storage_22;
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
         var inv: Inventory = sample_inventory(?alloc);
-        val t: R.Result[Transaction, Error] = prepare_subtree(?alloc, g, "project", ?inv, 0o755);
-        if (R.is_err[Transaction, Error](t)) { bad = 3; }
+        var t_storage: Transaction;
+        val t: O.Option[Error] = prepare_subtree(?t_storage, ?alloc, t_reserve(?g_session, "project"), ?inv, 0o755, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
+        fin { if (t_storage.state == STATE_PREPARED) { abort(?t_storage); } }
+        if (O.is_some[Error](t)) { bad = 3; }
         or {
-            var a: Transaction = R.unwrap_ok[Transaction, Error](t);
-            if (entry_count(?alloc, root) != 1) { bad = 4; }
+            val a: *Transaction = ?t_storage;
+            if (payload_entry_count(?alloc, root) != 1) { bad = 4; }
             # the staged tree has real content in it, so this exercises the
             # recursive removal rather than a single unlink
-            if (bad == 0 && O.is_some[Error](abort(?a))) { bad = 5; }
-            if (bad == 0 && entry_count(?alloc, root) != 0) { bad = 6; }
+            if (bad == 0 && O.is_some[Error](abort(a))) { bad = 5; }
+            if (bad == 0 && payload_entry_count(?alloc, root) != 0) { bad = 6; }
         }
         inventory_dnit(?inv);
-        root_dnit(g);
+
     }
 
     fs.remove_all(?alloc, root);
@@ -3084,12 +3275,18 @@ test "std.filesystem.transaction.commit_replacing_owned: replaces recognized con
     if (O.is_some[Error](opened)) { bad = 2; }
     or {
         val g: *Root = ?root_storage_23;
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
         var inv: Inventory = sample_inventory(?alloc);
-        val t: R.Result[Transaction, Error] = prepare_subtree(?alloc, g, "site", ?inv, 0o755);
-        if (R.is_err[Transaction, Error](t)) { bad = 3; }
+        var t_storage: Transaction;
+        val t: O.Option[Error] = prepare_subtree(?t_storage, ?alloc, t_reserve(?g_session, "site"), ?inv, 0o755, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
+        fin { if (t_storage.state == STATE_PREPARED) { abort(?t_storage); } }
+        if (O.is_some[Error](t)) { bad = 3; }
         or {
-            var a: Transaction = R.unwrap_ok[Transaction, Error](t);
-            val c: R.Result[Outcome, Error] = commit_replacing_owned[OwnsNames](?a, ?owns, owns_listed);
+            val a: *Transaction = ?t_storage;
+            val c: R.Result[Outcome, Error] = commit_replacing_owned[OwnsNames](a, ?owns, owns_listed);
             if (R.is_err[Outcome, Error](c)) { bad = 4; }
         }
         # the new content is in place
@@ -3101,10 +3298,10 @@ test "std.filesystem.transaction.commit_replacing_owned: replaces recognized con
         # and the page the new tree does not have is gone rather than surviving
         if (bad == 0 && O.is_some[str](read_back(?alloc, root, "site/stale.html"))) { bad = 7; }
         # no backup and no staging left behind
-        if (bad == 0 && entry_count(?alloc, root) != 2) { bad = 8; }
+        if (bad == 0 && payload_entry_count(?alloc, root) != 2) { bad = 8; }
 
         inventory_dnit(?inv);
-        root_dnit(g);
+
     }
 
     str_free(?alloc, d); str_free(?alloc, f1); str_free(?alloc, f2);
@@ -3141,12 +3338,18 @@ test "std.filesystem.transaction.commit_replacing_owned: refuses an unrecognized
     if (O.is_some[Error](opened)) { bad = 2; }
     or {
         val g: *Root = ?root_storage_24;
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
         var inv: Inventory = sample_inventory(?alloc);
-        val t: R.Result[Transaction, Error] = prepare_subtree(?alloc, g, "site", ?inv, 0o755);
-        if (R.is_err[Transaction, Error](t)) { bad = 3; }
+        var t_storage: Transaction;
+        val t: O.Option[Error] = prepare_subtree(?t_storage, ?alloc, t_reserve(?g_session, "site"), ?inv, 0o755, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
+        fin { if (t_storage.state == STATE_PREPARED) { abort(?t_storage); } }
+        if (O.is_some[Error](t)) { bad = 3; }
         or {
-            var a: Transaction = R.unwrap_ok[Transaction, Error](t);
-            val c: R.Result[Outcome, Error] = commit_replacing_owned[OwnsNames](?a, ?owns, owns_listed);
+            val a: *Transaction = ?t_storage;
+            val c: R.Result[Outcome, Error] = commit_replacing_owned[OwnsNames](a, ?owns, owns_listed);
             if (R.is_ok[Outcome, Error](c)) { bad = 4; }
             or {
                 if (R.unwrap_err[Outcome, Error](c).kind != CONFLICT) { bad = 5; }
@@ -3164,10 +3367,10 @@ test "std.filesystem.transaction.commit_replacing_owned: refuses an unrecognized
             if (bad == 0 && !str_equals(O.unwrap[str](old), "old")) { bad = 9; }
         }
         # and the refused replacement left no staging behind
-        if (bad == 0 && entry_count(?alloc, root) != 1) { bad = 10; }
+        if (bad == 0 && payload_entry_count(?alloc, root) != 1) { bad = 10; }
 
         inventory_dnit(?inv);
-        root_dnit(g);
+
     }
 
     str_free(?alloc, d); str_free(?alloc, f1); str_free(?alloc, f2);
@@ -3195,22 +3398,28 @@ test "std.filesystem.transaction.commit_replacing_owned: refuses when the target
     if (O.is_some[Error](opened)) { bad = 2; }
     or {
         val g: *Root = ?root_storage_25;
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
         var inv: Inventory = sample_inventory(?alloc);
-        val t: R.Result[Transaction, Error] = prepare_subtree(?alloc, g, "site", ?inv, 0o755);
-        if (R.is_err[Transaction, Error](t)) { bad = 3; }
+        var t_storage: Transaction;
+        val t: O.Option[Error] = prepare_subtree(?t_storage, ?alloc, t_reserve(?g_session, "site"), ?inv, 0o755, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
+        fin { if (t_storage.state == STATE_PREPARED) { abort(?t_storage); } }
+        if (O.is_some[Error](t)) { bad = 3; }
         or {
-            var a: Transaction = R.unwrap_ok[Transaction, Error](t);
+            val a: *Transaction = ?t_storage;
             # replacing is not creating: with nothing there this is a
             # precondition failure, not an accidental publish
-            val c: R.Result[Outcome, Error] = commit_replacing_owned[OwnsNames](?a, ?owns, owns_listed);
+            val c: R.Result[Outcome, Error] = commit_replacing_owned[OwnsNames](a, ?owns, owns_listed);
             if (R.is_ok[Outcome, Error](c)) { bad = 4; }
             or {
                 if (R.unwrap_err[Outcome, Error](c).kind != PRECONDITION) { bad = 5; }
             }
         }
-        if (bad == 0 && entry_count(?alloc, root) != 0) { bad = 6; }
+        if (bad == 0 && payload_entry_count(?alloc, root) != 0) { bad = 6; }
         inventory_dnit(?inv);
-        root_dnit(g);
+
     }
 
     fs.remove_all(?alloc, root);
@@ -3238,14 +3447,18 @@ test "std.filesystem.transaction.recover: every backup crash state resolves dete
     if (O.is_some[Error](o1)) { bad = 2; }
     or {
         val g: *Root = ?root_storage_26;
-        if (R.is_err[usize, Error](recover(?alloc, g, "site"))) { bad = 3; }
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
+        if (R.is_err[usize, Error](t_end_batch_and_recover(?g_session, "site"))) { bad = 3; }
         val back: O.Option[str] = read_back(?alloc, r1, "site/keep.txt");
         if (bad == 0 && O.is_none[str](back)) { bad = 4; }
         or {
             if (bad == 0 && !str_equals(O.unwrap[str](back), "restored")) { bad = 5; }
         }
-        if (bad == 0 && entry_count(?alloc, r1) != 2) { bad = 6; }
-        root_dnit(g);
+        if (bad == 0 && payload_entry_count(?alloc, r1) != 2) { bad = 6; }
+
     }
     str_free(?alloc, b1); str_free(?alloc, b1f);
     fs.remove_all(?alloc, r1); str_free(?alloc, r1);
@@ -3270,14 +3483,18 @@ test "std.filesystem.transaction.recover: every backup crash state resolves dete
     if (bad == 0 && O.is_some[Error](o2)) { bad = 7; }
     or {
         val g: *Root = ?root_storage_27;
-        if (bad == 0 && R.is_err[usize, Error](recover(?alloc, g, "site"))) { bad = 8; }
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
+        if (bad == 0 && R.is_err[usize, Error](t_end_batch_and_recover(?g_session, "site"))) { bad = 8; }
         val kept: O.Option[str] = read_back(?alloc, r2, "site/keep.txt");
         if (bad == 0 && O.is_none[str](kept)) { bad = 9; }
         or {
             if (bad == 0 && !str_equals(O.unwrap[str](kept), "current")) { bad = 10; }
         }
-        if (bad == 0 && entry_count(?alloc, r2) != 2) { bad = 11; }
-        root_dnit(g);
+        if (bad == 0 && payload_entry_count(?alloc, r2) != 2) { bad = 11; }
+
     }
     str_free(?alloc, d2); str_free(?alloc, d2f);
     str_free(?alloc, b2); str_free(?alloc, b2f);
@@ -3298,7 +3515,11 @@ test "std.filesystem.transaction.recover: every backup crash state resolves dete
     if (bad == 0 && O.is_some[Error](o3)) { bad = 12; }
     or {
         val g: *Root = ?root_storage_28;
-        val swept: R.Result[usize, Error] = recover(?alloc, g, "site");
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
+        val swept: R.Result[usize, Error] = t_end_batch_and_recover(?g_session, "site");
         if (bad == 0 && R.is_err[usize, Error](swept)) { bad = 13; }
         or {
             if (bad == 0 && R.unwrap_ok[usize, Error](swept) != 0) { bad = 14; }
@@ -3308,7 +3529,7 @@ test "std.filesystem.transaction.recover: every backup crash state resolves dete
         or {
             if (bad == 0 && !str_equals(O.unwrap[str](same), "untouched")) { bad = 16; }
         }
-        root_dnit(g);
+
     }
     str_free(?alloc, d3); str_free(?alloc, d3f);
     fs.remove_all(?alloc, r3); str_free(?alloc, r3);
@@ -3316,7 +3537,7 @@ test "std.filesystem.transaction.recover: every backup crash state resolves dete
     ret bad;
 }
 
-test "std.filesystem.transaction.commit_replacing_owned: self-heals a stale backup before replacing" {
+test "std.filesystem.transaction.commit_replacing_owned: recovers a stale backup before claiming and replacing" {
     var alloc: A.Allocator;
     if (O.is_some[str](page.make(?alloc))) { ret 1; }
     val root_r: R.Result[str, str] = scratch_root(?alloc);
@@ -3341,27 +3562,29 @@ test "std.filesystem.transaction.commit_replacing_owned: self-heals a stale back
     if (O.is_some[Error](opened)) { bad = 2; }
     or {
         val g: *Root = ?root_storage_29;
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
+        if (R.is_err[usize, Error](t_end_batch_and_recover(?g_session, "site"))) { ret 91; }
         var inv: Inventory = sample_inventory(?alloc);
-        val t: R.Result[Transaction, Error] = prepare_subtree(?alloc, g, "site", ?inv, 0o755);
-        if (R.is_err[Transaction, Error](t)) { bad = 3; }
+        var t_storage: Transaction;
+        val t: O.Option[Error] = prepare_subtree(?t_storage, ?alloc, t_reserve(?g_session, "site"), ?inv, 0o755, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
+        fin { if (t_storage.state == STATE_PREPARED) { abort(?t_storage); } }
+        if (O.is_some[Error](t)) { bad = 3; }
         or {
-            var a: Transaction = R.unwrap_ok[Transaction, Error](t);
-            # the replacement finds the stale backup, restores it, then replaces
-            # it, and says so in the outcome
-            val c: R.Result[Outcome, Error] = commit_replacing_owned[OwnsNames](?a, ?owns, owns_listed);
+            val a: *Transaction = ?t_storage;
+            val c: R.Result[Outcome, Error] = commit_replacing_owned[OwnsNames](a, ?owns, owns_listed);
             if (R.is_err[Outcome, Error](c)) { bad = 4; }
-            or {
-                if (!R.unwrap_ok[Outcome, Error](c).recovered) { bad = 5; }
-            }
         }
         val m: O.Option[str] = read_back(?alloc, root, "site/mach.toml");
         if (bad == 0 && O.is_none[str](m)) { bad = 6; }
         or {
             if (bad == 0 && !str_equals(O.unwrap[str](m), "[project]")) { bad = 7; }
         }
-        if (bad == 0 && entry_count(?alloc, root) != 2) { bad = 8; }
+        if (bad == 0 && payload_entry_count(?alloc, root) != 2) { bad = 8; }
         inventory_dnit(?inv);
-        root_dnit(g);
+
     }
 
     str_free(?alloc, b); str_free(?alloc, bf);
@@ -3386,6 +3609,10 @@ test "std.filesystem.transaction.prepare: failing at every allocation ordinal le
     if (O.is_some[Error](opened)) { bad = 2; }
     or {
         val g: *Root = ?root_storage_30;
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
 
         # walk the ordinal past the number of allocations a whole prepare and
         # commit makes, so the sweep covers every allocation site including the
@@ -3396,12 +3623,13 @@ test "std.filesystem.transaction.prepare: failing at every allocation ordinal le
             if (O.is_some[str](testing.make(?t))) { bad = 3; cnt; }
             testing.fail_at_ordinal(?t, ordinal);
 
-            val txn: R.Result[Transaction, Error] =
-                prepare_bytes(testing.allocator_of(?t), g, "out", "replacement", 11, 0o644, true);
-            if (R.is_ok[Transaction, Error](txn)) {
-                var a: Transaction = R.unwrap_ok[Transaction, Error](txn);
+            var txn_storage: Transaction;
+        val txn: O.Option[Error] = prepare_bytes(?txn_storage, testing.allocator_of(?t), t_reserve(?g_session, "out"), "replacement", 11, 0o644, true, PrepareOptions{precondition: PRE_SAME_OBJECT, durability: durability_none()});
+        fin { if (txn_storage.state == STATE_PREPARED) { abort(?txn_storage); } }
+            if (O.is_none[Error](txn)) {
+                val a: *Transaction = ?txn_storage;
                 # the injected failure may land during commit instead
-                commit(?a, PRE_UNCHANGED_SINCE_PREPARE, durability_none());
+                commit(a);
             }
 
             # whatever failed and wherever it failed, nothing was left allocated
@@ -3412,7 +3640,7 @@ test "std.filesystem.transaction.prepare: failing at every allocation ordinal le
 
             # and the directory holds only the destination: either the old
             # content or the new one, never staging residue and never nothing
-            if (bad == 0 && entry_count(?alloc, root) != 1) { bad = 7; }
+            if (bad == 0 && payload_entry_count(?alloc, root) != 1) { bad = 7; }
             val now: O.Option[str] = read_back(?alloc, root, "out");
             if (bad == 0 && O.is_none[str](now)) { bad = 8; }
             or {
@@ -3425,7 +3653,7 @@ test "std.filesystem.transaction.prepare: failing at every allocation ordinal le
             fs.write_bytes(dest, "published", 9, 0o644);
             ordinal = ordinal + 1;
         }
-        root_dnit(g);
+
     }
 
     str_free(?alloc, dest);
@@ -3447,6 +3675,10 @@ test "std.filesystem.transaction.prepare_subtree: failing at every allocation or
     if (O.is_some[Error](opened)) { bad = 2; }
     or {
         val g: *Root = ?root_storage_31;
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
 
         var ordinal: usize = 1;
         for (ordinal <= 24 && bad == 0) {
@@ -3460,10 +3692,12 @@ test "std.filesystem.transaction.prepare_subtree: failing at every allocation or
             inventory_push(?inv, entry_file("src/main.mach", "fun main() {}", 13, 0o644));
 
             testing.fail_at_ordinal(?t, ordinal);
-            val txn: R.Result[Transaction, Error] = prepare_subtree(ta, g, "project", ?inv, 0o755);
-            if (R.is_ok[Transaction, Error](txn)) {
-                var a: Transaction = R.unwrap_ok[Transaction, Error](txn);
-                abort(?a);
+            var txn_storage: Transaction;
+        val txn: O.Option[Error] = prepare_subtree(?txn_storage, ta, t_reserve(?g_session, "project"), ?inv, 0o755, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
+        fin { if (txn_storage.state == STATE_PREPARED) { abort(?txn_storage); } }
+            if (O.is_none[Error](txn)) {
+                val a: *Transaction = ?txn_storage;
+                abort(a);
             }
             testing.clear_failure(?t);
             inventory_dnit(?inv);
@@ -3474,10 +3708,10 @@ test "std.filesystem.transaction.prepare_subtree: failing at every allocation or
 
             # an aborted or failed subtree prepare never leaves the destination
             # half-built, and never leaves its private tree behind
-            if (bad == 0 && entry_count(?alloc, root) != 0) { bad = 6; }
+            if (bad == 0 && payload_entry_count(?alloc, root) != 0) { bad = 6; }
             ordinal = ordinal + 1;
         }
-        root_dnit(g);
+
     }
 
     fs.remove_all(?alloc, root);
@@ -3561,14 +3795,18 @@ test "std.filesystem.transaction: root mutations stay inside the root" {
     if (O.is_some[Error](opened)) { bad = 2; }
     or {
         val g: *Root = ?root_storage_33;
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
 
-        val mk: R.Result[bool, Error] = entry_make_dir(g, "made", 0o755);
+        val mk: R.Result[bool, Error] = entry_make_dir(t_reserve(?g_session, "made"), 0o755);
         if (R.is_err[bool, Error](mk)) { bad = 3; }
         or {
             if (!R.unwrap_ok[bool, Error](mk)) { bad = 4; }
         }
         # a second create reports "already there" rather than failing
-        val mk2: R.Result[bool, Error] = entry_make_dir(g, "made", 0o755);
+        val mk2: R.Result[bool, Error] = entry_make_dir(t_reserve(?g_session, "made"), 0o755);
         if (bad == 0 && R.is_err[bool, Error](mk2)) { bad = 5; }
         or {
             if (bad == 0 && R.unwrap_ok[bool, Error](mk2)) { bad = 6; }
@@ -3576,27 +3814,27 @@ test "std.filesystem.transaction: root mutations stay inside the root" {
 
         val f: str = abs_of(?alloc, root, "a.txt");
         fs.write_bytes(f, "content", 7, 0o644);
-        if (bad == 0 && O.is_some[Error](entry_rename(g, "a.txt", "b.txt"))) { bad = 7; }
+        if (bad == 0 && O.is_some[Error](entry_rename(t_reserve(?g_session, "a.txt"), t_reserve(?g_session, "b.txt")))) { bad = 7; }
         if (bad == 0 && O.is_none[str](read_back(?alloc, root, "b.txt"))) { bad = 8; }
 
         # every mutation refuses a name that would leave the root
-        if (bad == 0 && O.is_none[Error](entry_rename(g, "b.txt", "../escaped"))) { bad = 9; }
-        if (bad == 0 && O.is_none[Error](entry_unlink(g, "../escaped"))) { bad = 10; }
-        if (bad == 0 && R.is_ok[bool, Error](entry_make_dir(g, "../escaped", 0o755))) { bad = 11; }
+        if (bad == 0 && O.is_none[Error](entry_rename(t_reserve(?g_session, "b.txt"), t_reserve(?g_session, "../escaped")))) { bad = 9; }
+        if (bad == 0 && O.is_none[Error](entry_unlink(t_reserve(?g_session, "../escaped")))) { bad = 10; }
+        if (bad == 0 && R.is_ok[bool, Error](entry_make_dir(t_reserve(?g_session, "../escaped"), 0o755))) { bad = 11; }
 
-        if (bad == 0 && O.is_some[Error](entry_unlink(g, "b.txt"))) { bad = 12; }
+        if (bad == 0 && O.is_some[Error](entry_unlink(t_reserve(?g_session, "b.txt")))) { bad = 12; }
         # removing something already gone is success
-        if (bad == 0 && O.is_some[Error](entry_unlink(g, "b.txt"))) { bad = 13; }
+        if (bad == 0 && O.is_some[Error](entry_unlink(t_reserve(?g_session, "b.txt")))) { bad = 13; }
 
         # an empty directory goes; a populated one is left alone
         val inner: str = abs_of(?alloc, root, "made/keep.txt");
         fs.write_bytes(inner, "keep", 4, 0o644);
-        if (bad == 0 && O.is_some[Error](entry_rmdir_if_empty(g, "made"))) { bad = 14; }
+        if (bad == 0 && O.is_some[Error](entry_rmdir_if_empty(t_reserve(?g_session, "made")))) { bad = 14; }
         if (bad == 0 && O.is_none[str](read_back(?alloc, root, "made/keep.txt"))) { bad = 15; }
 
         str_free(?alloc, f);
         str_free(?alloc, inner);
-        root_dnit(g);
+
     }
 
     fs.remove_all(?alloc, root);
@@ -3684,15 +3922,19 @@ test "std.filesystem.transaction.root_remove_tree: removes a nested tree" {
         if (O.is_some[Error](opened)) { bad = 6; }
         or {
             val g: *Root = ?root_storage_35;
-            val rr: R.Result[usize, Error] = root_remove_tree(g, "tree");
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
+            val rr: R.Result[usize, Error] = root_remove_tree(t_reserve(?g_session, "tree"), "");
             if (R.is_err[usize, Error](rr)) { bad = 7; }
             or (R.unwrap_ok[usize, Error](rr) != 6) { bad = 8; }
-            root_dnit(g);
+
         }
     }
 
     # the tree is gone and the sibling is untouched
-    if (bad == 0 && entry_count(?alloc, root) != 1) { bad = 9; }
+    if (bad == 0 && payload_entry_count(?alloc, root) != 1) { bad = 9; }
     if (bad == 0) {
         val back: O.Option[str] = read_back(?alloc, root, "keep");
         if (O.is_none[str](back)) { bad = 10; }
@@ -3738,34 +3980,38 @@ test "std.filesystem.transaction.root_remove_tree: refuses every escape and remo
         if (O.is_some[Error](opened)) { bad = 7; }
         or {
             val g: *Root = ?root_storage_36;
+        fin { root_dnit(g); }
+        var g_session: TestSession;
+        if (O.is_some[Error](t_session_init(?g_session, ?alloc, g))) { ret 90; }
+        fin { t_session_dnit(?g_session); }
 
             # a `..` component never resolves
-            val up: R.Result[usize, Error] = root_remove_tree(g, "../outside");
+            val up: R.Result[usize, Error] = root_remove_tree(t_reserve(?g_session, "link"), "../outside");
             if (R.is_ok[usize, Error](up)) { bad = 8; }
             or (R.unwrap_err[usize, Error](up).kind != CONTAINMENT) { bad = 9; }
 
             # nor does an absolute path
             if (bad == 0) {
-                val abs_try: R.Result[usize, Error] = root_remove_tree(g, outside);
+                val abs_try: R.Result[usize, Error] = root_remove_tree(t_reserve(?g_session, "link"), outside);
                 if (R.is_ok[usize, Error](abs_try)) { bad = 10; }
                 or (R.unwrap_err[usize, Error](abs_try).kind != CONTAINMENT) { bad = 11; }
             }
 
             # nor a symlink named as the last component
             if (bad == 0) {
-                val via_link: R.Result[usize, Error] = root_remove_tree(g, "link");
+                val via_link: R.Result[usize, Error] = root_remove_tree(t_reserve(?g_session, "link"), "");
                 if (R.is_ok[usize, Error](via_link)) { bad = 12; }
                 or (R.unwrap_err[usize, Error](via_link).kind != CONTAINMENT) { bad = 13; }
             }
 
             # nor a path descending THROUGH that symlink
             if (bad == 0) {
-                val through: R.Result[usize, Error] = root_remove_tree(g, "link/victim");
+                val through: R.Result[usize, Error] = root_remove_tree(t_reserve(?g_session, "link"), "victim");
                 if (R.is_ok[usize, Error](through)) { bad = 14; }
                 or (R.unwrap_err[usize, Error](through).kind != CONTAINMENT) { bad = 15; }
             }
 
-            root_dnit(g);
+
         }
     }
 
@@ -3800,8 +4046,13 @@ test "std.filesystem.transaction.prepare_subtree: a renamed root keeps every sta
     val opened: O.Option[Error] = root_open(?root_storage_37, original, "");
     if (O.is_some[Error](opened)) { ret 4; }
     val r: *Root = ?root_storage_37;
-    fin { root_dnit(r); }
+        fin { root_dnit(r); }
+
+
     if (os.rename(os.AT_FDCWD, original, os.AT_FDCWD, moved) < 0) { ret 5; }
+        var r_session: TestSession;
+        if (O.is_some[Error](t_session_init(?r_session, ?alloc, r))) { ret 90; }
+        fin { t_session_dnit(?r_session); }
     if (O.is_some[str](fs.create_dir(original, 0o755))) { ret 6; }
     if (O.is_some[str](fs.write_bytes(marker, "untouched", 9, 0o644))) { ret 7; }
     var inv: Inventory = inventory_init(?alloc);
@@ -3809,10 +4060,12 @@ test "std.filesystem.transaction.prepare_subtree: a renamed root keeps every sta
     if (O.is_some[Error](inventory_push(?inv, entry_file("implicit/deep/data", "nested", 6, 0o640)))) { ret 8; }
     if (O.is_some[Error](inventory_push(?inv, entry_dir("explicit/empty", 0o750)))) { ret 9; }
     if (O.is_some[Error](inventory_push(?inv, entry_file("manifest", "complete", 8, 0o644)))) { ret 10; }
-    val prepared: R.Result[Transaction, Error] = prepare_subtree(?alloc, r, "project", ?inv, 0o755);
-    if (R.is_err[Transaction, Error](prepared)) { ret 11; }
-    var t: Transaction = R.unwrap_ok[Transaction, Error](prepared);
-    val committed: R.Result[Outcome, Error] = commit(?t, PRE_ABSENT_AT_COMMIT, durability_none());
+    var prepared_storage: Transaction;
+        val prepared: O.Option[Error] = prepare_subtree(?prepared_storage, ?alloc, t_reserve(?r_session, "project"), ?inv, 0o755, PrepareOptions{precondition: PRE_ABSENT, durability: durability_none()});
+        fin { if (prepared_storage.state == STATE_PREPARED) { abort(?prepared_storage); } }
+    if (O.is_some[Error](prepared)) { ret 11; }
+    val t: *Transaction = ?prepared_storage;
+    val committed: R.Result[Outcome, Error] = commit(t);
     if (R.is_err[Outcome, Error](committed)) { ret 12; }
     val nested: O.Option[str] = read_back(?alloc, moved, "project/implicit/deep/data");
     if (O.is_none[str](nested)) { ret 13; }
@@ -3832,7 +4085,7 @@ test "std.filesystem.transaction.prepare_subtree: a renamed root keeps every sta
     val kept_text: str = O.unwrap[str](kept);
     fin { str_free(?alloc, kept_text); }
     if (!str_equals(kept_text, "untouched")) { ret 19; }
-    if (entry_count(?alloc, original) != 1 || entry_count(?alloc, moved) != 1) { ret 20; }
+    if (payload_entry_count(?alloc, original) != 1 || payload_entry_count(?alloc, moved) != 1) { ret 20; }
     ret 0;
 }
 
@@ -3861,19 +4114,29 @@ test "std.filesystem.transaction.prepare_subtree: staged symlinks cannot redirec
     val opened: O.Option[Error] = root_open(?root_storage_38, staging, "");
     if (O.is_some[Error](opened)) { ret 8; }
     val r: *Root = ?root_storage_38;
-    fin { root_dnit(r); }
+        fin { root_dnit(r); }
+        var r_session: TestSession;
+        if (O.is_some[Error](t_session_init(?r_session, ?alloc, r))) { ret 90; }
+        fin { t_session_dnit(?r_session); }
+
     var nested: Entry = entry_file("redirect/new-file", "escaped", 7, 0o644);
-    val nested_error: O.Option[Error] = write_subtree_entry(?alloc, r.dirfd, ?nested);
+    var direct: Transaction = Transaction{alloc: ?alloc, staging_fd: r.dirfd};
+    var injected: Inventory = inventory_init(?alloc);
+    fin { inventory_dnit(?injected); }
+    inventory_push(?injected, nested);
+    val nested_error: O.Option[Error] = build_subtree(?direct, ?injected);
     if (O.is_none[Error](nested_error)) { ret 9; }
     if (O.unwrap[Error](nested_error).kind != CONTAINMENT) { ret 10; }
     var linked: Entry = entry_file("linked-file", "corrupt", 7, 0o644);
-    if (O.is_none[Error](write_subtree_entry(?alloc, r.dirfd, ?linked))) { ret 11; }
+    injected.entries.len = 0;
+    inventory_push(?injected, linked);
+    if (O.is_none[Error](build_subtree(?direct, ?injected))) { ret 11; }
     val kept: O.Option[str] = read_back(?alloc, outside, "marker");
     if (O.is_none[str](kept)) { ret 12; }
     val text: str = O.unwrap[str](kept);
     fin { str_free(?alloc, text); }
     if (!str_equals(text, "untouched")) { ret 13; }
-    if (entry_count(?alloc, outside) != 1) { ret 14; }
+    if (payload_entry_count(?alloc, outside) != 1) { ret 14; }
     ret 0;
 }
 fun t_journal_max_leaf(name: *u8) {
@@ -3893,17 +4156,19 @@ fun t_journal_max_leaf(name: *u8) {
     }
 }
 
-fun t_journal_publish(a: *A.Allocator, root: *Root, leaf: str, content: str) i32 {
-    val prepared: R.Result[Transaction, Error] = prepare_bytes(a, root, leaf, content,
-        str_len(content), 0o644, false);
-    if (R.is_err[Transaction, Error](prepared)) { ret 1; }
-    var t: Transaction = R.unwrap_ok[Transaction, Error](prepared);
-    val committed: R.Result[Outcome, Error] = commit(?t, PRE_UNCHANGED_SINCE_PREPARE, durability_none());
+fun t_journal_publish(a: *A.Allocator, session: *TestSession, leaf: str, content: str) i32 {
+    val root: *Root = session.held.root;
+    var prepared_storage: Transaction;
+        val prepared: O.Option[Error] = prepare_bytes(?prepared_storage, a, t_reserve(session, leaf), content, str_len(content), 0o644, false, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
+        fin { if (prepared_storage.state == STATE_PREPARED) { abort(?prepared_storage); } }
+    if (O.is_some[Error](prepared)) { ret 1; }
+    val t: *Transaction = ?prepared_storage;
+    val committed: R.Result[Outcome, Error] = commit(t);
     if (R.is_err[Outcome, Error](committed)) { ret 2; }
     ret 0;
 }
 
-fun t_journal_run(body: fun(*A.Allocator, *Root, str) i32) i32 {
+fun t_journal_run(body: fun(*A.Allocator, *TestSession, str) i32) i32 {
     var a: A.Allocator;
     if (O.is_some[str](page.make(?a))) { ret 1; }
     val scratch: R.Result[str, str] = scratch_root(?a);
@@ -3915,29 +4180,33 @@ fun t_journal_run(body: fun(*A.Allocator, *Root, str) i32) i32 {
     if (O.is_some[Error](opened)) { bad = 3; }
     or {
         val root: *Root = ?root_storage_39;
-        bad = body(?a, root, base);
-        root_dnit(root);
+        fin { root_dnit(root); }
+        var root_session: TestSession;
+        if (O.is_some[Error](t_session_init(?root_session, ?a, root))) { ret 90; }
+        fin { t_session_dnit(?root_session); }
+        bad = body(?a, ?root_session, base);
     }
     fs.remove_all(?a, base);
     str_free(?a, base);
     ret bad;
 }
 
-fun t_journal_max_file(a: *A.Allocator, root: *Root, base: str) i32 {
+fun t_journal_max_file(a: *A.Allocator, session: *TestSession, base: str) i32 {
+    val root: *Root = session.held.root;
     var name: [766]u8;
     t_journal_max_leaf(?name[0]);
     val leaf: str = (?name[0])::str;
-    if (t_journal_publish(a, root, leaf, "before") != 0) { ret 4; }
-    if (t_journal_publish(a, root, leaf, "after") != 0) { ret 5; }
+    if (t_journal_publish(a, session, leaf, "before") != 0) { ret 4; }
+    if (t_journal_publish(a, session, leaf, "after") != 0) { ret 5; }
     var content: [16]u8;
     val read: R.Result[O.Option[usize], Error] = entry_read_all(root, leaf, ?content[0], 16);
     if (R.is_err[O.Option[usize], Error](read)) { ret 6; }
     if (!str_equals((?content[0])::str, "after")) { ret 7; }
-    val swept: R.Result[usize, Error] = recover(a, root, leaf);
+    val swept: R.Result[usize, Error] = t_end_batch_and_recover(session, leaf);
     if (R.is_err[usize, Error](swept)) { ret 8; }
     if (R.unwrap_ok[usize, Error](swept) != 0) { ret 9; }
-    if (O.is_some[Error](entry_unlink(root, leaf))) { ret 10; }
-    if (entry_count(a, base) != 0) { ret 11; }
+    if (O.is_some[Error](entry_unlink(t_reserve(session, leaf)))) { ret 10; }
+    if (payload_entry_count(a, base) != 0) { ret 11; }
     ret 0;
 }
 
@@ -3945,12 +4214,21 @@ test "std.filesystem.transaction: maximum native destination names publish repla
     ret t_journal_run(t_journal_max_file);
 }
 
+fun t_fixture_write(root: *Root, leaf: str, content: str) i32 {
+    val opened: i64 = os.open(root.dirfd, leaf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644);
+    if (opened < 0) { ret 1; }
+    val wrote: i64 = os.write(opened::i32, content, str_len(content));
+    val closed: i64 = os.close(opened::i32);
+    if (wrote != str_len(content)::i64 || closed < 0) { ret 2; }
+    ret 0;
+}
+
 fun t_journal_child_write(a: *A.Allocator, root: *Root, leaf: str, content: str) i32 {
     val opened: i64 = os.open(root.dirfd, leaf, os.O_RDONLY | os.O_DIRECTORY, 0);
     if (opened < 0) { ret 1; }
     var child: Root;
     if (ownership.root_init(?child, opened::i32) < 0) { os.close(opened::i32); ret 99; }
-    val result: i32 = t_journal_publish(a, ?child, "entry", content);
+    val result: i32 = t_fixture_write(?child, "entry", content);
     root_dnit(?child);
     ret result;
 }
@@ -3973,122 +4251,117 @@ fun t_journal_owns(ctx: *i32, name: str, directory: bool) bool {
     ret str_equals(name, "entry") && !directory;
 }
 
-fun t_journal_empty_directory(a: *A.Allocator, root: *Root, leaf: str) i32 {
-    val prepared: R.Result[Transaction, Error] = prepare_dir(a, root, leaf, 0o755);
-    if (R.is_err[Transaction, Error](prepared)) { ret 1; }
-    var t: Transaction = R.unwrap_ok[Transaction, Error](prepared);
-    val committed: R.Result[Outcome, Error] = commit(?t, PRE_ABSENT_AT_COMMIT, durability_none());
+fun t_journal_empty_directory(a: *A.Allocator, session: *TestSession, leaf: str) i32 {
+    val root: *Root = session.held.root;
+    var prepared_storage: Transaction;
+        val prepared: O.Option[Error] = prepare_dir(?prepared_storage, a, t_reserve(session, leaf), 0o755, PrepareOptions{precondition: PRE_ABSENT, durability: durability_none()});
+        fin { if (prepared_storage.state == STATE_PREPARED) { abort(?prepared_storage); } }
+    if (O.is_some[Error](prepared)) { ret 1; }
+    val t: *Transaction = ?prepared_storage;
+    val committed: R.Result[Outcome, Error] = commit(t);
     if (R.is_err[Outcome, Error](committed)) { ret 2; }
     ret 0;
 }
 
-fun t_journal_directory_states(a: *A.Allocator, root: *Root) i32 {
+fun t_journal_directory_states(a: *A.Allocator, session: *TestSession) i32 {
+    val root: *Root = session.held.root;
     var name: [766]u8;
     t_journal_max_leaf(?name[0]);
     val leaf: str = (?name[0])::str;
-    if (t_journal_empty_directory(a, root, leaf) != 0) { ret 4; }
+    if (t_journal_empty_directory(a, session, leaf) != 0) { ret 4; }
     if (t_journal_child_write(a, root, leaf, "before") != 0) { ret 5; }
     val opened: R.Result[i32, Error] = open_backup_container(root.dirfd, true);
     if (R.is_err[i32, Error](opened)) { ret 6; }
     var backup: Root;
     if (ownership.root_init(?backup, R.unwrap_ok[i32, Error](opened)) < 0) { os.close(R.unwrap_ok[i32, Error](opened)); ret 99; }
     var bad: i32 = 0;
-    if (t_journal_empty_directory(a, ?backup, "other") != 0) { bad = 7; }
+    if (os.make_dir(backup.dirfd, "other", 0o755) < 0) { bad = 7; }
     if (bad == 0 && t_journal_child_write(a, ?backup, "other", "keep") != 0) { bad = 8; }
     if (bad == 0 && os.rename(root.dirfd, leaf, backup.dirfd, leaf) < 0) { bad = 9; }
-    if (bad == 0 && R.is_err[usize, Error](recover(a, root, leaf))) { bad = 10; }
+    if (bad == 0 && R.is_err[usize, Error](t_end_batch_and_recover(session, leaf))) { bad = 10; }
     if (bad == 0 && !t_journal_child_has(root, leaf, "before")) { bad = 11; }
     if (bad == 0 && !t_journal_child_has(?backup, "other", "keep")) { bad = 12; }
     if (bad == 0 && os.rename(root.dirfd, leaf, backup.dirfd, leaf) < 0) { bad = 13; }
-    if (bad == 0 && t_journal_empty_directory(a, root, leaf) != 0) { bad = 14; }
+    if (bad == 0 && t_journal_empty_directory(a, session, leaf) != 0) { bad = 14; }
     if (bad == 0 && t_journal_child_write(a, root, leaf, "after") != 0) { bad = 15; }
-    if (bad == 0 && R.is_err[usize, Error](recover(a, root, leaf))) { bad = 16; }
+    if (bad == 0 && R.is_err[usize, Error](t_end_batch_and_recover(session, leaf))) { bad = 16; }
     if (bad == 0 && !entry_absent(backup.dirfd, leaf)) { bad = 17; }
     if (bad == 0 && !t_journal_child_has(root, leaf, "after")) { bad = 18; }
     if (bad == 0 && os.rename(root.dirfd, leaf, backup.dirfd, leaf) < 0) { bad = 19; }
     if (bad == 0) {
-        val prepared: R.Result[Transaction, Error] = prepare_dir(a, root, leaf, 0o755);
-        if (R.is_err[Transaction, Error](prepared)) { bad = 20; }
+        if (R.is_err[usize, Error](t_end_batch_and_recover(session, leaf))) { ret 22; }
+        var prepared_storage: Transaction;
+        val prepared: O.Option[Error] = prepare_dir(?prepared_storage, a, t_reserve(session, leaf), 0o755, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
+        fin { if (prepared_storage.state == STATE_PREPARED) { abort(?prepared_storage); } }
+        if (O.is_some[Error](prepared)) { bad = 20; }
         or {
-            var t: Transaction = R.unwrap_ok[Transaction, Error](prepared);
+            val t: *Transaction = ?prepared_storage;
             var ctx: i32 = 0;
-            val committed: R.Result[Outcome, Error] = commit_replacing_owned[i32](?t, ?ctx, t_journal_owns);
+            val committed: R.Result[Outcome, Error] = commit_replacing_owned[i32](t, ?ctx, t_journal_owns);
             if (R.is_err[Outcome, Error](committed)) { bad = 21; }
-            or (!R.unwrap_ok[Outcome, Error](committed).recovered) { bad = 22; }
         }
     }
     if (bad == 0 && !entry_absent(backup.dirfd, leaf)) { bad = 23; }
     if (bad == 0 && !t_journal_child_has(?backup, "other", "keep")) { bad = 24; }
-    if (bad == 0 && R.is_err[usize, Error](recover(a, root, ""))) { bad = 25; }
+    if (bad == 0 && R.is_err[usize, Error](t_end_batch_and_recover(session, ""))) { bad = 25; }
     if (bad == 0 && !t_journal_child_has(?backup, "other", "keep")) { bad = 26; }
     root_dnit(?backup);
     ret bad;
 }
 
-fun t_journal_renamed_root(a: *A.Allocator, root: *Root, base: str) i32 {
-    if (R.is_err[bool, Error](entry_make_dir(root, "original", 0o755))) { ret 4; }
+fun t_journal_renamed_root(a: *A.Allocator, session: *TestSession, base: str) i32 {
+    val root: *Root = session.held.root;
+    if (R.is_err[bool, Error](entry_make_dir(t_reserve(session, "original"), 0o755))) { ret 4; }
     var root_storage_40: Root;
     val opened: O.Option[Error] = root_open(?root_storage_40, base, "original");
     if (O.is_some[Error](opened)) { ret 5; }
     val held: *Root = ?root_storage_40;
+        fin { root_dnit(held); }
+
     var bad: i32 = 0;
-    if (O.is_some[Error](entry_rename(root, "original", "moved"))) { bad = 6; }
-    if (bad == 0 && R.is_err[bool, Error](entry_make_dir(root, "original", 0o755))) { bad = 7; }
+    if (O.is_some[Error](entry_rename(t_reserve(session, "original"), t_reserve(session, "moved")))) { bad = 6; }
+    if (bad == 0 && R.is_err[bool, Error](entry_make_dir(t_reserve(session, "original"), 0o755))) { bad = 7; }
     if (bad == 0 && t_journal_child_write(a, root, "original", "untouched") != 0) { bad = 8; }
-    if (bad == 0) { bad = t_journal_directory_states(a, held); }
-    root_dnit(held);
+    if (bad == 0) {
+        var held_session: TestSession;
+        if (O.is_some[Error](t_session_init(?held_session, a, held))) { ret 90; }
+        fin { t_session_dnit(?held_session); }
+        bad = t_journal_directory_states(a, ?held_session);
+    }
+
     if (bad == 0 && !t_journal_child_has(root, "original", "untouched")) { bad = 9; }
     ret bad;
 }
 
-test "std.filesystem.transaction: maximum directory backups recover and self-heal through a renamed root" {
+test "std.filesystem.transaction: maximum directory backups recover through a renamed root" {
     ret t_journal_run(t_journal_renamed_root);
 }
 
-fun t_journal_reserved_and_sweep(a: *A.Allocator, root: *Root, base: str) i32 {
+fun t_journal_reserved_and_sweep(a: *A.Allocator, session: *TestSession, base: str) i32 {
+    val root: *Root = session.held.root;
     var reserved: [4]str = [4]str{".machtxn.out", ".machtxn.backup", ".MACHTXN.0011223344556677", ".MACH-TXN-LOCK"};
     var i: usize = 0;
-    var inv: Inventory = inventory_init(a);
     for (i < 4) {
-        val file: R.Result[Transaction, Error] = prepare_bytes(a, root, reserved[i], "x", 1, 0o644, false);
-        if (R.is_ok[Transaction, Error](file)) {
-            var t: Transaction = R.unwrap_ok[Transaction, Error](file);
-            abort(?t);
-            inventory_dnit(?inv);
-            ret 4;
-        }
-        if (R.unwrap_err[Transaction, Error](file).kind != CONTAINMENT) { inventory_dnit(?inv); ret 5; }
-        val directory: R.Result[Transaction, Error] = prepare_dir(a, root, reserved[i], 0o755);
-        if (R.is_ok[Transaction, Error](directory)) {
-            var t: Transaction = R.unwrap_ok[Transaction, Error](directory);
-            abort(?t);
-            inventory_dnit(?inv);
-            ret 6;
-        }
-        val subtree: R.Result[Transaction, Error] = prepare_subtree(a, root, reserved[i], ?inv, 0o755);
-        if (R.is_ok[Transaction, Error](subtree)) {
-            var t: Transaction = R.unwrap_ok[Transaction, Error](subtree);
-            abort(?t);
-            inventory_dnit(?inv);
-            ret 7;
-        }
+        var refused: Claim;
+        val result: O.Option[Error] = claim(?refused, a, ?session.held, reserved[i]);
+        if (O.is_none[Error](result)) { release_claim(?refused); ret 4; }
+        if (O.unwrap[Error](result).kind != CONTAINMENT) { ret 5; }
         i = i + 1;
     }
-    inventory_dnit(?inv);
-    if (entry_count(a, base) != 0) { ret 8; }
+    if (payload_entry_count(a, base) != 0) { ret 8; }
     if (!t_mkfile(base, a, ".machtxn.0011223344556677", "staging one")) { ret 9; }
     if (!t_mkfile(base, a, ".machtxn.8899aabbccddeeff", "staging two")) { ret 10; }
     if (!t_mkfile(base, a, ".machtxn.not-a-nonce", "foreign")) { ret 11; }
     if (!t_mkfile(base, a, ".machtxn.unrecognized", "foreign")) { ret 12; }
     if (os.make_dir(root.dirfd, "other-backup-guard", 0o755) < 0) { ret 13; }
     if (t_journal_child_write(a, root, "other-backup-guard", "keep") != 0) { ret 14; }
-    val recovered: R.Result[usize, Error] = recover(a, root, "chosen");
+    val recovered: R.Result[usize, Error] = t_end_batch_and_recover(session, "chosen");
     if (R.is_err[usize, Error](recovered)) { ret 15; }
     if (R.unwrap_ok[usize, Error](recovered) != 2) { ret 16; }
-    if (entry_count(a, base) != 3 || !t_journal_child_has(root, "other-backup-guard", "keep")) { ret 17; }
-    val again: R.Result[usize, Error] = recover(a, root, "");
+    if (payload_entry_count(a, base) != 3 || !t_journal_child_has(root, "other-backup-guard", "keep")) { ret 17; }
+    val again: R.Result[usize, Error] = t_end_batch_and_recover(session, "");
     if (R.is_err[usize, Error](again) || R.unwrap_ok[usize, Error](again) != 0) { ret 18; }
-    if (entry_count(a, base) != 3) { ret 19; }
+    if (payload_entry_count(a, base) != 3) { ret 19; }
     ret 0;
 }
 
@@ -4096,7 +4369,8 @@ test "std.filesystem.transaction: reserved publication names and exact staging r
     ret t_journal_run(t_journal_reserved_and_sweep);
 }
 
-fun t_journal_container_refusal(a: *A.Allocator, root: *Root, base: str) i32 {
+fun t_journal_container_refusal(a: *A.Allocator, session: *TestSession, base: str) i32 {
+    val root: *Root = session.held.root;
     val outside_result: R.Result[str, str] = scratch_root(a);
     if (R.is_err[str, str](outside_result)) { ret 4; }
     val outside: str = R.unwrap_ok[str, str](outside_result);
@@ -4105,12 +4379,12 @@ fun t_journal_container_refusal(a: *A.Allocator, root: *Root, base: str) i32 {
     if (!t_mkfile(outside, a, "guard", "keep")) { bad = 5; }
     if (bad == 0 && O.is_some[str](fs.symlink(outside, container))) { bad = 6; }
     if (bad == 0) {
-        val recovered: R.Result[usize, Error] = recover(a, root, "chosen");
+        val recovered: R.Result[usize, Error] = t_end_batch_and_recover(session, "chosen");
         if (R.is_ok[usize, Error](recovered)) { bad = 7; }
         or (R.unwrap_err[usize, Error](recovered).kind != CONTAINMENT) { bad = 8; }
     }
     if (bad == 0 && O.is_none[str](read_back(a, outside, "guard"))) { bad = 9; }
-    entry_unlink(root, BACKUP_CONTAINER);
+    os.unlink(root.dirfd, BACKUP_CONTAINER, 0);
     fs.remove_all(a, outside);
     str_free(a, outside);
     str_free(a, container);
@@ -4119,18 +4393,18 @@ fun t_journal_container_refusal(a: *A.Allocator, root: *Root, base: str) i32 {
     if (R.is_err[i32, Error](opened)) { ret 10; }
     var backup: Root;
     if (ownership.root_init(?backup, R.unwrap_ok[i32, Error](opened)) < 0) { os.close(R.unwrap_ok[i32, Error](opened)); ret 99; }
-    if (t_journal_publish(a, ?backup, "chosen", "foreign") != 0) { bad = 11; }
+    if (t_fixture_write(?backup, "chosen", "foreign") != 0) { bad = 11; }
     if (bad == 0) {
-        val recovered: R.Result[usize, Error] = recover(a, root, "chosen");
+        val recovered: R.Result[usize, Error] = t_end_batch_and_recover(session, "chosen");
         if (R.is_ok[usize, Error](recovered)) { bad = 12; }
         or (R.unwrap_err[usize, Error](recovered).kind != CONFLICT) { bad = 13; }
     }
     if (bad == 0 && entry_absent(backup.dirfd, "chosen")) { bad = 14; }
-    entry_unlink(?backup, "chosen");
+    os.unlink(backup.dirfd, "chosen", 0);
     if (bad == 0 && os.make_dir(backup.dirfd, "chosen", 0o755) < 0) { bad = 15; }
-    if (bad == 0 && t_journal_publish(a, root, "chosen", "foreign") != 0) { bad = 16; }
+    if (bad == 0 && t_journal_publish(a, session, "chosen", "foreign") != 0) { bad = 16; }
     if (bad == 0) {
-        val recovered: R.Result[usize, Error] = recover(a, root, "chosen");
+        val recovered: R.Result[usize, Error] = t_end_batch_and_recover(session, "chosen");
         if (R.is_ok[usize, Error](recovered)) { bad = 17; }
         or (R.unwrap_err[usize, Error](recovered).kind != CONFLICT) { bad = 18; }
     }
@@ -4143,19 +4417,22 @@ test "std.filesystem.transaction: backup containers reject symlinks malformed ch
     ret t_journal_run(t_journal_container_refusal);
 }
 
-fun t_publish(a: *A.Allocator, root: *Root, leaf: str, content: str) i32 {
-    val prepared: R.Result[Transaction, Error] = prepare_bytes(a, root, leaf,
-        content, str_len(content), 0o644, false);
-    if (R.is_err[Transaction, Error](prepared)) { ret 1; }
-    var t: Transaction = R.unwrap_ok[Transaction, Error](prepared);
-    val committed: R.Result[Outcome, Error] = commit(?t, PRE_UNCHANGED_SINCE_PREPARE, durability_none());
+fun t_publish(a: *A.Allocator, session: *TestSession, leaf: str, content: str) i32 {
+    val root: *Root = session.held.root;
+    var prepared_storage: Transaction;
+        val prepared: O.Option[Error] = prepare_bytes(?prepared_storage, a, t_reserve(session, leaf), content, str_len(content), 0o644, false, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
+        fin { if (prepared_storage.state == STATE_PREPARED) { abort(?prepared_storage); } }
+    if (O.is_some[Error](prepared)) { ret 1; }
+    val t: *Transaction = ?prepared_storage;
+    val committed: R.Result[Outcome, Error] = commit(t);
     if (R.is_err[Outcome, Error](committed)) { ret 2; }
     ret 0;
 }
 
-fun t_root_operations(a: *A.Allocator, root: *Root) i32 {
-    if (t_publish(a, root, "x", "content") != 0) { ret 1; }
-    if (O.is_some[Error](entry_rename(root, "x", "y"))) { ret 2; }
+fun t_root_operations(a: *A.Allocator, session: *TestSession) i32 {
+    val root: *Root = session.held.root;
+    if (t_publish(a, session, "x", "content") != 0) { ret 1; }
+    if (O.is_some[Error](entry_rename(t_reserve(session, "x"), t_reserve(session, "y")))) { ret 2; }
     var buf: [16]u8;
     val read: R.Result[O.Option[usize], Error] = entry_read_all(root, "y", ?buf[0], 16);
     if (R.is_err[O.Option[usize], Error](read)) { ret 3; }
@@ -4163,11 +4440,15 @@ fun t_root_operations(a: *A.Allocator, root: *Root) i32 {
     if (O.is_none[usize](found) || O.unwrap[usize](found) != 7) { ret 4; }
     if (!str_equals((?buf[0])::str, "content")) { ret 5; }
 
-    val stale: R.Result[Transaction, Error] = prepare_bytes(a, root, "y", "stale", 5, 0o644, false);
-    if (R.is_err[Transaction, Error](stale)) { ret 6; }
-    var t: Transaction = R.unwrap_ok[Transaction, Error](stale);
-    if (t_publish(a, root, "y", "winner") != 0) { abort(?t); ret 7; }
-    val conflict: R.Result[Outcome, Error] = commit(?t, PRE_UNCHANGED_SINCE_PREPARE, durability_none());
+    $if ($mach.build.os != $mach.os.darwin) {
+    var stale_storage: Transaction;
+        val stale: O.Option[Error] = prepare_bytes(?stale_storage, a, t_reserve(session, "y"), "stale", 5, 0o644, false, PrepareOptions{precondition: PRE_SAME_OBJECT, durability: durability_none()});
+        fin { if (stale_storage.state == STATE_PREPARED) { abort(?stale_storage); } }
+    if (O.is_some[Error](stale)) { ret 6; }
+    val t: *Transaction = ?stale_storage;
+    if (t_fixture_write(root, "outsider", "winner") != 0) { abort(t); ret 7; }
+    if (os.rename(root.dirfd, "outsider", root.dirfd, "y") < 0) { abort(t); ret 7; }
+    val conflict: R.Result[Outcome, Error] = commit(t);
     if (R.is_ok[Outcome, Error](conflict)) { ret 8; }
     if (R.unwrap_err[Outcome, Error](conflict).kind != PRECONDITION) { ret 9; }
     var winner: [16]u8;
@@ -4175,19 +4456,20 @@ fun t_root_operations(a: *A.Allocator, root: *Root) i32 {
     if (R.is_err[O.Option[usize], Error](wr)) { ret 10; }
     if (!str_equals((?winner[0])::str, "winner")) { ret 11; }
 
-    if (R.is_err[bool, Error](entry_make_dir(root, "sub", 0o755))) { ret 12; }
-    if (O.is_some[Error](entry_rename(root, "sub", "r"))) { ret 13; }
+    }
+    if (R.is_err[bool, Error](entry_make_dir(t_reserve(session, "sub"), 0o755))) { ret 12; }
+    if (O.is_some[Error](entry_rename(t_reserve(session, "sub"), t_reserve(session, "r")))) { ret 13; }
     val child_raw: i64 = os.open(root.dirfd, "r", os.O_RDONLY | os.O_DIRECTORY, 0);
     if (child_raw < 0) { ret 14; }
     var child: Root;
     if (ownership.root_init(?child, child_raw::i32) < 0) { os.close(child_raw::i32); ret 99; }
-    val published: i32 = t_publish(a, ?child, "inner", "kept");
+    val published: i32 = t_fixture_write(?child, "inner", "kept");
     root_dnit(?child);
     if (published != 0) { ret 15; }
-    val removed: R.Result[usize, Error] = root_remove_tree(root, "r");
+    val removed: R.Result[usize, Error] = root_remove_tree(t_reserve(session, "r"), "");
     if (R.is_err[usize, Error](removed)) { ret 16; }
     if (R.unwrap_ok[usize, Error](removed) != 2) { ret 17; }
-    if (O.is_some[Error](entry_unlink(root, "y"))) { ret 18; }
+    if (O.is_some[Error](entry_unlink(t_reserve(session, "y")))) { ret 18; }
     val probe: R.Result[EntryProbe, Error] = entry_probe(root, "y");
     if (R.is_err[EntryProbe, Error](probe)) { ret 19; }
     if (R.unwrap_ok[EntryProbe, Error](probe).present) { ret 20; }
@@ -4210,11 +4492,18 @@ test "std.filesystem.transaction: publication and mutations retain a renamed roo
         if (O.is_some[Error](opened)) { bad = 4; }
         or {
             val root: *Root = ?root_storage_41;
+        fin { root_dnit(root); }
+
             if (O.is_some[str](fs.rename(original, moved))) { bad = 5; }
             or (O.is_some[str](fs.create_dir(original, 0o755))) { bad = 6; }
             or (!t_mkfile(base, ?a, "original-\xc3\xa9/guard", "untouched")) { bad = 7; }
-            or { bad = t_root_operations(?a, root); }
-            root_dnit(root);
+            or {
+        var root_session: TestSession;
+        if (O.is_some[Error](t_session_init(?root_session, ?a, root))) { ret 90; }
+        fin { t_session_dnit(?root_session); }
+                bad = t_root_operations(?a, ?root_session);
+            }
+
         }
     }
     if (bad == 0) {
@@ -4225,7 +4514,7 @@ test "std.filesystem.transaction: publication and mutations retain a renamed roo
             if (!str_equals(content, "untouched")) { bad = 22; }
             str_free(?a, content);
         }
-        if (entry_count(?a, original) != 1 || entry_count(?a, moved) != 0) { bad = 23; }
+        if (payload_entry_count(?a, original) != 1 || payload_entry_count(?a, moved) != 0) { bad = 23; }
     }
     fs.remove_all(?a, base);
     str_free(?a, original);
@@ -4275,7 +4564,7 @@ fun t_fill_and_scan(a: *A.Allocator, root: *Root) i32 {
     for (i < 64) {
         name[5] = 'a' + i / 16;
         name[6] = 'a' + i % 16;
-        if (t_publish(a, root, (?name[0])::str, "x") != 0) { ret 1; }
+        if (t_fixture_write(root, (?name[0])::str, "x") != 0) { ret 1; }
         i = i + 1;
     }
     val first: i32 = t_scan_entries(root.dirfd);
@@ -4298,7 +4587,11 @@ test "std.filesystem.transaction: directory batches retain every entry and rewin
     if (O.is_some[Error](opened)) { bad = 3; }
     or {
         val root: *Root = ?root_storage_42;
-        if (R.is_err[bool, Error](entry_make_dir(root, "many", 0o755))) { bad = 4; }
+        fin { root_dnit(root); }
+        var root_session: TestSession;
+        if (O.is_some[Error](t_session_init(?root_session, ?a, root))) { ret 90; }
+        fin { t_session_dnit(?root_session); }
+        if (R.is_err[bool, Error](entry_make_dir(t_reserve(?root_session, "many"), 0o755))) { bad = 4; }
         or {
             val child_raw: i64 = os.open(root.dirfd, "many", os.O_RDONLY | os.O_DIRECTORY, 0);
             if (child_raw < 0) { bad = 5; }
@@ -4310,12 +4603,12 @@ test "std.filesystem.transaction: directory batches retain every entry and rewin
             }
         }
         if (bad == 0) {
-            val removed: R.Result[usize, Error] = root_remove_tree(root, "many");
+            val removed: R.Result[usize, Error] = root_remove_tree(t_reserve(?root_session, "many"), "");
             if (R.is_err[usize, Error](removed)) { bad = 6; }
             or (R.unwrap_ok[usize, Error](removed) != 65) { bad = 7; }
-            if (entry_count(?a, base) != 0) { bad = 8; }
+            if (payload_entry_count(?a, base) != 0) { bad = 8; }
         }
-        root_dnit(root);
+
     }
     # preserve failed scans for inspection without enumerating through the same defect
     if (bad == 0) { fs.remove_all(?a, base); }
@@ -4336,7 +4629,11 @@ $if ($mach.build.os == $mach.os.windows) {
         if (O.is_some[Error](opened)) { bad = 3; }
         or {
             val root: *Root = ?root_storage_43;
-            if (t_publish(?a, root, "file", "untouched") != 0) { bad = 4; }
+        fin { root_dnit(root); }
+        var root_session: TestSession;
+        if (O.is_some[Error](t_session_init(?root_session, ?a, root))) { ret 90; }
+        fin { t_session_dnit(?root_session); }
+            if (t_publish(?a, ?root_session, "file", "untouched") != 0) { bad = 4; }
             or {
                 val stream: i64 = os.open(root.dirfd, "file:hidden", os.O_CREAT | os.O_RDWR, 0o644);
                 if (stream >= 0) { os.close(stream::i32); bad = 5; }
@@ -4345,7 +4642,7 @@ $if ($mach.build.os == $mach.os.windows) {
                 if (R.is_err[O.Option[usize], Error](read)) { bad = 6; }
                 or (!str_equals((?content[0])::str, "untouched")) { bad = 7; }
             }
-            root_dnit(root);
+
         }
         fs.remove_all(?a, base);
         str_free(?a, base);
@@ -4370,7 +4667,7 @@ $if ($mach.build.os == $mach.os.windows) {
             }
             if (n::usize != capacity || storage.d_reclen::usize != capacity) { ret 4; }
             val name: str = (?storage.d_name[0])::str;
-            if (!dot_entry(name)) {
+            if (!dot_entry(name) && !str_equals(name, LOCK_LEAF) && !str_equals(name, ownership.CLAIMS_LEAF)) {
                 var bit: u8 = 0;
                 if (str_equals(name, expected)) { bit = 1; }
                 or (str_equals(name, "x")) { bit = 2; }
@@ -4404,9 +4701,14 @@ $if ($mach.build.os == $mach.os.windows) {
         if (O.is_some[Error](opened)) { bad = 3; }
         or {
             val root: *Root = ?root_storage_44;
-            if (t_publish(?a, root, "y", "wide") != 0) { bad = 4; }
-            or (O.is_some[Error](entry_rename(root, "y", leaf))) { bad = 9; }
-            or (t_publish(?a, root, "x", "short") != 0) { bad = 5; }
+        fin { root_dnit(root); }
+        var root_session: TestSession;
+        if (O.is_some[Error](t_session_init(?root_session, ?a, root))) { ret 90; }
+        fin { t_session_dnit(?root_session); }
+            if (t_publish(?a, ?root_session, "y", "wide") != 0) { bad = 4; }
+            or (O.is_some[Error](entry_rename(t_reserve(?root_session, "y"), t_reserve(?root_session, leaf)))) { bad = 9; }
+            or (t_publish(?a, ?root_session, "x", "short") != 0) { bad = 5; }
+            or (os.seek(root.dirfd, 0, os.SEEK_SET) < 0) { bad = 30; }
             or {
                 val first: i32 = t_scan_wide_component(root.dirfd, leaf);
                 if (first != 0) { bad = 10 + first; }
@@ -4416,9 +4718,9 @@ $if ($mach.build.os == $mach.os.windows) {
                     if (again != 0) { bad = 20 + again; }
                 }
             }
-            if (O.is_some[Error](entry_unlink(root, leaf)) && bad == 0) { bad = 7; }
-            if (O.is_some[Error](entry_unlink(root, "x")) && bad == 0) { bad = 8; }
-            root_dnit(root);
+            if (O.is_some[Error](entry_unlink(t_reserve(?root_session, leaf))) && bad == 0) { bad = 7; }
+            if (O.is_some[Error](entry_unlink(t_reserve(?root_session, "x"))) && bad == 0) { bad = 8; }
+
         }
         fs.remove_all(?a, base);
         str_free(?a, base);
@@ -4447,6 +4749,10 @@ $if ($mach.build.os == $mach.os.windows) {
         val opened: O.Option[Error] = root_open(?root_storage_45, base, "");
         if (O.is_some[Error](opened)) { str_free(?a, base); ret 3; }
         val root: *Root = ?root_storage_45;
+        fin { root_dnit(root); }
+        var root_session: TestSession;
+        if (O.is_some[Error](t_session_init(?root_session, ?a, root))) { ret 90; }
+        fin { t_session_dnit(?root_session); }
         var bad: i32 = 0;
         if (os.make_dir(root.dirfd, leaf, 0o755) < 0) { bad = 4; }
         if (bad == 0) {
@@ -4478,11 +4784,15 @@ $if ($mach.build.os == $mach.os.windows) {
                 if (O.is_some[Error](nested)) { bad = 11; }
                 or {
                     val inner: *Root = ?root_storage_46;
+        fin { root_dnit(inner); }
+        var inner_session: TestSession;
+        if (O.is_some[Error](t_session_init(?inner_session, ?a, inner))) { ret 90; }
+        fin { t_session_dnit(?inner_session); }
                     var bytes: [2]u8;
                     val read: R.Result[O.Option[usize], Error] = entry_read_all(inner, "payload", ?bytes[0], 2);
                     if (R.is_err[O.Option[usize], Error](read)) { bad = 12; }
                     or (bytes[0] != 'x') { bad = 13; }
-                    root_dnit(inner);
+
                 }
                 str_free(?a, rel);
             }
@@ -4496,7 +4806,11 @@ $if ($mach.build.os == $mach.os.windows) {
                     val absent: O.Option[Error] = root_open(?root_storage_47, base, rel);
                     if (O.is_none[Error](absent)) {
                         val unexpected: *Root = ?root_storage_47;
-                        root_dnit(unexpected);
+        fin { root_dnit(unexpected); }
+        var unexpected_session: TestSession;
+        if (O.is_some[Error](t_session_init(?unexpected_session, ?a, unexpected))) { ret 90; }
+        fin { t_session_dnit(?unexpected_session); }
+
                         bad = 15;
                     }
                     or (O.unwrap[Error](absent).code != os.ENOENT) { bad = 16; }
@@ -4510,20 +4824,20 @@ $if ($mach.build.os == $mach.os.windows) {
             if (R.is_err[str, str](relative)) { bad = 20; }
             or {
                 val rel: str = R.unwrap_ok[str, str](relative);
-                val nested: R.Result[usize, Error] = root_remove_tree(root, rel);
+                val nested: R.Result[usize, Error] = root_remove_tree(t_reserve(?root_session, leaf), "inner");
                 if (R.is_err[usize, Error](nested)) { bad = 21; }
                 or (R.unwrap_ok[usize, Error](nested) != 2) { bad = 22; }
                 str_free(?a, rel);
             }
             if (bad == 0) {
-                val removed: R.Result[usize, Error] = root_remove_tree(root, leaf);
+                val removed: R.Result[usize, Error] = root_remove_tree(t_reserve(?root_session, leaf), "");
                 if (R.is_err[usize, Error](removed)) { bad = 17; }
                 or (R.unwrap_ok[usize, Error](removed) != 1) { bad = 18; }
                 if (bad == 0 && !entry_absent(root.dirfd, leaf)) { bad = 19; }
             }
         }
         remove_recursive(root.dirfd, leaf);
-        root_dnit(root);
+
         fs.remove_all(?a, base);
         str_free(?a, base);
         ret bad;
@@ -4538,7 +4852,15 @@ $if ($mach.build.os == $mach.os.windows) {
     }
 }
 
-fun t_listing_allocation_ordinals(a: *A.Allocator, root: *Root, base: str) i32 {
+fun t_listing_allocation_ordinals(a: *A.Allocator, session: *TestSession, base: str) i32 {
+    val parent: *Root = session.held.root;
+    if (os.make_dir(parent.dirfd, "listing", 0o700) < 0) { ret 20; }
+    val opened: i64 = os.open(parent.dirfd, "listing", os.O_RDONLY | os.O_DIRECTORY, 0);
+    if (opened < 0) { ret 21; }
+    var listing: Root;
+    if (ownership.root_init(?listing, opened::i32) < 0) { os.close(opened::i32); ret 22; }
+    val root: *Root = ?listing;
+    fin { root_dnit(root); }
     var i: usize = 0;
     for (i < 9) {
         val formatted: R.Result[str, str] = format.sprint(a, "entry-{}", i);
@@ -4636,16 +4958,23 @@ test "std.filesystem.transaction.commit: held destinations retain old content th
     val rr: O.Option[Error] = root_open(?root_storage_48, base, "");
     if (O.is_some[Error](rr)) { ret 4; }
     val root: *Root = ?root_storage_48;
-    fin { root_dnit(root); }
+        fin { root_dnit(root); }
+
+
     if (O.is_some[str](fs.rename(base, moved))) { ret 7; }
+        var root_session: TestSession;
+        if (O.is_some[Error](t_session_init(?root_session, ?alloc, root))) { ret 90; }
+        fin { t_session_dnit(?root_session); }
     val held: i64 = os.open(root.dirfd, "b", os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600);
     if (held < 0) { ret 5; }
     fin { os.close(held::i32); }
     if (os.write(held::i32, "old", 3) != 3) { ret 6; }
-    val pr: R.Result[Transaction, Error] = prepare_bytes(?alloc, root, "b", "new", 3, 0o600, false);
-    if (R.is_err[Transaction, Error](pr)) { ret 8; }
-    var transaction: Transaction = R.unwrap_ok[Transaction, Error](pr);
-    val committed: R.Result[Outcome, Error] = commit(?transaction, PRE_UNCHANGED_SINCE_PREPARE, durability_none());
+    var pr_storage: Transaction;
+        val pr: O.Option[Error] = prepare_bytes(?pr_storage, ?alloc, t_reserve(?root_session, "b"), "new", 3, 0o600, false, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
+        fin { if (pr_storage.state == STATE_PREPARED) { abort(?pr_storage); } }
+    if (O.is_some[Error](pr)) { ret 8; }
+    val transaction: *Transaction = ?pr_storage;
+    val committed: R.Result[Outcome, Error] = commit(transaction);
     if (R.is_err[Outcome, Error](committed)) { ret 74; }
     if (!t_held_rename_contents(held::i32, "old")) { ret 10; }
     val next: i64 = os.open(root.dirfd, "b", os.O_RDONLY, 0);
@@ -4698,7 +5027,7 @@ test "std.filesystem.transaction.claim: planning owns reservations across active
     fin { unlock(?held); }
     if (ownership.begin_recovery(?held) < 0) { ret 5; }
     val initialized: i64 = ownership.initialize_claims(?held);
-    ownership.end_recovery(?held);
+    ownership.end_recovery(?held, true);
     if (initialized < 0) { ret 6; }
     var first: Claim;
     var second: Claim;
@@ -4725,6 +5054,287 @@ test "std.filesystem.transaction.claim: planning owns reservations across active
     if (O.is_some[Error](release_claim(?first)) || held.borrowers != 1) { ret 18; }
     if (O.is_some[Error](release_claim(?second)) || held.borrowers != 0) { ret 19; }
     if (ownership.begin_recovery(?held) < 0) { ret 20; }
-    ownership.end_recovery(?held);
+    ownership.end_recovery(?held, true);
+    ret 0;
+}
+
+test "std.filesystem.transaction.lifecycle: copied and invalid commits preserve exactly one claim owner" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val scratch: R.Result[str, str] = scratch_root(?alloc);
+    if (R.is_err[str, str](scratch)) { ret 2; }
+    val base: str = R.unwrap_ok[str, str](scratch);
+    fin { fs.remove_all(?alloc, base); str_free(?alloc, base); }
+    var root: Root;
+    if (O.is_some[Error](root_open(?root, base, ""))) { ret 3; }
+    fin { root_dnit(?root); }
+    var session: TestSession;
+    if (O.is_some[Error](t_session_init(?session, ?alloc, ?root))) { ret 4; }
+    fin { t_session_dnit(?session); }
+    val destination: *Claim = t_reserve(?session, "out");
+    if (destination == nil) { ret 5; }
+    var first: Transaction;
+    val options: PrepareOptions = PrepareOptions{precondition: PRE_ABSENT, durability: durability_none()};
+    if (O.is_some[Error](prepare_bytes(?first, ?alloc, destination, "old", 3, 0o600, false, options))) { ret 6; }
+    fin { if (prepared(?first)) { abort(?first); } }
+    var copied: Transaction = first;
+    val refused: R.Result[Outcome, Error] = commit(?copied);
+    if (R.is_ok[Outcome, Error](refused)) { first.state = STATE_SPENT; ret 7; }
+    if (R.unwrap_err[Outcome, Error](refused).kind != INVALID) {
+        if (!destination.active) { first.state = STATE_SPENT; }
+        ret 7;
+    }
+    if (O.is_none[Error](abort(?copied)) || !prepared(?first) || !destination.active) { ret 8; }
+    var competing: Transaction;
+    val conflict: O.Option[Error] = prepare_bytes(?competing, ?alloc, destination, "bad", 3, 0o600, false, options);
+    if (O.is_none[Error](conflict) || O.unwrap[Error](conflict).kind != INVALID) { ret 9; }
+    if (O.is_none[Error](release_claim(destination))) { ret 10; }
+    var ctx: i32 = 0;
+    val invalid: R.Result[Outcome, Error] = commit_replacing_owned[i32](?first, ?ctx, t_journal_owns);
+    if (R.is_ok[Outcome, Error](invalid) || R.unwrap_err[Outcome, Error](invalid).kind != INVALID) { ret 11; }
+    if (first.state != STATE_SPENT || destination.active || session.held.borrowers != 1) { ret 12; }
+    if (payload_entry_count(?alloc, base) != 0) { ret 13; }
+    if (O.is_some[Error](prepare_bytes(?first, ?alloc, destination, "new", 3, 0o600, false, options))) { ret 14; }
+    if (R.is_err[Outcome, Error](commit(?first))) { ret 15; }
+    if (O.is_none[Error](abort(?first)) || destination.active || session.held.borrowers != 1) { ret 16; }
+    ret 0;
+}
+
+test "std.filesystem.transaction.lifecycle: preparation alone selects retained identity capability" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val scratch: R.Result[str, str] = scratch_root(?alloc);
+    if (R.is_err[str, str](scratch)) { ret 2; }
+    val base: str = R.unwrap_ok[str, str](scratch);
+    fin { fs.remove_all(?alloc, base); str_free(?alloc, base); }
+    var root: Root;
+    if (O.is_some[Error](root_open(?root, base, ""))) { ret 3; }
+    fin { root_dnit(?root); }
+    var session: TestSession;
+    if (O.is_some[Error](t_session_init(?session, ?alloc, ?root))) { ret 4; }
+    fin { t_session_dnit(?session); }
+    val destination: *Claim = t_reserve(?session, "out");
+    if (destination == nil) { ret 5; }
+    val old: i64 = os.open(root.dirfd, "out", os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o000);
+    if (old < 0) { ret 6; }
+    fin { os.close(old::i32); }
+    if (os.write(old::i32, "old", 3) != 3) { ret 7; }
+    var transaction: Transaction;
+    val replace: PrepareOptions = PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()};
+    if (O.is_some[Error](prepare_bytes(?transaction, ?alloc, destination, "new", 3, 0o000, false, replace))) { ret 8; }
+    fin { if (prepared(?transaction)) { abort(?transaction); } }
+    if (transaction.prior_fd != -1 || transaction.had_prior) { ret 9; }
+    if (O.is_some[Error](abort(?transaction))) { ret 10; }
+    val same: PrepareOptions = PrepareOptions{precondition: PRE_SAME_OBJECT, durability: durability_none()};
+    val retained: O.Option[Error] = prepare_bytes(?transaction, ?alloc, destination, "new", 3, 0o000, false, same);
+    $if ($mach.build.os == $mach.os.darwin) {
+        if (O.is_none[Error](retained) || O.unwrap[Error](retained).kind != UNSUPPORTED) { ret 11; }
+        if (destination.active || transaction.state != STATE_SPENT) { ret 12; }
+    }
+    $or {
+        if (O.is_some[Error](retained) || transaction.prior_fd < 0 || !transaction.had_prior) { ret 13; }
+        val retained_fd: i32 = transaction.prior_fd;
+        var observed: Identity;
+        if (os.file_identity(retained_fd, ?observed) < 0 || !identity_equal(observed, transaction.prior)) { ret 18; }
+        var byte: u8 = 0;
+        if (os.read(transaction.prior_fd, ?byte, 1) >= 0) { ret 14; }
+        if (os.seek(old::i32, 0, os.SEEK_SET) < 0 || os.write(old::i32, "edit", 4) != 4) { ret 15; }
+        if (R.is_err[Outcome, Error](commit(?transaction))) { ret 16; }
+        if (destination.active || transaction.prior_fd != -1) { ret 17; }
+        var closed: os.stat_t;
+        if (os.stat(retained_fd, ?closed) != os.EBADF) { ret 19; }
+    }
+    ret 0;
+}
+
+test "std.filesystem.transaction.lifecycle: recovery refuses live claims and closes failed admission" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val scratch: R.Result[str, str] = scratch_root(?alloc);
+    if (R.is_err[str, str](scratch)) { ret 2; }
+    val base: str = R.unwrap_ok[str, str](scratch);
+    fin { fs.remove_all(?alloc, base); str_free(?alloc, base); }
+    var root: Root;
+    if (O.is_some[Error](root_open(?root, base, ""))) { ret 3; }
+    fin { root_dnit(?root); }
+    var session: TestSession;
+    if (O.is_some[Error](t_session_init(?session, ?alloc, ?root))) { ret 4; }
+    fin { t_session_dnit(?session); }
+    val destination: *Claim = t_reserve(?session, "out");
+    if (destination == nil) { ret 5; }
+    var transaction: Transaction;
+    val options: PrepareOptions = PrepareOptions{precondition: PRE_ABSENT, durability: durability_none()};
+    if (O.is_some[Error](prepare_bytes(?transaction, ?alloc, destination, "new", 3, 0o600, false, options))) { ret 6; }
+    fin { if (prepared(?transaction)) { abort(?transaction); } }
+    val refused: R.Result[usize, Error] = recover(?alloc, ?session.held, "out");
+    if (R.is_ok[usize, Error](refused) || R.unwrap_err[usize, Error](refused).kind != INVALID) { ret 7; }
+    if (!prepared(?transaction) || !destination.active || payload_entry_count(?alloc, base) != 1) { ret 8; }
+    if (O.is_some[Error](abort(?transaction))) { ret 9; }
+    if (R.is_ok[usize, Error](recover(?alloc, ?session.held, "out"))) { ret 10; }
+    if (O.is_some[Error](t_session_release_claims(?session))) { ret 11; }
+    val opened: R.Result[i32, Error] = open_backup_container(root.dirfd, true);
+    if (R.is_err[i32, Error](opened)) { ret 12; }
+    val backup: i32 = R.unwrap_ok[i32, Error](opened);
+    fin { os.close(backup); }
+    val foreign: i64 = os.open(backup, "out", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600);
+    if (foreign < 0) { ret 13; }
+    os.close(foreign::i32);
+    val failed: R.Result[usize, Error] = recover(?alloc, ?session.held, "out");
+    if (R.is_ok[usize, Error](failed) || R.unwrap_err[usize, Error](failed).kind != CONFLICT) { ret 14; }
+    var claimant: Claim;
+    val blocked: O.Option[Error] = claim(?claimant, ?alloc, ?session.held, "next");
+    if (O.is_none[Error](blocked)) { release_claim(?claimant); ret 15; }
+    if (O.unwrap[Error](blocked).kind != INVALID || session.held.initialized) { ret 16; }
+    if (os.unlink(backup, "out", 0) < 0) { ret 17; }
+    if (R.is_err[usize, Error](recover(?alloc, ?session.held, "out"))) { ret 18; }
+    if (O.is_some[Error](claim(?claimant, ?alloc, ?session.held, "next"))) { ret 19; }
+    if (O.is_some[Error](release_claim(?claimant))) { ret 20; }
+    ret 0;
+}
+
+test "std.filesystem.transaction.durability: final private modes remain abortable after subtree barriers" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val scratch: R.Result[str, str] = scratch_root(?alloc);
+    if (R.is_err[str, str](scratch)) { ret 2; }
+    val base: str = R.unwrap_ok[str, str](scratch);
+    fin { fs.remove_all(?alloc, base); str_free(?alloc, base); }
+    var root: Root;
+    if (O.is_some[Error](root_open(?root, base, ""))) { ret 3; }
+    fin { root_dnit(?root); }
+    var session: TestSession;
+    if (O.is_some[Error](t_session_init(?session, ?alloc, ?root))) { ret 4; }
+    fin { t_session_dnit(?session); }
+    val destination: *Claim = t_reserve(?session, "out");
+    if (destination == nil) { ret 5; }
+    var inv: Inventory = inventory_init(?alloc);
+    fin { inventory_dnit(?inv); }
+    if (O.is_some[Error](inventory_push(?inv, entry_file("locked/inner/secret", "data", 4, 0o000)))) { ret 6; }
+    if (O.is_some[Error](inventory_push(?inv, entry_dir("locked", 0o000)))) { ret 7; }
+    if (O.is_some[Error](inventory_push(?inv, entry_dir("locked/inner", 0o000)))) { ret 8; }
+    var transaction: Transaction;
+    val options: PrepareOptions = PrepareOptions{precondition: PRE_ABSENT, durability: durability_full(true)};
+    val built: O.Option[Error] = prepare_subtree(?transaction, ?alloc, destination, ?inv, 0o000, options);
+    if (O.is_some[Error](built)) { ret 9; }
+    fin { if (prepared(?transaction)) { abort(?transaction); } }
+    if (!transaction.content_flushed) { ret 10; }
+    var st: os.stat_t;
+    if (os.stat(transaction.staging_fd, ?st) < 0) { ret 11; }
+    $if ($mach.build.os != $mach.os.windows) {
+        if ((os.stat_mode(?st) & 0o777) != 0) { ret 12; }
+    }
+    if (O.is_some[Error](abort(?transaction))) { ret 13; }
+    if (payload_entry_count(?alloc, base) != 0 || destination.active) { ret 14; }
+    if (O.is_some[Error](prepare_subtree(?transaction, ?alloc, destination, ?inv, 0o000, options))) { ret 15; }
+    if (O.is_some[Error](transaction_cleanup(?transaction, false, OP_ABORT))) { ret 16; }
+    val swept: R.Result[usize, Error] = t_end_batch_and_recover(?session, "out");
+    if (R.is_err[usize, Error](swept) || R.unwrap_ok[usize, Error](swept) != 1) { ret 17; }
+    if (payload_entry_count(?alloc, base) != 0) { ret 18; }
+    ret 0;
+}
+
+fun t_alias_spelling(alloc: *A.Allocator, root: *Root) i32 {
+    if (t_fixture_write(root, "Leaf", "value") != 0) { ret 1; }
+    var st: os.stat_t;
+    val observed: i64 = os.stat_path(root.dirfd, "leaf", ?st, os.AT_SYMLINK_NOFOLLOW);
+    if (observed < 0 && observed != os.ENOENT) { ret 2; }
+    val folded: bool = observed >= 0;
+    var held: Lock;
+    if (O.is_some[Error](lock(?held, root))) { ret 3; }
+    fin { unlock(?held); }
+    if (R.is_err[usize, Error](recover(alloc, ?held, ""))) { ret 4; }
+    var destination: Claim;
+    if (O.is_some[Error](claim(?destination, alloc, ?held, "Leaf"))) { ret 5; }
+    fin { release_claim(?destination); }
+    var competitor: Claim;
+    val reserved: O.Option[Error] = claim(?competitor, alloc, ?held, "leaf");
+    if (folded) {
+        if (O.is_none[Error](reserved)) { release_claim(?competitor); ret 6; }
+        if (O.unwrap[Error](reserved).kind != CONFLICT) { ret 7; }
+    }
+    or {
+        if (O.is_some[Error](reserved)) { ret 8; }
+        if (O.is_some[Error](release_claim(?competitor))) { ret 9; }
+    }
+    var foreign: Claim;
+    if (O.is_some[Error](claim(?foreign, alloc, ?held, "Different"))) { ret 22; }
+    fin { release_claim(?foreign); }
+    if (t_fixture_write(root, "Different", "other") != 0) { ret 23; }
+    val distinct: O.Option[Error] = entry_rename_alias(?destination, "Different");
+    if (O.is_none[Error](distinct) || O.unwrap[Error](distinct).kind != CONFLICT) { ret 24; }
+    if (!str_equals(claim_leaf(?destination), "Leaf") || entry_absent(root.dirfd, "Leaf")) { ret 25; }
+    var other: [6]u8;
+    val preserved: R.Result[O.Option[usize], Error] = entry_read_all(root, "Different", ?other[0], 6);
+    if (R.is_err[O.Option[usize], Error](preserved) || !str_equals((?other[0])::str, "other")) { ret 26; }
+    if (O.is_some[Error](entry_unlink(?foreign)) || O.is_some[Error](release_claim(?foreign))) { ret 27; }
+    if (O.is_some[Error](borrow_claim(?destination, OP_COMMIT))) { ret 28; }
+    val busy: O.Option[Error] = entry_rename_alias(?destination, "Leaf");
+    return_claim(?destination);
+    if (O.is_none[Error](busy) || O.unwrap[Error](busy).kind != INVALID) { ret 29; }
+    val renamed: O.Option[Error] = entry_rename_alias(?destination, "leaf");
+    if (folded) {
+        if (O.is_some[Error](renamed)) { ret 10; }
+        if (!str_equals(claim_leaf(?destination), "leaf")) { ret 11; }
+        if (!str_equals(destination.reservation.name, "leaf")) { ret 12; }
+        var bytes: [6]u8;
+        val read: R.Result[O.Option[usize], Error] = entry_read_all(root, "leaf", ?bytes[0], 6);
+        if (R.is_err[O.Option[usize], Error](read) || !str_equals((?bytes[0])::str, "value")) { ret 13; }
+    }
+    or {
+        if (O.is_none[Error](renamed) || O.unwrap[Error](renamed).kind != CONFLICT) { ret 14; }
+        if (!str_equals(claim_leaf(?destination), "Leaf")) { ret 15; }
+        if (!entry_absent(root.dirfd, "leaf")) { ret 16; }
+    }
+    if (destination.active) { ret 17; }
+    if (O.is_some[Error](entry_rename_alias(?destination, claim_leaf(?destination)))) { ret 18; }
+    if (O.is_some[Error](entry_unlink(?destination))) { ret 19; }
+    if (O.is_some[Error](release_claim(?destination))) { ret 20; }
+    if (held.borrowers != 0) { ret 21; }
+    ret 0;
+}
+
+test "std.filesystem.transaction.claim: alias spelling follows the root filesystem namespace" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val scratch: R.Result[str, str] = scratch_root(?alloc);
+    if (R.is_err[str, str](scratch)) { ret 2; }
+    val base: str = R.unwrap_ok[str, str](scratch);
+    fin { fs.remove_all(?alloc, base); str_free(?alloc, base); }
+    var root: Root;
+    if (O.is_some[Error](root_open(?root, base, ""))) { ret 3; }
+    fin { root_dnit(?root); }
+    ret t_alias_spelling(?alloc, ?root);
+}
+
+test "std.filesystem.transaction.claim: distinct rename releases its first borrow when the second is busy" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val scratch: R.Result[str, str] = scratch_root(?alloc);
+    if (R.is_err[str, str](scratch)) { ret 2; }
+    val base: str = R.unwrap_ok[str, str](scratch);
+    fin { fs.remove_all(?alloc, base); str_free(?alloc, base); }
+    var root: Root;
+    if (O.is_some[Error](root_open(?root, base, ""))) { ret 3; }
+    fin { root_dnit(?root); }
+    var held: Lock;
+    if (O.is_some[Error](lock(?held, ?root))) { ret 4; }
+    fin { unlock(?held); }
+    if (R.is_err[usize, Error](recover(?alloc, ?held, ""))) { ret 5; }
+    var from: Claim;
+    var to: Claim;
+    if (O.is_some[Error](claim(?from, ?alloc, ?held, "source"))) { ret 6; }
+    fin { release_claim(?from); }
+    if (O.is_some[Error](claim(?to, ?alloc, ?held, "destination"))) { ret 7; }
+    fin { release_claim(?to); }
+    if (t_fixture_write(?root, "source", "keep") != 0) { ret 8; }
+    if (O.is_some[Error](borrow_claim(?to, OP_COMMIT))) { ret 9; }
+    val busy: O.Option[Error] = entry_rename(?from, ?to);
+    if (O.is_none[Error](busy) || O.unwrap[Error](busy).kind != INVALID) { return_claim(?to); ret 10; }
+    if (from.active || !to.active) { return_claim(?to); ret 11; }
+    if (entry_absent(root.dirfd, "source") || !entry_absent(root.dirfd, "destination")) { return_claim(?to); ret 12; }
+    return_claim(?to);
+    if (O.is_some[Error](entry_rename(?from, ?to))) { ret 13; }
+    if (!entry_absent(root.dirfd, "source") || entry_absent(root.dirfd, "destination")) { ret 14; }
+    if (from.active || to.active || held.borrowers != 2) { ret 15; }
     ret 0;
 }
