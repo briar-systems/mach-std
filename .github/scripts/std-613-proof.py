@@ -15,7 +15,7 @@ snapshot = root / 'test/native/dep/std'
 snapshot.mkdir(parents=True, exist_ok=True)
 shutil.copy2('mach.toml', snapshot / 'mach.toml')
 windows_path = 'src/system/os/windows/shared.mach'
-windows = (root / windows_path).read_text()
+windows = (root / windows_path).read_text(encoding="utf-8")
 results = []
 
 
