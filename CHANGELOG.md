@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Caller-journaled file commits retain originals under separately reserved backup
+  claims and report partial rename effects, durability and cleanup errors without
+  implicit rollback. Child roots and staged-child identity observations use held
+  directory capabilities, including complete subtree staging for a new source root.
+
 - Same-object preparation explicitly selects maximum prior access. Metadata-only
   remains the default. Read-authorized Darwin callers retain event-only references
   on supported local filesystems without reading content or changing permissions.
