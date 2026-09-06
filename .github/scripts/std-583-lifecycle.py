@@ -16,10 +16,7 @@ snapshot.mkdir(parents=True,exist_ok=True)
 shutil.copy2('mach.toml',snapshot/'mach.toml')
 shutil.copytree('src',snapshot/'src',dirs_exist_ok=True)
 results=[]
-if host=='windows':
-    manifest=root/'test/native/mach.toml'
-    manifest.write_text(manifest.read_text()+'\n[profile.proof-opt0]\nopt = 0\ndebug = false\nsimd = "scalarize"\n')
-profiles=['proof-opt0','release'] if host=='windows' else ['debug','release']
+profiles=['windows-opt0','release'] if host=='windows' else ['debug','release']
 for profile in profiles:
     for name,selected in [('lifecycle','std.filesystem.transaction')]:
         shutil.rmtree(root/'test/native/out',ignore_errors=True)
