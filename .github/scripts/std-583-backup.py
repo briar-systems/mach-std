@@ -39,15 +39,14 @@ def run(label,text,selected,profile,expected_count,expected_exit=None):
         assert result.returncode!=0 and counts==[0,1,1] and re.search(r'exit(?: code)?\s*[:=]?\s*'+str(expected_exit)+r'\b',clean),item
 try:
     for profile in profiles:
-        run(profile+'-all',original,'std.filesystem.transaction',profile,68 if host=='windows' else 64)
+        run(profile+'-all',original,'std.filesystem.transaction',profile,69 if host=='windows' else 65)
+    run('read-authorized-identity',original,'std.system.os.file_identity:',profiles[0],5 if host=='darwin' else 4)
     mutations=[
       ('hide-prior-move', 'out.prior_moved = true;', 'out.prior_moved = false;', 'prior identity and contents remain caller-owned',18),
       ('skip-prior-check','if (!R.unwrap_ok[bool, Error](holds)) { ret fail_backup_commit(t, ?out, error(PRECONDITION, OP_COMMIT)); }','', 'changed prior is preserved without any rename',27),
       ('hide-cleanup-error','out.cleanup_failure = transaction_cleanup_retaining(t, !out.published, OP_COMMIT, ?out.staging_residue);','out.cleanup_failure = transaction_cleanup_retaining(t, !out.published, OP_COMMIT, ?out.staging_residue); out.cleanup_failure = O.none[Error]();','cleanup residue ownership does not replace the primary error',32),
     ]
     for label,before,after,selected,code in mutations:
-        if host=='darwin' and label in ['hide-prior-move','skip-prior-check']:
-            continue
         assert original.count(before)==1,(label,original.count(before))
         run(label,original.replace(before,after),selected,profiles[0],1,code)
 finally:

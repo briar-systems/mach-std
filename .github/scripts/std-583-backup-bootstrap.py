@@ -25,6 +25,10 @@ actual_std=subprocess.check_output(['git','-C',str(compiler/'dep/std'),'rev-pars
 assert actual_std=='3ee8e709a8ed7baff6e93780ce9b3582a907a91f',actual_std
 chosen=compiler/('B'+suffix)
 if host=='darwin':
+    copied=root/'.group-compiler'
+    shutil.copytree(compiler,copied,ignore=shutil.ignore_patterns('.git','out','.cache','A','C'))
+    compiler=copied
+    subprocess.run(['git','init','--quiet'],cwd=compiler,check=True)
     source=compiler/'dep/std/src/system/os/darwin/shared.mach'
     original=source.read_text()
     production=Path('src/system/os/darwin/shared.mach').read_text()
@@ -36,7 +40,7 @@ if host=='darwin':
     (evidence/'compiler-group-substitution.mach').write_text(production[start:finish])
     manifest=compiler/'mach.toml'
     manifest.write_text(manifest.read_text().replace('[dep.std]\ngit = "https://github.com/briar-systems/mach-std"\nref = "commit/'+actual_std+'"','[dep.std]\npath = "dep/std"'))
-    subprocess.run(['git','add','-f','mach.toml','dep/std'],cwd=compiler,check=True)
+    subprocess.run(['git','add','-f','mach.toml','src','dep/std'],cwd=compiler,check=True)
     census('corrected-group-compiler-build',host)
     result=subprocess.run([str(chosen),'build','.','-o','D'],cwd=compiler,capture_output=True,timeout=600)
     (evidence/'group-compiler-build.log').write_bytes(result.stdout+result.stderr)
