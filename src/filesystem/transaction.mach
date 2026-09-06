@@ -305,6 +305,24 @@ pub fun root_open(out: *Root, base: Path, rel: Path) O.Option[Error] {
     ret O.none[Error]();
 }
 
+# derive an independently owned root from a held directory capability
+# the caller keeps parent alive and reserves leaf across derivation and use
+# no ancestor pathname is reconstructed and a symlink leaf is refused
+pub fun root_open_child(out: *Root, parent: *Root, leaf: str) O.Option[Error] {
+    if (out == nil || !ownership.root_valid(parent)) { ret O.some[Error](error(INVALID, OP_ROOT_OPEN)); }
+    if (!leaf_is_component(leaf)) { ret O.some[Error](error(CONTAINMENT, OP_ROOT_OPEN)); }
+    val opened: R.Result[i32, Error] = verified_directory(parent.dirfd, leaf, OP_ROOT_OPEN);
+    if (R.is_err[i32, Error](opened)) { ret O.some[Error](R.unwrap_err[i32, Error](opened)); }
+    val fd: i32 = R.unwrap_ok[i32, Error](opened);
+    val initialized: i64 = ownership.root_init(out, fd);
+    if (initialized < 0) {
+        val closed: i64 = os.close(fd);
+        if (closed < 0) { ret O.some[Error](io_error(OP_ROOT_OPEN, closed)); }
+        ret O.some[Error](error(INVALID, OP_ROOT_OPEN));
+    }
+    ret O.none[Error]();
+}
+
 fun open_root_descriptor(base: Path, rel: Path) R.Result[i32, Error] {
     if (str_empty(base)) { ret R.err[i32, Error](error(INVALID, OP_ROOT_OPEN)); }
 
@@ -960,6 +978,11 @@ fun prepared(t: *Transaction) bool {
 
 # all owned resources are consumed before returning the claim's active borrow
 fun transaction_cleanup(t: *Transaction, remove: bool, op: Op) O.Option[Error] {
+    ret transaction_cleanup_retaining(t, remove, op, nil);
+}
+
+fun transaction_cleanup_retaining(t: *Transaction, remove: bool, op: Op, residue: *str) O.Option[Error] {
+    var remaining: bool = false;
     var failure: O.Option[Error] = O.none[Error]();
     if (t.staging_fd >= 0) {
         val closed: i64 = os.close(t.staging_fd);
@@ -969,17 +992,21 @@ fun transaction_cleanup(t: *Transaction, remove: bool, op: Op) O.Option[Error] {
     if (remove && t.staging_name != nil) {
         if (t.kind == ENTRY_FILE) {
             val removed: i64 = os.unlink_force(t.dirfd, t.staging_name, 0);
-            if (removed < 0 && removed != os.ENOENT && O.is_none[Error](failure)) {
-                failure = O.some[Error](io_error(op, removed));
+            if (removed < 0 && removed != os.ENOENT) {
+                remaining = true;
+                if (O.is_none[Error](failure)) { failure = O.some[Error](io_error(op, removed)); }
             }
         }
         or {
             var count: usize = 0;
             val removed: O.Option[removal.Error] = removal.private_tree(t.dirfd, t.staging_name, ?count, MAX_REMOVE_DEPTH);
-            if (O.is_some[removal.Error](removed) && O.is_none[Error](failure)) {
-                val e: removal.Error = O.unwrap[removal.Error](removed);
-                if (e.containment) { failure = O.some[Error](error(CONTAINMENT, op)); }
-                or { failure = O.some[Error](io_error(op, e.code)); }
+            if (O.is_some[removal.Error](removed)) {
+                remaining = true;
+                if (O.is_none[Error](failure)) {
+                    val e: removal.Error = O.unwrap[removal.Error](removed);
+                    if (e.containment) { failure = O.some[Error](error(CONTAINMENT, op)); }
+                    or { failure = O.some[Error](io_error(op, e.code)); }
+                }
             }
         }
     }
@@ -988,7 +1015,8 @@ fun transaction_cleanup(t: *Transaction, remove: bool, op: Op) O.Option[Error] {
         t.prior_fd = -1;
         if (closed < 0 && O.is_none[Error](failure)) { failure = O.some[Error](io_error(op, closed)); }
     }
-    str_free(t.alloc, t.staging_name);
+    if (remaining && residue != nil) { @residue = t.staging_name; }
+    or { str_free(t.alloc, t.staging_name); }
     t.staging_name = nil;
     t.leaf = nil;
     val destination: *Claim = t.destination;
@@ -1065,6 +1093,19 @@ pub fun transaction_staged_identity(t: *Transaction) R.Result[Identity, Error] {
     if (t.staging_fd >= 0) { raw = os.file_identity(t.staging_fd, ?identity); }
     or { raw = os.identity_at(t.dirfd, t.staging_name, ?identity); }
     if (raw < 0) { ret R.err[Identity, Error](io_error(OP_PREPARE, raw)); }
+    ret R.ok[Identity, Error](identity);
+}
+
+# observe one prepared subtree child through its original held staging directory
+# the observation does not transfer a reference or admit a mutation
+pub fun transaction_staged_child_identity(t: *Transaction, leaf: str) R.Result[Identity, Error] {
+    if (!prepared(t) || t.kind == ENTRY_FILE || t.staging_fd < 0) {
+        ret R.err[Identity, Error](error(INVALID, OP_PREPARE));
+    }
+    if (!leaf_is_component(leaf)) { ret R.err[Identity, Error](error(CONTAINMENT, OP_PREPARE)); }
+    var identity: Identity;
+    val observed: i64 = os.identity_at(t.staging_fd, leaf, ?identity);
+    if (observed < 0) { ret R.err[Identity, Error](io_error(OP_PREPARE, observed)); }
     ret R.ok[Identity, Error](identity);
 }
 
@@ -1319,6 +1360,90 @@ pub rec Outcome {
     achieved: Durability;
     # true when less was reached than was requested and the request allowed it
     shortfall: bool;
+}
+
+# exact effects of a caller-journaled file publication, including failure
+pub rec BackupOutcome {
+    consumed: bool;
+    prior_moved: bool;
+    published: bool;
+    achieved: Durability;
+    shortfall: bool;
+    failure: O.Option[Error];
+    cleanup_failure: O.Option[Error];
+    # owned by the caller with the transaction allocator, nil after successful cleanup
+    staging_residue: str;
+}
+
+fun finish_backup_commit(t: *Transaction, out: *BackupOutcome) BackupOutcome {
+    if (out.published) {
+        val dur: DurabilityRequest = t.options.durability;
+        out.shortfall = dur.level != DUR_NONE && !t.content_flushed;
+        if (dur.level != DUR_NONE && t.content_flushed) { out.achieved = DUR_FILE; }
+        if (dur.level == DUR_FULL && t.content_flushed) {
+            val synced: i64 = os.sync_fd(t.dirfd);
+            if (synced >= 0) { out.achieved = DUR_FULL; }
+            or {
+                out.shortfall = true;
+                if (dur.required) { out.failure = O.some[Error](error(DURABILITY, OP_COMMIT)); }
+            }
+        }
+    }
+    out.cleanup_failure = transaction_cleanup_retaining(t, !out.published, OP_COMMIT, ?out.staging_residue);
+    ret @out;
+}
+
+fun fail_backup_commit(t: *Transaction, out: *BackupOutcome, failure: Error) BackupOutcome {
+    out.failure = O.some[Error](failure);
+    ret finish_backup_commit(t, out);
+}
+
+# consume a prepared file while retaining its original for a caller-owned journal
+# requires same-object preparation, including initial absence, and a distinct
+# absent backup claim under the same lock. both reservations remain caller-owned.
+# each successful rename is reported even if the next step or cleanup fails.
+# no rollback or backup retirement is implicit. a published result may still carry
+# a durability or cleanup error. failure and cleanup_failure are independent.
+# staging_residue transfers only the name allocation when private removal fails.
+# the caller frees that string with t.alloc and retains its journal for recovery.
+# an invalid or copied transaction is not consumed. every valid prepared owner is.
+pub fun commit_with_backup(t: *Transaction, backup: *Claim) BackupOutcome {
+    var out: BackupOutcome = BackupOutcome{failure: O.none[Error](), cleanup_failure: O.none[Error]()};
+    if (!prepared(t)) { out.failure = O.some[Error](error(INVALID, OP_COMMIT)); ret out; }
+    t.state = STATE_SPENT;
+    out.consumed = true;
+    if (t.kind != ENTRY_FILE || t.options.precondition != PRE_SAME_OBJECT || backup == t.destination) {
+        ret fail_backup_commit(t, ?out, error(INVALID, OP_COMMIT));
+    }
+    val borrowed: O.Option[Error] = borrow_claim(backup, OP_COMMIT);
+    if (O.is_some[Error](borrowed)) { ret fail_backup_commit(t, ?out, O.unwrap[Error](borrowed)); }
+    fin { return_claim(backup); }
+    if (backup.owner != t.destination.owner) { ret fail_backup_commit(t, ?out, error(INVALID, OP_COMMIT)); }
+    var st: os.stat_t;
+    val backup_found: i64 = os.stat_path(t.dirfd, backup.leaf, ?st, os.AT_SYMLINK_NOFOLLOW);
+    if (backup_found >= 0) { ret fail_backup_commit(t, ?out, error(CONFLICT, OP_COMMIT)); }
+    if (backup_found != os.ENOENT) { ret fail_backup_commit(t, ?out, io_error(OP_COMMIT, backup_found)); }
+    val holds: R.Result[bool, Error] = precondition_holds(t);
+    if (R.is_err[bool, Error](holds)) { ret fail_backup_commit(t, ?out, R.unwrap_err[bool, Error](holds)); }
+    if (!R.unwrap_ok[bool, Error](holds)) { ret fail_backup_commit(t, ?out, error(PRECONDITION, OP_COMMIT)); }
+    if (t.had_prior) {
+        val prior_stat: i64 = os.stat(t.prior_fd, ?st);
+        if (prior_stat < 0) { ret fail_backup_commit(t, ?out, io_error(OP_COMMIT, prior_stat)); }
+        if ((os.stat_mode(?st) & os.S_IFMT) != os.S_IFREG) {
+            ret fail_backup_commit(t, ?out, error(CONFLICT, OP_COMMIT));
+        }
+    }
+    val closed: O.Option[Error] = close_staging(t);
+    if (O.is_some[Error](closed)) { ret fail_backup_commit(t, ?out, O.unwrap[Error](closed)); }
+    if (t.had_prior) {
+        val moved: i64 = os.rename(t.dirfd, t.leaf, t.dirfd, backup.leaf);
+        if (moved < 0) { ret fail_backup_commit(t, ?out, io_error(OP_COMMIT, moved)); }
+        out.prior_moved = true;
+    }
+    val placed: i64 = os.rename(t.dirfd, t.staging_name, t.dirfd, t.leaf);
+    if (placed < 0) { ret fail_backup_commit(t, ?out, io_error(OP_COMMIT, placed)); }
+    out.published = true;
+    ret finish_backup_commit(t, ?out);
 }
 
 # true when the destination still satisfies `pre`
@@ -5377,5 +5502,237 @@ test "std.filesystem.transaction.prior_access: readable outputs replace repeated
     val invalid: PrepareOptions = PrepareOptions{precondition: PRE_REPLACE, prior_access: 2, durability: durability_none()};
     val denied: O.Option[Error] = prepare_bytes(?t, ?alloc, destination, "bad", 3, 0o600, false, invalid);
     if (O.is_none[Error](denied) || O.unwrap[Error](denied).kind != INVALID || destination.active) { ret 13; }
+    ret 0;
+}
+
+fun t_backup_contents(root: *Root, leaf: str, expected: str) bool {
+    var bytes: [16]u8;
+    val read: R.Result[O.Option[usize], Error] = entry_read_all(root, leaf, ?bytes[0], 16);
+    if (R.is_err[O.Option[usize], Error](read)) { ret false; }
+    val count: O.Option[usize] = R.unwrap_ok[O.Option[usize], Error](read);
+    ret O.is_some[usize](count) && O.unwrap[usize](count) == str_len(expected)
+        && str_equals((?bytes[0])::str, expected);
+}
+
+fun t_backup_commit_case(which: u8) i32 {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val scratch: R.Result[str, str] = scratch_root(?alloc);
+    if (R.is_err[str, str](scratch)) { ret 2; }
+    val base: str = R.unwrap_ok[str, str](scratch);
+    fin { fs.remove_all(?alloc, base); str_free(?alloc, base); }
+    var root: Root;
+    if (O.is_some[Error](root_open(?root, base, ""))) { ret 3; }
+    fin { root_dnit(?root); }
+    var session: TestSession;
+    if (O.is_some[Error](t_session_init(?session, ?alloc, ?root))) { ret 4; }
+    fin { t_session_dnit(?session); }
+    val destination: *Claim = t_reserve(?session, "out");
+    val backup: *Claim = t_reserve(?session, "saved");
+    if (destination == nil || backup == nil) { ret 5; }
+    val existing: bool = which == 1 || which == 2 || which == 3;
+    if (existing && t_fixture_write(?root, "out", "prior") != 0) { ret 6; }
+    var tracker: testing.Testing;
+    if (O.is_some[str](testing.make(?tracker))) { ret 37; }
+    fin { testing.dnit(?tracker); }
+    val owned: *A.Allocator = testing.allocator_of(?tracker);
+    var t: Transaction;
+    val options: PrepareOptions = PrepareOptions{precondition: PRE_SAME_OBJECT, prior_access: READ_AUTHORIZED, durability: durability_full(true)};
+    val made: O.Option[Error] = prepare_bytes(?t, owned, destination, "next", 4, 0o600, false, options);
+    if (O.is_some[Error](made)) { ret 9; }
+    fin { if (prepared(?t)) { abort(?t); } }
+    val staged: R.Result[Identity, Error] = transaction_staged_identity(?t);
+    if (R.is_err[Identity, Error](staged)) { ret 10; }
+    if (which == 2) {
+        if (t_fixture_write(?root, "other", "alien") != 0) { ret 11; }
+        if (os.rename(root.dirfd, "other", root.dirfd, "out") < 0) { ret 12; }
+    }
+    if (which == 3) {
+        if (O.is_some[Error](close_staging(?t)) || os.unlink(root.dirfd, t.staging_name, 0) < 0) { ret 13; }
+    }
+    if (which == 4 || which == 5) {
+        if (t_fixture_write(?root, "saved", "foreign") != 0) { ret 14; }
+    }
+    if (which == 5) {
+        if (O.is_some[Error](close_staging(?t)) || os.unlink(root.dirfd, t.staging_name, 0) < 0) { ret 15; }
+        if (os.make_dir(root.dirfd, t.staging_name, 0o700) < 0) { ret 16; }
+    }
+    var out: BackupOutcome = commit_with_backup(?t, backup);
+    fin { str_free(owned, out.staging_residue); }
+    if (!out.consumed || prepared(?t) || destination.active || backup.active || session.held.borrowers != 2) { ret 17; }
+    if (which == 0 || which == 1) {
+        if (O.is_some[Error](out.failure) || O.is_some[Error](out.cleanup_failure)
+            || !out.published || out.prior_moved != existing || out.achieved != DUR_FULL || out.shortfall) { ret 18; }
+        if (!t_backup_contents(?root, "out", "next")) { ret 19; }
+        val identity: R.Result[O.Option[Identity], Error] = entry_identity(?root, "out");
+        if (R.is_err[O.Option[Identity], Error](identity)) { ret 20; }
+        val current: O.Option[Identity] = R.unwrap_ok[O.Option[Identity], Error](identity);
+        if (O.is_none[Identity](current) || !identity_equal(R.unwrap_ok[Identity, Error](staged), O.unwrap[Identity](current))) { ret 21; }
+        if (existing) {
+            if (!t_backup_contents(?root, "saved", "prior")) { ret 22; }
+            val prior: R.Result[O.Option[Identity], Error] = entry_identity(?root, "saved");
+            if (R.is_err[O.Option[Identity], Error](prior)) { ret 23; }
+            val saved: O.Option[Identity] = R.unwrap_ok[O.Option[Identity], Error](prior);
+            if (O.is_none[Identity](saved) || !identity_equal(t.prior, O.unwrap[Identity](saved))) { ret 24; }
+            if (O.is_some[Error](entry_unlink(backup))) { ret 25; }
+        }
+        or { if (!entry_absent(root.dirfd, "saved")) { ret 26; } }
+    }
+    or {
+        if (O.is_none[Error](out.failure) || out.published || out.achieved != DUR_NONE) { ret 27; }
+        if (which == 2) {
+            if (O.unwrap[Error](out.failure).kind != PRECONDITION || out.prior_moved
+                || !t_backup_contents(?root, "out", "alien") || !entry_absent(root.dirfd, "saved")) { ret 28; }
+        }
+        if (which == 3) {
+            if (!out.prior_moved || !entry_absent(root.dirfd, "out") || !t_backup_contents(?root, "saved", "prior")) { ret 29; }
+            if (O.is_some[Error](entry_rename(backup, destination)) || !t_backup_contents(?root, "out", "prior")) { ret 30; }
+        }
+        if (which == 4 || which == 5) {
+            if (O.unwrap[Error](out.failure).kind != CONFLICT || out.prior_moved
+                || !t_backup_contents(?root, "saved", "foreign") || !entry_absent(root.dirfd, "out")) { ret 31; }
+        }
+    }
+    if (which == 5) {
+        if (O.is_none[Error](out.cleanup_failure) || out.staging_residue == nil || !staging_residue(out.staging_residue)) { ret 32; }
+        if (os.unlink(root.dirfd, out.staging_residue, os.AT_REMOVEDIR) < 0) { ret 33; }
+    }
+    or { if (O.is_some[Error](out.cleanup_failure) || out.staging_residue != nil) { ret 34; } }
+    val spent: BackupOutcome = commit_with_backup(?t, backup);
+    if (spent.consumed || O.is_none[Error](spent.failure) || O.unwrap[Error](spent.failure).kind != INVALID) { ret 35; }
+    str_free(owned, out.staging_residue);
+    out.staging_residue = nil;
+    if (testing.leaked(?tracker) || testing.double_free_count(?tracker) != 0 || testing.tracking_exhausted(?tracker)) { ret 36; }
+    ret 0;
+}
+
+test "std.filesystem.transaction.backup_commit: initial absence publishes without creating a backup" {
+    ret t_backup_commit_case(0);
+}
+
+test "std.filesystem.transaction.backup_commit: prior identity and contents remain caller-owned" {
+    ret t_backup_commit_case(1);
+}
+
+test "std.filesystem.transaction.backup_commit: changed prior is preserved without any rename" {
+    ret t_backup_commit_case(2);
+}
+
+test "std.filesystem.transaction.backup_commit: second rename failure retains the original for explicit rollback" {
+    ret t_backup_commit_case(3);
+}
+
+test "std.filesystem.transaction.backup_commit: occupied backup is preserved and staging is consumed" {
+    ret t_backup_commit_case(4);
+}
+
+test "std.filesystem.transaction.backup_commit: cleanup residue ownership does not replace the primary error" {
+    ret t_backup_commit_case(5);
+}
+
+test "std.filesystem.transaction.backup_commit: copied owners and active backups cannot consume another borrow" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val scratch: R.Result[str, str] = scratch_root(?alloc);
+    if (R.is_err[str, str](scratch)) { ret 2; }
+    val base: str = R.unwrap_ok[str, str](scratch);
+    fin { fs.remove_all(?alloc, base); str_free(?alloc, base); }
+    var root: Root;
+    if (O.is_some[Error](root_open(?root, base, ""))) { ret 3; }
+    fin { root_dnit(?root); }
+    var session: TestSession;
+    if (O.is_some[Error](t_session_init(?session, ?alloc, ?root))) { ret 4; }
+    fin { t_session_dnit(?session); }
+    val destination: *Claim = t_reserve(?session, "out");
+    val backup: *Claim = t_reserve(?session, "saved");
+    if (destination == nil || backup == nil) { ret 5; }
+    var t: Transaction;
+    val options: PrepareOptions = PrepareOptions{precondition: PRE_SAME_OBJECT, durability: durability_none()};
+    if (O.is_some[Error](prepare_bytes(?t, ?alloc, destination, "next", 4, 0o600, false, options))) { ret 6; }
+    fin { if (prepared(?t)) { abort(?t); } }
+    var copied: Transaction = t;
+    val refused: BackupOutcome = commit_with_backup(?copied, backup);
+    if (refused.consumed || O.is_none[Error](refused.failure) || !prepared(?t) || !destination.active) { ret 7; }
+    if (O.is_some[Error](borrow_claim(backup, OP_COMMIT))) { ret 8; }
+    val busy: BackupOutcome = commit_with_backup(?t, backup);
+    if (!busy.consumed || O.is_none[Error](busy.failure) || destination.active || !backup.active) { return_claim(backup); ret 9; }
+    return_claim(backup);
+    if (!entry_absent(root.dirfd, "out") || !entry_absent(root.dirfd, "saved") || busy.staging_residue != nil) { ret 10; }
+    ret 0;
+}
+
+test "std.filesystem.transaction.root_open_child: derives the held namespace after ancestor rename" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val scratch: R.Result[str, str] = scratch_root(?alloc);
+    if (R.is_err[str, str](scratch)) { ret 2; }
+    val base: str = R.unwrap_ok[str, str](scratch);
+    fin { fs.remove_all(?alloc, base); str_free(?alloc, base); }
+    var outer: Root;
+    if (O.is_some[Error](root_open(?outer, base, ""))) { ret 3; }
+    fin { root_dnit(?outer); }
+    if (os.make_dir(outer.dirfd, "anchor", 0o700) < 0) { ret 4; }
+    var parent: Root;
+    if (O.is_some[Error](root_open_child(?parent, ?outer, "anchor"))) { ret 14; }
+    fin { root_dnit(?parent); }
+    if (os.make_dir(parent.dirfd, "before", 0o700) < 0) { ret 15; }
+    var child: Root;
+    if (O.is_some[Error](root_open_child(?child, ?parent, "before"))) { ret 5; }
+    if (t_fixture_write(?child, "data", "held") != 0 || O.is_some[Error](root_dnit(?child))) { ret 6; }
+    if (os.rename(outer.dirfd, "anchor", outer.dirfd, "moved") < 0) { ret 7; }
+    if (os.make_dir(outer.dirfd, "anchor", 0o700) < 0) { ret 16; }
+    if (O.is_some[Error](root_open_child(?child, ?parent, "before"))) { ret 8; }
+    fin { root_dnit(?child); }
+    if (!t_backup_contents(?child, "data", "held")) { ret 9; }
+    var copied: Root = parent;
+    var invalid: Root;
+    val refused: O.Option[Error] = root_open_child(?invalid, ?copied, "before");
+    if (O.is_none[Error](refused) || O.unwrap[Error](refused).kind != INVALID) { ret 10; }
+    if (O.is_none[Error](root_open_child(?invalid, ?parent, "../before"))) { ret 11; }
+    if (t_fixture_write(?parent, "file", "plain") != 0) { ret 12; }
+    val regular: O.Option[Error] = root_open_child(?invalid, ?parent, "file");
+    if (O.is_none[Error](regular) || O.unwrap[Error](regular).kind != CONTAINMENT) { ret 13; }
+    ret 0;
+}
+
+test "std.filesystem.transaction.staged_child_identity: journal observes the exact prepared descendant" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val scratch: R.Result[str, str] = scratch_root(?alloc);
+    if (R.is_err[str, str](scratch)) { ret 2; }
+    val base: str = R.unwrap_ok[str, str](scratch);
+    fin { fs.remove_all(?alloc, base); str_free(?alloc, base); }
+    var root: Root;
+    if (O.is_some[Error](root_open(?root, base, ""))) { ret 3; }
+    fin { root_dnit(?root); }
+    var session: TestSession;
+    if (O.is_some[Error](t_session_init(?session, ?alloc, ?root))) { ret 4; }
+    fin { t_session_dnit(?session); }
+    val destination: *Claim = t_reserve(?session, "src");
+    if (destination == nil) { ret 5; }
+    var inv: Inventory = inventory_init(?alloc);
+    fin { inventory_dnit(?inv); }
+    if (O.is_some[Error](inventory_push(?inv, entry_file("entry", "payload", 7, 0o000)))) { ret 6; }
+    var t: Transaction;
+    val options: PrepareOptions = PrepareOptions{precondition: PRE_ABSENT, durability: durability_none()};
+    if (O.is_some[Error](prepare_subtree(?t, ?alloc, destination, ?inv, 0o700, options))) { ret 7; }
+    fin { if (prepared(?t)) { abort(?t); } }
+    val before: R.Result[Identity, Error] = transaction_staged_child_identity(?t, "entry");
+    if (R.is_err[Identity, Error](before)) { ret 8; }
+    var copy: Transaction = t;
+    if (R.is_ok[Identity, Error](transaction_staged_child_identity(?copy, "entry"))) { ret 9; }
+    val escape: R.Result[Identity, Error] = transaction_staged_child_identity(?t, "../entry");
+    if (R.is_ok[Identity, Error](escape) || R.unwrap_err[Identity, Error](escape).kind != CONTAINMENT) { ret 10; }
+    val absent: R.Result[Identity, Error] = transaction_staged_child_identity(?t, "missing");
+    if (R.is_ok[Identity, Error](absent) || R.unwrap_err[Identity, Error](absent).code != os.ENOENT) { ret 11; }
+    if (R.is_err[Outcome, Error](commit(?t))) { ret 12; }
+    if (R.is_ok[Identity, Error](transaction_staged_child_identity(?t, "entry"))) { ret 13; }
+    var child: Root;
+    if (O.is_some[Error](root_open_child(?child, ?root, "src"))) { ret 14; }
+    fin { root_dnit(?child); }
+    val after: R.Result[O.Option[Identity], Error] = entry_identity(?child, "entry");
+    if (R.is_err[O.Option[Identity], Error](after)) { ret 15; }
+    val observed: O.Option[Identity] = R.unwrap_ok[O.Option[Identity], Error](after);
+    if (O.is_none[Identity](observed) || !identity_equal(R.unwrap_ok[Identity, Error](before), O.unwrap[Identity](observed))) { ret 16; }
     ret 0;
 }
