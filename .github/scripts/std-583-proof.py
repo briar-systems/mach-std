@@ -23,9 +23,11 @@ def run(name, selected, counts, changed=None):
     shutil.copytree('src', snapshot / 'src', dirs_exist_ok=True)
     if changed is not None:
         (snapshot / identity_path).write_text(changed, encoding='utf-8', newline='')
+    shutil.rmtree(root / 'test/native/out', ignore_errors=True)
+    shutil.rmtree(root / 'test/native/.cache', ignore_errors=True)
     census(name, host)
     result = subprocess.run([os.environ.get('MACH_583_COMPILER', 'mach'), 'test', 'test/native', '--target', host + '-' + arch,
-        '--include-deps', '--filter', selected], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
+        '--include-deps', '--profile', os.environ.get('MACH_583_PROFILE', 'debug'), '--filter', selected], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
     log = result.stdout.decode('utf-8', errors='replace')
     (evidence / (name + '.log')).write_text(log, encoding='utf-8')
     clean = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', log)
@@ -34,7 +36,7 @@ def run(name, selected, counts, changed=None):
     exits = re.findall(r'^\s*FAIL\s+.*\(exit ([^)]+)\)', clean, re.MULTILINE)
     valid = actual == counts and ((result.returncode == 0) == (counts[1] == 0))
     valid = valid and len(exits) == counts[1] and all(x.isdigit() and int(x) != 0 for x in exits)
-    record = dict(name=name, counts=actual, exits=exits, code=result.returncode, verified=valid)
+    record = dict(name=name, profile=os.environ.get('MACH_583_PROFILE', 'debug'), counts=actual, exits=exits, code=result.returncode, verified=valid)
     results.append(record)
     print(json.dumps(record), flush=True)
     (evidence / 'summary.json').write_text(json.dumps(results, indent=2))
