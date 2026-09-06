@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import re
 import runpy
@@ -23,7 +24,7 @@ def run(name, selected, counts, changed=None):
     if changed is not None:
         (snapshot / identity_path).write_text(changed, encoding='utf-8', newline='')
     census(name, host)
-    result = subprocess.run(['mach', 'test', 'test/native', '--target', host + '-' + arch,
+    result = subprocess.run([os.environ.get('MACH_583_COMPILER', 'mach'), 'test', 'test/native', '--target', host + '-' + arch,
         '--include-deps', '--filter', selected], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
     log = result.stdout.decode('utf-8', errors='replace')
     (evidence / (name + '.log')).write_text(log, encoding='utf-8')
