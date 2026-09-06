@@ -1187,15 +1187,10 @@ pub fun spawn_redirected_in(pathname: *u8, argv: **u8, envp: **u8, cwd: *u8, std
 # spawn a child with redirected streams and an explicit working directory,
 # placed as the leader of its own new process group
 #
-# identical to spawn_redirected_in except both sides of the real fork() call
-# setpgid: the child calls setpgid(0, 0) on itself before exec, and the parent
-# ALSO calls setpgid(pid, pid) on the child. unlike the linux backend (which
-# suspends the parent under CLONE_VFORK until the child execs), darwin's fork
-# lets parent and child run concurrently, so either call may lose the race and
-# fail - the parent's failure is ignored (Stevens' classic double-setpgid
-# mitigation: whichever side runs first wins, and by the time both have run
-# the group is guaranteed to exist before any external observer can use the
-# returned pid).
+# the child alone creates the group and acknowledges it through a private pipe.
+# the parent returns only after receiving readiness, so immediate group signals
+# cannot race establishment. failed handshakes close their pipes and reap the
+# unexposed child before returning the native error.
 # ---
 # pathname:  path to executable
 # argv:      null-terminated argument array
@@ -1209,14 +1204,55 @@ pub fun spawn_redirected_in_grouped(pathname: *u8, argv: **u8, envp: **u8, cwd: 
     ret spawn_redirected_in_impl(pathname, argv, envp, cwd, stdin_fd, stdout_fd, stderr_fd, 1);
 }
 
+# pipe records are complete before child readiness is observable
+fun group_handshake(fd: i32, status: *i64, sending: bool) i64 {
+    var transferred: usize = 0;
+    for (transferred < $size_of(i64)) {
+        val data: *u8 = (status::usize + transferred)::*u8;
+        var count: i64 = 0;
+        if (sending) { count = write(fd, data, $size_of(i64) - transferred); }
+        or { count = read(fd, data, $size_of(i64) - transferred); }
+        if (count < 0) { ret count; }
+        if (count == 0 || count::usize > $size_of(i64) - transferred) { ret EIO; }
+        transferred = transferred + count::usize;
+    }
+    ret 0;
+}
+
+# the pid remains private and unreaped throughout failure cleanup
+fun discard_spawn_child(pid: i64) i64 {
+    var failure: i64 = 0;
+    val group: i64 = syscall2(SYS_KILL, (-pid)::usize, SIGKILL::usize);
+    if (group < 0 && group != ESRCH) { failure = group; }
+    val child: i64 = syscall2(SYS_KILL, pid::usize, SIGKILL::usize);
+    if (child < 0 && child != ESRCH && failure >= 0) { failure = child; }
+    var status: i32 = 0;
+    var waited: i64 = wait_pid(pid, ?status, 0);
+    for (waited == EINTR) { waited = wait_pid(pid, ?status, 0); }
+    if (waited < 0 && failure >= 0) { failure = waited; }
+    ret failure;
+}
+
 fun spawn_redirected_in_impl(pathname: *u8, argv: **u8, envp: **u8, cwd: *u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32, grouped: i32) i64 {
+    var ready: [2]i32;
+    if (grouped != 0) {
+        if (ls.pipe(?ready[0]) < 0) { ret ls.fail_errno(); }
+        var flags: i64 = set_fd_flags(ready[0], FD_CLOEXEC);
+        if (flags >= 0) { flags = set_fd_flags(ready[1], FD_CLOEXEC); }
+        if (flags < 0) { close(ready[0]); close(ready[1]); ret flags; }
+    }
     val pid: i64 = fork();
     if (pid < 0) {
+        if (grouped != 0) { close(ready[0]); close(ready[1]); }
         ret pid;
     }
     if (pid == 0) {
-        if (grouped != 0 && syscall2(SYS_SETPGID, 0, 0) < 0) {
-            syscall1(SYS_EXIT, 126);
+        if (grouped != 0) {
+            var status: i64 = close(ready[0]);
+            if (status >= 0) { status = syscall2(SYS_SETPGID, 0, 0); }
+            val sent: i64 = group_handshake(ready[1], ?status, true);
+            val closed: i64 = close(ready[1]);
+            if (status < 0 || sent < 0 || closed < 0) { syscall1(SYS_EXIT, 126); }
         }
         if (stdin_fd != -1 && syscall2(SYS_DUP2, stdin_fd::isize::usize, STDIN_FD::isize::usize) < 0) {
             syscall1(SYS_EXIT, 126);
@@ -1236,10 +1272,19 @@ fun spawn_redirected_in_impl(pathname: *u8, argv: **u8, envp: **u8, cwd: *u8, st
         exec(pathname, argv, envp);
         syscall1(SYS_EXIT, 127);
     }
-    # parent-side half of the race mitigation described above; EACCES here
-    # (the child already exec'd) is expected and not an error, since the
-    # child's own call already succeeded in that case.
-    if (grouped != 0) { syscall2(SYS_SETPGID, pid::usize, pid::usize); }
+    if (grouped != 0) {
+        var failure: i64 = close(ready[1]);
+        var status: i64 = 0;
+        if (failure >= 0) { failure = group_handshake(ready[0], ?status, false); }
+        val closed: i64 = close(ready[0]);
+        if (failure >= 0 && status < 0) { failure = status; }
+        if (failure >= 0 && closed < 0) { failure = closed; }
+        if (failure < 0) {
+            val consumed: i64 = discard_spawn_child(pid);
+            if (consumed < 0) { ret consumed; }
+            ret failure;
+        }
+    }
     ret pid;
 }
 
@@ -2972,4 +3017,59 @@ pub fun error_message(code: i64) str {
     or (code == ENOTEMPTY) { ret "directory not empty"; }
     or (code == ENOTSUP) { ret "operation not supported"; }
     or { ret "unknown error"; }
+}
+
+fun grouped_launch_probe(arg: *u8) {
+    val failed: *i64 = arg::*i64;
+    var argv: [3]usize;
+    argv[0] = ("/bin/sleep")::usize;
+    argv[1] = ("10")::usize;
+    argv[2] = 0;
+    var envp: [1]usize;
+    envp[0] = 0;
+    var i: usize = 0;
+    for (i < 32) {
+        var pid: i64 = 0;
+        if (i % 3 == 0) { pid = spawn_grouped("/bin/sleep", (?argv[0])::**u8, (?envp[0])::**u8); }
+        or (i % 3 == 1) { pid = spawn_redirected_grouped("/bin/sleep", (?argv[0])::**u8, (?envp[0])::**u8, -1, -1, -1); }
+        or { pid = spawn_redirected_in_grouped("/bin/sleep", (?argv[0])::**u8, (?envp[0])::**u8, "/", -1, -1, -1); }
+        if (pid < 0) { atomic.store(failed, 2); ret; }
+        val group: i64 = getpgid(pid);
+        val consumed: i64 = discard_spawn_child(pid);
+        if (group != pid) { atomic.store(failed, 3); ret; }
+        if (consumed < 0) { atomic.store(failed, 4); ret; }
+        i = i + 1;
+    }
+}
+
+fun grouped_probe_descriptors() usize {
+    var count: usize = 0;
+    var fd: i32 = 0;
+    for (fd < 256) {
+        if (fd_flags(fd) >= 0) { count = count + 1; }
+        fd = fd + 1;
+    }
+    ret count;
+}
+
+test "std.system.os.darwin.spawn: concurrent grouped launches return ready groups without leaking pipes" {
+    val before: usize = grouped_probe_descriptors();
+    var workers: [4]TestThread;
+    var failures: [4]i64;
+    var started: usize = 0;
+    var bad: i32 = 0;
+    for (started < 4 && bad == 0) {
+        failures[started] = 0;
+        if (tt_spawn(grouped_launch_probe, (?failures[started])::*u8, ?workers[started]) < 0) { bad = 1; }
+        or { started = started + 1; }
+    }
+    var i: usize = 0;
+    for (i < started) {
+        tt_join(?workers[i]);
+        if (atomic.load(?failures[i]) != 0 && bad == 0) { bad = atomic.load(?failures[i])::i32; }
+        i = i + 1;
+    }
+    if (bad != 0) { ret bad; }
+    if (grouped_probe_descriptors() != before) { ret 5; }
+    ret 0;
 }
