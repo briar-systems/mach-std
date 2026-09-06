@@ -48,11 +48,11 @@ def run(name, selected, counts, changed=None, extra=None):
 
 
 owner_path = 'src/filesystem/transaction/ownership.mach'
-owner = (root / owner_path).read_text()
+owner = (root / owner_path).read_text(encoding='utf-8')
 windows_path = 'src/system/os/windows/shared.mach'
-windows = (root / windows_path).read_text()
+windows = (root / windows_path).read_text(encoding='utf-8')
 os_path = 'src/system/os.mach'
-os_source = (root / os_path).read_text()
+os_source = (root / os_path).read_text(encoding='utf-8')
 
 def command(args):
     result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
