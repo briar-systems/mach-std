@@ -49,6 +49,7 @@ def run(name, selected, counts, changed=None, extra=None):
 try:
     for profile in (['debug', 'release'] if host == 'darwin' else ['debug']):
         os.environ['MACH_583_PROFILE'] = profile
+        run(profile + '-file-observations', 'io.file:', [13, 0, 13])
         run(profile + '-serialization', 'std.system.file_identity:', [2, 0, 2])
         run(profile + '-native-observation', 'std.system.os.file_identity:', [2, 0, 2])
         before = 'for (i < 41) {\n        if (a.representation[i] != b.representation[i])'
