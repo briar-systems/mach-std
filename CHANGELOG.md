@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Cooperative publication ownership primitives keep roots, locks and borrowers
+  in final storage, reject copied owners, and exclude recovery while borrowers
+  remain live. Fresh claim directories use native destination-name equivalence
+  and admit work only after successful initialization (#583).
+
 - Explicit filesystem identity observations preserve complete native identifiers
   and serialize one backend-qualified representation. Windows local identities
   include the volume GUID, 64-bit volume serial and 128-bit file ID. Unsupported
