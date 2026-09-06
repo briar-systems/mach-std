@@ -36,6 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Darwin grouped spawning gives the child sole authority to create its process
+  group and waits for explicit readiness before exposing the PID. Concurrent
+  launches no longer race two native group creators.
+
 - Whole-file string reads reject unrepresentable sizes before allocation and
   release the exact buffer on read or close failure.
 
