@@ -38,10 +38,31 @@ def run(name, selected, counts, changed=None, extra=None):
     exits = re.findall(r'^\s*FAIL\s+.*\(exit ([^)]+)\)', clean, re.MULTILINE)
     valid = actual == counts and ((result.returncode == 0) == (counts[1] == 0))
     valid = valid and len(exits) == counts[1] and all(x.isdigit() and int(x) != 0 for x in exits)
+    expected_exits = {
+        'missing-private-restoration': ['13'],
+        'public-mode-expansion': ['11'],
+        'file-mode-expansion': ['14'],
+        'follow-mode-mutant': ['10'],
+        'duplicate-claim-mutant': ['13'],
+    }
+    for suffix, expected in expected_exits.items():
+        if name.endswith(suffix):
+            valid = valid and exits == expected
     record = dict(name=name, profile=os.environ.get('MACH_583_PROFILE', 'debug'), counts=actual, exits=exits, code=result.returncode, verified=valid)
     results.append(record)
     print(json.dumps(record), flush=True)
     (evidence / 'summary.json').write_text(json.dumps(results, indent=2))
+    fixture = root / 'mach_612_private_removal'
+    if fixture.exists():
+        def remove_owned(path):
+            if path.is_symlink() or not path.is_dir():
+                path.unlink()
+                return
+            path.chmod(0o700)
+            for child in path.iterdir():
+                remove_owned(child)
+            path.rmdir()
+        remove_owned(fixture)
     if not valid:
         print(log, flush=True)
         raise AssertionError(record)
