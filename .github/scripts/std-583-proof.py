@@ -53,6 +53,18 @@ try:
         run(profile + '-descent', 'std.filesystem.transaction.descend:', [1, 0, 1])
         if host != 'windows':
             run(profile + '-private-modes', 'std.system.os.mode:', [1, 0, 1])
+            run(profile + '-private-cleanup', 'std.filesystem.removal.private:', [1, 0, 1])
+            removal_path = 'src/filesystem/removal.mach'
+            removal_source = (root / removal_path).read_text(encoding='utf-8')
+            before = 'if (private && (os.stat_mode(?before) & 0o700) != 0o700) {'
+            assert removal_source.count(before) == 1
+            run(profile + '-missing-private-restoration', 'std.filesystem.removal.private:', [0, 1, 1], extra={removal_path: removal_source.replace(before, 'if (false) {')})
+            before = 'ret walk(dirfd, name, removed, 0, max_depth, false);'
+            assert removal_source.count(before) == 1
+            run(profile + '-public-mode-expansion', 'std.filesystem.removal.private:', [0, 1, 1], extra={removal_path: removal_source.replace(before, 'ret walk(dirfd, name, removed, 0, max_depth, true);')})
+            before = '        val raw: i64 = os.unlink_force(dirfd, name, 0);'
+            assert removal_source.count(before) == 1
+            run(profile + '-file-mode-expansion', 'std.filesystem.removal.private:', [0, 1, 1], extra={removal_path: removal_source.replace(before, '        if (private) { os.set_mode_at(dirfd, name, 0o700); }\n' + before)})
             mode_path = 'src/system/os/' + host + '/shared.mach'
             mode_source = (root / mode_path).read_text(encoding='utf-8')
             before = 'name::usize, mode::usize, AT_SYMLINK_NOFOLLOW::usize)' if host == 'linux' else 'dirfd, name, mode::u32, AT_SYMLINK_NOFOLLOW)'
