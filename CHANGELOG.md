@@ -9,11 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Cooperative publication ownership primitives keep roots, locks and borrowers
+  in final storage, reject copied owners, and exclude recovery while borrowers
+  remain live. Fresh claim directories use native destination-name equivalence
+  and admit work only after successful initialization. Sessions own stable
+  destination claims before worker admission. Active transaction or mutation
+  borrowers exclude simultaneous use without releasing the planned reservation
+  (#583).
+
+- Explicit filesystem identity observations preserve complete native identifiers
+  and serialize one backend-qualified local representation. Windows identities
+  retain the full 64-bit volume serial and 128-bit file ID without a pathname
+  query, including while an unlinked object remains open. Unsupported
+  identity domains remain distinct from presence and type observations.
+  `filesystem.Metadata` no longer carries an implicit truncated identity.
+  `identity_of` and `identity_link` query it explicitly, and portable watch
+  scans retain the complete observation separately. Transaction entry probes
+  report presence and type without identity queries, and explicit root, entry
+  and staging identity APIs use the same complete representation. Rooted
+  containment relies on nofollow opens instead of truncated identity checks
+  between unretained observations (#583).
+
+
 - `std.types.path.root` borrows an indivisible root prefix through the existing
   `std.types.view.View`, preserving native drive and UNC spelling without
   allocating or splitting the root (#608).
 
 ### Fixed
+
+- Transaction preparation selects preconditions and durability before retaining
+  any prior object or creating staging. Commit and abort consume final-storage
+  transactions and release their active destination borrow on every path.
+  Mutation helpers require the same planned Claim capabilities, recovery rejects
+  live claims and workers, and failed recovery keeps admission closed (#583).
+- Subtree preparation flushes file data through its original writable handles
+  and completes directory modes and barriers in child-first order. Explicit
+  directory modes apply even when files introduce their parents first. Private
+  mode `000` trees remain abortable and recoverable without granting content-read
+  access to files or changing public objects. Permissive durability reports every
+  missing child barrier instead of allowing an outer directory flush to hide it
+  (#612).
+
 
 - Darwin grouped spawning gives the child sole authority to create its process
   group and waits for explicit readiness before exposing the PID. Concurrent
