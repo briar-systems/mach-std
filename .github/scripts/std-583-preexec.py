@@ -1,0 +1,50 @@
+import json
+import os
+from pathlib import Path
+import re
+import runpy
+import shutil
+import subprocess
+import sys
+arch=sys.argv[1]
+root=Path.cwd()
+evidence=root/'std-583-evidence'
+census=runpy.run_path('.github/scripts/std-583-census.py')['census']
+compiler=root/'.identity-compiler'
+source=compiler/'dep/std/src/system/os/darwin/shared.mach'
+original=source.read_text()
+start=original.index('fun spawn_redirected_in_impl(')
+end=original.index('\n}',start)+2
+region=original[start:end]
+assert region.count('syscall1(SYS_EXIT, 126);')==5
+for code in range(141,146):
+    region=region.replace('syscall1(SYS_EXIT, 126);','syscall1(SYS_EXIT, '+str(code)+');',1)
+source.write_text(original[:start]+region+original[end:])
+try:
+    census('diagnostic-compiler-build','darwin')
+    build=subprocess.run(['./B','build','.','-o','D'],cwd=compiler,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=600)
+    (evidence/'preexec-compiler-build.log').write_bytes(build.stdout)
+    assert build.returncode==0,build.returncode
+finally:
+    source.write_text(original)
+(evidence/'preexec-codes.json').write_text(json.dumps(dict(source='2e9bef5e57838f4a81321c1da6c5070a45e3afb0',std='3ee8e709a8ed7baff6e93780ce9b3582a907a91f',codes={141:'setpgid',142:'stdin dup2',143:'stdout dup2',144:'stderr dup2',145:'chdir'},restored=True),indent=2))
+snapshot=root/'test/native/dep/std'
+shutil.copytree('src',snapshot/'src',dirs_exist_ok=True)
+results=[]
+for iteration in range(3):
+    census('preexec-diagnostic-'+str(iteration),'darwin')
+    run=subprocess.run([str(compiler/'D'),'test','test/native','--target','darwin-'+arch,'--include-deps','--profile','debug'],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=240)
+    log=run.stdout.decode('utf-8',errors='replace')
+    (evidence/('preexec-suite-'+str(iteration)+'.log')).write_text(log)
+    print(log,flush=True)
+    codes=re.findall(r'\(exit (14[1-5])\)',log)
+    results.append(dict(iteration=iteration,code=run.returncode,preexec_codes=codes))
+    (evidence/'preexec-summary.json').write_text(json.dumps(results,indent=2))
+    if codes:
+        break
+image=root/('test/native/out/darwin-'+arch+'/debug/test/native-suite')
+if image.exists():
+    shutil.copy2(image,evidence/'preexec-native-suite')
+    (evidence/'preexec-otool.txt').write_bytes(subprocess.check_output(['otool','-l',str(image)]))
+shutil.copy2(compiler/'D',evidence/'D-preexec-compiler')
+assert any(item['preexec_codes'] for item in results),'no pre-exec refusal reproduced in three diagnostic suite runs'
