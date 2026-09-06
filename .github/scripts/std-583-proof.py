@@ -51,6 +51,14 @@ try:
         os.environ['MACH_583_PROFILE'] = profile
         run(profile + '-root-containment', 'std.filesystem.transaction.root_open:', [3, 0, 3] if host == 'windows' else [2, 0, 2])
         run(profile + '-descent', 'std.filesystem.transaction.descend:', [1, 0, 1])
+        if host != 'windows':
+            run(profile + '-private-modes', 'std.system.os.mode:', [1, 0, 1])
+            mode_path = 'src/system/os/' + host + '/shared.mach'
+            mode_source = (root / mode_path).read_text(encoding='utf-8')
+            before = 'name::usize, mode::usize, AT_SYMLINK_NOFOLLOW::usize)' if host == 'linux' else 'dirfd, name, mode::u32, AT_SYMLINK_NOFOLLOW)'
+            after = 'name::usize, mode::usize, 0)' if host == 'linux' else 'dirfd, name, mode::u32, 0)'
+            assert mode_source.count(before) == 1
+            run(profile + '-follow-mode-mutant', 'std.system.os.mode:', [0, 1, 1], extra={mode_path: mode_source.replace(before, after)})
         run(profile + '-public-ownership', 'std.filesystem.transaction.ownership: public descent', [1, 0, 1])
         run(profile + '-sibling-workers', 'std.filesystem.transaction.ownership: admitted sibling', [1, 0, 1])
         owner_path = 'src/filesystem/transaction/ownership.mach'
