@@ -25,7 +25,7 @@ def run(name, selected, counts, edits=None):
         (snapshot / path).write_text(body, encoding='utf-8', newline='')
     census(name, host)
     result = subprocess.run(['mach', 'test', 'test/native', '--target', host + '-x86_64',
-        '--include-deps', '--filter', selected], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        '--include-deps', '--timeout_seconds', '30', '--filter', selected], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     log = result.stdout.decode('utf-8', errors='replace')
     (evidence / (name + '.log')).write_text(log, encoding='utf-8')
     clean = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', log)
