@@ -36,6 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Whole-file string reads reject unrepresentable sizes before allocation and
+  release the exact buffer on read or close failure.
+
 - Transaction preparation selects preconditions and durability before retaining
   any prior object or creating staging. Commit and abort consume final-storage
   transactions and release their active destination borrow on every path.
