@@ -16,7 +16,7 @@ snapshot.mkdir(parents=True,exist_ok=True)
 shutil.copy2('mach.toml',snapshot/'mach.toml')
 shutil.copytree('src',snapshot/'src',dirs_exist_ok=True)
 results=[]
-for profile in (['debug','release'] if host=='darwin' else ['debug']):
+for profile in ['debug','release']:
     for name,selected in [('lifecycle','std.filesystem.transaction')]:
         shutil.rmtree(root/'test/native/out',ignore_errors=True)
         shutil.rmtree(root/'test/native/.cache',ignore_errors=True)
