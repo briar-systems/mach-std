@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from pathlib import Path
 import runpy
 import shutil
@@ -36,6 +37,7 @@ changed[transaction] = changed[transaction].replace(needle, needle + dump('claim
 needle = 'fun register(out: *Borrow, held: *Lock) i64 {'
 changed[ownership] = changed[ownership].replace(needle, needle + dump('register-entry', 'out', 'Borrow'))
 results = []
+case_index = None
 try:
     for version, compiler in [('released', 'mach'), ('audited', os.environ['MACH_583_COMPILER'])]:
         for variant, contents in [('baseline', original), ('state', changed)]:
@@ -58,8 +60,20 @@ try:
                                            ('out' in path.parts and path.suffix in ('', '.exe'))):
                         archive.write(path, str(path))
             results.append(dict(version=version, variant=variant, code=run.returncode, args=args))
+            if version == 'released':
+                match = re.search(rb'rerun: [^\n]+ (\d+)\r?\n', run.stdout)
+                assert match is not None, (label, 'runtime rerun index absent')
+                case_index = match.group(1).decode()
             if variant == 'state':
-                assert b'STATE-after-init' in run.stdout, (label, 'runtime state was not emitted')
+                binaries = list(Path('test/native/out').rglob('native-suite.exe' if host == 'windows' else 'native-suite'))
+                assert len(binaries) == 1, binaries
+                census(label + '-direct', host)
+                direct = subprocess.run([str(binaries[0].resolve()), case_index], stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, timeout=60)
+                (evidence / (label + '-direct.log')).write_bytes(direct.stdout)
+                assert b'STATE-after-init' in direct.stdout, (label, 'runtime state was not emitted')
+                assert direct.returncode == (5 if version == 'released' else 0), (label, direct.returncode)
+
             if version == 'audited':
                 assert run.returncode == 0, (label, run.returncode)
             else:
