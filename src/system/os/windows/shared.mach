@@ -773,15 +773,27 @@ pub val ERANGE:    i64 = -34;
 
 pub val EINTR_MAX_RETRIES: usize = 8;
 
-# HANDLE-to-fd mapping table
-
-val MAX_FDS: usize = 256;
-var _handles: [256]isize;
+val HEAP_ZERO_MEMORY: u32 = 8;
 val DIR_SCAN_START:  u8 = 0;
 val DIR_SCAN_ACTIVE: u8 = 1;
 val DIR_SCAN_END:    u8 = 2;
-var _directory_state: [256]u8;
-var _handle_locks: [256]i64;
+
+rec FdEntry {
+    handle: isize;
+    lock: i64;
+    next_free: i32;
+    directory_state: u8;
+}
+
+rec FdSegment { entries: [1024]FdEntry; }
+rec FdDirectory { segments: [1024]*FdSegment; }
+
+# published pages live until process exit so wait addresses never move.
+var _fd_directories: [2048]*FdDirectory;
+var _fd_first_directory: FdDirectory;
+var _fd_first_segment: FdSegment;
+var _fd_count: usize = 3;
+var _fd_free: i32 = -1;
 var _initialized: bool = false;
 var _fd_lock: i64 = 0;
 
@@ -796,78 +808,134 @@ fun fd_spin_unlock() {
     atomic.store(?_fd_lock, 0);
 }
 
+fun init_fds() {
+    if (_initialized) { ret; }
+    _fd_directories[0] = ?_fd_first_directory;
+    _fd_first_directory.segments[0] = ?_fd_first_segment;
+    _fd_first_segment.entries[0].handle = GetStdHandle(STD_INPUT_HANDLE);
+    _fd_first_segment.entries[1].handle = GetStdHandle(STD_OUTPUT_HANDLE);
+    _fd_first_segment.entries[2].handle = GetStdHandle(STD_ERROR_HANDLE);
+    _initialized = true;
+}
+
+# callers hold the registry lock while reading its page index.
+fun fd_entry_locked(fd: i32) *FdEntry {
+    if (fd < 0 || fd::usize >= _fd_count) { ret nil; }
+    val index: usize = fd::usize;
+    val directory: *FdDirectory = _fd_directories[index >> 20];
+    val segment: *FdSegment = directory.segments[(index >> 10) & 1023];
+    ret ?segment.entries[index & 1023];
+}
+
+fun fd_entry(fd: i32) *FdEntry {
+    fd_spin_lock();
+    init_fds();
+    val entry: *FdEntry = fd_entry_locked(fd);
+    fd_spin_unlock();
+    ret entry;
+}
+
 fun handle_lock(fd: i32) bool {
-    if (fd < 0 || fd::usize >= MAX_FDS) { ret false; }
+    val entry: *FdEntry = fd_entry(fd);
+    if (entry == nil) { ret false; }
     var expected: i64 = 0;
-    for (!atomic.cas(?_handle_locks[fd::usize], ?expected, 1)) {
+    for (!atomic.cas(?entry.lock, ?expected, 1)) {
         var busy: i64 = 1;
-        WaitOnAddress((?_handle_locks[fd::usize])::ptr, (?busy)::ptr, 8, INFINITE);
+        WaitOnAddress((?entry.lock)::ptr, (?busy)::ptr, 8, INFINITE);
         expected = 0;
     }
     ret true;
 }
 
 fun handle_unlock(fd: i32) {
-    atomic.store(?_handle_locks[fd::usize], 0);
-    WakeByAddressSingle((?_handle_locks[fd::usize])::ptr);
+    val entry: *FdEntry = fd_entry(fd);
+    atomic.store(?entry.lock, 0);
+    WakeByAddressSingle((?entry.lock)::ptr);
 }
 
-fun init_fds() {
-    if (_initialized) {
-        ret;
+fun fd_page_allocate(size: usize) ptr {
+    ret HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, size);
+}
+
+# build missing pages privately and publish only a complete slot path.
+fun fd_grow(index: usize, allocate_zeroed_page: fun(usize) ptr) *FdEntry {
+    val root: usize = index >> 20;
+    val page: usize = (index >> 10) & 1023;
+    var directory: *FdDirectory = _fd_directories[root];
+    val fresh: bool = directory == nil;
+    if (fresh) {
+        directory = allocate_zeroed_page($size_of(FdDirectory))::*FdDirectory;
+        if (directory == nil) { ret nil; }
     }
-    var i: usize = 0;
-    for (i < MAX_FDS) {
-        _handles[i] = INVALID_HANDLE_VALUE;
-        _directory_state[i] = DIR_SCAN_START;
-        i = i + 1;
+    var segment: *FdSegment = directory.segments[page];
+    if (segment == nil) {
+        segment = allocate_zeroed_page($size_of(FdSegment))::*FdSegment;
+        if (segment == nil) {
+            if (fresh) { HeapFree(GetProcessHeap(), 0, directory::ptr); }
+            ret nil;
+        }
+        directory.segments[page] = segment;
     }
-    _handles[0] = GetStdHandle(STD_INPUT_HANDLE);
-    _handles[1] = GetStdHandle(STD_OUTPUT_HANDLE);
-    _handles[2] = GetStdHandle(STD_ERROR_HANDLE);
-    _initialized = true;
+    if (fresh) { _fd_directories[root] = directory; }
+    ret ?segment.entries[index & 1023];
 }
 
 fun alloc_fd(h: isize) i32 {
+    ret alloc_fd_using(h, fd_page_allocate);
+}
+
+fun alloc_fd_using(h: isize, allocate_zeroed_page: fun(usize) ptr) i32 {
     fd_spin_lock();
     init_fds();
-    var fd: usize = 3;
-    for (fd < MAX_FDS) {
-        if (_handles[fd] == INVALID_HANDLE_VALUE) {
-            _handles[fd] = h;
+    var fd: i32 = _fd_free;
+    var entry: *FdEntry = nil;
+    if (fd >= 0) {
+        entry = fd_entry_locked(fd);
+        _fd_free = entry.next_free;
+    } or {
+        if (_fd_count == 0x80000000) {
             fd_spin_unlock();
-            ret fd::i32;
+            ret EMFILE::i32;
         }
-        fd = fd + 1;
+        entry = fd_grow(_fd_count, allocate_zeroed_page);
+        if (entry == nil) {
+            fd_spin_unlock();
+            ret ENOMEM::i32;
+        }
+        fd = _fd_count::i32;
+        _fd_count = _fd_count + 1;
     }
+    entry.handle = h;
+    entry.directory_state = DIR_SCAN_START;
     fd_spin_unlock();
-    ret -1;
+    ret fd;
 }
 
 fun get_handle(fd: i32) isize {
     fd_spin_lock();
     init_fds();
-    if (fd < 0 || fd::usize >= MAX_FDS) {
-        fd_spin_unlock();
-        ret INVALID_HANDLE_VALUE;
-    }
-    val h: isize = _handles[fd::usize];
+    val entry: *FdEntry = fd_entry_locked(fd);
+    var h: isize = INVALID_HANDLE_VALUE;
+    if (entry != nil) { h = entry.handle; }
     fd_spin_unlock();
     ret h;
 }
 
 fun free_fd(fd: i32) {
     fd_spin_lock();
-    if (fd >= 0 && fd::usize < MAX_FDS) {
-        _directory_state[fd::usize] = DIR_SCAN_START;
-        _handles[fd::usize] = INVALID_HANDLE_VALUE;
+    val entry: *FdEntry = fd_entry_locked(fd);
+    if (entry != nil && entry.handle != INVALID_HANDLE_VALUE) {
+        entry.directory_state = DIR_SCAN_START;
+        entry.handle = INVALID_HANDLE_VALUE;
+        entry.next_free = _fd_free;
+        _fd_free = fd;
     }
     fd_spin_unlock();
 }
 
 # child process tracking table
 #
-# fixed-size, like the fd table above. the bound is pinned by
+# the fixed bound is pinned by
 # WaitForMultipleObjects' MAXIMUM_WAIT_OBJECTS (64): the wait-any path
 # passes every live handle in a single call, so MAX_PROCS must never
 # exceed it. an exhausted table fails spawn with EAGAIN, mirroring POSIX
@@ -1573,7 +1641,7 @@ pub fun open_root_utf8(path: *u8) i64 {
     val fd: i32 = alloc_fd(handle);
     if (fd < 0) {
         CloseHandle(handle);
-        ret EMFILE;
+        ret fd::i64;
     }
     ret fd::i64;
 }
@@ -1629,7 +1697,7 @@ pub fun open_relative_utf8(dirfd: i32, path: *u8, path_length: usize, flags: i32
     val fd: i32 = alloc_fd(handle);
     if (fd < 0) {
         CloseHandle(handle);
-        ret EMFILE;
+        ret fd::i64;
     }
     ret fd::i64;
 }
@@ -1929,7 +1997,7 @@ pub fun open(dirfd: i32, path: *u8, flags: i32, mode: i32) i64 {
     val fd: i32 = alloc_fd(h);
     if (fd < 0) {
         CloseHandle(h);
-        ret EMFILE;
+        ret fd::i64;
     }
     ret fd::i64;
 }
@@ -2125,7 +2193,7 @@ pub fun retain_identity_at(dirfd: i32, path: *u8, access: identities.Access, out
     native_parent_close(?parent);
     if (opened < 0) { ret opened; }
     val fd: i32 = alloc_fd(handle);
-    if (fd < 0) { CloseHandle(handle); ret EMFILE; }
+    if (fd < 0) { CloseHandle(handle); ret fd::i64; }
     val capabilities: i64 = publication_capabilities(fd);
     if (capabilities < 0) { close(fd); ret capabilities; }
     if ((capabilities & os_shared.PUBLICATION_RETAIN_REPLACE) == 0) { close(fd); ret ENOTSUP; }
@@ -2494,9 +2562,10 @@ pub fun read_dir(fd: i32, dirp: *dirent64, count: usize) i64 {
     val entry_size: usize = $size_of(dirent64);
     if (dirp == nil || count < entry_size) { ret EINVAL; }
     if (!handle_lock(fd)) { ret EBADF; }
+    val entry: *FdEntry = fd_entry(fd);
     val handle: isize = get_handle(fd);
     if (handle == INVALID_HANDLE_VALUE) { handle_unlock(fd); ret EBADF; }
-    if (_directory_state[fd::usize] == DIR_SCAN_END) { handle_unlock(fd); ret 0; }
+    if (entry.directory_state == DIR_SCAN_END) { handle_unlock(fd); ret 0; }
     val procedure: ptr = ntdll_procedure("NtQueryDirectoryFile");
     if (procedure == nil) { handle_unlock(fd); ret ENOTSUP; }
     val query: fun(isize, isize, ptr, ptr, *IO_STATUS_BLOCK, ptr, u32, u32, u8, ptr, u8) i32 = procedure::usize::fun(isize, isize, ptr, ptr, *IO_STATUS_BLOCK, ptr, u32, u32, u8, ptr, u8) i32;
@@ -2504,15 +2573,15 @@ pub fun read_dir(fd: i32, dirp: *dirent64, count: usize) i64 {
     for (count - written >= entry_size) {
         var info: FILE_DIRECTORY_INFORMATION;
         var status_block: IO_STATUS_BLOCK;
-        val restart: u8 = _directory_state[fd::usize] == DIR_SCAN_START;
+        val restart: u8 = entry.directory_state == DIR_SCAN_START;
         val status: i32 = query(handle, 0, nil, nil, ?status_block, (?info)::ptr,
             $size_of(FILE_DIRECTORY_INFORMATION)::u32, FILE_DIRECTORY_INFORMATION_CLASS, 1, nil, restart);
         if (status == STATUS_NO_MORE_FILES) {
-            _directory_state[fd::usize] = DIR_SCAN_END;
+            entry.directory_state = DIR_SCAN_END;
             brk;
         }
         if (status < 0) { handle_unlock(fd); ret ntstatus_error(status); }
-        _directory_state[fd::usize] = DIR_SCAN_ACTIVE;
+        entry.directory_state = DIR_SCAN_ACTIVE;
         val name_offset: usize = $offset_of(FILE_DIRECTORY_INFORMATION, file_name);
         if (status_block.information < name_offset || info.file_name_length == 0
             || info.file_name_length > MAX_COMPONENT_UNITS::u32 * 2
@@ -2547,6 +2616,7 @@ pub fun access(dirfd: i32, path: *u8, mode: i32, flags: i32) i64 {
 
 pub fun seek(fd: i32, offset: i64, whence: i32) i64 {
     if (!handle_lock(fd)) { ret EBADF; }
+    val entry: *FdEntry = fd_entry(fd);
     val h: isize = get_handle(fd);
     if (h == INVALID_HANDLE_VALUE) {
         handle_unlock(fd);
@@ -2560,7 +2630,7 @@ pub fun seek(fd: i32, offset: i64, whence: i32) i64 {
     }
     if ((info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
         if (offset != 0 || whence != SEEK_SET) { handle_unlock(fd); ret EINVAL; }
-        _directory_state[fd::usize] = DIR_SCAN_START;
+        entry.directory_state = DIR_SCAN_START;
         handle_unlock(fd);
         ret 0;
     }
@@ -3443,14 +3513,14 @@ pub fun pipe(fds: *i32) i64 {
     if (rfd < 0) {
         CloseHandle(read_h);
         CloseHandle(write_h);
-        ret EMFILE;
+        ret rfd::i64;
     }
     val wfd: i32 = alloc_fd(write_h);
     if (wfd < 0) {
         free_fd(rfd);
         CloseHandle(read_h);
         CloseHandle(write_h);
-        ret EMFILE;
+        ret wfd::i64;
     }
     fds[0] = rfd;
     fds[1] = wfd;
@@ -4786,7 +4856,7 @@ test "std.system.os.windows.symlink: invalid UTF8 fails before creating a link" 
 }
 
 test "std.system.os.windows.sync_fd: refuses unsupported filesystems and preserves native failures" {
-    if (sync_fd(-1) != EBADF || sync_fd(MAX_FDS::i32) != EBADF) { ret 1; }
+    if (sync_fd(-1) != EBADF || sync_fd(0x7fffffff) != EBADF) { ret 1; }
     if (sync_handle(INVALID_HANDLE_VALUE) != win32_error(ERROR_INVALID_HANDLE)) { ret 2; }
     if (sync_directory_handle(INVALID_HANDLE_VALUE) != win32_error(ERROR_INVALID_HANDLE)) { ret 3; }
     var filesystem: [6]u16;
@@ -5183,4 +5253,143 @@ test "std.system.os.windows: command capacity measures native UTF-16 units" {
     if (shorter != ENOENT || boundary != ENOENT) { ret 2; }
     if (terminated_boundary != E2BIG || oversized != E2BIG) { ret 3; }
     ret 0;
+}
+
+rec FdWaitProbe {
+    fd: i32;
+    started: i64;
+    observed: isize;
+}
+
+fun t_fd_wait(raw: ptr) u32 {
+    val probe: *FdWaitProbe = raw::*FdWaitProbe;
+    atomic.store(?probe.started, 1);
+    if (!handle_lock(probe.fd)) { ret 1; }
+    probe.observed = get_handle(probe.fd);
+    handle_unlock(probe.fd);
+    ret 0;
+}
+
+test "std.system.os.windows.fd_registry: growth preserves handles and blocked lock addresses" {
+    # initialize the native pipe runtime before measuring owned handles.
+    var warm_reader: isize = 0;
+    var warm_writer: isize = 0;
+    if (CreatePipe(?warm_reader, ?warm_writer, nil, 0) == 0) { ret 13; }
+    val reader_closed: i32 = CloseHandle(warm_reader);
+    val writer_closed: i32 = CloseHandle(warm_writer);
+    if (reader_closed == 0 || writer_closed == 0) { ret 14; }
+    var count_before: u32 = 0;
+    if (GetProcessHandleCount(-1, ?count_before) == 0) { ret 11; }
+    var fds: [2200]i32;
+    var used: usize = 0;
+    var bad: i32 = 0;
+    if (pipe(?fds[0]) != 0) { ret 1; }
+    used = 2;
+    val original: isize = get_handle(fds[0]);
+    val entry: *FdEntry = fd_entry(fds[0]);
+    if (!handle_lock(fds[0])) { close(fds[0]); close(fds[1]); ret 2; }
+    var probe: FdWaitProbe = FdWaitProbe{fd: fds[0], started: 0, observed: 0};
+    val worker: fun(ptr) u32 = t_fd_wait;
+    var tid: u32 = 0;
+    val thread: isize = CreateThread(nil, 0, worker::usize, (?probe)::ptr, 0, ?tid);
+    if (thread == 0) {
+        handle_unlock(fds[0]); close(fds[0]); close(fds[1]); ret 3;
+    }
+    for (atomic.load(?probe.started) == 0) { Sleep(1); }
+    for (used < 2200) {
+        if (pipe(?fds[used]) != 0) { bad = 4; brk; }
+        used = used + 2;
+    }
+    if (fd_entry(fds[0]) != entry || atomic.load(?entry.lock) != 1
+        || get_handle(fds[0]) != original) { bad = 5; }
+    handle_unlock(fds[0]);
+    if (WaitForSingleObject(thread, INFINITE) != WAIT_OBJECT_0) { bad = 6; }
+    if (probe.observed != original) { bad = 7; }
+    if (CloseHandle(thread) == 0) { bad = 8; }
+    var i: usize = 0;
+    for (i < used) {
+        var sent: u8 = (i / 2)::u8;
+        var received: u8 = 0;
+        if (write(fds[i + 1], ?sent, 1) != 1
+            || read(fds[i], ?received, 1) != 1 || received != sent) { bad = 9; }
+        if (close(fds[i]) != 0 || close(fds[i + 1]) != 0) { bad = 10; }
+        i = i + 2;
+    }
+    var count_after: u32 = 0;
+    if (GetProcessHandleCount(-1, ?count_after) == 0 || count_after != count_before) { bad = 12; }
+    ret bad;
+}
+
+fun t_fd_no_page(size: usize) ptr { ret nil; }
+
+fun t_fd_no_segment(size: usize) ptr {
+    if (size == $size_of(FdSegment)) { ret nil; }
+    ret fd_page_allocate(size);
+}
+
+test "std.system.os.windows.fd_registry: failed growth leaves the published registry intact" {
+    fd_spin_lock();
+    init_fds();
+    val count: usize = _fd_count;
+    val free: i32 = _fd_free;
+    val first: *FdEntry = fd_entry_locked(0);
+    var bad: i32 = 0;
+    if (_fd_directories[2047] != nil) { bad = 1; }
+    if (fd_grow(0x7fffffff, t_fd_no_page) != nil) { bad = 2; }
+    if (_fd_directories[2047] != nil) { bad = 3; }
+    if (fd_grow(0x7fffffff, t_fd_no_segment) != nil) { bad = 4; }
+    if (_fd_directories[2047] != nil || _fd_count != count || _fd_free != free
+        || fd_entry_locked(0) != first) { bad = 5; }
+    fd_spin_unlock();
+    ret bad;
+}
+
+test "std.system.os.windows.fd_registry: closed descriptors reuse their stable entries" {
+    var fds: [2]i32;
+    if (pipe(?fds[0]) != 0) { ret 1; }
+    val original: *FdEntry = fd_entry(fds[0]);
+    val released: i32 = fds[0];
+    if (close(released) != 0) { close(fds[1]); ret 2; }
+    var replacement: [2]i32;
+    if (pipe(?replacement[0]) != 0) { close(fds[1]); ret 3; }
+    var bad: i32 = 0;
+    if (replacement[0] != released || fd_entry(released) != original
+        || original.directory_state != DIR_SCAN_START || atomic.load(?original.lock) != 0) { bad = 4; }
+    var sent: u8 = 93;
+    var received: u8 = 0;
+    if (write(replacement[1], ?sent, 1) != 1 || read(replacement[0], ?received, 1) != 1
+        || sent != received) { bad = 5; }
+    if (close(fds[1]) != 0 || close(replacement[0]) != 0 || close(replacement[1]) != 0) { bad = 6; }
+    ret bad;
+}
+
+test "std.system.os.windows.fd_registry: allocation failure preserves capacity and descriptor ownership" {
+    var fds: [2048]i32;
+    var used: usize = 0;
+    var bad: i32 = 0;
+    for (_fd_free >= 0 || (_fd_count & 1023) != 0) {
+        if (used == 2048) { bad = 1; brk; }
+        val fd: i32 = alloc_fd(1);
+        if (fd < 0) { bad = 2; brk; }
+        fds[used] = fd;
+        used = used + 1;
+    }
+    val count: usize = _fd_count;
+    if (bad == 0) {
+        if (alloc_fd_using(1, t_fd_no_page) != ENOMEM::i32) { bad = 3; }
+        if (_fd_count != count || _fd_free != -1) { bad = 4; }
+        val fd: i32 = alloc_fd(1);
+        if (fd < 0) { bad = 5; }
+        or {
+            if (fd::usize != count || get_handle(fd) != 1) { bad = 6; }
+            free_fd(fd);
+        }
+    }
+    var i: usize = 0;
+    for (i < used) {
+        if (get_handle(fds[i]) != 1) { bad = 7; }
+        free_fd(fds[i]);
+        i = i + 1;
+    }
+    ret bad;
 }

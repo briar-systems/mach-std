@@ -46,6 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Windows file descriptors grow through stable pages instead of stopping at 256.
+  Closed descriptors are reused, live wait addresses remain fixed during growth,
+  and allocation failures preserve existing owners and report their actual error.
+
 - Transaction preparation selects preconditions and durability before retaining
   any prior object or creating staging. Commit and abort consume final-storage
   transactions and release their active destination borrow on every path.
