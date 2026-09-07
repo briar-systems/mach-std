@@ -21,7 +21,7 @@ def dump(label, pointer, typename):
     marker = '\nSTATE-' + label + '\n'
     end = '\nENDSTATE\n'
     return ('\n    os.write(2, ' + json.dumps(marker) + ', ' + str(len(marker)) + ');'
-            '\n    os.write(2, ' + pointer + '::str, size_of[' + typename + ']());'
+            '\n    os.write(2, ' + pointer + '::str, $size_of(' + typename + '));'
             '\n    os.write(2, ' + json.dumps(end) + ', ' + str(len(end)) + ');\n')
 
 changed = dict(original)
@@ -58,6 +58,12 @@ try:
                                            ('out' in path.parts and path.suffix in ('', '.exe'))):
                         archive.write(path, str(path))
             results.append(dict(version=version, variant=variant, code=run.returncode, args=args))
+            if variant == 'state':
+                assert b'STATE-after-init' in run.stdout, (label, 'runtime state was not emitted')
+            if version == 'audited':
+                assert run.returncode == 0, (label, run.returncode)
+            else:
+                assert b'exit 5' in run.stdout or b'exit: 5' in run.stdout, (label, 'expected runtime refusal missing')
     (evidence / 'seed-state-summary.json').write_text(json.dumps(results, indent=2))
 finally:
     for path, text in original.items():
