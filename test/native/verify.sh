@@ -8,6 +8,7 @@ case "$target" in
     windows-*) profile=windows-opt0 ;;
 esac
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/../lib/compiler.sh"
 known="${3:-$here/known-failures/$target.txt}"
 root="$(cd "$here/../.." && pwd)"
 result="$here/results/$target.log"
@@ -31,7 +32,7 @@ expected_file="$(mktemp)"
 actual_file="$(mktemp)"
 trap 'rm -f "$expected_file" "$actual_file"' EXIT
 
-"$mach" test "$here" --target "$target" --profile "$profile" --include-deps --list \
+mach_run test "$here" --target "$target" --profile "$profile" --include-deps --list \
     | tr '\134' '/' > "$list" \
     || fail "$target suite could not be listed"
 
@@ -59,7 +60,7 @@ done
     | sed 's/[[:space:]]*$//' | sort -u > "$expected_file"
 
 set +e
-"$mach" test "$here" --target "$target" --profile "$profile" --include-deps 2>&1 | tee "$result"
+mach_run test "$here" --target "$target" --profile "$profile" --include-deps 2>&1 | tee "$result"
 code=${PIPESTATUS[0]}
 set -e
 
@@ -98,7 +99,7 @@ echo "OK: $target ran the complete native suite with $expected_count known failu
 echo "OK: thread, process, file, socket, and timer coverage is present"
 
 release_result="$here/results/$target-ownership-release.log"
-"$mach" test "$here" --target "$target" --profile release --include-deps \
+mach_run test "$here" --target "$target" --profile release --include-deps \
     --filter 'ownership query' 2>&1 | tee "$release_result" \
     || fail "$target release ownership suite failed"
 grep -qE '[0-9]+ passed, 0 failed, [0-9]+ total' "$release_result" \
