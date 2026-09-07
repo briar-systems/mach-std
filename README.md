@@ -7,23 +7,43 @@ This repository contains the canonical standard library for the Mach programming
 To use the standard library in your Mach project, you can include it as a dependency in your project's configuration file:
 
 ```toml
-[deps.mach-std]
+[dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v0.34.0"
+ref = "tag/v1.0.0"
 ```
 
 You can also use the Mach dependency manager to add it to your project:
 
 ```bash
-mach dep add mach-std --git https://github.com/briar-systems/mach-std --ref tag/v0.34.0
+mach dep add std --git https://github.com/briar-systems/mach-std --ref tag/v1.0.0
 ```
+
+## Versioning
+
+Starting with 1.0.0, releases follow [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
+The public API consists of public declarations in shipped modules under `src`,
+including their signatures, exposed type layouts, documented behavior, ownership,
+lifetimes and error contracts on supported targets. Test-only modules and private
+implementation helpers are excluded.
+
+- Incompatible public API changes increment the major version.
+- Compatible additions and public API deprecations increment the minor version.
+- Compatible bug fixes increment the patch version.
+
+A published version's source and tag are immutable. Release tags must match
+`mach.toml`. Each release documents its supported compiler and target combinations.
+Changes that invalidate an existing supported combination require a major release.
+Version compatibility does not silently move an application's dependency pin.
+
+Std 1.0.0 is the audited dependency for Mach 4.30.0. The breaking language and API
+migration for Mach v5 is planned as std 2.0.0. Compiler and std version numbers
+are independent.
 
 ## Documentation
 
-The documentation for the Mach Standard Library can be found in the [doc](./doc) directory.
+API documentation lives alongside the implementation in [src](./src).
 
-> NOTE: The documentation is currently a work in progress and the API is rapidly changing.
-> Please refer to the source code for the most up-to-date information.
+See the [changelog](./CHANGELOG.md) for release changes and migration requirements.
 
 ### I/O ownership queries
 

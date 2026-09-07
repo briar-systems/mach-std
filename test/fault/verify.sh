@@ -3,8 +3,11 @@ set -euo pipefail
 
 mach="${1:-mach}"
 target="${2:-linux-x86_64}"
+profile=debug
+case "$target" in windows-*) profile=windows-opt0 ;; esac
 runner="${3:-}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/../lib/compiler.sh"
 root="$(cd "$here/../.." && pwd)"
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/mach-std-fault.XXXXXX")"
 trap 'rm -rf -- "$scratch"' EXIT
@@ -21,24 +24,28 @@ cp "$root/mach.toml" "$scratch/repo/mach.toml"
 cp -R "$root/src" "$scratch/repo/src"
 cp "$here/mach.toml" "$scratch/repo/test/fault/mach.toml"
 cp -R "$here/src" "$scratch/repo/test/fault/src"
+mkdir -p "$scratch/repo/test/fault/dep/std"
+cp "$root/mach.toml" "$scratch/repo/test/fault/dep/std/mach.toml"
+cp -R "$root/src" "$scratch/repo/test/fault/dep/std/src"
+git init --quiet "$scratch/repo"
+git -C "$scratch/repo" add -f mach.toml src test/fault
 
 release_checked=0
 if grep -qF "[target.$target]" "$scratch/repo/mach.toml"; then
-    "$mach" build "$scratch/repo" -O2 --target "$target"
+    mach_run build "$scratch/repo" -O2 --target "$target"
     production="$scratch/repo/out/$target/debug/lib/std"
     bash "$here/verify-release.sh" "$production"
     release_checked=1
 fi
 
-"$mach" dep pull "$scratch/repo/test/fault"
-test_args=(test "$scratch/repo/test/fault" --target "$target")
+test_args=(test "$scratch/repo/test/fault" --target "$target" --profile "$profile")
 if [ -n "$runner" ]; then
     test_args+=(--runner "$runner")
 fi
-"$mach" "${test_args[@]}"
-"$mach" "${test_args[@]}" -O2
-"$mach" build "$scratch/repo/test/fault" -O2 --target "$target"
-explicit="$scratch/repo/test/fault/out/$target/debug/lib/fault"
+mach_run "${test_args[@]}"
+mach_run "${test_args[@]}" -O2
+mach_run build "$scratch/repo/test/fault" -O2 --target "$target" --profile "$profile"
+explicit="$scratch/repo/test/fault/out/$target/$profile/lib/fault"
 [ -f "$explicit" ] || fail "explicit fault archive was not built"
 
 members="$("${AR:-ar}" t "$explicit")"

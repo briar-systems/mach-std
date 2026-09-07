@@ -4,6 +4,7 @@ set -euo pipefail
 mach="${1:-mach}"
 target="${2:-linux-x86_64}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/../lib/compiler.sh"
 root="$(cd "$here/../.." && pwd)"
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/mach-std-thread-release.XXXXXX")"
 trap 'rm -rf -- "$scratch"' EXIT
@@ -19,8 +20,10 @@ cp "$here/mach.toml" "$fixture/mach.toml"
 cp -R "$here/src/." "$fixture/src"
 cp "$root/mach.toml" "$fixture/dep/std/mach.toml"
 cp -R "$root/src" "$fixture/dep/std/src"
+git init --quiet "$scratch/repo"
+git -C "$scratch/repo" add -f test/thread-resources
 
-"$mach" build "$fixture" --target "$target" -O2
+mach_run build "$fixture" --target "$target" --profile release
 out="$fixture/out/$target"
 artifact="$(find "$out" -type f -path '*/bin/thread-resources' | head -1)"
 object="$(find "$out" -type f -path '*/obj/std/system/os.o' | head -1)"

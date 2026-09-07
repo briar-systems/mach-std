@@ -13,17 +13,20 @@ expect_code=42
 
 mach="${1:-mach}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/../lib/compiler.sh"
 cd "$here"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
-# vendor this checkout's std as the path dependency (dep/std -> repo root).
-mkdir -p dep
-ln -sfn "$(cd ../.. && pwd)" dep/std
+# copy the dependency inside the fixture project
+rm -rf dep
+mkdir -p dep/std
+cp ../../mach.toml dep/std/mach.toml
+cp -R ../../src dep/std/src
 
 echo "cross-compiling the riscv64 runtime smoke test with $mach"
 rm -rf out
-"$mach" build . --target linux-riscv64 --profile debug
+mach_run build . --target linux-riscv64 --profile debug
 exe="$(find out -name rvprobe -type f -print -quit)"
 [ -n "$exe" ] || fail "no rvprobe binary produced"
 

@@ -3,7 +3,10 @@ set -euo pipefail
 
 mach="${1:-mach}"
 target="${2:-linux-x86_64}"
+profile=debug
+case "$target" in windows-*) profile=windows-opt0 ;; esac
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/../lib/compiler.sh"
 root="$(cd "$here/../.." && pwd)"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
@@ -15,7 +18,7 @@ cp -R "$root/src" "$here/dep/std/src"
 
 cd "$here"
 rm -rf "out/$target"
-"$mach" build . --target "$target" --profile debug
+mach_run build . --target "$target" --profile "$profile"
 exe="$(find "out/$target" -type f \( -name backends -o -name 'backends.exe' \) -print -quit)"
 [ -n "$exe" ] || fail "$target produced no native executable"
 

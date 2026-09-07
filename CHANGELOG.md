@@ -5,6 +5,208 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [1.0.0] - 2026-09-07
+
+The audited standard library defines its stable public API under Semantic
+Versioning 2.0.0. This major release includes the ownership and filesystem API
+changes below. Mach 4.30.0 pins this release as its transition dependency.
+The later breaking result/option/tag migration for Mach v5 will ship as std 2.0.0.
+
+### Added
+
+- Caller-journaled file commits retain originals under separately reserved backup
+  claims and report partial rename effects, durability and cleanup errors without
+  implicit rollback. Child roots and staged-child identity observations use held
+  directory capabilities, including complete subtree staging for a new source root.
+
+- Same-object preparation explicitly selects maximum prior access. Metadata-only
+  remains the default. Read-authorized Darwin callers retain event-only references
+  on supported local filesystems without reading content or changing permissions.
+
+- Cooperative publication ownership primitives keep roots, locks and borrowers
+  in final storage, reject copied owners, and exclude recovery while borrowers
+  remain live. Fresh claim directories use native destination-name equivalence
+  and admit work only after successful initialization. Sessions own stable
+  destination claims before worker admission. Active transaction or mutation
+  borrowers exclude simultaneous use without releasing the planned reservation
+  (#583).
+
+- Explicit filesystem identity observations preserve complete native identifiers
+  and serialize one backend-qualified local representation. Windows identities
+  retain the full 64-bit volume serial and 128-bit file ID without a pathname
+  query, including while an unlinked object remains open. Unsupported
+  identity domains remain distinct from presence and type observations.
+  `filesystem.Metadata` no longer carries an implicit truncated identity.
+  `identity_of` and `identity_link` query it explicitly, and portable watch
+  scans retain the complete observation separately. Transaction entry probes
+  report presence and type without identity queries, and explicit root, entry
+  and staging identity APIs use the same complete representation. Rooted
+  containment relies on nofollow opens instead of truncated identity checks
+  between unretained observations (#583).
+
+
+- `std.types.path.root` borrows an indivisible root prefix through the existing
+  `std.types.view.View`, preserving native drive and UNC spelling without
+  allocating or splitting the root (#608).
+
+### Fixed
+
+- Process tests use Darwin's installed `/usr/bin/true` and `/usr/bin/false`.
+  Remove the five failure exceptions caused by the old nonexistent `/bin` paths.
+
+- Windows file descriptors grow through stable pages instead of stopping at 256.
+  Closed descriptors are reused, live wait addresses remain fixed during growth,
+  and allocation failures preserve existing owners and report their actual error.
+
+- Transaction preparation selects preconditions and durability before retaining
+  any prior object or creating staging. Commit and abort consume final-storage
+  transactions and release their active destination borrow on every path.
+  Mutation helpers require the same planned Claim capabilities, recovery rejects
+  live claims and workers, and failed recovery keeps admission closed (#583).
+- Subtree preparation flushes file data through its original writable handles
+  and completes directory modes and barriers in child-first order. Explicit
+  directory modes apply even when files introduce their parents first. Private
+  mode `000` trees remain abortable and recoverable without granting content-read
+  access to files or changing public objects. Permissive durability reports every
+  missing child barrier instead of allowing an outer directory flush to hide it
+  (#612).
+
+
+- Darwin grouped spawning gives the child sole authority to create its process
+  group and waits for explicit readiness before exposing the PID. Concurrent
+  launches no longer race two native group creators.
+
+- Whole-file string reads reject unrepresentable sizes before allocation and
+  release the exact buffer on read or close failure.
+
+- The native Windows harness selects optimization level 0 without requesting
+  unsupported COFF debug symbols. ELF and Mach-O debug runs retain symbols, and
+  release ownership coverage remains at optimization level 2 (#615).
+
+- Recursive removal shares a rooted nofollow walker with transaction cleanup.
+  Windows force deletion removes read-only entries without changing surviving
+  hardlink attributes on supporting filesystems. SMB read-only entries report
+  unsupported, ordinary file removal remains strict, and root or dot removal
+  requests are rejected before mutation (#613).
+
+- Atomic byte replacement flushes the parent directory on Windows through the
+  native NTFS durability backend. Unsupported directory persistence and flush
+  failures remain errors after publication (#607).
+- Windows rename atomically replaces destinations with open handles on
+  supporting filesystems. Existing
+  handles retain the old file while new opens see the replacement, through both
+  public path operations and rooted filesystem publication. SMB retains its
+  supported basic rename operation and refuses held destinations (#607).
+- Path segment depth excludes Windows drive and UNC root units, including
+  drive-relative paths and parent climbs below their anchor (#609).
+- Windows process environments, executable names, arguments, working directories,
+  and directory queries preserve UTF-8 through native UTF-16 APIs. Environment
+  name comparison follows host identity and Windows blocks use native name order
+  (#603).
+- Filesystem transaction directory listing releases a copied entry name when
+  vector growth fails, preserving exact allocation ownership under memory
+  pressure (#605).
+- Public filesystem Root opening and removal allocate each path component from
+  its exact UTF-8 length and verify opened directory identities. Valid Unicode
+  names are no longer rejected by a fixed byte buffer (#601).
+- Subtree publication retains its held root after ancestor renames. Staged
+  directories and files are created through directory descriptors, and staged
+  symlinks cannot redirect inventory writes (#575). The subtree API and descent
+  state no longer carry unused absolute path metadata.
+- Filesystem transactions publish valid maximum-length destination names using
+  short staging names and a persistent descriptor-relative backup directory.
+  Recovery resolves only the requested destination, preserving other backups
+  and malformed residue (#581).
+- Publication rejects reserved journal and lock names with portable ASCII
+  case-insensitive matching, preventing recovery from deleting published content
+  under an internal name (#581).
+- The OS boundary reports filename overflow as `ENAMETOOLONG` on every target,
+  including Windows UTF-16 component validation (#581).
+- Windows symbolic links preserve UTF-8 link names and relative targets through
+  UTF-16 conversion. Target normalization and directory probing use the actual
+  converted lengths instead of fixed byte buffers (#580).
+- Windows filesystem transactions honor directory descriptors for publication,
+  metadata, rename, directory creation, and removal. Operations use native
+  handles and retain their root when its pathname is renamed or replaced
+  (#574).
+- Windows file creation, metadata, rename, and removal accept UTF-8 paths
+  consistently with handle-based directory enumeration (#574).
+- Windows directory enumeration remains attached to its open handle, preserves
+  every entry across output-buffer boundaries, supports full Unicode component
+  lengths, and supports rewind for
+  transaction recovery and recursive cleanup (#574).
+- Native Windows relative path components reject alternate-stream syntax and
+  path separators. Metadata and deletion inspect reparse points without
+  following their targets (#574).
+
+## [0.37.2] - 2026-09-04
+
+### Fixed
+
+- TOML table cleanup stores the value in a local before taking its address,
+  complying with Mach's refusal of addresses of call temporaries (#571).
+
+## [0.37.1] - 2026-09-04
+
+### Added
+
+- `std.filesystem.transaction.root_remove_tree` removes a subtree through
+  its root directory capability (#569).
+
+## [0.37.0] - 2026-09-04
+
+### Changed
+
+- The producer callback passed to `std.filesystem.transaction.prepare` returns
+  `Result[Void, str]`. Return an error to abort production. Callbacks returning
+  `Result[bool, str]` must migrate to the new signature (#567).
+
+## [0.36.1] - 2026-09-04
+
+### Added
+
+- `std.types.result.void_of[T, E]` discards a successful payload while
+  preserving the error, adapting a result to `Result[Void, E]` (#565).
+
+## [0.36.0] - 2026-09-03
+
+### Added
+
+- `std.types.result.Void` and `ok_void[E]` represent success without a
+  payload (#563).
+
+## [0.35.2] - 2026-09-02
+
+### Fixed
+
+- TOML parsing bounds nested values and reports excessive nesting rather
+  than exhausting the stack (#561).
+
+## [0.35.1] - 2026-09-02
+
+### Fixed
+
+- Darwin external imports explicitly name libSystem, whose exported manifest
+  requirement uses `/usr/lib/libSystem.B.dylib` (#559).
+
+## [0.35.0] - 2026-09-02
+
+### Added
+
+- Filesystem transactions provide staged publication, validation, commit,
+  abort, recovery, root directory capabilities and contained entry operations
+  (#557).
+- Advisory whole-file locks support coordinating filesystem publishers (#557).
+- The allocator fault harness can refuse a chosen allocation or reallocation
+  to exercise failure cleanup (#557).
+- Process supervision supports deadlines and reports spawn failures (#557).
+
+### Fixed
+
+- Process waits retry an interrupted wait instead of reporting failure (#557).
+
 ## [0.34.0] - 2026-09-01
 
 ### Added

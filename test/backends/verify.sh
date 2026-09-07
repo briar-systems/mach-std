@@ -9,6 +9,7 @@ set -euo pipefail
 
 mach="${1:-mach}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/../lib/compiler.sh"
 cd "$here"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
@@ -16,9 +17,11 @@ fail() { echo "FAIL: $1" >&2; exit 1; }
 command -v llvm-nm >/dev/null || fail "llvm-nm is required"
 command -v llvm-readobj >/dev/null || fail "llvm-readobj is required"
 
-# vendor this checkout's std as the path dependency (dep/std -> repo root).
-mkdir -p dep
-ln -sfn "$(cd ../.. && pwd)" dep/std
+# copy the dependency inside the fixture project
+rm -rf dep
+mkdir -p dep/std
+cp ../../mach.toml dep/std/mach.toml
+cp -R ../../src dep/std/src
 
 targets=(
     linux-x86_64
@@ -28,14 +31,14 @@ targets=(
     darwin-x86_64
     darwin-aarch64
 )
-profiles=(debug release)
-
 for target in "${targets[@]}"; do
+    profiles=(debug release)
+    case "$target" in windows-*) profiles=(windows-opt0 release) ;; esac
     rm -rf "out/$target"
     for profile in "${profiles[@]}"; do
         echo "cross-compiling the $profile backend smoke test for $target with $mach"
-        log="$("$mach" build . --target "$target" --profile "$profile" \
-            --emit-ir --emit-asm --verify-ir -vv 2>&1)" \
+        log="$(mach_run build . --target "$target" --profile "$profile" \
+            --emit-ir --emit-asm -vv 2>&1)" \
             || { echo "$log" >&2; fail "$target $profile failed to compile"; }
 
         exe="$(find "out/$target/$profile" -name backends -type f -print -quit)"
@@ -57,49 +60,8 @@ for target in "${targets[@]}"; do
         [ -f "$secret_asm" ] || fail "$target $profile: secret OS assembly missing"
         [ -f "$main_ir" ] || fail "$target $profile: typed boundary IR missing"
         [ -f "$main_asm" ] || fail "$target $profile: typed boundary assembly missing"
-        grep -q 'fn @std.system.os.secret.allocate' "$secret_ir" \
-            || fail "$target $profile: secret allocation boundary missing"
-        grep -q 'fn @std.system.os.secret.deallocate' "$secret_ir" \
-            || fail "$target $profile: secret release boundary missing"
-        grep -q 'fn @std.system.os.secret.random_fill' "$secret_ir" \
-            || fail "$target $profile: secret entropy boundary missing"
-        if grep -Eq 'ptrtoint|inttoptr' "$secret_ir"; then
-            fail "$target $profile: secret boundary materialized an integer pointer alias"
-        fi
-        grep -Fq 'std.system.os.secret_allocate_typed$backends.main.SecretRecord' "$main_ir" \
-            || fail "$target $profile: typed allocation boundary missing"
-        grep -Fq 'std.system.os.secret_deallocate_typed$backends.main.SecretRecord' "$main_ir" \
-            || fail "$target $profile: typed release boundary missing"
-        grep -Fq 'std.system.os.secret.wipe_typed$backends.main.SecretRecord' "$main_ir" \
-            || fail "$target $profile: typed full-layout wipe missing"
-        if grep -Eq 'ptrtoint|inttoptr' "$main_ir"; then
-            fail "$target $profile: typed boundary materialized an integer pointer alias"
-        fi
-        if grep -Eq 'std[.]system[.]os[.]secret[.](scripted_fill|all_zero|reset_probe_fill|interrupted_fill|probe_release|probe_typed_release)' "$secret_ir"; then
-            fail "$target $profile: secret test-only inspection entered the production artifact"
-        fi
-        release_ir="$(sed -n '/fn @std.system.os.secret.release_all/,/^  fn /p' "$secret_ir")"
-        if [ "$profile" = debug ]; then
-            wipe_ir_line="$(echo "$release_ir" | grep -n -m1 'call void @std.system.os.secret.wipe' | cut -d: -f1 || true)"
-        else
-            wipe_ir_line="$(echo "$release_ir" | grep -n -m1 'store 0: i8' | cut -d: -f1 || true)"
-        fi
-        release_ir_line="$(echo "$release_ir" | grep -n -m1 'call i64 %p3' | cut -d: -f1 || true)"
-        [ -n "$wipe_ir_line" ] || fail "$target $profile: secret release wipe missing from IR"
-        [ -n "$release_ir_line" ] || fail "$target $profile: native release call missing from IR"
-        [ "$wipe_ir_line" -lt "$release_ir_line" ] \
-            || fail "$target $profile: native release call precedes secret wipe in IR"
-        typed_release_ir="$(sed -n '/fn @std.system.os.secret.release_typed\$backends.main.SecretRecord/,/^  fn /p' "$main_ir")"
-        typed_release_ir_line="$(echo "$typed_release_ir" | grep -n -m1 'call i64 %p3' | cut -d: -f1 || true)"
-        [ -n "$typed_release_ir_line" ] \
-            || fail "$target $profile: typed native release call missing from IR"
-        if [ "$profile" = debug ]; then
-            typed_wipe_ir_line="$(echo "$typed_release_ir" | grep -n -m1 'call void @std.system.os.secret.wipe_typed' | cut -d: -f1 || true)"
-            [ -n "$typed_wipe_ir_line" ] \
-                || fail "$target debug: typed release wipe missing from IR"
-            [ "$typed_wipe_ir_line" -lt "$typed_release_ir_line" ] \
-                || fail "$target debug: native typed release precedes full-layout wipe in IR"
-        fi
+        python3 "$here/verify-ir.py" "$secret_ir" "$main_ir" "$profile" \
+            || fail "$target $profile: secret IR contract failed"
         case "$target" in
             linux-*)
                 grep -q 'syscall\|ecall\|svc' "$secret_asm" \
@@ -171,7 +133,7 @@ for target in "${targets[@]}"; do
                 *-x86_64)
                     typed_release_line="$(echo "$typed_release_body" | grep -n -E 'call r[0-9]+' | tail -1 | cut -d: -f1 || true)"
                     ;;
-                *-arm64)
+                *-arm64|*-aarch64)
                     typed_release_line="$(echo "$typed_release_body" | grep -n -E 'blr x[0-9]+' | tail -1 | cut -d: -f1 || true)"
                     ;;
                 linux-riscv64)

@@ -12,13 +12,16 @@ set -euo pipefail
 
 mach="${1:-mach}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/../lib/compiler.sh"
 cd "$here"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
-# vendor this checkout's std as the path dependency (dep/std -> repo root).
-mkdir -p dep
-ln -sfn "$(cd ../.. && pwd)" dep/std
+# copy the dependency inside the fixture project
+rm -rf dep
+mkdir -p dep/std
+cp ../../mach.toml dep/std/mach.toml
+cp -R ../../src dep/std/src
 
 emit() {
     mkdir -p src
@@ -53,7 +56,7 @@ EOF
 build() {
     rm -rf out
     set +e
-    log="$("$mach" build . --profile debug 2>&1)"
+    log="$(mach_run build . --profile debug 2>&1)"
     code=$?
     set -e
 }

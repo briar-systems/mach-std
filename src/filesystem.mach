@@ -21,6 +21,9 @@ use std.types.string.str_equals;
 use std.types.string.str_len;
 use std.types.string.str_copy;
 use std.system.os;
+use identities: std.system.file_identity;
+fwd identities.Identity;
+use removal: std.filesystem.removal;
 use std.chrono.time;
 use std.types.path;
 use std.collections.vector;
@@ -60,12 +63,6 @@ pub val KIND_FILE:    Kind = 1;
 pub val KIND_DIR:     Kind = 2;
 pub val KIND_SYMLINK: Kind = 3;
 
-# identity is stable across path rename while the underlying file exists
-pub rec Identity {
-    device: u64;
-    file:   u64;
-}
-
 # portable file metadata
 # ---
 # kind:     file, directory, symlink, or other
@@ -75,7 +72,6 @@ pub rec Identity {
 # accessed: last access time
 # created:  birth time when the platform provides it, else none
 pub rec Metadata {
-    identity: Identity;
     kind:     Kind;
     size:     usize;
     mode:     u32;
@@ -260,6 +256,7 @@ pub fun read_bytes(a: *A.Allocator, p: Path) R.Result[Vector[u8], str] {
 # p:   file path
 # ret: the file contents, or an error
 pub fun read_string(a: *A.Allocator, p: Path) R.Result[str, str] {
+    if (a == nil) { ret R.err[str, str]("allocator is nil"); }
     val ro: R.Result[File, io_error.Error] = open(p);
     if (R.is_err[File, io_error.Error](ro)) { ret R.err[str, str](error_text(R.unwrap_err[File, io_error.Error](ro))); }
     var f: File = R.unwrap_ok[File, io_error.Error](ro);
@@ -268,6 +265,10 @@ pub fun read_string(a: *A.Allocator, p: Path) R.Result[str, str] {
     var st: os.stat_t;
     val sr: i64 = os.stat(f.handle.value::i32, ?st);
     if (sr < 0) { close(?f); ret R.err[str, str](os.message(sr)); }
+    if (st.st_size < 0 || st.st_size::u64 >= (-1)::usize::u64) {
+        close(?f);
+        ret R.err[str, str]("file size is not representable");
+    }
     val size: usize = st.st_size::usize;
 
     val ar: R.Result[*u8, *u8] = A.allocate[u8](a, size + 1);
@@ -276,8 +277,12 @@ pub fun read_string(a: *A.Allocator, p: Path) R.Result[str, str] {
 
     var rd: m_reader.Reader = reader(f);
     val e: O.Option[str] = m_reader.read_exact(?rd, buf, size);
-    close(?f);
-    if (O.is_some[str](e)) { ret R.err[str, str](O.unwrap[str](e)); }
+    val closed: O.Option[io_error.Error] = close(?f);
+    if (O.is_some[str](e) || O.is_some[io_error.Error](closed)) {
+        A.deallocate[u8](a, buf, size + 1);
+        if (O.is_some[str](e)) { ret R.err[str, str](O.unwrap[str](e)); }
+        ret R.err[str, str](error_text(O.unwrap[io_error.Error](closed)));
+    }
 
     buf[size] = 0;
     ret R.ok[str, str](buf::str);
@@ -309,8 +314,8 @@ pub fun write_bytes(p: Path, data: *u8, len: usize, mode: i32) O.Option[str] {
 # missing parent directories are created before the temporary. the temporary is
 # created beside the destination with O_EXCL, flushed, and closed before rename,
 # so readers see either the old file or the complete replacement and a
-# cross-device rename cannot occur. after rename, posix also flushes the parent
-# directory so the new namespace entry survives a crash. if that final flush
+# cross-device rename cannot occur. after rename, the parent directory is
+# flushed through the platform durability contract. if that final flush
 # fails, the replacement is already visible even though this function reports
 # the durability failure.
 # ---
@@ -392,7 +397,6 @@ fun kind_from_mode(mode: u32) Kind {
 # build Metadata from a filled stat buffer
 fun meta_from_stat(st: *os.stat_t) Metadata {
     ret Metadata{
-        identity: Identity{device: st.st_dev::u64, file: st.st_ino},
         kind:     kind_from_mode(os.stat_mode(st)),
         size:     st.st_size::usize,
         mode:     os.stat_mode(st),
@@ -403,7 +407,24 @@ fun meta_from_stat(st: *os.stat_t) Metadata {
 }
 
 pub fun identity_equal(a: Identity, b: Identity) bool {
-    ret a.device == b.device && a.file == b.file;
+    ret identities.equal(a, b);
+}
+
+# observations do not retain an object or imply unchanged contents
+pub fun identity_of(f: File) R.Result[Identity, io_error.Error] {
+    var identity: Identity;
+    val observed: i64 = os.file_identity(f.handle.value::i32, ?identity);
+    if (observed < 0) { ret R.err[Identity, io_error.Error](io_error.from_code(observed, io_error.OP_OPTION)); }
+    ret R.ok[Identity, io_error.Error](identity);
+}
+
+# the final symlink itself is observed and unsupported domains remain explicit
+pub fun identity_link(p: Path) R.Result[Identity, io_error.Error] {
+    if (p == nil) { ret R.err[Identity, io_error.Error](io_error.from_code(os.EINVAL, io_error.OP_OPTION)); }
+    var identity: Identity;
+    val observed: i64 = os.identity_at(os.AT_FDCWD, p, ?identity);
+    if (observed < 0) { ret R.err[Identity, io_error.Error](io_error.from_code(observed, io_error.OP_OPTION)); }
+    ret R.ok[Identity, io_error.Error](identity);
 }
 
 # metadata for an open file with normalized target detail
@@ -543,6 +564,8 @@ pub fun remove_dir(p: Path) O.Option[str] {
 # existing *directory* is not portable: POSIX allows it when the destination is
 # an empty directory and windows refuses it outright, so callers should not rely
 # on it.
+# windows retains open destination handles on supporting local filesystems,
+# while smb refuses replacement until destination handles close.
 # ---
 # from: source path
 # to:   destination path
@@ -676,68 +699,44 @@ pub fun create_dir_all(a: *A.Allocator, p: Path, mode: i32) O.Option[str] {
 # directories are removed depth-first. symbolic links are removed as links and
 # never followed, so a link pointing outside the tree leaves its target intact.
 # a missing path succeeds, making the operation idempotent.
+# windows force deletion preserves alias attributes and reports unsupported
+# for read-only entries on filesystems without native posix deletion.
+# roots and dot entries are refused before mutation.
 # ---
-# a:   allocator for transient child paths
-# p:   path to remove
+# a:   allocator for the owned input and parent paths
+# p:   path naming the child entry to remove
 # ret: none on success, or an error
 pub fun remove_all(a: *A.Allocator, p: Path) O.Option[str] {
     if (a == nil) { ret O.some[str]("allocator is nil"); }
     if (p == nil) { ret O.some[str]("path is nil"); }
-
-    ret remove_all_at(a, p, 0);
-}
-
-fun remove_all_at(a: *A.Allocator, p: Path, depth: usize) O.Option[str] {
-    if (depth >= REMOVE_MAX_DEPTH) { ret O.some[str]("directory tree too deep"); }
-
-    # lstat: a symlink reports as a link so the walk removes it, not its target
-    var st: os.stat_t;
-    val sr: i64 = os.stat_path(os.AT_FDCWD, p, ?st, os.AT_SYMLINK_NOFOLLOW);
-    if (sr < 0) {
-        if (sr == os.ENOENT) { ret O.none[str](); }
-        ret O.some[str](os.message(sr));
+    if (str_len(p) == 0) { ret O.none[str](); }
+    val owned_r: R.Result[Path, str] = path.clone(a, p);
+    if (R.is_err[Path, str](owned_r)) { ret O.some[str](R.unwrap_err[Path, str](owned_r)); }
+    val owned: Path = R.unwrap_ok[Path, str](owned_r);
+    val length: usize = str_len(owned);
+    fin { A.deallocate[u8](a, owned, length + 1); }
+    var end: usize = length;
+    val root_length: usize = path.root(owned).len;
+    for (end > root_length && path.is_separator(owned[end - 1])) { end = end - 1; }
+    owned[end] = 0;
+    val name: str = path.filename(owned);
+    if (name == nil || name[0] == 0 || str_equals(name, ".") || str_equals(name, "..")) {
+        ret O.some[str]("removal requires a named child entry");
     }
-
-    # only a real directory is descended; a symlink (even to a dir) is unlinked
-    if (kind_from_mode(os.stat_mode(?st)) != KIND_DIR) { ret remove_file(p); }
-
-    val contents: O.Option[str] = remove_dir_contents(a, p, depth);
-    if (O.is_some[str](contents)) { ret contents; }
-
-    ret remove_dir(p);
-}
-
-# remove every entry inside p (collected up front so the directory is never
-# modified mid-enumeration), leaving p itself for the caller to remove
-fun remove_dir_contents(a: *A.Allocator, p: Path, depth: usize) O.Option[str] {
-    val listed: R.Result[Vector[str], str] = read_dir(a, p);
-    if (R.is_err[Vector[str], str](listed)) {
-        ret O.some[str](R.unwrap_err[Vector[str], str](listed));
-    }
-    var names: Vector[str] = R.unwrap_ok[Vector[str], str](listed);
-
-    var result: O.Option[str] = O.none[str]();
-    val count:  usize = names.len;
-    var i:      usize = 0;
-    for (i < count) {
-        val got: R.Result[*str, str] = vector.get[str](?names, i);
-        if (R.is_err[*str, str](got)) { result = O.some[str](R.unwrap_err[*str, str](got)); brk; }
-        val name: str = @R.unwrap_ok[*str, str](got);
-
-        val joined: R.Result[Path, str] = path.join(a, p, name);
-        if (R.is_err[Path, str](joined)) { result = O.some[str](R.unwrap_err[Path, str](joined)); brk; }
-        val child: Path = R.unwrap_ok[Path, str](joined);
-
-        val rr: O.Option[str] = remove_all_at(a, child, depth + 1);
-        A.deallocate[u8](a, child, str_len(child) + 1);
-        A.deallocate[u8](a, name, str_len(name) + 1);
-        if (O.is_some[str](rr)) { result = rr; brk; }
-
-        i = i + 1;
-    }
-
-    vector.dnit[str](?names);
-    ret result;
+    val parent_r: R.Result[Path, str] = path.parent(a, owned);
+    if (R.is_err[Path, str](parent_r)) { ret O.some[str](R.unwrap_err[Path, str](parent_r)); }
+    val parent: Path = R.unwrap_ok[Path, str](parent_r);
+    fin { A.deallocate[u8](a, parent, str_len(parent) + 1); }
+    val raw: i64 = os.open(os.AT_FDCWD, parent, os.O_RDONLY | os.O_DIRECTORY, 0);
+    if (raw == os.ENOENT) { ret O.none[str](); }
+    if (raw < 0) { ret O.some[str](os.message(raw)); }
+    val fd: i32 = raw::i32;
+    var removed: usize = 0;
+    val result: O.Option[removal.Error] = removal.tree(fd, name, ?removed, REMOVE_MAX_DEPTH - 1);
+    val closed: i64 = os.close(fd);
+    if (O.is_some[removal.Error](result)) { ret O.some[str](removal.message(O.unwrap[removal.Error](result))); }
+    if (closed < 0) { ret O.some[str](os.message(closed)); }
+    ret O.none[str]();
 }
 
 # a created temporary file and its path
@@ -910,21 +909,14 @@ fun sibling_temp_name(a: *A.Allocator, name: str, rnd: *u8) R.Result[Path, str] 
     ret R.ok[Path, str](buf::Path);
 }
 
-# flush a directory entry update on posix; MoveFileEx is write-through on windows
 fun sync_directory(p: Path) O.Option[str] {
-    $if ($mach.build.os == $mach.os.windows) {
-        ret O.none[str]();
-    }
-    $or {
-        val raw: i64 = os.open(os.AT_FDCWD, p, os.O_RDONLY | os.O_DIRECTORY, 0);
-        if (raw < 0) { ret O.some[str](os.message(raw)); }
-        var f: File = File{handle: io_handle.FileHandle{value: raw::usize}};
-
-        val se: O.Option[str] = error_option_text(sync(f));
-        val ce: O.Option[str] = error_option_text(close(?f));
-        if (O.is_some[str](se)) { ret se; }
-        ret ce;
-    }
+    val raw: i64 = os.open(os.AT_FDCWD, p, os.O_RDONLY | os.O_DIRECTORY, 0);
+    if (raw < 0) { ret O.some[str](os.message(raw)); }
+    var f: File = File{handle: io_handle.FileHandle{value: raw::usize}};
+    val se: O.Option[str] = error_option_text(sync(f));
+    val ce: O.Option[str] = error_option_text(close(?f));
+    if (O.is_some[str](se)) { ret se; }
+    ret ce;
 }
 
 fun atomic_paths_free(a: *A.Allocator, parent: Path, temp: Path) {
@@ -1110,11 +1102,7 @@ test "std.filesystem.rename:moves_entry" {
     ret bad;
 }
 
-# rename replaces an existing destination file rather than refusing
-#
-# the POSIX parity the docstring promises. windows needed MoveFileEx with
-# REPLACE_EXISTING for this: bare MoveFile fails whenever the destination
-# exists, which is the common case for write-a-temp-then-rename (#414)
+# replacing a closed destination retains the source bytes
 test "std.filesystem.rename:replaces_existing_destination" {
     val from: Path = "mach_std_fs_ren_r_a";
     val to:   Path = "mach_std_fs_ren_r_b";
@@ -1237,4 +1225,296 @@ test "std.filesystem.symlink:link_vs_target" {
     remove_file(link);
     remove_file(target);
     ret bad;
+}
+
+fun rename_held_contents(file: File, expected: str) bool {
+    if (R.is_err[i64, io_error.Error](seek(file, 0, os.SEEK_SET))) { ret false; }
+    var bytes: [3]u8;
+    val got: R.Result[usize, io_error.Error] = read(file, ?bytes[0], 3);
+    if (R.is_err[usize, io_error.Error](got)) { ret false; }
+    if (R.unwrap_ok[usize, io_error.Error](got) != 3) { ret false; }
+    ret bytes[0] == expected[0] && bytes[1] == expected[1] && bytes[2] == expected[2];
+}
+
+fun rename_held_pair(from: Path, to: Path) i32 {
+    if (O.is_some[str](write_bytes(from, "new", 3, 0o600))) { ret 1; }
+    fin { remove_file(from); }
+    if (O.is_some[str](write_bytes(to, "old", 3, 0o600))) { ret 2; }
+    fin { remove_file(to); }
+    val sr: R.Result[File, io_error.Error] = open(from);
+    if (R.is_err[File, io_error.Error](sr)) { ret 3; }
+    var source: File = R.unwrap_ok[File, io_error.Error](sr);
+    fin { close(?source); }
+    val dr: R.Result[File, io_error.Error] = open(to);
+    if (R.is_err[File, io_error.Error](dr)) { ret 4; }
+    var destination: File = R.unwrap_ok[File, io_error.Error](dr);
+    fin { close(?destination); }
+    if (O.is_some[str](rename(from, to))) { ret 73; }
+    if (exists(from)) { ret 6; }
+    if (!rename_held_contents(destination, "old")) { ret 7; }
+    if (!rename_held_contents(source, "new")) { ret 8; }
+    val nr: R.Result[File, io_error.Error] = open(to);
+    if (R.is_err[File, io_error.Error](nr)) { ret 9; }
+    var next: File = R.unwrap_ok[File, io_error.Error](nr);
+    fin { close(?next); }
+    if (!rename_held_contents(next, "new")) { ret 10; }
+    ret 0;
+}
+
+test "std.filesystem.rename: held destinations preserve old handles with relative paths" {
+    ret rename_held_pair("mach_std_held_é_from", "mach_std_held_é_to");
+}
+
+test "std.filesystem.rename: held destinations preserve old handles with absolute paths" {
+    var bytes: [8192]u8;
+    var state: fixed.FixedState;
+    var alloc: A.Allocator;
+    if (O.is_some[*u8](fixed.make(?alloc, ?state, ?bytes[0], 8192))) { ret 1; }
+    val sr: R.Result[TempFile, str] = temp_create(?alloc, "mach_held_source");
+    if (R.is_err[TempFile, str](sr)) { ret 2; }
+    var source: TempFile = R.unwrap_ok[TempFile, str](sr);
+    fin { temp_close_and_remove(?source); A.deallocate[u8](?alloc, source.path, str_len(source.path) + 1); }
+    val dr: R.Result[TempFile, str] = temp_create(?alloc, "mach_held_destination");
+    if (R.is_err[TempFile, str](dr)) { ret 3; }
+    var destination: TempFile = R.unwrap_ok[TempFile, str](dr);
+    fin { temp_close_and_remove(?destination); A.deallocate[u8](?alloc, destination.path, str_len(destination.path) + 1); }
+    if (!path.is_abs(source.path) || !path.is_abs(destination.path)) { ret 4; }
+    ret rename_held_pair(source.path, destination.path);
+}
+
+test "std.filesystem.rename: source symlinks move without moving their targets" {
+    val target: str = "mach_std_rename_symlink_target";
+    val from: str = "mach_std_rename_symlink_from";
+    val to: str = "mach_std_rename_symlink_to";
+    if (O.is_some[str](write_bytes(target, "old", 3, 0o600))) { ret 1; }
+    fin { remove_file(target); }
+    if (O.is_some[str](symlink(target, from))) { ret 2; }
+    fin { remove_file(from); remove_file(to); }
+    if (O.is_some[str](rename(from, to))) { ret 3; }
+    val moved: R.Result[Metadata, str] = metadata_link(to);
+    if (R.is_err[Metadata, str](moved)) { ret 4; }
+    if (R.unwrap_ok[Metadata, str](moved).kind != KIND_SYMLINK) { ret 5; }
+    if (!is_file(target) || exists(from)) { ret 6; }
+    val opened: R.Result[File, io_error.Error] = open(to);
+    if (R.is_err[File, io_error.Error](opened)) { ret 7; }
+    var file: File = R.unwrap_ok[File, io_error.Error](opened);
+    fin { close(?file); }
+    if (!rename_held_contents(file, "old")) { ret 8; }
+    ret 0;
+}
+
+fun rename_type_conflicts(rooted: bool) i32 {
+    var file_path: str = "mach_std_rename_type_file";
+    var dir_path: str = "mach_std_rename_type_directory";
+    if (rooted) {
+        file_path = "mach_std_rename_rooted_type_file";
+        dir_path = "mach_std_rename_rooted_type_directory";
+    }
+    if (O.is_some[str](write_bytes(file_path, "old", 3, 0o600))) { ret 1; }
+    fin { remove_file(file_path); remove_dir(file_path); }
+    if (O.is_some[str](create_dir(dir_path, 0o700))) { ret 2; }
+    fin { remove_dir(dir_path); remove_file(dir_path); }
+    var dirfd: i32 = os.AT_FDCWD;
+    if (rooted) {
+        val opened: i64 = os.open(os.AT_FDCWD, ".", os.O_RDONLY | os.O_DIRECTORY, 0);
+        if (opened < 0) { ret 9; }
+        dirfd = opened::i32;
+    }
+    fin { if (rooted) { os.close(dirfd); } }
+    if (os.rename(dirfd, file_path, dirfd, dir_path) >= 0) { ret 3; }
+    if (!is_file(file_path) || !is_dir(dir_path)) { ret 4; }
+    if (os.rename(dirfd, dir_path, dirfd, file_path) >= 0) { ret 5; }
+    if (!is_file(file_path) || !is_dir(dir_path)) { ret 6; }
+    val opened: R.Result[File, io_error.Error] = open(file_path);
+    if (R.is_err[File, io_error.Error](opened)) { ret 7; }
+    var file: File = R.unwrap_ok[File, io_error.Error](opened);
+    fin { close(?file); }
+    if (!rename_held_contents(file, "old")) { ret 8; }
+    ret 0;
+}
+
+test "std.filesystem.rename: type conflicts preserve both entries" {
+    ret rename_type_conflicts(false);
+}
+
+test "std.filesystem.rename: rooted type conflicts preserve both entries" {
+    ret rename_type_conflicts(true);
+}
+
+
+fun rename_directory_symlink(existing: bool) i32 {
+    var target: str = "mach_607_dirlink_absent_target";
+    var from: str = "mach_607_dirlink_absent_from";
+    var to: str = "mach_607_dirlink_absent_to";
+    if (existing) {
+        target = "mach_607_dirlink_existing_target";
+        from = "mach_607_dirlink_existing_from";
+        to = "mach_607_dirlink_existing_to";
+    }
+    if (O.is_some[str](create_dir(target, 0o700))) { ret 97; }
+    fin { remove_dir(target); }
+    if (O.is_some[str](symlink(target, from))) { ret 98; }
+    fin { remove_dir(from); remove_file(from); remove_dir(to); remove_file(to); }
+    val before: R.Result[Metadata, str] = metadata_link(from);
+    if (R.is_err[Metadata, str](before)) { ret 96; }
+    if (R.unwrap_ok[Metadata, str](before).kind != KIND_SYMLINK) { ret 95; }
+    if (existing && O.is_some[str](write_bytes(to, "old", 3, 0o600))) { ret 94; }
+    val raw: i64 = os.rename(os.AT_FDCWD, from, os.AT_FDCWD, to);
+    if (raw < 0) { ret (0 - raw)::i32; }
+    val moved: R.Result[Metadata, str] = metadata_link(to);
+    if (R.is_err[Metadata, str](moved)) { ret 93; }
+    if (R.unwrap_ok[Metadata, str](moved).kind != KIND_SYMLINK) { ret 92; }
+    if (!is_dir(target) || exists(from)) { ret 91; }
+    ret 0;
+}
+test "std.filesystem.rename: directory symlink source to absent destination" { ret rename_directory_symlink(false); }
+test "std.filesystem.rename: directory symlink source to regular file destination" { ret rename_directory_symlink(true); }
+
+$if ($mach.build.os == $mach.os.windows) {
+    test "std.filesystem.rename: drive-relative destinations preserve held handles" {
+        var bytes: [8192]u8;
+        var state: fixed.FixedState;
+        var alloc: A.Allocator;
+        if (O.is_some[*u8](fixed.make(?alloc, ?state, ?bytes[0], 8192))) { ret 1; }
+        val sr: R.Result[TempFile, str] = temp_create(?alloc, "mach_held_drive_source");
+        if (R.is_err[TempFile, str](sr)) { ret 2; }
+        var source: TempFile = R.unwrap_ok[TempFile, str](sr);
+        fin { temp_close_and_remove(?source); A.deallocate[u8](?alloc, source.path, str_len(source.path) + 1); }
+        if (source.path[1] != ':') { ret 3; }
+        val leaf: str = path.filename(source.path);
+        val length: usize = str_len(leaf) + 7;
+        val ar: R.Result[*u8, str] = A.allocate[u8](?alloc, length);
+        if (R.is_err[*u8, str](ar)) { ret 4; }
+        val to: *u8 = R.unwrap_ok[*u8, str](ar);
+        fin { A.deallocate[u8](?alloc, to, length); }
+        to[0] = source.path[0];
+        to[1] = ':';
+        memory.raw_copy(?to[2], leaf, length - 7);
+        memory.raw_copy(?to[length - 5], ".dst", 4);
+        to[length - 1] = 0;
+        ret rename_held_pair(source.path, to);
+    }
+}
+
+test "std.filesystem.remove_all: removes nested entries and preserves external link targets" {
+    var bytes: [8192]u8;
+    var state: fixed.FixedState;
+    var alloc: A.Allocator;
+    if (O.is_some[*u8](fixed.make(?alloc, ?state, ?bytes[0], 8192))) { ret 1; }
+    val tree: str = "mach_613_remove_tree";
+    val outside: str = "mach_613_remove_outside";
+    if (O.is_some[str](create_dir(tree, 0o700))) { ret 2; }
+    fin { remove_all(?alloc, tree); }
+    if (O.is_some[str](create_dir(outside, 0o700))) { ret 3; }
+    fin { remove_all(?alloc, outside); }
+    if (O.is_some[str](write_bytes("mach_613_remove_outside/kept", "kept", 4, 0o600))) { ret 4; }
+    if (O.is_some[str](create_dir("mach_613_remove_tree/nested", 0o700))) { ret 5; }
+    if (O.is_some[str](write_bytes("mach_613_remove_tree/nested/empty_mode", "private", 7, 0))) { ret 6; }
+    if (O.is_some[str](symlink("../mach_613_remove_outside", "mach_613_remove_tree/directory_link"))) { ret 7; }
+    if (O.is_some[str](symlink("../mach_613_remove_outside/kept", "mach_613_remove_tree/file_link"))) { ret 8; }
+    if (O.is_some[str](remove_all(?alloc, tree))) { ret 9; }
+    if (exists(tree) || !is_file("mach_613_remove_outside/kept")) { ret 10; }
+    if (O.is_some[str](remove_all(?alloc, tree))) { ret 11; }
+    ret 0;
+}
+
+$if ($mach.build.os == $mach.os.windows) {
+    #[library("kernel32.dll")]
+    ext fun SetFileAttributesW(path: *u16, attributes: u32) i32;
+    #[library("kernel32.dll")]
+    ext fun GetFileAttributesW(path: *u16) u32;
+    #[library("kernel32.dll")]
+    ext fun CreateHardLinkW(path: *u16, existing: *u16, security: ptr) i32;
+
+    fun removal_test_wide(name: str, out: *u16) {
+        var i: usize = 0;
+        for (name[i] != 0) { out[i] = name[i]::u16; i = i + 1; }
+        out[i] = 0;
+    }
+
+    test "std.filesystem.remove_all: forces readonly entries without changing surviving aliases" {
+        var bytes: [8192]u8;
+        var state: fixed.FixedState;
+        var alloc: A.Allocator;
+        if (O.is_some[*u8](fixed.make(?alloc, ?state, ?bytes[0], 8192))) { ret 1; }
+        val tree: str = "mach_613_readonly_tree";
+        val alias: str = "mach_613_readonly_alias";
+        val file: str = "mach_613_readonly_tree/file";
+        if (O.is_some[str](create_dir(tree, 0o700))) { ret 2; }
+        fin { remove_all(?alloc, tree); }
+        if (O.is_some[str](write_bytes(file, "kept", 4, 0o600))) { ret 3; }
+        var wide_file: [128]u16;
+        var wide_alias: [128]u16;
+        removal_test_wide(file, ?wide_file[0]);
+        removal_test_wide(alias, ?wide_alias[0]);
+        if (CreateHardLinkW(?wide_alias[0], ?wide_file[0], nil) == 0) { ret 4; }
+        fin { remove_all(?alloc, alias); }
+        if (SetFileAttributesW(?wide_file[0], 0x21) == 0) { ret 5; }
+        val before: u32 = GetFileAttributesW(?wide_alias[0]);
+        if (before == 0xffffffff || (before & 1) == 0) { ret 6; }
+        if (O.is_none[str](remove_file(file))) { ret 7; }
+        if (!is_file(file) || GetFileAttributesW(?wide_alias[0]) != before) { ret 8; }
+        if (O.is_some[str](symlink("../mach_613_readonly_alias", "mach_613_readonly_tree/link"))) { ret 9; }
+        if (O.is_some[str](remove_all(?alloc, tree))) { ret 10; }
+        if (exists(tree) || !is_file(alias) || GetFileAttributesW(?wide_alias[0]) != before) { ret 11; }
+        val opened: R.Result[File, io_error.Error] = open(alias);
+        if (R.is_err[File, io_error.Error](opened)) { ret 12; }
+        var held: File = R.unwrap_ok[File, io_error.Error](opened);
+        fin { close(?held); }
+        if (!rename_held_contents(held, "kept")) { ret 13; }
+        if (O.is_some[str](remove_all(?alloc, alias))) { ret 14; }
+        if (exists(alias) || !rename_held_contents(held, "kept")) { ret 15; }
+        ret 0;
+    }
+}
+
+use read_string_testing: std.allocator.testing;
+
+rec ReadStringProbe {
+    backing: *read_string_testing.Testing;
+    path: Path;
+    truncate: bool;
+    failed: bool;
+}
+
+fun read_string_probe_allocate(ctx: ptr, size: usize, align: usize) O.Option[ptr] {
+    val probe: *ReadStringProbe = ctx::*ReadStringProbe;
+    if (probe.truncate) {
+        val opened: i64 = os.open(os.AT_FDCWD, probe.path, os.O_WRONLY | os.O_TRUNC, 0);
+        if (opened < 0) { probe.failed = true; ret O.none[ptr](); }
+        if (os.close(opened::i32) < 0) { probe.failed = true; ret O.none[ptr](); }
+    }
+    ret probe.backing.a.fn_allocate(probe.backing.a.ctx, size, align);
+}
+
+fun read_string_probe_deallocate(ctx: ptr, data: ptr, size: usize, align: usize) i64 {
+    val probe: *ReadStringProbe = ctx::*ReadStringProbe;
+    ret probe.backing.a.fn_deallocate(probe.backing.a.ctx, data, size, align);
+}
+
+test "std.filesystem.read_string: truncation releases the exact allocation before returning" {
+    val name: Path = "mach_std_read_string_truncation";
+    if (O.is_some[str](write_bytes(name, "content", 7, 0o600))) { ret 1; }
+    fin { remove_file(name); }
+    var tracking: read_string_testing.Testing;
+    if (O.is_some[str](read_string_testing.make(?tracking))) { ret 2; }
+    fin { read_string_testing.dnit(?tracking); }
+    var probe: ReadStringProbe = ReadStringProbe{backing: ?tracking, path: name, truncate: true};
+    var alloc: A.Allocator = A.Allocator{ctx: (?probe)::ptr,
+        fn_allocate: read_string_probe_allocate, fn_deallocate: read_string_probe_deallocate};
+    val failed: R.Result[str, str] = read_string(?alloc, name);
+    if (probe.failed || R.is_ok[str, str](failed)) { ret 3; }
+    if (!str_equals(R.unwrap_err[str, str](failed), m_reader.ERR_EOF)) { ret 4; }
+    if (tracking.attempts != 1 || tracking.total != 1 || tracking.live != 0 || tracking.double_frees != 0) { ret 5; }
+    probe.truncate = false;
+    val empty: R.Result[str, str] = read_string(?alloc, name);
+    if (R.is_err[str, str](empty)) { ret 6; }
+    val data: str = R.unwrap_ok[str, str](empty);
+    if (data == nil || data[0] != 0 || tracking.live != 1) { ret 7; }
+    if (R.is_err[bool, *u8](A.deallocate[u8](?alloc, data, 1))) { ret 8; }
+    if (tracking.live != 0 || tracking.double_frees != 0) { ret 9; }
+    tracking.fail_at = tracking.attempts + 1;
+    val refused: R.Result[str, str] = read_string(?alloc, name);
+    if (R.is_ok[str, str](refused) || tracking.live != 0) { ret 10; }
+    ret 0;
 }

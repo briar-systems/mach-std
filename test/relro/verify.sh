@@ -24,21 +24,24 @@ mach="${1:-mach}"
 target="${2:-linux}"
 runner="${3:-}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/../lib/compiler.sh"
 cd "$here"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 run()  { if [ -n "$runner" ]; then "$runner" "$@"; else "$@"; fi; }
 
-# vendor this checkout's std as the path dependency (dep/std -> repo root).
-mkdir -p dep
-ln -sfn "$(cd ../.. && pwd)" dep/std
+# copy the dependency inside the fixture project
+rm -rf dep
+mkdir -p dep/std
+cp ../../mach.toml dep/std/mach.toml
+cp -R ../../src dep/std/src
 
 echo "building the RELRO probes --pie with $mach (target $target)"
 rm -rf out
 # the manifest declares two bins; a plain build is intentionally ambiguous, so
 # select each probe explicitly.
-"$mach" build . --bin relro_happy --target "$target" --pie --profile debug
-"$mach" build . --bin relro_fault --target "$target" --pie --profile debug
+mach_run build . --bin relro_happy --target "$target" --pie --profile debug
+mach_run build . --bin relro_fault --target "$target" --pie --profile debug
 happy="$(find out -name relro_happy -type f -print -quit)"
 fault="$(find out -name relro_fault -type f -print -quit)"
 [ -n "$happy" ] || fail "no relro_happy binary produced"
