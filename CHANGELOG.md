@@ -7,11 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-09-07
+
+### Fixed
+
+- Directory listing releases copied names and vector storage on enumeration or
+  allocation failure, including a name awaiting vector growth. Its ownership
+  documentation now requires callers to free each returned name before the vector.
+
 ## [1.0.0] - 2026-09-07
 
 The audited standard library defines its stable public API under Semantic
 Versioning 2.0.0. This major release includes the ownership and filesystem API
-changes below. Mach 4.30.0 pins this release as its transition dependency.
+changes below. Mach 4.30.0 uses this API generation as its transition dependency.
 The later breaking result/option/tag migration for Mach v5 will ship as std 2.0.0.
 
 ### Added
