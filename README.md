@@ -35,7 +35,7 @@ A published version's source and tag are immutable. Release tags must match
 Changes that invalidate an existing supported combination require a major release.
 Version compatibility does not silently move an application's dependency pin.
 
-Std 1.0.0 is the audited dependency for Mach 4.30.0. The breaking language and API
+Std 1.0.1 is the audited dependency for Mach 4.30.0. The breaking language and API
 migration for Mach v5 is planned as std 2.0.0. Compiler and std version numbers
 are independent.
 
