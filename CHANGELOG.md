@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Darwin CPU discovery uses public sysctlbyname with hw.activecpu, returning the
+  current active count instead of the boot maximum and retaining a minimum of one.
+
 - Darwin ordinary entropy filling uses the public libSystem getentropy interface,
   preserving bounded chunks, immediate errors and the completed prefix on failure.
 
