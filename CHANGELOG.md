@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Darwin ordinary entropy filling uses the public libSystem getentropy interface,
+  preserving bounded chunks, immediate errors and the completed prefix on failure.
+
 - Crypto and secret-storage tests use explicit typed declassification with the
   published Mach 4.30.0 compiler. The legacy spelling is removed from current source.
 
