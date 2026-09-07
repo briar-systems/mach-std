@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Crypto and secret-storage tests use explicit typed declassification with the
+  published Mach 4.30.0 compiler. The legacy spelling is removed from current source.
+
 - Darwin virtual-memory primitives use typed public libSystem interfaces, preserving
   mapping ownership, native failure sentinels and heap publication ordering.
 
