@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Darwin virtual-memory primitives use typed public libSystem interfaces, preserving
+  mapping ownership, native failure sentinels and heap publication ordering.
+
 ## [1.0.1] - 2026-09-07
 
 ### Fixed
