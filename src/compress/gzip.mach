@@ -6,13 +6,11 @@
 # a mismatch is reported rather than silently returning corrupt output. the
 # optional FHCRC header checksum is verified too when present.
 #
-# one member is decoded. RFC 1952 permits members to be concatenated, but the
-# streaming contract here reports DONE at the end of a member and a caller
-# feeding chunks has no way to say "more members follow"; a multi-member reader
-# needs an explicit end-of-input signal and is a separate surface. bytes after
-# the first member's trailer are left unconsumed.
+# all concatenated members are decoded and checked independently. after every
+# input byte has been consumed, finish declares end-of-input and drains output.
+# DONE means the complete stream was verified after that declaration.
 # Progress, its status constants, and WINDOW are re-exported from inflate so a
-# caller needs only this module to drive a member and size its scratch storage.
+# caller needs only this module to drive a stream and size its scratch storage.
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -22,6 +20,8 @@ use std.types.string.str;
 use std.types.string.str_equals;
 
 use A: std.allocator;
+use T: std.allocator.testing;
+use O: std.types.option;
 use R: std.types.result;
 use V: std.collections.vector;
 use I: std.compress.inflate;
@@ -43,7 +43,9 @@ val G_COMMENT: u8 = 4;
 val G_HCRC:    u8 = 5;
 val G_DATA:    u8 = 6;
 val G_TRAILER: u8 = 7;
-val G_DONE:    u8 = 8;
+val G_BETWEEN: u8 = 8;
+val G_DONE:    u8 = 9;
+val G_CLOSED:  u8 = 10;
 
 val F_HCRC:    u8 = 2;
 val F_EXTRA:   u8 = 4;
@@ -52,7 +54,7 @@ val F_COMMENT: u8 = 16;
 
 # streaming gzip decoder state
 #
-# create with init, drive with decompress, confirm with finish, release with
+# create with init, feed with decompress, drain with finish, release with
 # dnit. all fields are internal; the surface is the functions below.
 pub rec Decompressor {
     inf:   I.Inflater;
@@ -64,6 +66,8 @@ pub rec Decompressor {
     crc:   u32;
     isize: u64;
     buf:   [10]u8;
+    eof:   bool;
+    failure: str;
 }
 
 fun progress(st: I.Status, consumed: usize, written: usize) R.Result[I.Progress, str] {
@@ -101,12 +105,8 @@ fun after_head(z: *Decompressor) {
     after_extra(z);
 }
 
-# reset the decoder to the start of a new stream, keeping the window allocation
-# ---
-# z: decoder to reset
-pub fun reset(z: *Decompressor) {
-    if (z == nil) { ret; }
-
+# begin another member without changing the stream lifecycle
+fun member_reset(z: *Decompressor) {
     I.reset(?z.inf);
     z.state = G_HEAD;
     z.have  = 0;
@@ -115,6 +115,14 @@ pub fun reset(z: *Decompressor) {
     z.hcrc  = crc32.init();
     z.crc   = crc32.init();
     z.isize = 0;
+}
+
+# restart a live decoder after completion or failure, retaining its window
+pub fun reset(z: *Decompressor) {
+    if (z == nil || z.inf.win == nil) { ret; }
+    z.eof = false;
+    z.failure = nil;
+    member_reset(z);
 }
 
 # create a decoder, allocating the inflater's window from a
@@ -140,43 +148,20 @@ pub fun init(a: *A.Allocator) R.Result[Decompressor, str] {
 # ret: true if the window was released
 pub fun dnit(z: *Decompressor) bool {
     if (z == nil) { ret true; }
+    z.state = G_CLOSED;
     ret I.dnit(?z.inf);
 }
 
-# check whether the member finished and its checksums verified
+# check whether end-of-input and every member have been verified
 # ---
 # z:   decoder to query
-# ret: true once the trailer has been read and matched
+# ret: true once the complete stream has been verified
 pub fun is_done(z: *Decompressor) bool {
     if (z == nil) { ret false; }
     ret z.state == G_DONE;
 }
 
-# confirm the member ended rather than simply running out of input
-# ---
-# z:   decoder to check
-# ret: true if the member completed, or an error describing why it did not
-pub fun finish(z: *Decompressor) R.Result[bool, str] {
-    if (z == nil) { ret R.err[bool, str]("decompressor is nil"); }
-    if (z.state != G_DONE) { ret R.err[bool, str]("truncated gzip stream"); }
-    ret R.ok[bool, str](true);
-}
-
-# decode as much as src and dst allow
-#
-# returns when src runs out (NEED_INPUT), dst fills (OUTPUT_FULL), or the member
-# ends and its crc32 and length match (DONE). advance src by consumed and dst by
-# written, then call again.
-# ---
-# z:       decoder created by init
-# src:     next chunk of the gzip stream
-# src_len: length of that chunk
-# dst:     where decompressed bytes go
-# dst_len: space available at dst
-# ret:     what the call accomplished, or an error describing the malformed stream
-pub fun decompress(z: *Decompressor, src: *u8, src_len: usize, dst: *u8, dst_len: usize) R.Result[I.Progress, str] {
-    if (z == nil) { ret R.err[I.Progress, str]("decompressor is nil"); }
-
+fun member(z: *Decompressor, src: *u8, src_len: usize, dst: *u8, dst_len: usize) R.Result[I.Progress, str] {
     var consumed: usize = 0;
     var written:  usize = 0;
 
@@ -318,10 +303,66 @@ pub fun decompress(z: *Decompressor, src: *u8, src_len: usize, dst: *u8, dst_len
             ret R.err[I.Progress, str]("gzip length mismatch");
         }
 
-        z.state = G_DONE;
+        z.state = G_BETWEEN;
     }
 
     ret progress(I.DONE, consumed, written);
+}
+
+fun pump(z: *Decompressor, src: *u8, src_len: usize, dst: *u8, dst_len: usize) R.Result[I.Progress, str] {
+    var consumed: usize = 0;
+    var written: usize = 0;
+    for (z.state != G_DONE) {
+        if (z.state == G_BETWEEN) {
+            if (consumed == src_len) {
+                if (!z.eof) { ret progress(I.NEED_INPUT, consumed, written); }
+                z.state = G_DONE;
+                brk;
+            }
+            member_reset(z);
+        }
+        val step: R.Result[I.Progress, str] = member(z, ?src[consumed], src_len - consumed,
+            ?dst[written], dst_len - written);
+        if (R.is_err[I.Progress, str](step)) {
+            z.failure = R.unwrap_err[I.Progress, str](step);
+            ret step;
+        }
+        val p: I.Progress = R.unwrap_ok[I.Progress, str](step);
+        consumed = consumed + p.consumed;
+        written = written + p.written;
+        if (p.status == I.NEED_INPUT && z.eof) {
+            z.failure = "truncated gzip stream";
+            ret R.err[I.Progress, str](z.failure);
+        }
+        if (p.status != I.DONE) { ret progress(p.status, consumed, written); }
+    }
+    ret progress(I.DONE, consumed, written);
+}
+
+# feed input, advancing buffers by the returned consumed and written counts
+# member boundaries require more input until finish declares end-of-input
+# output remains unverified until DONE and must be discarded on stream failure
+# a zero-capacity output may return OUTPUT_FULL without progress
+pub fun decompress(z: *Decompressor, src: *u8, src_len: usize, dst: *u8, dst_len: usize) R.Result[I.Progress, str] {
+    if (z == nil) { ret R.err[I.Progress, str]("decompressor is nil"); }
+    if (z.inf.win == nil) { ret R.err[I.Progress, str]("decompressor is not initialized"); }
+    if (z.failure != nil) { ret R.err[I.Progress, str](z.failure); }
+    if (z.eof) { ret R.err[I.Progress, str]("gzip input is already finished"); }
+    if (src == nil && src_len != 0) { ret R.err[I.Progress, str]("gzip input is nil"); }
+    if (dst == nil && dst_len != 0) { ret R.err[I.Progress, str]("gzip output is nil"); }
+    ret pump(z, src, src_len, dst, dst_len);
+}
+
+# declare end-of-input after all supplied input has been consumed, then drain
+# repeat with output space on OUTPUT_FULL, DONE is idempotent, NEED_INPUT never occurs
+# an empty or truncated stream fails, failure persists until reset or dnit
+pub fun finish(z: *Decompressor, dst: *u8, dst_len: usize) R.Result[I.Progress, str] {
+    if (z == nil) { ret R.err[I.Progress, str]("decompressor is nil"); }
+    if (z.inf.win == nil) { ret R.err[I.Progress, str]("decompressor is not initialized"); }
+    if (z.failure != nil) { ret R.err[I.Progress, str](z.failure); }
+    if (dst == nil && dst_len != 0) { ret R.err[I.Progress, str]("gzip output is nil"); }
+    z.eof = true;
+    ret pump(z, nil, 0, dst, dst_len);
 }
 
 fun drive(z: *Decompressor, src: *u8, src_len: usize, dst: *u8, dst_len: usize) R.Result[usize, str] {
@@ -329,8 +370,9 @@ fun drive(z: *Decompressor, src: *u8, src_len: usize, dst: *u8, dst_len: usize) 
     var out_off: usize = 0;
 
     for (!is_done(z)) {
-        val r: R.Result[I.Progress, str] = decompress(z, ?src[in_off], src_len - in_off,
-                                                         ?dst[out_off], dst_len - out_off);
+        var r: R.Result[I.Progress, str];
+        if (in_off == src_len) { r = finish(z, ?dst[out_off], dst_len - out_off); }
+        or { r = decompress(z, ?src[in_off], src_len - in_off, ?dst[out_off], dst_len - out_off); }
         if (R.is_err[I.Progress, str](r)) {
             ret R.err[usize, str](R.unwrap_err[I.Progress, str](r));
         }
@@ -340,19 +382,16 @@ fun drive(z: *Decompressor, src: *u8, src_len: usize, dst: *u8, dst_len: usize) 
         out_off = out_off + p.written;
 
         if (p.status == I.OUTPUT_FULL) { ret R.err[usize, str]("output buffer too small"); }
-        if (p.status == I.NEED_INPUT && in_off >= src_len) {
-            ret R.err[usize, str]("truncated gzip stream");
-        }
     }
 
     ret R.ok[usize, str](out_off);
 }
 
-# decompress a whole gzip member into a caller-provided buffer
+# decompress a complete gzip stream into a caller-provided buffer
 # ---
 # a:       allocator for the decoder's window
-# src:     the complete gzip member
-# src_len: length of that member
+# src:     the complete gzip stream, including all members
+# src_len: length of that stream
 # dst:     where decompressed bytes go
 # dst_len: space available at dst
 # ret:     bytes written, or an error if the stream is malformed or does not fit
@@ -373,16 +412,9 @@ fun grow(z: *Decompressor, out: *V.Vector[u8], src: *u8, src_len: usize) R.Resul
     var in_off: usize = 0;
 
     for (!is_done(z)) {
-        if (out.len == out.cap) {
-            var next: usize = out.cap * 2;
-            if (next < 4096) { next = 4096; }
-
-            val e: R.Result[usize, str] = V.ensure[u8](out, next);
-            if (R.is_err[usize, str](e)) { ret e; }
-        }
-
-        val r: R.Result[I.Progress, str] = decompress(z, ?src[in_off], src_len - in_off,
-                                                         ?out.data[out.len], out.cap - out.len);
+        var r: R.Result[I.Progress, str];
+        if (in_off == src_len) { r = finish(z, ?out.data[out.len], out.cap - out.len); }
+        or { r = decompress(z, ?src[in_off], src_len - in_off, ?out.data[out.len], out.cap - out.len); }
         if (R.is_err[I.Progress, str](r)) {
             ret R.err[usize, str](R.unwrap_err[I.Progress, str](r));
         }
@@ -391,19 +423,23 @@ fun grow(z: *Decompressor, out: *V.Vector[u8], src: *u8, src_len: usize) R.Resul
         in_off  = in_off + p.consumed;
         out.len = out.len + p.written;
 
-        if (p.status == I.NEED_INPUT && in_off >= src_len) {
-            ret R.err[usize, str]("truncated gzip stream");
+        if (p.status == I.OUTPUT_FULL) {
+            var next: usize = out.cap * 2;
+            if (out.cap != 0 && next <= out.cap) { ret R.err[usize, str]("gzip output capacity overflow"); }
+            if (next < 4096) { next = 4096; }
+            val expanded: R.Result[usize, str] = V.ensure[u8](out, next);
+            if (R.is_err[usize, str](expanded)) { ret expanded; }
         }
     }
 
     ret R.ok[usize, str](out.len);
 }
 
-# decompress a whole gzip member into a vector that grows as needed
+# decompress a complete gzip stream into a vector that grows as needed
 # ---
 # a:       allocator for the decoder's window and the output vector
-# src:     the complete gzip member
-# src_len: length of that member
+# src:     the complete gzip stream, including all members
+# src_len: length of that stream
 # ret:     a vector owning the decompressed bytes, which the caller must dnit,
 #          or an error if the stream is malformed
 pub fun decompress_alloc(a: *A.Allocator, src: *u8, src_len: usize) R.Result[V.Vector[u8], str] {
@@ -611,19 +647,21 @@ fun stream_check(comp: *u8, comp_len: usize, in_chunk: usize, out_chunk: usize, 
         var room: usize = out_chunk;
         if (out_off + room > 4096) { room = 4096 - out_off; }
 
-        val r: R.Result[I.Progress, str] = decompress(?z, ?comp[in_off], feed, ?obuf[out_off], room);
+        var r: R.Result[I.Progress, str];
+        if (in_off == comp_len) { r = finish(?z, ?obuf[out_off], room); }
+        or { r = decompress(?z, ?comp[in_off], feed, ?obuf[out_off], room); }
         if (R.is_err[I.Progress, str](r)) { dnit(?z); ret 2; }
 
         val p: I.Progress = R.unwrap_ok[I.Progress, str](r);
         in_off  = in_off + p.consumed;
         out_off = out_off + p.written;
 
-        if (p.status == I.NEED_INPUT && in_off >= comp_len) { dnit(?z); ret 3; }
+        if (p.consumed > feed || p.written > room) { dnit(?z); ret 3; }
     }
 
-    val f: R.Result[bool, str] = finish(?z);
+    val done: bool = is_done(?z);
     dnit(?z);
-    if (R.is_err[bool, str](f)) { ret 4; }
+    if (!done) { ret 4; }
     if (in_off != comp_len)  { ret 5; }
     if (out_off != orig_len) { ret 6; }
 
@@ -771,5 +809,271 @@ test "gzip: header with a valid FHCRC is accepted" {
         if (obuf[i] != D_GOOD_HCRC[i]) { ret 3; }
         i = i + 1;
     }
+    ret 0;
+}
+
+fun t_copy(dst: *u8, src: *u8, count: usize) {
+    var i: usize = 0;
+    for (i < count) { dst[i] = src[i]; i = i + 1; }
+}
+
+fun t_split(comp: *u8, count: usize, split: usize, room: usize, expected: *u8, expected_len: usize) i32 {
+    var a: A.Allocator;
+    page.make(?a);
+    val created: R.Result[Decompressor, str] = init(?a);
+    if (R.is_err[Decompressor, str](created)) { ret 1; }
+    var z: Decompressor = R.unwrap_ok[Decompressor, str](created);
+    fin { dnit(?z); }
+    var read: usize = 0;
+    var written: usize = 0;
+    var steps: usize = 0;
+    for (!is_done(?z) && steps < 4096) {
+        var feed: usize = count - read;
+        if (read < split) { feed = split - read; }
+        var available: usize = room;
+        if (available > 4096 - written) { available = 4096 - written; }
+        var result: R.Result[I.Progress, str];
+        if (read == count) { result = finish(?z, ?obuf[written], available); }
+        or { result = decompress(?z, ?comp[read], feed, ?obuf[written], available); }
+        if (R.is_err[I.Progress, str](result)) { ret 2; }
+        val p: I.Progress = R.unwrap_ok[I.Progress, str](result);
+        if (p.consumed > feed || p.written > available) { ret 3; }
+        if (read == count && p.status == I.NEED_INPUT) { ret 4; }
+        if (p.status == I.DONE && !z.eof) { ret 5; }
+        if (p.status != I.DONE && p.consumed == 0 && p.written == 0) { ret 6; }
+        read = read + p.consumed;
+        written = written + p.written;
+        steps = steps + 1;
+    }
+    if (!is_done(?z) || read != count || written != expected_len) { ret 7; }
+    var i: usize = 0;
+    for (i < written) {
+        if (obuf[i] != expected[i]) { ret 8; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test "gzip: all member split points preserve output and independent framing" {
+    var comp: [242]u8;
+    t_copy(?comp[0], ?C_G_PY6[0], 71);
+    t_copy(?comp[71], ?C_G_EMPTY[0], 20);
+    t_copy(?comp[91], ?C_G_CLI[0], 95);
+    t_copy(?comp[186], ?N_G_GOOD_HCRC[0], 56);
+    var expected: [152]u8;
+    t_copy(?expected[0], ?D_G_PY6[0], 51);
+    t_copy(?expected[51], ?D_G_CLI[0], 67);
+    t_copy(?expected[118], ?D_GOOD_HCRC[0], 34);
+    var split: usize = 0;
+    for (split <= 242) {
+        if (t_split(?comp[0], 242, split, 1, ?expected[0], 152) != 0) { ret 1; }
+        if (t_split(?comp[0], 242, split, 17, ?expected[0], 152) != 0) { ret 2; }
+        if (t_split(?comp[0], 242, split, 4096, ?expected[0], 152) != 0) { ret 3; }
+        split = split + 1;
+    }
+    ret check(?comp[0], 242, ?expected[0], 152);
+}
+
+test "gzip: later corruption truncation and trailing junk never return prefix success" {
+    var comp: [127]u8;
+    t_copy(?comp[0], ?C_G_PY6[0], 71);
+    t_copy(?comp[71], ?N_G_BAD_CRC[0], 54);
+    if (rejects(?comp[0], 125, "gzip checksum mismatch") != 0) { ret 1; }
+    t_copy(?comp[71], ?N_G_BAD_ISIZE[0], 54);
+    if (rejects(?comp[0], 125, "gzip length mismatch") != 0) { ret 2; }
+    t_copy(?comp[71], ?N_G_BAD_MAGIC[0], 54);
+    if (rejects(?comp[0], 125, "not a gzip stream") != 0) { ret 3; }
+    t_copy(?comp[71], ?N_G_RESERVED_FLAG[0], 54);
+    if (rejects(?comp[0], 125, "gzip reserved header flags are set") != 0) { ret 4; }
+    t_copy(?comp[71], ?N_G_BAD_HCRC[0], 56);
+    if (rejects(?comp[0], 127, "gzip header checksum mismatch") != 0) { ret 5; }
+    t_copy(?comp[71], ?N_G_GOOD_HCRC[0], 56);
+    var cut: usize = 72;
+    for (cut < 127) {
+        if (rejects(?comp[0], cut, "truncated gzip stream") != 0) { ret 6; }
+        cut = cut + 1;
+    }
+    comp[71] = 0;
+    if (rejects(?comp[0], 72, "truncated gzip stream") != 0) { ret 7; }
+    ret rejects(nil, 0, "truncated gzip stream");
+}
+
+test "gzip: EOF completion failure reset and destruction have explicit states" {
+    var a: A.Allocator;
+    page.make(?a);
+    val created: R.Result[Decompressor, str] = init(?a);
+    if (R.is_err[Decompressor, str](created)) { ret 1; }
+    var z: Decompressor = R.unwrap_ok[Decompressor, str](created);
+    fin { dnit(?z); }
+    val fed: R.Result[I.Progress, str] = decompress(?z, ?C_G_EMPTY[0], 20, nil, 0);
+    if (R.is_err[I.Progress, str](fed)) { ret 2; }
+    val first: I.Progress = R.unwrap_ok[I.Progress, str](fed);
+    if (first.status != I.NEED_INPUT || first.consumed != 20 || first.written != 0 || is_done(?z)) { ret 3; }
+    var repeat: u32 = 0;
+    for (repeat < 2) {
+        val ended: R.Result[I.Progress, str] = finish(?z, nil, 0);
+        if (R.is_err[I.Progress, str](ended)) { ret 4; }
+        val p: I.Progress = R.unwrap_ok[I.Progress, str](ended);
+        if (p.status != I.DONE || p.consumed != 0 || p.written != 0 || !is_done(?z)) { ret 5; }
+        repeat = repeat + 1;
+    }
+    val late: R.Result[I.Progress, str] = decompress(?z, ?C_G_EMPTY[0], 20, nil, 0);
+    if (R.is_ok[I.Progress, str](late) || !str_equals(R.unwrap_err[I.Progress, str](late), "gzip input is already finished")) { ret 6; }
+    reset(?z);
+    val empty: R.Result[I.Progress, str] = finish(?z, nil, 0);
+    if (R.is_ok[I.Progress, str](empty) || !str_equals(R.unwrap_err[I.Progress, str](empty), "truncated gzip stream")) { ret 7; }
+    val failed: R.Result[I.Progress, str] = decompress(?z, ?C_G_EMPTY[0], 20, nil, 0);
+    if (R.is_ok[I.Progress, str](failed) || !str_equals(R.unwrap_err[I.Progress, str](failed), "truncated gzip stream")) { ret 8; }
+    reset(?z);
+    if (R.is_err[usize, str](drive(?z, ?C_G_PY6[0], 71, ?obuf[0], 51))) { ret 9; }
+    if (!dnit(?z) || !dnit(?z)) { ret 10; }
+    reset(?z);
+    if (is_done(?z) || R.is_ok[I.Progress, str](finish(?z, nil, 0))) { ret 11; }
+    ret 0;
+}
+
+test "gzip: empty members need no output and full buffers can resume" {
+    var a: A.Allocator;
+    page.make(?a);
+    var empty: [40]u8;
+    t_copy(?empty[0], ?C_G_EMPTY[0], 20);
+    t_copy(?empty[20], ?C_G_EMPTY[0], 20);
+    val nothing: R.Result[usize, str] = decompress_into(?a, ?empty[0], 40, nil, 0);
+    if (R.is_err[usize, str](nothing) || R.unwrap_ok[usize, str](nothing) != 0) { ret 1; }
+    val created: R.Result[Decompressor, str] = init(?a);
+    if (R.is_err[Decompressor, str](created)) { ret 2; }
+    var z: Decompressor = R.unwrap_ok[Decompressor, str](created);
+    fin { dnit(?z); }
+    val first: R.Result[I.Progress, str] = decompress(?z, ?C_G_PY6[0], 71, nil, 0);
+    if (R.is_err[I.Progress, str](first)) { ret 3; }
+    val p: I.Progress = R.unwrap_ok[I.Progress, str](first);
+    if (p.status != I.OUTPUT_FULL || p.written != 0 || p.consumed > 71) { ret 4; }
+    val second: R.Result[I.Progress, str] = decompress(?z, ?C_G_PY6[p.consumed], 71 - p.consumed, nil, 0);
+    if (R.is_err[I.Progress, str](second)) { ret 5; }
+    val q: I.Progress = R.unwrap_ok[I.Progress, str](second);
+    if (q.status != I.OUTPUT_FULL || q.written != 0 || q.consumed > 71 - p.consumed) { ret 6; }
+    val read: usize = p.consumed + q.consumed;
+    val restored: R.Result[usize, str] = drive(?z, ?C_G_PY6[read], 71 - read, ?obuf[0], 51);
+    if (R.is_err[usize, str](restored) || R.unwrap_ok[usize, str](restored) != 51) { ret 7; }
+    var i: usize = 0;
+    for (i < 51) { if (obuf[i] != D_G_PY6[i]) { ret 8; } i = i + 1; }
+    ret 0;
+}
+
+test "gzip: finishing drains buffered matches through output backpressure" {
+    var a: A.Allocator;
+    page.make(?a);
+    val created: R.Result[Decompressor, str] = init(?a);
+    if (R.is_err[Decompressor, str](created)) { ret 1; }
+    var z: Decompressor = R.unwrap_ok[Decompressor, str](created);
+    fin { dnit(?z); }
+    var read: usize = 0;
+    var written: usize = 0;
+    var drains: usize = 0;
+    for (!is_done(?z) && written <= 276) {
+        var result: R.Result[I.Progress, str];
+        if (read == 69) { result = finish(?z, ?obuf[written], 1); drains = drains + 1; }
+        or { result = decompress(?z, ?C_G_STREAM[read], 69 - read, ?obuf[written], 1); }
+        if (R.is_err[I.Progress, str](result)) { ret 2; }
+        val p: I.Progress = R.unwrap_ok[I.Progress, str](result);
+        if (p.consumed > 69 - read || p.written > 1) { ret 3; }
+        if (p.status != I.DONE && p.consumed == 0 && p.written == 0) { ret 4; }
+        if (read == 69 && p.status == I.NEED_INPUT) { ret 5; }
+        read = read + p.consumed;
+        written = written + p.written;
+    }
+    if (!is_done(?z) || drains == 0 || written != 276) { ret 6; }
+    var i: usize = 0;
+    for (i < 276) { if (obuf[i] != D_G_STREAM[i]) { ret 7; } i = i + 1; }
+
+    var most_drains: usize = 0;
+    var cut: usize = 1;
+    for (cut < 69) {
+        reset(?z);
+        read = 0;
+        written = 0;
+        drains = 0;
+        var failed: bool = false;
+        var steps: usize = 0;
+        for (!failed && written <= 276 && steps < 400) {
+            steps = steps + 1;
+            val eof: bool = read == cut;
+            var result: R.Result[I.Progress, str];
+            if (eof) { result = finish(?z, ?obuf[written], 1); }
+            or { result = decompress(?z, ?C_G_STREAM[read], cut - read, ?obuf[written], 1); }
+            if (R.is_err[I.Progress, str](result)) {
+                if (!eof || !str_equals(R.unwrap_err[I.Progress, str](result), "truncated gzip stream")) { ret 8; }
+                failed = true;
+                brk;
+            }
+            val p: I.Progress = R.unwrap_ok[I.Progress, str](result);
+            if (p.consumed > cut - read || p.written > 1 || p.status == I.DONE) { ret 9; }
+            if (p.consumed == 0 && p.written == 0) { ret 10; }
+            if (eof) {
+                if (p.status != I.OUTPUT_FULL || p.consumed != 0) { ret 11; }
+                drains = drains + 1;
+            }
+            read = read + p.consumed;
+            written = written + p.written;
+        }
+        if (!failed || is_done(?z) || written > 276) { ret 12; }
+        i = 0;
+        for (i < written) { if (obuf[i] != D_G_STREAM[i]) { ret 13; } i = i + 1; }
+        val repeated: R.Result[I.Progress, str] = finish(?z, nil, 0);
+        if (R.is_ok[I.Progress, str](repeated) || !str_equals(R.unwrap_err[I.Progress, str](repeated), "truncated gzip stream")) { ret 14; }
+        if (drains > most_drains) { most_drains = drains; }
+        cut = cut + 1;
+    }
+    if (most_drains < 2) { ret 15; }
+    ret 0;
+}
+
+test "gzip: allocation refusal frees the window and cumulative output" {
+    var comp: [1054]u8;
+    t_copy(?comp[0], ?C_G_LARGE[0], 527);
+    t_copy(?comp[527], ?C_G_LARGE[0], 527);
+    var ordinal: usize = 1;
+    for (ordinal <= 32) {
+        var tracker: T.Testing;
+        if (O.is_some[str](T.make(?tracker))) { ret 1; }
+        T.fail_at_ordinal(?tracker, ordinal);
+        val result: R.Result[V.Vector[u8], str] = decompress_alloc(T.allocator_of(?tracker), ?comp[0], 1054);
+        var accepted: bool = false;
+        if (R.is_ok[V.Vector[u8], str](result)) {
+            var out: V.Vector[u8] = R.unwrap_ok[V.Vector[u8], str](result);
+            accepted = out.len == 24000;
+            var i: usize = 0;
+            for (i < out.len) {
+                if (out.data[i] != expected_pseudo(i % 12000)) { accepted = false; }
+                i = i + 1;
+            }
+            V.dnit[u8](?out);
+        }
+        val leaked: bool = T.live_count(?tracker) != 0 || T.double_free_count(?tracker) != 0;
+        val attempts: usize = T.attempt_count(?tracker);
+        T.dnit(?tracker);
+        if (leaked) { ret 2; }
+        if (accepted) { if (attempts >= ordinal) { ret 3; } ret 0; }
+        if (R.is_ok[V.Vector[u8], str](result) || attempts != ordinal) { ret 4; }
+        ordinal = ordinal + 1;
+    }
+    ret 5;
+}
+
+test "gzip: a malformed later member releases allocated prefix output" {
+    var comp: [581]u8;
+    t_copy(?comp[0], ?C_G_LARGE[0], 527);
+    t_copy(?comp[527], ?N_G_BAD_CRC[0], 54);
+    var tracker: T.Testing;
+    if (O.is_some[str](T.make(?tracker))) { ret 1; }
+    fin { T.dnit(?tracker); }
+    val result: R.Result[V.Vector[u8], str] = decompress_alloc(T.allocator_of(?tracker), ?comp[0], 581);
+    if (R.is_ok[V.Vector[u8], str](result)) {
+        var unexpected: V.Vector[u8] = R.unwrap_ok[V.Vector[u8], str](result);
+        V.dnit[u8](?unexpected);
+        ret 2;
+    }
+    if (!str_equals(R.unwrap_err[V.Vector[u8], str](result), "gzip checksum mismatch")) { ret 3; }
+    if (T.live_count(?tracker) != 0 || T.double_free_count(?tracker) != 0) { ret 4; }
     ret 0;
 }

@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Darwin completion queues use public kqueue and kevent with typed native storage,
   preserving event translation and descriptor cleanup. Wake and close reject nil queues.
 
+- Gzip decodes complete concatenated streams. `finish` declares end-of-input and
+  drains buffered output, with terminal completion only after every member verifies.
+  Later corruption and trailing junk fail instead of returning prefix success.
+
 - Darwin CPU discovery uses public sysctlbyname with hw.activecpu, returning the
   current active count instead of the boot maximum and retaining a minimum of one.
 
