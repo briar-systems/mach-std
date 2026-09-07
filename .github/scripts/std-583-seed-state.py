@@ -65,7 +65,7 @@ try:
                 assert match is not None, (label, 'runtime rerun index absent')
                 case_index = match.group(1).decode()
             if variant == 'state':
-                binaries = list(Path('test/native/out').rglob('native-suite.exe' if host == 'windows' else 'native-suite'))
+                binaries = [p for p in Path('test/native/out').rglob('native-suite.exe' if host == 'windows' else 'native-suite') if p.is_file()]
                 assert len(binaries) == 1, binaries
                 census(label + '-direct', host)
                 direct = subprocess.run([str(binaries[0].resolve()), case_index], stdout=subprocess.PIPE,
