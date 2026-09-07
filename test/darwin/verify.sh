@@ -1,16 +1,6 @@
 #!/usr/bin/env bash
-# run the suite natively on darwin and gate it against known-failures.txt.
-#
-# darwin carries a set of failures that predate the libSystem migration (#415);
-# they are enumerated, with evidence, in known-failures.txt. this script exists
-# so that set can be tolerated WITHOUT tolerating anything else:
-#
-#   - a failure that is not on the list fails the build (a regression)
-#   - a listed test that PASSES fails the build (the list has gone stale and
-#     must shrink)
-#
-# both directions matter. only checking the first turns the list into a mute
-# button that silently outlives the bugs it describes.
+# gate the native darwin suite against the explicit known-failure list.
+# unexpected failures and obsolete list entries both fail the gate.
 #
 # usage: verify.sh [path-to-mach]   (defaults to `mach` on PATH)
 set -uo pipefail

@@ -46,6 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Process tests use Darwin's installed `/usr/bin/true` and `/usr/bin/false`.
+  Remove the five failure exceptions caused by the old nonexistent `/bin` paths.
+
 - Windows file descriptors grow through stable pages instead of stopping at 256.
   Closed descriptors are reused, live wait addresses remain fixed during growth,
   and allocation failures preserve existing owners and report their actual error.
