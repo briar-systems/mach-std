@@ -30,7 +30,24 @@ _Static_assert(SCM_RIGHTS == 1 && SOL_SOCKET == 0xffff, "rights header constants
 _Static_assert(MSG_TRUNC == 0x10 && MSG_CTRUNC == 0x20, "message truncation flags");
 _Static_assert(AF_UNIX == 1, "local socket family");
 
-int main(void) {
+int main(int argc, char **argv) {
+    (void)argv;
+    if (argc == 2) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return 10;
+        int value = 1;
+        if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &value, sizeof(value))) {
+            close(fd);
+            return 11;
+        }
+        value = 0;
+        socklen_t length = sizeof(value);
+        int result = getsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &value, &length);
+        int closed = close(fd);
+        if (result || closed || !value || length != sizeof(value)) return 12;
+        printf("keepalive=%d length=%u\n", value, length);
+        return 0;
+    }
     printf("%zu %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu\n",
         sizeof(struct iovec), _Alignof(struct iovec), offsetof(struct iovec, iov_base), offsetof(struct iovec, iov_len),
         sizeof(struct msghdr), _Alignof(struct msghdr), offsetof(struct msghdr, msg_name),
