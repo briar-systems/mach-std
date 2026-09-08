@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Directory root opening and descent preserve the primary failure and first
+  cleanup error, consuming newly acquired descriptors on a failed advance.
+
+- Linux and Darwin expose `O_NONBLOCK` through their file-open interfaces.
+
+- Darwin local byte reads reject ancillary input before installing descriptor
+  rights and retain socket ownership on refusal. Local async reads share that
+  boundary. Generic Darwin async operations reject non-internet socket handles.
+
 - Process waits preserve complete Windows exit codes and explicit POSIX state
   observations. Typed wait failures retain native causes and unreaped child
   ownership. Windows cleanup retries keep process and group tokens valid.
