@@ -5,8 +5,7 @@
 # io.read_all/read_exact/write_all rather than hand-rolled loops); and
 # namespace operations on a Path.
 #
-# errors are str messages, matching std.io: producers return R.Result[T, str],
-# effects return O.Option[str] (none = success). predicates are total and
+# handle and directory operations retain structured native errors. predicates
 # answer false for a nil or missing path.
 
 use std.types.bool.bool;
@@ -25,6 +24,8 @@ use std.system.os;
 use identities: std.system.file_identity;
 fwd identities.Identity;
 use removal: std.filesystem.removal;
+fwd RemovalError: removal.Error;
+fwd removal_message: removal.message;
 use std.chrono.time;
 use std.types.path;
 use std.collections.vector;
@@ -595,7 +596,6 @@ pub fun symlink(target: Path, linkpath: Path) O.Option[str] {
 }
 
 val REMOVE_MAX_DEPTH:  usize = 1024;
-val DIRENT_BUF_SIZE:   usize = 8192;
 val TEMP_MAX_ATTEMPTS: usize = 100;
 val HEX_CHARS:         str   = "0123456789abcdef";
 
@@ -608,53 +608,58 @@ val HEX_CHARS:         str   = "0123456789abcdef";
 # a:   allocator for the vector and each name
 # p:   directory path
 # ret: the child names, or an error
-pub fun read_dir(a: *A.Allocator, p: Path) R.Result[Vector[str], str] {
-    if (a == nil) { ret R.err[Vector[str], str]("allocator is nil"); }
-
+pub fun read_dir(a: *A.Allocator, p: Path) R.Result[Vector[str], io_error.Error] {
+    if (a == nil || p == nil) { ret R.err[Vector[str], io_error.Error](io_error.from_code(os.EINVAL, io_error.OP_OPEN)); }
     val raw: i64 = os.open(os.AT_FDCWD, p, os.O_RDONLY | os.O_DIRECTORY, 0);
-    if (raw < 0) { ret R.err[Vector[str], str](os.message(raw)); }
-    val dfd: i32 = raw::i32;
-    fin { os.close(dfd); }
-
+    if (raw < 0) { ret R.err[Vector[str], io_error.Error](io_error.from_code(raw, io_error.OP_OPEN)); }
+    val fd: i32 = raw::i32;
+    var cursor: os.DirectoryCursor = os.DirectoryCursor{};
+    val initialized: os.DirectoryInitResult = os.directory_init(?cursor, fd);
+    if (initialized.code < 0) {
+        var failure: io_error.Error = io_error.from_code(initialized.code, io_error.OP_OPEN);
+        failure.cleanup_code = initialized.cleanup_code;
+        val closed: i64 = os.close(fd);
+        if (failure.cleanup_code == 0 && closed < 0) { failure.cleanup_code = closed; }
+        ret R.err[Vector[str], io_error.Error](failure);
+    }
     var names: Vector[str] = vector.init[str](a);
-    var dbuf:  [DIRENT_BUF_SIZE]u8;
+    var result: O.Option[io_error.Error] = read_directory_names(a, ?cursor, ?names);
+    val cursor_closed: i64 = os.directory_close(?cursor);
+    result = directory_cleanup_error(result, cursor_closed);
+    val fd_closed: i64 = os.close(fd);
+    result = directory_cleanup_error(result, fd_closed);
+    if (O.is_some[io_error.Error](result)) {
+        free_dir_names(?names);
+        ret R.err[Vector[str], io_error.Error](O.unwrap[io_error.Error](result));
+    }
+    ret R.ok[Vector[str], io_error.Error](names);
+}
 
+fun directory_cleanup_error(result: O.Option[io_error.Error], code: i64) O.Option[io_error.Error] {
+    if (code >= 0) { ret result; }
+    if (O.is_none[io_error.Error](result)) { ret O.some[io_error.Error](io_error.from_code(code, io_error.OP_CLOSE)); }
+    var failure: io_error.Error = O.unwrap[io_error.Error](result);
+    if (failure.cleanup_code == 0) { failure.cleanup_code = code; }
+    ret O.some[io_error.Error](failure);
+}
+
+fun read_directory_names(a: *A.Allocator, cursor: *os.DirectoryCursor, names: *Vector[str]) O.Option[io_error.Error] {
     for {
-        val n: i64 = os.read_dir(dfd, (?dbuf[0])::*os.dirent64, DIRENT_BUF_SIZE);
-        if (n < 0) {
-            free_dir_names(?names);
-            ret R.err[Vector[str], str](os.message(n));
-        }
-        if (n == 0) { brk; }
-
-        var pos: usize = 0;
-        for (pos < n::usize) {
-            val ent:    *os.dirent64 = ((?dbuf[0])::usize + pos)::*os.dirent64;
-            val reclen: usize        = ent.d_reclen::usize;
-            val name:   *u8          = ?ent.d_name[0];
-
-            if (!is_dot_name(name)) {
-                val copied: R.Result[str, str] = str_copy(a, name::str);
-                if (R.is_err[str, str](copied)) {
-                    free_dir_names(?names);
-                    ret R.err[Vector[str], str](R.unwrap_err[str, str](copied));
-                }
-                val owned: str = R.unwrap_ok[str, str](copied);
-                val pushed: R.Result[usize, str] = vector.push[str](?names, owned);
-                if (R.is_err[usize, str](pushed)) {
-                    str_free(a, owned);
-                    free_dir_names(?names);
-                    ret R.err[Vector[str], str](R.unwrap_err[usize, str](pushed));
-                }
-            }
-
-            # a zero record length would never advance; guard a malformed buffer
-            if (reclen == 0) { brk; }
-            pos = pos + reclen;
+        var entry: os.DirectoryEntry;
+        val next: i64 = os.directory_next(cursor, ?entry);
+        if (next < 0) { ret O.some[io_error.Error](io_error.from_code(next, io_error.OP_READ)); }
+        if (next == 0) { ret O.none[io_error.Error](); }
+        if (is_dot_name(entry.name)) { cnt; }
+        val copied: R.Result[str, str] = str_copy(a, entry.name);
+        if (R.is_err[str, str](copied)) { ret O.some[io_error.Error](io_error.from_code(os.ENOMEM, io_error.OP_READ)); }
+        val owned: str = R.unwrap_ok[str, str](copied);
+        val pushed: R.Result[usize, str] = vector.push[str](names, owned);
+        if (R.is_err[usize, str](pushed)) {
+            str_free(a, owned);
+            ret O.some[io_error.Error](io_error.from_code(os.ENOMEM, io_error.OP_READ));
         }
     }
-
-    ret R.ok[Vector[str], str](names);
+    ret O.none[io_error.Error]();
 }
 
 fun free_dir_names(names: *Vector[str]) {
@@ -715,12 +720,12 @@ pub fun create_dir_all(a: *A.Allocator, p: Path, mode: i32) O.Option[str] {
 # a:   allocator for the owned input and parent paths
 # p:   path naming the child entry to remove
 # ret: none on success, or an error
-pub fun remove_all(a: *A.Allocator, p: Path) O.Option[str] {
-    if (a == nil) { ret O.some[str]("allocator is nil"); }
-    if (p == nil) { ret O.some[str]("path is nil"); }
-    if (str_len(p) == 0) { ret O.none[str](); }
+pub fun remove_all(a: *A.Allocator, p: Path) O.Option[RemovalError] {
+    if (a == nil) { ret O.some[RemovalError](RemovalError{code: os.EINVAL}); }
+    if (p == nil) { ret O.some[RemovalError](RemovalError{code: os.EINVAL}); }
+    if (str_len(p) == 0) { ret O.none[RemovalError](); }
     val owned_r: R.Result[Path, str] = path.clone(a, p);
-    if (R.is_err[Path, str](owned_r)) { ret O.some[str](R.unwrap_err[Path, str](owned_r)); }
+    if (R.is_err[Path, str](owned_r)) { ret O.some[RemovalError](RemovalError{code: os.ENOMEM}); }
     val owned: Path = R.unwrap_ok[Path, str](owned_r);
     val length: usize = str_len(owned);
     fin { A.deallocate[u8](a, owned, length + 1); }
@@ -730,22 +735,20 @@ pub fun remove_all(a: *A.Allocator, p: Path) O.Option[str] {
     owned[end] = 0;
     val name: str = path.filename(owned);
     if (name == nil || name[0] == 0 || str_equals(name, ".") || str_equals(name, "..")) {
-        ret O.some[str]("removal requires a named child entry");
+        ret O.some[RemovalError](RemovalError{code: os.EINVAL, containment: true});
     }
     val parent_r: R.Result[Path, str] = path.parent(a, owned);
-    if (R.is_err[Path, str](parent_r)) { ret O.some[str](R.unwrap_err[Path, str](parent_r)); }
+    if (R.is_err[Path, str](parent_r)) { ret O.some[RemovalError](RemovalError{code: os.ENOMEM}); }
     val parent: Path = R.unwrap_ok[Path, str](parent_r);
     fin { A.deallocate[u8](a, parent, str_len(parent) + 1); }
     val raw: i64 = os.open(os.AT_FDCWD, parent, os.O_RDONLY | os.O_DIRECTORY, 0);
-    if (raw == os.ENOENT) { ret O.none[str](); }
-    if (raw < 0) { ret O.some[str](os.message(raw)); }
+    if (raw == os.ENOENT) { ret O.none[RemovalError](); }
+    if (raw < 0) { ret O.some[RemovalError](RemovalError{code: raw}); }
     val fd: i32 = raw::i32;
     var removed: usize = 0;
     val result: O.Option[removal.Error] = removal.tree(fd, name, ?removed, REMOVE_MAX_DEPTH - 1);
     val closed: i64 = os.close(fd);
-    if (O.is_some[removal.Error](result)) { ret O.some[str](removal.message(O.unwrap[removal.Error](result))); }
-    if (closed < 0) { ret O.some[str](os.message(closed)); }
-    ret O.none[str]();
+    ret removal.with_cleanup(result, closed);
 }
 
 # a created temporary file and its path
@@ -972,10 +975,10 @@ test "std.filesystem.replace_bytes_atomic:create_replace_and_cleanup" {
     if (R.is_err[str, str](rr)) { bad = 4; }
     or (!str_equals(R.unwrap_ok[str, str](rr), "second")) { bad = 5; }
 
-    val lr: R.Result[Vector[str], str] = read_dir(?a, "mach_std_fs_atomic/nested");
-    if (R.is_err[Vector[str], str](lr)) { bad = 6; }
+    val lr: R.Result[Vector[str], io_error.Error] = read_dir(?a, "mach_std_fs_atomic/nested");
+    if (R.is_err[Vector[str], io_error.Error](lr)) { bad = 6; }
     or {
-        var names: Vector[str] = R.unwrap_ok[Vector[str], str](lr);
+        var names: Vector[str] = R.unwrap_ok[Vector[str], io_error.Error](lr);
         if (names.len != 1 || !str_equals(names.data[0], "state.dat")) { bad = 7; }
         free_dir_names(?names);
     }
@@ -1001,10 +1004,10 @@ test "std.filesystem.replace_bytes_atomic:rename_failure_cleans_temp" {
 
     var bad: i32 = 0;
     if (!is_dir(p)) { bad = 4; }
-    val lr: R.Result[Vector[str], str] = read_dir(?a, d);
-    if (R.is_err[Vector[str], str](lr)) { bad = 5; }
+    val lr: R.Result[Vector[str], io_error.Error] = read_dir(?a, d);
+    if (R.is_err[Vector[str], io_error.Error](lr)) { bad = 5; }
     or {
-        var names: Vector[str] = R.unwrap_ok[Vector[str], str](lr);
+        var names: Vector[str] = R.unwrap_ok[Vector[str], io_error.Error](lr);
         if (names.len != 1 || !str_equals(names.data[0], "destination")) { bad = 6; }
         free_dir_names(?names);
     }
@@ -1163,10 +1166,10 @@ test "std.filesystem.read_dir:lists_children" {
     if (O.is_some[str](write_bytes("mach_std_fs_rd/a.txt", "a", 1, 0o644))) { ret 2; }
     if (O.is_some[str](write_bytes("mach_std_fs_rd/b.txt", "b", 1, 0o644))) { ret 3; }
 
-    val rr: R.Result[Vector[str], str] = read_dir(?alloc, d);
-    if (R.is_err[Vector[str], str](rr)) { bad = 4; }
+    val rr: R.Result[Vector[str], io_error.Error] = read_dir(?alloc, d);
+    if (R.is_err[Vector[str], io_error.Error](rr)) { bad = 4; }
     or {
-        var names: Vector[str] = R.unwrap_ok[Vector[str], str](rr);
+        var names: Vector[str] = R.unwrap_ok[Vector[str], io_error.Error](rr);
         # both children present, and "." / ".." not reported as children
         var saw_a: bool = false;
         var saw_b: bool = false;
@@ -1421,9 +1424,9 @@ test "std.filesystem.remove_all: removes nested entries and preserves external l
     if (O.is_some[str](write_bytes("mach_613_remove_tree/nested/empty_mode", "private", 7, 0))) { ret 6; }
     if (O.is_some[str](symlink("../mach_613_remove_outside", "mach_613_remove_tree/directory_link"))) { ret 7; }
     if (O.is_some[str](symlink("../mach_613_remove_outside/kept", "mach_613_remove_tree/file_link"))) { ret 8; }
-    if (O.is_some[str](remove_all(?alloc, tree))) { ret 9; }
+    if (O.is_some[RemovalError](remove_all(?alloc, tree))) { ret 9; }
     if (exists(tree) || !is_file("mach_613_remove_outside/kept")) { ret 10; }
-    if (O.is_some[str](remove_all(?alloc, tree))) { ret 11; }
+    if (O.is_some[RemovalError](remove_all(?alloc, tree))) { ret 11; }
     ret 0;
 }
 
@@ -1464,14 +1467,14 @@ $if ($mach.build.os == $mach.os.windows) {
         if (O.is_none[str](remove_file(file))) { ret 7; }
         if (!is_file(file) || GetFileAttributesW(?wide_alias[0]) != before) { ret 8; }
         if (O.is_some[str](symlink("../mach_613_readonly_alias", "mach_613_readonly_tree/link"))) { ret 9; }
-        if (O.is_some[str](remove_all(?alloc, tree))) { ret 10; }
+        if (O.is_some[RemovalError](remove_all(?alloc, tree))) { ret 10; }
         if (exists(tree) || !is_file(alias) || GetFileAttributesW(?wide_alias[0]) != before) { ret 11; }
         val opened: R.Result[File, io_error.Error] = open(alias);
         if (R.is_err[File, io_error.Error](opened)) { ret 12; }
         var held: File = R.unwrap_ok[File, io_error.Error](opened);
         fin { close(?held); }
         if (!rename_held_contents(held, "kept")) { ret 13; }
-        if (O.is_some[str](remove_all(?alloc, alias))) { ret 14; }
+        if (O.is_some[RemovalError](remove_all(?alloc, alias))) { ret 14; }
         if (exists(alias) || !rename_held_contents(held, "kept")) { ret 15; }
         ret 0;
     }
@@ -1534,7 +1537,7 @@ test "std.filesystem.read_dir: caller ownership and allocation failure cleanup" 
     var setup: A.Allocator;
     if (O.is_some[*u8](fixed.make(?setup, ?state, ?scratch[0], 32768))) { ret 1; }
     val dir: Path = "mach_std_fs_rd_ownership";
-    if (O.is_some[str](remove_all(?setup, dir))) { ret 2; }
+    if (O.is_some[RemovalError](remove_all(?setup, dir))) { ret 2; }
     if (O.is_some[str](create_dir(dir, 0o700))) { ret 3; }
     fin { remove_all(?setup, dir); }
     var i: usize = 0;
@@ -1554,9 +1557,9 @@ test "std.filesystem.read_dir: caller ownership and allocation failure cleanup" 
     var tracking: alloc_testing.Testing;
     if (O.is_some[str](alloc_testing.make(?tracking))) { ret 6; }
     fin { alloc_testing.dnit(?tracking); }
-    val listed: R.Result[Vector[str], str] = read_dir(?tracking.a, dir);
-    if (R.is_err[Vector[str], str](listed)) { ret 7; }
-    var names: Vector[str] = R.unwrap_ok[Vector[str], str](listed);
+    val listed: R.Result[Vector[str], io_error.Error] = read_dir(?tracking.a, dir);
+    if (R.is_err[Vector[str], io_error.Error](listed)) { ret 7; }
+    var names: Vector[str] = R.unwrap_ok[Vector[str], io_error.Error](listed);
     val attempts: usize = tracking.attempts;
     if (names.len != 10 || tracking.live != 11 || attempts < 12) { ret 8; }
     var seen: u32 = 0;
@@ -1577,8 +1580,8 @@ test "std.filesystem.read_dir: caller ownership and allocation failure cleanup" 
     for (ordinal <= attempts) {
         val before: usize = tracking.attempts;
         tracking.fail_at = before + ordinal;
-        val refused: R.Result[Vector[str], str] = read_dir(?tracking.a, dir);
-        if (R.is_ok[Vector[str], str](refused)) { ret 13; }
+        val refused: R.Result[Vector[str], io_error.Error] = read_dir(?tracking.a, dir);
+        if (R.is_ok[Vector[str], io_error.Error](refused)) { ret 13; }
         if (tracking.attempts != before + ordinal) { ret 14; }
         if (tracking.live != 0) { ret 15; }
         if (tracking.double_frees != 0 || tracking.exhausted != 0) { ret 16; }
