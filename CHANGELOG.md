@@ -35,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- CI rebuilds the audited compiler from published 4.26.5 and fixed source pins after withdrawal of the 4.30.0 release.
+
 - Directory listing releases copied names and vector storage on enumeration or
   allocation failure, including a name awaiting vector growth. Its ownership
   documentation now requires callers to free each returned name before the vector.

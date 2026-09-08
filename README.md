@@ -35,7 +35,10 @@ A published version's source and tag are immutable. Release tags must match
 Changes that invalidate an existing supported combination require a major release.
 Version compatibility does not silently move an application's dependency pin.
 
-Std 1.0.1 is the audited dependency for Mach 4.30.0. The breaking language and API
+Std 1.0.1 is the audited dependency for the Mach 4.30.0 implementation. Its
+compiler release was withdrawn. CI builds that implementation from published
+4.26.5 and fixed source commits reachable from main, then requires identical
+final self-builds. See the [source bootstrap recipe](https://github.com/briar-systems/mach/blob/dev/doc/tooling/bootstrap.md). The breaking language and API
 migration for Mach v5 is planned as std 2.0.0. Compiler and std version numbers
 are independent.
 
