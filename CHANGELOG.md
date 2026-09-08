@@ -53,6 +53,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused. The old `Result`, `Option` and `Void` remain for the modules that
   have not migrated yet and are removed with the last of them.
 
+- The eight `std.sync.atomic` wrappers (`load`, `store`, `cas`, `fetch_add`,
+  `fetch_sub`, `exchange`, `fence`, `spin_hint`) are `#[inline]`: a release
+  build folds each into its caller while retaining the instruction sequences
+  and their memory-ordering effects (mach #3110, std #618).
+
 
 - Completion queue wake and close reject nil owners consistently on Linux, Windows
   and Darwin, preserving live wake and repeated-close behavior.
