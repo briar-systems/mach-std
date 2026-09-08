@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Atomic operations request inlining while retaining their instruction sequences
+  and memory-ordering effects.
+
 - Directory root opening and descent preserve the primary failure and first
   cleanup error, consuming newly acquired descriptors on a failed advance.
 
