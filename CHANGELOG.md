@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Completion queue wake and close reject nil owners consistently on Linux, Windows
+  and Darwin, preserving live wake and repeated-close behavior.
+
 - Darwin completion queues use public kqueue and kevent with typed native storage,
   preserving event translation and descriptor cleanup. Wake and close reject nil queues.
 
