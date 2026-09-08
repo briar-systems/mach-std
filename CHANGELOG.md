@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Process waits preserve complete Windows exit codes and explicit POSIX state
+  observations. Typed wait failures retain native causes and unreaped child
+  ownership. Windows cleanup retries keep process and group tokens valid.
+
 - Directory enumeration uses an explicitly owned cursor and borrowed entries on
   every backend. Darwin uses public fdopendir, readdir and closedir. Native record
   lengths govern delivery, with terminal errors and explicit cleanup. Filesystem

@@ -14,6 +14,7 @@ use std.types.string.str_copy_slice;
 use std.types.string.str_join;
 use std.types.string.str_contains_char;
 use std.collections.vector.Vector;
+use std.collections.vector;
 use std.allocator.fixed;
 use std.allocator.page;
 
@@ -35,7 +36,7 @@ use duration: std.chrono.duration;
 
 # spawn_grouped, spawn_redirected_grouped, and terminate_group below give
 # every target the same signature; the underlying primitive is platform-
-# specific (posix setpgid/kill(-pgid) vs a windows job object), so the actual
+# specific (posix setpgid/kill(-pgid) vs a tracked windows job object), so the actual
 # implementation is per-platform in each function body.
 $if ($mach.build.os == $mach.os.linux) {
     use std.system.os.linux;
@@ -47,12 +48,11 @@ $or ($mach.build.os == $mach.os.windows) {
     use std.system.os.windows;
 }
 
-# raw wait status from a terminated process
-# ---
-# raw: wait status as returned by wait_pid
-pub rec ExitStatus {
-    raw: i32;
-}
+fwd ExitStatus: os.ProcessStatus;
+fwd os.PROCESS_EXITED;
+fwd os.PROCESS_SIGNALED;
+fwd os.PROCESS_STOPPED;
+fwd os.PROCESS_CONTINUED;
 
 # handle to a spawned child process
 # ---
@@ -61,10 +61,36 @@ pub rec ExitStatus {
 #       spawn_redirected_grouped); otherwise the group token needed to signal
 #       the whole group - on linux/darwin this is the posix process group id
 #       (pgid == pid, since the child is its own group's leader); on windows
-#       it is the raw job object HANDLE value returned alongside the pid
+#       it is a tracked group token backed by the retained child process
 pub rec Child {
     pid:  i64;
     pgid: i64;
+}
+
+# a failed convenience call transfers its unreaped child here, with pid zero for none
+# retry wait(error.child), or explicitly terminate it first, before releasing ownership
+pub rec Error {
+    code: i64;
+    native_code: u32;
+    operation: u8;
+    child: Child;
+    detail: str;
+    secondary_wait: os.ProcessWaitError;
+}
+
+pub fun error_message(error: Error) str {
+    if (error.detail != nil) { ret error.detail; }
+    ret os.message(error.code);
+}
+
+fun process_error(code: i64, operation: u8) Error {
+    ret Error{code: code, operation: operation};
+}
+
+fun wait_error(error: os.ProcessWaitError, child: Child) Error {
+    var pending: Child = Child{};
+    if (child.pid > 0 && error.code != os.ECHILD) { pending = child; }
+    ret Error{code: error.code, native_code: error.native_code, operation: error.operation, child: pending};
 }
 
 # a child reaped by wait_any
@@ -90,16 +116,11 @@ pub rec Output {
 # pathname: path to executable
 # argv:     null-terminated argument array
 # envp:     null-terminated environment array
-# ret:      exit status, or an error message
-pub fun run(pathname: str, argv: **u8, envp: **u8) R.Result[ExitStatus, str] {
+# ret:      exit status, or an error retaining an unreaped child
+pub fun run(pathname: str, argv: **u8, envp: **u8) R.Result[ExitStatus, Error] {
     val pid: i64 = os.spawn(pathname, argv, envp);
-    if (pid < 0) { ret R.err[ExitStatus, str]("spawn failed"); }
-
-    var wstatus: i32 = 0;
-    val r: i64 = os.wait_pid(pid, ?wstatus, 0);
-    if (r < 0) { ret R.err[ExitStatus, str]("wait failed"); }
-
-    ret R.ok[ExitStatus, str](ExitStatus{raw: wstatus});
+    if (pid < 0) { ret R.err[ExitStatus, Error](process_error(pid, os.PROCESS_OP_SPAWN)); }
+    ret wait(Child{pid: pid});
 }
 
 # run a command through the host command interpreter, from `cwd`
@@ -118,39 +139,35 @@ pub fun run(pathname: str, argv: **u8, envp: **u8) R.Result[ExitStatus, str] {
 # command: the command line to run
 # cwd:     working directory for the child, or nil to inherit
 # envp:    null-terminated environment array, or nil to inherit
-# ret:     exit status, or an error message
-pub fun run_shell(command: str, cwd: str, envp: **u8) R.Result[ExitStatus, str] {
+# ret:     exit status, or an error retaining an unreaped child
+pub fun run_shell(command: str, cwd: str, envp: **u8) R.Result[ExitStatus, Error] {
     val pid: i64 = os.spawn_shell(command, envp, cwd);
-    if (pid < 0) { ret R.err[ExitStatus, str]("spawn failed"); }
-
-    var wstatus: i32 = 0;
-    val r: i64 = os.wait_pid(pid, ?wstatus, 0);
-    if (r < 0) { ret R.err[ExitStatus, str]("wait failed"); }
-
-    ret R.ok[ExitStatus, str](ExitStatus{raw: wstatus});
+    if (pid < 0) { ret R.err[ExitStatus, Error](process_error(pid, os.PROCESS_OP_SPAWN)); }
+    ret wait(Child{pid: pid});
 }
 
 # run a process and collect its complete standard output
 #
 # spawns the child with stdout bound to a pipe and drains it to end-of-file
 # through io.read_all over the pipe's read end, so output of any length is
-# captured and the child never blocks on a full pipe. the child is always
-# waited on, even when the drain fails.
+# captured and the child never blocks on a full pipe. a wait is attempted even
+# when the drain fails, and a failed wait returns the remaining child owner.
 # ---
 # a:        allocator for the captured output
 # pathname: path to executable
 # argv:     null-terminated argument array
 # envp:     null-terminated environment array
 # ret:      the exit status and captured stdout, or an error
-pub fun output(a: *A.Allocator, pathname: str, argv: **u8, envp: **u8) R.Result[Output, str] {
+pub fun output(a: *A.Allocator, pathname: str, argv: **u8, envp: **u8) R.Result[Output, Error] {
     var fds: [2]i32;
-    if (os.pipe(?fds[0]) < 0) { ret R.err[Output, str]("pipe failed"); }
+    val piped: i64 = os.pipe(?fds[0]);
+    if (piped < 0) { ret R.err[Output, Error](process_error(piped, os.PROCESS_OP_PIPE)); }
 
     val pid: i64 = os.spawn_redirected(pathname, argv, envp, -1, fds[1], -1);
     if (pid < 0) {
         os.close(fds[0]);
         os.close(fds[1]);
-        ret R.err[Output, str]("spawn failed");
+        ret R.err[Output, Error](process_error(pid, os.PROCESS_OP_SPAWN));
     }
 
     # the parent never writes; closing its write end lets the drain see EOF
@@ -162,18 +179,26 @@ pub fun output(a: *A.Allocator, pathname: str, argv: **u8, envp: **u8) R.Result[
     val bytes_r: R.Result[Vector[u8], str] = m_reader.read_all(a, ?rd);
     os.close(fds[0]);
 
-    var wstatus: i32 = 0;
-    val w: i64 = os.wait_pid(pid, ?wstatus, 0);
+    val waited: R.Result[ExitStatus, Error] = wait(Child{pid: pid});
+    ret finish_output(bytes_r, waited);
+}
 
+fun finish_output(bytes_r: R.Result[Vector[u8], str], waited: R.Result[ExitStatus, Error]) R.Result[Output, Error] {
     if (R.is_err[Vector[u8], str](bytes_r)) {
-        ret R.err[Output, str](R.unwrap_err[Vector[u8], str](bytes_r));
+        var error: Error = Error{operation: os.PROCESS_OP_READ, detail: R.unwrap_err[Vector[u8], str](bytes_r)};
+        if (R.is_err[ExitStatus, Error](waited)) {
+            val secondary: Error = R.unwrap_err[ExitStatus, Error](waited);
+            error.child = secondary.child;
+            error.secondary_wait = os.ProcessWaitError{code: secondary.code, native_code: secondary.native_code, operation: secondary.operation};
+        }
+        ret R.err[Output, Error](error);
     }
-    if (w < 0) { ret R.err[Output, str]("wait failed"); }
-
-    ret R.ok[Output, str](Output{
-        status: ExitStatus{raw: wstatus},
-        bytes:  R.unwrap_ok[Vector[u8], str](bytes_r),
-    });
+    var bytes: Vector[u8] = R.unwrap_ok[Vector[u8], str](bytes_r);
+    if (R.is_err[ExitStatus, Error](waited)) {
+        vector.dnit[u8](?bytes);
+        ret R.err[Output, Error](R.unwrap_err[ExitStatus, Error](waited));
+    }
+    ret R.ok[Output, Error](Output{status: R.unwrap_ok[ExitStatus, Error](waited), bytes: bytes});
 }
 
 # start a process without waiting
@@ -413,14 +438,16 @@ pub fun terminate_group(child: Child) R.Result[bool, str] {
 # error and leave the child unreaped.
 # ---
 # child: child handle from spawn
-# ret:   exit status, or an error message
-pub fun wait(child: Child) R.Result[ExitStatus, str] {
-    var wstatus: i32 = 0;
-    var r: i64 = os.EINTR;
-    for (r == os.EINTR) { r = os.wait_pid(child.pid, ?wstatus, 0); }
-    if (r < 0) { ret R.err[ExitStatus, str]("wait failed"); }
-
-    ret R.ok[ExitStatus, str](ExitStatus{raw: wstatus});
+# ret:   exit status, or a typed error retaining any unreaped child
+pub fun wait(child: Child) R.Result[ExitStatus, Error] {
+    if (child.pid <= 0) { ret R.err[ExitStatus, Error](process_error(os.EINVAL, os.PROCESS_OP_WAIT)); }
+    for {
+        var status: ExitStatus;
+        val result: os.WaitResult = os.wait_pid(child.pid, ?status, 0);
+        if (result.error.code == os.EINTR) { cnt; }
+        if (result.error.code < 0) { ret R.err[ExitStatus, Error](wait_error(result.error, child)); }
+        if (result.pid > 0 && (exited(status) || signaled(status))) { ret R.ok[ExitStatus, Error](status); }
+    }
 }
 
 # reap a child if it has already exited, without blocking
@@ -435,14 +462,19 @@ pub fun wait(child: Child) R.Result[ExitStatus, str] {
 # ---
 # child: child handle from any spawn
 # ret:   the exit status if it has terminated, absent if it is still running,
-#        or an error message
-pub fun try_wait(child: Child) R.Result[O.Option[ExitStatus], str] {
-    var wstatus: i32 = 0;
-    var r: i64 = os.EINTR;
-    for (r == os.EINTR) { r = os.wait_pid(child.pid, ?wstatus, os.WNOHANG); }
-    if (r < 0) { ret R.err[O.Option[ExitStatus], str]("wait failed"); }
-    if (r == 0) { ret R.ok[O.Option[ExitStatus], str](O.none[ExitStatus]()); }
-    ret R.ok[O.Option[ExitStatus], str](O.some[ExitStatus](ExitStatus{raw: wstatus}));
+#        or a typed error retaining any unreaped child
+pub fun try_wait(child: Child) R.Result[O.Option[ExitStatus], Error] {
+    if (child.pid <= 0) { ret R.err[O.Option[ExitStatus], Error](process_error(os.EINVAL, os.PROCESS_OP_WAIT)); }
+    for {
+        var status: ExitStatus;
+        val result: os.WaitResult = os.wait_pid(child.pid, ?status, os.WNOHANG);
+        if (result.error.code == os.EINTR) { cnt; }
+        if (result.error.code < 0) { ret R.err[O.Option[ExitStatus], Error](wait_error(result.error, child)); }
+        if (result.pid > 0 && (exited(status) || signaled(status))) {
+            ret R.ok[O.Option[ExitStatus], Error](O.some[ExitStatus](status));
+        }
+        ret R.ok[O.Option[ExitStatus], Error](O.none[ExitStatus]());
+    }
 }
 
 # block until any child of this process exits
@@ -453,19 +485,22 @@ pub fun try_wait(child: Child) R.Result[O.Option[ExitStatus], str] {
 # several children can map the exit back to its work item. errs when there is
 # no child to wait for.
 #
-# wait_any must not run concurrently with terminate_child, because it may reap
-# and release the process ID that termination is validating.
+# serialize waits on the same child, and wait_any with all waits and termination
+# an error without a selected child leaves every existing child owner with its caller
 #
 # an interrupting signal is retried rather than reported, as in wait.
 # ---
-# ret: the reaped child and its exit status, or an error message
-pub fun wait_any() R.Result[Reaped, str] {
-    var wstatus: i32 = 0;
-    var pid: i64 = os.EINTR;
-    for (pid == os.EINTR) { pid = os.wait_pid(-1, ?wstatus, 0); }
-    if (pid <= 0) { ret R.err[Reaped, str]("wait failed"); }
-
-    ret R.ok[Reaped, str](Reaped{child: Child{pid: pid, pgid: 0}, status: ExitStatus{raw: wstatus}});
+# ret: the reaped child and its exit status, or a typed wait error
+pub fun wait_any() R.Result[Reaped, Error] {
+    for {
+        var status: ExitStatus;
+        val result: os.WaitResult = os.wait_pid(-1, ?status, 0);
+        if (result.error.code == os.EINTR) { cnt; }
+        if (result.error.code < 0) { ret R.err[Reaped, Error](wait_error(result.error, Child{})); }
+        if (result.pid > 0 && (exited(status) || signaled(status))) {
+            ret R.ok[Reaped, Error](Reaped{child: Child{pid: result.pid}, status: status});
+        }
+    }
 }
 
 # how a supervised child ended
@@ -491,9 +526,8 @@ val SUPERVISE_POLL_NSEC: i64 = 2000000;
 # if only the shell is signalled. so the group is what gets terminated, which is
 # why the child should come from one of the grouped spawns.
 #
-# the child is always reaped, including when the deadline is what ended it, so a
-# terminated child never becomes a zombie. the caller learns which happened from
-# the returned reason.
+# successful supervision reaps the child. a wait or termination failure returns
+# its retained child for explicit retry or cleanup, alongside the original cause.
 #
 # a child that is not in a group is still supervised; expiry then terminates
 # just that child, and any grandchildren it started survive. that is a weaker
@@ -501,19 +535,19 @@ val SUPERVISE_POLL_NSEC: i64 = 2000000;
 # ---
 # child: child handle, ideally from a grouped spawn
 # scope: the scope whose deadline or cancellation bounds the child
-# ret:   how it ended, or an error message
-pub fun wait_within(child: Child, scope: *cancel.Scope) R.Result[Supervised, str] {
-    if (scope == nil) { ret R.err[Supervised, str]("supervision scope is nil"); }
+# ret:   how it ended, or a typed error retaining any unreaped child
+pub fun wait_within(child: Child, scope: *cancel.Scope) R.Result[Supervised, Error] {
+    if (scope == nil) { ret R.err[Supervised, Error](Error{code: os.EINVAL, operation: os.PROCESS_OP_WAIT, child: child}); }
 
     var terminated: bool = false;
     for {
-        val probe: R.Result[O.Option[ExitStatus], str] = try_wait(child);
-        if (R.is_err[O.Option[ExitStatus], str](probe)) {
-            ret R.err[Supervised, str](R.unwrap_err[O.Option[ExitStatus], str](probe));
+        val probe: R.Result[O.Option[ExitStatus], Error] = try_wait(child);
+        if (R.is_err[O.Option[ExitStatus], Error](probe)) {
+            ret R.err[Supervised, Error](R.unwrap_err[O.Option[ExitStatus], Error](probe));
         }
-        val got: O.Option[ExitStatus] = R.unwrap_ok[O.Option[ExitStatus], str](probe);
+        val got: O.Option[ExitStatus] = R.unwrap_ok[O.Option[ExitStatus], Error](probe);
         if (O.is_some[ExitStatus](got)) {
-            ret R.ok[Supervised, str](Supervised{
+            ret R.ok[Supervised, Error](Supervised{
                 status: O.unwrap[ExitStatus](got),
                 terminated: terminated,
                 reason: cancel.reason(scope)});
@@ -523,9 +557,13 @@ pub fun wait_within(child: Child, scope: *cancel.Scope) R.Result[Supervised, str
         cancel.expire(scope, tm.monotonic());
         val why: cancel.Reason = cancel.reason(scope);
         if (why != cancel.ACTIVE && !terminated) {
+            var stopped: R.Result[bool, str];
+            if (child.pgid != 0) { stopped = terminate_group(child); }
+            or { stopped = terminate_child(child); }
+            if (R.is_err[bool, str](stopped)) {
+                ret R.err[Supervised, Error](Error{operation: os.PROCESS_OP_TERMINATE, detail: R.unwrap_err[bool, str](stopped), child: child});
+            }
             terminated = true;
-            if (child.pgid != 0) { terminate_group(child); }
-            or { terminate_child(child); }
             # fall through and keep polling: the child still has to be reaped
         }
         os.sleep(SUPERVISE_POLL_NSEC);
@@ -537,15 +575,15 @@ pub fun wait_within(child: Child, scope: *cancel.Scope) R.Result[Supervised, str
 # status: exit status to inspect
 # ret:    true if the process called exit
 pub fun exited(status: ExitStatus) bool {
-    ret os.has_exited(status.raw);
+    ret os.has_exited(status);
 }
 
 # get the exit code of a normally exited process
 # ---
 # status: exit status to inspect
-# ret:    exit code (0-255), only valid if exited() is true
-pub fun code(status: ExitStatus) i32 {
-    ret os.exit_code(status.raw);
+# ret:    full u32 exit code, only valid if exited() is true
+pub fun code(status: ExitStatus) u32 {
+    ret os.exit_code(status);
 }
 
 # check if the process was killed by a signal
@@ -553,7 +591,7 @@ pub fun code(status: ExitStatus) i32 {
 # status: exit status to inspect
 # ret:    true if terminated by signal
 pub fun signaled(status: ExitStatus) bool {
-    ret os.was_signaled(status.raw);
+    ret os.was_signaled(status);
 }
 
 # get the signal number that killed the process
@@ -561,7 +599,7 @@ pub fun signaled(status: ExitStatus) bool {
 # status: exit status to inspect
 # ret:    signal number
 pub fun signal(status: ExitStatus) i32 {
-    ret os.term_signal(status.raw);
+    ret os.term_signal(status);
 }
 
 # terminate the current process
@@ -788,7 +826,7 @@ $if ($mach.build.os == $mach.os.windows) {
         var av2: [4]usize = make_shell_argv("ping -n 3 127.0.0.1 > NUL");
         val pid2: i64 = os.spawn(shell_path(), (?av2[0])::**u8, nil);
         os.close(fds[1]);
-        var st: i32 = 0;
+        var st: os.ProcessStatus;
         if (pid2 < 0) {
             os.close(fds[0]);
             os.wait_pid(pid1, ?st, 0);
@@ -802,10 +840,10 @@ $if ($mach.build.os == $mach.os.windows) {
             total = total + n::usize;
         }
         os.close(fds[0]);
-        val still_running: i64 = os.wait_pid(pid2, ?st, os.WNOHANG);
+        val still_running: os.WaitResult = os.wait_pid(pid2, ?st, os.WNOHANG);
         os.wait_pid(pid1, ?st, 0);
         os.wait_pid(pid2, ?st, 0);
-        if (still_running != 0) { ret 1; }
+        if (still_running.pid != 0 || still_running.error.code != 0) { ret 1; }
         if (total != ECHO_LEN) { ret 1; }
         ret 0;
     }
@@ -859,9 +897,9 @@ $or {
 
 test "std.process.exec.run:success_exits_zero" {
     var argv: [4]usize = argv_ok();
-    val r: R.Result[ExitStatus, str] = run(prog_ok(), (?argv[0])::**u8, nil);
-    if (R.is_err[ExitStatus, str](r)) { ret 1; }
-    val s: ExitStatus = R.unwrap_ok[ExitStatus, str](r);
+    val r: R.Result[ExitStatus, Error] = run(prog_ok(), (?argv[0])::**u8, nil);
+    if (R.is_err[ExitStatus, Error](r)) { ret 1; }
+    val s: ExitStatus = R.unwrap_ok[ExitStatus, Error](r);
     if (!exited(s)) { ret 1; }
     if (code(s) != 0) { ret 1; }
     ret 0;
@@ -869,9 +907,9 @@ test "std.process.exec.run:success_exits_zero" {
 
 test "std.process.exec.run:failure_exits_one" {
     var argv: [4]usize = argv_fail();
-    val r: R.Result[ExitStatus, str] = run(prog_fail(), (?argv[0])::**u8, nil);
-    if (R.is_err[ExitStatus, str](r)) { ret 1; }
-    val s: ExitStatus = R.unwrap_ok[ExitStatus, str](r);
+    val r: R.Result[ExitStatus, Error] = run(prog_fail(), (?argv[0])::**u8, nil);
+    if (R.is_err[ExitStatus, Error](r)) { ret 1; }
+    val s: ExitStatus = R.unwrap_ok[ExitStatus, Error](r);
     if (!exited(s)) { ret 1; }
     if (code(s) != 1) { ret 1; }
     ret 0;
@@ -882,9 +920,9 @@ test "std.process.exec.spawn:wait_matches_run" {
     val sr: R.Result[Child, str] = spawn(prog_ok(), (?argv[0])::**u8, nil);
     if (R.is_err[Child, str](sr)) { ret 1; }
     val child: Child = R.unwrap_ok[Child, str](sr);
-    val wr: R.Result[ExitStatus, str] = wait(child);
-    if (R.is_err[ExitStatus, str](wr)) { ret 1; }
-    val s: ExitStatus = R.unwrap_ok[ExitStatus, str](wr);
+    val wr: R.Result[ExitStatus, Error] = wait(child);
+    if (R.is_err[ExitStatus, Error](wr)) { ret 1; }
+    val s: ExitStatus = R.unwrap_ok[ExitStatus, Error](wr);
     if (!exited(s)) { ret 1; }
     if (code(s) != 0) { ret 1; }
     ret 0;
@@ -898,9 +936,9 @@ test "std.process.exec.output:captures_echo" {
     fixed.make(?a, ?fst, ?buf[0], 32768);
 
     var argv: [4]usize = argv_echo();
-    val r: R.Result[Output, str] = output(?a, prog_echo(), (?argv[0])::**u8, nil);
-    if (R.is_err[Output, str](r)) { ret 1; }
-    val o: Output = R.unwrap_ok[Output, str](r);
+    val r: R.Result[Output, Error] = output(?a, prog_echo(), (?argv[0])::**u8, nil);
+    if (R.is_err[Output, Error](r)) { ret 1; }
+    val o: Output = R.unwrap_ok[Output, Error](r);
     if (!exited(o.status)) { ret 1; }
     if (code(o.status) != 0) { ret 1; }
     if (o.bytes.len != ECHO_LEN) { ret 1; }
@@ -918,9 +956,9 @@ test "std.process.exec.run:repeated_spawns_stay_correct" {
     var i: usize = 0;
     for (i < 64) {
         var argv: [4]usize = argv_ok();
-        val r: R.Result[ExitStatus, str] = run(prog_ok(), (?argv[0])::**u8, nil);
-        if (R.is_err[ExitStatus, str](r)) { ret 1; }
-        val s: ExitStatus = R.unwrap_ok[ExitStatus, str](r);
+        val r: R.Result[ExitStatus, Error] = run(prog_ok(), (?argv[0])::**u8, nil);
+        if (R.is_err[ExitStatus, Error](r)) { ret 1; }
+        val s: ExitStatus = R.unwrap_ok[ExitStatus, Error](r);
         if (!exited(s)) { ret 1; }
         if (code(s) != 0) { ret 1; }
         i = i + 1;
@@ -951,9 +989,9 @@ test "std.process.exec.spawn_redirected:pipes_child_stdout" {
     }
     os.close(fds[0]);
 
-    val wr: R.Result[ExitStatus, str] = wait(R.unwrap_ok[Child, str](sr));
-    if (R.is_err[ExitStatus, str](wr)) { ret 1; }
-    if (code(R.unwrap_ok[ExitStatus, str](wr)) != 0) { ret 1; }
+    val wr: R.Result[ExitStatus, Error] = wait(R.unwrap_ok[Child, str](sr));
+    if (R.is_err[ExitStatus, Error](wr)) { ret 1; }
+    if (code(R.unwrap_ok[ExitStatus, Error](wr)) != 0) { ret 1; }
 
     if (total != ECHO_LEN) { ret 1; }
     if (redir_buf[0] != 'h') { ret 1; }
@@ -978,9 +1016,9 @@ test "std.process.exec.spawn_grouped:child_pgid_equals_pid" {
         var bad: u8 = 0;
         if (child.pgid == 0) { bad = 1; }
 
-        val wr: R.Result[ExitStatus, str] = wait(child);
-        if (R.is_err[ExitStatus, str](wr)) { bad = 1; }
-        or (!exited(R.unwrap_ok[ExitStatus, str](wr)) || code(R.unwrap_ok[ExitStatus, str](wr)) != 0) { bad = 1; }
+        val wr: R.Result[ExitStatus, Error] = wait(child);
+        if (R.is_err[ExitStatus, Error](wr)) { bad = 1; }
+        or (!exited(R.unwrap_ok[ExitStatus, Error](wr)) || code(R.unwrap_ok[ExitStatus, Error](wr)) != 0) { bad = 1; }
         ret bad::i32;
     }
     $or {
@@ -998,8 +1036,8 @@ test "std.process.exec.spawn_grouped:child_pgid_equals_pid" {
             if (darwin.getpgid(child.pid) != child.pgid) { bad = 1; }
         }
 
-        val wr: R.Result[ExitStatus, str] = wait(child);
-        if (R.is_err[ExitStatus, str](wr)) { bad = 1; }
+        val wr: R.Result[ExitStatus, Error] = wait(child);
+        if (R.is_err[ExitStatus, Error](wr)) { bad = 1; }
         ret bad::i32;
     }
 }
@@ -1029,14 +1067,14 @@ test "std.process.exec.terminate_group:kills_a_grandchild" {
         val tr: R.Result[bool, str] = terminate_group(child);
         if (R.is_err[bool, str](tr)) { terminate_child(child); wait(child); ret 1; }
 
-        var wstatus: i32 = 0;
-        val w: i64 = os.wait_pid(child.pid, ?wstatus, 0);
-        if (w != child.pid) { ret 1; }
+        var wstatus: os.ProcessStatus;
+        val w: os.WaitResult = os.wait_pid(child.pid, ?wstatus, 0);
+        if (w.pid != child.pid || w.error.code != 0) { ret 1; }
         # TerminateJobObject's uExitCode becomes every member's exit code,
         # same TERMINATE_CHILD_EXIT_CODE terminate_child already uses -
         # confirms this reaped exit came from the group kill, not a ping that
         # happened to finish its own 30-second run on its own
-        if (!exited(ExitStatus{raw: wstatus}) || code(ExitStatus{raw: wstatus}) != 137) { ret 1; }
+        if (!exited(wstatus) || code(wstatus) != 137) { ret 1; }
         ret 0;
     }
     $or {
@@ -1088,8 +1126,8 @@ test "std.process.exec.terminate_group:kills_a_grandchild" {
         var tries: usize = 0;
         for (tries < 50 && (shell_reaped == 0 || grandchild_gone == 0)) {
             if (shell_reaped == 0) {
-                var wstatus: i32 = 0;
-                if (os.wait_pid(shell.pid, ?wstatus, os.WNOHANG) == shell.pid) { shell_reaped = 1; }
+                var wstatus: os.ProcessStatus;
+                if (os.wait_pid(shell.pid, ?wstatus, os.WNOHANG).pid == shell.pid) { shell_reaped = 1; }
             }
             if (grandchild_gone == 0) {
                 $if ($mach.build.os == $mach.os.linux) {
@@ -1104,7 +1142,7 @@ test "std.process.exec.terminate_group:kills_a_grandchild" {
         }
 
         if (shell_reaped == 0) {
-            var final_status: i32 = 0;
+            var final_status: os.ProcessStatus;
             os.wait_pid(shell.pid, ?final_status, 0);
         }
         if (shell_reaped == 0 || grandchild_gone == 0) { ret 1; }
@@ -1136,14 +1174,14 @@ test "std.process.exec.wait_any:reaps_each_child_once" {
     val pa: i64 = R.unwrap_ok[Child, str](ra).pid;
     val pb: i64 = R.unwrap_ok[Child, str](rb).pid;
 
-    val w1: R.Result[Reaped, str] = wait_any();
-    if (R.is_err[Reaped, str](w1)) { ret 1; }
-    val r1: Reaped = R.unwrap_ok[Reaped, str](w1);
+    val w1: R.Result[Reaped, Error] = wait_any();
+    if (R.is_err[Reaped, Error](w1)) { ret 1; }
+    val r1: Reaped = R.unwrap_ok[Reaped, Error](w1);
     if (!exited(r1.status) || code(r1.status) != 0) { ret 1; }
 
-    val w2: R.Result[Reaped, str] = wait_any();
-    if (R.is_err[Reaped, str](w2)) { ret 1; }
-    val r2: Reaped = R.unwrap_ok[Reaped, str](w2);
+    val w2: R.Result[Reaped, Error] = wait_any();
+    if (R.is_err[Reaped, Error](w2)) { ret 1; }
+    val r2: Reaped = R.unwrap_ok[Reaped, Error](w2);
     if (!exited(r2.status) || code(r2.status) != 0) { ret 1; }
 
     # both children reaped, each exactly once, in either order
@@ -1154,7 +1192,7 @@ test "std.process.exec.wait_any:reaps_each_child_once" {
 }
 
 test "std.process.exec.wait_any:errs_with_no_children" {
-    if (!R.is_err[Reaped, str](wait_any())) { ret 1; }
+    if (!R.is_err[Reaped, Error](wait_any())) { ret 1; }
     ret 0;
 }
 
@@ -1183,9 +1221,9 @@ test "std.process.exec.run_shell:child_starts_in_cwd" {
     # negative half of this test, so clear both sites before spawning
     filesystem.remove_file(leaf);
 
-    val r: R.Result[ExitStatus, str] = run_shell(probe_cmd(), dir, nil);
-    if (R.is_err[ExitStatus, str](r)) { ret 1; }
-    val st: ExitStatus = R.unwrap_ok[ExitStatus, str](r);
+    val r: R.Result[ExitStatus, Error] = run_shell(probe_cmd(), dir, nil);
+    if (R.is_err[ExitStatus, Error](r)) { ret 1; }
+    val st: ExitStatus = R.unwrap_ok[ExitStatus, Error](r);
     if (!exited(st) || code(st) != 0) { ret 1; }
 
     var joined: [4160]u8;
@@ -1225,15 +1263,15 @@ test "std.process.exec.run_shell:quoted_command_survives" {
     filesystem.remove_file((?seed_path[0])::str);
     filesystem.remove_file((?out_path[0])::str);
 
-    val mk: R.Result[ExitStatus, str] = run_shell(seed_cmd(), dir, nil);
-    if (R.is_err[ExitStatus, str](mk)) { ret 1; }
+    val mk: R.Result[ExitStatus, Error] = run_shell(seed_cmd(), dir, nil);
+    if (R.is_err[ExitStatus, Error](mk)) { ret 1; }
     if (!filesystem.is_file((?seed_path[0])::str)) { ret 1; }
 
-    val r: R.Result[ExitStatus, str] = run_shell(probe_quoted_cmd(), dir, nil);
+    val r: R.Result[ExitStatus, Error] = run_shell(probe_quoted_cmd(), dir, nil);
     var bad: u8 = 0;
-    if (R.is_err[ExitStatus, str](r)) { bad = 1; }
+    if (R.is_err[ExitStatus, Error](r)) { bad = 1; }
     or {
-        val st: ExitStatus = R.unwrap_ok[ExitStatus, str](r);
+        val st: ExitStatus = R.unwrap_ok[ExitStatus, Error](r);
         if (!exited(st) || code(st) != 0)               { bad = 1; }
         or (!filesystem.is_file((?out_path[0])::str))   { bad = 1; }
     }
@@ -1442,9 +1480,9 @@ test "std.process.exec.try_wait:absent_while_running_then_present" {
     val child: Child = R.unwrap_ok[Child, str](sr);
 
     # the child is still running, so the answer is absent rather than a block
-    val first: R.Result[O.Option[ExitStatus], str] = try_wait(child);
-    if (R.is_err[O.Option[ExitStatus], str](first)) { terminate_child(child); wait(child); ret 2; }
-    if (O.is_some[ExitStatus](R.unwrap_ok[O.Option[ExitStatus], str](first))) {
+    val first: R.Result[O.Option[ExitStatus], Error] = try_wait(child);
+    if (R.is_err[O.Option[ExitStatus], Error](first)) { terminate_child(child); wait(child); ret 2; }
+    if (O.is_some[ExitStatus](R.unwrap_ok[O.Option[ExitStatus], Error](first))) {
         terminate_child(child); wait(child); ret 3;
     }
 
@@ -1452,9 +1490,9 @@ test "std.process.exec.try_wait:absent_while_running_then_present" {
     var seen: bool = false;
     var spins: i32 = 0;
     for (spins < 500 && !seen) {
-        val probe: R.Result[O.Option[ExitStatus], str] = try_wait(child);
-        if (R.is_err[O.Option[ExitStatus], str](probe)) { ret 4; }
-        if (O.is_some[ExitStatus](R.unwrap_ok[O.Option[ExitStatus], str](probe))) { seen = true; }
+        val probe: R.Result[O.Option[ExitStatus], Error] = try_wait(child);
+        if (R.is_err[O.Option[ExitStatus], Error](probe)) { ret 4; }
+        if (O.is_some[ExitStatus](R.unwrap_ok[O.Option[ExitStatus], Error](probe))) { seen = true; }
         or { os.sleep(2000000); }
         spins = spins + 1;
     }
@@ -1475,10 +1513,10 @@ test "std.process.exec.wait_within:a_child_that_finishes_first_is_not_terminated
     if (R.is_err[Child, str](sr)) { cancel.destroy(?scope); ret 2; }
     val child: Child = R.unwrap_ok[Child, str](sr);
 
-    val wr: R.Result[Supervised, str] = wait_within(child, ?scope);
+    val wr: R.Result[Supervised, Error] = wait_within(child, ?scope);
     cancel.destroy(?scope);
-    if (R.is_err[Supervised, str](wr)) { ret 3; }
-    val sup: Supervised = R.unwrap_ok[Supervised, str](wr);
+    if (R.is_err[Supervised, Error](wr)) { ret 3; }
+    val sup: Supervised = R.unwrap_ok[Supervised, Error](wr);
 
     if (sup.terminated) { ret 4; }
     if (sup.reason != cancel.ACTIVE) { ret 5; }
@@ -1503,17 +1541,18 @@ test "std.process.exec.wait_within:an_expired_deadline_terminates_and_reaps" {
 
     # the child would run for 30 seconds; the deadline is 50ms, so returning at
     # all is the first half of the claim
-    val wr: R.Result[Supervised, str] = wait_within(child, ?scope);
+    val wr: R.Result[Supervised, Error] = wait_within(child, ?scope);
     cancel.destroy(?scope);
-    if (R.is_err[Supervised, str](wr)) { ret 4; }
-    val sup: Supervised = R.unwrap_ok[Supervised, str](wr);
+    if (R.is_err[Supervised, Error](wr)) { ret 4; }
+    val sup: Supervised = R.unwrap_ok[Supervised, Error](wr);
     if (!sup.terminated) { ret 5; }
     if (sup.reason != cancel.TIMED_OUT) { ret 6; }
 
     # and it was reaped on the way out, so a second wait finds nothing rather
     # than a zombie
-    var wstatus: i32 = 0;
-    if (os.wait_pid(child.pid, ?wstatus, os.WNOHANG) > 0) { ret 7; }
+    var wstatus: os.ProcessStatus;
+    val consumed: os.WaitResult = os.wait_pid(child.pid, ?wstatus, os.WNOHANG);
+    if (consumed.pid != 0 || consumed.error.code != os.ECHILD) { ret 7; }
     ret 0;
 }
 
@@ -1560,10 +1599,10 @@ test "std.process.exec.wait_within:an_expired_deadline_reaches_a_grandchild" {
         val deadline: tm.Time = tm.time_add(tm.monotonic(), 50 * duration.MILLISECOND);
         if (!cancel.make_root(?scope, true, deadline)) { terminate_group(shell); wait(shell); ret 6; }
 
-        val wr: R.Result[Supervised, str] = wait_within(shell, ?scope);
+        val wr: R.Result[Supervised, Error] = wait_within(shell, ?scope);
         cancel.destroy(?scope);
-        if (R.is_err[Supervised, str](wr)) { ret 7; }
-        val sup: Supervised = R.unwrap_ok[Supervised, str](wr);
+        if (R.is_err[Supervised, Error](wr)) { ret 7; }
+        val sup: Supervised = R.unwrap_ok[Supervised, Error](wr);
         if (!sup.terminated || sup.reason != cancel.TIMED_OUT) { ret 8; }
 
         # the grandchild was never our own child, so its disappearance is proof
@@ -1583,4 +1622,32 @@ test "std.process.exec.wait_within:an_expired_deadline_reaches_a_grandchild" {
         if (!gone) { ret 9; }
         ret 0;
     }
+}
+
+use process_testing: std.allocator.testing;
+
+test "std.process.exec.output: failed wait releases capture and retains child ownership" {
+    var tracking: process_testing.Testing;
+    if (O.is_some[str](process_testing.make(?tracking))) { ret 1; }
+    fin { process_testing.dnit(?tracking); }
+    var bytes: Vector[u8] = vector.init[u8](?tracking.a);
+    if (R.is_err[usize, str](vector.push[u8](?bytes, 42))) { ret 2; }
+    if (tracking.live != 1) { ret 3; }
+    val cause: Error = Error{code: os.EACCES, native_code: 5, operation: os.PROCESS_OP_STATUS,
+        child: Child{pid: 123, pgid: 123}};
+    val failed: R.Result[Output, Error] = finish_output(
+        R.ok[Vector[u8], str](bytes), R.err[ExitStatus, Error](cause));
+    if (R.is_ok[Output, Error](failed)) { ret 4; }
+    val error: Error = R.unwrap_err[Output, Error](failed);
+    if (error.code != cause.code || error.native_code != 5 || error.operation != os.PROCESS_OP_STATUS
+        || error.child.pid != 123 || error.child.pgid != 123) { ret 5; }
+    if (tracking.live != 0 || tracking.double_frees != 0) { ret 6; }
+    val both: R.Result[Output, Error] = finish_output(
+        R.err[Vector[u8], str](m_reader.ERR_EOF), R.err[ExitStatus, Error](cause));
+    if (R.is_ok[Output, Error](both)) { ret 7; }
+    val primary: Error = R.unwrap_err[Output, Error](both);
+    if (primary.operation != os.PROCESS_OP_READ || !str_equals(error_message(primary), m_reader.ERR_EOF)
+        || primary.child.pid != 123 || primary.secondary_wait.code != cause.code
+        || primary.secondary_wait.native_code != 5 || primary.secondary_wait.operation != os.PROCESS_OP_STATUS) { ret 8; }
+    ret 0;
 }
