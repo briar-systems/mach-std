@@ -110,7 +110,9 @@ for target in "${targets[@]}"; do
         esac
         if [ "$profile" = release ]; then
             release_body="$(sed -n '/std.system.os.secret.deallocate:/,/std.system.os.secret.random_fill:/p' "$secret_asm")"
-            wipe_line="$(echo "$release_body" | grep -n -m1 -E 'mov byte \[[^]]+\], 0|strb wzr|sb zero' | cut -d: -f1 || true)"
+            # the oblivious wipe stays a call under the v5 inlining policy (mach
+            # N6, PR #3270), so the call site counts as the wipe here
+            wipe_line="$(echo "$release_body" | grep -n -m1 -E 'mov byte \[[^]]+\], 0|strb wzr|sb zero|std\.system\.os\.secret\.wipe([^_]|$)' | cut -d: -f1 || true)"
             case "$target" in
                 linux-*)
                     release_line="$(echo "$release_body" | grep -n -m1 -E 'syscall|ecall|svc' | cut -d: -f1 || true)"
