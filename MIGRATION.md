@@ -22,7 +22,7 @@ mach `doc/design/tagged-values.md`; the compiler pin is
 | migration compiler | mach `dev` `b4ab85122e30bb24d733a024d549a9a05ef1a2c2`, built by the 4.30.0 seed (generation A `a881f3c2`) or through std's own bootstrap chain (fixpoint `b1fe8a87`) |
 | std base | `origin/dev` `c373e56` (std 1.0.2) |
 | bootstrap chain | `.github/actions/setup-mach/bootstrap.py`: published 4.26.5, bridge `878a8f66` single, audited `b65afb97` fixpoint, v5 `8464568d` fixpoint (std pin `168a9f76` at every stage). `8464568d` is `9a15ac3a6` plus the seeding removal (mach PR #3278: the compiler no longer seeds `res`, `opt` and `err` and no longer refuses a module that declares them); `9a15ac3a6` is `b4ab85122` plus the darwin build fix (mach PR #3277, the pinned std does not forward `O_NONBLOCK` on darwin) and is language-identical |
-| suite at this phase | 1182 passed, 0 failed under the v5 compiler on linux-x86_64 (1157 on the base under both the 4.30.0 seed and the v5 compiler) |
+| suite at this phase | 1185 passed, 0 failed under the v5 compiler `8464568d` on linux-x86_64 (1182 at S1 phase 1 under `9a15ac3a6`, 1157 on the base under both the 4.30.0 seed and the v5 compiler) |
 
 ## Compiler facts every lane must know
 
@@ -35,13 +35,15 @@ mach `doc/design/tagged-values.md`; the compiler pin is
   and every consuming module gains `use std.types.canonical.res;` and friends.
   That is a one-line-per-module sweep, not a redesign, and it must land with
   the compiler change as one pinned pair.
-- **A user generic instantiated over a canonical tag does not compile**
-  (`mangle: nominal module is not acquired in the current operation`, the nil
-  owner module noted on mach #3218). `Vector[res[T, E]]`, `Map[K, opt[V]]`,
-  `Holder[opt[T]]` and the like are unavailable until that compiler defect is
-  fixed. Nesting the canonical tags in each other works (`res[opt[T], E]`,
-  `opt[res[T, E]]`), and a record field of canonical type works. No frozen
-  signature below depends on the defect being fixed.
+- **A user generic instantiates over a canonical tag like over any other
+  declared type.** `Vector[res[T, E]]`, `Map[K, opt[V]]`, `Holder[opt[T]]`
+  and the like build and behave (the mangler defect noted on mach #3218 had
+  a nil owner module because the tags were seeded; declared in std they have
+  one). Tests pin it: `vector: elements of canonical tag type round-trip`,
+  `map: values of canonical tag type round-trip` and
+  `std.types.canonical: user generics instantiate over the canonical tags`.
+  Nesting the canonical tags in each other works (`res[opt[T], E]`,
+  `opt[res[T, E]]`), and a record field of canonical type works.
 - Guards are lexical (contract "Payload places and guards"). The forms that
   bite during migration: an `or` arm is never guarded by the `if` arm's test,
   so `if (sel r.err) {...} or { r.ok }` is rejected, write
