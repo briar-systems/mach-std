@@ -28,10 +28,16 @@ mach `doc/design/tagged-values.md`; the compiler pin is
 
 - **The declarations of `res`, `opt` and `err` are std's; the compiler has
   none.** mach `8464568d` (PR #3278, mach #3226) seeds nothing and no longer
-  refuses a module that declares the three names. `std.types.canonical`
-  declares them `pub` exactly as the contract spells them and pins the shapes
-  by test, and every consuming module has `use std.types.canonical.res;` and
-  friends. A module that names a canonical tag without
+  refuses a module that declares the three names. `std.types.result`
+  (`res[T, E]`), `std.types.option` (`opt[T]`) and `std.types.error`
+  (`err[E]`) declare them `pub` exactly as the contract spells them, one
+  module per tag, and pin the shapes by test; every consuming module has
+  `use std.types.result.res;`, `use std.types.option.opt;` and
+  `use std.types.error.err;` as it needs them, alias-free. (The three were
+  one module, `std.types.canonical`, until the owner's 2026-09-12 ruling
+  split it; the module names deliberately reuse the names C5c deleted and
+  nothing else in them is called `Result` or `Option`.) A module that names
+  a canonical tag without
   the `use` fails to compile with `unresolved type name`, and a local binding
   named `res`, `opt` or `err` now shadows the tag in type position, which the
   seeded compiler hid.
@@ -50,7 +56,8 @@ mach `doc/design/tagged-values.md`; the compiler pin is
   a nil owner module because the tags were seeded; declared in std they have
   one). Tests pin it: `vector: elements of canonical tag type round-trip`,
   `map: values of canonical tag type round-trip` and
-  `std.types.canonical: user generics instantiate over the canonical tags`.
+  `std.types.result.res: user generics instantiate over the canonical tag`
+  and its `option.opt` and `error.err` siblings.
   Nesting the canonical tags in each other works (`res[opt[T], E]`,
   `opt[res[T, E]]`), and a record field of canonical type works.
 - Guards are lexical (contract "Payload places and guards"). The forms that
@@ -320,7 +327,7 @@ growth that is refused part way releases the buffers it acquired.
 | `text.string.str_dup`, `str_dup_range` | `... res[str, allocator.Error]` | yes |
 | `text.string.str_free` | `fun(a: *Allocator, s: str) err[allocator.Error]` | yes |
 | `memory.*` | unchanged (predicates and infallible effects) | yes |
-| `types.canonical` | tests only until the compiler stops seeding; then the three declarations | yes |
+| `types.result` (`res[T, E]`), `types.option` (`opt[T]`), `types.error` (`err[E]`) | the three canonical declarations, one module per tag (split from `types.canonical` on the 2026-09-12 ruling); shapes pinned by test per module | yes |
 | `types.result`, `types.option` (`Result`, `Option`, `Void`, `ok`, `err`, `ok_void`, `void_of`, `some`, `none`, `is_*`, `unwrap*`) | removed (C5c, std 2.0.0): both modules and their `libstd` forwards deleted after S2 to S8 and mach #3226; the compiler at mach `33d60001e` consumed nothing of them | removed |
 
 ### Text, encoding, data and compression (S2)
@@ -613,8 +620,10 @@ and the bitset refusal test.
 ### Types (S1, done)
 
 `types.string`, `view`, `path`, `semver`, `char`, `bool`, `size`,
-`canonical`, plus `text.string` (owned `str` helpers) and `memory`: frozen
-above. `types.result` and `types.option` are removed (C5c); the last consumers
+`result`, `option`, `error` (the canonical tags, one module each), plus
+`text.string` (owned `str` helpers) and `memory`: frozen above. The legacy
+`types.result` and `types.option` (`Result`, `Option`) are removed (C5c)
+and the module names are reused for the tags; the last consumers
 were the manual darwin probes under `test/vm-darwin` and `test/socket-darwin`,
 which now spell `res` and `err` against the current allocator and `net.local`
 signatures.
@@ -1291,7 +1300,9 @@ never retires; a read resolving `request.length` instead of the native count
 - C5: done. The compiler side is mach #3226 (`8464568d` seeds nothing;
   `33d60001e`, C5a, has zero uses of `std.types.result`, `std.types.option`,
   `Void`, `ok_void` and `void_of` in the compiler), std declares the three
-  tags in `std.types.canonical` with the `use` sweep (std #617, S1 phase 2),
+  tags in `std.types.result`, `std.types.option` and `std.types.error`
+  (declared in `std.types.canonical` at S1 phase 2 with the `use` sweep,
+  split one module per tag on the 2026-09-12 ruling; std #617),
   and C5c deleted `std.types.result` and `std.types.option` (`Result`,
   `Option`, `Void`, `ok`, `err`, `ok_void`, `void_of`, `some`, `none`,
   `is_*`, `unwrap*`) with their `libstd` forwards, moved `mach.toml` to
