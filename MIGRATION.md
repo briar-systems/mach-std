@@ -569,6 +569,16 @@ The release stream keeps the wrappers' instruction sequences and their order,
 pass. The mach half (linking and running the wrappers on three native
 targets) is the compiler repository's.
 
+Control (same program, same compiler, mach 4.30.0): with all eight
+annotations stripped from the copied `std.sync.atomic` the release `main.s`
+also carries zero `call` instructions and the same atomic sequence. The
+compiler's release policy (`doc/design/inline-acceptance-3110.md` in mach)
+already flows every small cross-module body, and the wrappers clear its
+25-instruction bar. The annotations therefore pin the decision rather than
+create it: they are the wrappers' declared contract, independent of the size
+heuristic and of any future growth of a wrapper body. `#[inline]` has no
+effect at `-O0`, by that policy.
+
 ## What the lanes owe
 
 - S2 to S4: migrate the modules in their domain tables to the representations
