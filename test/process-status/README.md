@@ -53,30 +53,38 @@ the failed native stage. Windows accepts only zero or `WNOHANG` options and nil
 rusage, and explicitly refuses unsupported requests.
 
 `exec.ExitStatus` is the same complete status. `exec.code(status)` returns `u32`.
-The following result error type changes from a string to `exec.Error`:
+Every operation reports through the v5 canonical tags with `exec.Error` as the
+domain tag:
 
-| Function | Success value |
+| Function | Outcome |
 | --- | --- |
-| `run`, `run_shell`, `wait` | `ExitStatus` |
-| `try_wait` | `Option[ExitStatus]` |
-| `wait_any` | `Reaped` |
-| `output` | `Output` |
-| `wait_within` | `Supervised` |
+| `run`, `run_shell`, `wait` | `res[ExitStatus, Error]` |
+| `try_wait` | `res[opt[ExitStatus], Error]` |
+| `wait_any` | `res[Reaped, Error]` |
+| `output` | `res[Output, Error]` |
+| `wait_within` | `res[Supervised, Error]` |
+| `spawn*` | `res[Child, Error]` |
+| `terminate_child`, `terminate_group` | `err[Error]` |
+| `resolve`, `resolve_in` | `res[str, Error]` |
 
-`Error` contains `code`, `native_code`, `operation`, `child`, `detail`, and
-`secondary_wait`. `error_message(error)` renders its borrowed detail or mapped
-OS code. Spawn, pipe, read, and termination stages use the corresponding
-`PROCESS_OP_*` values. Existing string-only reader and termination producers
-retain their detail without inventing a numeric native cause. If reading fails
-and waiting also fails, reading remains primary and `secondary_wait` preserves
-the wait cause. Captured bytes are released on a failed wait.
+`Error` is a tag: `native: Failure` (a refused spawn, pipe, wait, status query,
+close or termination with `code`, `native_code`, `operation` and the retained
+`child`), `output: OutputFailure` (a failed capture drain with the reader's
+`ReadError`, the retained `child` and the wait's failure beside it),
+`alloc`, `env`, `empty_name`, `unset`, `not_found`, `ungrouped` and
+`unsupported`. `exec.retained(error)` is the child an error still owns, pid
+zero for none, and `error_message(error)` renders it. Spawn, pipe, read, and
+termination stages use the corresponding `PROCESS_OP_*` values. If reading
+fails and waiting also fails, reading remains primary and the wait cause is
+kept beside it. Captured bytes are released on a failed wait.
 
-A positive `error.child.pid` transfers the remaining child owner to the caller.
-Call `exec.wait(error.child)` again, or explicitly call `terminate_child` or
-`terminate_group` before waiting if that is the caller's policy. Do not discard
-the error while it owns a child. A zero child means no selected pending child,
-including spawn refusal and `ECHILD`. An error from `wait_any` selects no child
-and leaves every existing child owner with its caller.
+A positive retained child transfers the remaining child owner to the caller.
+Call `exec.wait(exec.retained(error))` again, or explicitly call
+`terminate_child` or `terminate_group` before waiting if that is the caller's
+policy. Do not discard the error while it owns a child. A zero child means no
+selected pending child, including spawn refusal and `ECHILD`. An error from
+`wait_any` selects no child and leaves every existing child owner with its
+caller.
 
 Serialize operations on the same child. Serialize `wait_any` with other waits
 and termination of tracked children. This excludes closing native wait handles
@@ -95,17 +103,11 @@ the slot and invalidates its group token.
 
 ## Focused native check
 
-Build the C child with the runner's native C compiler. Materialize the candidate
-stdlib under `dep/std` using the existing native fixture setup. Build the Mach
-fixture in the target's supported profiles and run:
-
-```text
-process_status_probe /absolute/path/to/native-child
-```
-
-Require exit zero. Run the existing `std.system.os.process_status` and
-`std.process.exec` inline tests in the same checkpoint. No native results have
-been claimed by this source draft.
+`verify.sh [mach] [target] [runner]` builds the C child with `$CC` (default
+`cc`), materializes this checkout under `dep/std`, builds the probe and runs
+it against the child; CI runs it on every native leg beside the tracked child
+termination probe. The `std.system.os.process_status` and `std.process.exec`
+inline tests cover the decoders and the result boundary.
 
 References:
 
