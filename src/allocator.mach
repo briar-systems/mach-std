@@ -3,25 +3,39 @@
 # this is intended to be the glue between platform memory primitives and higher
 # level containers/types
 
-use O: std.types.option;
-use R: std.types.result;
-
 use std.types.bool.bool;
 use std.types.bool.true;
 use std.types.size.usize;
 
 use std.memory;
 
+# why an allocation request or a release did not complete
+#
+# the first case is the zero default, so a zero-initialized `res[_, Error]`
+# reads as a refused request.
+# ---
+# exhausted: the backend refused the request, out of memory or over its bound
+# overflow:  the byte count of the request does not fit usize
+# invalid:   a nil allocator, an alignment that is zero or not a power of two,
+#            or another call that violates the interface contract
+# release:   the backend reported a negative errno while releasing storage
+pub tag Error: u8 {
+    exhausted;
+    overflow;
+    invalid;
+    release: i64;
+}
+
 # backend-agnostic allocator interface
 # ---
 # ctx:           opaque context passed to callbacks.
-# fn_allocate:   allocate (ctx, size, align) -> ptr (nil on OOM).
-# fn_reallocate: reallocate (ctx, p, old_size, new_size, align) -> ptr (nil on OOM).
+# fn_allocate:   allocate (ctx, size, align) -> some(ptr), or none when refused.
+# fn_reallocate: reallocate (ctx, p, old_size, new_size, align) -> some(ptr), or none when refused.
 # fn_deallocate: deallocate (ctx, p, size, align) -> i64 (0 on success, negative errno on failure).
 pub rec Allocator {
     ctx:           ptr;
-    fn_allocate:   fun(ptr, usize, usize)             O.Option[ptr];
-    fn_reallocate: fun(ptr, ptr, usize, usize, usize) O.Option[ptr];
+    fn_allocate:   fun(ptr, usize, usize)             opt[ptr];
+    fn_reallocate: fun(ptr, ptr, usize, usize, usize) opt[ptr];
     fn_deallocate: fun(ptr, ptr, usize, usize)        i64;
 }
 
@@ -29,19 +43,16 @@ pub rec Allocator {
 # ---
 # a:     allocator to use for this allocation.
 # size:  number of bytes (0 returns nil).
-# align: requested alignment in bytes.
-# ret:   ptr to allocated memory or error on OOM
-pub fun allocate_raw(a: *Allocator, size: usize, align: usize) R.Result[ptr, *u8] {
-    if (size == 0) {
-        ret R.ok[ptr, *u8](nil);
-    }
+# align: requested alignment in bytes, a power of two.
+# ret:   ptr to allocated memory, or the refusal
+pub fun allocate_raw(a: *Allocator, size: usize, align: usize) res[ptr, Error] {
+    if (a == nil)             { ret res[ptr, Error].err{Error.invalid{}}; }
+    if (!align_valid(align))  { ret res[ptr, Error].err{Error.invalid{}}; }
+    if (size == 0)            { ret res[ptr, Error].ok{nil}; }
 
-    val opt_fn_allocate: O.Option[ptr] = a.fn_allocate(a.ctx, size, align);
-    if (O.is_none[ptr](opt_fn_allocate)) {
-        ret R.err[ptr, *u8]("out of memory");
-    }
-
-    ret R.ok[ptr, *u8](O.unwrap[ptr](opt_fn_allocate));
+    val got: opt[ptr] = a.fn_allocate(a.ctx, size, align);
+    if (!sel got.some) { ret res[ptr, Error].err{Error.exhausted{}}; }
+    ret res[ptr, Error].ok{got.some};
 }
 
 # reallocate an allocation in-place if possible, otherwise may return a new pointer
@@ -50,79 +61,79 @@ pub fun allocate_raw(a: *Allocator, size: usize, align: usize) R.Result[ptr, *u8
 # p:        existing pointer (or nil to allocate new)
 # old_size: previous size in bytes
 # new_size: desired size in bytes (0 frees the allocation)
-# align:    alignment in bytes
-# ret:      ptr to reallocated memory (same as p if in-place) or error on OOM
-pub fun reallocate_raw(a: *Allocator, p: ptr, old_size: usize, new_size: usize, align: usize) R.Result[ptr, *u8] {
+# align:    alignment in bytes, a power of two
+# ret:      ptr to reallocated memory (same as p if in-place), or the refusal
+pub fun reallocate_raw(a: *Allocator, p: ptr, old_size: usize, new_size: usize, align: usize) res[ptr, Error] {
+    if (a == nil)            { ret res[ptr, Error].err{Error.invalid{}}; }
+    if (!align_valid(align)) { ret res[ptr, Error].err{Error.invalid{}}; }
+
     if (new_size == 0) {
-        val res_deallocate: i64 = deallocate_raw(a, p, old_size, align);
-        if (res_deallocate == 0) {
-            ret R.ok[ptr, *u8](nil);
-        }
-
-        ret R.err[ptr, *u8]("failed to deallocate on reallocate to zero");
+        val released: err[Error] = deallocate_raw(a, p, old_size, align);
+        if (sel released.err) { ret res[ptr, Error].err{released.err}; }
+        ret res[ptr, Error].ok{nil};
     }
 
-    val opt_fn_reallocate: O.Option[ptr] = a.fn_reallocate(a.ctx, p, old_size, new_size, align);
-    if (O.is_none[ptr](opt_fn_reallocate)) {
-        ret R.err[ptr, *u8]("out of memory");
-    }
-
-    ret R.ok[ptr, *u8](O.unwrap[ptr](opt_fn_reallocate));
+    val got: opt[ptr] = a.fn_reallocate(a.ctx, p, old_size, new_size, align);
+    if (!sel got.some) { ret res[ptr, Error].err{Error.exhausted{}}; }
+    ret res[ptr, Error].ok{got.some};
 }
 
 # deallocate an allocation previously returned by allocate_raw or reallocate_raw
+#
+# a nil pointer is a no-op that succeeds. the backend's negative status is
+# carried as `release`, so a refused release keeps its native cause.
 # ---
 # a:     Allocator to use for this operation
 # p:     pointer previously returned by allocate_raw or reallocate_raw
 # size:  size in bytes that was allocated
 # align: alignment in bytes
-# ret:   0 on success, or negative errno
-pub fun deallocate_raw(a: *Allocator, p: ptr, size: usize, align: usize) i64 {
-    ret a.fn_deallocate(a.ctx, p, size, align);
+# ret:   ok, `invalid` for a nil allocator, or the backend's status as `release`
+pub fun deallocate_raw(a: *Allocator, p: ptr, size: usize, align: usize) err[Error] {
+    if (a == nil) { ret err[Error].err{Error.invalid{}}; }
+    if (p == nil) { ret err[Error].ok{}; }
+
+    val code: i64 = a.fn_deallocate(a.ctx, p, size, align);
+    if (code != 0) { ret err[Error].err{Error.release{code}}; }
+    ret err[Error].ok{};
+}
+
+# an alignment is a power of two
+fun align_valid(align: usize) bool {
+    ret align != 0 && (align & (align - 1)) == 0;
 }
 
 # allocate count elements of type T
 # ---
 # a:     Allocator to use for this allocation
 # count: number of elements to allocate
-# ret:   pointer to allocated memory or error on OOM or overflow (nil for count == 0)
-pub fun allocate[T](a: *Allocator, count: usize) R.Result[*T, *u8] {
-    if (count == 0) {
-        ret R.ok[*T, *u8](nil::*T);
-    }
+# ret:   pointer to allocated memory (nil for count == 0), or the refusal
+pub fun allocate[T](a: *Allocator, count: usize) res[*T, Error] {
+    if (a == nil)    { ret res[*T, Error].err{Error.invalid{}}; }
+    if (count == 0)  { ret res[*T, Error].ok{nil::*T}; }
 
     # check for size overflow (relies on unsigned wraparound behavior)
     val size:  usize = $size_of(T);
     val total: usize = size * count;
     if (size != 0 && total / size != count) {
-        ret R.err[*T, *u8]("allocation size overflow");
+        ret res[*T, Error].err{Error.overflow{}};
     }
 
-    val res_allocate_raw: R.Result[ptr, *u8] = allocate_raw(a, total, $align_of(T));
-    if (R.is_err[ptr, *u8](res_allocate_raw)) {
-        ret R.err[*T, *u8](R.unwrap_err[ptr, *u8](res_allocate_raw));
-    }
-
-    ret R.ok[*T, *u8](R.unwrap_ok[ptr, *u8](res_allocate_raw)::*T);
+    val raw: res[ptr, Error] = allocate_raw(a, total, $align_of(T));
+    if (sel raw.err) { ret res[*T, Error].err{raw.err}; }
+    ret res[*T, Error].ok{raw.ok::*T};
 }
 
 # allocate and zero-initialize count elements of T
 # ---
 # a:     Allocator to use for this allocation
 # count: number of elements to allocate
-# ret:   pointer to allocated and zero-initialized memory or error on OOM or overflow (nil for count == 0)
-pub fun zallocate[T](a: *Allocator, count: usize) R.Result[*T, *u8] {
-    # attempt initial allocation using allocate
-    val res_allocate: R.Result[*T, *u8] = allocate[T](a, count);
-    if (R.is_err[*T, *u8](res_allocate)) {
-        ret res_allocate;
-    }
+# ret:   pointer to allocated and zero-initialized memory (nil for count == 0), or the refusal
+pub fun zallocate[T](a: *Allocator, count: usize) res[*T, Error] {
+    val got: res[*T, Error] = allocate[T](a, count);
+    if (sel got.err) { ret got; }
 
-    val p: *T = R.unwrap_ok[*T, *u8](res_allocate);
-
-    memory.zero[T](p, count);
-
-    ret R.ok[*T, *u8](p);
+    memory.zero[T](got.ok, count);
+    ret got;
 }
 
 # reallocate an allocation of T elements
@@ -131,39 +142,34 @@ pub fun zallocate[T](a: *Allocator, count: usize) R.Result[*T, *u8] {
 # p:         existing pointer
 # old_count: previous number of elements
 # new_count: desired number of elements (0 frees)
-# ret:       pointer to reallocated memory (same as p if in-place) or error on OOM or overflow (nil for new_count == 0)
-pub fun reallocate[T](a: *Allocator, p: *T, old_count: usize, new_count: usize) R.Result[*T, *u8] {
+# ret:       pointer to reallocated memory (same as p if in-place, nil for new_count == 0), or the refusal
+pub fun reallocate[T](a: *Allocator, p: *T, old_count: usize, new_count: usize) res[*T, Error] {
+    if (a == nil) { ret res[*T, Error].err{Error.invalid{}}; }
+
     # check for size overflow (relies on unsigned wraparound behavior)
     val elem_size: usize = $size_of(T);
     val old_size:  usize = elem_size * old_count;
     val new_size:  usize = elem_size * new_count;
     if (elem_size != 0 && new_size / elem_size != new_count) {
-        ret R.err[*T, *u8]("allocation size overflow");
+        ret res[*T, Error].err{Error.overflow{}};
     }
 
-    val res_reallocate_raw: R.Result[ptr, *u8] = reallocate_raw(a, p::ptr, old_size, new_size, $align_of(T));
-    if (R.is_err[ptr, *u8](res_reallocate_raw)) {
-        ret R.err[*T, *u8](R.unwrap_err[ptr, *u8](res_reallocate_raw));
-    }
-
-    ret R.ok[*T, *u8](R.unwrap_ok[ptr, *u8](res_reallocate_raw)::*T);
+    val raw: res[ptr, Error] = reallocate_raw(a, p::ptr, old_size, new_size, $align_of(T));
+    if (sel raw.err) { ret res[*T, Error].err{raw.err}; }
+    ret res[*T, Error].ok{raw.ok::*T};
 }
 
-# deallocate memory previously returned by alloc/zalloc for count
+# deallocate memory previously returned by allocate/zallocate for count
 # elements.
 # ---
 # a:     Allocator to use for this operation
-# p:     pointer returned by alloc/zalloc (may be nil)
+# p:     pointer returned by allocate/zallocate (may be nil)
 # count: number of elements to deallocate
-# ret:   ok(true) on success (including the nil-pointer / count == 0 no-op), or
-#        err on a non-zero deallocator status, mirroring allocate/reallocate.
-pub fun deallocate[T](a: *Allocator, p: *T, count: usize) R.Result[bool, *u8] {
-    if (p == nil || count == 0) {
-        ret R.ok[bool, *u8](true);
-    }
+# ret:   ok on success (including the nil-pointer / count == 0 no-op), or the
+#        deallocator's negative status as `release`
+pub fun deallocate[T](a: *Allocator, p: *T, count: usize) err[Error] {
+    if (a == nil)               { ret err[Error].err{Error.invalid{}}; }
+    if (p == nil || count == 0) { ret err[Error].ok{}; }
 
-    if (deallocate_raw(a, p::ptr, $size_of(T) * count, $align_of(T)) != 0) {
-        ret R.err[bool, *u8]("deallocate failed");
-    }
-    ret R.ok[bool, *u8](true);
+    ret deallocate_raw(a, p::ptr, $size_of(T) * count, $align_of(T));
 }
