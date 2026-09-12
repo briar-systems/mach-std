@@ -16,7 +16,7 @@ census = runpy.run_path(str(Path(__file__).with_name('census.py')))['census']
 STAGES = [
     ('bridge', '878a8f66a90127360dc23de4480241934fc1bf0d', '3ee8e709a8ed7baff6e93780ce9b3582a907a91f', 'single'),
     ('audited', 'b65afb9704218e89998af5f71050ca315e7709a9', '168a9f760d7c0f7a182f3b0685081e62f1a4f682', 'fixpoint'),
-    ('v5', 'b4ab85122e30bb24d733a024d549a9a05ef1a2c2', '168a9f760d7c0f7a182f3b0685081e62f1a4f682', 'fixpoint'),
+    ('v5', '9a15ac3a6d71ea9b41cf381bc0455eef240e8a2e', '168a9f760d7c0f7a182f3b0685081e62f1a4f682', 'fixpoint'),
 ]
 
 
