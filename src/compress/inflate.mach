@@ -13,6 +13,11 @@
 #
 # std.compress.zlib and std.compress.gzip wrap this with their framing and
 # checksums; use those for zlib or gzip streams, and this module for raw deflate.
+#
+# every outcome is an InflateError shared by the three modules: a malformed
+# stream names its defect, and a failure after progress carries the input and
+# output counts committed by the call that failed, so a caller knows how much
+# of dst holds decoded bytes and how far src was read.
 
 use std.types.canonical.res;
 use std.types.canonical.err;
@@ -24,9 +29,9 @@ use std.types.string.str;
 use std.types.string.str_equals;
 
 use A: std.allocator;
-use R: std.types.result;
 use V: std.collections.vector;
 use std.allocator.page;
+use std.allocator.testing;
 
 # size of the sliding window in bytes, the largest back-reference distance
 pub val WINDOW: usize = 32768;
@@ -52,6 +57,135 @@ pub rec Progress {
     status:   Status;
     consumed: usize;
     written:  usize;
+}
+
+# what a stream violated
+#
+# the deflate cases are raised here; the framing cases are raised by the zlib
+# and gzip wrappers, which share this tag so one InflateError describes a
+# whole stream. `method`, `checksum` and the rest read against the wrapper
+# that was called.
+# ---
+# block_type:               reserved block type 3
+# stored_length:            a stored block's LEN and NLEN disagree
+# code_count:               too many literal/length or distance codes
+# length_code_set:          the code length code is over-subscribed or incomplete
+# length_code:              a code length code that matches nothing
+# repeat_no_previous:       a repeat code with no length to repeat
+# repeat_overrun:           a repeat code past the end of the table
+# oversubscribed_literals:  the literal/length code is over-subscribed
+# incomplete_literals:      the literal/length code is incomplete
+# oversubscribed_distances: the distance code is over-subscribed
+# incomplete_distances:     the distance code is incomplete
+# literal_code:             a literal/length code that matches nothing
+# distance_code:            a distance code that matches nothing
+# distance_range:           a distance reaching before the stream started
+# method:                   the wrapper's compression method is not deflate
+# window:                   the zlib window size exceeds 32 KiB
+# header_check:             the zlib header check failed
+# dictionary:               a zlib preset dictionary, which is not supported
+# magic:                    not a gzip stream
+# flags:                    gzip reserved header flags are set
+# header_checksum:          the gzip FHCRC does not match the header
+# checksum:                 the trailer checksum (adler32 or crc32) does not
+#                           match the output
+# length:                   the gzip ISIZE does not match the output length
+pub tag Defect: u8 {
+    block_type;
+    stored_length;
+    code_count;
+    length_code_set;
+    length_code;
+    repeat_no_previous;
+    repeat_overrun;
+    oversubscribed_literals;
+    incomplete_literals;
+    oversubscribed_distances;
+    incomplete_distances;
+    literal_code;
+    distance_code;
+    distance_range;
+    method;
+    window;
+    header_check;
+    dictionary;
+    magic;
+    flags;
+    header_checksum;
+    checksum;
+    length;
+}
+
+# the input and output the failing call committed before it stopped
+# ---
+# consumed: bytes taken from src this call
+# written:  bytes written to dst this call, all of them decoded output
+pub rec Committed {
+    consumed: usize;
+    written:  usize;
+}
+
+# a malformed stream and the counts committed before it was detected
+pub rec Fault {
+    defect:   Defect;
+    consumed: usize;
+    written:  usize;
+}
+
+# every way decompression can fail
+# ---
+# alloc:     the window or the output vector was refused; nothing survives
+# malformed: the stream violates its format; the payload names the defect and
+#            carries the committed counts
+# truncated: the input ended before the stream did; the payload carries the
+#            committed counts
+# full:      dst cannot hold the whole stream (decompress_into); the payload
+#            carries the committed counts
+# closed:    the decoder's window was released, or was never acquired
+# finished:  the input was already declared finished (gzip)
+# invalid:   the decoder's state is not one of its own
+pub tag InflateError: u8 {
+    alloc:     A.Error;
+    malformed: Fault;
+    truncated: Committed;
+    full:      Committed;
+    closed;
+    finished;
+    invalid;
+}
+
+# add the counts committed by earlier steps of the same call to the failure
+pub fun advance(e: InflateError, consumed: usize, written: usize) InflateError {
+    if (sel e.malformed) {
+        ret InflateError.malformed{Fault{defect: e.malformed.defect, consumed: e.malformed.consumed + consumed, written: e.malformed.written + written}};
+    }
+    if (sel e.truncated) {
+        ret InflateError.truncated{Committed{consumed: e.truncated.consumed + consumed, written: e.truncated.written + written}};
+    }
+    if (sel e.full) {
+        ret InflateError.full{Committed{consumed: e.full.consumed + consumed, written: e.full.written + written}};
+    }
+    ret e;
+}
+
+# the failure as a later call re-reports it: the same cause, nothing committed
+pub fun settled(e: InflateError) InflateError {
+    if (sel e.malformed) {
+        ret InflateError.malformed{Fault{defect: e.malformed.defect, consumed: 0, written: 0}};
+    }
+    if (sel e.truncated) { ret InflateError.truncated{Committed{consumed: 0, written: 0}}; }
+    if (sel e.full) { ret InflateError.full{Committed{consumed: 0, written: 0}}; }
+    ret e;
+}
+
+# a malformed stream with the counts committed so far
+pub fun malformed(defect: Defect, consumed: usize, written: usize) InflateError {
+    ret InflateError.malformed{Fault{defect: defect, consumed: consumed, written: written}};
+}
+
+# an input that ended early, with the counts committed so far
+pub fun truncated(consumed: usize, written: usize) InflateError {
+    ret InflateError.truncated{Committed{consumed: consumed, written: written}};
 }
 
 # canonical huffman decoding table
@@ -299,12 +433,16 @@ fun emit(z: *Inflater, cur: *Cursor, b: u8) {
     if (z.wfill < WINDOW) { z.wfill = z.wfill + 1; }
 }
 
-fun progress(st: Status, cur: *Cursor) R.Result[Progress, str] {
+fun progress(st: Status, cur: *Cursor) res[Progress, InflateError] {
     var p: Progress;
     p.status   = st;
     p.consumed = cur.in_pos;
     p.written  = cur.out_pos;
-    ret R.ok[Progress, str](p);
+    ret res[Progress, InflateError].ok{p};
+}
+
+fun fault(defect: Defect, cur: *Cursor) res[Progress, InflateError] {
+    ret res[Progress, InflateError].err{malformed(defect, cur.in_pos, cur.out_pos)};
 }
 
 # reset the decoder to the start of a new stream, keeping the window allocation
@@ -334,33 +472,33 @@ pub fun reset(z: *Inflater) {
 # create a decoder, allocating its 32 KiB window from a
 # ---
 # a:   allocator used for the window and nothing else
-# ret: a ready decoder, or an error if the window could not be allocated
-pub fun init(a: *A.Allocator) R.Result[Inflater, str] {
-    if (a == nil) { ret R.err[Inflater, str]("allocator is nil"); }
-
+# ret: a ready decoder, or the allocator's refusal of the window
+pub fun init(a: *A.Allocator) res[Inflater, InflateError] {
     val win: res[*u8, A.Error] = A.allocate[u8](a, WINDOW);
-    if (sel win.err) { ret R.err[Inflater, str]("out of memory"); }
+    if (sel win.err) { ret res[Inflater, InflateError].err{InflateError.alloc{win.err}}; }
 
     var z: Inflater;
     z.a   = a;
     z.win = win.ok;
     reset(?z);
 
-    ret R.ok[Inflater, str](z);
+    ret res[Inflater, InflateError].ok{z};
 }
 
 # release the window
+#
+# a decoder that holds no window is already released. a refused release
+# leaves the decoder owning its window.
 # ---
 # z:   decoder to deinitialize
-# ret: true if the window was released
-pub fun dnit(z: *Inflater) bool {
-    if (z == nil) { ret true; }
-    if (z.win == nil) { ret true; }
+# ret: ok, or the allocator's refusal
+pub fun dnit(z: *Inflater) err[A.Error] {
+    if (z.win == nil) { ret err[A.Error].ok{}; }
 
     val freed: err[A.Error] = A.deallocate[u8](z.a, z.win, WINDOW);
+    if (sel freed.err) { ret freed; }
     z.win = nil;
-
-    ret sel freed.ok;
+    ret err[A.Error].ok{};
 }
 
 # check whether the stream reached its final block
@@ -378,11 +516,11 @@ pub fun is_done(z: *Inflater) bool {
 # for bytes means the stream was cut short.
 # ---
 # z:   decoder to check
-# ret: true if the stream completed, or an error describing why it did not
-pub fun finish(z: *Inflater) R.Result[bool, str] {
-    if (z == nil) { ret R.err[bool, str]("inflater is nil"); }
-    if (z.state != S_END) { ret R.err[bool, str]("truncated deflate stream"); }
-    ret R.ok[bool, str](true);
+# ret: ok if the stream completed, or truncated
+pub fun finish(z: *Inflater) err[InflateError] {
+    if (z.win == nil) { ret err[InflateError].err{InflateError.closed{}}; }
+    if (z.state != S_END) { ret err[InflateError].err{truncated(0, 0)}; }
+    ret err[InflateError].ok{};
 }
 
 # discard bits up to the next byte boundary
@@ -434,10 +572,10 @@ pub fun pop_buffered(z: *Inflater) u8 {
 # src_len: length of that chunk
 # dst:     where decompressed bytes go
 # dst_len: space available at dst
-# ret:     what the call accomplished, or an error describing the malformed stream
-pub fun decompress(z: *Inflater, src: *u8, src_len: usize, dst: *u8, dst_len: usize) R.Result[Progress, str] {
-    if (z == nil)     { ret R.err[Progress, str]("inflater is nil"); }
-    if (z.win == nil) { ret R.err[Progress, str]("inflater is not initialized"); }
+# ret:     what the call accomplished, or the failure with the counts this
+#          call committed before it
+pub fun decompress(z: *Inflater, src: *u8, src_len: usize, dst: *u8, dst_len: usize) res[Progress, InflateError] {
+    if (z.win == nil) { ret res[Progress, InflateError].err{InflateError.closed{}}; }
 
     var cur: Cursor;
     cur.src     = src;
@@ -473,7 +611,7 @@ pub fun decompress(z: *Inflater, src: *u8, src_len: usize, dst: *u8, dst_len: us
                 z.have  = 0;
             }
             or {
-                ret R.err[Progress, str]("invalid deflate block type");
+                ret fault(Defect.block_type{}, ?cur);
             }
         }
         or (z.state == S_STORED_HEAD) {
@@ -482,7 +620,7 @@ pub fun decompress(z: *Inflater, src: *u8, src_len: usize, dst: *u8, dst_len: us
             val len_v:  i64 = take_bits(z, 16);
             val nlen_v: i64 = take_bits(z, 16);
             if ((len_v ^ 0xFFFF) != nlen_v) {
-                ret R.err[Progress, str]("stored block length check failed");
+                ret fault(Defect.stored_length{}, ?cur);
             }
 
             z.stored_left = len_v::usize;
@@ -512,7 +650,7 @@ pub fun decompress(z: *Inflater, src: *u8, src_len: usize, dst: *u8, dst_len: us
                 z.ncode = take_bits(z, 4)::usize + 4;
 
                 if (z.nlen > 286 || z.ndist > 30) {
-                    ret R.err[Progress, str]("too many length or distance codes");
+                    ret fault(Defect.code_count{}, ?cur);
                 }
 
                 z.have = 0;
@@ -535,7 +673,7 @@ pub fun decompress(z: *Inflater, src: *u8, src_len: usize, dst: *u8, dst_len: us
                 }
 
                 if (build(?z.clencode, ?z.lengths[0], 19) != 0) {
-                    ret R.err[Progress, str]("invalid code length code set");
+                    ret fault(Defect.length_code_set{}, ?cur);
                 }
 
                 z.have = 0;
@@ -548,7 +686,7 @@ pub fun decompress(z: *Inflater, src: *u8, src_len: usize, dst: *u8, dst_len: us
                     refill(z, ?cur);
                     val sym: i32 = decode_sym(z, ?z.clencode);
                     if (sym == NEED_BITS) { ret progress(NEED_INPUT, ?cur); }
-                    if (sym == BAD_CODE)  { ret R.err[Progress, str]("invalid code length code"); }
+                    if (sym == BAD_CODE)  { ret fault(Defect.length_code{}, ?cur); }
 
                     if (sym < 16) {
                         z.lengths[z.have] = sym::u8;
@@ -575,13 +713,13 @@ pub fun decompress(z: *Inflater, src: *u8, src_len: usize, dst: *u8, dst_len: us
                 var v: u8 = 0;
                 if (z.pend == 16) {
                     if (z.have == 0) {
-                        ret R.err[Progress, str]("code length repeat with no previous length");
+                        ret fault(Defect.repeat_no_previous{}, ?cur);
                     }
                     v = z.lengths[z.have - 1];
                 }
 
                 if (z.have + count > total) {
-                    ret R.err[Progress, str]("code length repeat overruns the table");
+                    ret fault(Defect.repeat_overrun{}, ?cur);
                 }
 
                 var k: usize = 0;
@@ -596,22 +734,22 @@ pub fun decompress(z: *Inflater, src: *u8, src_len: usize, dst: *u8, dst_len: us
 
             val lerr: i32 = build(?z.lencode, ?z.lengths[0], z.nlen);
             if (lerr < 0) {
-                ret R.err[Progress, str]("over-subscribed literal/length code");
+                ret fault(Defect.oversubscribed_literals{}, ?cur);
             }
             # an incomplete code is only meaningful when its only symbol has a
             # one-bit code; longer single-symbol codes leave invalid prefixes
             if (lerr > 0 && (z.nlen != z.lencode.counts[0]::usize + 1
                           || z.lencode.counts[1] != 1)) {
-                ret R.err[Progress, str]("incomplete literal/length code");
+                ret fault(Defect.incomplete_literals{}, ?cur);
             }
 
             val derr: i32 = build(?z.distcode, ?z.lengths[z.nlen], z.ndist);
             if (derr < 0) {
-                ret R.err[Progress, str]("over-subscribed distance code");
+                ret fault(Defect.oversubscribed_distances{}, ?cur);
             }
             if (derr > 0 && (z.ndist != z.distcode.counts[0]::usize + 1
                           || z.distcode.counts[1] != 1)) {
-                ret R.err[Progress, str]("incomplete distance code");
+                ret fault(Defect.incomplete_distances{}, ?cur);
             }
 
             z.state = S_BODY;
@@ -632,7 +770,7 @@ pub fun decompress(z: *Inflater, src: *u8, src_len: usize, dst: *u8, dst_len: us
                 if (z.sub == B_SYM) {
                     val sym: i32 = decode_sym(z, ?z.lencode);
                     if (sym == NEED_BITS) { ret progress(NEED_INPUT, ?cur); }
-                    if (sym == BAD_CODE)  { ret R.err[Progress, str]("invalid literal/length code"); }
+                    if (sym == BAD_CODE)  { ret fault(Defect.literal_code{}, ?cur); }
 
                     if (sym < 256) {
                         if (cur.out_pos == cur.dst_len) {
@@ -652,7 +790,7 @@ pub fun decompress(z: *Inflater, src: *u8, src_len: usize, dst: *u8, dst_len: us
                     }
 
                     if (sym > 285) {
-                        ret R.err[Progress, str]("invalid literal/length code");
+                        ret fault(Defect.literal_code{}, ?cur);
                     }
 
                     z.pend = sym::u16;
@@ -671,8 +809,8 @@ pub fun decompress(z: *Inflater, src: *u8, src_len: usize, dst: *u8, dst_len: us
                 if (z.sub == B_DIST) {
                     val sym: i32 = decode_sym(z, ?z.distcode);
                     if (sym == NEED_BITS) { ret progress(NEED_INPUT, ?cur); }
-                    if (sym == BAD_CODE)  { ret R.err[Progress, str]("invalid distance code"); }
-                    if (sym > 29)         { ret R.err[Progress, str]("invalid distance code"); }
+                    if (sym == BAD_CODE)  { ret fault(Defect.distance_code{}, ?cur); }
+                    if (sym > 29)         { ret fault(Defect.distance_code{}, ?cur); }
 
                     z.pend = sym::u16;
                     z.sub  = B_DIST_EXTRA;
@@ -688,7 +826,7 @@ pub fun decompress(z: *Inflater, src: *u8, src_len: usize, dst: *u8, dst_len: us
                     # wfill saturates at WINDOW, so this also rejects a distance
                     # reaching past the start of the stream
                     if (z.mdist > z.wfill) {
-                        ret R.err[Progress, str]("distance reaches past the start of the window");
+                        ret fault(Defect.distance_range{}, ?cur);
                     }
 
                     z.state = S_MATCH;
@@ -709,35 +847,35 @@ pub fun decompress(z: *Inflater, src: *u8, src_len: usize, dst: *u8, dst_len: us
             z.state = S_BODY;
         }
         or {
-            ret R.err[Progress, str]("inflater in an unknown state");
+            ret res[Progress, InflateError].err{InflateError.invalid{}};
         }
     }
 
     ret progress(DONE, ?cur);
 }
 
-fun drive(z: *Inflater, src: *u8, src_len: usize, dst: *u8, dst_len: usize) R.Result[usize, str] {
+fun drive(z: *Inflater, src: *u8, src_len: usize, dst: *u8, dst_len: usize) res[usize, InflateError] {
     var in_off:  usize = 0;
     var out_off: usize = 0;
 
     for (!is_done(z)) {
-        val r: R.Result[Progress, str] = decompress(z, ?src[in_off], src_len - in_off,
-                                                       ?dst[out_off], dst_len - out_off);
-        if (R.is_err[Progress, str](r)) {
-            ret R.err[usize, str](R.unwrap_err[Progress, str](r));
-        }
+        val r: res[Progress, InflateError] = decompress(z, ?src[in_off], src_len - in_off,
+                                                          ?dst[out_off], dst_len - out_off);
+        if (sel r.err) { ret res[usize, InflateError].err{advance(r.err, in_off, out_off)}; }
 
-        val p: Progress = R.unwrap_ok[Progress, str](r);
+        val p: Progress = r.ok;
         in_off  = in_off + p.consumed;
         out_off = out_off + p.written;
 
-        if (p.status == OUTPUT_FULL) { ret R.err[usize, str]("output buffer too small"); }
+        if (p.status == OUTPUT_FULL) {
+            ret res[usize, InflateError].err{InflateError.full{Committed{consumed: in_off, written: out_off}}};
+        }
         if (p.status == NEED_INPUT && in_off >= src_len) {
-            ret R.err[usize, str]("truncated deflate stream");
+            ret res[usize, InflateError].err{truncated(in_off, out_off)};
         }
     }
 
-    ret R.ok[usize, str](out_off);
+    ret res[usize, InflateError].ok{out_off};
 }
 
 # decompress a whole stream into a caller-provided buffer
@@ -747,21 +885,20 @@ fun drive(z: *Inflater, src: *u8, src_len: usize, dst: *u8, dst_len: usize) R.Re
 # src_len: length of that stream
 # dst:     where decompressed bytes go
 # dst_len: space available at dst
-# ret:     bytes written, or an error if the stream is malformed or does not fit
-pub fun decompress_into(a: *A.Allocator, src: *u8, src_len: usize, dst: *u8, dst_len: usize) R.Result[usize, str] {
-    val ri: R.Result[Inflater, str] = init(a);
-    if (R.is_err[Inflater, str](ri)) {
-        ret R.err[usize, str](R.unwrap_err[Inflater, str](ri));
-    }
+# ret:     bytes written, or the failure; malformed, truncated and full carry
+#          the counts committed over the whole call
+pub fun decompress_into(a: *A.Allocator, src: *u8, src_len: usize, dst: *u8, dst_len: usize) res[usize, InflateError] {
+    val ri: res[Inflater, InflateError] = init(a);
+    if (sel ri.err) { ret res[usize, InflateError].err{ri.err}; }
 
-    var z: Inflater = R.unwrap_ok[Inflater, str](ri);
-    val out: R.Result[usize, str] = drive(?z, src, src_len, dst, dst_len);
+    var z: Inflater = ri.ok;
+    val out: res[usize, InflateError] = drive(?z, src, src_len, dst, dst_len);
     dnit(?z);
 
     ret out;
 }
 
-fun grow(z: *Inflater, out: *V.Vector[u8], src: *u8, src_len: usize) R.Result[usize, str] {
+fun grow(z: *Inflater, out: *V.Vector[u8], src: *u8, src_len: usize) res[usize, InflateError] {
     var in_off: usize = 0;
 
     for (!is_done(z)) {
@@ -770,25 +907,23 @@ fun grow(z: *Inflater, out: *V.Vector[u8], src: *u8, src_len: usize) R.Result[us
             if (next < 4096) { next = 4096; }
 
             val e: res[usize, A.Error] = V.ensure[u8](out, next);
-            if (sel e.err) { ret R.err[usize, str]("out of memory"); }
+            if (sel e.err) { ret res[usize, InflateError].err{InflateError.alloc{e.err}}; }
         }
 
-        val r: R.Result[Progress, str] = decompress(z, ?src[in_off], src_len - in_off,
-                                                       ?out.data[out.len], out.cap - out.len);
-        if (R.is_err[Progress, str](r)) {
-            ret R.err[usize, str](R.unwrap_err[Progress, str](r));
-        }
+        val r: res[Progress, InflateError] = decompress(z, ?src[in_off], src_len - in_off,
+                                                          ?out.data[out.len], out.cap - out.len);
+        if (sel r.err) { ret res[usize, InflateError].err{advance(r.err, in_off, out.len)}; }
 
-        val p: Progress = R.unwrap_ok[Progress, str](r);
+        val p: Progress = r.ok;
         in_off  = in_off + p.consumed;
         out.len = out.len + p.written;
 
         if (p.status == NEED_INPUT && in_off >= src_len) {
-            ret R.err[usize, str]("truncated deflate stream");
+            ret res[usize, InflateError].err{truncated(in_off, out.len)};
         }
     }
 
-    ret R.ok[usize, str](out.len);
+    ret res[usize, InflateError].ok{out.len};
 }
 
 # decompress a whole stream into a vector that grows as needed
@@ -797,25 +932,24 @@ fun grow(z: *Inflater, out: *V.Vector[u8], src: *u8, src_len: usize) R.Result[us
 # src:     the complete compressed stream
 # src_len: length of that stream
 # ret:     a vector owning the decompressed bytes, which the caller must dnit,
-#          or an error if the stream is malformed
-pub fun decompress_alloc(a: *A.Allocator, src: *u8, src_len: usize) R.Result[V.Vector[u8], str] {
-    val ri: R.Result[Inflater, str] = init(a);
-    if (R.is_err[Inflater, str](ri)) {
-        ret R.err[V.Vector[u8], str](R.unwrap_err[Inflater, str](ri));
-    }
+#          or the failure; on failure the vector is already released, so the
+#          committed counts describe output that no longer exists
+pub fun decompress_alloc(a: *A.Allocator, src: *u8, src_len: usize) res[V.Vector[u8], InflateError] {
+    val ri: res[Inflater, InflateError] = init(a);
+    if (sel ri.err) { ret res[V.Vector[u8], InflateError].err{ri.err}; }
 
-    var z: Inflater = R.unwrap_ok[Inflater, str](ri);
+    var z: Inflater = ri.ok;
     var out: V.Vector[u8] = V.init[u8](a);
 
-    val res: R.Result[usize, str] = grow(?z, ?out, src, src_len);
+    val grown: res[usize, InflateError] = grow(?z, ?out, src, src_len);
     dnit(?z);
 
-    if (R.is_err[usize, str](res)) {
+    if (sel grown.err) {
         V.dnit[u8](?out);
-        ret R.err[V.Vector[u8], str](R.unwrap_err[usize, str](res));
+        ret res[V.Vector[u8], InflateError].err{grown.err};
     }
 
-    ret R.ok[V.Vector[u8], str](out);
+    ret res[V.Vector[u8], InflateError].ok{out};
 }
 
 val C_FIXED: [10]u8 = [10]u8{
@@ -1017,10 +1151,10 @@ fun check(comp: *u8, comp_len: usize, orig: *u8, orig_len: usize) i32 {
     var a: A.Allocator;
     page.make(?a);
 
-    val r: R.Result[usize, str] = decompress_into(?a, comp, comp_len, ?obuf[0], 4096);
-    if (R.is_err[usize, str](r)) { ret 1; }
+    val r: res[usize, InflateError] = decompress_into(?a, comp, comp_len, ?obuf[0], 4096);
+    if (sel r.err) { ret 1; }
 
-    val n: usize = R.unwrap_ok[usize, str](r);
+    val n: usize = r.ok;
     if (n != orig_len) { ret 2; }
 
     var i: usize = 0;
@@ -1047,9 +1181,9 @@ test "inflate: one byte in one byte out streaming" {
     var a: A.Allocator;
     page.make(?a);
 
-    val ri: R.Result[Inflater, str] = init(?a);
-    if (R.is_err[Inflater, str](ri)) { ret 1; }
-    var z: Inflater = R.unwrap_ok[Inflater, str](ri);
+    val ri: res[Inflater, InflateError] = init(?a);
+    if (sel ri.err) { ret 1; }
+    var z: Inflater = ri.ok;
 
     var in_off:  usize = 0;
     var out_off: usize = 0;
@@ -1061,19 +1195,19 @@ test "inflate: one byte in one byte out streaming" {
         var feed: usize = 1;
         if (in_off + feed > 402) { feed = 402 - in_off; }
 
-        val r: R.Result[Progress, str] = decompress(?z, ?C_DYNAMIC[in_off], feed, ?obuf[out_off], 1);
-        if (R.is_err[Progress, str](r)) { dnit(?z); ret 2; }
+        val r: res[Progress, InflateError] = decompress(?z, ?C_DYNAMIC[in_off], feed, ?obuf[out_off], 1);
+        if (sel r.err) { dnit(?z); ret 2; }
 
-        val p: Progress = R.unwrap_ok[Progress, str](r);
+        val p: Progress = r.ok;
         in_off  = in_off + p.consumed;
         out_off = out_off + p.written;
 
         if (p.status == NEED_INPUT && in_off >= 402) { dnit(?z); ret 3; }
     }
 
-    val f: R.Result[bool, str] = finish(?z);
+    val f: err[InflateError] = finish(?z);
     dnit(?z);
-    if (R.is_err[bool, str](f)) { ret 4; }
+    if (sel f.err) { ret 4; }
     if (out_off != 2253) { ret 5; }
 
     var i: usize = 0;
@@ -1087,16 +1221,16 @@ test "inflate: one byte in one byte out streaming" {
 test "inflate: truncated stream is rejected" {
     var a: A.Allocator;
     page.make(?a);
-    val r: R.Result[usize, str] = decompress_into(?a, ?C_DYNAMIC[0], 200, ?obuf[0], 4096);
-    if (!R.is_err[usize, str](r)) { ret 1; }
+    val r: res[usize, InflateError] = decompress_into(?a, ?C_DYNAMIC[0], 200, ?obuf[0], 4096);
+    if (!sel r.err) { ret 1; }
     ret 0;
 }
 
 test "inflate: output buffer too small is rejected" {
     var a: A.Allocator;
     page.make(?a);
-    val r: R.Result[usize, str] = decompress_into(?a, ?C_DYNAMIC[0], 402, ?obuf[0], 100);
-    if (!R.is_err[usize, str](r)) { ret 1; }
+    val r: res[usize, InflateError] = decompress_into(?a, ?C_DYNAMIC[0], 402, ?obuf[0], 100);
+    if (!sel r.err) { ret 1; }
     ret 0;
 }
 
@@ -1104,9 +1238,9 @@ test "inflate: exactly-sized output reaches the end of block" {
     var a: A.Allocator;
     page.make(?a);
 
-    val r: R.Result[usize, str] = decompress_into(?a, ?C_FIXED[0], 10, ?obuf[0], 23);
-    if (R.is_err[usize, str](r)) { ret 1; }
-    if (R.unwrap_ok[usize, str](r) != 23) { ret 2; }
+    val r: res[usize, InflateError] = decompress_into(?a, ?C_FIXED[0], 10, ?obuf[0], 23);
+    if (sel r.err) { ret 1; }
+    if (r.ok != 23) { ret 2; }
     ret 0;
 }
 
@@ -1114,14 +1248,14 @@ test "inflate: streaming with an exact output budget reaches done" {
     var a: A.Allocator;
     page.make(?a);
 
-    val ri: R.Result[Inflater, str] = init(?a);
-    if (R.is_err[Inflater, str](ri)) { ret 1; }
-    var z: Inflater = R.unwrap_ok[Inflater, str](ri);
+    val ri: res[Inflater, InflateError] = init(?a);
+    if (sel ri.err) { ret 1; }
+    var z: Inflater = ri.ok;
 
-    val r: R.Result[Progress, str] = decompress(?z, ?C_FIXED[0], 10, ?obuf[0], 23);
-    if (R.is_err[Progress, str](r)) { dnit(?z); ret 2; }
+    val r: res[Progress, InflateError] = decompress(?z, ?C_FIXED[0], 10, ?obuf[0], 23);
+    if (sel r.err) { dnit(?z); ret 2; }
 
-    val p: Progress = R.unwrap_ok[Progress, str](r);
+    val p: Progress = r.ok;
     val done: bool = is_done(?z);
     dnit(?z);
 
@@ -1523,10 +1657,10 @@ fun gen_check(comp: *u8, comp_len: usize, orig_len: usize, gen: fun(usize) u8) i
     var a: A.Allocator;
     page.make(?a);
 
-    val r: R.Result[usize, str] = decompress_into(?a, comp, comp_len, ?obuf[0], 4096);
-    if (R.is_err[usize, str](r)) { ret 1; }
+    val r: res[usize, InflateError] = decompress_into(?a, comp, comp_len, ?obuf[0], 4096);
+    if (sel r.err) { ret 1; }
 
-    val n: usize = R.unwrap_ok[usize, str](r);
+    val n: usize = r.ok;
     if (n != orig_len) { ret 2; }
 
     var i: usize = 0;
@@ -1542,10 +1676,10 @@ fun gen_check_alloc(comp: *u8, comp_len: usize, orig_len: usize, gen: fun(usize)
     var a: A.Allocator;
     page.make(?a);
 
-    val r: R.Result[V.Vector[u8], str] = decompress_alloc(?a, comp, comp_len);
-    if (R.is_err[V.Vector[u8], str](r)) { ret 1; }
+    val r: res[V.Vector[u8], InflateError] = decompress_alloc(?a, comp, comp_len);
+    if (sel r.err) { ret 1; }
 
-    var v: V.Vector[u8] = R.unwrap_ok[V.Vector[u8], str](r);
+    var v: V.Vector[u8] = r.ok;
     if (v.len != orig_len) { V.dnit[u8](?v); ret 2; }
 
     var i: usize = 0;
@@ -1564,9 +1698,9 @@ fun stream_check(comp: *u8, comp_len: usize, in_chunk: usize, out_chunk: usize, 
     var a: A.Allocator;
     page.make(?a);
 
-    val ri: R.Result[Inflater, str] = init(?a);
-    if (R.is_err[Inflater, str](ri)) { ret 1; }
-    var z: Inflater = R.unwrap_ok[Inflater, str](ri);
+    val ri: res[Inflater, InflateError] = init(?a);
+    if (sel ri.err) { ret 1; }
+    var z: Inflater = ri.ok;
 
     var in_off:  usize = 0;
     var out_off: usize = 0;
@@ -1581,19 +1715,19 @@ fun stream_check(comp: *u8, comp_len: usize, in_chunk: usize, out_chunk: usize, 
         var room: usize = out_chunk;
         if (out_off + room > 4096) { room = 4096 - out_off; }
 
-        val r: R.Result[Progress, str] = decompress(?z, ?comp[in_off], feed, ?obuf[out_off], room);
-        if (R.is_err[Progress, str](r)) { dnit(?z); ret 2; }
+        val r: res[Progress, InflateError] = decompress(?z, ?comp[in_off], feed, ?obuf[out_off], room);
+        if (sel r.err) { dnit(?z); ret 2; }
 
-        val p: Progress = R.unwrap_ok[Progress, str](r);
+        val p: Progress = r.ok;
         in_off  = in_off + p.consumed;
         out_off = out_off + p.written;
 
         if (p.status == NEED_INPUT && in_off >= comp_len) { dnit(?z); ret 3; }
     }
 
-    val f: R.Result[bool, str] = finish(?z);
+    val f: err[InflateError] = finish(?z);
     dnit(?z);
-    if (R.is_err[bool, str](f)) { ret 4; }
+    if (sel f.err) { ret 4; }
     if (in_off != comp_len)  { ret 5; }
     if (out_off != orig_len) { ret 6; }
 
@@ -1660,10 +1794,10 @@ test "inflate: accepts the maximum back-reference distance of 32768" {
 
     var a: A.Allocator;
     page.make(?a);
-    val r: R.Result[V.Vector[u8], str] = decompress_alloc(?a, ?max_distance_comp[0], 32778);
-    if (R.is_err[V.Vector[u8], str](r)) { ret 1; }
+    val r: res[V.Vector[u8], InflateError] = decompress_alloc(?a, ?max_distance_comp[0], 32778);
+    if (sel r.err) { ret 1; }
 
-    var v: V.Vector[u8] = R.unwrap_ok[V.Vector[u8], str](r);
+    var v: V.Vector[u8] = r.ok;
     if (v.len != WINDOW + 3) { V.dnit[u8](?v); ret 2; }
 
     i = 0;
@@ -1741,57 +1875,79 @@ val N_TRUNC_DYNAMIC: [27]u8 = [27]u8{
     0x48, 0xCB, 0xAF, 0x50, 0xC8, 0x2A, 0xCD, 0x2D, 0x28, 0x56, 0xC8
 };
 
-# a malformed stream must be refused, and refused for the stated reason
-fun rejects(comp: *u8, comp_len: usize, want: str) i32 {
+# the discriminator of a defect, for comparing a reported one with the
+# expected one
+fun defect_code(d: Defect) u8 {
+    var x: Defect = d;
+    val p: *u8 = (?x)::*u8;
+    ret p[0];
+}
+
+# a malformed stream must be refused, and refused for the stated defect
+fun rejects(comp: *u8, comp_len: usize, want: Defect) i32 {
     var a: A.Allocator;
     page.make(?a);
 
-    val r: R.Result[usize, str] = decompress_into(?a, comp, comp_len, ?obuf[0], 4096);
-    if (!R.is_err[usize, str](r)) { ret 1; }
-    if (!str_equals(R.unwrap_err[usize, str](r), want)) { ret 2; }
+    val r: res[usize, InflateError] = decompress_into(?a, comp, comp_len, ?obuf[0], 4096);
+    if (!sel r.err) { ret 1; }
+    if (!sel r.err.malformed) { ret 2; }
+    if (defect_code(r.err.malformed.defect) != defect_code(want)) { ret 3; }
+    ret 0;
+}
+
+# a stream that ends early must be refused as truncated, with every input
+# byte reported consumed
+fun rejects_truncated(comp: *u8, comp_len: usize) i32 {
+    var a: A.Allocator;
+    page.make(?a);
+
+    val r: res[usize, InflateError] = decompress_into(?a, comp, comp_len, ?obuf[0], 4096);
+    if (!sel r.err) { ret 1; }
+    if (!sel r.err.truncated) { ret 2; }
+    if (r.err.truncated.consumed != comp_len) { ret 3; }
     ret 0;
 }
 test "inflate: reserved block type 3 is rejected" {
-    ret rejects(?N_BAD_BTYPE[0], 1, "invalid deflate block type");
+    ret rejects(?N_BAD_BTYPE[0], 1, Defect.block_type{});
 }
 test "inflate: stored block with a bad length check is rejected" {
-    ret rejects(?N_BAD_STORED_NLEN[0], 10, "stored block length check failed");
+    ret rejects(?N_BAD_STORED_NLEN[0], 10, Defect.stored_length{});
 }
 test "inflate: stored block cut short is rejected" {
-    ret rejects(?N_TRUNC_STORED[0], 8, "truncated deflate stream");
+    ret rejects_truncated(?N_TRUNC_STORED[0], 8);
 }
 test "inflate: distance reaching before the stream is rejected" {
-    ret rejects(?N_DIST_TOO_FAR[0], 4, "distance reaches past the start of the window");
+    ret rejects(?N_DIST_TOO_FAR[0], 4, Defect.distance_range{});
 }
 test "inflate: unassigned distance symbol 30 is rejected" {
-    ret rejects(?N_BAD_DIST_CODE[0], 5, "invalid distance code");
+    ret rejects(?N_BAD_DIST_CODE[0], 5, Defect.distance_code{});
 }
 test "inflate: over-subscribed code length code is rejected" {
-    ret rejects(?N_OVERSUB_CLEN[0], 10, "invalid code length code set");
+    ret rejects(?N_OVERSUB_CLEN[0], 10, Defect.length_code_set{});
 }
 test "inflate: over-subscribed literal/length code is rejected" {
-    ret rejects(?N_OVERSUB_LITLEN[0], 42, "over-subscribed literal/length code");
+    ret rejects(?N_OVERSUB_LITLEN[0], 42, Defect.oversubscribed_literals{});
 }
 test "inflate: incomplete literal/length code is rejected" {
-    ret rejects(?N_INCOMPLETE_LITLEN[0], 42, "incomplete literal/length code");
+    ret rejects(?N_INCOMPLETE_LITLEN[0], 42, Defect.incomplete_literals{});
 }
 test "inflate: a single literal symbol longer than one bit is rejected" {
-    ret rejects(?N_SINGLE_LITLEN_LEN2[0], 11, "incomplete literal/length code");
+    ret rejects(?N_SINGLE_LITLEN_LEN2[0], 11, Defect.incomplete_literals{});
 }
 test "inflate: a single one-bit end symbol is accepted" {
     ret check(?C_SINGLE_LITLEN_LEN1[0], 12, ?C_EMPTY[0], 0);
 }
 test "inflate: a single distance symbol longer than one bit is rejected" {
-    ret rejects(?N_SINGLE_DIST_LEN2[0], 12, "incomplete distance code");
+    ret rejects(?N_SINGLE_DIST_LEN2[0], 12, Defect.incomplete_distances{});
 }
 test "inflate: too many literal/length codes is rejected" {
-    ret rejects(?N_TOO_MANY_LIT[0], 10, "too many length or distance codes");
+    ret rejects(?N_TOO_MANY_LIT[0], 10, Defect.code_count{});
 }
 test "inflate: code length repeat with nothing to repeat is rejected" {
-    ret rejects(?N_REPEAT_NO_PREV[0], 10, "code length repeat with no previous length");
+    ret rejects(?N_REPEAT_NO_PREV[0], 10, Defect.repeat_no_previous{});
 }
 test "inflate: dynamic stream cut in half is rejected" {
-    ret rejects(?N_TRUNC_DYNAMIC[0], 27, "truncated deflate stream");
+    ret rejects_truncated(?N_TRUNC_DYNAMIC[0], 27);
 }
 
 var fuzz_buf: [512]u8;
@@ -1801,9 +1957,9 @@ fun split_check(at: usize) i32 {
     var a: A.Allocator;
     page.make(?a);
 
-    val ri: R.Result[Inflater, str] = init(?a);
-    if (R.is_err[Inflater, str](ri)) { ret 1; }
-    var z: Inflater = R.unwrap_ok[Inflater, str](ri);
+    val ri: res[Inflater, InflateError] = init(?a);
+    if (sel ri.err) { ret 1; }
+    var z: Inflater = ri.ok;
 
     var in_off:  usize = 0;
     var out_off: usize = 0;
@@ -1813,11 +1969,11 @@ fun split_check(at: usize) i32 {
     for (guard < 10000 && !is_done(?z)) {
         guard = guard + 1;
 
-        val r: R.Result[Progress, str] = decompress(?z, ?C_DYNAMIC[in_off], limit - in_off,
+        val r: res[Progress, InflateError] = decompress(?z, ?C_DYNAMIC[in_off], limit - in_off,
                                                        ?obuf[out_off], 4096 - out_off);
-        if (R.is_err[Progress, str](r)) { dnit(?z); ret 2; }
+        if (sel r.err) { dnit(?z); ret 2; }
 
-        val p: Progress = R.unwrap_ok[Progress, str](r);
+        val p: Progress = r.ok;
         in_off  = in_off + p.consumed;
         out_off = out_off + p.written;
 
@@ -1827,9 +1983,9 @@ fun split_check(at: usize) i32 {
         }
     }
 
-    val f: R.Result[bool, str] = finish(?z);
+    val f: err[InflateError] = finish(?z);
     dnit(?z);
-    if (R.is_err[bool, str](f)) { ret 4; }
+    if (sel f.err) { ret 4; }
     if (out_off != 2253) { ret 5; }
 
     var i: usize = 0;
@@ -1856,8 +2012,8 @@ test "inflate: every truncated prefix is rejected" {
 
     var n: usize = 0;
     for (n < 402) {
-        val r: R.Result[usize, str] = decompress_into(?a, ?C_DYNAMIC[0], n, ?obuf[0], 4096);
-        if (!R.is_err[usize, str](r)) { ret 1; }
+        val r: res[usize, InflateError] = decompress_into(?a, ?C_DYNAMIC[0], n, ?obuf[0], 4096);
+        if (!sel r.err) { ret 1; }
         n = n + 1;
     }
     ret 0;
@@ -1880,14 +2036,91 @@ test "inflate: every single-bit corruption is contained" {
 
             # a flipped bit may still form a valid stream, so either outcome is
             # allowed; what matters is that the call returns and stays in bounds
-            val r: R.Result[usize, str] = decompress_into(?a, ?fuzz_buf[0], 402, ?obuf[0], 4096);
-            if (!R.is_err[usize, str](r)) {
-                if (R.unwrap_ok[usize, str](r) > 4096) { ret 1; }
+            val r: res[usize, InflateError] = decompress_into(?a, ?fuzz_buf[0], 402, ?obuf[0], 4096);
+            if (sel r.ok) {
+                if (r.ok > 4096) { ret 1; }
             }
 
             b = b + 1;
         }
         i = i + 1;
     }
+    ret 0;
+}
+
+# the window is the only acquisition init makes: refused, the failure is the
+# allocator's, nothing is held, and the vector path releases the vector it had
+test "inflate: allocation refusal at the window and the output vector is alloc" {
+    var ordinal: usize = 1;
+    for (ordinal <= 8) {
+        var tracker: testing.Testing;
+        val made: err[A.Error] = testing.make(?tracker);
+        if (sel made.err) { ret 1; }
+        testing.fail_at_ordinal(?tracker, ordinal);
+        val r: res[V.Vector[u8], InflateError] = decompress_alloc(testing.allocator_of(?tracker), ?C_DYNAMIC[0], 402);
+        var accepted: bool = false;
+        if (sel r.err) {
+            if (!sel r.err.alloc) { testing.dnit(?tracker); ret 2; }
+            if (!sel r.err.alloc.exhausted) { testing.dnit(?tracker); ret 3; }
+        }
+        if (sel r.ok) {
+            var out: V.Vector[u8] = r.ok;
+            accepted = out.len == 2253;
+            V.dnit[u8](?out);
+        }
+        val leaked: bool = testing.live_count(?tracker) != 0 || testing.double_free_count(?tracker) != 0;
+        val attempts: usize = testing.attempt_count(?tracker);
+        testing.dnit(?tracker);
+        if (leaked) { ret 4; }
+        if (accepted) { if (attempts >= ordinal || ordinal < 2) { ret 5; } ret 0; }
+        if (attempts != ordinal) { ret 6; }
+        ordinal = ordinal + 1;
+    }
+    ret 7;
+}
+
+# a failure after progress carries the counts committed over the whole call:
+# a short destination reports full with dst filled, and a cut stream reports
+# truncated with every byte consumed and the output decoded so far
+test "inflate: a failure after progress carries the committed counts" {
+    var a: A.Allocator;
+    page.make(?a);
+
+    val small: res[usize, InflateError] = decompress_into(?a, ?C_DYNAMIC[0], 402, ?obuf[0], 100);
+    if (!sel small.err) { ret 1; }
+    if (!sel small.err.full) { ret 2; }
+    if (small.err.full.written != 100) { ret 3; }
+    if (small.err.full.consumed == 0 || small.err.full.consumed > 402) { ret 4; }
+
+    val cut: res[usize, InflateError] = decompress_into(?a, ?C_DYNAMIC[0], 200, ?obuf[0], 4096);
+    if (!sel cut.err) { ret 5; }
+    if (!sel cut.err.truncated) { ret 6; }
+    if (cut.err.truncated.consumed != 200) { ret 7; }
+    if (cut.err.truncated.written == 0 || cut.err.truncated.written >= 2253) { ret 8; }
+    ret 0;
+}
+
+# a released decoder reports closed from every entry point, and a second
+# release is ok
+test "inflate: a released decoder is closed" {
+    var a: A.Allocator;
+    page.make(?a);
+
+    val ri: res[Inflater, InflateError] = init(?a);
+    if (sel ri.err) { ret 1; }
+    var z: Inflater = ri.ok;
+
+    val first: err[A.Error] = dnit(?z);
+    if (sel first.err) { ret 2; }
+    val second: err[A.Error] = dnit(?z);
+    if (sel second.err) { ret 3; }
+
+    val fed: res[Progress, InflateError] = decompress(?z, ?C_FIXED[0], 10, ?obuf[0], 23);
+    if (!sel fed.err) { ret 4; }
+    if (!sel fed.err.closed) { ret 5; }
+
+    val f: err[InflateError] = finish(?z);
+    if (!sel f.err) { ret 6; }
+    if (!sel f.err.closed) { ret 7; }
     ret 0;
 }

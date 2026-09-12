@@ -22,7 +22,7 @@ mach `doc/design/tagged-values.md`; the compiler pin is
 | migration compiler | mach `dev` `b4ab85122e30bb24d733a024d549a9a05ef1a2c2`, built by the 4.30.0 seed (generation A `a881f3c2`) or through std's own bootstrap chain (fixpoint `b1fe8a87`) |
 | std base | `origin/dev` `c373e56` (std 1.0.2) |
 | bootstrap chain | `.github/actions/setup-mach/bootstrap.py`: published 4.26.5, bridge `878a8f66` single, audited `b65afb97` fixpoint, v5 `8464568d` fixpoint (std pin `168a9f76` at every stage). `8464568d` is `9a15ac3a6` plus the seeding removal (mach PR #3278: the compiler no longer seeds `res`, `opt` and `err` and no longer refuses a module that declares them); `9a15ac3a6` is `b4ab85122` plus the darwin build fix (mach PR #3277, the pinned std does not forward `O_NONBLOCK` on darwin) and is language-identical |
-| suite at this phase | 1216 passed, 0 failed under the v5 compiler `8464568d` on linux-x86_64 after S3b (1199 after S3a, 1208 after the two `feat/618` filesystem producer fixes landed, 1185 at S1 phase 2, 1182 at S1 phase 1 under `9a15ac3a6`, 1157 on the base under both the 4.30.0 seed and the v5 compiler) |
+| suite at this phase | 1241 passed, 0 failed under the v5 compiler `8464568d` on linux-x86_64 after S2 on S3b (1216 after S3b, 1199 after S3a, 1208 after the two `feat/618` filesystem producer fixes landed, 1185 at S1 phase 2, 1182 at S1 phase 1 under `9a15ac3a6`, 1157 on the base under both the 4.30.0 seed and the v5 compiler) |
 
 ## Compiler facts every lane must know
 
@@ -135,6 +135,28 @@ S3b executed its rows as tabled with these corrections:
 | `filesystem.transaction.BackupOutcome.failure`, `cleanup_failure` | not tabled | `err[Error]` fields | the report's two independent outcomes, spelled as the module's unit outcome |
 | `filesystem.transaction.ownership.initialize_claims` | unchanged `i64` | `err[removal.Error]` | `feat/618` `dac63cd` typed it (cursor and cleanup failures are two facts); landed as the canonical spelling. The other ownership operations stay native `i64` |
 | `io.error.Error` | unchanged record | gains `cleanup_code: i64` | `feat/618` `dac63cd`: the first cleanup failure observed beside a primary refusal, zero when none; every existing construction stays valid and S3a's frozen consumers are untouched |
+
+S2 executed its rows as tabled with these corrections:
+
+| table or census row | tabled target | executed | why |
+| --- | --- | --- | --- |
+| `format.vformat`, `format.format` | `res[usize, WriteError]` | `res[usize, FormatError]` with `FormatError { syntax: usize; few_holes: usize; many_holes: usize; write: WriteError; alloc: A.Error; }` | a malformed format string and an argument-count mismatch are the format's own failures, distinct from the sink's; the sink's outcome nests as `write` with its persisted prefix. `write_*` and `write_value` take no format string and stay `res[usize, WriteError]` |
+| `format.sprint` | `res[OwnedString\|str, FormatError]` | `res[str, FormatError]` (extent `str_len + 1`, released with `text.string.str_free`) | the result is measured exactly before it is allocated, so there is no spare extent to keep; `alloc` is the tag's own case, not a shim |
+| `format.capacity_exhausted` | listed as a translation shim | retained as the span sink's native `ENOSPC` `WriteError` | it is the bounded sink reporting its own refusal through the frozen `WriteError`, not a message spelled over a typed outcome; `ERR_SHORT_WRITE` and `write_error_text` are gone |
+| `print.printf`, `eprintf`, `printlnf`, `eprintlnf` | `res[usize, WriteError]` | `res[usize, FormatError]` | they format, so they can fail the way `format` does; `print`, `println`, `eprint`, `eprintln`, `u64`, `eu64` are `res[usize, WriteError]` as tabled |
+| `input.read_line`, `read_line_from` | `res[usize, ReadError]` | `res[usize, InputError]` with `InputError { read: ReadError; too_long: usize; }` | a line that does not fit the buffer is not a reader failure; it carries the bytes buffered, the overflowing byte is consumed and dropped, and the next call continues. `read{eof{0}}` is the end of input with nothing buffered, distinct from an empty line `ok{0}` |
+| `text.parse.ParseError` | "invalid syntax and overflow distinct" | `ParseError { empty; syntax: usize; overflow: usize; base: u8; }` | an empty input and a base outside 2..36 are distinct from a bad byte; `syntax` and `overflow` carry the byte offset |
+| `data.json.dnit` | not tabled | `err[allocator.Error]` (every child released, first refusal reported) | allocator-release, the same shape as every container `dnit` |
+| `data.json.value_get`, `value_find` | not tabled (census `opt[*Value]`) | `opt[*Value]` | no child at an index and no entry with a key are absence; the pointer borrows the tree |
+| `data.json.value_key` | not tabled (census `opt[str]`) | `opt[str]` (`value_key_len` unchanged) | the same absence |
+| `data.toml.get`, `get_table`, `get_array`, `array_get`, `table_value` | not tabled (census `opt[*T]`) | `opt[*Value]`, `opt[*Table]`, `opt[*Array]` | absence and wrong shape were a nil pointer, the last pointer-as-option in the module; nil receivers are contract violations and no longer special-cased (`table_len`, `array_len` included) |
+| `data.toml.get_str`, `table_key` | not tabled (census `opt[str]`) | `opt[str]` | the same absence |
+| `data.toml.TomlError` | "positioned syntax distinct" | `TomlError { syntax: usize; overflow: usize; depth: usize; conflict: usize; alloc: Error; }` | an integer that does not fit, nesting past the bound and a key colliding with a value of another shape each carry their offset |
+| `encoding.binary.EncodeError` | "alloc and invalid-encoder distinct" | `EncodeError { alloc: A.Error; overflow; invalid; full: usize; alignment: usize; reserved; bounds; inactive; stale; busy; }` | the builder and reservation refusals were each a distinct message; each is a case now |
+| `encoding.binary.DecodeError` | "short input distinct from malformed" | `DecodeError { short: usize; invalid; alignment: usize; bounds; unterminated; }` | `short` carries the bytes remaining; the malformed cases are named |
+| `compress.*.finish` (inflate, zlib) | `res[Progress, InflateError]` | `err[InflateError]` | a completed stream has no value; `truncated{0, 0}` when the stream did not reach its end, `closed` after `dnit`. `gzip.finish` keeps `res[Progress, InflateError]` because it drains output |
+| `compress.*` nil arguments | `"inflater is nil"`, `"gzip input is nil"` | no check | a nil decoder, or a nil buffer with a nonzero length, is a contract violation under the raw-memory rules, not an outcome |
+| `io.reader.advance`, `io.writer.advance` | private | `pub` | a composite consumer (`input`, `format`, `data.json`) rebases a prefix the same way the reader and writer do; additive, no frozen row changes |
 
 ## Frozen core signatures
 
@@ -251,6 +273,59 @@ growth that is refused part way releases the buffers it acquired.
 | `memory.*` | unchanged (predicates and infallible effects) | yes |
 | `types.canonical` | tests only until the compiler stops seeding; then the three declarations | yes |
 | `types.result`, `types.option` (`Result`, `Option`, `Void`, `ok`, `err`, `ok_void`, `void_of`, `some`, `none`, `is_*`, `unwrap*`) | retained on the migration branch only; removed by C5 after S2 to S8 and mach #3226 | removal owed |
+
+### Text, encoding, data and compression (S2)
+
+| API | signature | frozen |
+| --- | --- | --- |
+| `text.parse.ParseError` | `pub tag ParseError: u8 { empty; syntax: usize; overflow: usize; base: u8; }` | yes |
+| `text.parse.parse_u64`, `parse_u64_exact`, `parse_i64`, `parse_i64_exact` | `fun(s: str, base: u8) res[u64\|i64, ParseError]` | yes |
+| `text.parse.parse_f64`, `parse_f64_exact` | `fun(s: str) res[f64, ParseError]`; `parse_f64_len` `fun(s: str, len: usize) res[f64, ParseError]` | yes |
+| `format.FormatError` | `pub tag FormatError: u8 { syntax: usize; few_holes: usize; many_holes: usize; write: WriteError; alloc: A.Error; }` | yes |
+| `format.write_bytes`, `write_str`, `write_byte`, `write_newline`, `write_u64`, `write_i64`, `write_hex_u64`, `write_ptr`, `write_f64`, `write_value` | `... res[usize, WriteError]` (the payload is the persisted prefix) | yes |
+| `format.vformat`, `format` | `fun(w: *writer.Writer, fmt: str, va: ...) res[usize, FormatError]` | yes |
+| `format.sprint` | `fun(a: *A.Allocator, fmt: str, va: ...) res[str, FormatError]` (extent `str_len + 1`, released with `text.string.str_free`; a format failure is reported before any allocation) | yes |
+| `print.print`, `println`, `eprint`, `eprintln`, `u64`, `eu64` | `... res[usize, WriteError]` | yes |
+| `print.printf`, `eprintf`, `printlnf`, `eprintlnf` | `... res[usize, FormatError]` | yes |
+| `input.InputError` | `pub tag InputError: u8 { read: ReadError; too_long: usize; }` | yes |
+| `input.read_line_from` | `fun(r: *reader.Reader, buf: *u8, cap: usize) res[usize, InputError]`; `read_line` `fun(buf: *u8, cap: usize) res[usize, InputError]` | yes |
+| `encoding.binary.EncodeError` | `pub tag EncodeError: u8 { alloc: A.Error; overflow; invalid; full: usize; alignment: usize; reserved; bounds; inactive; stale; busy; }` | yes |
+| `encoding.binary.DecodeError` | `pub tag DecodeError: u8 { short: usize; invalid; alignment: usize; bounds; unterminated; }` | yes |
+| `encoding.binary.encoder_dnit` | `fun(e: *Encoder) err[A.Error]` | yes |
+| `encoding.binary.reserve`, `write_*`, `patch_*`, `align`, `builder_write_*`, `builder_patch_*`, `builder_align`, `builder_rollback`, `builder_commit`, `reservation_rollback` | `... res[usize, EncodeError]`; `builder_checkpoint` `res[Checkpoint, EncodeError]`; `builder_reserve` `res[Reservation, EncodeError]` | yes |
+| `encoding.binary.read_u8/u16/u32/u64` | `... res[uN, DecodeError]`; `read_bytes` `res[*u8, DecodeError]`; `read_str` `res[str, DecodeError]`; `skip`, `align_read`, `cursor_rollback` `res[usize, DecodeError]`; `read_subview` `res[Cursor, DecodeError]`; `cursor_checkpoint` `res[Checkpoint, DecodeError]` | yes |
+| `encoding.base64`, `encoding.hex`, `text.utf8` | unchanged | yes |
+| `data.json.JsonError` | `pub tag JsonError: u8 { syntax: usize; depth: usize; alloc: allocator.Error; }` | yes |
+| `data.json.parse` | `fun(src: *u8, src_len: usize, alloc: *allocator.Allocator) res[Value, JsonError]` (a partial parse releases what it acquired before reporting) | yes |
+| `data.json.dnit` | `fun(alloc: *allocator.Allocator, v: *Value) err[allocator.Error]` | yes |
+| `data.json.value_string_decode` | `fun(v: *Value, buf: *u8, len: usize) res[usize, JsonError]` | yes |
+| `data.json.value_get`, `value_find` | `... opt[*Value]`; `value_key` `opt[str]` (borrow the tree; `value_key_len`, `value_count`, predicates and numbers unchanged) | yes |
+| `data.json.write_value`, `object_begin`, `object_end`, `object_end_value`, `field_*`, `array_*`, `value_f64`, `write_json_string` | `... err[WriteError]` (the payload is the emitted prefix) | yes |
+| `data.toml.TomlError` | `pub tag TomlError: u8 { syntax: usize; overflow: usize; depth: usize; conflict: usize; alloc: Error; }` | yes |
+| `data.toml.parse` | `fun(a: *Allocator, src: str) res[Table, TomlError]` (nothing a failed parse built survives) | yes |
+| `data.toml.dnit` | `fun(a: *Allocator, t: *Table) err[Error]` | yes |
+| `data.toml.get`, `array_get`, `table_value` | `... opt[*Value]`; `get_table` `opt[*Table]`; `get_array` `opt[*Array]`; `get_str`, `table_key` `opt[str]`; `get_int` `opt[i64]`; `get_float` `opt[f64]`; `get_bool` `opt[bool]` (absence or wrong shape is `none`) | yes |
+| `derive.fmt[T]` | `fun(w: *writer.Writer, v: *T) res[usize, WriteError]`; `eq`, `hash`, `clone`, `check` unchanged | yes |
+| `compress.inflate.Defect` | `pub tag Defect: u8 { block_type; stored_length; code_count; length_code_set; length_code; repeat_no_previous; repeat_overrun; oversubscribed_literals; incomplete_literals; oversubscribed_distances; incomplete_distances; literal_code; distance_code; distance_range; method; window; header_check; dictionary; magic; flags; header_checksum; checksum; length; }` (the deflate cases are inflate's, the framing cases the wrappers'; one tag describes a whole stream) | yes |
+| `compress.inflate.Committed`, `Fault` | `pub rec Committed { consumed: usize; written: usize; }`, `pub rec Fault { defect: Defect; consumed: usize; written: usize; }` | yes |
+| `compress.inflate.InflateError` | `pub tag InflateError: u8 { alloc: A.Error; malformed: Fault; truncated: Committed; full: Committed; closed; finished; invalid; }` (re-exported by `zlib` and `gzip`) | yes |
+| `compress.inflate.advance`, `settled`, `malformed`, `truncated` | `fun(e: InflateError, consumed: usize, written: usize) InflateError`, `fun(e: InflateError) InflateError`, `fun(defect: Defect, consumed: usize, written: usize) InflateError`, `fun(consumed: usize, written: usize) InflateError` | yes |
+| `compress.{inflate,zlib,gzip}.init` | `fun(a: *A.Allocator) res[Inflater\|Decompressor, InflateError]` (`alloc` is the only failure; a decoder is relocatable, not address-bound) | yes |
+| `compress.{inflate,zlib,gzip}.dnit` | `fun(z: *T) err[A.Error]` (a decoder holding no window is already released; a refused release leaves it owning) | yes |
+| `compress.{inflate,zlib,gzip}.decompress` | `fun(z: *T, src: *u8, src_len: usize, dst: *u8, dst_len: usize) res[Progress, InflateError]` (a failure carries the counts this call committed; `closed` after `dnit`) | yes |
+| `compress.{inflate,zlib}.finish` | `fun(z: *T) err[InflateError]`; `compress.gzip.finish` `fun(z: *Decompressor, dst: *u8, dst_len: usize) res[Progress, InflateError]` (`finished` on input after it) | yes |
+| `compress.{inflate,zlib,gzip}.decompress_into` | `fun(a, src, src_len, dst, dst_len) res[usize, InflateError]` (`malformed`, `truncated` and `full` carry the counts over the whole call) | yes |
+| `compress.{inflate,zlib,gzip}.decompress_alloc` | `fun(a, src, src_len) res[Vector[u8], InflateError]` (on failure the vector is already released) | yes |
+| `compress.*.is_done`, `reset`, `Progress`, status constants, `WINDOW` | unchanged | yes |
+| `math.mat4.mat4_inverse` | `fun(m: Mat4) opt[Mat4]` | yes |
+| `io.reader.advance`, `io.writer.advance` | `pub fun(error: ReadError\|WriteError, delivered\|written: usize) ReadError\|WriteError` (additive) | yes |
+
+Contract: a composite operation's error payload is the whole prefix the call
+committed, never the whole stream's (a gzip call that fails in its second
+member reports that call's consumed and written; the sticky failure it stores
+is re-reported `settled`, with nothing committed). Every parser releases what
+it acquired before reporting `alloc`; every emitter's `WriteError` payload is
+the prefix persisted.
 
 ### I/O (S3a)
 
@@ -372,32 +447,36 @@ and the bitset refusal test.
 `canonical`, plus `text.string` (owned `str` helpers) and `memory`: frozen
 above. `types.result` and `types.option` remain for the unmigrated consumers.
 
-### Text and encoding (S2)
+### Text and encoding (S2, done)
 
 | module | outcome-bearing APIs | representation | S0 rule |
 | --- | --- | --- | --- |
-| `text.parse` | `parse_u64`, `parse_u64_exact`, `parse_i64`, `parse_i64_exact`, `parse_f64`, `parse_f64_len`, `parse_f64_exact` | `res[T, ParseError]` with invalid syntax and overflow distinct; no allocation | result-payload |
+| `text.parse` | `parse_u64`, `parse_u64_exact`, `parse_i64`, `parse_i64_exact`, `parse_f64`, `parse_f64_len`, `parse_f64_exact` | done (S2): `res[T, ParseError]` with `empty`, `syntax`, `overflow` and `base` distinct; no allocation | result-payload |
 | `text.utf8` | `validate`, `is_continuation`, decoders | unchanged predicates and values | value-or-effect |
-| `format` | `write_*`, `vformat`, `format` | `res[usize, WriteError]` carrying committed bytes and the writer cause (shared with `io.writer`, S3 owns the writer error type) | result-payload |
-| `format.sprint` | | `res[OwnedString, FormatError]` or `res[str, FormatError]` with `alloc: allocator.Error` (translation shim at the `A.allocate` site) | result-payload |
-| `print` | `print`, `println`, `eprint*`, `printf` family, `u64`, `eu64` | `res[usize, WriteError]` (checked printing stays checked) | result-payload |
-| `input` | `read_line`, `read_line_from` | `res[usize, ReadError]` with EOF distinct from failure | result-payload |
-| `encoding.binary` | `reserve`, `write_*`, `patch_*`, `align`, builder and reservation operations | `res[usize, EncodeError]` with `alloc: allocator.Error` and invalid-encoder distinct (translation shim at the `A.reallocate` site) | result-payload |
-| `encoding.binary` | `read_*`, `skip`, `align_read`, `read_subview`, checkpoints and rollbacks | `res[T, DecodeError]` with short input distinct from malformed | result-payload |
-| `encoding.binary.encoder_dnit` | | `err[allocator.Error]` | allocator-release |
+| `format` | `write_*`, `write_value` | done (S2): `res[usize, WriteError]` carrying committed bytes and the writer cause (shared with `io.writer`, S3 owns the writer error type) | result-payload |
+| `format` | `vformat`, `format` | done (S2): `res[usize, FormatError]` (correction above: the format string's own failures are distinct from the sink's, which nests as `write`) | result-payload |
+| `format.sprint` | | done (S2): `res[str, FormatError]` with `alloc: allocator.Error`; the shim at the `A.allocate` site is gone | result-payload |
+| `print` | `print`, `println`, `eprint*`, `u64`, `eu64` | done (S2): `res[usize, WriteError]` (checked printing stays checked) | result-payload |
+| `print` | `printf` family | done (S2): `res[usize, FormatError]` (correction above) | result-payload |
+| `input` | `read_line`, `read_line_from` | done (S2): `res[usize, InputError]` with `read: ReadError` (EOF distinct inside it) and `too_long` (correction above); `ERR_EOF` and `read_error_text` are gone | result-payload |
+| `encoding.binary` | `reserve`, `write_*`, `patch_*`, `align`, builder and reservation operations | done (S2): `res[usize, EncodeError]` with `alloc: allocator.Error` and `invalid` distinct; the shim at the `A.reallocate` site is gone | result-payload |
+| `encoding.binary` | `read_*`, `skip`, `align_read`, `read_subview`, checkpoints and rollbacks | done (S2): `res[T, DecodeError]` with `short` distinct from the malformed cases | result-payload |
+| `encoding.binary.encoder_dnit` | | done (S2): `err[allocator.Error]` | allocator-release |
 | `encoding.base64`, `encoding.hex` | | unchanged (values and lengths) | value-or-effect |
-| `data.json` | `parse`, `value_string_decode`, children/keys growth | `res[Value, JsonError]` with `alloc: allocator.Error`, syntax with position, and depth distinct; `value_*` predicates and numbers unchanged; a partial parse releases what it acquired (translation shims at the two growth sites) | result-payload |
-| `data.json` streaming writer helpers | | `err[WriteError]` with the emitted prefix and writer cause | streaming-output |
-| `data.toml` | `parse`, key and array growth, string decoding | `res[Table, TomlError]` with `alloc: allocator.Error` and positioned syntax distinct (translation shims at the growth and decode sites); `get_int`, `get_float`, `get_bool` stay `opt[T]` as absence-or-type-mismatch unless a checked accessor is added; `dnit` becomes `err[allocator.Error]` | result-payload, optional-value, allocator-release |
-| `derive` | `eq[T]` unchanged; `fmt[T]` | `res[usize, WriteError]` | result-payload |
+| `data.json` | `parse`, `value_string_decode`, children/keys growth | done (S2): `res[Value, JsonError]` with `alloc: allocator.Error`, `syntax` with position and `depth` distinct; `value_*` predicates and numbers unchanged; a partial parse releases what it acquired; the two growth shims are gone; `dnit` `err[allocator.Error]` | result-payload |
+| `data.json` | `value_get`, `value_key`, `value_find` | done (S2): `opt[*Value]`, `opt[str]`, `opt[*Value]` (census rows, correction above) | optional-value |
+| `data.json` streaming writer helpers | | done (S2): `err[WriteError]` with the emitted prefix and writer cause | streaming-output |
+| `data.toml` | `parse`, key and array growth, string decoding | done (S2): `res[Table, TomlError]` with `alloc: allocator.Error` and positioned `syntax`, `overflow`, `depth` and `conflict` distinct; the eight growth and decode shims are gone; `get_int`, `get_float`, `get_bool` `opt[T]` as absence-or-type-mismatch; `dnit` `err[allocator.Error]` | result-payload, optional-value, allocator-release |
+| `data.toml` | `get`, `get_str`, `get_table`, `get_array`, `array_get`, `table_key`, `table_value` | done (S2): `opt[*Value]`, `opt[str]`, `opt[*Table]`, `opt[*Array]`, `opt[*Value]`, `opt[str]`, `opt[*Value]` (census rows, correction above) | optional-value |
+| `derive` | `eq[T]` unchanged; `fmt[T]` | done (S2): `res[usize, WriteError]` | result-payload |
 
-### Compression (S2 types, S8 lifecycle)
+### Compression (S2 types done, S8 lifecycle)
 
 | module | outcome-bearing APIs | representation | S0 rule |
 | --- | --- | --- | --- |
-| `compress.inflate`, `zlib`, `gzip` | `init` | `res[Inflater\|Decompressor, allocator.Error]` (the window is the only acquisition; translation shim at the window allocation) | result-payload |
-| | `dnit` | `err[allocator.Error]` | allocator-release |
-| | `decompress`, `finish`, `decompress_into`, `decompress_alloc` | `res[Progress, InflateError]` where a failure after progress carries the committed input and output counts; concatenated members, explicit EOF, sticky failure, truncation and CRC verdicts are S8's to preserve (translation shims at the `V.ensure` growth sites) | result-payload |
+| `compress.inflate`, `zlib`, `gzip` | `init` | done (S2): `res[Inflater\|Decompressor, InflateError]` with `alloc` the only case raised (the window is the only acquisition; the shim at the window allocation is gone) | result-payload |
+| | `dnit` | done (S2): `err[allocator.Error]` | allocator-release |
+| | `decompress`, `finish`, `decompress_into`, `decompress_alloc` | done (S2): `res[Progress, InflateError]` where a failure after progress carries the committed input and output counts; `finish` is `err[InflateError]` on inflate and zlib (correction above); concatenated members, explicit EOF, sticky failure (`opt[InflateError]`, re-reported `settled`), truncation and CRC verdicts are preserved for S8 with their tests passing unchanged in form; the `V.ensure` growth shims are gone | result-payload |
 | | `is_done` | unchanged predicate | predicate-or-transition |
 
 ### Crypto and random (S4)
@@ -497,12 +576,12 @@ above. `types.result` and `types.option` remain for the unmigrated consumers.
 | `runtime`, `runtime.linux.*`, `runtime.darwin.*`, `runtime.windows.*` | unchanged native entry and relocation boundary |
 | `system.os.tests` | in-tree census tests; migrated call sites only |
 
-### Math and SIMD (S2)
+### Math and SIMD (S2, done)
 
 | module | representation |
 | --- | --- |
 | `math`, `math.bits`, `math.float`, `math.quat`, `math.bignum` | unchanged values and predicates |
-| `math.mat4.mat4_inverse` | `opt[Mat4]` (a singular matrix is mathematical absence) |
+| `math.mat4.mat4_inverse` | done (S2): `opt[Mat4]` (a singular matrix is mathematical absence) |
 | `simd.select`, `reduce`, `shuffle`, `saturate`, `gather` | unchanged values |
 
 ## Translation shims left by this phase
@@ -515,15 +594,15 @@ phase (33 sites over 15 modules):
 | module | sites | lane |
 | --- | ---: | --- |
 | `filesystem` | 0 (16 removed by S3b) | S3 |
-| `data.toml` | 8 | S2 |
-| `data.json` | 4 | S2 |
-| `compress.inflate` | 3 | S2/S8 |
+| `data.toml` | 0 (8 removed by S2) | S2 |
+| `data.json` | 0 (4 removed by S2) | S2 |
+| `compress.inflate` | 0 (3 removed by S2) | S2/S8 |
 | `process.exec` | 2 | S3 |
 | `process.env` | 2 | S3 |
-| `format` | 2 | S2 |
-| `filesystem.transaction` | 0 (2 removed by S3b) | S3 |
-| `encoding.binary` | 1 | S2 |
-| `compress.zlib`, `compress.gzip` | 1 each | S2/S8 |
+| `format` | 0 (2 removed by S2) | S2 |
+| `filesystem.transaction` | 0 (2 removed by S3b), plus `sprint_text` around `format.sprint` (7 call sites, added by S2) | S3 |
+| `encoding.binary` | 0 (1 removed by S2) | S2 |
+| `compress.zlib`, `compress.gzip` | 0 (1 each removed by S2) | S2/S8 |
 | `net.resolve`, `net.resolve.shared` | 0 (typed `types.Error` and `bool` already) | S3 |
 
 The `system.os.*` hits of that string are the OS layer's own native
@@ -541,9 +620,10 @@ module's own return types:
 | `process.exec` | `file_exists` around `filesystem.is_file` (a query the platform cannot answer reads as absent) | S3c |
 | `process.exec` | `read_error_text` around `read_all` in `output` | S3c |
 | `process.events`, `net.async`, `net.async.local`, `net.resolve` | `runtime_ok_*` predicates and `res`/`canonical.err` bindings at every `io_runtime` call; `net.async.wait` and `process.events.begin_runtime_drain` re-wrap the runtime's `res` in their `Result` | S3c |
-| `input` | `ERR_EOF`, `read_error_text` in `read_line_from` | S4 |
-| `format` | `ERR_SHORT_WRITE`, `write_error_text`, `capacity_exhausted` (the span, measure and test writers report `ENOSPC` natively) | S2 |
-| `derive`, `data.json` | writer callbacks return the typed outcome; no message shim | S2 |
+| `input` | `ERR_EOF`, `read_error_text` in `read_line_from` | removed (S2): `InputError` nests the `ReadError` |
+| `format` | `ERR_SHORT_WRITE`, `write_error_text` | removed (S2): `WriteError` is the outcome; `capacity_exhausted` stays as the span sink's native `ENOSPC` report (correction above) |
+| `derive`, `data.json` | writer callbacks return the typed outcome; no message shim | done (S2) |
+| `filesystem.transaction` | `sprint_text` spelling `format.sprint`'s `FormatError` as `R.Result[str, str]` (`"out of memory"`) at seven call sites, left by S2 after S3b | S3c |
 | `log.sink`, `log` | `ERR_SHORT_WRITE`, `report_write` folding a `WriteError` into a `WriteReport` | S4 |
 
 ## Prepared branches
@@ -572,7 +652,10 @@ module's own return types:
   `WriteError`, `EncodeError`, `JsonError`, `TomlError`, `InflateError`,
   `FsError` (declared by S3b), `EnvError`, `StateError`, `ThreadError`,
   `SinkError`, `TermError`), each nesting `allocator.Error` where allocation
-  is one of its causes.
+  is one of its causes. S2 is done: `ParseError`, `FormatError`,
+  `InputError`, `EncodeError`, `DecodeError`, `JsonError`, `TomlError`,
+  `InflateError` and `Defect` are frozen above, and S8 inherits the
+  compression lifecycle on those shapes.
 - S3 owns the operation and error contracts S5 to S7 consume, and lands
   `feat/618`'s three producer fixes on the frozen foundations (two landed by
   S3b, `9dd151d` owed by S3c).
