@@ -22,7 +22,7 @@ mach `doc/design/tagged-values.md`; the compiler pin is
 | migration compiler | mach `dev` `b4ab85122e30bb24d733a024d549a9a05ef1a2c2`, built by the 4.30.0 seed (generation A `a881f3c2`) or through std's own bootstrap chain (fixpoint `b1fe8a87`) |
 | std base | `origin/dev` `c373e56` (std 1.0.2) |
 | bootstrap chain | `.github/actions/setup-mach/bootstrap.py`: published 4.26.5, bridge `878a8f66` single, audited `b65afb97` fixpoint, v5 `8464568d` fixpoint (std pin `168a9f76` at every stage). `8464568d` is `9a15ac3a6` plus the seeding removal (mach PR #3278: the compiler no longer seeds `res`, `opt` and `err` and no longer refuses a module that declares them); `9a15ac3a6` is `b4ab85122` plus the darwin build fix (mach PR #3277, the pinned std does not forward `O_NONBLOCK` on darwin) and is language-identical |
-| suite at this phase | 1286 passed, 0 failed under the v5 compiler `8464568d` on linux-x86_64 after S6 on S4b (1278 after S4b on S4a and S8, 1266 after S4a on S8, 1259 after S8 on S3c, 1256 after S3c on S2, 1241 after S2, 1216 after S3b, 1199 after S3a, 1208 after the two `feat/618` filesystem producer fixes landed, 1185 at S1 phase 2, 1182 at S1 phase 1 under `9a15ac3a6`, 1157 on the base under both the 4.30.0 seed and the v5 compiler) |
+| suite at this phase | 1269 passed, 0 failed under the v5 stage compiler (mach `2a2918b23`) on linux-x86_64 after C5c (1300 after S7 on S6, the 31 tests of `types.result` and `types.option` removed with their modules; 1286 after S6 on S4b, 1278 after S4b on S4a and S8, 1266 after S4a on S8, 1259 after S8 on S3c, 1256 after S3c on S2, 1241 after S2, 1216 after S3b, 1199 after S3a, 1208 after the two `feat/618` filesystem producer fixes landed, 1185 at S1 phase 2, 1182 at S1 phase 1 under `9a15ac3a6`, 1157 on the base under both the 4.30.0 seed and the v5 compiler) |
 
 ## Compiler facts every lane must know
 
@@ -31,12 +31,19 @@ mach `doc/design/tagged-values.md`; the compiler pin is
   refuses a module that declares the three names. `std.types.canonical`
   declares them `pub` exactly as the contract spells them and pins the shapes
   by test, and every consuming module has `use std.types.canonical.res;` and
-  friends (`std.data.toml` and `std.net.resolve` also import the
-  `std.types.result.err` helper, so they spell the tag `canonical.err[E]`
-  until C5 deletes that helper). A module that names a canonical tag without
+  friends. A module that names a canonical tag without
   the `use` fails to compile with `unresolved type name`, and a local binding
   named `res`, `opt` or `err` now shadows the tag in type position, which the
   seeded compiler hid.
+- **The compiler consumes nothing of `std.types.result` or
+  `std.types.option`.** At mach `33d60001e` (C5a, mach #3226) the compiler
+  source has zero uses of `std.types.result`, `std.types.option`, `Void`,
+  `ok_void` and `void_of`; C5c (std #617) deleted both modules, and the
+  compiler at that pin builds and passes its suite against a std that has
+  no legacy modules (the paired-pin proof is on the C5c PR). `err` and the
+  other helper names are free: `std.data.toml` and `std.net.resolve`, which
+  once imported the `std.types.result.err` helper and spelled the tag
+  `canonical.err[E]`, spell the bare `err[E]` like every other module.
 - **A user generic instantiates over a canonical tag like over any other
   declared type.** `Vector[res[T, E]]`, `Map[K, opt[V]]`, `Holder[opt[T]]`
   and the like build and behave (the mangler defect noted on mach #3218 had
@@ -61,9 +68,7 @@ mach `doc/design/tagged-values.md`; the compiler pin is
   (`fun ok_err(r: err[E]) bool { ret sel r.ok; }`), which S3a does in
   `io.runtime`, `io.file.tests` and the runtime consumers. `||` opens no guard,
   so `if (sel r.err || r.ok != 1) { ret 1; }` is rejected even though every
-  arm exits; split it into one `if` per term. A module that imports the
-  `std.types.result.err` helper spells the tag `canonical.err[E]`
-  (`use canonical: std.types.canonical;`).
+  arm exits; split it into one `if` per term.
 
 ## Representation rules
 
@@ -316,7 +321,7 @@ growth that is refused part way releases the buffers it acquired.
 | `text.string.str_free` | `fun(a: *Allocator, s: str) err[allocator.Error]` | yes |
 | `memory.*` | unchanged (predicates and infallible effects) | yes |
 | `types.canonical` | tests only until the compiler stops seeding; then the three declarations | yes |
-| `types.result`, `types.option` (`Result`, `Option`, `Void`, `ok`, `err`, `ok_void`, `void_of`, `some`, `none`, `is_*`, `unwrap*`) | retained on the migration branch only; removed by C5 after S2 to S8 and mach #3226 | removal owed |
+| `types.result`, `types.option` (`Result`, `Option`, `Void`, `ok`, `err`, `ok_void`, `void_of`, `some`, `none`, `is_*`, `unwrap*`) | removed (C5c, std 2.0.0): both modules and their `libstd` forwards deleted after S2 to S8 and mach #3226; the compiler at mach `33d60001e` consumed nothing of them | removed |
 
 ### Text, encoding, data and compression (S2)
 
@@ -609,7 +614,10 @@ and the bitset refusal test.
 
 `types.string`, `view`, `path`, `semver`, `char`, `bool`, `size`,
 `canonical`, plus `text.string` (owned `str` helpers) and `memory`: frozen
-above. `types.result` and `types.option` remain for the unmigrated consumers.
+above. `types.result` and `types.option` are removed (C5c); the last consumers
+were the manual darwin probes under `test/vm-darwin` and `test/socket-darwin`,
+which now spell `res` and `err` against the current allocator and `net.local`
+signatures.
 
 ### Text and encoding (S2, done)
 
@@ -1280,10 +1288,14 @@ never retires; a read resolving `request.length` instead of the native count
   unchanged and three additive entry points plus the boundary's borrow table
   are frozen above; the design is under "Welded secret buffers through native
   completion".
-- C5: the compiler side is done (mach #3226, `8464568d` seeds nothing) and
-  std declares the three tags in `std.types.canonical` with the `use` sweep
-  (std #617, S1 phase 2). What remains: `std.types.result` and
-  `std.types.option` (`Result`, `Option`, `Void`, `ok`, `err`, `ok_void`,
-  `void_of`, `some`, `none`, `is_*`, `unwrap*`) are deleted after the last
-  consumer migrates, `mach.toml` moves to 2.0.0 and the CHANGELOG records
-  the breaking surface. Generics over the canonical tags need no follow-up.
+- C5: done. The compiler side is mach #3226 (`8464568d` seeds nothing;
+  `33d60001e`, C5a, has zero uses of `std.types.result`, `std.types.option`,
+  `Void`, `ok_void` and `void_of` in the compiler), std declares the three
+  tags in `std.types.canonical` with the `use` sweep (std #617, S1 phase 2),
+  and C5c deleted `std.types.result` and `std.types.option` (`Result`,
+  `Option`, `Void`, `ok`, `err`, `ok_void`, `void_of`, `some`, `none`,
+  `is_*`, `unwrap*`) with their `libstd` forwards, moved `mach.toml` to
+  2.0.0 and recorded the breaking surface by domain in the CHANGELOG (this
+  document holds the tables). The compiler at `33d60001e` builds and passes
+  its suite against the std with no legacy modules. Generics over the
+  canonical tags need no follow-up.
