@@ -22,7 +22,7 @@ mach `doc/design/tagged-values.md`; the compiler pin is
 | migration compiler | mach `dev` `b4ab85122e30bb24d733a024d549a9a05ef1a2c2`, built by the 4.30.0 seed (generation A `a881f3c2`) or through std's own bootstrap chain (fixpoint `b1fe8a87`) |
 | std base | `origin/dev` `c373e56` (std 1.0.2) |
 | bootstrap chain | `.github/actions/setup-mach/bootstrap.py`: published 4.26.5, bridge `878a8f66` single, audited `b65afb97` fixpoint, v5 `8464568d` fixpoint (std pin `168a9f76` at every stage). `8464568d` is `9a15ac3a6` plus the seeding removal (mach PR #3278: the compiler no longer seeds `res`, `opt` and `err` and no longer refuses a module that declares them); `9a15ac3a6` is `b4ab85122` plus the darwin build fix (mach PR #3277, the pinned std does not forward `O_NONBLOCK` on darwin) and is language-identical |
-| suite at this phase | 1241 passed, 0 failed under the v5 compiler `8464568d` on linux-x86_64 after S2 on S3b (1216 after S3b, 1199 after S3a, 1208 after the two `feat/618` filesystem producer fixes landed, 1185 at S1 phase 2, 1182 at S1 phase 1 under `9a15ac3a6`, 1157 on the base under both the 4.30.0 seed and the v5 compiler) |
+| suite at this phase | 1256 passed, 0 failed under the v5 compiler `8464568d` on linux-x86_64 after S3c on S2 (1241 after S2, 1216 after S3b, 1199 after S3a, 1208 after the two `feat/618` filesystem producer fixes landed, 1185 at S1 phase 2, 1182 at S1 phase 1 under `9a15ac3a6`, 1157 on the base under both the 4.30.0 seed and the v5 compiler) |
 
 ## Compiler facts every lane must know
 
@@ -157,6 +157,21 @@ S2 executed its rows as tabled with these corrections:
 | `compress.*.finish` (inflate, zlib) | `res[Progress, InflateError]` | `err[InflateError]` | a completed stream has no value; `truncated{0, 0}` when the stream did not reach its end, `closed` after `dnit`. `gzip.finish` keeps `res[Progress, InflateError]` because it drains output |
 | `compress.*` nil arguments | `"inflater is nil"`, `"gzip input is nil"` | no check | a nil decoder, or a nil buffer with a nonzero length, is a contract violation under the raw-memory rules, not an outcome |
 | `io.reader.advance`, `io.writer.advance` | private | `pub` | a composite consumer (`input`, `format`, `data.json`) rebases a prefix the same way the reader and writer do; additive, no frozen row changes |
+
+S3c executed its rows as tabled with these corrections:
+
+| table row | table target | executed | why |
+| --- | --- | --- | --- |
+| `process.env.current_dir` | native and allocation failure distinct | `EnvError.changed` as a third case, shared with `value` | the platform reports only `ERANGE` for a directory longer than the probe; a directory that grew again between the probe and the exact read is the same bounded race `value` reports, not a native failure |
+| `process.exec.wait`, `try_wait`, `wait_within` on a zero pid | not tabled | `Error.native{EINVAL, PROCESS_OP_WAIT}`, no wait is issued | a `Child` with no pid is invalid use, not "no child exited": a kernel `waitpid(0)` would reap an arbitrary group member |
+| `process.exec.output` when the drain fails | "secondary wait failure" inside `Error` | `Error.output{OutputFailure{read: ReadError; child: Child; wait: opt[os.ProcessWaitError]}}` | the drain's failure keeps the reader's typed outcome (bytes delivered, native cause) beside the wait that followed it; a wait that reaped the child leaves `child` at pid zero, a wait that failed leaves the child retained and its native failure in `wait` |
+| `process.exec.resolve`, `resolve_in` | `res[T, Error]` | `res[str, Error]` with `alloc: A.Error` and `env: EnvError` as their own cases; a refused copy releases the joined candidate before reporting | the PATH read and the candidate copy are the two acquisition sites, and both refusals were `str` messages |
+| `process.events.notify_service_stop` | not tabled | `err[io_error.Error]` | the same unit-success shape as `make` and `close` |
+| `process.exec.resolve_in` when a candidate cannot be examined | not tabled (S3b left `file_exists`, reading a refused `is_file` query as absent) | the search continues past the refused query, a later hit still wins, and a search that finds nothing reports the last refusal as `Error.query{io_error.Error}` instead of `not_found` | `execvp`'s rule: an unreadable PATH entry does not hide a program further along, and a name found nowhere is not "not found" when a directory could not be looked at |
+| `net.resolve.lines.next` with a zero capacity | not tabled | `EINVAL` on `OP_READ` | a line cannot be delivered into no storage; before, a zero capacity read as an empty line |
+| `net.resolve.conf.load`, `net.resolve.hosts.collect` | "config loading surfaces read/close failure" | `load` `err[io_error.Error]`, `collect` `res[usize, io_error.Error]`; a missing file is the defaults (`load`) or zero entries (`collect`), every other open, read or close failure is reported | `ENOENT` is the documented absent-configuration case; a permission or read failure used to fall through to the defaults silently |
+| `net.resolve.shared` allocation failures | `alloc: allocator.Error` distinct | `types.Error{kind: OUT_OF_MEMORY, native_code: ENOMEM}` for a refused acquisition, `{SYSTEM_FAILURE, status}` for a refused release | `types.Error` is the retained resolver record: the adapter boundary (`types.AdapterFun`) returns it by value and the completion queue stores it, so it cannot become a tag nesting `allocator.Error` without changing the adapter contract; the two allocator cases stay distinct through the existing kinds |
+| `net.resolve.lookup.Outcome` | "becomes a tag" | `pub tag Outcome: u8 { found; no_name; temporary; failed; }` | `found` first so a zero-initialized answer reads as found only when `resolve_name` wrote it; the adapters map the three failures onto `types.NO_NAME`, `TEMPORARY` and `SYSTEM_FAILURE` |
 
 ## Frozen core signatures
 
@@ -415,6 +430,57 @@ every valid prepared transaction by commit or abort; recovery only under the
 coordinator lock with no live claims) are unchanged; only the spelling of the
 outcomes moved.
 
+### Process and network (S3c)
+
+| API | signature | frozen |
+| --- | --- | --- |
+| `process.env.EnvError` | `pub tag EnvError: u8 { native: i64; alloc: A.Error; changed; }` | yes |
+| `process.env.get` | `fun(name: str, buf: *u8, cap: usize) res[opt[usize], EnvError]` (the full length excluding the terminator; `>= cap` is truncation; unset is `none`) | yes |
+| `process.env.value` | `fun(a: *A.Allocator, name: str) res[opt[OwnedString], EnvError]` (one probe, one exact read; unset or longer at the second read is `changed`) | yes |
+| `process.env.current_dir` | `fun(a: *A.Allocator) res[OwnedString, EnvError]` | yes |
+| `process.env.compare_names` | `fun(left: str, right: str) res[i32, EnvError]` | yes |
+| `process.env.environ` | unchanged | yes |
+| `os.ProcessStatus` | `pub rec ProcessStatus { kind: u8; code: u32; signal: i32; core_dumped: bool; }` with `PROCESS_EXITED`, `PROCESS_SIGNALED`, `PROCESS_STOPPED`, `PROCESS_CONTINUED`; `code` is the full 32-bit Windows exit code | yes |
+| `os.ProcessWaitError` | `pub rec ProcessWaitError { code: i64; native_code: u32; operation: u8; }` (`PROCESS_OP_WAIT`, `STATUS`, `CLOSE`, `SPAWN`, `READ`, `PIPE`, `TERMINATE`) | yes |
+| `process.exec.ExitStatus` | `fwd ExitStatus: os.ProcessStatus`; `exited`, `code`, `signaled`, `signal` unchanged predicates and projections | yes |
+| `process.exec.Failure` | `pub rec Failure { code: i64; native_code: u32; operation: u8; child: Child; }` | yes |
+| `process.exec.OutputFailure` | `pub rec OutputFailure { read: ReadError; child: Child; wait: opt[os.ProcessWaitError]; }` | yes |
+| `process.exec.Error` | `pub tag Error: u8 { native: Failure; output: OutputFailure; alloc: A.Error; env: env.EnvError; empty_name; unset; not_found; ungrouped; unsupported; query: io_error.Error; }` | yes |
+| `process.exec.retained` | `fun(error: Error) Child` (the child an error still owns, pid zero for none; an error owning a child is waited for or terminated before it is dropped) | yes |
+| `process.exec.run`, `run_shell`, `wait` | `... res[ExitStatus, Error]` | yes |
+| `process.exec.output` | `fun(a: *A.Allocator, pathname: str, argv: **u8, envp: **u8) res[Output, Error]` (the vector is released before an error is reported) | yes |
+| `process.exec.spawn*` | `... res[Child, Error]` | yes |
+| `process.exec.try_wait` | `fun(child: Child) res[opt[ExitStatus], Error]` (still running is `none`) | yes |
+| `process.exec.wait_any` | `fun() res[Reaped, Error]` | yes |
+| `process.exec.wait_within` | `fun(child: Child, scope: *cancel.Scope) res[Supervised, Error]` | yes |
+| `process.exec.terminate_child`, `terminate_group` | `fun(child: Child) err[Error]` | yes |
+| `process.exec.resolve`, `resolve_in` | `... res[str, Error]` (extent is `str_len + 1`, released with `text.string.str_free`) | yes |
+| `process.events.make`, `make_runtime`, `notify_service_stop`, `close` | `... err[io_error.Error]` (in place) | yes |
+| `process.events.next` | `fun(source: *Source) res[opt[Event], io_error.Error]` | yes |
+| `process.events.wait` | `fun(source: *Source, timeout_ms: i32) res[bool, io_error.Error]` | yes |
+| `net.ip.ParseError` | `pub tag ParseError: u8 { syntax; empty; bracket; zone; port; }` | yes |
+| `net.ip.ipv4_parse`, `ipv6_parse`, `addr_parse`, `endpoint_parse` | `... res[IPv4\|IPv6\|Addr\|Endpoint, ParseError]`; formatting and predicates unchanged | yes |
+| `net.socket`, `net.tcp`, `net.udp`, `net.local`, `net.local.endpoint`, `net.async`, `net.async.local` | unit successes `err[io_error.Error]`; handle, endpoint, count and token results `res[T, io_error.Error]`; `submit_*` `res[io_runtime.Token, io_error.Error]`; `wait` `res[usize, io_error.Error]` | yes |
+| `net.resolve.make*` | `... err[types.Error]` (in place) | yes |
+| `net.resolve.submit`, `submit_runtime` | `... res[types.Token\|io_runtime.Token, types.Error]` | yes |
+| `net.resolve.cancel` | `fun(resolver: *Resolver, token: types.Token) res[bool, StateError]` (true when it set the reason) | yes |
+| `net.resolve.close`, `destroy`, `resolution_destroy` | `... err[types.Error]` (a refused release keeps the storage owned) | yes |
+| `net.resolve.shared.destroy`, `allocate_endpoints`, `set_canonical`, `append_unique`, `deduplicate` | `... err[types.Error]` (an allocator refusal is `OUT_OF_MEMORY`; a refused release is `SYSTEM_FAILURE` with the backend status in `native_code`) | yes |
+| `net.resolve.lines.open`, `close` | `fun(reader: *Reader, ...) err[io_error.Error]` | yes |
+| `net.resolve.lines.next` | `fun(reader: *Reader, output: *u8, capacity: usize) res[opt[usize], io_error.Error]` (end of input is `none`; the full line length, `>= capacity` when truncated) | yes |
+| `net.resolve.service.lookup` | `fun(service: str, socket_kind: types.SocketKind) res[opt[u16], types.Error]` | yes |
+| `net.resolve.conf.load` | `fun(config: *Config) err[io_error.Error]`; `net.resolve.hosts.collect` `fun(lookup: *Lookup) res[usize, io_error.Error]` | yes |
+| `net.resolve.lookup.Outcome` | `pub tag Outcome: u8 { found; no_name; temporary; failed; }`; `resolve_name` returns it | yes |
+| `net.dns.lookup_hosts`, `query`, `resolve` | `fun(hostname: str, addr: *ip.IPv4) res[bool, types.Error]` (false is no such name, the error is a system failure) | yes |
+| `net.resolve.wire`, the native resolver and socket backends | unchanged | yes |
+
+Contract: an `exec.Error` that retains a child (`retained(error).pid > 0`)
+transfers that child's ownership to the caller, who waits for it or terminates
+it before dropping the error. `ExitStatus` is an observation, so `wait` only
+returns exited or signaled observations and `try_wait` reports a still-running
+child as `none`. Resolver storage refused on release stays owned by the
+resolution, never leaked and never freed twice.
+
 ## Domain inventory
 
 Lanes are the roadmap's: S2 value/text/codec, S3 I/O, filesystem, process,
@@ -515,21 +581,21 @@ above. `types.result` and `types.option` remain for the unmigrated consumers.
 
 | module | outcome-bearing APIs | representation | S0 rule |
 | --- | --- | --- | --- |
-| `process.env` | `get` | `res[opt[usize], EnvError]`: missing is `none`, the length excludes the terminator | environment-buffer |
-| | `value` | `res[opt[OwnedString], EnvError]` with the read-again race bounded and reported (`changed`) and the owned extent preserved (translation shims at the `A.allocate` and `str_copy` sites) | environment-owned |
-| | `current_dir` | `res[OwnedString, EnvError]` with native and allocation failure distinct | environment-owned |
-| | `compare_names` | `res[i32, EnvError]` keeping native Unicode comparison failure | environment-order |
-| `process.exec` | `run`, `run_shell`, `output`, `spawn*`, `wait`, `wait_any`, `wait_within`, `resolve`, `resolve_in` | `res[T, Error]` where `Error` is `feat/618`'s typed record (unreaped child, detail, native code, operation, secondary wait failure); `try_wait` `res[opt[ExitStatus], Error]`; `terminate_child`, `terminate_group` `err[Error]`; `ExitStatus` keeps the full 32-bit Windows code and POSIX exit/signal/stop distinctions (translation shims at the `str_copy`, `str_join`, `str_copy_slice` and `path.join` sites) | result-payload, process-poll |
-| `process.events` | `next` | `res[opt[Event], io_error.Error]`; `wait` `res[bool, io_error.Error]`; `make`, `make_runtime`, `close` `err[io_error.Error]` | event-poll, event-ready |
-| `net.ip` | `ipv4_parse`, `ipv6_parse`, `addr_parse`, `endpoint_parse` | `res[T, ParseError]`; predicates unchanged | result-payload |
-| `net.socket`, `net.tcp`, `net.udp`, `net.local`, `net.local.endpoint`, `net.async`, `net.async.local` | every `Result[bool, io_error.Error]` | `err[io_error.Error]`; value results stay `res[T, io_error.Error]`; completion lifetimes and retained descriptors survive in the error | result-payload |
-| `net.async.linux`, `darwin`, `windows`, `net.async.local.unix`, `net.async.local.windows`, `net.local.unix`, `net.local.windows` | native `i64` | unchanged native boundary | native-boundary |
-| `net.resolve` | `make*` | `err[types.Error]`; `submit`, `submit_runtime` `res[Token, types.Error]`; `cancel` `res[bool, StateError]` (whether it changed the reason); `close`, `destroy`, `resolution_destroy` `err[types.Error]` keeping live resolution storage on failure | resolver-operation |
-| `net.resolve.shared` | `destroy`, `allocate_endpoints`, `set_canonical`, `append_unique`, `deduplicate` | `err[types.Error]` with `alloc: allocator.Error` distinct; `error` still constructs an error value; `valid`, `within_limits`, `canonical_fits` unchanged predicates | resolver-operation |
-| `net.resolve.lines` | `open` `err[io_error.Error]`; `next` `res[opt[usize], io_error.Error]` (EOF is `none`, the full line length on success); `close` surfaces cleanup failure | resolver-lines |
-| `net.resolve.service.lookup` | `res[opt[u16], types.Error]`, output pointer removed; `numeric`, `scan_line` unchanged | service-lookup |
-| `net.dns` | `lookup_hosts`, `query`, `resolve` | `res[bool, types.Error]` with the existing output pointer | resolver-query |
-| `net.resolve.conf`, `hosts`, `linux`, `darwin`, `windows`, `wire`, `lookup`, `order` | | per the census: `Outcome` becomes a tag, wire parsing stays a predicate with `Parsed` status, config loading surfaces read/close failure | closed-value, retained |
+| `process.env` | `get` | done (S3c): `res[opt[usize], EnvError]`, missing is `none`, the length excludes the terminator | environment-buffer |
+| | `value` | done (S3c): `res[opt[OwnedString], EnvError]` with the read-again race bounded and reported (`changed`) and the owned extent preserved; the `A.allocate` and `str_copy` shims are gone | environment-owned |
+| | `current_dir` | done (S3c): `res[OwnedString, EnvError]` with native, allocation and `changed` distinct (correction above) | environment-owned |
+| | `compare_names` | done (S3c): `res[i32, EnvError]` keeping native Unicode comparison failure | environment-order |
+| `process.exec` | `run`, `run_shell`, `output`, `spawn*`, `wait`, `wait_any`, `wait_within`, `resolve`, `resolve_in` | done (S3c): `res[T, Error]` with `feat/618`'s `9dd151d` landed on the frozen signatures (unreaped child, native code, operation, the drain's `ReadError` beside the secondary wait failure); `try_wait` `res[opt[ExitStatus], Error]`; `terminate_child`, `terminate_group` `err[Error]`; `ExitStatus` keeps the full 32-bit Windows code and POSIX exit/signal/stop/continue distinctions; the `str_copy`, `str_join`, `str_copy_slice`, `path.join` and `read_error_text` shims are gone | result-payload, process-poll |
+| `process.events` | `next` | done (S3c): `res[opt[Event], io_error.Error]`; `wait` `res[bool, io_error.Error]`; `make`, `make_runtime`, `notify_service_stop`, `close` `err[io_error.Error]` | event-poll, event-ready |
+| `net.ip` | `ipv4_parse`, `ipv6_parse`, `addr_parse`, `endpoint_parse` | done (S3c): `res[T, ParseError]`; predicates unchanged | result-payload |
+| `net.socket`, `net.tcp`, `net.udp`, `net.local`, `net.local.endpoint`, `net.async`, `net.async.local` | every `Result[bool, io_error.Error]` | done (S3c): `err[io_error.Error]`; value results `res[T, io_error.Error]`; completion lifetimes and retained descriptors survive in the error; the `runtime_ok_*` predicates and re-wrapped runtime results are gone | result-payload |
+| `net.async.linux`, `darwin`, `windows`, `net.async.local.unix`, `net.async.local.windows`, `net.local.unix`, `net.local.windows` | native `i64` | unchanged native boundary (done, S3c) | native-boundary |
+| `net.resolve` | `make*` | done (S3c): `err[types.Error]`; `submit`, `submit_runtime` `res[Token, types.Error]`; `cancel` `res[bool, StateError]` (whether it changed the reason); `close`, `destroy`, `resolution_destroy` `err[types.Error]` keeping live resolution storage on failure | resolver-operation |
+| `net.resolve.shared` | `destroy`, `allocate_endpoints`, `set_canonical`, `append_unique`, `deduplicate` | done (S3c): `err[types.Error]` with the allocator's refusal carried as `OUT_OF_MEMORY` (correction above); `error` still constructs an error value; `valid`, `within_limits`, `canonical_fits` unchanged predicates | resolver-operation |
+| `net.resolve.lines` | `open` `err[io_error.Error]`; `next` `res[opt[usize], io_error.Error]` (EOF is `none`, the full line length on success); `close` surfaces cleanup failure | done (S3c) as tabled; a zero capacity is `EINVAL` (correction above) | resolver-lines |
+| `net.resolve.service.lookup` | `res[opt[u16], types.Error]`, output pointer removed; `numeric`, `scan_line` unchanged | done (S3c) as tabled | service-lookup |
+| `net.dns` | `lookup_hosts`, `query`, `resolve` | done (S3c): `res[bool, types.Error]` with the existing output pointer | resolver-query |
+| `net.resolve.conf`, `hosts`, `linux`, `darwin`, `windows`, `wire`, `lookup`, `order` | | done (S3c): `Outcome` is a tag, wire parsing stays a predicate with `Parsed` status, `conf.load` and `hosts.collect` surface open, read and close failure (corrections above) | closed-value, retained |
 
 ### Synchronization (S4)
 
@@ -597,13 +663,13 @@ phase (33 sites over 15 modules):
 | `data.toml` | 0 (8 removed by S2) | S2 |
 | `data.json` | 0 (4 removed by S2) | S2 |
 | `compress.inflate` | 0 (3 removed by S2) | S2/S8 |
-| `process.exec` | 2 | S3 |
-| `process.env` | 2 | S3 |
+| `process.exec` | 2 (removed, S3c) | S3 |
+| `process.env` | 2 (removed, S3c) | S3 |
 | `format` | 0 (2 removed by S2) | S2 |
-| `filesystem.transaction` | 0 (2 removed by S3b), plus `sprint_text` around `format.sprint` (7 call sites, added by S2) | S3 |
+| `filesystem.transaction` | 0 (2 removed by S3b), plus `sprint_text` around `format.sprint` (7 call sites, added by S2, removed by S3c) | S3 |
 | `encoding.binary` | 0 (1 removed by S2) | S2 |
 | `compress.zlib`, `compress.gzip` | 0 (1 each removed by S2) | S2/S8 |
-| `net.resolve`, `net.resolve.shared` | 0 (typed `types.Error` and `bool` already) | S3 |
+| `net.resolve`, `net.resolve.shared` | 0 (typed `types.Error` and `bool` already; the `bool` carriers are `err`/`res` since S3c) | S3 |
 
 The `system.os.*` hits of that string are the OS layer's own native
 messages, not shims.
@@ -617,13 +683,13 @@ module's own return types:
 | module | shim | lane |
 | --- | --- | --- |
 | `filesystem`, `filesystem.transaction` | removed by S3b (`FsError.read`/`write` carry the reader and writer tags whole; the transaction's writer callback returns `err[WriteError]`) | done |
-| `process.exec` | `file_exists` around `filesystem.is_file` (a query the platform cannot answer reads as absent) | S3c |
-| `process.exec` | `read_error_text` around `read_all` in `output` | S3c |
-| `process.events`, `net.async`, `net.async.local`, `net.resolve` | `runtime_ok_*` predicates and `res`/`canonical.err` bindings at every `io_runtime` call; `net.async.wait` and `process.events.begin_runtime_drain` re-wrap the runtime's `res` in their `Result` | S3c |
+| `process.exec` | `file_exists` around `filesystem.is_file` (a query the platform cannot answer reads as absent) (removed, S3c: the search continues past a refused query and reports it as `Error.query` when nothing is found) | S3c |
+| `process.exec` | `read_error_text` around `read_all` in `output` (removed, S3c: `Error.output` carries the `ReadError`) | S3c |
+| `process.events`, `net.async`, `net.async.local`, `net.resolve` | `runtime_ok_*` predicates and `res`/`canonical.err` bindings at every `io_runtime` call; `net.async.wait` and `process.events.begin_runtime_drain` re-wrap the runtime's `res` in their `Result` (removed, S3c: the runtime's outcome is returned as is) | S3c |
 | `input` | `ERR_EOF`, `read_error_text` in `read_line_from` | removed (S2): `InputError` nests the `ReadError` |
 | `format` | `ERR_SHORT_WRITE`, `write_error_text` | removed (S2): `WriteError` is the outcome; `capacity_exhausted` stays as the span sink's native `ENOSPC` report (correction above) |
 | `derive`, `data.json` | writer callbacks return the typed outcome; no message shim | done (S2) |
-| `filesystem.transaction` | `sprint_text` spelling `format.sprint`'s `FormatError` as `R.Result[str, str]` (`"out of memory"`) at seven call sites, left by S2 after S3b | S3c |
+| `filesystem.transaction` | `sprint_text` spelling `format.sprint`'s `FormatError` as `R.Result[str, str]` (`"out of memory"`) at seven call sites, left by S2 after S3b (removed, S3c: `sprint_name` returns `res[str, Error]` with the allocator refusal as `MEMORY` on the caller's `Op`, `abs_of` and the tests read `format.sprint`'s `res` directly) | S3c |
 | `log.sink`, `log` | `ERR_SHORT_WRITE`, `report_write` folding a `WriteError` into a `WriteReport` | S4 |
 
 ## Prepared branches
@@ -634,12 +700,12 @@ module's own return types:
   first scan because btrfs hides entries created after the descriptor was
   opened until a seek; `a230488`'s changelog line for process waits belongs
   to `9dd151d` and was not taken). `9dd151d` process status and wait
-  ownership (typed `exec.Error`, full Windows exit codes) is S3c's. `66d545c`
-  is superseded: std 1.0.2 on `dev` already declares both profiles (and
-  `{artifact.suffix}` landed with mach #3222). When rebased, `9dd151d` adopts
-  the frozen signatures above and spells its carriers as `res`, `opt` and
-  `err` (`R.Result[ExitStatus, Error]` becomes `res[ExitStatus, Error]`,
-  `O.Option[ExitStatus]` becomes `opt[ExitStatus]`).
+  ownership (typed `exec.Error`, full Windows exit codes) is landed by S3c
+  the same way (`process.exec.Error`, `os.ProcessStatus`, the
+  `test/process-status` CI leg; `R.Result[ExitStatus, Error]` became
+  `res[ExitStatus, Error]`, `O.Option[ExitStatus]` became `opt[ExitStatus]`).
+  `66d545c` is superseded: std 1.0.2 on `dev` already declares both profiles
+  (and `{artifact.suffix}` landed with mach #3222).
 - `origin/feat/mach-3110` (`ad7add3` on top of feat/618): the eight
   `sync.atomic` inline annotations. Orthogonal to S1; lands with N6 under S4.
   Its base is feat/618, so it rebases after that branch.
