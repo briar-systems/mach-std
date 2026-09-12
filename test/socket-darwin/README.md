@@ -36,3 +36,29 @@ never count as successful runtime controls.
 The nil-control receive uses a plain datagram with no ancillary data and checks payload truncation, zero returned control length and no acquired descriptor. Its raw result, flags, length and descriptor-count delta must match `control.c` on the same host. A nil control buffer requests no ancillary output, so this case does not require `MSG_CTRUNC`. The separate nonempty rights transfer and returned-flags control retain their strict checks.
 
 Darwin can install an unreported descriptor when receiving `SCM_RIGHTS` with a nil control pointer. Native C reproduces this kernel behavior. This raw boundary does not promise safe descriptor discard. The rights-transfer fixture supplies a sufficient control buffer and closes the returned descriptor.
+
+## Local byte ownership controls
+
+The `local-bytes`, `local-async` and `internet-async-capability` modes exercise the
+std 2.0 byte-only contract. All must exit zero on both Darwin architectures.
+The first queues a clean prefix followed by two messages with sixteen rights
+apiece. It requires the exact clean prefix, a zero-length no-op, an actual EFAULT
+peek, eight typed ancillary refusals and unchanged descriptor count. Closing the
+stream must release all queued pipe writers, observed as pipe EOF. The async mode
+requires an unsupported completion with zero bytes, then successful queued close
+and pipe EOF. The internet backend mode refuses a local handle before claiming a
+token or owner slot, retains EBADF for an invalid handle, and proves that the
+refused caller-owned local handle remains usable.
+
+These fixture processes may count their descriptors. Production never does.
+The 12-byte control region holds one native header solely to detect ancillary
+presence. It is not claimed to fit a rights payload. `layout.c` checks the native
+header size/alignment and MSG_PEEK value without changing the existing layout
+output. Existing raw adequate-buffer descriptor-transfer coverage remains intact.
+
+A removed-peek control must fail an exact ownership/value assertion in these new
+modes. Compile refusal, timeout or signal is not acceptance. The previously
+retained nil/tiny/plain-read leak probes need not run again. Source review also
+requires the consuming length to be the returned peek count, not the original
+request. No claim is made that the original-length mutation necessarily crosses
+a control-record boundary on XNU's current record traversal.

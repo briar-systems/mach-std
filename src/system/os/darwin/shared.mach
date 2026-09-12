@@ -20,6 +20,8 @@ $if ($mach.build.os != $mach.os.darwin) {
 }
 
 use os_shared: std.system.os.shared;
+fwd os_shared.DirectoryEntry;
+fwd os_shared.DirectoryInitResult;
 use ls: std.system.os.darwin.libsystem;
 fwd ls.IoVector;
 
@@ -32,7 +34,6 @@ val SYS_WAIT4:            usize = 7;
 val SYS_WAITID:           usize = 173;
 val SYS_EXECVE:           usize = 59;
 val SYS_VFORK:            usize = 66;
-val SYS_GETDIRENTRIES64:  usize = 344;
 val SYS_GETPID:           usize = 20;
 val SYS_KILL:             usize = 37;
 val SYS_GETRLIMIT:        usize = 194;
@@ -119,14 +120,12 @@ pub rec timespec {
     tv_nsec: i64;
 }
 
-# directory entry (darwin getdirentries64 layout)
-pub rec dirent64 {
-    d_ino:     u64;
-    d_seekoff: u64;
-    d_reclen:  u16;
-    d_namlen:  u16;
-    d_type:    u8;
-    d_name:    [1024]u8;
+pub rec DirectoryCursor {
+    address: usize;
+    active: bool;
+    ended: bool;
+    error: i64;
+    stream: ls.DirectoryStream;
 }
 
 # path
@@ -869,10 +868,72 @@ pub fun make_dir(dirfd: i32, path: *u8, mode: i32) i64 {
     ret 0;
 }
 
-# darwin uses getdirentries64 instead of getdents64
-pub fun read_dir(fd: i32, dirp: *dirent64, count: usize) i64 {
-    var basep: i64 = 0;
-    ret syscall4(SYS_GETDIRENTRIES64, fd::isize::usize, dirp::usize, count, (?basep)::usize);
+# fd and its aliases lend exclusive enumeration and seek access until close
+pub fun directory_init(out: *DirectoryCursor, fd: i32) DirectoryInitResult {
+    if (out == nil || (out.address != 0 && (out.address != out::usize || out.active))) {
+        ret DirectoryInitResult{code: EINVAL};
+    }
+    out.address = out::usize;
+    out.active = false;
+    val duplicate: i32 = ls.fcntl(fd, ls.F_DUPFD_CLOEXEC, 0::i32);
+    if (duplicate == -1) { ret DirectoryInitResult{code: ls.fail_errno()}; }
+    val stream: ls.DirectoryStream = ls.fdopendir(duplicate);
+    if (stream == nil) {
+        val primary: i64 = ls.fail_errno();
+        val cleaned: i64 = close(duplicate);
+        ret DirectoryInitResult{code: primary, cleanup_code: cleaned};
+    }
+    out.stream = stream;
+    out.ended = false;
+    out.error = 0;
+    out.active = true;
+    ret DirectoryInitResult{};
+}
+
+fun directory_failure(cursor: *DirectoryCursor, code: i64) i64 {
+    cursor.error = code;
+    ret code;
+}
+
+pub fun directory_next(cursor: *DirectoryCursor, out: *DirectoryEntry) i64 {
+    if (cursor == nil || out == nil || cursor.address != cursor::usize || !cursor.active) { ret EINVAL; }
+    if (cursor.error < 0) { ret cursor.error; }
+    if (cursor.ended) { ret 0; }
+    ls.clear_errno();
+    val native: *ls.DirectoryRecord = ls.readdir(cursor.stream);
+    if (native == nil) {
+        val code: i32 = ls.errno();
+        if (code != 0) { ret directory_failure(cursor, -(code::i64)); }
+        cursor.ended = true;
+        ret 0;
+    }
+    val name_offset: usize = $offset_of(ls.DirectoryRecord, name);
+    val extent: usize = native.record_length::usize;
+    if (extent <= name_offset) { ret directory_failure(cursor, EIO); }
+    val length: usize = native.name_length::usize;
+    if (length == 0 || length >= extent - name_offset) {
+        ret directory_failure(cursor, EIO);
+    }
+    val name: *u8 = ?native.name[0];
+    if (name[length] != 0) { ret directory_failure(cursor, EIO); }
+    var index: usize = 0;
+    for (index < length) {
+        if (name[index] == 0) { ret directory_failure(cursor, EIO); }
+        index = index + 1;
+    }
+    @out = DirectoryEntry{name: name::str, length: length, type_hint: native.type_hint};
+    ret 1;
+}
+
+# closedir consumes its stream even when the underlying close fails
+pub fun directory_close(cursor: *DirectoryCursor) i64 {
+    if (cursor == nil || cursor.address != cursor::usize) { ret EINVAL; }
+    if (!cursor.active) { ret 0; }
+    val stream: ls.DirectoryStream = cursor.stream;
+    cursor.active = false;
+    cursor.stream = nil;
+    if (ls.closedir(stream) == -1) { ret ls.fail_errno(); }
+    ret 0;
 }
 
 pub fun access(dirfd: i32, path: *u8, mode: i32, flags: i32) i64 {
@@ -2662,6 +2723,22 @@ pub fun sock_recv(fd: usize, buf: *u8, len: usize) i64 {
     ret read(fd::i32, buf, len);
 }
 
+# exclusively borrow the receive queue through peek and consume, including all aliases.
+# ancillary refusal leaves the socket and its queued rights owned by the caller.
+pub fun local_stream_recv(fd: usize, buffer: *u8, length: usize) i64 {
+    if (length == 0) { ret 0; }
+    if (buffer == nil || length > 0x7fffffff) { ret EINVAL; }
+    var control: ls.ControlHeader = ls.ControlHeader{};
+    var vector: ls.IoVector = ls.IoVector{data: buffer, length: length};
+    var message: ls.MessageHeader;
+    message_init(?message, nil, 0, ?vector, 1, (?control)::*u8, $size_of(ls.ControlHeader));
+    val peeked: i64 = ls.recvmsg(fd::i32, ?message, ls.MSG_PEEK);
+    if (peeked == -1) { ret ls.fail_errno(); }
+    if (message.control_length != 0 || (message.flags & (ls.MSG_TRUNC | ls.MSG_CTRUNC)) != 0) { ret ENOTSUP; }
+    if (peeked == 0) { ret 0; }
+    ret read(fd::i32, buffer, peeked::usize);
+}
+
 pub fun sock_write_vector(fd: usize, vectors: *IoVector, count: usize) i64 {
     if (vectors == nil || count == 0 || count > 1024) { ret EINVAL; }
     val result: i64 = ls.writev(fd::i32, vectors, count::i32);
@@ -3142,5 +3219,16 @@ test "std.system.os.darwin.spawn: concurrent grouped launches return ready group
     }
     if (bad != 0) { ret bad; }
     if (grouped_probe_descriptors() != before) { ret 5; }
+    ret 0;
+}
+
+
+test "std.system.os.directory.darwin: public variable record prefix uses exact field offsets" {
+    if ($offset_of(ls.DirectoryRecord, inode) != 0
+        || $offset_of(ls.DirectoryRecord, seek_offset) != 8
+        || $offset_of(ls.DirectoryRecord, record_length) != 16
+        || $offset_of(ls.DirectoryRecord, name_length) != 18
+        || $offset_of(ls.DirectoryRecord, type_hint) != 20
+        || $offset_of(ls.DirectoryRecord, name) != 21) { ret 1; }
     ret 0;
 }
