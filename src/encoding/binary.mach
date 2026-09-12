@@ -11,6 +11,10 @@
 # (`v:~u32`). pointers, strings, and variable-length data need a format
 # decision (length prefixes, encodings) the caller must make with the
 # byte/str operations.
+#
+# every producing operation reports an EncodeError and every consuming one a
+# DecodeError; both are closed tags, and a refused operation leaves its
+# encoder, builder or cursor exactly as it was.
 
 use std.types.canonical.res;
 use std.types.canonical.err;
@@ -23,7 +27,6 @@ use std.types.string.str_len;
 use std.memory;
 
 use A: std.allocator;
-use R: std.types.result;
 
 # byte order for multi-byte values
 pub def Order: u8;
@@ -32,6 +35,50 @@ pub val BIG:    Order = 1;
 
 # a logical position captured for explicit rollback
 pub def Checkpoint: usize;
+
+# every way a write, patch, alignment or reservation can fail
+# ---
+# alloc:     the encoder's growth was refused; the encoder is unchanged
+# overflow:  a length or epoch would not fit usize
+# invalid:   the encoder or builder is inconsistent (length past capacity,
+#            storage missing for a nonzero width, a nil source for nonzero
+#            bytes)
+# full:      the fixed builder lacks room; payload is the bytes available
+# alignment: the boundary is not a power of two; payload is the boundary
+# reserved:  the builder is locked by an active reservation
+# bounds:    a patch or checkpoint lies outside the published bytes
+# inactive:  the reservation was already resolved, or never made
+# stale:     the reservation no longer matches its parent
+# busy:      the reservation's child still holds a reservation of its own
+pub tag EncodeError: u8 {
+    alloc:     A.Error;
+    overflow;
+    invalid;
+    full:      usize;
+    alignment: usize;
+    reserved;
+    bounds;
+    inactive;
+    stale;
+    busy;
+}
+
+# every way a read, skip, alignment or checkpoint can fail
+# ---
+# short:        the request exceeds the bytes remaining; payload is the
+#               remaining count
+# invalid:      the cursor is inconsistent (position past the end, storage
+#               missing for pending bytes)
+# alignment:    the boundary is not a power of two; payload is the boundary
+# bounds:       a checkpoint lies outside the cursor's past
+# unterminated: no null terminator before the end
+pub tag DecodeError: u8 {
+    short:        usize;
+    invalid;
+    alignment:    usize;
+    bounds;
+    unterminated;
+}
 
 # write the low sz bytes of v into dst in the given order
 # ---
@@ -78,16 +125,17 @@ fun span_fits(total: usize, offset: usize, width: usize) bool {
     ret width <= total - offset;
 }
 
-# padding required to reach a power-of-two boundary
-fun alignment_padding(pos: usize, boundary: usize) R.Result[usize, str] {
-    if (boundary == 0) { ret R.err[usize, str]("invalid alignment"); }
+# padding required to reach a power-of-two boundary, or none for a boundary
+# that is not one
+fun alignment_padding(pos: usize, boundary: usize) res[usize, usize] {
+    if (boundary == 0) { ret res[usize, usize].err{boundary}; }
 
     val mask: usize = boundary - 1;
-    if ((boundary & mask) != 0) { ret R.err[usize, str]("invalid alignment"); }
+    if ((boundary & mask) != 0) { ret res[usize, usize].err{boundary}; }
 
     val rem: usize = pos & mask;
-    if (rem == 0) { ret R.ok[usize, str](0); }
-    ret R.ok[usize, str](boundary - rem);
+    if (rem == 0) { ret res[usize, usize].ok{0}; }
+    ret res[usize, usize].ok{boundary - rem};
 }
 
 # grow by powers of two without allowing the capacity to wrap
@@ -103,6 +151,13 @@ fun growth_capacity(current: usize, need: usize) usize {
     ret cap;
 }
 
+fun encode_fail(e: EncodeError) res[usize, EncodeError] {
+    ret res[usize, EncodeError].err{e};
+}
+
+fun encoded(n: usize) res[usize, EncodeError] {
+    ret res[usize, EncodeError].ok{n};
+}
 
 # growable byte sequence with a fixed byte order
 # ---
@@ -134,61 +189,64 @@ pub fun encoder(a: *A.Allocator, order: Order) Encoder {
     ret e;
 }
 
-# free the encoder's buffer and reset it
+# release the encoder's buffer and reset it
+#
+# an encoder that owns no buffer is reset without asking the allocator. a
+# refused release leaves the encoder owning its buffer.
 # ---
 # e:   encoder to deinitialize
-# ret: true if memory was freed
-pub fun encoder_dnit(e: *Encoder) bool {
-    if (e == nil)   { ret true; }
-    if (e.cap == 0) { e.data = nil; e.len = 0; ret true; }
+# ret: ok, or the allocator's refusal
+pub fun encoder_dnit(e: *Encoder) err[A.Error] {
+    if (e.cap == 0) { e.data = nil; e.len = 0; ret err[A.Error].ok{}; }
 
     val freed: err[A.Error] = A.deallocate[u8](e.alloc, e.data, e.cap);
-    if (sel freed.err) { ret false; }
+    if (sel freed.err) { ret freed; }
     e.data = nil;
     e.len  = 0;
     e.cap  = 0;
-    ret true;
+    ret err[A.Error].ok{};
 }
 
 # ensure capacity for `additional` more bytes
 # ---
 # e:          encoder to reserve in
 # additional: number of additional bytes needed
-# ret:        new capacity, or an error
-pub fun reserve(e: *Encoder, additional: usize) R.Result[usize, str] {
-    if (e.len > e.cap) { ret R.err[usize, str]("invalid encoder"); }
-    if (e.cap > 0 && e.data == nil) { ret R.err[usize, str]("invalid encoder"); }
+# ret:        new capacity, or the failure; a refused growth leaves the
+#             encoder as it was
+pub fun reserve(e: *Encoder, additional: usize) res[usize, EncodeError] {
+    if (e.len > e.cap) { ret encode_fail(EncodeError.invalid{}); }
+    if (e.cap > 0 && e.data == nil) { ret encode_fail(EncodeError.invalid{}); }
 
     val need: usize = e.len + additional;
-    if (need < e.len)  { ret R.err[usize, str]("capacity overflow"); }
-    if (e.cap >= need) { ret R.ok[usize, str](e.cap); }
+    if (need < e.len)  { ret encode_fail(EncodeError.overflow{}); }
+    if (e.cap >= need) { ret encoded(e.cap); }
 
     val new_cap: usize = growth_capacity(e.cap, need);
 
     val r: res[*u8, A.Error] = A.reallocate[u8](e.alloc, e.data, e.cap, new_cap);
-    if (sel r.err) { ret R.err[usize, str]("out of memory"); }
+    if (sel r.err) { ret encode_fail(EncodeError.alloc{r.err}); }
 
     e.data = r.ok;
     e.cap  = new_cap;
-    ret R.ok[usize, str](e.cap);
+    ret encoded(e.cap);
 }
 
 # append sz bytes of v in the encoder's byte order
-fun write_uint(e: *Encoder, v: u64, sz: usize) R.Result[usize, str] {
-    val rr: R.Result[usize, str] = reserve(e, sz);
-    if (R.is_err[usize, str](rr)) { ret rr; }
+fun write_uint(e: *Encoder, v: u64, sz: usize) res[usize, EncodeError] {
+    val rr: res[usize, EncodeError] = reserve(e, sz);
+    if (sel rr.err) { ret rr; }
 
     put_uint(?e.data[e.len], v, sz, e.order);
     e.len = e.len + sz;
-    ret R.ok[usize, str](e.len);
+    ret encoded(e.len);
 }
 
 # append a u8
 # ---
 # e:   encoder to write into
 # v:   value to append
-# ret: new length, or an error
-pub fun write_u8(e: *Encoder, v: u8) R.Result[usize, str] {
+# ret: new length, or the failure
+pub fun write_u8(e: *Encoder, v: u8) res[usize, EncodeError] {
     ret write_uint(e, v::u64, 1);
 }
 
@@ -196,8 +254,8 @@ pub fun write_u8(e: *Encoder, v: u8) R.Result[usize, str] {
 # ---
 # e:   encoder to write into
 # v:   value to append
-# ret: new length, or an error
-pub fun write_u16(e: *Encoder, v: u16) R.Result[usize, str] {
+# ret: new length, or the failure
+pub fun write_u16(e: *Encoder, v: u16) res[usize, EncodeError] {
     ret write_uint(e, v::u64, 2);
 }
 
@@ -205,8 +263,8 @@ pub fun write_u16(e: *Encoder, v: u16) R.Result[usize, str] {
 # ---
 # e:   encoder to write into
 # v:   value to append
-# ret: new length, or an error
-pub fun write_u32(e: *Encoder, v: u32) R.Result[usize, str] {
+# ret: new length, or the failure
+pub fun write_u32(e: *Encoder, v: u32) res[usize, EncodeError] {
     ret write_uint(e, v::u64, 4);
 }
 
@@ -214,8 +272,8 @@ pub fun write_u32(e: *Encoder, v: u32) R.Result[usize, str] {
 # ---
 # e:   encoder to write into
 # v:   value to append
-# ret: new length, or an error
-pub fun write_u64(e: *Encoder, v: u64) R.Result[usize, str] {
+# ret: new length, or the failure
+pub fun write_u64(e: *Encoder, v: u64) res[usize, EncodeError] {
     ret write_uint(e, v, 8);
 }
 
@@ -224,72 +282,67 @@ pub fun write_u64(e: *Encoder, v: u64) R.Result[usize, str] {
 # e:   encoder to write into
 # p:   source bytes
 # len: number of bytes
-# ret: new length, or an error
-pub fun write_bytes(e: *Encoder, p: *u8, len: usize) R.Result[usize, str] {
-    if (len == 0) { ret R.ok[usize, str](e.len); }
+# ret: new length, or the failure
+pub fun write_bytes(e: *Encoder, p: *u8, len: usize) res[usize, EncodeError] {
+    if (len == 0) { ret encoded(e.len); }
+    if (p == nil) { ret encode_fail(EncodeError.invalid{}); }
 
-    val rr: R.Result[usize, str] = reserve(e, len);
-    if (R.is_err[usize, str](rr)) { ret rr; }
+    val rr: res[usize, EncodeError] = reserve(e, len);
+    if (sel rr.err) { ret rr; }
 
     memory.copy[u8](?e.data[e.len], p, len);
     e.len = e.len + len;
-    ret R.ok[usize, str](e.len);
+    ret encoded(e.len);
 }
 
 # append a string and its null terminator
 # ---
 # e:   encoder to write into
 # s:   string to append
-# ret: new length, or an error
-pub fun write_str(e: *Encoder, s: str) R.Result[usize, str] {
+# ret: new length, or the failure
+pub fun write_str(e: *Encoder, s: str) res[usize, EncodeError] {
     val slen:  usize = str_len(s);
-    if (slen == 0 - 1) { ret R.err[usize, str]("capacity overflow"); }
+    if (slen == 0 - 1) { ret encode_fail(EncodeError.overflow{}); }
     val total: usize = slen + 1;
 
-    val rr: R.Result[usize, str] = reserve(e, total);
-    if (R.is_err[usize, str](rr)) { ret rr; }
+    val rr: res[usize, EncodeError] = reserve(e, total);
+    if (sel rr.err) { ret rr; }
 
     memory.copy[u8](?e.data[e.len], s, slen);
     e.data[e.len + slen] = 0;
     e.len = e.len + total;
-    ret R.ok[usize, str](e.len);
+    ret encoded(e.len);
 }
 
 # pad with zero bytes up to an alignment boundary
 # ---
 # e:        encoder to align
 # boundary: alignment boundary (a power of two)
-# ret:      new length, or an error
-pub fun align(e: *Encoder, boundary: usize) R.Result[usize, str] {
-    val pr: R.Result[usize, str] = alignment_padding(e.len, boundary);
-    if (R.is_err[usize, str](pr)) { ret pr; }
+# ret:      new length, or the failure
+pub fun align(e: *Encoder, boundary: usize) res[usize, EncodeError] {
+    val pr: res[usize, usize] = alignment_padding(e.len, boundary);
+    if (sel pr.err) { ret encode_fail(EncodeError.alignment{pr.err}); }
 
-    val pad: usize = R.unwrap_ok[usize, str](pr);
-    if (pad == 0) {
-        val rr: R.Result[usize, str] = reserve(e, 0);
-        if (R.is_err[usize, str](rr)) { ret rr; }
-        ret R.ok[usize, str](e.len);
-    }
-
-    val rr: R.Result[usize, str] = reserve(e, pad);
-    if (R.is_err[usize, str](rr)) { ret rr; }
+    val pad: usize = pr.ok;
+    val rr: res[usize, EncodeError] = reserve(e, pad);
+    if (sel rr.err) { ret rr; }
+    if (pad == 0) { ret encoded(e.len); }
 
     memory.fill[u8](?e.data[e.len], 0, pad);
     e.len = e.len + pad;
-    ret R.ok[usize, str](e.len);
+    ret encoded(e.len);
 }
 
 # overwrite sz bytes of v at an earlier offset without changing length
-fun patch_uint(e: *Encoder, offset: usize, v: u64, sz: usize) R.Result[usize, str] {
-    if (offset > e.len)       { ret R.err[usize, str]("patch out of bounds"); }
-    if (sz > e.len - offset)  { ret R.err[usize, str]("patch out of bounds"); }
+fun patch_uint(e: *Encoder, offset: usize, v: u64, sz: usize) res[usize, EncodeError] {
+    if (!span_fits(e.len, offset, sz)) { ret encode_fail(EncodeError.bounds{}); }
 
     put_uint(?e.data[offset], v, sz, e.order);
-    ret R.ok[usize, str](sz);
+    ret encoded(sz);
 }
 
 # overwrite a u8 at an earlier offset without changing length
-pub fun patch_u8(e: *Encoder, offset: usize, v: u8) R.Result[usize, str] {
+pub fun patch_u8(e: *Encoder, offset: usize, v: u8) res[usize, EncodeError] {
     ret patch_uint(e, offset, v::u64, 1);
 }
 
@@ -298,8 +351,8 @@ pub fun patch_u8(e: *Encoder, offset: usize, v: u8) R.Result[usize, str] {
 # e:      encoder to patch
 # offset: byte offset to write at
 # v:      value to write
-# ret:    bytes written, or an error
-pub fun patch_u16(e: *Encoder, offset: usize, v: u16) R.Result[usize, str] {
+# ret:    bytes written, or the failure
+pub fun patch_u16(e: *Encoder, offset: usize, v: u16) res[usize, EncodeError] {
     ret patch_uint(e, offset, v::u64, 2);
 }
 
@@ -308,8 +361,8 @@ pub fun patch_u16(e: *Encoder, offset: usize, v: u16) R.Result[usize, str] {
 # e:      encoder to patch
 # offset: byte offset to write at
 # v:      value to write
-# ret:    bytes written, or an error
-pub fun patch_u32(e: *Encoder, offset: usize, v: u32) R.Result[usize, str] {
+# ret:    bytes written, or the failure
+pub fun patch_u32(e: *Encoder, offset: usize, v: u32) res[usize, EncodeError] {
     ret patch_uint(e, offset, v::u64, 4);
 }
 
@@ -318,8 +371,8 @@ pub fun patch_u32(e: *Encoder, offset: usize, v: u32) R.Result[usize, str] {
 # e:      encoder to patch
 # offset: byte offset to write at
 # v:      value to write
-# ret:    bytes written, or an error
-pub fun patch_u64(e: *Encoder, offset: usize, v: u64) R.Result[usize, str] {
+# ret:    bytes written, or the failure
+pub fun patch_u64(e: *Encoder, offset: usize, v: u64) res[usize, EncodeError] {
     ret patch_uint(e, offset, v, 8);
 }
 
@@ -379,149 +432,143 @@ pub fun builder_remaining(b: *Builder) usize {
 }
 
 # validate one atomic fixed-buffer write and return its start
-fun builder_prepare(b: *Builder, width: usize) R.Result[usize, str] {
-    if (b == nil) { ret R.err[usize, str]("builder nil"); }
-    if (b.reserved) { ret R.err[usize, str]("builder reserved"); }
-    if (b.len > b.cap) { ret R.err[usize, str]("invalid builder"); }
-    if (width > b.cap - b.len) { ret R.err[usize, str]("builder full"); }
-    if (width > 0 && b.data == nil) { ret R.err[usize, str]("invalid builder"); }
-    ret R.ok[usize, str](b.len);
+fun builder_prepare(b: *Builder, width: usize) res[usize, EncodeError] {
+    if (b.reserved) { ret encode_fail(EncodeError.reserved{}); }
+    if (b.len > b.cap) { ret encode_fail(EncodeError.invalid{}); }
+    if (width > b.cap - b.len) { ret encode_fail(EncodeError.full{b.cap - b.len}); }
+    if (width > 0 && b.data == nil) { ret encode_fail(EncodeError.invalid{}); }
+    ret encoded(b.len);
 }
 
 # append one fixed-width integer atomically
-fun builder_write_uint(b: *Builder, v: u64, width: usize) R.Result[usize, str] {
-    val pr: R.Result[usize, str] = builder_prepare(b, width);
-    if (R.is_err[usize, str](pr)) { ret pr; }
+fun builder_write_uint(b: *Builder, v: u64, width: usize) res[usize, EncodeError] {
+    val pr: res[usize, EncodeError] = builder_prepare(b, width);
+    if (sel pr.err) { ret pr; }
 
-    val start: usize = R.unwrap_ok[usize, str](pr);
+    val start: usize = pr.ok;
     put_uint(?b.data[start], v, width, b.order);
     b.len = start + width;
-    ret R.ok[usize, str](b.len);
+    ret encoded(b.len);
 }
 
 # append a u8 atomically
-pub fun builder_write_u8(b: *Builder, v: u8) R.Result[usize, str] {
+pub fun builder_write_u8(b: *Builder, v: u8) res[usize, EncodeError] {
     ret builder_write_uint(b, v::u64, 1);
 }
 
 # append a u16 in the builder's byte order atomically
-pub fun builder_write_u16(b: *Builder, v: u16) R.Result[usize, str] {
+pub fun builder_write_u16(b: *Builder, v: u16) res[usize, EncodeError] {
     ret builder_write_uint(b, v::u64, 2);
 }
 
 # append a u32 in the builder's byte order atomically
-pub fun builder_write_u32(b: *Builder, v: u32) R.Result[usize, str] {
+pub fun builder_write_u32(b: *Builder, v: u32) res[usize, EncodeError] {
     ret builder_write_uint(b, v::u64, 4);
 }
 
 # append a u64 in the builder's byte order atomically
-pub fun builder_write_u64(b: *Builder, v: u64) R.Result[usize, str] {
+pub fun builder_write_u64(b: *Builder, v: u64) res[usize, EncodeError] {
     ret builder_write_uint(b, v, 8);
 }
 
 # append raw bytes atomically
-pub fun builder_write_bytes(b: *Builder, data: *u8, len: usize) R.Result[usize, str] {
-    if (len > 0 && data == nil) { ret R.err[usize, str]("source nil"); }
+pub fun builder_write_bytes(b: *Builder, data: *u8, len: usize) res[usize, EncodeError] {
+    if (len > 0 && data == nil) { ret encode_fail(EncodeError.invalid{}); }
 
-    val pr: R.Result[usize, str] = builder_prepare(b, len);
-    if (R.is_err[usize, str](pr)) { ret pr; }
+    val pr: res[usize, EncodeError] = builder_prepare(b, len);
+    if (sel pr.err) { ret pr; }
 
-    val start: usize = R.unwrap_ok[usize, str](pr);
+    val start: usize = pr.ok;
     if (len > 0) { memory.copy[u8](?b.data[start], data, len); }
     b.len = start + len;
-    ret R.ok[usize, str](b.len);
+    ret encoded(b.len);
 }
 
 # append a string and null terminator atomically
-pub fun builder_write_str(b: *Builder, s: str) R.Result[usize, str] {
+pub fun builder_write_str(b: *Builder, s: str) res[usize, EncodeError] {
     val slen: usize = str_len(s);
-    if (slen == 0 - 1) { ret R.err[usize, str]("capacity overflow"); }
+    if (slen == 0 - 1) { ret encode_fail(EncodeError.overflow{}); }
 
     val total: usize = slen + 1;
-    val pr: R.Result[usize, str] = builder_prepare(b, total);
-    if (R.is_err[usize, str](pr)) { ret pr; }
+    val pr: res[usize, EncodeError] = builder_prepare(b, total);
+    if (sel pr.err) { ret pr; }
 
-    val start: usize = R.unwrap_ok[usize, str](pr);
+    val start: usize = pr.ok;
     if (slen > 0) { memory.copy[u8](?b.data[start], s, slen); }
     b.data[start + slen] = 0;
     b.len = start + total;
-    ret R.ok[usize, str](b.len);
+    ret encoded(b.len);
 }
 
 # append zero padding to a power-of-two boundary atomically
-pub fun builder_align(b: *Builder, boundary: usize) R.Result[usize, str] {
-    if (b == nil) { ret R.err[usize, str]("builder nil"); }
+pub fun builder_align(b: *Builder, boundary: usize) res[usize, EncodeError] {
+    val ar: res[usize, usize] = alignment_padding(b.len, boundary);
+    if (sel ar.err) { ret encode_fail(EncodeError.alignment{ar.err}); }
 
-    val ar: R.Result[usize, str] = alignment_padding(b.len, boundary);
-    if (R.is_err[usize, str](ar)) { ret ar; }
+    val pad: usize = ar.ok;
+    val pr: res[usize, EncodeError] = builder_prepare(b, pad);
+    if (sel pr.err) { ret pr; }
 
-    val pad: usize = R.unwrap_ok[usize, str](ar);
-    val pr: R.Result[usize, str] = builder_prepare(b, pad);
-    if (R.is_err[usize, str](pr)) { ret pr; }
-
-    val start: usize = R.unwrap_ok[usize, str](pr);
+    val start: usize = pr.ok;
     if (pad > 0) { memory.fill[u8](?b.data[start], 0, pad); }
     b.len = start + pad;
-    ret R.ok[usize, str](b.len);
+    ret encoded(b.len);
 }
 
 # patch a published fixed-width integer without changing length
-fun builder_patch_uint(b: *Builder, offset: usize, v: u64, width: usize) R.Result[usize, str] {
-    if (b == nil) { ret R.err[usize, str]("builder nil"); }
-    if (b.reserved) { ret R.err[usize, str]("builder reserved"); }
-    if (!span_fits(b.len, offset, width)) { ret R.err[usize, str]("patch out of bounds"); }
-    if (width > 0 && b.data == nil) { ret R.err[usize, str]("invalid builder"); }
+fun builder_patch_uint(b: *Builder, offset: usize, v: u64, width: usize) res[usize, EncodeError] {
+    if (b.reserved) { ret encode_fail(EncodeError.reserved{}); }
+    if (!span_fits(b.len, offset, width)) { ret encode_fail(EncodeError.bounds{}); }
+    if (width > 0 && b.data == nil) { ret encode_fail(EncodeError.invalid{}); }
 
     put_uint(?b.data[offset], v, width, b.order);
-    ret R.ok[usize, str](width);
+    ret encoded(width);
 }
 
 # patch one published byte without changing length
-pub fun builder_patch_u8(b: *Builder, offset: usize, v: u8) R.Result[usize, str] {
+pub fun builder_patch_u8(b: *Builder, offset: usize, v: u8) res[usize, EncodeError] {
     ret builder_patch_uint(b, offset, v::u64, 1);
 }
 
 # patch a published u16 without changing length
-pub fun builder_patch_u16(b: *Builder, offset: usize, v: u16) R.Result[usize, str] {
+pub fun builder_patch_u16(b: *Builder, offset: usize, v: u16) res[usize, EncodeError] {
     ret builder_patch_uint(b, offset, v::u64, 2);
 }
 
 # patch a published u32 without changing length
-pub fun builder_patch_u32(b: *Builder, offset: usize, v: u32) R.Result[usize, str] {
+pub fun builder_patch_u32(b: *Builder, offset: usize, v: u32) res[usize, EncodeError] {
     ret builder_patch_uint(b, offset, v::u64, 4);
 }
 
 # patch a published u64 without changing length
-pub fun builder_patch_u64(b: *Builder, offset: usize, v: u64) R.Result[usize, str] {
+pub fun builder_patch_u64(b: *Builder, offset: usize, v: u64) res[usize, EncodeError] {
     ret builder_patch_uint(b, offset, v, 8);
 }
 
 # capture the current fixed-builder length for explicit rollback
-pub fun builder_checkpoint(b: *Builder) R.Result[Checkpoint, str] {
-    if (b == nil) { ret R.err[Checkpoint, str]("builder nil"); }
-    if (b.reserved) { ret R.err[Checkpoint, str]("builder reserved"); }
-    if (b.len > b.cap) { ret R.err[Checkpoint, str]("invalid builder"); }
-    ret R.ok[Checkpoint, str](b.len);
+pub fun builder_checkpoint(b: *Builder) res[Checkpoint, EncodeError] {
+    if (b.reserved) { ret res[Checkpoint, EncodeError].err{EncodeError.reserved{}}; }
+    if (b.len > b.cap) { ret res[Checkpoint, EncodeError].err{EncodeError.invalid{}}; }
+    ret res[Checkpoint, EncodeError].ok{b.len};
 }
 
 # restore a prior builder checkpoint without changing backing bytes
-pub fun builder_rollback(b: *Builder, mark: Checkpoint) R.Result[usize, str] {
-    if (b == nil) { ret R.err[usize, str]("builder nil"); }
-    if (b.reserved) { ret R.err[usize, str]("builder reserved"); }
-    if (b.len > b.cap || mark > b.len) { ret R.err[usize, str]("invalid checkpoint"); }
+pub fun builder_rollback(b: *Builder, mark: Checkpoint) res[usize, EncodeError] {
+    if (b.reserved) { ret encode_fail(EncodeError.reserved{}); }
+    if (b.len > b.cap) { ret encode_fail(EncodeError.invalid{}); }
+    if (mark > b.len) { ret encode_fail(EncodeError.bounds{}); }
 
     b.len = mark;
-    ret R.ok[usize, str](b.len);
+    ret encoded(b.len);
 }
 
 # lock capacity for a child field without publishing parent length
-pub fun builder_reserve(b: *Builder, capacity: usize) R.Result[Reservation, str] {
-    if (b == nil) { ret R.err[Reservation, str]("builder nil"); }
-    if (b.reserved) { ret R.err[Reservation, str]("builder reserved"); }
-    if (b.len > b.cap) { ret R.err[Reservation, str]("invalid builder"); }
-    if (capacity > b.cap - b.len) { ret R.err[Reservation, str]("builder full"); }
-    if (capacity > 0 && b.data == nil) { ret R.err[Reservation, str]("invalid builder"); }
-    if (b.epoch == 0 - 1) { ret R.err[Reservation, str]("reservation overflow"); }
+pub fun builder_reserve(b: *Builder, capacity: usize) res[Reservation, EncodeError] {
+    if (b.reserved) { ret res[Reservation, EncodeError].err{EncodeError.reserved{}}; }
+    if (b.len > b.cap) { ret res[Reservation, EncodeError].err{EncodeError.invalid{}}; }
+    if (capacity > b.cap - b.len) { ret res[Reservation, EncodeError].err{EncodeError.full{b.cap - b.len}}; }
+    if (capacity > 0 && b.data == nil) { ret res[Reservation, EncodeError].err{EncodeError.invalid{}}; }
+    if (b.epoch == 0 - 1) { ret res[Reservation, EncodeError].err{EncodeError.overflow{}}; }
 
     var child_data: *u8 = nil;
     if (capacity > 0) { child_data = ?b.data[b.len]; }
@@ -536,7 +583,7 @@ pub fun builder_reserve(b: *Builder, capacity: usize) R.Result[Reservation, str]
     r.limit  = capacity;
     r.epoch  = b.epoch;
     r.active = true;
-    ret R.ok[Reservation, str](r);
+    ret res[Reservation, EncodeError].ok{r};
 }
 
 # invalidate a resolved reservation and revoke its child builder
@@ -551,45 +598,33 @@ fun reservation_close(r: *Reservation) {
 }
 
 # publish the completed prefix of a reservation as one logical field
-pub fun builder_commit(r: *Reservation) R.Result[usize, str] {
-    if (r == nil || !r.active || r.parent == nil) {
-        ret R.err[usize, str]("invalid reservation");
-    }
+pub fun builder_commit(r: *Reservation) res[usize, EncodeError] {
+    if (!r.active || r.parent == nil) { ret encode_fail(EncodeError.inactive{}); }
 
     val b: *Builder = r.parent;
-    if (!b.reserved || b.epoch != r.epoch || b.len != r.start) {
-        ret R.err[usize, str]("stale reservation");
-    }
-    if (r.body.reserved) { ret R.err[usize, str]("child reserved"); }
-    if (r.body.len > r.body.cap || r.body.cap != r.limit) {
-        ret R.err[usize, str]("invalid reservation");
-    }
-    if (!span_fits(b.cap, r.start, r.limit)) {
-        ret R.err[usize, str]("invalid reservation");
-    }
-    if (r.body.len > r.limit) { ret R.err[usize, str]("invalid reservation"); }
+    if (!b.reserved || b.epoch != r.epoch || b.len != r.start) { ret encode_fail(EncodeError.stale{}); }
+    if (r.body.reserved) { ret encode_fail(EncodeError.busy{}); }
+    if (r.body.len > r.body.cap || r.body.cap != r.limit) { ret encode_fail(EncodeError.invalid{}); }
+    if (!span_fits(b.cap, r.start, r.limit)) { ret encode_fail(EncodeError.invalid{}); }
+    if (r.body.len > r.limit) { ret encode_fail(EncodeError.invalid{}); }
 
     b.len = r.start + r.body.len;
     b.reserved = false;
     reservation_close(r);
-    ret R.ok[usize, str](b.len);
+    ret encoded(b.len);
 }
 
 # discard an unpublished reservation and unlock its parent
-pub fun reservation_rollback(r: *Reservation) R.Result[usize, str] {
-    if (r == nil || !r.active || r.parent == nil) {
-        ret R.err[usize, str]("invalid reservation");
-    }
+pub fun reservation_rollback(r: *Reservation) res[usize, EncodeError] {
+    if (!r.active || r.parent == nil) { ret encode_fail(EncodeError.inactive{}); }
 
     val b: *Builder = r.parent;
-    if (!b.reserved || b.epoch != r.epoch || b.len != r.start) {
-        ret R.err[usize, str]("stale reservation");
-    }
-    if (r.body.reserved) { ret R.err[usize, str]("child reserved"); }
+    if (!b.reserved || b.epoch != r.epoch || b.len != r.start) { ret encode_fail(EncodeError.stale{}); }
+    if (r.body.reserved) { ret encode_fail(EncodeError.busy{}); }
 
     b.reserved = false;
     reservation_close(r);
-    ret R.ok[usize, str](b.len);
+    ret encoded(b.len);
 }
 
 # cursor over existing bytes with a fixed byte order
@@ -628,51 +663,57 @@ pub fun cursor(data: *u8, len: usize, order: Order) Cursor {
     ret decoder(data, len, order);
 }
 
+# the failure for a request of `width` bytes the cursor cannot satisfy
+fun too_short(d: *Decoder) DecodeError {
+    if (d.pos > d.len) { ret DecodeError.invalid{}; }
+    ret DecodeError.short{d.len - d.pos};
+}
+
 # read sz bytes in the decoder's byte order and advance
-fun read_uint(d: *Decoder, sz: usize) R.Result[u64, str] {
-    if (!span_fits(d.len, d.pos, sz)) { ret R.err[u64, str]("eof"); }
-    if (sz > 0 && d.data == nil) { ret R.err[u64, str]("invalid cursor"); }
+fun read_uint(d: *Decoder, sz: usize) res[u64, DecodeError] {
+    if (!span_fits(d.len, d.pos, sz)) { ret res[u64, DecodeError].err{too_short(d)}; }
+    if (sz > 0 && d.data == nil) { ret res[u64, DecodeError].err{DecodeError.invalid{}}; }
 
     val v: u64 = get_uint(?d.data[d.pos], sz, d.order);
     d.pos = d.pos + sz;
-    ret R.ok[u64, str](v);
+    ret res[u64, DecodeError].ok{v};
 }
 
 # read a u8 and advance
 # ---
 # d:   decoder to read from
-# ret: the value, or an error
-pub fun read_u8(d: *Decoder) R.Result[u8, str] {
-    val r: R.Result[u64, str] = read_uint(d, 1);
-    if (R.is_err[u64, str](r)) { ret R.err[u8, str](R.unwrap_err[u64, str](r)); }
-    ret R.ok[u8, str](R.unwrap_ok[u64, str](r)::u8);
+# ret: the value, or the failure
+pub fun read_u8(d: *Decoder) res[u8, DecodeError] {
+    val r: res[u64, DecodeError] = read_uint(d, 1);
+    if (sel r.err) { ret res[u8, DecodeError].err{r.err}; }
+    ret res[u8, DecodeError].ok{r.ok::u8};
 }
 
 # read a u16 in the decoder's byte order and advance
 # ---
 # d:   decoder to read from
-# ret: the value, or an error
-pub fun read_u16(d: *Decoder) R.Result[u16, str] {
-    val r: R.Result[u64, str] = read_uint(d, 2);
-    if (R.is_err[u64, str](r)) { ret R.err[u16, str](R.unwrap_err[u64, str](r)); }
-    ret R.ok[u16, str](R.unwrap_ok[u64, str](r)::u16);
+# ret: the value, or the failure
+pub fun read_u16(d: *Decoder) res[u16, DecodeError] {
+    val r: res[u64, DecodeError] = read_uint(d, 2);
+    if (sel r.err) { ret res[u16, DecodeError].err{r.err}; }
+    ret res[u16, DecodeError].ok{r.ok::u16};
 }
 
 # read a u32 in the decoder's byte order and advance
 # ---
 # d:   decoder to read from
-# ret: the value, or an error
-pub fun read_u32(d: *Decoder) R.Result[u32, str] {
-    val r: R.Result[u64, str] = read_uint(d, 4);
-    if (R.is_err[u64, str](r)) { ret R.err[u32, str](R.unwrap_err[u64, str](r)); }
-    ret R.ok[u32, str](R.unwrap_ok[u64, str](r)::u32);
+# ret: the value, or the failure
+pub fun read_u32(d: *Decoder) res[u32, DecodeError] {
+    val r: res[u64, DecodeError] = read_uint(d, 4);
+    if (sel r.err) { ret res[u32, DecodeError].err{r.err}; }
+    ret res[u32, DecodeError].ok{r.ok::u32};
 }
 
 # read a u64 in the decoder's byte order and advance
 # ---
 # d:   decoder to read from
-# ret: the value, or an error
-pub fun read_u64(d: *Decoder) R.Result[u64, str] {
+# ret: the value, or the failure
+pub fun read_u64(d: *Decoder) res[u64, DecodeError] {
     ret read_uint(d, 8);
 }
 
@@ -680,88 +721,88 @@ pub fun read_u64(d: *Decoder) R.Result[u64, str] {
 # ---
 # d:   decoder to read from
 # len: number of bytes to consume
-# ret: pointer into the decoder's data, or an error
-pub fun read_bytes(d: *Decoder, len: usize) R.Result[*u8, str] {
-    if (!span_fits(d.len, d.pos, len)) { ret R.err[*u8, str]("eof"); }
-    if (len == 0) { ret R.ok[*u8, str](nil); }
-    if (d.data == nil) { ret R.err[*u8, str]("invalid cursor"); }
+# ret: pointer into the decoder's data (nil for a zero-length request), or
+#      the failure
+pub fun read_bytes(d: *Decoder, len: usize) res[*u8, DecodeError] {
+    if (!span_fits(d.len, d.pos, len)) { ret res[*u8, DecodeError].err{too_short(d)}; }
+    if (len == 0) { ret res[*u8, DecodeError].ok{nil}; }
+    if (d.data == nil) { ret res[*u8, DecodeError].err{DecodeError.invalid{}}; }
 
     val p: *u8 = ?d.data[d.pos];
     d.pos = d.pos + len;
-    ret R.ok[*u8, str](p);
+    ret res[*u8, DecodeError].ok{p};
 }
 
 # read a null-terminated string and advance past the terminator
 # ---
 # d:   decoder to read from
-# ret: pointer to the string within the data, or an error
-pub fun read_str(d: *Decoder) R.Result[str, str] {
-    if (d.pos > d.len) { ret R.err[str, str]("eof"); }
-    if (d.pos < d.len && d.data == nil) { ret R.err[str, str]("invalid cursor"); }
+# ret: pointer to the string within the data, or the failure
+pub fun read_str(d: *Decoder) res[str, DecodeError] {
+    if (d.pos > d.len) { ret res[str, DecodeError].err{DecodeError.invalid{}}; }
+    if (d.pos < d.len && d.data == nil) { ret res[str, DecodeError].err{DecodeError.invalid{}}; }
 
     var i: usize = d.pos;
     for (i < d.len) {
         if (d.data[i] == 0) {
             val s: str = ?d.data[d.pos];
             d.pos = i + 1;
-            ret R.ok[str, str](s);
+            ret res[str, DecodeError].ok{s};
         }
         i = i + 1;
     }
-    ret R.err[str, str]("no null terminator");
+    ret res[str, DecodeError].err{DecodeError.unterminated{}};
 }
 
 # advance the cursor by n bytes
 # ---
 # d:   decoder to advance
 # n:   number of bytes to skip
-# ret: new position, or an error
-pub fun skip(d: *Decoder, n: usize) R.Result[usize, str] {
-    if (!span_fits(d.len, d.pos, n)) { ret R.err[usize, str]("eof"); }
+# ret: new position, or the failure
+pub fun skip(d: *Decoder, n: usize) res[usize, DecodeError] {
+    if (!span_fits(d.len, d.pos, n)) { ret res[usize, DecodeError].err{too_short(d)}; }
     d.pos = d.pos + n;
-    ret R.ok[usize, str](d.pos);
+    ret res[usize, DecodeError].ok{d.pos};
 }
 
 # advance the cursor to an alignment boundary
 # ---
 # d:        decoder to align
 # boundary: alignment boundary (a power of two)
-# ret:      new position, or an error
-pub fun align_read(d: *Decoder, boundary: usize) R.Result[usize, str] {
-    if (d.pos > d.len) { ret R.err[usize, str]("eof"); }
+# ret:      new position, or the failure
+pub fun align_read(d: *Decoder, boundary: usize) res[usize, DecodeError] {
+    if (d.pos > d.len) { ret res[usize, DecodeError].err{DecodeError.invalid{}}; }
 
-    val ar: R.Result[usize, str] = alignment_padding(d.pos, boundary);
-    if (R.is_err[usize, str](ar)) { ret ar; }
-    ret skip(d, R.unwrap_ok[usize, str](ar));
+    val ar: res[usize, usize] = alignment_padding(d.pos, boundary);
+    if (sel ar.err) { ret res[usize, DecodeError].err{DecodeError.alignment{ar.err}}; }
+    ret skip(d, ar.ok);
 }
 
 # return a bounded child cursor and advance only after validation
-pub fun read_subview(d: *Decoder, len: usize) R.Result[Cursor, str] {
-    if (!span_fits(d.len, d.pos, len)) { ret R.err[Cursor, str]("eof"); }
-    if (len > 0 && d.data == nil) { ret R.err[Cursor, str]("invalid cursor"); }
+pub fun read_subview(d: *Decoder, len: usize) res[Cursor, DecodeError] {
+    if (!span_fits(d.len, d.pos, len)) { ret res[Cursor, DecodeError].err{too_short(d)}; }
+    if (len > 0 && d.data == nil) { ret res[Cursor, DecodeError].err{DecodeError.invalid{}}; }
 
     var data: *u8 = nil;
     if (len > 0) { data = ?d.data[d.pos]; }
 
     val sub: Cursor = cursor(data, len, d.order);
     d.pos = d.pos + len;
-    ret R.ok[Cursor, str](sub);
+    ret res[Cursor, DecodeError].ok{sub};
 }
 
 # capture a cursor position for speculative decoding
-pub fun cursor_checkpoint(d: *Decoder) R.Result[Checkpoint, str] {
-    if (d == nil || d.pos > d.len) { ret R.err[Checkpoint, str]("invalid cursor"); }
-    ret R.ok[Checkpoint, str](d.pos);
+pub fun cursor_checkpoint(d: *Decoder) res[Checkpoint, DecodeError] {
+    if (d.pos > d.len) { ret res[Checkpoint, DecodeError].err{DecodeError.invalid{}}; }
+    ret res[Checkpoint, DecodeError].ok{d.pos};
 }
 
 # restore an earlier cursor checkpoint
-pub fun cursor_rollback(d: *Decoder, mark: Checkpoint) R.Result[usize, str] {
-    if (d == nil || d.pos > d.len || mark > d.pos) {
-        ret R.err[usize, str]("invalid checkpoint");
-    }
+pub fun cursor_rollback(d: *Decoder, mark: Checkpoint) res[usize, DecodeError] {
+    if (d.pos > d.len) { ret res[usize, DecodeError].err{DecodeError.invalid{}}; }
+    if (mark > d.pos) { ret res[usize, DecodeError].err{DecodeError.bounds{}}; }
 
     d.pos = mark;
-    ret R.ok[usize, str](d.pos);
+    ret res[usize, DecodeError].ok{d.pos};
 }
 
 # bytes remaining between the cursor and the end
@@ -772,6 +813,21 @@ pub fun remaining(d: *Decoder) usize {
     if (d == nil || d.pos > d.len) { ret 0; }
     ret d.len - d.pos;
 }
+
+# test predicates: `sel` takes a place, so an outcome tested inline goes
+# through one of these
+fun enc_ok(r: res[usize, EncodeError]) bool { ret sel r.ok; }
+fun res_ok(r: res[Reservation, EncodeError]) bool { ret sel r.ok; }
+fun mark_ok(r: res[Checkpoint, EncodeError]) bool { ret sel r.ok; }
+fun dec_ok(r: res[usize, DecodeError]) bool { ret sel r.ok; }
+fun bytes_ok(r: res[*u8, DecodeError]) bool { ret sel r.ok; }
+fun str_ok(r: res[str, DecodeError]) bool { ret sel r.ok; }
+fun view_ok(r: res[Cursor, DecodeError]) bool { ret sel r.ok; }
+fun cmark_ok(r: res[Checkpoint, DecodeError]) bool { ret sel r.ok; }
+fun u8_ok(r: res[u8, DecodeError]) bool { ret sel r.ok; }
+fun u16_ok(r: res[u16, DecodeError]) bool { ret sel r.ok; }
+fun u32_ok(r: res[u32, DecodeError]) bool { ret sel r.ok; }
+fun u64_ok(r: res[u64, DecodeError]) bool { ret sel r.ok; }
 
 test "binary cursor: exhaustive small-region reads preserve failure position" {
     var data: [16]u8;
@@ -790,16 +846,18 @@ test "binary cursor: exhaustive small-region reads preserve failure position" {
                 var d: Decoder = decoder(?data[0], region_len, LITTLE);
                 d.pos = offset;
                 val before: usize = d.pos;
-                val r: R.Result[*u8, str] = read_bytes(?d, width);
+                val r: res[*u8, DecodeError] = read_bytes(?d, width);
 
                 var fits: bool = false;
                 if (offset <= region_len && width <= region_len - offset) { fits = true; }
 
-                if (R.is_ok[*u8, str](r) != fits) { ret 1; }
+                if (sel r.ok != fits) { ret 1; }
                 if (!fits && d.pos != before) { ret 1; }
                 if (fits && d.pos != before + width) { ret 1; }
-                if (fits && width == 0 && R.unwrap_ok[*u8, str](r) != nil) { ret 1; }
-                if (fits && width > 0 && R.unwrap_ok[*u8, str](r) != ?data[offset]) { ret 1; }
+                if (sel r.ok) {
+                    if (width == 0 && r.ok != nil) { ret 1; }
+                    if (width > 0 && r.ok != ?data[offset]) { ret 1; }
+                }
 
                 width = width + 1;
             }
@@ -829,16 +887,16 @@ test "binary cursor: exhaustive scalar widths obey the region and byte order" {
                     var d: Decoder = decoder(?data[0], region_len, order);
                     d.pos = offset;
                     val before: usize = d.pos;
-                    val r: R.Result[u64, str] = read_uint(?d, width);
+                    val r: res[u64, DecodeError] = read_uint(?d, width);
 
                     var fits: bool = false;
                     if (offset <= region_len && width <= region_len - offset) { fits = true; }
 
-                    if (R.is_ok[u64, str](r) != fits) { ret 1; }
+                    if (sel r.ok != fits) { ret 1; }
                     if (!fits && d.pos != before) { ret 1; }
-                    if (fits) {
-                        if (d.pos != before + width) { ret 1; }
-                        if (R.unwrap_ok[u64, str](r) != get_uint(?data[offset], width, order)) { ret 1; }
+                    if (fits && d.pos != before + width) { ret 1; }
+                    if (sel r.ok) {
+                        if (r.ok != get_uint(?data[offset], width, order)) { ret 1; }
                     }
 
                     width = width + 1;
@@ -865,19 +923,19 @@ test "binary cursor: exhaustive skips and subviews are transactional" {
 
                 var ds: Decoder = decoder(?data[0], region_len, BIG);
                 ds.pos = offset;
-                val sr: R.Result[usize, str] = skip(?ds, width);
-                if (R.is_ok[usize, str](sr) != fits) { ret 1; }
+                val sr: res[usize, DecodeError] = skip(?ds, width);
+                if (sel sr.ok != fits) { ret 1; }
                 if (!fits && ds.pos != offset) { ret 1; }
                 if (fits && ds.pos != offset + width) { ret 1; }
 
                 var dv: Decoder = decoder(?data[0], region_len, BIG);
                 dv.pos = offset;
-                val vr: R.Result[Cursor, str] = read_subview(?dv, width);
-                if (R.is_ok[Cursor, str](vr) != fits) { ret 1; }
+                val vr: res[Cursor, DecodeError] = read_subview(?dv, width);
+                if (sel vr.ok != fits) { ret 1; }
                 if (!fits && dv.pos != offset) { ret 1; }
-                if (fits) {
-                    if (dv.pos != offset + width) { ret 1; }
-                    val sub: Cursor = R.unwrap_ok[Cursor, str](vr);
+                if (fits && dv.pos != offset + width) { ret 1; }
+                if (sel vr.ok) {
+                    val sub: Cursor = vr.ok;
                     if (sub.len != width || sub.pos != 0 || sub.order != BIG) { ret 1; }
                     if (width == 0 && sub.data != nil) { ret 1; }
                     if (width > 0 && sub.data != ?data[offset]) { ret 1; }
@@ -910,11 +968,11 @@ test "binary cursor: operation sequences match a reference position model" {
             val fits: bool = width <= region_len - model;
 
             if (kind == 0) {
-                val r: R.Result[usize, str] = skip(?d, width);
-                if (R.is_ok[usize, str](r) != fits) { ret 1; }
+                val r: res[usize, DecodeError] = skip(?d, width);
+                if (sel r.ok != fits) { ret 1; }
             } or {
-                val r: R.Result[*u8, str] = read_bytes(?d, width);
-                if (R.is_ok[*u8, str](r) != fits) { ret 1; }
+                val r: res[*u8, DecodeError] = read_bytes(?d, width);
+                if (sel r.ok != fits) { ret 1; }
             }
 
             if (fits) { model = model + width; }
@@ -929,19 +987,19 @@ test "binary cursor: operation sequences match a reference position model" {
 test "binary cursor: checkpoints restore only earlier valid positions" {
     var data: [16]u8;
     var d: Decoder = decoder(?data[0], 16, LITTLE);
-    if (R.is_err[u16, str](read_u16(?d))) { ret 1; }
+    if (!u16_ok(read_u16(?d))) { ret 1; }
 
-    val mr: R.Result[Checkpoint, str] = cursor_checkpoint(?d);
-    if (R.is_err[Checkpoint, str](mr)) { ret 1; }
-    val mark: Checkpoint = R.unwrap_ok[Checkpoint, str](mr);
+    val mr: res[Checkpoint, DecodeError] = cursor_checkpoint(?d);
+    if (sel mr.err) { ret 1; }
+    val mark: Checkpoint = mr.ok;
 
-    if (R.is_err[u32, str](read_u32(?d))) { ret 1; }
+    if (!u32_ok(read_u32(?d))) { ret 1; }
     if (d.pos != 6) { ret 1; }
-    if (R.is_err[usize, str](cursor_rollback(?d, mark))) { ret 1; }
+    if (!dec_ok(cursor_rollback(?d, mark))) { ret 1; }
     if (d.pos != 2) { ret 1; }
 
-    val failed: R.Result[usize, str] = cursor_rollback(?d, 3);
-    if (R.is_ok[usize, str](failed) || d.pos != 2) { ret 1; }
+    val failed: res[usize, DecodeError] = cursor_rollback(?d, 3);
+    if (sel failed.ok || d.pos != 2) { ret 1; }
     ret 0;
 }
 
@@ -950,14 +1008,14 @@ test "binary cursor: failed string scan preserves position" {
     memory.fill[u8](?data[0], 0x41, 8);
     var d: Decoder = decoder(?data[0], 8, LITTLE);
     d.pos = 2;
-    if (R.is_ok[str, str](read_str(?d)) || d.pos != 2) { ret 1; }
+    if (str_ok(read_str(?d)) || d.pos != 2) { ret 1; }
 
     data[5] = 0;
-    val r: R.Result[str, str] = read_str(?d);
-    if (R.is_err[str, str](r) || d.pos != 6) { ret 1; }
+    val r: res[str, DecodeError] = read_str(?d);
+    if (sel r.err || d.pos != 6) { ret 1; }
 
     d.pos = 0 - 1;
-    if (R.is_ok[str, str](read_str(?d)) || d.pos != 0 - 1) { ret 1; }
+    if (str_ok(read_str(?d)) || d.pos != 0 - 1) { ret 1; }
     ret 0;
 }
 
@@ -967,19 +1025,19 @@ test "binary cursor: malformed positions and huge widths never wrap" {
 
     var d: Decoder = decoder(?data[0], 8, LITTLE);
     d.pos = max;
-    if (R.is_ok[*u8, str](read_bytes(?d, 1)) || d.pos != max) { ret 1; }
-    if (R.is_ok[usize, str](skip(?d, 1)) || d.pos != max) { ret 1; }
-    if (R.is_ok[Cursor, str](read_subview(?d, 1)) || d.pos != max) { ret 1; }
-    if (R.is_ok[usize, str](align_read(?d, 8)) || d.pos != max) { ret 1; }
+    if (bytes_ok(read_bytes(?d, 1)) || d.pos != max) { ret 1; }
+    if (dec_ok(skip(?d, 1)) || d.pos != max) { ret 1; }
+    if (view_ok(read_subview(?d, 1)) || d.pos != max) { ret 1; }
+    if (dec_ok(align_read(?d, 8)) || d.pos != max) { ret 1; }
     if (remaining(?d) != 0) { ret 1; }
 
     d.pos = 1;
-    if (R.is_ok[*u8, str](read_bytes(?d, max)) || d.pos != 1) { ret 1; }
-    if (R.is_ok[usize, str](skip(?d, max)) || d.pos != 1) { ret 1; }
+    if (bytes_ok(read_bytes(?d, max)) || d.pos != 1) { ret 1; }
+    if (dec_ok(skip(?d, max)) || d.pos != 1) { ret 1; }
 
     d.pos = 3;
-    if (R.is_ok[usize, str](align_read(?d, 0)) || d.pos != 3) { ret 1; }
-    if (R.is_ok[usize, str](align_read(?d, 3)) || d.pos != 3) { ret 1; }
+    if (dec_ok(align_read(?d, 0)) || d.pos != 3) { ret 1; }
+    if (dec_ok(align_read(?d, 3)) || d.pos != 3) { ret 1; }
     ret 0;
 }
 
@@ -1006,11 +1064,11 @@ test "binary builder: exhaustive small-region writes preserve failure state" {
 
                 var b: Builder = builder(?backing[0], cap, BIG);
                 b.len = offset;
-                val r: R.Result[usize, str] = builder_write_bytes(?b, ?input[0], width);
+                val r: res[usize, EncodeError] = builder_write_bytes(?b, ?input[0], width);
 
                 var fits: bool = false;
                 if (offset <= cap && width <= cap - offset) { fits = true; }
-                if (R.is_ok[usize, str](r) != fits) { ret 1; }
+                if (sel r.ok != fits) { ret 1; }
                 if (!fits && b.len != offset) { ret 1; }
                 if (fits && b.len != offset + width) { ret 1; }
 
@@ -1046,15 +1104,15 @@ test "binary builder: scalar output matches the growable encoder" {
         e.len = 0;
         e.cap = 32;
 
-        if (R.is_err[usize, str](builder_write_u8(?b, 0x12))) { ret 1; }
-        if (R.is_err[usize, str](builder_write_u16(?b, 0x3456))) { ret 1; }
-        if (R.is_err[usize, str](builder_write_u32(?b, 0x789ABCDE))) { ret 1; }
-        if (R.is_err[usize, str](builder_write_u64(?b, 0x0123456789ABCDEF))) { ret 1; }
+        if (!enc_ok(builder_write_u8(?b, 0x12))) { ret 1; }
+        if (!enc_ok(builder_write_u16(?b, 0x3456))) { ret 1; }
+        if (!enc_ok(builder_write_u32(?b, 0x789ABCDE))) { ret 1; }
+        if (!enc_ok(builder_write_u64(?b, 0x0123456789ABCDEF))) { ret 1; }
 
-        if (R.is_err[usize, str](write_u8(?e, 0x12))) { ret 1; }
-        if (R.is_err[usize, str](write_u16(?e, 0x3456))) { ret 1; }
-        if (R.is_err[usize, str](write_u32(?e, 0x789ABCDE))) { ret 1; }
-        if (R.is_err[usize, str](write_u64(?e, 0x0123456789ABCDEF))) { ret 1; }
+        if (!enc_ok(write_u8(?e, 0x12))) { ret 1; }
+        if (!enc_ok(write_u16(?e, 0x3456))) { ret 1; }
+        if (!enc_ok(write_u32(?e, 0x789ABCDE))) { ret 1; }
+        if (!enc_ok(write_u64(?e, 0x0123456789ABCDEF))) { ret 1; }
 
         if (b.len != e.len) { ret 1; }
         var i: usize = 0;
@@ -1072,20 +1130,24 @@ test "binary builder: scalar wrappers round trip through the checked cursor" {
     var order: Order = LITTLE;
     for (order <= BIG) {
         var b: Builder = builder(?data[0], 32, order);
-        if (R.is_err[usize, str](builder_write_u8(?b, 0x12))) { ret 1; }
-        if (R.is_err[usize, str](builder_write_u16(?b, 0x3456))) { ret 1; }
-        if (R.is_err[usize, str](builder_write_u32(?b, 0x789ABCDE))) { ret 1; }
-        if (R.is_err[usize, str](builder_write_u64(?b, 0x0123456789ABCDEF))) { ret 1; }
+        if (!enc_ok(builder_write_u8(?b, 0x12))) { ret 1; }
+        if (!enc_ok(builder_write_u16(?b, 0x3456))) { ret 1; }
+        if (!enc_ok(builder_write_u32(?b, 0x789ABCDE))) { ret 1; }
+        if (!enc_ok(builder_write_u64(?b, 0x0123456789ABCDEF))) { ret 1; }
 
         var c: Cursor = cursor(?data[0], b.len, order);
-        val u8r: R.Result[u8, str] = read_u8(?c);
-        val u16r: R.Result[u16, str] = read_u16(?c);
-        val u32r: R.Result[u32, str] = read_u32(?c);
-        val u64r: R.Result[u64, str] = read_u64(?c);
-        if (R.is_err[u8, str](u8r) || R.unwrap_ok[u8, str](u8r) != 0x12) { ret 1; }
-        if (R.is_err[u16, str](u16r) || R.unwrap_ok[u16, str](u16r) != 0x3456) { ret 1; }
-        if (R.is_err[u32, str](u32r) || R.unwrap_ok[u32, str](u32r) != 0x789ABCDE) { ret 1; }
-        if (R.is_err[u64, str](u64r) || R.unwrap_ok[u64, str](u64r) != 0x0123456789ABCDEF) { ret 1; }
+        val u8r: res[u8, DecodeError] = read_u8(?c);
+        val u16r: res[u16, DecodeError] = read_u16(?c);
+        val u32r: res[u32, DecodeError] = read_u32(?c);
+        val u64r: res[u64, DecodeError] = read_u64(?c);
+        if (!sel u8r.ok) { ret 1; }
+        if (u8r.ok != 0x12) { ret 1; }
+        if (!sel u16r.ok) { ret 1; }
+        if (u16r.ok != 0x3456) { ret 1; }
+        if (!sel u32r.ok) { ret 1; }
+        if (u32r.ok != 0x789ABCDE) { ret 1; }
+        if (!sel u64r.ok) { ret 1; }
+        if (u64r.ok != 0x0123456789ABCDEF) { ret 1; }
         if (remaining(?c) != 0) { ret 1; }
         order = order + 1;
     }
@@ -1097,16 +1159,16 @@ test "binary builder: strings and alignment publish only after full validation" 
     memory.fill[u8](?data[0], 0xA5, 16);
     var b: Builder = builder(?data[0], 16, BIG);
 
-    if (R.is_err[usize, str](builder_write_str(?b, "ab"))) { ret 1; }
+    if (!enc_ok(builder_write_str(?b, "ab"))) { ret 1; }
     if (b.len != 3 || data[0] != 'a' || data[1] != 'b' || data[2] != 0) { ret 1; }
-    if (R.is_err[usize, str](builder_align(?b, 4))) { ret 1; }
+    if (!enc_ok(builder_align(?b, 4))) { ret 1; }
     if (b.len != 4 || data[3] != 0) { ret 1; }
 
     b.cap = 6;
-    if (R.is_err[usize, str](builder_write_u8(?b, 0x11))) { ret 1; }
-    if (R.is_ok[usize, str](builder_align(?b, 8)) || b.len != 5) { ret 1; }
+    if (!enc_ok(builder_write_u8(?b, 0x11))) { ret 1; }
+    if (enc_ok(builder_align(?b, 8)) || b.len != 5) { ret 1; }
     if (data[5] != 0xA5) { ret 1; }
-    if (R.is_ok[usize, str](builder_write_str(?b, "x")) || b.len != 5) { ret 1; }
+    if (enc_ok(builder_write_str(?b, "x")) || b.len != 5) { ret 1; }
     if (data[5] != 0xA5) { ret 1; }
     ret 0;
 }
@@ -1124,20 +1186,21 @@ test "binary builder: reservation bounds are exhaustive and transactional" {
                 b.len = offset;
                 b.epoch = 5;
 
-                val rr: R.Result[Reservation, str] = builder_reserve(?b, capacity);
+                val rr: res[Reservation, EncodeError] = builder_reserve(?b, capacity);
                 var fits: bool = false;
                 if (offset <= cap && capacity <= cap - offset) { fits = true; }
-                if (R.is_ok[Reservation, str](rr) != fits) { ret 1; }
+                if (sel rr.ok != fits) { ret 1; }
 
                 if (!fits) {
                     if (b.len != offset || b.cap != cap || b.reserved || b.epoch != 5) { ret 1; }
-                } or {
+                }
+                if (sel rr.ok) {
                     if (b.len != offset || !b.reserved || b.epoch != 6) { ret 1; }
                     if (builder_remaining(?b) != 0) { ret 1; }
-                    var reservation: Reservation = R.unwrap_ok[Reservation, str](rr);
+                    var reservation: Reservation = rr.ok;
                     if (reservation.start != offset || reservation.limit != capacity) { ret 1; }
                     if (reservation.body.len != 0 || reservation.body.cap != capacity) { ret 1; }
-                    if (R.is_err[usize, str](reservation_rollback(?reservation))) { ret 1; }
+                    if (!enc_ok(reservation_rollback(?reservation))) { ret 1; }
                     if (b.len != offset || b.reserved || b.epoch != 6) { ret 1; }
                 }
 
@@ -1160,18 +1223,18 @@ test "binary builder: reservation commits one length-prefixed field" {
     var payload: [3]u8 = [3]u8{0xAA, 0xBB, 0xCC};
     var b: Builder = builder(?data[0], 32, BIG);
 
-    val rr: R.Result[Reservation, str] = builder_reserve(?b, 16);
-    if (R.is_err[Reservation, str](rr)) { ret 1; }
-    var r: Reservation = R.unwrap_ok[Reservation, str](rr);
+    val rr: res[Reservation, EncodeError] = builder_reserve(?b, 16);
+    if (sel rr.err) { ret 1; }
+    var r: Reservation = rr.ok;
     if (b.len != 0 || !b.reserved) { ret 1; }
 
-    if (R.is_err[usize, str](builder_write_u16(?r.body, 0))) { ret 1; }
-    if (R.is_err[usize, str](builder_write_bytes(?r.body, ?payload[0], 3))) { ret 1; }
-    if (R.is_err[usize, str](builder_patch_u16(?r.body, 0, 3))) { ret 1; }
+    if (!enc_ok(builder_write_u16(?r.body, 0))) { ret 1; }
+    if (!enc_ok(builder_write_bytes(?r.body, ?payload[0], 3))) { ret 1; }
+    if (!enc_ok(builder_patch_u16(?r.body, 0, 3))) { ret 1; }
     if (b.len != 0) { ret 1; }
 
-    val cr: R.Result[usize, str] = builder_commit(?r);
-    if (R.is_err[usize, str](cr) || b.len != 5 || b.reserved) { ret 1; }
+    val cr: res[usize, EncodeError] = builder_commit(?r);
+    if (sel cr.err || b.len != 5 || b.reserved) { ret 1; }
     if (data[0] != 0 || data[1] != 3) { ret 1; }
     if (data[2] != 0xAA || data[3] != 0xBB || data[4] != 0xCC) { ret 1; }
     ret 0;
@@ -1181,23 +1244,23 @@ test "binary builder: nested reservations commit inside out" {
     var data: [32]u8;
     var root: Builder = builder(?data[0], 32, LITTLE);
 
-    val orr: R.Result[Reservation, str] = builder_reserve(?root, 16);
-    if (R.is_err[Reservation, str](orr)) { ret 1; }
-    var outer: Reservation = R.unwrap_ok[Reservation, str](orr);
-    if (R.is_err[usize, str](builder_write_u8(?outer.body, 0xAA))) { ret 1; }
+    val orr: res[Reservation, EncodeError] = builder_reserve(?root, 16);
+    if (sel orr.err) { ret 1; }
+    var outer: Reservation = orr.ok;
+    if (!enc_ok(builder_write_u8(?outer.body, 0xAA))) { ret 1; }
 
-    val irr: R.Result[Reservation, str] = builder_reserve(?outer.body, 8);
-    if (R.is_err[Reservation, str](irr)) { ret 1; }
-    var inner: Reservation = R.unwrap_ok[Reservation, str](irr);
-    if (R.is_err[usize, str](builder_write_u32(?inner.body, 0x11223344))) { ret 1; }
-    if (R.is_ok[usize, str](builder_commit(?outer))) { ret 1; }
+    val irr: res[Reservation, EncodeError] = builder_reserve(?outer.body, 8);
+    if (sel irr.err) { ret 1; }
+    var inner: Reservation = irr.ok;
+    if (!enc_ok(builder_write_u32(?inner.body, 0x11223344))) { ret 1; }
+    if (enc_ok(builder_commit(?outer))) { ret 1; }
     if (root.len != 0 || !root.reserved || !outer.body.reserved) { ret 1; }
-    if (R.is_ok[usize, str](reservation_rollback(?outer))) { ret 1; }
+    if (enc_ok(reservation_rollback(?outer))) { ret 1; }
     if (root.len != 0 || !root.reserved || !outer.body.reserved) { ret 1; }
-    if (R.is_err[usize, str](builder_commit(?inner))) { ret 1; }
-    if (R.is_err[usize, str](builder_write_u8(?outer.body, 0xBB))) { ret 1; }
+    if (!enc_ok(builder_commit(?inner))) { ret 1; }
+    if (!enc_ok(builder_write_u8(?outer.body, 0xBB))) { ret 1; }
     if (root.len != 0) { ret 1; }
-    if (R.is_err[usize, str](builder_commit(?outer))) { ret 1; }
+    if (!enc_ok(builder_commit(?outer))) { ret 1; }
 
     if (root.len != 6) { ret 1; }
     if (data[0] != 0xAA || data[1] != 0x44 || data[2] != 0x33) { ret 1; }
@@ -1209,22 +1272,22 @@ test "binary builder: failed child write and reservation rollback publish nothin
     var data: [8]u8;
     memory.fill[u8](?data[0], 0xCC, 8);
     var b: Builder = builder(?data[0], 8, BIG);
-    if (R.is_err[usize, str](builder_write_u8(?b, 0x11))) { ret 1; }
+    if (!enc_ok(builder_write_u8(?b, 0x11))) { ret 1; }
 
-    val rr: R.Result[Reservation, str] = builder_reserve(?b, 4);
-    if (R.is_err[Reservation, str](rr)) { ret 1; }
-    var r: Reservation = R.unwrap_ok[Reservation, str](rr);
+    val rr: res[Reservation, EncodeError] = builder_reserve(?b, 4);
+    if (sel rr.err) { ret 1; }
+    var r: Reservation = rr.ok;
 
-    if (R.is_ok[usize, str](builder_write_u64(?r.body, 1))) { ret 1; }
+    if (enc_ok(builder_write_u64(?r.body, 1))) { ret 1; }
     if (r.body.len != 0 || b.len != 1) { ret 1; }
     if (data[1] != 0xCC || data[4] != 0xCC) { ret 1; }
 
-    if (R.is_err[usize, str](builder_write_u32(?r.body, 0xAABBCCDD))) { ret 1; }
+    if (!enc_ok(builder_write_u32(?r.body, 0xAABBCCDD))) { ret 1; }
     if (b.len != 1) { ret 1; }
-    if (R.is_err[usize, str](reservation_rollback(?r))) { ret 1; }
+    if (!enc_ok(reservation_rollback(?r))) { ret 1; }
     if (b.len != 1 || b.reserved) { ret 1; }
 
-    if (R.is_err[usize, str](builder_write_u8(?b, 0x22))) { ret 1; }
+    if (!enc_ok(builder_write_u8(?b, 0x22))) { ret 1; }
     if (b.len != 2 || data[1] != 0x22) { ret 1; }
     ret 0;
 }
@@ -1233,48 +1296,48 @@ test "binary builder: malformed and stale commits leave the parent unchanged" {
     var data: [16]u8;
     var b: Builder = builder(?data[0], 16, LITTLE);
 
-    val rr: R.Result[Reservation, str] = builder_reserve(?b, 4);
-    if (R.is_err[Reservation, str](rr)) { ret 1; }
-    var malformed: Reservation = R.unwrap_ok[Reservation, str](rr);
+    val rr: res[Reservation, EncodeError] = builder_reserve(?b, 4);
+    if (sel rr.err) { ret 1; }
+    var malformed: Reservation = rr.ok;
     malformed.body.len = 5;
-    if (R.is_ok[usize, str](builder_commit(?malformed))) { ret 1; }
+    if (enc_ok(builder_commit(?malformed))) { ret 1; }
     if (b.len != 0 || !b.reserved || !malformed.active) { ret 1; }
-    if (R.is_err[usize, str](reservation_rollback(?malformed))) { ret 1; }
+    if (!enc_ok(reservation_rollback(?malformed))) { ret 1; }
 
-    val first_r: R.Result[Reservation, str] = builder_reserve(?b, 4);
-    if (R.is_err[Reservation, str](first_r)) { ret 1; }
-    var first: Reservation = R.unwrap_ok[Reservation, str](first_r);
+    val first_r: res[Reservation, EncodeError] = builder_reserve(?b, 4);
+    if (sel first_r.err) { ret 1; }
+    var first: Reservation = first_r.ok;
     var stale: Reservation = first;
-    if (R.is_err[usize, str](reservation_rollback(?first))) { ret 1; }
+    if (!enc_ok(reservation_rollback(?first))) { ret 1; }
 
-    val second_r: R.Result[Reservation, str] = builder_reserve(?b, 4);
-    if (R.is_err[Reservation, str](second_r)) { ret 1; }
-    var second: Reservation = R.unwrap_ok[Reservation, str](second_r);
-    if (R.is_ok[usize, str](builder_commit(?stale))) { ret 1; }
+    val second_r: res[Reservation, EncodeError] = builder_reserve(?b, 4);
+    if (sel second_r.err) { ret 1; }
+    var second: Reservation = second_r.ok;
+    if (enc_ok(builder_commit(?stale))) { ret 1; }
     if (b.len != 0 || !b.reserved) { ret 1; }
-    if (R.is_err[usize, str](reservation_rollback(?second))) { ret 1; }
+    if (!enc_ok(reservation_rollback(?second))) { ret 1; }
     ret 0;
 }
 
 test "binary builder: checkpoints and locked parents roll back explicitly" {
     var data: [16]u8;
     var b: Builder = builder(?data[0], 16, BIG);
-    if (R.is_err[usize, str](builder_write_u16(?b, 0x1234))) { ret 1; }
+    if (!enc_ok(builder_write_u16(?b, 0x1234))) { ret 1; }
 
-    val mr: R.Result[Checkpoint, str] = builder_checkpoint(?b);
-    if (R.is_err[Checkpoint, str](mr)) { ret 1; }
-    val mark: Checkpoint = R.unwrap_ok[Checkpoint, str](mr);
-    if (R.is_err[usize, str](builder_write_u32(?b, 0x55667788))) { ret 1; }
-    if (R.is_err[usize, str](builder_rollback(?b, mark))) { ret 1; }
+    val mr: res[Checkpoint, EncodeError] = builder_checkpoint(?b);
+    if (sel mr.err) { ret 1; }
+    val mark: Checkpoint = mr.ok;
+    if (!enc_ok(builder_write_u32(?b, 0x55667788))) { ret 1; }
+    if (!enc_ok(builder_rollback(?b, mark))) { ret 1; }
     if (b.len != 2) { ret 1; }
 
-    if (R.is_ok[usize, str](builder_rollback(?b, 3)) || b.len != 2) { ret 1; }
-    val rr: R.Result[Reservation, str] = builder_reserve(?b, 4);
-    if (R.is_err[Reservation, str](rr)) { ret 1; }
-    var reservation: Reservation = R.unwrap_ok[Reservation, str](rr);
-    if (R.is_ok[Checkpoint, str](builder_checkpoint(?b)) || b.len != 2) { ret 1; }
-    if (R.is_ok[usize, str](builder_rollback(?b, 0)) || b.len != 2) { ret 1; }
-    if (R.is_err[usize, str](reservation_rollback(?reservation))) { ret 1; }
+    if (enc_ok(builder_rollback(?b, 3)) || b.len != 2) { ret 1; }
+    val rr: res[Reservation, EncodeError] = builder_reserve(?b, 4);
+    if (sel rr.err) { ret 1; }
+    var reservation: Reservation = rr.ok;
+    if (mark_ok(builder_checkpoint(?b)) || b.len != 2) { ret 1; }
+    if (enc_ok(builder_rollback(?b, 0)) || b.len != 2) { ret 1; }
+    if (!enc_ok(reservation_rollback(?reservation))) { ret 1; }
     ret 0;
 }
 
@@ -1284,7 +1347,7 @@ test "binary builder: patch failures leave length and bytes unchanged" {
     var b: Builder = builder(?data[0], 8, LITTLE);
     b.len = 4;
 
-    if (R.is_ok[usize, str](builder_patch_u64(?b, 0, 1))) { ret 1; }
+    if (enc_ok(builder_patch_u64(?b, 0, 1))) { ret 1; }
     if (b.len != 4) { ret 1; }
     var i: usize = 0;
     for (i < 8) {
@@ -1292,15 +1355,15 @@ test "binary builder: patch failures leave length and bytes unchanged" {
         i = i + 1;
     }
 
-    if (R.is_err[usize, str](builder_patch_u8(?b, 3, 0x11))) { ret 1; }
+    if (!enc_ok(builder_patch_u8(?b, 3, 0x11))) { ret 1; }
     if (b.len != 4 || data[3] != 0x11) { ret 1; }
 
-    val rr: R.Result[Reservation, str] = builder_reserve(?b, 2);
-    if (R.is_err[Reservation, str](rr)) { ret 1; }
-    var reservation: Reservation = R.unwrap_ok[Reservation, str](rr);
-    if (R.is_ok[usize, str](builder_patch_u8(?b, 0, 0x22))) { ret 1; }
+    val rr: res[Reservation, EncodeError] = builder_reserve(?b, 2);
+    if (sel rr.err) { ret 1; }
+    var reservation: Reservation = rr.ok;
+    if (enc_ok(builder_patch_u8(?b, 0, 0x22))) { ret 1; }
     if (data[0] != 0xA5 || b.len != 4) { ret 1; }
-    if (R.is_err[usize, str](reservation_rollback(?reservation))) { ret 1; }
+    if (!enc_ok(reservation_rollback(?reservation))) { ret 1; }
     ret 0;
 }
 
@@ -1317,25 +1380,165 @@ test "binary builder: capacity and alignment arithmetic never wraps" {
 
     var b: Builder = builder(?data[0], max, LITTLE);
     b.len = max - 1;
-    if (R.is_ok[usize, str](builder_write_bytes(?b, ?input[0], 2)) || b.len != max - 1) { ret 1; }
-    if (R.is_ok[usize, str](builder_align(?b, 8)) || b.len != max - 1) { ret 1; }
-    if (R.is_ok[Reservation, str](builder_reserve(?b, 2)) || b.len != max - 1) { ret 1; }
+    if (enc_ok(builder_write_bytes(?b, ?input[0], 2)) || b.len != max - 1) { ret 1; }
+    if (enc_ok(builder_align(?b, 8)) || b.len != max - 1) { ret 1; }
+    if (res_ok(builder_reserve(?b, 2)) || b.len != max - 1) { ret 1; }
 
     b.len = 3;
     b.cap = 8;
-    if (R.is_ok[usize, str](builder_write_bytes(?b, nil, 1)) || b.len != 3) { ret 1; }
-    if (R.is_ok[usize, str](builder_align(?b, 0)) || b.len != 3) { ret 1; }
-    if (R.is_ok[usize, str](builder_align(?b, 3)) || b.len != 3) { ret 1; }
+    if (enc_ok(builder_write_bytes(?b, nil, 1)) || b.len != 3) { ret 1; }
+    if (enc_ok(builder_align(?b, 0)) || b.len != 3) { ret 1; }
+    if (enc_ok(builder_align(?b, 3)) || b.len != 3) { ret 1; }
 
     b.epoch = max;
-    if (R.is_ok[Reservation, str](builder_reserve(?b, 0))) { ret 1; }
+    if (res_ok(builder_reserve(?b, 0))) { ret 1; }
     if (b.len != 3 || b.reserved || b.epoch != max) { ret 1; }
 
     var e: Encoder = encoder(nil, LITTLE);
     e.data = ?data[0];
     e.len = max;
     e.cap = max;
-    if (R.is_ok[usize, str](reserve(?e, 1)) || e.len != max || e.cap != max) { ret 1; }
-    if (R.is_ok[usize, str](align(?e, 8)) || e.len != max || e.cap != max) { ret 1; }
+    if (enc_ok(reserve(?e, 1)) || e.len != max || e.cap != max) { ret 1; }
+    if (enc_ok(align(?e, 8)) || e.len != max || e.cap != max) { ret 1; }
+    ret 0;
+}
+
+use std.allocator.testing;
+
+# the encoder's only acquisition is its growth: a refusal is the allocator's
+# own error, the encoder is exactly as it was, and a release balances it
+test "binary encoder: refused growth is alloc and leaves the encoder unchanged" {
+    var tracker: testing.Testing;
+    val made: err[A.Error] = testing.make(?tracker);
+    if (sel made.err) { ret 1; }
+    fin { testing.dnit(?tracker); }
+    val a: *A.Allocator = testing.allocator_of(?tracker);
+
+    var e: Encoder = encoder(a, LITTLE);
+    if (!enc_ok(write_u32(?e, 0x11223344))) { ret 2; }
+    if (e.len != 4 || e.cap != 256) { ret 3; }
+
+    testing.fail_at_ordinal(?tracker, testing.attempt_count(?tracker) + 1);
+    var big: [512]u8;
+    val refused: res[usize, EncodeError] = write_bytes(?e, ?big[0], 512);
+    if (!sel refused.err) { ret 4; }
+    if (!sel refused.err.alloc) { ret 5; }
+    if (!sel refused.err.alloc.exhausted) { ret 6; }
+    if (e.len != 4 || e.cap != 256 || e.data[0] != 0x44) { ret 7; }
+    testing.clear_failure(?tracker);
+
+    val grown: res[usize, EncodeError] = write_bytes(?e, ?big[0], 512);
+    if (!sel grown.ok) { ret 8; }
+    if (grown.ok != 516 || e.cap != 1024) { ret 9; }
+
+    val released: err[A.Error] = encoder_dnit(?e);
+    if (sel released.err) { ret 10; }
+    if (e.cap != 0 || e.data != nil || testing.live_count(?tracker) != 0) { ret 11; }
+    val again: err[A.Error] = encoder_dnit(?e);
+    if (sel again.err) { ret 12; }
+    ret 0;
+}
+
+# every builder refusal is its own case, and the payload-bearing ones carry
+# the fact a caller acts on: the room that is left, the bad boundary
+test "binary builder: refusals are classified" {
+    var data: [8]u8;
+    var b: Builder = builder(?data[0], 8, LITTLE);
+    if (!enc_ok(builder_write_u32(?b, 1))) { ret 1; }
+
+    val full: res[usize, EncodeError] = builder_write_u64(?b, 2);
+    if (!sel full.err) { ret 2; }
+    if (!sel full.err.full) { ret 3; }
+    if (full.err.full != 4) { ret 3; }
+
+    val aligned: res[usize, EncodeError] = builder_align(?b, 6);
+    if (!sel aligned.err) { ret 4; }
+    if (!sel aligned.err.alignment) { ret 5; }
+    if (aligned.err.alignment != 6) { ret 5; }
+
+    val out: res[usize, EncodeError] = builder_patch_u32(?b, 2, 9);
+    if (!sel out.err) { ret 6; }
+    if (!sel out.err.bounds) { ret 7; }
+
+    val back: res[usize, EncodeError] = builder_rollback(?b, 5);
+    if (!sel back.err) { ret 8; }
+    if (!sel back.err.bounds) { ret 9; }
+
+    val rr: res[Reservation, EncodeError] = builder_reserve(?b, 2);
+    if (!sel rr.ok) { ret 10; }
+    var r: Reservation = rr.ok;
+    val locked: res[usize, EncodeError] = builder_write_u8(?b, 1);
+    if (!sel locked.err) { ret 11; }
+    if (!sel locked.err.reserved) { ret 12; }
+    val mark: res[Checkpoint, EncodeError] = builder_checkpoint(?b);
+    if (!sel mark.err) { ret 13; }
+    if (!sel mark.err.reserved) { ret 13; }
+
+    val inner: res[Reservation, EncodeError] = builder_reserve(?r.body, 1);
+    if (!sel inner.ok) { ret 14; }
+    var child: Reservation = inner.ok;
+    val busy: res[usize, EncodeError] = builder_commit(?r);
+    if (!sel busy.err) { ret 15; }
+    if (!sel busy.err.busy) { ret 16; }
+    if (!enc_ok(reservation_rollback(?child))) { ret 17; }
+
+    var stale: Reservation = r;
+    if (!enc_ok(builder_commit(?r))) { ret 18; }
+    val gone: res[usize, EncodeError] = builder_commit(?r);
+    if (!sel gone.err) { ret 19; }
+    if (!sel gone.err.inactive) { ret 20; }
+    val old: res[usize, EncodeError] = reservation_rollback(?stale);
+    if (!sel old.err) { ret 21; }
+    if (!sel old.err.stale) { ret 22; }
+
+    b.len = 9;
+    val broken: res[usize, EncodeError] = builder_write_u8(?b, 1);
+    if (!sel broken.err) { ret 23; }
+    if (!sel broken.err.invalid) { ret 24; }
+    ret 0;
+}
+
+# a short read names the bytes that remain, distinct from a malformed cursor,
+# a bad boundary, a checkpoint outside the past, and a missing terminator
+test "binary cursor: refusals are classified" {
+    var data: [8]u8;
+    memory.fill[u8](?data[0], 0x41, 8);
+    var d: Decoder = decoder(?data[0], 8, LITTLE);
+    if (!dec_ok(skip(?d, 5))) { ret 1; }
+
+    val short: res[u64, DecodeError] = read_u64(?d);
+    if (!sel short.err) { ret 2; }
+    if (!sel short.err.short) { ret 3; }
+    if (short.err.short != 3) { ret 3; }
+    if (d.pos != 5) { ret 4; }
+
+    val aligned: res[usize, DecodeError] = align_read(?d, 3);
+    if (!sel aligned.err) { ret 5; }
+    if (!sel aligned.err.alignment) { ret 6; }
+    if (aligned.err.alignment != 3) { ret 6; }
+
+    val back: res[usize, DecodeError] = cursor_rollback(?d, 6);
+    if (!sel back.err) { ret 7; }
+    if (!sel back.err.bounds) { ret 8; }
+
+    val text: res[str, DecodeError] = read_str(?d);
+    if (!sel text.err) { ret 9; }
+    if (!sel text.err.unterminated) { ret 10; }
+    if (d.pos != 5) { ret 11; }
+
+    d.pos = 9;
+    val broken: res[u8, DecodeError] = read_u8(?d);
+    if (!sel broken.err) { ret 12; }
+    if (!sel broken.err.invalid) { ret 13; }
+    val mark: res[Checkpoint, DecodeError] = cursor_checkpoint(?d);
+    if (!sel mark.err) { ret 14; }
+    if (!sel mark.err.invalid) { ret 14; }
+
+    var empty: Decoder = decoder(nil, 3, LITTLE);
+    val missing: res[*u8, DecodeError] = read_bytes(?empty, 1);
+    if (!sel missing.err) { ret 15; }
+    if (!sel missing.err.invalid) { ret 16; }
+    val none: res[*u8, DecodeError] = read_bytes(?empty, 0);
+    if (!sel none.ok) { ret 17; }
     ret 0;
 }
