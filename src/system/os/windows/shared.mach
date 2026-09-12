@@ -947,6 +947,9 @@ var _proc_pids: [MAX_PROCS]u32;
 # (or a slot that hasn't reached register_child_grouped yet). closed
 # alongside the process handle in close_proc - see register_child_grouped.
 var _job_handles: [MAX_PROCS]isize;
+var _proc_grouped: [MAX_PROCS]bool;
+var _proc_completed: [MAX_PROCS]bool;
+var _proc_codes: [MAX_PROCS]u32;
 var _procs_init: u8 = 0;
 var _proc_lock: i64 = 0;
 
@@ -979,6 +982,9 @@ fun init_procs() {
         _proc_handles[i] = INVALID_HANDLE_VALUE;
         _proc_pids[i] = 0;
         _job_handles[i] = 0;
+        _proc_grouped[i] = false;
+        _proc_completed[i] = false;
+        _proc_codes[i] = 0;
         i = i + 1;
     }
     _procs_init = 1;
@@ -1043,34 +1049,36 @@ fun get_proc_handle(pid: u32) isize {
     ret INVALID_HANDLE_VALUE;
 }
 
-fun close_proc(pid: u32, handle: isize) {
-    # pid 0 is never a child; rejecting it keeps a bogus lookup from
-    # matching a reserved slot's zero pid
-    if (pid == 0) {
-        ret;
-    }
+# failed closure leaves each remaining native handle in its owned slot
+fun close_proc(pid: u32, handle: isize, code: u32) os_shared.ProcessWaitError {
     proc_spin_lock();
+    fin { proc_spin_unlock(); }
     var i: usize = 0;
     for (i < MAX_PROCS) {
-        if (_proc_pids[i] == pid && _proc_handles[i] == handle) {
-            _proc_handles[i] = INVALID_HANDLE_VALUE;
-            _proc_pids[i] = 0;
-            CloseHandle(handle);
-            # the job (if any) is JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: closing
-            # it here, at the same point the process handle is closed, also
-            # terminates any surviving group members if the caller reaped
-            # without ever calling terminate_group - the same abandoned-
-            # handle safety net a job object exists to provide.
+        if (_proc_pids[i] == pid && _proc_handles[i] == handle && proc_slot_live(handle)) {
+            _proc_completed[i] = true;
+            _proc_codes[i] = code;
             if (_job_handles[i] != 0) {
-                CloseHandle(_job_handles[i]);
+                if (CloseHandle(_job_handles[i]) == 0) {
+                    val native: u32 = GetLastError();
+                    ret os_shared.ProcessWaitError{code: win32_error(native), native_code: native, operation: os_shared.PROCESS_OP_CLOSE};
+                }
                 _job_handles[i] = 0;
             }
-            proc_spin_unlock();
-            ret;
+            if (CloseHandle(handle) == 0) {
+                val native: u32 = GetLastError();
+                ret os_shared.ProcessWaitError{code: win32_error(native), native_code: native, operation: os_shared.PROCESS_OP_CLOSE};
+            }
+            _proc_handles[i] = INVALID_HANDLE_VALUE;
+            _proc_pids[i] = 0;
+            _proc_grouped[i] = false;
+            _proc_completed[i] = false;
+            _proc_codes[i] = 0;
+            ret os_shared.ProcessWaitError{};
         }
         i = i + 1;
     }
-    proc_spin_unlock();
+    ret os_shared.ProcessWaitError{code: ECHILD, operation: os_shared.PROCESS_OP_CLOSE};
 }
 
 fun count_procs() usize {
@@ -2946,7 +2954,7 @@ fun abort_grouped_spawn(pi: PROCESS_INFORMATION, job: isize) i64 {
 # ---
 # pi:      the freshly created (CREATE_SUSPENDED) process
 # slot:    pre-reserved process-table slot
-# job_out: receives the job object handle on success
+# job_out: receives the tracked child group token on success
 # ret:     the child pid on success (slot committed, job registered), or
 #          negative errno (slot left reserved for the caller to release_proc)
 fun register_child_grouped(pi: PROCESS_INFORMATION, slot: i32, job_out: *isize) i64 {
@@ -2973,9 +2981,10 @@ fun register_child_grouped(pi: PROCESS_INFORMATION, slot: i32, job_out: *isize) 
     # order rules out a reap racing in and finding a still-zero job handle.
     proc_spin_lock();
     _job_handles[slot::usize] = job;
+    _proc_grouped[slot::usize] = true;
     proc_spin_unlock();
     commit_proc(slot, pi.dwProcessId, pi.hProcess);
-    @job_out = job;
+    @job_out = pi.dwProcessId::isize;
     ret pi.dwProcessId::i64;
 }
 
@@ -3168,7 +3177,7 @@ pub fun spawn(pathname: *u8, argv: **u8, envp: **u8) i64 {
 # pathname: path to executable
 # argv:     null-terminated argument array
 # envp:     null-terminated environment array
-# job_out:  receives the job object handle on success
+# job_out:  receives the tracked child group token on success
 # ret:      child PID on success, or negative errno
 pub fun spawn_grouped(pathname: *u8, argv: **u8, envp: **u8, job_out: *isize) i64 {
     ret spawn_redirected_grouped(pathname, argv, envp, -1, -1, -1, job_out);
@@ -3217,7 +3226,7 @@ pub fun spawn_redirected(pathname: *u8, argv: **u8, envp: **u8, stdin_fd: i32, s
 # stdin_fd:  descriptor to install as the child's stdin, or -1 to inherit
 # stdout_fd: descriptor to install as the child's stdout, or -1 to inherit
 # stderr_fd: descriptor to install as the child's stderr, or -1 to inherit
-# job_out:   receives the job object handle on success
+# job_out:   receives the tracked child group token on success
 # ret:       child PID on success, or negative errno
 pub fun spawn_redirected_grouped(pathname: *u8, argv: **u8, envp: **u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32, job_out: *isize) i64 {
     ret spawn_redirected_in_grouped(pathname, argv, envp, nil, stdin_fd, stdout_fd, stderr_fd, job_out);
@@ -3296,7 +3305,7 @@ pub fun spawn_redirected_in(pathname: *u8, argv: **u8, envp: **u8, cwd: *u8, std
 # stdin_fd:  descriptor to install as the child's stdin, or -1 to inherit
 # stdout_fd: descriptor to install as the child's stdout, or -1 to inherit
 # stderr_fd: descriptor to install as the child's stderr, or -1 to inherit
-# job_out:   receives the job object handle on success
+# job_out:   receives the tracked child group token on success
 # ret:       child PID on success, or negative errno (job_out untouched)
 pub fun spawn_redirected_in_grouped(pathname: *u8, argv: **u8, envp: **u8, cwd: *u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32, job_out: *isize) i64 {
     var cmdline: [98304]u8;
@@ -3449,6 +3458,7 @@ pub fun terminate_child(pid: i64) i64 {
     var i: usize = 0;
     for (i < MAX_PROCS) {
         if (_proc_pids[i] == child_pid && proc_slot_live(_proc_handles[i])) {
+            if (_proc_completed[i]) { proc_spin_unlock(); ret 0; }
             if (TerminateProcess(_proc_handles[i], TERMINATE_CHILD_EXIT_CODE) == 0) {
                 val e: i64 = last_error();
                 proc_spin_unlock();
@@ -3463,23 +3473,21 @@ pub fun terminate_child(pid: i64) i64 {
     ret ECHILD;
 }
 
-# terminate every process currently associated with a job object
-#
-# unlike terminate_child there is no process-table lookup: `job` is the raw
-# handle spawn_grouped/spawn_redirected_grouped already returned to the
-# caller, exactly as a posix caller already holds the raw pgid. the handle
-# stays open and registered afterward (see close_proc): reaping the group's
-# direct child through wait/wait_pid remains the caller's responsibility, and
-# is what eventually closes it.
-# ---
-# job: job object handle from spawn_grouped or spawn_redirected_grouped
-# ret: 0 on success, or negative errno
-pub fun terminate_group(job: i64) i64 {
-    if (job == 0) { ret EINVAL; }
-    if (TerminateJobObject(job::isize, TERMINATE_CHILD_EXIT_CODE) == 0) {
-        ret last_error();
+# the group token is the child pid, pinned until its retained process handle closes
+pub fun terminate_group(group: i64) i64 {
+    if (group <= 0 || group > 0xFFFFFFFF) { ret EINVAL; }
+    proc_spin_lock();
+    fin { proc_spin_unlock(); }
+    var i: usize = 0;
+    for (i < MAX_PROCS) {
+        if (_proc_pids[i] == group::u32 && proc_slot_live(_proc_handles[i]) && _proc_grouped[i]) {
+            if (_job_handles[i] == 0 && _proc_completed[i]) { ret 0; }
+            if (TerminateJobObject(_job_handles[i], TERMINATE_CHILD_EXIT_CODE) == 0) { ret last_error(); }
+            ret 0;
+        }
+        i = i + 1;
     }
-    ret 0;
+    ret ECHILD;
 }
 
 # return the current process ID
@@ -3738,155 +3746,107 @@ pub fun environ() **u8 {
     ret vec;
 }
 
-# wait for a child process to change state
-#
-# uses the process handle table to look up children by pid.
-# pid == -1 waits for any child. WNOHANG uses a zero timeout.
-#
-# WAIT_FAILED is treated as a dead handle, on windows it is in practice
-# ERROR_INVALID_HANDLE, a permanent condition no retry can clear, so the
-# affected child is purged (best-effort CloseHandle + slot freed) rather
-# than left pinning the table forever. a single-pid wait purges and
-# returns the error; the wait-any path probes each snapshot handle
-# individually, purges the unwaitable ones, and retries the multi-wait
-# once so one poisoned handle cannot block reaping of healthy children.
-pub fun wait(pid: i64, wstatus: *i32, options: i32, rusage: *u8) i64 {
-    if (pid > 0) {
-        val h: isize = get_proc_handle(pid::u32);
-        if (h == INVALID_HANDLE_VALUE) {
-            ret ECHILD;
-        }
+# callers serialize wait-any with other waits and termination of tracked children
+# failures retain unclosed handles and the child for retry
+fun wait_failure(code: i64, native: u32, operation: u8) os_shared.WaitResult {
+    ret os_shared.WaitResult{error: os_shared.ProcessWaitError{code: code, native_code: native, operation: operation}};
+}
 
-        var timeout: u32 = INFINITE;
-        if ((options & WNOHANG) != 0) {
-            timeout = 0;
+fun reap_process(pid: u32, handle: isize, status: *os_shared.ProcessStatus) os_shared.WaitResult {
+    var code: u32 = 0;
+    var completed: bool = false;
+    proc_spin_lock();
+    var i: usize = 0;
+    for (i < MAX_PROCS) {
+        if (_proc_pids[i] == pid && _proc_handles[i] == handle) {
+            completed = _proc_completed[i];
+            code = _proc_codes[i];
+            brk;
         }
+        i = i + 1;
+    }
+    proc_spin_unlock();
+    if (!completed && GetExitCodeProcess(handle, ?code) == 0) {
+        val native: u32 = GetLastError();
+        ret wait_failure(win32_error(native), native, os_shared.PROCESS_OP_STATUS);
+    }
+    val closed: os_shared.ProcessWaitError = close_proc(pid, handle, code);
+    if (closed.code < 0) { ret os_shared.WaitResult{error: closed}; }
+    if (status != nil) { @status = os_shared.ProcessStatus{kind: os_shared.PROCESS_EXITED, code: code}; }
+    ret os_shared.WaitResult{pid: pid::i64};
+}
 
-        val result: u32 = WaitForSingleObject(h, timeout);
-        if (result == WAIT_TIMEOUT) {
-            ret 0;
-        }
+pub fun wait(pid: i64, status: *os_shared.ProcessStatus, options: i32, rusage: *u8) os_shared.WaitResult {
+    if ((options & ~WNOHANG) != 0 || rusage != nil) { ret wait_failure(ENOTSUP, 0, os_shared.PROCESS_OP_WAIT); }
+    var timeout: u32 = INFINITE;
+    if ((options & WNOHANG) != 0) { timeout = 0; }
+    if (pid > 0 && pid <= 0xFFFFFFFF) {
+        val handle: isize = get_proc_handle(pid::u32);
+        if (handle == INVALID_HANDLE_VALUE) { ret wait_failure(ECHILD, 0, os_shared.PROCESS_OP_WAIT); }
+        val result: u32 = WaitForSingleObject(handle, timeout);
+        if (result == WAIT_TIMEOUT) { ret os_shared.WaitResult{}; }
         if (result == WAIT_FAILED) {
-            # dead handle: purge the slot so it cannot pin the table
-            val e: i64 = last_error();
-            close_proc(pid::u32, h);
-            ret e;
+            val native: u32 = GetLastError();
+            ret wait_failure(win32_error(native), native, os_shared.PROCESS_OP_WAIT);
         }
-
-        var ec: u32 = 0;
-        GetExitCodeProcess(h, ?ec);
-        if (wstatus != nil) {
-            @wstatus = (ec::i32 << 8);
-        }
-        close_proc(pid::u32, h);
-        ret pid;
+        if (result != WAIT_OBJECT_0) { ret wait_failure(EIO, 0, os_shared.PROCESS_OP_WAIT); }
+        ret reap_process(pid::u32, handle, status);
     }
-
     if (pid == -1) {
-        var timeout: u32 = INFINITE;
-        if ((options & WNOHANG) != 0) {
-            timeout = 0;
+        var handles: [MAX_PROCS]isize;
+        var pids: [MAX_PROCS]u32;
+        var count: usize = 0;
+        var i: usize = 0;
+        proc_spin_lock();
+        init_procs();
+        for (i < MAX_PROCS) {
+            if (proc_slot_live(_proc_handles[i])) {
+                handles[count] = _proc_handles[i];
+                pids[count] = _proc_pids[i];
+                count = count + 1;
+            }
+            i = i + 1;
         }
-
-        # at most one retry, after purging unwaitable handles
-        var attempt: usize = 0;
-        for (attempt < 2) {
-            var wait_handles: [MAX_PROCS]isize;
-            var wait_pids: [MAX_PROCS]u32;
-            var n: usize = 0;
-            var i: usize = 0;
-
-            # snapshot live slots under the table lock, skipping reserved
-            # ones (a child mid-spawn has no handle to wait on yet); the
-            # lock is dropped before the blocking wait below
-            proc_spin_lock();
-            init_procs();
-            for (i < MAX_PROCS) {
-                if (proc_slot_live(_proc_handles[i])) {
-                    wait_handles[n] = _proc_handles[i];
-                    wait_pids[n] = _proc_pids[i];
-                    n = n + 1;
-                }
-                i = i + 1;
-            }
-            proc_spin_unlock();
-
-            if (n == 0) {
-                ret ECHILD;
-            }
-
-            val result: u32 = WaitForMultipleObjects(n::u32, (?wait_handles[0])::ptr, 0, timeout);
-            if (result == WAIT_TIMEOUT) {
-                ret 0;
-            }
-            if (result == WAIT_FAILED) {
-                val e: i64 = last_error();
-                # one dead handle poisons the whole multi-wait: probe each
-                # snapshot handle and purge the unwaitable ones so healthy
-                # children stay reapable
-                var purged: usize = 0;
-                i = 0;
-                for (i < n) {
-                    if (WaitForSingleObject(wait_handles[i], 0) == WAIT_FAILED) {
-                        close_proc(wait_pids[i], wait_handles[i]);
-                        purged = purged + 1;
-                    }
-                    i = i + 1;
-                }
-                if (purged == 0 || attempt == 1) {
-                    ret e;
-                }
-                attempt = attempt + 1;
-            } or {
-                if (result >= n::u32) {
-                    ret EIO;
-                }
-                val idx: usize = result::usize;
-                var ec: u32 = 0;
-                GetExitCodeProcess(wait_handles[idx], ?ec);
-                if (wstatus != nil) {
-                    @wstatus = (ec::i32 << 8);
-                }
-                val child_pid: u32 = wait_pids[idx];
-                close_proc(child_pid, wait_handles[idx]);
-                ret child_pid::i64;
-            }
+        proc_spin_unlock();
+        if (count == 0) { ret wait_failure(ECHILD, 0, os_shared.PROCESS_OP_WAIT); }
+        val result: u32 = WaitForMultipleObjects(count::u32, (?handles[0])::ptr, 0, timeout);
+        if (result == WAIT_TIMEOUT) { ret os_shared.WaitResult{}; }
+        if (result == WAIT_FAILED) {
+            val native: u32 = GetLastError();
+            ret wait_failure(win32_error(native), native, os_shared.PROCESS_OP_WAIT);
         }
-        ret EIO;
+        if (result >= count::u32) { ret wait_failure(EIO, 0, os_shared.PROCESS_OP_WAIT); }
+        val index: usize = result::usize;
+        ret reap_process(pids[index], handles[index], status);
     }
-
-    ret EINVAL;
+    ret wait_failure(EINVAL, 0, os_shared.PROCESS_OP_WAIT);
 }
 
-pub fun wait_pid(pid: i64, wstatus: *i32, options: i32) i64 {
-    ret wait(pid, wstatus, options, nil);
+pub fun wait_pid(pid: i64, status: *os_shared.ProcessStatus, options: i32) os_shared.WaitResult {
+    ret wait(pid, status, options, nil);
 }
 
-# wait status decoding (POSIX encoding: exit_code << 8 for normal exit)
-
-pub fun has_exited(status: i32) bool {
-    ret (status & 0x7f) == 0;
-}
-
-pub fun exit_code(status: i32) i32 {
-    ret (status >> 8) & 0xff;
-}
-
-pub fun was_signaled(status: i32) bool {
-    ret false;
-}
-
-pub fun term_signal(status: i32) i32 {
-    ret 0;
-}
-
-pub fun was_stopped(status: i32) bool {
-    ret false;
-}
-
-pub fun stop_signal(status: i32) i32 {
-    ret 0;
-}
+fwd os_shared.ProcessStatus;
+fwd os_shared.ProcessWaitError;
+fwd os_shared.WaitResult;
+fwd os_shared.PROCESS_EXITED;
+fwd os_shared.PROCESS_SIGNALED;
+fwd os_shared.PROCESS_STOPPED;
+fwd os_shared.PROCESS_CONTINUED;
+fwd os_shared.PROCESS_OP_WAIT;
+fwd os_shared.PROCESS_OP_STATUS;
+fwd os_shared.PROCESS_OP_CLOSE;
+fwd os_shared.PROCESS_OP_SPAWN;
+fwd os_shared.PROCESS_OP_READ;
+fwd os_shared.PROCESS_OP_PIPE;
+fwd os_shared.PROCESS_OP_TERMINATE;
+fwd os_shared.has_exited;
+fwd os_shared.exit_code;
+fwd os_shared.was_signaled;
+fwd os_shared.term_signal;
+fwd os_shared.was_stopped;
+fwd os_shared.stop_signal;
+fwd os_shared.was_continued;
 
 # threads
 
@@ -5074,9 +5034,9 @@ test "std.system.os.windows: spawned children receive Unicode commands and envir
     val pid: i64 = spawn(program, (?argv[0])::**u8, entries);
     deallocate(entries::ptr, (count + 2) * 8);
     if (pid < 0) { ret 1; }
-    var status: i32 = 0;
-    if (wait(pid, ?status, 0, nil) < 0) { ret 2; }
-    if (status != 0) { ret 3; }
+    var status: os_shared.ProcessStatus;
+    if (wait(pid, ?status, 0, nil).error.code < 0) { ret 2; }
+    if (status.kind != os_shared.PROCESS_EXITED || status.code != 0) { ret 3; }
     ret 0;
 }
 
@@ -5126,8 +5086,8 @@ test "std.system.os.windows: Unicode executable and working directories round tr
     val pid: i64 = spawn_in(?executable[0], (?argv[0])::**u8, nil, ?directory[0]);
     if (pid < 0) { bad = 7; }
     or {
-        var status: i32 = 0;
-        if (wait(pid, ?status, 0, nil) < 0 || status != 0) { bad = 8; }
+        var status: os_shared.ProcessStatus;
+        if (wait(pid, ?status, 0, nil).error.code < 0 || status.kind != os_shared.PROCESS_EXITED || status.code != 0) { bad = 8; }
     }
     var before: WIDE_PATH;
     var after: WIDE_PATH;
@@ -5394,4 +5354,64 @@ test "std.system.os.windows.fd_registry: allocation failure preserves capacity a
         i = i + 1;
     }
     ret bad;
+}
+
+
+#[library("kernel32.dll")]
+ext fun DuplicateHandle(source_process: isize, source: isize, target_process: isize,
+                        target: *isize, access: u32, inherit: i32, options: u32) i32;
+
+test "std.system.os.process_status.windows: failed native status query retains the child for retry" {
+    val before: usize = count_procs();
+    val pid: i64 = spawn_shell("exit /b 0", nil, nil);
+    if (pid <= 0) { ret 1; }
+    val original: isize = get_proc_handle(pid::u32);
+    var limited: isize = 0;
+    if (DuplicateHandle(-1, original, -1, ?limited, SYNCHRONIZE_ACCESS, 0, 0) == 0) { ret 2; }
+    if (WaitForSingleObject(original, 10000) != WAIT_OBJECT_0) { ret 3; }
+    var index: usize = 0;
+    proc_spin_lock();
+    for (index < MAX_PROCS && _proc_pids[index] != pid::u32) { index = index + 1; }
+    if (index < MAX_PROCS) { _proc_handles[index] = limited; }
+    proc_spin_unlock();
+    if (index == MAX_PROCS) { ret 4; }
+    var status: os_shared.ProcessStatus = os_shared.ProcessStatus{kind: 99, code: 0x12345678, signal: 77};
+    val failed: os_shared.WaitResult = wait_pid(pid, ?status, 0);
+    val held: isize = get_proc_handle(pid::u32);
+    proc_spin_lock();
+    _proc_handles[index] = original;
+    proc_spin_unlock();
+    if (CloseHandle(limited) == 0) { ret 5; }
+    val reaped: os_shared.WaitResult = wait_pid(pid, nil, 0);
+    if (failed.pid != 0 || failed.error.code != EACCES || failed.error.native_code != ERROR_ACCESS_DENIED
+        || failed.error.operation != os_shared.PROCESS_OP_STATUS) { ret 6; }
+    if (status.kind != 99 || status.code != 0x12345678 || status.signal != 77 || held != limited) { ret 7; }
+    if (reaped.pid != pid || reaped.error.code != 0 || count_procs() != before) { ret 8; }
+    ret 0;
+}
+
+test "std.system.os.process_status.windows: partial group cleanup keeps the process and group token safe" {
+    val before: usize = count_procs();
+    var shell: [512]u8;
+    if (!comspec(?shell[0], 512)) { ret 1; }
+    var argv: [5]*u8;
+    argv[0] = ?shell[0]; argv[1] = "/c"; argv[2] = "exit"; argv[3] = "37"; argv[4] = nil;
+    var group: isize = 0;
+    val pid: i64 = spawn_grouped(?shell[0], ?argv[0], nil, ?group);
+    if (pid <= 0) { ret 2; }
+    val handle: isize = get_proc_handle(pid::u32);
+    if (SetHandleInformation(handle, 2, 2) == 0) { ret 3; }
+    var status: os_shared.ProcessStatus = os_shared.ProcessStatus{kind: 99, code: 77};
+    val failed: os_shared.WaitResult = wait_pid(pid, ?status, 0);
+    val held: isize = get_proc_handle(pid::u32);
+    val grouped: i64 = terminate_group(group::i64);
+    val unchanged: bool = status.kind == 99 && status.code == 77;
+    if (SetHandleInformation(handle, 2, 0) == 0) { ret 4; }
+    val reaped: os_shared.WaitResult = wait_pid(pid, ?status, 0);
+    if (failed.pid != 0 || failed.error.code >= 0 || failed.error.native_code == 0
+        || failed.error.operation != os_shared.PROCESS_OP_CLOSE || held != handle || !unchanged) { ret 5; }
+    if (group::i64 != pid || grouped != 0) { ret 6; }
+    if (reaped.pid != pid || reaped.error.code != 0 || status.kind != os_shared.PROCESS_EXITED || status.code != 37) { ret 7; }
+    if (count_procs() != before || terminate_group(group::i64) != ECHILD) { ret 8; }
+    ret 0;
 }

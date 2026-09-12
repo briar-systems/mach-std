@@ -53,6 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused. The old `Result`, `Option` and `Void` remain for the modules that
   have not migrated yet and are removed with the last of them.
 
+- Process waits preserve complete Windows exit codes and explicit POSIX state
+  observations. Typed wait failures retain native causes and unreaped child
+  ownership. Windows cleanup retries keep process and group tokens valid.
+
 
 - Completion queue wake and close reject nil owners consistently on Linux, Windows
   and Darwin, preserving live wake and repeated-close behavior.

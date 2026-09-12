@@ -1,6 +1,7 @@
 # process spawning and management
 
 use std.types.canonical.res;
+use std.types.canonical.opt;
 use std.types.canonical.err;
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -16,13 +17,14 @@ use std.types.string.str_equals;
 use std.types.string.str_copy_slice;
 use std.types.string.str_join;
 use std.types.string.str_contains_char;
+use std.types.string.OwnedString;
+use std.types.string.owned_release;
 use std.collections.vector.Vector;
+use std.collections.vector;
 use std.allocator.fixed;
 use std.allocator.page;
 
 use A: std.allocator;
-use R: std.types.result;
-use O: std.types.option;
 
 use std.types.path;
 use std.process.env;
@@ -33,14 +35,6 @@ use std.io.reader.ReadError;
 use io_error: std.io.error;
 use io_handle: std.io.handle;
 
-# translation shim (S3c removes it with exec.Error): the reader's typed
-# outcome spelled as this module's legacy message
-fun read_error_text(e: ReadError) str {
-    if (sel e.native) { ret io_error.message(e.native.error); }
-    if (sel e.alloc)  { ret "out of memory"; }
-    ret "ERR_EOF";
-}
-
 use std.system.os;
 use cancel: std.sync.cancel;
 use tm: std.chrono.time;
@@ -48,7 +42,7 @@ use duration: std.chrono.duration;
 
 # spawn_grouped, spawn_redirected_grouped, and terminate_group below give
 # every target the same signature; the underlying primitive is platform-
-# specific (posix setpgid/kill(-pgid) vs a windows job object), so the actual
+# specific (posix setpgid/kill(-pgid) vs a tracked windows job object), so the actual
 # implementation is per-platform in each function body.
 $if ($mach.build.os == $mach.os.linux) {
     use std.system.os.linux;
@@ -60,12 +54,11 @@ $or ($mach.build.os == $mach.os.windows) {
     use std.system.os.windows;
 }
 
-# raw wait status from a terminated process
-# ---
-# raw: wait status as returned by wait_pid
-pub rec ExitStatus {
-    raw: i32;
-}
+fwd ExitStatus: os.ProcessStatus;
+fwd os.PROCESS_EXITED;
+fwd os.PROCESS_SIGNALED;
+fwd os.PROCESS_STOPPED;
+fwd os.PROCESS_CONTINUED;
 
 # handle to a spawned child process
 # ---
@@ -74,10 +67,96 @@ pub rec ExitStatus {
 #       spawn_redirected_grouped); otherwise the group token needed to signal
 #       the whole group - on linux/darwin this is the posix process group id
 #       (pgid == pid, since the child is its own group's leader); on windows
-#       it is the raw job object HANDLE value returned alongside the pid
+#       it is a tracked group token backed by the retained child process
 pub rec Child {
     pid:  i64;
     pgid: i64;
+}
+
+# a failed native process operation
+# ---
+# code:        the negative mapped OS error
+# native_code: the exact windows GetLastError; zero on posix, whose errno is `code`
+# operation:   the os.PROCESS_OP_* stage that failed
+# child:       the unreaped child transferred to the caller, pid zero for none
+pub rec Failure {
+    code: i64;
+    native_code: u32;
+    operation: u8;
+    child: Child;
+}
+
+# the drain of a captured child's output failed
+# ---
+# read:  the reader's failure, with the bytes delivered before it
+# child: the unreaped child transferred to the caller when the wait that
+#        followed the drain failed too, pid zero when the wait reaped it
+# wait:  that wait's native failure, absent when the wait succeeded
+pub rec OutputFailure {
+    read: ReadError;
+    child: Child;
+    wait: opt[os.ProcessWaitError];
+}
+
+# why a process operation failed
+# ---
+# native:      a spawn, pipe, wait, status query, close or termination refused
+#              by the platform; the child it retains is the caller's to wait
+#              for again, or to terminate first, before releasing ownership
+# output:      the capture drain failed (the wait's outcome is inside)
+# alloc:       an owned path copy was refused
+# env:         the PATH read failed
+# empty_name:  the program name is empty
+# unset:       PATH is not set
+# not_found:   the name is on no directory of the search list
+# ungrouped:   the child was not spawned into a group, so no group can be signalled
+# unsupported: process groups do not exist on this platform
+pub tag Error: u8 {
+    native: Failure;
+    output: OutputFailure;
+    alloc: A.Error;
+    env: env.EnvError;
+    empty_name;
+    unset;
+    not_found;
+    ungrouped;
+    unsupported;
+}
+
+# the child an error still owns: pid zero when none was retained. do not
+# discard an error while it owns a child; wait for it or terminate it first
+pub fun retained(error: Error) Child {
+    if (sel error.native) { ret error.native.child; }
+    if (sel error.output) { ret error.output.child; }
+    ret Child{};
+}
+
+# a rendering of the error for diagnostics
+pub fun error_message(error: Error) str {
+    if (sel error.native) { ret os.message(error.native.code); }
+    if (sel error.output) {
+        if (sel error.output.read.native) { ret io_error.message(error.output.read.native.error); }
+        if (sel error.output.read.alloc) { ret "out of memory"; }
+        if (sel error.output.read.would_block) { ret "would block"; }
+        ret "end of file";
+    }
+    if (sel error.alloc) { ret "out of memory"; }
+    if (sel error.env) { ret "environment read failed"; }
+    if (sel error.empty_name) { ret "empty program name"; }
+    if (sel error.unset) { ret "PATH unset"; }
+    if (sel error.not_found) { ret "not found on PATH"; }
+    if (sel error.ungrouped) { ret "child is not in a process group"; }
+    ret "process groups are not supported on this platform";
+}
+
+fun process_error(code: i64, operation: u8) Error {
+    ret Error.native{Failure{code: code, operation: operation}};
+}
+
+fun wait_error(error: os.ProcessWaitError, child: Child) Error {
+    var pending: Child = Child{};
+    if (child.pid > 0 && error.code != os.ECHILD) { pending = child; }
+    ret Error.native{Failure{code: error.code, native_code: error.native_code, operation: error.operation, child: pending}};
 }
 
 # a child reaped by wait_any
@@ -103,16 +182,11 @@ pub rec Output {
 # pathname: path to executable
 # argv:     null-terminated argument array
 # envp:     null-terminated environment array
-# ret:      exit status, or an error message
-pub fun run(pathname: str, argv: **u8, envp: **u8) R.Result[ExitStatus, str] {
+# ret:      exit status, or an error retaining an unreaped child
+pub fun run(pathname: str, argv: **u8, envp: **u8) res[ExitStatus, Error] {
     val pid: i64 = os.spawn(pathname, argv, envp);
-    if (pid < 0) { ret R.err[ExitStatus, str]("spawn failed"); }
-
-    var wstatus: i32 = 0;
-    val r: i64 = os.wait_pid(pid, ?wstatus, 0);
-    if (r < 0) { ret R.err[ExitStatus, str]("wait failed"); }
-
-    ret R.ok[ExitStatus, str](ExitStatus{raw: wstatus});
+    if (pid < 0) { ret res[ExitStatus, Error].err{process_error(pid, os.PROCESS_OP_SPAWN)}; }
+    ret wait(Child{pid: pid});
 }
 
 # run a command through the host command interpreter, from `cwd`
@@ -131,39 +205,35 @@ pub fun run(pathname: str, argv: **u8, envp: **u8) R.Result[ExitStatus, str] {
 # command: the command line to run
 # cwd:     working directory for the child, or nil to inherit
 # envp:    null-terminated environment array, or nil to inherit
-# ret:     exit status, or an error message
-pub fun run_shell(command: str, cwd: str, envp: **u8) R.Result[ExitStatus, str] {
+# ret:     exit status, or an error retaining an unreaped child
+pub fun run_shell(command: str, cwd: str, envp: **u8) res[ExitStatus, Error] {
     val pid: i64 = os.spawn_shell(command, envp, cwd);
-    if (pid < 0) { ret R.err[ExitStatus, str]("spawn failed"); }
-
-    var wstatus: i32 = 0;
-    val r: i64 = os.wait_pid(pid, ?wstatus, 0);
-    if (r < 0) { ret R.err[ExitStatus, str]("wait failed"); }
-
-    ret R.ok[ExitStatus, str](ExitStatus{raw: wstatus});
+    if (pid < 0) { ret res[ExitStatus, Error].err{process_error(pid, os.PROCESS_OP_SPAWN)}; }
+    ret wait(Child{pid: pid});
 }
 
 # run a process and collect its complete standard output
 #
 # spawns the child with stdout bound to a pipe and drains it to end-of-file
 # through io.read_all over the pipe's read end, so output of any length is
-# captured and the child never blocks on a full pipe. the child is always
-# waited on, even when the drain fails.
+# captured and the child never blocks on a full pipe. a wait is attempted even
+# when the drain fails, and a failed wait returns the remaining child owner.
 # ---
 # a:        allocator for the captured output
 # pathname: path to executable
 # argv:     null-terminated argument array
 # envp:     null-terminated environment array
 # ret:      the exit status and captured stdout, or an error
-pub fun output(a: *A.Allocator, pathname: str, argv: **u8, envp: **u8) R.Result[Output, str] {
+pub fun output(a: *A.Allocator, pathname: str, argv: **u8, envp: **u8) res[Output, Error] {
     var fds: [2]i32;
-    if (os.pipe(?fds[0]) < 0) { ret R.err[Output, str]("pipe failed"); }
+    val piped: i64 = os.pipe(?fds[0]);
+    if (piped < 0) { ret res[Output, Error].err{process_error(piped, os.PROCESS_OP_PIPE)}; }
 
     val pid: i64 = os.spawn_redirected(pathname, argv, envp, -1, fds[1], -1);
     if (pid < 0) {
         os.close(fds[0]);
         os.close(fds[1]);
-        ret R.err[Output, str]("spawn failed");
+        ret res[Output, Error].err{process_error(pid, os.PROCESS_OP_SPAWN)};
     }
 
     # the parent never writes; closing its write end lets the drain see EOF
@@ -175,16 +245,38 @@ pub fun output(a: *A.Allocator, pathname: str, argv: **u8, envp: **u8) R.Result[
     val bytes_r: res[Vector[u8], ReadError] = m_reader.read_all(a, ?rd);
     os.close(fds[0]);
 
-    var wstatus: i32 = 0;
-    val w: i64 = os.wait_pid(pid, ?wstatus, 0);
+    val waited: res[ExitStatus, Error] = wait(Child{pid: pid});
+    ret finish_output(bytes_r, waited);
+}
 
-    if (sel bytes_r.err) { ret R.err[Output, str](read_error_text(bytes_r.err)); }
-    if (w < 0) { ret R.err[Output, str]("wait failed"); }
+# combine the drain and the wait: a failed drain is primary and carries the
+# wait's outcome beside it; a failed wait after a good drain releases the
+# capture and passes the wait's error, with its retained child, through
+fun finish_output(bytes_r: res[Vector[u8], ReadError], waited: res[ExitStatus, Error]) res[Output, Error] {
+    if (sel bytes_r.err) {
+        var failure: OutputFailure = OutputFailure{read: bytes_r.err, wait: opt[os.ProcessWaitError].none{}};
+        if (sel waited.err) {
+            val secondary: Child = retained(waited.err);
+            failure.child = secondary;
+            if (sel waited.err.native) {
+                val cause: Failure = waited.err.native;
+                failure.wait = opt[os.ProcessWaitError].some{os.ProcessWaitError{
+                    code: cause.code, native_code: cause.native_code, operation: cause.operation}};
+            }
+        }
+        ret res[Output, Error].err{Error.output{failure}};
+    }
+    var bytes: Vector[u8] = bytes_r.ok;
+    if (sel waited.err) {
+        vector.dnit[u8](?bytes);
+        ret res[Output, Error].err{waited.err};
+    }
+    ret res[Output, Error].ok{Output{status: waited.ok, bytes: bytes}};
+}
 
-    ret R.ok[Output, str](Output{
-        status: ExitStatus{raw: wstatus},
-        bytes:  bytes_r.ok,
-    });
+fun spawned(pid: i64, pgid: i64) res[Child, Error] {
+    if (pid < 0) { ret res[Child, Error].err{process_error(pid, os.PROCESS_OP_SPAWN)}; }
+    ret res[Child, Error].ok{Child{pid: pid, pgid: pgid}};
 }
 
 # start a process without waiting
@@ -192,12 +284,9 @@ pub fun output(a: *A.Allocator, pathname: str, argv: **u8, envp: **u8) R.Result[
 # pathname: path to executable
 # argv:     null-terminated argument array
 # envp:     null-terminated environment array
-# ret:      child handle, or an error message
-pub fun spawn(pathname: str, argv: **u8, envp: **u8) R.Result[Child, str] {
-    val pid: i64 = os.spawn(pathname, argv, envp);
-    if (pid < 0) { ret R.err[Child, str](os.message(pid)); }
-
-    ret R.ok[Child, str](Child{pid: pid, pgid: 0});
+# ret:      child handle, or the spawn failure
+pub fun spawn(pathname: str, argv: **u8, envp: **u8) res[Child, Error] {
+    ret spawned(os.spawn(pathname, argv, envp), 0);
 }
 
 # start a process without waiting, with its stdout and/or
@@ -212,12 +301,9 @@ pub fun spawn(pathname: str, argv: **u8, envp: **u8) R.Result[Child, str] {
 # envp:      null-terminated environment array
 # stdout_fd: descriptor for the child's stdout, or -1 to inherit
 # stderr_fd: descriptor for the child's stderr, or -1 to inherit
-# ret:       child handle, or an error message
-pub fun spawn_redirected(pathname: str, argv: **u8, envp: **u8, stdout_fd: i32, stderr_fd: i32) R.Result[Child, str] {
-    val pid: i64 = os.spawn_redirected(pathname, argv, envp, -1, stdout_fd, stderr_fd);
-    if (pid < 0) { ret R.err[Child, str](os.message(pid)); }
-
-    ret R.ok[Child, str](Child{pid: pid, pgid: 0});
+# ret:       child handle, or the spawn failure
+pub fun spawn_redirected(pathname: str, argv: **u8, envp: **u8, stdout_fd: i32, stderr_fd: i32) res[Child, Error] {
+    ret spawned(os.spawn_redirected(pathname, argv, envp, -1, stdout_fd, stderr_fd), 0);
 }
 
 # start a process without waiting, placed as the leader of its own new
@@ -231,26 +317,23 @@ pub fun spawn_redirected(pathname: str, argv: **u8, envp: **u8, stdout_fd: i32, 
 # pathname: path to executable
 # argv:     null-terminated argument array
 # envp:     null-terminated environment array
-# ret:      child handle, or an error message
-pub fun spawn_grouped(pathname: str, argv: **u8, envp: **u8) R.Result[Child, str] {
+# ret:      child handle, or the spawn failure
+pub fun spawn_grouped(pathname: str, argv: **u8, envp: **u8) res[Child, Error] {
     $if ($mach.build.os == $mach.os.linux) {
         val pid: i64 = linux.spawn_grouped(pathname, argv, envp);
-        if (pid < 0) { ret R.err[Child, str](os.message(pid)); }
-        ret R.ok[Child, str](Child{pid: pid, pgid: pid});
+        ret spawned(pid, pid);
     }
     $or ($mach.build.os == $mach.os.darwin) {
         val pid: i64 = darwin.spawn_grouped(pathname, argv, envp);
-        if (pid < 0) { ret R.err[Child, str](os.message(pid)); }
-        ret R.ok[Child, str](Child{pid: pid, pgid: pid});
+        ret spawned(pid, pid);
     }
     $or ($mach.build.os == $mach.os.windows) {
         var job: isize = 0;
         val pid: i64 = windows.spawn_grouped(pathname, argv, envp, ?job);
-        if (pid < 0) { ret R.err[Child, str](os.message(pid)); }
-        ret R.ok[Child, str](Child{pid: pid, pgid: job::i64});
+        ret spawned(pid, job::i64);
     }
     $or {
-        ret R.err[Child, str]("process groups are not supported on this platform");
+        ret res[Child, Error].err{Error.unsupported{}};
     }
 }
 
@@ -263,26 +346,23 @@ pub fun spawn_grouped(pathname: str, argv: **u8, envp: **u8) R.Result[Child, str
 # envp:      null-terminated environment array
 # stdout_fd: descriptor for the child's stdout, or -1 to inherit
 # stderr_fd: descriptor for the child's stderr, or -1 to inherit
-# ret:       child handle, or an error message
-pub fun spawn_redirected_grouped(pathname: str, argv: **u8, envp: **u8, stdout_fd: i32, stderr_fd: i32) R.Result[Child, str] {
+# ret:       child handle, or the spawn failure
+pub fun spawn_redirected_grouped(pathname: str, argv: **u8, envp: **u8, stdout_fd: i32, stderr_fd: i32) res[Child, Error] {
     $if ($mach.build.os == $mach.os.linux) {
         val pid: i64 = linux.spawn_redirected_grouped(pathname, argv, envp, -1, stdout_fd, stderr_fd);
-        if (pid < 0) { ret R.err[Child, str](os.message(pid)); }
-        ret R.ok[Child, str](Child{pid: pid, pgid: pid});
+        ret spawned(pid, pid);
     }
     $or ($mach.build.os == $mach.os.darwin) {
         val pid: i64 = darwin.spawn_redirected_grouped(pathname, argv, envp, -1, stdout_fd, stderr_fd);
-        if (pid < 0) { ret R.err[Child, str](os.message(pid)); }
-        ret R.ok[Child, str](Child{pid: pid, pgid: pid});
+        ret spawned(pid, pid);
     }
     $or ($mach.build.os == $mach.os.windows) {
         var job: isize = 0;
         val pid: i64 = windows.spawn_redirected_grouped(pathname, argv, envp, -1, stdout_fd, stderr_fd, ?job);
-        if (pid < 0) { ret R.err[Child, str](os.message(pid)); }
-        ret R.ok[Child, str](Child{pid: pid, pgid: job::i64});
+        ret spawned(pid, job::i64);
     }
     $or {
-        ret R.err[Child, str]("process groups are not supported on this platform");
+        ret res[Child, Error].err{Error.unsupported{}};
     }
 }
 
@@ -305,11 +385,9 @@ fun cwd_or_inherit(cwd: str) *u8 {
 # argv:     null-terminated argument array
 # envp:     null-terminated environment array
 # cwd:      directory to run in, or empty to inherit this process's
-# ret:      child handle, or an error message
-pub fun spawn_in(pathname: str, argv: **u8, envp: **u8, cwd: str) R.Result[Child, str] {
-    val pid: i64 = os.spawn_in(pathname, argv, envp, cwd_or_inherit(cwd));
-    if (pid < 0) { ret R.err[Child, str](os.message(pid)); }
-    ret R.ok[Child, str](Child{pid: pid, pgid: 0});
+# ret:      child handle, or the spawn failure
+pub fun spawn_in(pathname: str, argv: **u8, envp: **u8, cwd: str) res[Child, Error] {
+    ret spawned(os.spawn_in(pathname, argv, envp, cwd_or_inherit(cwd)), 0);
 }
 
 # start a process in a given working directory with its standard streams bound
@@ -319,13 +397,11 @@ pub fun spawn_in(pathname: str, argv: **u8, envp: **u8, cwd: str) R.Result[Child
 # stdin_fd:  descriptor for the child's stdin, or -1 to inherit
 # stdout_fd: descriptor for the child's stdout, or -1 to inherit
 # stderr_fd: descriptor for the child's stderr, or -1 to inherit
-# ret:       child handle, or an error message
+# ret:       child handle, or the spawn failure
 pub fun spawn_redirected_in(pathname: str, argv: **u8, envp: **u8, cwd: str,
                             stdin_fd: i32, stdout_fd: i32,
-                            stderr_fd: i32) R.Result[Child, str] {
-    val pid: i64 = os.spawn_redirected_in(pathname, argv, envp, cwd_or_inherit(cwd), stdin_fd, stdout_fd, stderr_fd);
-    if (pid < 0) { ret R.err[Child, str](os.message(pid)); }
-    ret R.ok[Child, str](Child{pid: pid, pgid: 0});
+                            stderr_fd: i32) res[Child, Error] {
+    ret spawned(os.spawn_redirected_in(pathname, argv, envp, cwd_or_inherit(cwd), stdin_fd, stdout_fd, stderr_fd), 0);
 }
 
 # start a process in a given working directory, with redirected streams, as the
@@ -336,29 +412,34 @@ pub fun spawn_redirected_in(pathname: str, argv: **u8, envp: **u8, cwd: str,
 # the whole tree, where terminate_child would leave the grandchildren orphaned
 # and still running.
 # ---
-# ret: child handle whose pgid identifies the group, or an error message
+# ret: child handle whose pgid identifies the group, or the spawn failure
 pub fun spawn_redirected_in_grouped(pathname: str, argv: **u8, envp: **u8, cwd: str,
                                     stdin_fd: i32, stdout_fd: i32,
-                                    stderr_fd: i32) R.Result[Child, str] {
+                                    stderr_fd: i32) res[Child, Error] {
     $if ($mach.build.os == $mach.os.linux) {
         val pid: i64 = linux.spawn_redirected_in_grouped(pathname, argv, envp, cwd_or_inherit(cwd), stdin_fd, stdout_fd, stderr_fd);
-        if (pid < 0) { ret R.err[Child, str](os.message(pid)); }
-        ret R.ok[Child, str](Child{pid: pid, pgid: pid});
+        ret spawned(pid, pid);
     }
     $or ($mach.build.os == $mach.os.darwin) {
         val pid: i64 = darwin.spawn_redirected_in_grouped(pathname, argv, envp, cwd_or_inherit(cwd), stdin_fd, stdout_fd, stderr_fd);
-        if (pid < 0) { ret R.err[Child, str](os.message(pid)); }
-        ret R.ok[Child, str](Child{pid: pid, pgid: pid});
+        ret spawned(pid, pid);
     }
     $or ($mach.build.os == $mach.os.windows) {
         var job: isize = 0;
         val pid: i64 = windows.spawn_redirected_in_grouped(pathname, argv, envp, cwd_or_inherit(cwd), stdin_fd, stdout_fd, stderr_fd, ?job);
-        if (pid < 0) { ret R.err[Child, str](os.message(pid)); }
-        ret R.ok[Child, str](Child{pid: pid, pgid: job::i64});
+        ret spawned(pid, job::i64);
     }
     $or {
-        ret R.err[Child, str]("process groups are not supported on this platform");
+        ret res[Child, Error].err{Error.unsupported{}};
     }
+}
+
+# a termination refused by the platform keeps the child with the caller
+fun terminated(code: i64, child: Child) err[Error] {
+    if (code < 0) {
+        ret err[Error].err{Error.native{Failure{code: code, operation: os.PROCESS_OP_TERMINATE, child: child}}};
+    }
+    ret err[Error].ok{};
 }
 
 # forcefully stop a child without reaping it
@@ -372,46 +453,34 @@ pub fun spawn_redirected_in_grouped(pathname: str, argv: **u8, envp: **u8, cwd: 
 # process ID can be released for reuse.
 # ---
 # child: child handle from spawn
-# ret:   true on success, or an error message
-pub fun terminate_child(child: Child) R.Result[bool, str] {
-    if (os.terminate_child(child.pid) < 0) {
-        ret R.err[bool, str]("terminate child failed");
-    }
-    ret R.ok[bool, str](true);
+# ret:   the native failure, which keeps the child with the caller
+pub fun terminate_child(child: Child) err[Error] {
+    ret terminated(os.terminate_child(child.pid), child);
 }
 
 # signal every process in a child's group, reaching descendants that spawned
 # their own children in turn
 #
-# errs if `child` was not created through spawn_grouped / spawn_redirected_grouped
-# (child.pgid == 0): there is no group to signal. member processes remain
-# individually waitable afterward, exactly as terminate_child leaves a single
-# child waitable.
+# `ungrouped` when `child` was not created through spawn_grouped /
+# spawn_redirected_grouped (child.pgid == 0): there is no group to signal.
+# member processes remain individually waitable afterward, exactly as
+# terminate_child leaves a single child waitable.
 # ---
 # child: child handle from spawn_grouped or spawn_redirected_grouped
-# ret:   true on success, or an error message
-pub fun terminate_group(child: Child) R.Result[bool, str] {
-    if (child.pgid == 0) { ret R.err[bool, str]("child is not in a process group"); }
+# ret:   the native failure, which keeps the child with the caller
+pub fun terminate_group(child: Child) err[Error] {
+    if (child.pgid == 0) { ret err[Error].err{Error.ungrouped{}}; }
     $if ($mach.build.os == $mach.os.linux) {
-        if (linux.terminate_group(child.pgid) < 0) {
-            ret R.err[bool, str]("terminate group failed");
-        }
-        ret R.ok[bool, str](true);
+        ret terminated(linux.terminate_group(child.pgid), child);
     }
     $or ($mach.build.os == $mach.os.darwin) {
-        if (darwin.terminate_group(child.pgid) < 0) {
-            ret R.err[bool, str]("terminate group failed");
-        }
-        ret R.ok[bool, str](true);
+        ret terminated(darwin.terminate_group(child.pgid), child);
     }
     $or ($mach.build.os == $mach.os.windows) {
-        if (windows.terminate_group(child.pgid) < 0) {
-            ret R.err[bool, str]("terminate group failed");
-        }
-        ret R.ok[bool, str](true);
+        ret terminated(windows.terminate_group(child.pgid), child);
     }
     $or {
-        ret R.err[bool, str]("process groups are not supported on this platform");
+        ret err[Error].err{Error.unsupported{}};
     }
 }
 
@@ -424,14 +493,16 @@ pub fun terminate_group(child: Child) R.Result[bool, str] {
 # error and leave the child unreaped.
 # ---
 # child: child handle from spawn
-# ret:   exit status, or an error message
-pub fun wait(child: Child) R.Result[ExitStatus, str] {
-    var wstatus: i32 = 0;
-    var r: i64 = os.EINTR;
-    for (r == os.EINTR) { r = os.wait_pid(child.pid, ?wstatus, 0); }
-    if (r < 0) { ret R.err[ExitStatus, str]("wait failed"); }
-
-    ret R.ok[ExitStatus, str](ExitStatus{raw: wstatus});
+# ret:   exit status, or a typed error retaining any unreaped child
+pub fun wait(child: Child) res[ExitStatus, Error] {
+    if (child.pid <= 0) { ret res[ExitStatus, Error].err{process_error(os.EINVAL, os.PROCESS_OP_WAIT)}; }
+    for {
+        var status: ExitStatus;
+        val result: os.WaitResult = os.wait_pid(child.pid, ?status, 0);
+        if (result.error.code == os.EINTR) { cnt; }
+        if (result.error.code < 0) { ret res[ExitStatus, Error].err{wait_error(result.error, child)}; }
+        if (result.pid > 0 && (exited(status) || signaled(status))) { ret res[ExitStatus, Error].ok{status}; }
+    }
 }
 
 # reap a child if it has already exited, without blocking
@@ -446,14 +517,19 @@ pub fun wait(child: Child) R.Result[ExitStatus, str] {
 # ---
 # child: child handle from any spawn
 # ret:   the exit status if it has terminated, absent if it is still running,
-#        or an error message
-pub fun try_wait(child: Child) R.Result[O.Option[ExitStatus], str] {
-    var wstatus: i32 = 0;
-    var r: i64 = os.EINTR;
-    for (r == os.EINTR) { r = os.wait_pid(child.pid, ?wstatus, os.WNOHANG); }
-    if (r < 0) { ret R.err[O.Option[ExitStatus], str]("wait failed"); }
-    if (r == 0) { ret R.ok[O.Option[ExitStatus], str](O.none[ExitStatus]()); }
-    ret R.ok[O.Option[ExitStatus], str](O.some[ExitStatus](ExitStatus{raw: wstatus}));
+#        or a typed error retaining any unreaped child
+pub fun try_wait(child: Child) res[opt[ExitStatus], Error] {
+    if (child.pid <= 0) { ret res[opt[ExitStatus], Error].err{process_error(os.EINVAL, os.PROCESS_OP_WAIT)}; }
+    for {
+        var status: ExitStatus;
+        val result: os.WaitResult = os.wait_pid(child.pid, ?status, os.WNOHANG);
+        if (result.error.code == os.EINTR) { cnt; }
+        if (result.error.code < 0) { ret res[opt[ExitStatus], Error].err{wait_error(result.error, child)}; }
+        if (result.pid > 0 && (exited(status) || signaled(status))) {
+            ret res[opt[ExitStatus], Error].ok{opt[ExitStatus].some{status}};
+        }
+        ret res[opt[ExitStatus], Error].ok{opt[ExitStatus].none{}};
+    }
 }
 
 # block until any child of this process exits
@@ -464,19 +540,22 @@ pub fun try_wait(child: Child) R.Result[O.Option[ExitStatus], str] {
 # several children can map the exit back to its work item. errs when there is
 # no child to wait for.
 #
-# wait_any must not run concurrently with terminate_child, because it may reap
-# and release the process ID that termination is validating.
+# serialize waits on the same child, and wait_any with all waits and termination
+# an error without a selected child leaves every existing child owner with its caller
 #
 # an interrupting signal is retried rather than reported, as in wait.
 # ---
-# ret: the reaped child and its exit status, or an error message
-pub fun wait_any() R.Result[Reaped, str] {
-    var wstatus: i32 = 0;
-    var pid: i64 = os.EINTR;
-    for (pid == os.EINTR) { pid = os.wait_pid(-1, ?wstatus, 0); }
-    if (pid <= 0) { ret R.err[Reaped, str]("wait failed"); }
-
-    ret R.ok[Reaped, str](Reaped{child: Child{pid: pid, pgid: 0}, status: ExitStatus{raw: wstatus}});
+# ret: the reaped child and its exit status, or a typed wait error
+pub fun wait_any() res[Reaped, Error] {
+    for {
+        var status: ExitStatus;
+        val result: os.WaitResult = os.wait_pid(-1, ?status, 0);
+        if (result.error.code == os.EINTR) { cnt; }
+        if (result.error.code < 0) { ret res[Reaped, Error].err{wait_error(result.error, Child{})}; }
+        if (result.pid > 0 && (exited(status) || signaled(status))) {
+            ret res[Reaped, Error].ok{Reaped{child: Child{pid: result.pid}, status: status}};
+        }
+    }
 }
 
 # how a supervised child ended
@@ -502,9 +581,8 @@ val SUPERVISE_POLL_NSEC: i64 = 2000000;
 # if only the shell is signalled. so the group is what gets terminated, which is
 # why the child should come from one of the grouped spawns.
 #
-# the child is always reaped, including when the deadline is what ended it, so a
-# terminated child never becomes a zombie. the caller learns which happened from
-# the returned reason.
+# successful supervision reaps the child. a wait or termination failure returns
+# its retained child for explicit retry or cleanup, alongside the original cause.
 #
 # a child that is not in a group is still supervised; expiry then terminates
 # just that child, and any grandchildren it started survive. that is a weaker
@@ -512,31 +590,32 @@ val SUPERVISE_POLL_NSEC: i64 = 2000000;
 # ---
 # child: child handle, ideally from a grouped spawn
 # scope: the scope whose deadline or cancellation bounds the child
-# ret:   how it ended, or an error message
-pub fun wait_within(child: Child, scope: *cancel.Scope) R.Result[Supervised, str] {
-    if (scope == nil) { ret R.err[Supervised, str]("supervision scope is nil"); }
+# ret:   how it ended, or a typed error retaining any unreaped child
+pub fun wait_within(child: Child, scope: *cancel.Scope) res[Supervised, Error] {
+    if (scope == nil) {
+        ret res[Supervised, Error].err{Error.native{Failure{code: os.EINVAL, operation: os.PROCESS_OP_WAIT, child: child}}};
+    }
 
     var terminated: bool = false;
     for {
-        val probe: R.Result[O.Option[ExitStatus], str] = try_wait(child);
-        if (R.is_err[O.Option[ExitStatus], str](probe)) {
-            ret R.err[Supervised, str](R.unwrap_err[O.Option[ExitStatus], str](probe));
-        }
-        val got: O.Option[ExitStatus] = R.unwrap_ok[O.Option[ExitStatus], str](probe);
-        if (O.is_some[ExitStatus](got)) {
-            ret R.ok[Supervised, str](Supervised{
-                status: O.unwrap[ExitStatus](got),
+        val probe: res[opt[ExitStatus], Error] = try_wait(child);
+        if (sel probe.err) { ret res[Supervised, Error].err{probe.err}; }
+        if (sel probe.ok.some) {
+            ret res[Supervised, Error].ok{Supervised{
+                status: probe.ok.some,
                 terminated: terminated,
-                reason: cancel.reason(scope)});
+                reason: cancel.reason(scope)}};
         }
 
         # the child is still running, so ask whether it is still allowed to
         cancel.expire(scope, tm.monotonic());
         val why: cancel.Reason = cancel.reason(scope);
         if (why != cancel.ACTIVE && !terminated) {
+            var stopped: err[Error];
+            if (child.pgid != 0) { stopped = terminate_group(child); }
+            or { stopped = terminate_child(child); }
+            if (sel stopped.err) { ret res[Supervised, Error].err{stopped.err}; }
             terminated = true;
-            if (child.pgid != 0) { terminate_group(child); }
-            or { terminate_child(child); }
             # fall through and keep polling: the child still has to be reaped
         }
         os.sleep(SUPERVISE_POLL_NSEC);
@@ -548,15 +627,15 @@ pub fun wait_within(child: Child, scope: *cancel.Scope) R.Result[Supervised, str
 # status: exit status to inspect
 # ret:    true if the process called exit
 pub fun exited(status: ExitStatus) bool {
-    ret os.has_exited(status.raw);
+    ret os.has_exited(status);
 }
 
 # get the exit code of a normally exited process
 # ---
 # status: exit status to inspect
-# ret:    exit code (0-255), only valid if exited() is true
-pub fun code(status: ExitStatus) i32 {
-    ret os.exit_code(status.raw);
+# ret:    full u32 exit code, only valid if exited() is true
+pub fun code(status: ExitStatus) u32 {
+    ret os.exit_code(status);
 }
 
 # check if the process was killed by a signal
@@ -564,7 +643,7 @@ pub fun code(status: ExitStatus) i32 {
 # status: exit status to inspect
 # ret:    true if terminated by signal
 pub fun signaled(status: ExitStatus) bool {
-    ret os.was_signaled(status.raw);
+    ret os.was_signaled(status);
 }
 
 # get the signal number that killed the process
@@ -572,7 +651,7 @@ pub fun signaled(status: ExitStatus) bool {
 # status: exit status to inspect
 # ret:    signal number
 pub fun signal(status: ExitStatus) i32 {
-    ret os.term_signal(status.raw);
+    ret os.term_signal(status);
 }
 
 # terminate the current process
@@ -586,6 +665,13 @@ pub fun exit(code: i64) {
 # one; windows uses one per PATHEXT entry, and the cmd default has four.
 val CAND_MAX: usize = 16;
 
+# a refused string copy; a slice this module computes is always inside its
+# string, so a bounds refusal is invalid use rather than a reachable outcome
+fun copy_refused(failure: StrError) Error {
+    if (sel failure.alloc) { ret Error.alloc{failure.alloc}; }
+    ret Error.alloc{A.Error.invalid{}};
+}
+
 # resolve a user-named program to a spawnable path using PATH
 #
 # none of the spawn entry points searches PATH: execve resolves nothing, and
@@ -597,18 +683,29 @@ val CAND_MAX: usize = 16;
 # ---
 # a:    allocator for the result
 # name: program name, bare or already pathed
-# ret:  an owned spawnable path, or an error
-pub fun resolve(a: *A.Allocator, name: str) R.Result[str, str] {
-    if (str_empty(name)) { ret R.err[str, str]("empty program name"); }
+# ret:  an owned spawnable path (extent is its length plus the terminator,
+#       released with text.string.str_free), or the failure
+pub fun resolve(a: *A.Allocator, name: str) res[str, Error] {
+    if (str_empty(name)) { ret res[str, Error].err{Error.empty_name{}}; }
     if (path.has_separator(name)) { ret owned_copy(a, name); }
 
-    val paths_r: R.Result[str, str] = env.value(a, "PATH");
-    if (R.is_err[str, str](paths_r)) { ret R.err[str, str]("PATH unset"); }
-    val paths: str = R.unwrap_ok[str, str](paths_r);
+    val paths_r: res[opt[OwnedString], env.EnvError] = env.value(a, "PATH");
+    if (sel paths_r.err) { ret res[str, Error].err{Error.env{paths_r.err}}; }
+    if (sel paths_r.ok.none) { ret res[str, Error].err{Error.unset{}}; }
+    var paths: OwnedString = paths_r.ok.some;
 
-    val out: R.Result[str, str] = resolve_in(a, name, paths);
-    A.deallocate[u8](a, paths, str_len(paths) + 1);
+    val out: res[str, Error] = resolve_in(a, name, paths.data);
+    owned_release(?paths);
     ret out;
+}
+
+# the candidate spellings are owned only when PATHEXT built them; the
+# single-spelling case aliases `name`, which belongs to the caller
+fun release_candidates(a: *A.Allocator, cand: *str, ncand: usize, exts: str, exts_extent: usize) {
+    if (str_empty(exts)) { ret; }
+    var k: usize = 0;
+    for (k < ncand) { A.deallocate[u8](a, cand[k], str_len(cand[k]) + 1); k = k + 1; }
+    A.deallocate[u8](a, exts, exts_extent);
 }
 
 # resolve a program name against a caller-supplied search list
@@ -629,13 +726,17 @@ pub fun resolve(a: *A.Allocator, name: str) R.Result[str, str] {
 # returning the borrowed argument for pathed names would make ownership depend
 # on the value, which is how a caller ends up leaking one path and double
 # freeing the other.
+#
+# a refused copy anywhere in the walk is the allocator's error, never a
+# directory silently skipped: a search that could not look everywhere does
+# not get to answer `not_found`.
 # ---
 # a:      allocator for the result
 # name:   program name, bare or already pathed
 # search: PATH-shaped list of directories, searched in order
-# ret:    an owned spawnable path, or an error
-pub fun resolve_in(a: *A.Allocator, name: str, search: str) R.Result[str, str] {
-    if (str_empty(name)) { ret R.err[str, str]("empty program name"); }
+# ret:    an owned spawnable path, or the failure
+pub fun resolve_in(a: *A.Allocator, name: str, search: str) res[str, Error] {
+    if (str_empty(name)) { ret res[str, Error].err{Error.empty_name{}}; }
     if (path.has_separator(name)) { ret owned_copy(a, name); }
 
     var list_sep: u8 = ':';
@@ -653,20 +754,26 @@ pub fun resolve_in(a: *A.Allocator, name: str, search: str) R.Result[str, str] {
     cand[0] = name;
 
     var exts: str = 0::str;
-    var elen: usize = 0;
+    var exts_extent: usize = 0;
     $if ($mach.build.os == $mach.os.windows) {
         if (!str_contains_char(name, '.')) {
-            val exts_r: R.Result[str, str] = env.value(a, "PATHEXT");
-            if (R.is_ok[str, str](exts_r)) { exts = R.unwrap_ok[str, str](exts_r); }
+            val exts_r: res[opt[OwnedString], env.EnvError] = env.value(a, "PATHEXT");
+            if (sel exts_r.err) { ret res[str, Error].err{Error.env{exts_r.err}}; }
+            if (sel exts_r.ok.some) {
+                exts = exts_r.ok.some.data;
+                exts_extent = exts_r.ok.some.extent;
+            }
 
             # the set cmd.exe assumes when PATHEXT is unset
             if (str_empty(exts)) {
+                if (exts != 0::str) { A.deallocate[u8](a, exts, exts_extent); }
                 val d_r: res[str, StrError] = str_copy(a, ".COM;.EXE;.BAT;.CMD");
-                if (sel d_r.err) { ret R.err[str, str]("out of memory"); }
+                if (sel d_r.err) { ret res[str, Error].err{copy_refused(d_r.err)}; }
                 exts = d_r.ok;
+                exts_extent = str_len(exts) + 1;
             }
 
-            elen = str_len(exts);
+            val elen: usize = str_len(exts);
             ncand = 0;
             var e: usize = 0;
             for (e < elen && ncand < CAND_MAX) {
@@ -678,7 +785,10 @@ pub fun resolve_in(a: *A.Allocator, name: str, search: str) R.Result[str, str] {
                 if (eseg == 0) { cnt; }
 
                 val j_r: res[str, StrError] = str_join(a, name, (?exts[estart])::str);
-                if (sel j_r.err) { cnt; }
+                if (sel j_r.err) {
+                    release_candidates(a, ?cand[0], ncand, exts, exts_extent);
+                    ret res[str, Error].err{copy_refused(j_r.err)};
+                }
                 cand[ncand] = j_r.ok;
                 ncand = ncand + 1;
             }
@@ -701,40 +811,39 @@ pub fun resolve_in(a: *A.Allocator, name: str, search: str) R.Result[str, str] {
         # `search` belongs to the caller and may be a literal in read-only
         # memory, so the entry is copied out rather than terminated in place
         val dir_r: res[str, StrError] = str_copy_slice(a, search, start, seg_len);
-        if (sel dir_r.err) { cnt; }
+        if (sel dir_r.err) {
+            release_candidates(a, ?cand[0], ncand, exts, exts_extent);
+            ret res[str, Error].err{copy_refused(dir_r.err)};
+        }
         val dir: str = dir_r.ok;
 
         var c: usize = 0;
         for (c < ncand) {
             val cand_r: res[path.Path, A.Error] = path.join(a, dir, cand[c]);
-            if (sel cand_r.ok) {
-                val full: str = cand_r.ok;
-                if (filesystem.is_file(full)) { found = full; brk; }
-                A.deallocate[u8](a, full, str_len(full) + 1);
+            if (sel cand_r.err) {
+                A.deallocate[u8](a, dir, seg_len + 1);
+                release_candidates(a, ?cand[0], ncand, exts, exts_extent);
+                ret res[str, Error].err{Error.alloc{cand_r.err}};
             }
+            val full: str = cand_r.ok;
+            if (filesystem.is_file(full)) { found = full; brk; }
+            A.deallocate[u8](a, full, str_len(full) + 1);
             c = c + 1;
         }
         A.deallocate[u8](a, dir, seg_len + 1);
     }
 
-    # the candidate spellings are owned only when PATHEXT built them; the
-    # single-spelling case aliases `name`, which belongs to the caller
-    if (!str_empty(exts)) {
-        var k: usize = 0;
-        for (k < ncand) { A.deallocate[u8](a, cand[k], str_len(cand[k]) + 1); k = k + 1; }
-        A.deallocate[u8](a, exts, elen + 1);
-    }
+    release_candidates(a, ?cand[0], ncand, exts, exts_extent);
 
-    if (str_empty(found)) { ret R.err[str, str]("not found on PATH"); }
-    ret R.ok[str, str](found);
+    if (str_empty(found)) { ret res[str, Error].err{Error.not_found{}}; }
+    ret res[str, Error].ok{found};
 }
 
-# an owned copy of a pathed name, keeping this module's string error surface
-# until its own migration (mach-std#618)
-fun owned_copy(a: *A.Allocator, name: str) R.Result[str, str] {
+# an owned copy of a pathed name
+fun owned_copy(a: *A.Allocator, name: str) res[str, Error] {
     val copied: res[str, StrError] = str_copy(a, name);
-    if (sel copied.err) { ret R.err[str, str]("out of memory"); }
-    ret R.ok[str, str](copied.ok);
+    if (sel copied.err) { ret res[str, Error].err{copy_refused(copied.err)}; }
+    ret res[str, Error].ok{copied.ok};
 }
 
 # the exec contract is platform-neutral, but the test programs are not;
@@ -807,7 +916,7 @@ $if ($mach.build.os == $mach.os.windows) {
         var av2: [4]usize = make_shell_argv("ping -n 3 127.0.0.1 > NUL");
         val pid2: i64 = os.spawn(shell_path(), (?av2[0])::**u8, nil);
         os.close(fds[1]);
-        var st: i32 = 0;
+        var st: os.ProcessStatus;
         if (pid2 < 0) {
             os.close(fds[0]);
             os.wait_pid(pid1, ?st, 0);
@@ -821,10 +930,10 @@ $if ($mach.build.os == $mach.os.windows) {
             total = total + n::usize;
         }
         os.close(fds[0]);
-        val still_running: i64 = os.wait_pid(pid2, ?st, os.WNOHANG);
+        val still_running: os.WaitResult = os.wait_pid(pid2, ?st, os.WNOHANG);
         os.wait_pid(pid1, ?st, 0);
         os.wait_pid(pid2, ?st, 0);
-        if (still_running != 0) { ret 1; }
+        if (still_running.pid != 0 || still_running.error.code != 0) { ret 1; }
         if (total != ECHO_LEN) { ret 1; }
         ret 0;
     }
@@ -876,36 +985,65 @@ $or {
     fun seed_cmd() str { ret "echo seeded>\"std exec seed.txt\""; }
 }
 
+# test predicates: `sel` takes a place, so an inline call is tested through these
+fun exited_zero(r: res[ExitStatus, Error]) bool {
+    if (!sel r.ok) { ret false; }
+    ret exited(r.ok) && code(r.ok) == 0;
+}
+
+fun exited_with(r: res[ExitStatus, Error], want: u32) bool {
+    if (!sel r.ok) { ret false; }
+    ret exited(r.ok) && code(r.ok) == want;
+}
+
+fun stopped(r: err[Error]) bool { ret sel r.ok; }
+
+fun still_running(r: res[opt[ExitStatus], Error]) bool {
+    if (!sel r.ok) { ret false; }
+    ret sel r.ok.none;
+}
+
+fun resolved_to(r: res[str, Error], want: str) bool {
+    if (!sel r.ok) { ret false; }
+    ret str_equals(r.ok, want);
+}
+
 test "std.process.exec.run:success_exits_zero" {
     var argv: [4]usize = argv_ok();
-    val r: R.Result[ExitStatus, str] = run(prog_ok(), (?argv[0])::**u8, nil);
-    if (R.is_err[ExitStatus, str](r)) { ret 1; }
-    val s: ExitStatus = R.unwrap_ok[ExitStatus, str](r);
-    if (!exited(s)) { ret 1; }
-    if (code(s) != 0) { ret 1; }
+    val r: res[ExitStatus, Error] = run(prog_ok(), (?argv[0])::**u8, nil);
+    if (!exited_zero(r)) { ret 1; }
     ret 0;
 }
 
 test "std.process.exec.run:failure_exits_one" {
     var argv: [4]usize = argv_fail();
-    val r: R.Result[ExitStatus, str] = run(prog_fail(), (?argv[0])::**u8, nil);
-    if (R.is_err[ExitStatus, str](r)) { ret 1; }
-    val s: ExitStatus = R.unwrap_ok[ExitStatus, str](r);
-    if (!exited(s)) { ret 1; }
-    if (code(s) != 1) { ret 1; }
+    val r: res[ExitStatus, Error] = run(prog_fail(), (?argv[0])::**u8, nil);
+    if (!exited_with(r, 1)) { ret 1; }
     ret 0;
 }
 
 test "std.process.exec.spawn:wait_matches_run" {
     var argv: [4]usize = argv_ok();
-    val sr: R.Result[Child, str] = spawn(prog_ok(), (?argv[0])::**u8, nil);
-    if (R.is_err[Child, str](sr)) { ret 1; }
-    val child: Child = R.unwrap_ok[Child, str](sr);
-    val wr: R.Result[ExitStatus, str] = wait(child);
-    if (R.is_err[ExitStatus, str](wr)) { ret 1; }
-    val s: ExitStatus = R.unwrap_ok[ExitStatus, str](wr);
-    if (!exited(s)) { ret 1; }
-    if (code(s) != 0) { ret 1; }
+    val sr: res[Child, Error] = spawn(prog_ok(), (?argv[0])::**u8, nil);
+    if (sel sr.err) { ret 1; }
+    val child: Child = sr.ok;
+    val wr: res[ExitStatus, Error] = wait(child);
+    if (!exited_zero(wr)) { ret 2; }
+    ret 0;
+}
+
+# a spawn that cannot exec reports the platform's refusal with no child
+test "std.process.exec.spawn:missing_program_is_the_native_failure" {
+    var argv: [4]usize = argv_ok();
+    val sr: res[Child, Error] = spawn("/std_exec_no_such_program_dir/nothing", (?argv[0])::**u8, nil);
+    if (!sel sr.err) { ret 1; }
+    if (!sel sr.err.native) { ret 2; }
+    if (sr.err.native.operation != os.PROCESS_OP_SPAWN || sr.err.native.code >= 0) { ret 3; }
+    if (retained(sr.err).pid != 0) { ret 4; }
+    val wr: res[ExitStatus, Error] = wait(Child{pid: 0});
+    if (!sel wr.err) { ret 5; }
+    if (!sel wr.err.native) { ret 6; }
+    if (wr.err.native.code != os.EINVAL || wr.err.native.operation != os.PROCESS_OP_WAIT) { ret 7; }
     ret 0;
 }
 
@@ -917,9 +1055,9 @@ test "std.process.exec.output:captures_echo" {
     fixed.make(?a, ?fst, ?buf[0], 32768);
 
     var argv: [4]usize = argv_echo();
-    val r: R.Result[Output, str] = output(?a, prog_echo(), (?argv[0])::**u8, nil);
-    if (R.is_err[Output, str](r)) { ret 1; }
-    val o: Output = R.unwrap_ok[Output, str](r);
+    val r: res[Output, Error] = output(?a, prog_echo(), (?argv[0])::**u8, nil);
+    if (sel r.err) { ret 1; }
+    val o: Output = r.ok;
     if (!exited(o.status)) { ret 1; }
     if (code(o.status) != 0) { ret 1; }
     if (o.bytes.len != ECHO_LEN) { ret 1; }
@@ -937,11 +1075,8 @@ test "std.process.exec.run:repeated_spawns_stay_correct" {
     var i: usize = 0;
     for (i < 64) {
         var argv: [4]usize = argv_ok();
-        val r: R.Result[ExitStatus, str] = run(prog_ok(), (?argv[0])::**u8, nil);
-        if (R.is_err[ExitStatus, str](r)) { ret 1; }
-        val s: ExitStatus = R.unwrap_ok[ExitStatus, str](r);
-        if (!exited(s)) { ret 1; }
-        if (code(s) != 0) { ret 1; }
+        val r: res[ExitStatus, Error] = run(prog_ok(), (?argv[0])::**u8, nil);
+        if (!exited_zero(r)) { ret 1; }
         i = i + 1;
     }
     ret 0;
@@ -953,8 +1088,8 @@ test "std.process.exec.spawn_redirected:pipes_child_stdout" {
     if (os.pipe(?fds[0]) < 0) { ret 1; }
 
     var argv: [4]usize = argv_echo();
-    val sr: R.Result[Child, str] = spawn_redirected(prog_echo(), (?argv[0])::**u8, nil, fds[1], -1);
-    if (R.is_err[Child, str](sr)) {
+    val sr: res[Child, Error] = spawn_redirected(prog_echo(), (?argv[0])::**u8, nil, fds[1], -1);
+    if (sel sr.err) {
         os.close(fds[0]);
         os.close(fds[1]);
         ret 1;
@@ -970,9 +1105,8 @@ test "std.process.exec.spawn_redirected:pipes_child_stdout" {
     }
     os.close(fds[0]);
 
-    val wr: R.Result[ExitStatus, str] = wait(R.unwrap_ok[Child, str](sr));
-    if (R.is_err[ExitStatus, str](wr)) { ret 1; }
-    if (code(R.unwrap_ok[ExitStatus, str](wr)) != 0) { ret 1; }
+    val wr: res[ExitStatus, Error] = wait(sr.ok);
+    if (!exited_zero(wr)) { ret 1; }
 
     if (total != ECHO_LEN) { ret 1; }
     if (redir_buf[0] != 'h') { ret 1; }
@@ -990,23 +1124,22 @@ test "std.process.exec.spawn_redirected:pipes_child_stdout" {
 test "std.process.exec.spawn_grouped:child_pgid_equals_pid" {
     $if ($mach.build.os == $mach.os.windows) {
         var argv: [4]usize = argv_ok();
-        val sr: R.Result[Child, str] = spawn_grouped(prog_ok(), (?argv[0])::**u8, nil);
-        if (R.is_err[Child, str](sr)) { ret 1; }
-        val child: Child = R.unwrap_ok[Child, str](sr);
+        val sr: res[Child, Error] = spawn_grouped(prog_ok(), (?argv[0])::**u8, nil);
+        if (sel sr.err) { ret 1; }
+        val child: Child = sr.ok;
 
         var bad: u8 = 0;
         if (child.pgid == 0) { bad = 1; }
 
-        val wr: R.Result[ExitStatus, str] = wait(child);
-        if (R.is_err[ExitStatus, str](wr)) { bad = 1; }
-        or (!exited(R.unwrap_ok[ExitStatus, str](wr)) || code(R.unwrap_ok[ExitStatus, str](wr)) != 0) { bad = 1; }
+        val wr: res[ExitStatus, Error] = wait(child);
+        if (!exited_zero(wr)) { bad = 1; }
         ret bad::i32;
     }
     $or {
         var argv: [4]usize = argv_ok();
-        val sr: R.Result[Child, str] = spawn_grouped(prog_ok(), (?argv[0])::**u8, nil);
-        if (R.is_err[Child, str](sr)) { ret 1; }
-        val child: Child = R.unwrap_ok[Child, str](sr);
+        val sr: res[Child, Error] = spawn_grouped(prog_ok(), (?argv[0])::**u8, nil);
+        if (sel sr.err) { ret 1; }
+        val child: Child = sr.ok;
 
         var bad: u8 = 0;
         if (child.pgid != child.pid) { bad = 1; }
@@ -1017,8 +1150,8 @@ test "std.process.exec.spawn_grouped:child_pgid_equals_pid" {
             if (darwin.getpgid(child.pid) != child.pgid) { bad = 1; }
         }
 
-        val wr: R.Result[ExitStatus, str] = wait(child);
-        if (R.is_err[ExitStatus, str](wr)) { bad = 1; }
+        val wr: res[ExitStatus, Error] = wait(child);
+        if (sel wr.err) { bad = 1; }
         ret bad::i32;
     }
 }
@@ -1040,22 +1173,21 @@ test "std.process.exec.spawn_grouped:child_pgid_equals_pid" {
 test "std.process.exec.terminate_group:kills_a_grandchild" {
     $if ($mach.build.os == $mach.os.windows) {
         var argv: [4]usize = make_shell_argv("ping -n 30 127.0.0.1 >NUL");
-        val sr: R.Result[Child, str] = spawn_grouped(shell_path(), (?argv[0])::**u8, nil);
-        if (R.is_err[Child, str](sr)) { ret 1; }
-        val child: Child = R.unwrap_ok[Child, str](sr);
+        val sr: res[Child, Error] = spawn_grouped(shell_path(), (?argv[0])::**u8, nil);
+        if (sel sr.err) { ret 1; }
+        val child: Child = sr.ok;
         if (child.pgid == 0) { terminate_child(child); wait(child); ret 1; }
 
-        val tr: R.Result[bool, str] = terminate_group(child);
-        if (R.is_err[bool, str](tr)) { terminate_child(child); wait(child); ret 1; }
+        if (!stopped(terminate_group(child))) { terminate_child(child); wait(child); ret 1; }
 
-        var wstatus: i32 = 0;
-        val w: i64 = os.wait_pid(child.pid, ?wstatus, 0);
-        if (w != child.pid) { ret 1; }
+        var wstatus: os.ProcessStatus;
+        val w: os.WaitResult = os.wait_pid(child.pid, ?wstatus, 0);
+        if (w.pid != child.pid || w.error.code != 0) { ret 1; }
         # TerminateJobObject's uExitCode becomes every member's exit code,
         # same TERMINATE_CHILD_EXIT_CODE terminate_child already uses -
         # confirms this reaped exit came from the group kill, not a ping that
         # happened to finish its own 30-second run on its own
-        if (!exited(ExitStatus{raw: wstatus}) || code(ExitStatus{raw: wstatus}) != 137) { ret 1; }
+        if (!exited(wstatus) || code(wstatus) != 137) { ret 1; }
         ret 0;
     }
     $or {
@@ -1069,14 +1201,14 @@ test "std.process.exec.terminate_group:kills_a_grandchild" {
         argv[2] = ("sleep 30 & echo $!; wait")::usize;
         argv[3] = 0;
 
-        val sr: R.Result[Child, str] = spawn_redirected_grouped("/bin/sh", (?argv[0])::**u8, nil, fds[1], -1);
-        if (R.is_err[Child, str](sr)) {
+        val sr: res[Child, Error] = spawn_redirected_grouped("/bin/sh", (?argv[0])::**u8, nil, fds[1], -1);
+        if (sel sr.err) {
             os.close(fds[0]);
             os.close(fds[1]);
             ret 1;
         }
         os.close(fds[1]);
-        val shell: Child = R.unwrap_ok[Child, str](sr);
+        val shell: Child = sr.ok;
 
         # read the grandchild's pid, echoed as decimal text followed by '\n'
         var total: usize = 0;
@@ -1097,8 +1229,7 @@ test "std.process.exec.terminate_group:kills_a_grandchild" {
         }
         if (grandchild <= 0) { terminate_child(shell); wait(shell); ret 1; }
 
-        val tr: R.Result[bool, str] = terminate_group(shell);
-        if (R.is_err[bool, str](tr)) { wait(shell); ret 1; }
+        if (!stopped(terminate_group(shell))) { wait(shell); ret 1; }
 
         # bounded poll (at most 1s total): both the shell and the grandchild
         # must disappear, not merely the one this process can wait() on
@@ -1107,8 +1238,8 @@ test "std.process.exec.terminate_group:kills_a_grandchild" {
         var tries: usize = 0;
         for (tries < 50 && (shell_reaped == 0 || grandchild_gone == 0)) {
             if (shell_reaped == 0) {
-                var wstatus: i32 = 0;
-                if (os.wait_pid(shell.pid, ?wstatus, os.WNOHANG) == shell.pid) { shell_reaped = 1; }
+                var wstatus: os.ProcessStatus;
+                if (os.wait_pid(shell.pid, ?wstatus, os.WNOHANG).pid == shell.pid) { shell_reaped = 1; }
             }
             if (grandchild_gone == 0) {
                 $if ($mach.build.os == $mach.os.linux) {
@@ -1123,7 +1254,7 @@ test "std.process.exec.terminate_group:kills_a_grandchild" {
         }
 
         if (shell_reaped == 0) {
-            var final_status: i32 = 0;
+            var final_status: os.ProcessStatus;
             os.wait_pid(shell.pid, ?final_status, 0);
         }
         if (shell_reaped == 0 || grandchild_gone == 0) { ret 1; }
@@ -1135,34 +1266,52 @@ test "std.process.exec.terminate_group:kills_a_grandchild" {
 # there is no group to signal.
 test "std.process.exec.terminate_group:ungrouped_child_errs" {
     var argv: [4]usize = argv_ok();
-    val sr: R.Result[Child, str] = spawn(prog_ok(), (?argv[0])::**u8, nil);
-    if (R.is_err[Child, str](sr)) { ret 1; }
-    val child: Child = R.unwrap_ok[Child, str](sr);
+    val sr: res[Child, Error] = spawn(prog_ok(), (?argv[0])::**u8, nil);
+    if (sel sr.err) { ret 1; }
+    val child: Child = sr.ok;
 
-    val tr: R.Result[bool, str] = terminate_group(child);
+    val tr: err[Error] = terminate_group(child);
     wait(child);
-    if (!R.is_err[bool, str](tr)) { ret 1; }
+    if (!sel tr.err) { ret 1; }
+    if (!sel tr.err.ungrouped) { ret 2; }
+    ret 0;
+}
+
+# a termination the platform refuses keeps the child with the caller: a
+# reaped pid is ECHILD, and the error names the child it was asked about
+test "std.process.exec.terminate_child:refusal_is_native_and_keeps_the_child" {
+    var argv: [4]usize = argv_ok();
+    val sr: res[Child, Error] = spawn(prog_ok(), (?argv[0])::**u8, nil);
+    if (sel sr.err) { ret 1; }
+    val child: Child = sr.ok;
+    val wr: res[ExitStatus, Error] = wait(child);
+    if (!exited_zero(wr)) { ret 2; }
+    val tr: err[Error] = terminate_child(child);
+    if (!sel tr.err) { ret 3; }
+    if (!sel tr.err.native) { ret 4; }
+    if (tr.err.native.code != os.ECHILD || tr.err.native.operation != os.PROCESS_OP_TERMINATE) { ret 5; }
+    if (retained(tr.err).pid != child.pid) { ret 6; }
     ret 0;
 }
 
 test "std.process.exec.wait_any:reaps_each_child_once" {
     var argv_a: [4]usize = argv_ok();
-    val ra: R.Result[Child, str] = spawn(prog_ok(), (?argv_a[0])::**u8, nil);
-    if (R.is_err[Child, str](ra)) { ret 1; }
+    val ra: res[Child, Error] = spawn(prog_ok(), (?argv_a[0])::**u8, nil);
+    if (sel ra.err) { ret 1; }
     var argv_b: [4]usize = argv_ok();
-    val rb: R.Result[Child, str] = spawn(prog_ok(), (?argv_b[0])::**u8, nil);
-    if (R.is_err[Child, str](rb)) { ret 1; }
-    val pa: i64 = R.unwrap_ok[Child, str](ra).pid;
-    val pb: i64 = R.unwrap_ok[Child, str](rb).pid;
+    val rb: res[Child, Error] = spawn(prog_ok(), (?argv_b[0])::**u8, nil);
+    if (sel rb.err) { ret 1; }
+    val pa: i64 = ra.ok.pid;
+    val pb: i64 = rb.ok.pid;
 
-    val w1: R.Result[Reaped, str] = wait_any();
-    if (R.is_err[Reaped, str](w1)) { ret 1; }
-    val r1: Reaped = R.unwrap_ok[Reaped, str](w1);
+    val w1: res[Reaped, Error] = wait_any();
+    if (sel w1.err) { ret 1; }
+    val r1: Reaped = w1.ok;
     if (!exited(r1.status) || code(r1.status) != 0) { ret 1; }
 
-    val w2: R.Result[Reaped, str] = wait_any();
-    if (R.is_err[Reaped, str](w2)) { ret 1; }
-    val r2: Reaped = R.unwrap_ok[Reaped, str](w2);
+    val w2: res[Reaped, Error] = wait_any();
+    if (sel w2.err) { ret 1; }
+    val r2: Reaped = w2.ok;
     if (!exited(r2.status) || code(r2.status) != 0) { ret 1; }
 
     # both children reaped, each exactly once, in either order
@@ -1173,7 +1322,10 @@ test "std.process.exec.wait_any:reaps_each_child_once" {
 }
 
 test "std.process.exec.wait_any:errs_with_no_children" {
-    if (!R.is_err[Reaped, str](wait_any())) { ret 1; }
+    val w: res[Reaped, Error] = wait_any();
+    if (!sel w.err) { ret 1; }
+    if (!sel w.err.native) { ret 2; }
+    if (w.err.native.code != os.ECHILD || retained(w.err).pid != 0) { ret 3; }
     ret 0;
 }
 
@@ -1202,10 +1354,8 @@ test "std.process.exec.run_shell:child_starts_in_cwd" {
     # negative half of this test, so clear both sites before spawning
     filesystem.remove_file(leaf);
 
-    val r: R.Result[ExitStatus, str] = run_shell(probe_cmd(), dir, nil);
-    if (R.is_err[ExitStatus, str](r)) { ret 1; }
-    val st: ExitStatus = R.unwrap_ok[ExitStatus, str](r);
-    if (!exited(st) || code(st) != 0) { ret 1; }
+    val r: res[ExitStatus, Error] = run_shell(probe_cmd(), dir, nil);
+    if (!exited_zero(r)) { ret 1; }
 
     var joined: [4160]u8;
     join_scratch(?joined[0], dir, leaf);
@@ -1244,18 +1394,14 @@ test "std.process.exec.run_shell:quoted_command_survives" {
     filesystem.remove_file((?seed_path[0])::str);
     filesystem.remove_file((?out_path[0])::str);
 
-    val mk: R.Result[ExitStatus, str] = run_shell(seed_cmd(), dir, nil);
-    if (R.is_err[ExitStatus, str](mk)) { ret 1; }
+    val mk: res[ExitStatus, Error] = run_shell(seed_cmd(), dir, nil);
+    if (sel mk.err) { ret 1; }
     if (!filesystem.is_file((?seed_path[0])::str)) { ret 1; }
 
-    val r: R.Result[ExitStatus, str] = run_shell(probe_quoted_cmd(), dir, nil);
+    val r: res[ExitStatus, Error] = run_shell(probe_quoted_cmd(), dir, nil);
     var bad: u8 = 0;
-    if (R.is_err[ExitStatus, str](r)) { bad = 1; }
-    or {
-        val st: ExitStatus = R.unwrap_ok[ExitStatus, str](r);
-        if (!exited(st) || code(st) != 0)               { bad = 1; }
-        or (!filesystem.is_file((?out_path[0])::str))   { bad = 1; }
-    }
+    if (!exited_zero(r))                            { bad = 1; }
+    or (!filesystem.is_file((?out_path[0])::str))   { bad = 1; }
 
     filesystem.remove_file((?seed_path[0])::str);
     filesystem.remove_file((?out_path[0])::str);
@@ -1283,9 +1429,8 @@ test "std.process.exec.resolve_in:pathed_name_is_verbatim_and_unprobed" {
     val want: str = (?probe[0])::str;
     if (filesystem.is_file(want)) { ret 1; }
 
-    val r: R.Result[str, str] = resolve_in(?a, want, "");
-    if (R.is_err[str, str](r)) { ret 1; }
-    if (!str_equals(R.unwrap_ok[str, str](r), want)) { ret 1; }
+    val r: res[str, Error] = resolve_in(?a, want, "");
+    if (!resolved_to(r, want)) { ret 1; }
     ret 0;
 }
 
@@ -1320,19 +1465,22 @@ test "std.process.exec.resolve_in:first_entry_wins" {
 
     var bad: u8 = 0;
 
-    val ab_r: R.Result[str, str] = resolve_in(?a, leaf, list_of(?a, dir_a, dir_b));
-    if (R.is_err[str, str](ab_r)) { bad = 1; }
-    or (!str_equals(R.unwrap_ok[str, str](ab_r), (?fa[0])::str)) { bad = 1; }
+    val ab_r: res[str, Error] = resolve_in(?a, leaf, list_of(?a, dir_a, dir_b));
+    if (!resolved_to(ab_r, (?fa[0])::str)) { bad = 1; }
 
-    val ba_r: R.Result[str, str] = resolve_in(?a, leaf, list_of(?a, dir_b, dir_a));
-    if (R.is_err[str, str](ba_r)) { bad = 1; }
-    or (!str_equals(R.unwrap_ok[str, str](ba_r), (?fb[0])::str)) { bad = 1; }
+    val ba_r: res[str, Error] = resolve_in(?a, leaf, list_of(?a, dir_b, dir_a));
+    if (!resolved_to(ba_r, (?fb[0])::str)) { bad = 1; }
 
     filesystem.remove_file((?fa[0])::str);
     filesystem.remove_file((?fb[0])::str);
     filesystem.remove_dir(dir_a);
     filesystem.remove_dir(dir_b);
     ret bad::i32;
+}
+
+fun not_found(r: res[str, Error]) bool {
+    if (!sel r.err) { ret false; }
+    ret sel r.err.not_found;
 }
 
 # a program sitting in the CURRENT directory must not resolve. this is the
@@ -1354,25 +1502,25 @@ test "std.process.exec.resolve_in:current_directory_is_never_searched" {
 
     var bad: u8 = 0;
     # a bare empty list, a leading empty entry, an interior one, a trailing one
-    if (R.is_ok[str, str](resolve_in(?a, leaf, "")))    { bad = 1; }
-    if (R.is_ok[str, str](resolve_in(?a, leaf, sep1(?a)))) { bad = 1; }
-    if (R.is_ok[str, str](resolve_in(?a, leaf, sep2(?a)))) { bad = 1; }
+    if (!not_found(resolve_in(?a, leaf, "")))       { bad = 1; }
+    if (!not_found(resolve_in(?a, leaf, sep1(?a)))) { bad = 1; }
+    if (!not_found(resolve_in(?a, leaf, sep2(?a)))) { bad = 1; }
 
     filesystem.remove_file(leaf);
     ret bad::i32;
 }
 
-# a name that is nowhere on the list is an error, not a silent pass-through of
-# the bare name. returning the name unresolved would hand execve something it
-# cannot run and turn a clear lookup failure into a spawn failure.
+# a name that is nowhere on the list is `not_found`, not a silent pass-through
+# of the bare name. returning the name unresolved would hand execve something
+# it cannot run and turn a clear lookup failure into a spawn failure.
 test "std.process.exec.resolve_in:missing_name_errs" {
     var buf: [8192]u8;
     var fst: fixed.FixedState;
     var a: A.Allocator;
     fixed.make(?a, ?fst, ?buf[0], 8192);
 
-    val r: R.Result[str, str] = resolve_in(?a, "std_exec_no_such_program", scratch_dir());
-    if (R.is_ok[str, str](r)) { ret 1; }
+    val r: res[str, Error] = resolve_in(?a, "std_exec_no_such_program", scratch_dir());
+    if (!not_found(r)) { ret 1; }
     ret 0;
 }
 
@@ -1382,7 +1530,42 @@ test "std.process.exec.resolve_in:empty_name_errs" {
     var a: A.Allocator;
     fixed.make(?a, ?fst, ?buf[0], 8192);
 
-    if (R.is_ok[str, str](resolve_in(?a, "", scratch_dir()))) { ret 1; }
+    val r: res[str, Error] = resolve_in(?a, "", scratch_dir());
+    if (!sel r.err) { ret 1; }
+    if (!sel r.err.empty_name) { ret 2; }
+    ret 0;
+}
+
+use process_testing: std.allocator.testing;
+
+# a refused copy is the allocator's error and leaves nothing behind, at the
+# pathed-name copy and at the directory copy inside the walk alike
+test "std.process.exec.resolve_in:refused_copies_are_alloc_and_leak_nothing" {
+    var tracking: process_testing.Testing;
+    val tracked: err[A.Error] = process_testing.make(?tracking);
+    if (sel tracked.err) { ret 1; }
+    fin { process_testing.dnit(?tracking); }
+
+    var probe: [4160]u8;
+    join_scratch(?probe[0], scratch_dir(), "std_exec_resolve_absent.tmp");
+    process_testing.fail_at_ordinal(?tracking, 1);
+    val pathed: res[str, Error] = resolve_in(?tracking.a, (?probe[0])::str, "");
+    if (!sel pathed.err) { ret 2; }
+    if (!sel pathed.err.alloc) { ret 3; }
+    if (tracking.live != 0) { ret 4; }
+
+    # the walk copies each directory entry; the refusal of that copy is not a
+    # skipped directory followed by `not_found`
+    process_testing.fail_at_ordinal(?tracking, 1);
+    val walked: res[str, Error] = resolve_in(?tracking.a, "std_exec_no_such_program", scratch_dir());
+    if (!sel walked.err) { ret 5; }
+    if (!sel walked.err.alloc) { ret 6; }
+    if (tracking.live != 0) { ret 7; }
+
+    process_testing.clear_failure(?tracking);
+    val searched: res[str, Error] = resolve_in(?tracking.a, "std_exec_no_such_program", scratch_dir());
+    if (!not_found(searched)) { ret 8; }
+    if (tracking.live != 0) { ret 9; }
     ret 0;
 }
 
@@ -1393,9 +1576,9 @@ test "std.process.exec.resolve:finds_a_real_program_on_path" {
     var a: A.Allocator;
     page.make(?a);
 
-    val r: R.Result[str, str] = resolve(?a, known_program());
-    if (R.is_err[str, str](r)) { ret 1; }
-    val resolved: str = R.unwrap_ok[str, str](r);
+    val r: res[str, Error] = resolve(?a, known_program());
+    if (sel r.err) { ret 1; }
+    val resolved: str = r.ok;
     val exists: bool = filesystem.is_file(resolved);
     A.deallocate[u8](?a, resolved, str_len(resolved) + 1);
     if (!exists) { ret 1; }
@@ -1456,24 +1639,22 @@ fun exit_seven_argv() [4]usize {
 # wait would once the child is gone
 test "std.process.exec.try_wait:absent_while_running_then_present" {
     var argv: [4]usize = long_running_argv();
-    val sr: R.Result[Child, str] = spawn(long_running_path(), (?argv[0])::**u8, nil);
-    if (R.is_err[Child, str](sr)) { ret 1; }
-    val child: Child = R.unwrap_ok[Child, str](sr);
+    val sr: res[Child, Error] = spawn(long_running_path(), (?argv[0])::**u8, nil);
+    if (sel sr.err) { ret 1; }
+    val child: Child = sr.ok;
 
     # the child is still running, so the answer is absent rather than a block
-    val first: R.Result[O.Option[ExitStatus], str] = try_wait(child);
-    if (R.is_err[O.Option[ExitStatus], str](first)) { terminate_child(child); wait(child); ret 2; }
-    if (O.is_some[ExitStatus](R.unwrap_ok[O.Option[ExitStatus], str](first))) {
-        terminate_child(child); wait(child); ret 3;
-    }
+    val first: res[opt[ExitStatus], Error] = try_wait(child);
+    if (sel first.err) { terminate_child(child); wait(child); ret 2; }
+    if (!still_running(first)) { terminate_child(child); wait(child); ret 3; }
 
     terminate_child(child);
     var seen: bool = false;
     var spins: i32 = 0;
     for (spins < 500 && !seen) {
-        val probe: R.Result[O.Option[ExitStatus], str] = try_wait(child);
-        if (R.is_err[O.Option[ExitStatus], str](probe)) { ret 4; }
-        if (O.is_some[ExitStatus](R.unwrap_ok[O.Option[ExitStatus], str](probe))) { seen = true; }
+        val probe: res[opt[ExitStatus], Error] = try_wait(child);
+        if (sel probe.err) { ret 4; }
+        if (sel probe.ok.some) { seen = true; }
         or { os.sleep(2000000); }
         spins = spins + 1;
     }
@@ -1489,15 +1670,15 @@ test "std.process.exec.wait_within:a_child_that_finishes_first_is_not_terminated
     if (!cancel.make_root(?scope, true, deadline)) { ret 1; }
 
     var argv: [4]usize = exit_seven_argv();
-    val sr: R.Result[Child, str] =
+    val sr: res[Child, Error] =
         spawn_redirected_in_grouped(long_running_path(), (?argv[0])::**u8, nil, "", -1, -1, -1);
-    if (R.is_err[Child, str](sr)) { cancel.destroy(?scope); ret 2; }
-    val child: Child = R.unwrap_ok[Child, str](sr);
+    if (sel sr.err) { cancel.destroy(?scope); ret 2; }
+    val child: Child = sr.ok;
 
-    val wr: R.Result[Supervised, str] = wait_within(child, ?scope);
+    val wr: res[Supervised, Error] = wait_within(child, ?scope);
     cancel.destroy(?scope);
-    if (R.is_err[Supervised, str](wr)) { ret 3; }
-    val sup: Supervised = R.unwrap_ok[Supervised, str](wr);
+    if (sel wr.err) { ret 3; }
+    val sup: Supervised = wr.ok;
 
     if (sup.terminated) { ret 4; }
     if (sup.reason != cancel.ACTIVE) { ret 5; }
@@ -1514,25 +1695,26 @@ test "std.process.exec.wait_within:an_expired_deadline_terminates_and_reaps" {
     if (!cancel.make_root(?scope, true, deadline)) { ret 1; }
 
     var argv: [4]usize = long_running_argv();
-    val sr: R.Result[Child, str] =
+    val sr: res[Child, Error] =
         spawn_redirected_in_grouped(long_running_path(), (?argv[0])::**u8, nil, "", -1, -1, -1);
-    if (R.is_err[Child, str](sr)) { cancel.destroy(?scope); ret 2; }
-    val child: Child = R.unwrap_ok[Child, str](sr);
+    if (sel sr.err) { cancel.destroy(?scope); ret 2; }
+    val child: Child = sr.ok;
     if (child.pgid == 0) { cancel.destroy(?scope); terminate_child(child); wait(child); ret 3; }
 
     # the child would run for 30 seconds; the deadline is 50ms, so returning at
     # all is the first half of the claim
-    val wr: R.Result[Supervised, str] = wait_within(child, ?scope);
+    val wr: res[Supervised, Error] = wait_within(child, ?scope);
     cancel.destroy(?scope);
-    if (R.is_err[Supervised, str](wr)) { ret 4; }
-    val sup: Supervised = R.unwrap_ok[Supervised, str](wr);
+    if (sel wr.err) { ret 4; }
+    val sup: Supervised = wr.ok;
     if (!sup.terminated) { ret 5; }
     if (sup.reason != cancel.TIMED_OUT) { ret 6; }
 
     # and it was reaped on the way out, so a second wait finds nothing rather
     # than a zombie
-    var wstatus: i32 = 0;
-    if (os.wait_pid(child.pid, ?wstatus, os.WNOHANG) > 0) { ret 7; }
+    var wstatus: os.ProcessStatus;
+    val consumed: os.WaitResult = os.wait_pid(child.pid, ?wstatus, os.WNOHANG);
+    if (consumed.pid != 0 || consumed.error.code != os.ECHILD) { ret 7; }
     ret 0;
 }
 
@@ -1556,11 +1738,11 @@ test "std.process.exec.wait_within:an_expired_deadline_reaches_a_grandchild" {
         argv[2] = ("sleep 30 & echo $!; wait")::usize;
         argv[3] = 0;
 
-        val sr: R.Result[Child, str] =
+        val sr: res[Child, Error] =
             spawn_redirected_in_grouped("/bin/sh", (?argv[0])::**u8, nil, "", -1, fds[1], -1);
-        if (R.is_err[Child, str](sr)) { os.close(fds[0]); os.close(fds[1]); ret 2; }
+        if (sel sr.err) { os.close(fds[0]); os.close(fds[1]); ret 2; }
         os.close(fds[1]);
-        val shell: Child = R.unwrap_ok[Child, str](sr);
+        val shell: Child = sr.ok;
         if (shell.pgid == 0) { os.close(fds[0]); terminate_child(shell); wait(shell); ret 3; }
 
         val n: i64 = os.read(fds[0], ?out_buf[0], 32);
@@ -1579,10 +1761,10 @@ test "std.process.exec.wait_within:an_expired_deadline_reaches_a_grandchild" {
         val deadline: tm.Time = tm.time_add(tm.monotonic(), 50 * duration.MILLISECOND);
         if (!cancel.make_root(?scope, true, deadline)) { terminate_group(shell); wait(shell); ret 6; }
 
-        val wr: R.Result[Supervised, str] = wait_within(shell, ?scope);
+        val wr: res[Supervised, Error] = wait_within(shell, ?scope);
         cancel.destroy(?scope);
-        if (R.is_err[Supervised, str](wr)) { ret 7; }
-        val sup: Supervised = R.unwrap_ok[Supervised, str](wr);
+        if (sel wr.err) { ret 7; }
+        val sup: Supervised = wr.ok;
         if (!sup.terminated || sup.reason != cancel.TIMED_OUT) { ret 8; }
 
         # the grandchild was never our own child, so its disappearance is proof
@@ -1602,4 +1784,62 @@ test "std.process.exec.wait_within:an_expired_deadline_reaches_a_grandchild" {
         if (!gone) { ret 9; }
         ret 0;
     }
+}
+
+# a nil scope is invalid use that still names the child, which stays the
+# caller's to wait for
+test "std.process.exec.wait_within:nil_scope_keeps_the_child" {
+    var argv: [4]usize = argv_ok();
+    val sr: res[Child, Error] = spawn(prog_ok(), (?argv[0])::**u8, nil);
+    if (sel sr.err) { ret 1; }
+    val child: Child = sr.ok;
+    val wr: res[Supervised, Error] = wait_within(child, nil);
+    val reaped: res[ExitStatus, Error] = wait(child);
+    if (!sel wr.err) { ret 2; }
+    if (!sel wr.err.native) { ret 3; }
+    if (wr.err.native.code != os.EINVAL || retained(wr.err).pid != child.pid) { ret 4; }
+    if (!exited_zero(reaped)) { ret 5; }
+    ret 0;
+}
+
+test "std.process.exec.output: failed wait releases capture and retains child ownership" {
+    var tracking: process_testing.Testing;
+    val tracked: err[A.Error] = process_testing.make(?tracking);
+    if (sel tracked.err) { ret 1; }
+    fin { process_testing.dnit(?tracking); }
+    var bytes: Vector[u8] = vector.init[u8](?tracking.a);
+    val pushed: res[usize, A.Error] = vector.push[u8](?bytes, 42);
+    if (sel pushed.err) { ret 2; }
+    if (tracking.live != 1) { ret 3; }
+    val cause: Error = Error.native{Failure{code: os.EACCES, native_code: 5, operation: os.PROCESS_OP_STATUS,
+        child: Child{pid: 123, pgid: 123}}};
+    val failed: res[Output, Error] = finish_output(
+        res[Vector[u8], ReadError].ok{bytes}, res[ExitStatus, Error].err{cause});
+    if (!sel failed.err) { ret 4; }
+    if (!sel failed.err.native) { ret 5; }
+    val error: Failure = failed.err.native;
+    if (error.code != os.EACCES || error.native_code != 5 || error.operation != os.PROCESS_OP_STATUS
+        || error.child.pid != 123 || error.child.pgid != 123) { ret 6; }
+    if (tracking.live != 0 || tracking.double_frees != 0) { ret 7; }
+
+    # a failed drain is primary; the wait's failure and its child ride beside it
+    val both: res[Output, Error] = finish_output(
+        res[Vector[u8], ReadError].err{ReadError.eof{3}}, res[ExitStatus, Error].err{cause});
+    if (!sel both.err) { ret 8; }
+    if (!sel both.err.output) { ret 9; }
+    val primary: OutputFailure = both.err.output;
+    if (!sel primary.read.eof) { ret 10; }
+    if (primary.read.eof != 3 || primary.child.pid != 123 || retained(both.err).pid != 123) { ret 11; }
+    if (!sel primary.wait.some) { ret 12; }
+    if (primary.wait.some.code != os.EACCES || primary.wait.some.native_code != 5
+        || primary.wait.some.operation != os.PROCESS_OP_STATUS) { ret 13; }
+
+    # a failed drain after a good wait retains no child and no wait failure
+    val drained: res[Output, Error] = finish_output(
+        res[Vector[u8], ReadError].err{ReadError.eof{0}}, res[ExitStatus, Error].ok{ExitStatus{kind: PROCESS_EXITED}});
+    if (!sel drained.err) { ret 14; }
+    if (!sel drained.err.output) { ret 15; }
+    if (retained(drained.err).pid != 0) { ret 16; }
+    if (!sel drained.err.output.wait.none) { ret 17; }
+    ret 0;
 }
