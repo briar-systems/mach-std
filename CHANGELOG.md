@@ -144,6 +144,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `crypto.rand.fill` returns `err[io_error.Error]` with the completed prefix
   left in the buffer (#617).
 
+- **Breaking, std 2.0.0 (Mach 5.0.0):** the terminal and the log report
+  outcomes with the v5 canonical tags. `terminal.enable_raw`, `disable_raw`
+  and `flush_input` return `err[TermError]` and `poll_key` and
+  `poll_key_decoded` return `res[opt[Key], TermError]` on Linux, Darwin and
+  Windows, where an empty queue is `none` and a native read failure is the
+  error; `TermError` (`std.terminal.error`, re-exported) nests the native
+  `io_error.Error` with `OP_OPTION` for a control call and `OP_READ` for a
+  poll, and the Windows backend decodes `GetLastError` through
+  `std.system.os.windows.last_error` instead of a fixed message.
+  `log.sink.SinkError` (`invalid`, `contract`, `malformed`, `clock`, `encode`,
+  `too_large`, `write: WriteError`, `queue_full`, `queue_closed`, `open`,
+  `unjoined`, `busy`, `queue: channel.StateError`,
+  `thread: thread.ThreadError`) is the domain tag; `WriteStatus` is a closed
+  tag whose `partial`, `failed` and `rejected` cases carry it, and
+  `WriteReport.error` and every `ERR_*` string are gone (`cause(report)`
+  answers `opt[SinkError]`). `logger`, `make`, `custom`, `from_writer`,
+  `console`, `file`, `pipe`, `queued` and `queued_with_config` return
+  `res[Sink|Logger, SinkError]` with `Direct` and `Queued` initialized in
+  place; `queued_close_drain`, `queued_join` and `queued_destroy` return
+  `err[SinkError]` (a failed native join is recorded and replayed, never
+  re-joined; destroy refuses `unjoined` and `busy` apart), and
+  `queued_close_abort` returns `res[usize, SinkError]` without the output
+  pointer. `log.record.EncodeStatus` is a closed tag (`encoded`,
+  `truncated`, `rejected`, `failed: EncodeError`) and `Encoded.error` is
+  gone. A log clock reports its refusal: `NowFun` returns `time.Clock`,
+  `clock_now` returns `res[Time, ClockError]`, and `log.write` and the global
+  `info`/`warn`/`error`/`debug` fail the write with `SinkError.clock` and
+  publish nothing instead of stamping the zero time. A direct adapter's
+  `write` cause must agree with its report about the persisted prefix or the
+  report is `malformed` (#617).
+
 - The eight `std.sync.atomic` wrappers (`load`, `store`, `cas`, `fetch_add`,
   `fetch_sub`, `exchange`, `fence`, `spin_hint`) are `#[inline]`: a release
   build folds each into its caller while retaining the instruction sequences
