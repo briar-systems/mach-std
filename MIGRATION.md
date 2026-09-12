@@ -173,6 +173,20 @@ S3c executed its rows as tabled with these corrections:
 | `net.resolve.shared` allocation failures | `alloc: allocator.Error` distinct | `types.Error{kind: OUT_OF_MEMORY, native_code: ENOMEM}` for a refused acquisition, `{SYSTEM_FAILURE, status}` for a refused release | `types.Error` is the retained resolver record: the adapter boundary (`types.AdapterFun`) returns it by value and the completion queue stores it, so it cannot become a tag nesting `allocator.Error` without changing the adapter contract; the two allocator cases stay distinct through the existing kinds |
 | `net.resolve.lookup.Outcome` | "becomes a tag" | `pub tag Outcome: u8 { found; no_name; temporary; failed; }` | `found` first so a zero-initialized answer reads as found only when `resolve_name` wrote it; the adapters map the three failures onto `types.NO_NAME`, `TEMPORARY` and `SYSTEM_FAILURE` |
 
+## S4a corrections to the S0 census
+
+| census row | census target | executed | why |
+| --- | --- | --- | --- |
+| `sync.thread.join_result` | `err[ThreadError]` beside `join` | removed, `join` is the checked operation | two names for one operation once both are checked |
+| `sync.once.run` | `err[InitError]` | `res[bool, InitError]` | the S1 table's form; the real "this call initialized" boolean is kept |
+| `sync.once.InitFun` | (not in the census) | `fun(ptr) err[i64]` | the census prose requires the initializer's actual failure retained, which a bool cannot carry |
+| `sync.cancel.finish`, `unregister` | `res[bool, StateError]` | as proposed, `ok{false}` meaning the completion hook owns the registration | the S1 table listed them under `err[StateError]`; the census row is the one with the real boolean |
+| `sync.cancel.expire` | `res[bool, StateError]` | as proposed; a `destroyed` scope is the error, a scope with no deadline or a deadline not yet reached is `ok{false}` | |
+| `sync.channel.Status` | a closed tag | `Status[T]`, generic over the element | the received element rides on the `received` case |
+| `sync.worker_pool.Status` | a closed tag | as proposed, `spawn_failed` and `join_failed` carry the `ThreadError` | the census prose asks the pool to preserve native refusals; `last_thread_error` still returns the `i64` code, 0 when none |
+| `sync.condition.WaitStatus` | a closed tag | `{ invalid; failed: i64; timed_out; notified; }` | a refused native wait keeps its code instead of collapsing into one failure case |
+| `chrono.time.now`, `monotonic` | `res[Time, io_error.Error]` | as proposed, spelled `time.Clock`; the error is `from_code(code, OP_READ)` | |
+
 ## Frozen core signatures
 
 "Frozen" means S2 to S8 code against exactly this and C1 pins the compiler's
@@ -481,6 +495,41 @@ returns exited or signaled observations and `try_wait` reports a still-running
 child as `none`. Resolver storage refused on release stays owned by the
 resolution, never leaked and never freed twice.
 
+### Synchronization and clocks (S4a)
+
+| API | signature | frozen |
+| --- | --- | --- |
+| `sync.thread.ThreadError` | `pub tag ThreadError: u8 { invalid; exhausted; unsupported; native: i64; }` | yes |
+| `sync.thread.code` | `fun(e: ThreadError) i64` (`ERROR_INVALID`, `ERROR_NO_MEMORY`, `ERROR_UNSUPPORTED` or the native code) | yes |
+| `sync.thread.spawn*`, `join`, `detach` | `... err[ThreadError]` (`Operation`) | yes |
+| `sync.cancel.Reason` | `pub tag Reason: u8 { active; cancelled; timed_out; destroyed; invalid; }` | yes |
+| `sync.cancel.StateError` | `pub tag StateError: u8 { invalid; destroyed; busy; }` | yes |
+| `sync.cancel.Deadline` | `pub rec Deadline { at: time.Time; owner: *Scope; }` | yes |
+| `sync.cancel.make_root`, `make_child`, `init_registration`, `destroy` | `... err[StateError]` (`Operation`) in place | yes |
+| `sync.cancel.finish`, `unregister`, `cancel`, `timeout`, `expire` | `... res[bool, StateError]` (`Transition`, true when this call made the change) | yes |
+| `sync.cancel.get_deadline` | `fun(scope: *Scope) res[opt[Deadline], StateError]` (`DeadlineQuery`) | yes |
+| `sync.channel.Status[T]` | `pub tag Status[T]: u8 { invalid; sent; received: T; full; empty; closed; timed_out; cancelled; aborted; }` | yes |
+| `sync.channel.StateError` | `pub tag StateError: u8 { invalid; destroyed; open; busy; }` | yes |
+| `sync.channel.make[T]`, `destroy[T]` | `... err[StateError]` (`Operation`) in place | yes |
+| `sync.channel.close[T]` | `fun(channel: *Channel[T]) res[bool, StateError]` (`Transition`) | yes |
+| `sync.channel.try_receive[T]`, `receive[T]`, `receive_until[T]`, `receive_scoped[T]` | `fun(channel: *Channel[T], ...) Status[T]` (no output pointer) | yes |
+| `sync.worker_pool.Status` | `pub tag Status: u8 { invalid; accepted; queue_full; pool_closed; timed_out; cancelled; spawn_failed: thread.ThreadError; draining; aborting; joined; join_failed: thread.ThreadError; joining; }` | yes |
+| `sync.worker_pool.StateError` | `pub tag StateError: u8 { invalid; unjoined; busy; queue: channel.StateError; }` | yes |
+| `sync.worker_pool.destroy` | `fun(pool: *Pool) err[StateError]` (`Operation`) | yes |
+| `sync.condition.WaitStatus` | `pub tag WaitStatus: u8 { invalid; failed: i64; timed_out; notified; }` | yes |
+| `sync.once.InitFun`, `InitError`, `run` | `pub def InitFun: fun(ptr) err[i64];` `pub tag InitError: u8 { invalid; failed: i64; }` `fun(o: *Once, ctx: ptr, init: InitFun) res[bool, InitError]` (`Outcome`) | yes |
+| `sync.semaphore.StateError`, `init`, `release` | `pub tag StateError: u8 { invalid; overflow; }` `... err[StateError]` (`Operation`) | yes |
+| `chrono.time.Clock`, `now`, `monotonic` | `pub def Clock: res[Time, io_error.Error];` `fun() Clock` | yes |
+| `chrono.time.Elapsed`, `since`, `until` | `pub def Elapsed: res[Duration, io_error.Error];` `fun(t: Time) Elapsed` | yes |
+| `crypto.rand.fill` | `fun(buf: *u8, len: usize) err[io_error.Error]` | yes |
+| `EnvError` | owed by the lane that migrates `process.env` (the S3 table); S4a did not touch `process.env` | owed |
+
+Every state-bound object (scope, registration, channel, pool, semaphore) is
+initialized in place into caller-owned storage and never returned by value;
+the operation's outcome is the only return. A refused transition leaves the
+object exactly as it was, and the change/no-change boolean of a transition is
+carried in `res[bool, E]` with the invalid-state refusals kept apart in `E`.
+
 ## Domain inventory
 
 Lanes are the roadmap's: S2 value/text/codec, S3 I/O, filesystem, process,
@@ -577,14 +626,14 @@ because the decoder's state does not advance past a failed trailer check and
 would re-derive the same defect, which is why the truncated case is the one
 the control rests on.
 
-### Crypto and random (S4)
+### Crypto and random (S4a, done)
 
 | module | representation |
 | --- | --- |
-| `crypto.hash.*` (sha256, sha512, sha3, keccak, shake, crc32, adler32, fnv1a) | unchanged: values, states and digests |
-| `crypto.ct` | unchanged: constant-time predicates and values; `begin` stays a bool meaning a hardware mode was engaged |
-| `crypto.rand.fill` | `err[io_error.Error]` in place of the negative errno; the completed prefix on failure stays observable |
-| `rand` | unchanged values |
+| `crypto.hash.*` (sha256, sha512, sha3, keccak, shake, crc32, adler32, fnv1a) | unchanged (S4a, not touched): values, states and digests |
+| `crypto.ct` | unchanged (S4a, not touched): constant-time predicates and values; `begin` stays a bool meaning a hardware mode was engaged |
+| `crypto.rand.fill` | done (S4a): `err[io_error.Error]` in place of the negative errno (`OP_READ`, the native code kept); the bytes written before the refusal stay in the buffer |
+| `rand` | unchanged (S4a, not touched) values |
 
 ### Filesystem and I/O (S3)
 
@@ -629,26 +678,26 @@ the control rests on.
 | `net.dns` | `lookup_hosts`, `query`, `resolve` | done (S3c): `res[bool, types.Error]` with the existing output pointer | resolver-query |
 | `net.resolve.conf`, `hosts`, `linux`, `darwin`, `windows`, `wire`, `lookup`, `order` | | done (S3c): `Outcome` is a tag, wire parsing stays a predicate with `Parsed` status, `conf.load` and `hosts.collect` surface open, read and close failure (corrections above) | closed-value, retained |
 
-### Synchronization (S4)
+### Synchronization (S4a, done)
 
 | module | outcome-bearing APIs | representation | S0 rule |
 | --- | --- | --- | --- |
-| `sync.atomic` | `load`, `store`, `cas`, `fetch_add`, `fetch_sub`, `exchange`, `fence`, `spin_hint` | unchanged values; the eight N6 inline annotations land with `feat/mach-3110` | atomic-inline |
-| `sync.mutex` | `try_lock`, `is_locked` | unchanged predicates | predicate-or-transition |
-| `sync.channel` | `Status` | a closed tag; `send*`/`receive*` return the tag with the received element on the received case and the output pointer removed; `make`, `close`, `destroy` `err[StateError]` or `res[bool, StateError]` | closed-value, state-transition |
-| `sync.worker_pool` | `Status` | a closed tag; `make*`, `submit*`, `close_*`, `join`, `shutdown_*` return it; `destroy` `err[StateError]`; `last_thread_error` keeps the native code | closed-value |
-| `sync.cancel` | `Reason` | a closed tag; `make_root`, `make_child`, `init_registration`, `finish`, `unregister`, `destroy` `err[StateError]` in place (scopes and registrations are address-bound); `cancel`, `timeout`, `expire` `res[bool, StateError]`; `get_deadline` `res[opt[Deadline], StateError]` | deadline-query, state-transition |
-| `sync.condition` | `WaitStatus` | a closed tag | closed-value |
-| `sync.once` | `run` | `res[bool, InitError]` retaining the initializer's failure | state-transition |
-| `sync.semaphore` | `init`, `release` | `err[StateError]`; `try_wait` unchanged predicate; counts unchanged | state-operation |
-| `sync.thread` | `spawn*`, `join*`, `detach` | `err[ThreadError]`/`res[i64, ThreadError]` decoding native errors without narrowing; error-hiding `spawn`, `spawn_with`, `join` become checked or are removed; `diagnostic_id`, `is_done` unchanged | thread-operation |
+| `sync.atomic` | `load`, `store`, `cas`, `fetch_add`, `fetch_sub`, `exchange`, `fence`, `spin_hint` | done (S4a): unchanged values; the eight `#[inline]` annotations landed (`ad7add3` cherry-picked); elimination proven below | atomic-inline |
+| `sync.mutex` | `try_lock`, `is_locked` | done (S4a): unchanged predicates | predicate-or-transition |
+| `sync.channel` | `Status[T]` | done (S4a): a closed tag generic over the element; `send*`/`receive*`/`close_abort` return it with the element on `received` and the output pointer removed; `make`, `destroy` `err[StateError]` in place; `close` `res[bool, StateError]` (true closed it now) | closed-value, state-transition |
+| `sync.worker_pool` | `Status` | done (S4a): a closed tag; `make*`, `submit*`, `close_*`, `join`, `shutdown_*`, `state` return it, `spawn_failed` and `join_failed` carry the `ThreadError`; `destroy` `err[StateError]` nesting the queue's refusal; `last_thread_error` keeps the `i64` code (0 when none) | closed-value |
+| `sync.cancel` | `Reason` | done (S4a): a closed tag; `make_root`, `make_child`, `init_registration`, `destroy` `err[StateError]` in place (scopes and registrations are address-bound); `finish`, `unregister`, `cancel`, `timeout`, `expire` `res[bool, StateError]` (the real changed boolean, `destroyed` kept apart); `get_deadline` `res[opt[Deadline], StateError]` with the output pointers removed | deadline-query, state-transition |
+| `sync.condition` | `WaitStatus` | done (S4a): a closed tag, `failed` carries the native code | closed-value |
+| `sync.once` | `run` | done (S4a): `res[bool, InitError]` (true ran the initializer, false already complete) retaining the initializer's failure code; `InitFun` returns `err[i64]` | state-transition |
+| `sync.semaphore` | `init`, `release` | done (S4a): `err[StateError]` (`invalid`, `overflow`); `try_wait` unchanged predicate; counts unchanged | state-operation |
+| `sync.thread` | `spawn*`, `join`, `detach` | done (S4a): `err[ThreadError]` decoding native errors without narrowing (`native: i64` keeps the code, `code()` round-trips it); `spawn`, `spawn_with` and `join` are checked, `join_result` is removed; `Thread.tid` still carries the failure code so a moved handle stays diagnosable; `diagnostic_id`, `is_done` unchanged | thread-operation |
 
-### Clocks (S4)
+### Clocks (S4a, done)
 
 | module | representation |
 | --- | --- |
-| `chrono.time.now`, `monotonic` | `res[Time, io_error.Error]`; `since`, `until` `res[Duration, io_error.Error]`; a failed clock is never zero time |
-| `chrono.time` comparisons and components, `chrono.duration`, `chrono.date`, `chrono.format` | unchanged values and predicates |
+| `chrono.time.now`, `monotonic` | done (S4a): `time.Clock` = `res[Time, io_error.Error]`; `since`, `until` `time.Elapsed` = `res[Duration, io_error.Error]`; a failed clock is never zero time. Consumers with an error channel propagate the clock's `io_error.Error`; a deadline pre-check with no channel skips the check on failure and leaves the deadline to the native timed wait |
+| `chrono.time` comparisons and components, `chrono.duration`, `chrono.date`, `chrono.format` | done (S4a): unchanged values and predicates |
 
 ### Terminal (S4)
 
@@ -662,17 +711,17 @@ the control rests on.
 | module | representation |
 | --- | --- |
 | `log`, `log.sink` | `WriteReport` retained with offered, persisted, suppression, truncation and failure; convenience functions return it; `logger`, `make`, `custom`, `from_writer`, `console`, `file`, `pipe`, `queued*` `res[Sink\|Logger, SinkError]` with queued sinks initialized in place (address-bound); `queued_close_*`, `queued_join`, `queued_destroy` `err[SinkError]` preserving undelivered records and thread failure |
-| `log.record` | unchanged values; `EncodeStatus` becomes a closed tag |
+| `log.record` | unchanged values; `EncodeStatus` becomes a closed tag. S4a touched only the clock consumers: `system_now` reads `time.now()` and keeps the log clock's existing zero-time convention for an unreadable clock (the same one `clock_now` applies to an invalid clock), and `log.log_msg` stamps through `record.clock_now`; S4b decides whether `NowFun` reports the clock's refusal |
 
-### Runtime and OS (S4 portable, S5 Darwin)
+### Runtime and OS (S4a portable done, S5 Darwin)
 
 | module | representation |
 | --- | --- |
-| `system.os`, `system.os.linux.*`, `system.os.darwin.*`, `system.os.windows.*`, `system.os.shared`, `system.os.secret`, `system.os.darwin.libsystem` | unchanged native boundary: foreign ABI widths, native constants, negative errno and raw calling conventions; the portable producers above decode them. `allocate`, `deallocate`, `reallocate`, `secret_allocate`, `secret_deallocate` keep nil and `i64` |
-| `system.file_identity` | unchanged predicates and values |
-| `system.panic` | unchanged |
-| `runtime`, `runtime.linux.*`, `runtime.darwin.*`, `runtime.windows.*` | unchanged native entry and relocation boundary |
-| `system.os.tests` | in-tree census tests; migrated call sites only |
+| `system.os`, `system.os.linux.*`, `system.os.darwin.*`, `system.os.windows.*`, `system.os.shared`, `system.os.secret`, `system.os.darwin.libsystem` | done (S4a, not touched): unchanged native boundary: foreign ABI widths, native constants, negative errno and raw calling conventions; the portable producers above decode them. `allocate`, `deallocate`, `reallocate`, `secret_allocate`, `secret_deallocate` keep nil and `i64` |
+| `system.file_identity` | done (S4a, not touched): unchanged predicates and values |
+| `system.panic` | done (S4a, not touched): unchanged |
+| `runtime`, `runtime.linux.*`, `runtime.darwin.*`, `runtime.windows.*` | done (S4a, not touched): unchanged native entry and relocation boundary |
+| `system.os.tests` | done (S4a): in-tree census tests; no call site needed migration |
 
 ### Math and SIMD (S2, done)
 
@@ -723,6 +772,9 @@ module's own return types:
 | `derive`, `data.json` | writer callbacks return the typed outcome; no message shim | done (S2) |
 | `filesystem.transaction` | `sprint_text` spelling `format.sprint`'s `FormatError` as `R.Result[str, str]` (`"out of memory"`) at seven call sites, left by S2 after S3b (removed, S3c: `sprint_name` returns `res[str, Error]` with the allocator refusal as `MEMORY` on the caller's `Op`, `abs_of` and the tests read `format.sprint`'s `res` directly) | S3c |
 | `log.sink`, `log` | `ERR_SHORT_WRITE`, `report_write` folding a `WriteError` into a `WriteReport` | S4 |
+| `io.runtime`, `net.resolve`, `net.async`, `net.async.local`, `io.file.tests`, the native and fault fixtures | `transitioned`/`transition_changed`/`scope_changed` folding a refused `cancel.Transition` into the old false, `scope_ok` folding a refused `cancel.Operation` (S4a, call-site translation; the runtime and resolver already report their own `io_error`/`types.Error`, so the fold loses nothing a caller could read before) | stays |
+| `net.resolve` | `reason_code`/`reason_of` mirroring `cancellation.Reason` as the futex-waited integer word (not a carrier shim: the word is the native wait's representation) | stays |
+| `log.record` | `system_now` keeps the zero time for an unreadable clock | S4b |
 
 ## Prepared branches
 
@@ -739,8 +791,35 @@ module's own return types:
   `66d545c` is superseded: std 1.0.2 on `dev` already declares both profiles
   (and `{artifact.suffix}` landed with mach #3222).
 - `origin/feat/mach-3110` (`ad7add3` on top of feat/618): the eight
-  `sync.atomic` inline annotations. Orthogonal to S1; lands with N6 under S4.
-  Its base is feat/618, so it rebases after that branch.
+  `sync.atomic` inline annotations. Landed by S4a (cherry-picked onto `dev`,
+  the feat/618 CHANGELOG line dropped); see "Atomic inlining" below.
+
+## Atomic inlining (mach #3110, std half of phase 2)
+
+Proof under the v5 compiler `8464568d` on linux-x86_64 with a program that
+calls each of the eight wrappers once cross-module (`use std.sync.atomic;`,
+`store`, `load`, `cas`, `fetch_add`, `fetch_sub`, `fence`, `exchange`,
+`spin_hint`, then a checking `load`), built with `--emit-asm`:
+
+| profile | `call` instructions in `main.s` | atomic instructions in `main.s`, in source order | exit |
+| --- | ---: | --- | ---: |
+| release (`-O2`) | 0 | `xchg` (store), `mov` load, `lock cmpxchg`, `lock xadd`, `neg` + `lock xadd`, `mfence`, `xchg` (exchange), `pause`, `mov` load | 0 |
+| debug (`-O0`, control) | 9 (one per wrapper call, `std.sync.atomic.*`) | none in `main.s` (all inside the callees) | 0 |
+
+The release stream keeps the wrappers' instruction sequences and their order,
+`fence` stays an `mfence`, and the program's checks on the observed values
+pass. The mach half (linking and running the wrappers on three native
+targets) is the compiler repository's.
+
+Control (same program, same compiler, mach 4.30.0): with all eight
+annotations stripped from the copied `std.sync.atomic` the release `main.s`
+also carries zero `call` instructions and the same atomic sequence. The
+compiler's release policy (`doc/design/inline-acceptance-3110.md` in mach)
+already flows every small cross-module body, and the wrappers clear its
+25-instruction bar. The annotations therefore pin the decision rather than
+create it: they are the wrappers' declared contract, independent of the size
+heuristic and of any future growth of a wrapper body. `#[inline]` has no
+effect at `-O0`, by that policy.
 
 ## What the lanes owe
 

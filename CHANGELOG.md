@@ -112,6 +112,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   observations. Typed wait failures retain native causes and unreaped child
   ownership. Windows cleanup retries keep process and group tokens valid.
 
+- **Breaking, std 2.0.0 (Mach 5.0.0):** synchronization, clocks and
+  cryptographic randomness report outcomes with the v5 canonical tags.
+  `sync.thread` spawn, `join` and `detach` return `err[ThreadError]`
+  (`invalid`, `exhausted`, `unsupported`, `native: i64`; `join_result` is
+  removed, `join` is checked). `sync.cancel.Reason` is a tag; `make_root`,
+  `make_child`, `init_registration` and `destroy` return `err[StateError]`,
+  `finish`, `unregister`, `cancel`, `timeout` and `expire` return
+  `res[bool, StateError]` (true when the call made the change), and
+  `get_deadline(scope)` returns `res[opt[Deadline], StateError]` without
+  output pointers. `sync.channel.Status[T]` is a tag carrying the element on
+  `received` (the receive output pointer is removed); `make` and `destroy`
+  return `err[StateError]` and `close` `res[bool, StateError]`.
+  `sync.worker_pool.Status` is a tag whose `spawn_failed` and `join_failed`
+  carry the `ThreadError`; `destroy` returns `err[StateError]`.
+  `sync.condition.WaitStatus` is a tag (`failed` keeps the native code).
+  `sync.once.run` returns `res[bool, InitError]` and an `InitFun` returns
+  `err[i64]`, so the initializer's failure is retained. `sync.semaphore.init`
+  and `release` return `err[StateError]`. `chrono.time.now` and `monotonic`
+  return `res[Time, io_error.Error]` (`time.Clock`), `since` and `until`
+  `res[Duration, io_error.Error]`; a failed clock is never the zero time.
+  `crypto.rand.fill` returns `err[io_error.Error]` with the completed prefix
+  left in the buffer (#617).
+
+- The eight `std.sync.atomic` wrappers (`load`, `store`, `cas`, `fetch_add`,
+  `fetch_sub`, `exchange`, `fence`, `spin_hint`) are `#[inline]`: a release
+  build folds each into its caller while retaining the instruction sequences
+  and their memory-ordering effects (mach #3110, std #618).
+
 - Linux and Darwin expose `O_NONBLOCK` through their file-open interfaces.
 
 - Darwin local byte reads reject ancillary input before installing descriptor

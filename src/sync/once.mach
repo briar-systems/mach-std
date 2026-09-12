@@ -4,6 +4,8 @@ use std.types.bool.bool;
 use std.types.bool.true;
 use std.types.bool.false;
 use std.types.size.usize;
+use std.types.canonical.res;
+use std.types.canonical.err;
 use std.sync.atomic;
 use std.sync.thread;
 use std.system.os;
@@ -13,20 +15,31 @@ pub val RUNNING:  i64 = 1;
 pub val COMPLETE: i64 = 2;
 pub val FAILED:   i64 = 3;
 
-pub def InitFun: fun(ptr) bool;
+# an initializer reports its own failure as a code it chooses; the once
+# value retains the code so every later caller observes the same refusal
+pub def InitFun: fun(ptr) err[i64];
+
+# why initialization did not complete
+# ---
+# invalid: a nil once value or initializer
+# failed:  the initializer refused, with the code it returned (sticky)
+pub tag InitError: u8 { invalid; failed: i64; }
+
+pub def Outcome: res[bool, InitError];
 
 pub rec Once {
     state:   i64;
     waiters: i64;
+    error:   i64;
 }
 
 # initializer selection is unfair and recursive use of one value deadlocks
 # waits may wake spuriously and always recheck the published state
-# false is a sticky failure and initialization is never retried
+# a refused initializer is a sticky failure and initialization is never retried
 # a panic terminates the process and does not create recoverable poisoning
 # once owns no target handle and may be discarded only without callers
 pub fun make() Once {
-    ret Once{state: PENDING, waiters: 0};
+    ret Once{state: PENDING, waiters: 0, error: 0};
 }
 
 fun wake_all(o: *Once) {
@@ -38,23 +51,28 @@ fun wake_all(o: *Once) {
     }
 }
 
-pub fun run(o: *Once, ctx: ptr, init: InitFun) bool {
+# ret: true when this call ran the initializer to completion, false when
+#      initialization had already completed, or the retained failure
+pub fun run(o: *Once, ctx: ptr, init: InitFun) Outcome {
+    if (o == nil || init::usize == 0) { ret Outcome.err{InitError.invalid{}}; }
     for (true) {
         val state: i64 = atomic.load(?o.state);
-        if (state == COMPLETE) { ret true; }
-        if (state == FAILED) { ret false; }
+        if (state == COMPLETE) { ret Outcome.ok{false}; }
+        if (state == FAILED) { ret Outcome.err{InitError.failed{atomic.load(?o.error)}}; }
 
         if (state == PENDING) {
             var expected: i64 = PENDING;
             if (atomic.cas(?o.state, ?expected, RUNNING)) {
-                val ok: bool = init(ctx);
-                if (ok) {
+                val result: err[i64] = init(ctx);
+                if (sel result.ok) {
                     atomic.store(?o.state, COMPLETE);
-                } or {
-                    atomic.store(?o.state, FAILED);
+                    wake_all(o);
+                    ret Outcome.ok{true};
                 }
+                atomic.store(?o.error, result.err);
+                atomic.store(?o.state, FAILED);
                 wake_all(o);
-                ret ok;
+                ret Outcome.err{InitError.failed{result.err}};
             }
             cnt;
         }
@@ -65,7 +83,7 @@ pub fun run(o: *Once, ctx: ptr, init: InitFun) bool {
         }
         atomic.fetch_sub(?o.waiters, 1);
     }
-    ret false;
+    ret Outcome.err{InitError.invalid{}};
 }
 
 pub fun is_complete(o: *Once) bool {
@@ -81,6 +99,7 @@ rec RunContext {
     init:      ptr;
     value:     *i64;
     successes: *i64;
+    ran:       *i64;
 }
 
 rec InitContext {
@@ -90,7 +109,7 @@ rec InitContext {
     value:   *i64;
 }
 
-fun blocking_succeed(ctx: ptr) bool {
+fun blocking_succeed(ctx: ptr) err[i64] {
     val init: *InitContext = ctx::*InitContext;
     atomic.fetch_add(init.calls, 1);
     @init.value = 42;
@@ -98,19 +117,21 @@ fun blocking_succeed(ctx: ptr) bool {
     for (atomic.load(init.release) == 0) {
         os.thread_wait(init.release, 0);
     }
-    ret true;
+    ret err[i64].ok{};
 }
 
-fun fail(ctx: ptr) bool {
+fun fail(ctx: ptr) err[i64] {
     val calls: *i64 = ctx::*i64;
     atomic.fetch_add(calls, 1);
-    ret false;
+    ret err[i64].err{-7};
 }
 
 fun run_worker(arg: *u8) {
     val ctx: *RunContext = arg::*RunContext;
-    if (run(ctx.once, ctx.init, blocking_succeed) && @ctx.value == 42) {
-        atomic.fetch_add(ctx.successes, 1);
+    val outcome: Outcome = run(ctx.once, ctx.init, blocking_succeed);
+    if (sel outcome.ok) {
+        if (@ctx.value == 42) { atomic.fetch_add(ctx.successes, 1); }
+        if (outcome.ok) { atomic.fetch_add(ctx.ran, 1); }
     }
 }
 
@@ -121,8 +142,9 @@ test "once: concurrent callers initialize exactly once" {
     var release: i64 = 0;
     var value: i64 = 0;
     var successes: i64 = 0;
+    var ran: i64 = 0;
     var init: InitContext = InitContext{calls: ?calls, entered: ?entered, release: ?release, value: ?value};
-    var ctx: RunContext = RunContext{once: ?o, init: (?init)::ptr, value: ?value, successes: ?successes};
+    var ctx: RunContext = RunContext{once: ?o, init: (?init)::ptr, value: ?value, successes: ?successes, ran: ?ran};
     var threads: [4]thread.Thread;
     var i: usize = 0;
 
@@ -150,17 +172,36 @@ test "once: concurrent callers initialize exactly once" {
     i = 0;
     for (i < 4) { thread.join(?threads[i]); i = i + 1; }
     if (atomic.load(?calls) != 1) { ret 1; }
-    if (atomic.load(?successes) != 4 || value != 42) { ret 1; }
+    if (atomic.load(?successes) != 4 || atomic.load(?ran) != 1 || value != 42) { ret 1; }
     if (!is_complete(?o) || is_failed(?o)) { ret 1; }
+    val later: Outcome = run(?o, (?init)::ptr, blocking_succeed);
+    if (!sel later.ok) { ret 2; }
+    if (later.ok || atomic.load(?calls) != 1) { ret 3; }
     ret 0;
 }
 
-test "once: explicit failure is sticky" {
+test "once: the initializer's failure is retained and sticky" {
     var o: Once = make();
     var calls: i64 = 0;
-    if (run(?o, (?calls)::ptr, fail)) { ret 1; }
-    if (run(?o, (?calls)::ptr, fail)) { ret 1; }
-    if (atomic.load(?calls) != 1) { ret 1; }
-    if (!is_failed(?o) || is_complete(?o)) { ret 1; }
+    val first: Outcome = run(?o, (?calls)::ptr, fail);
+    if (!sel first.err) { ret 1; }
+    if (!sel first.err.failed) { ret 2; }
+    if (first.err.failed != -7) { ret 3; }
+    val second: Outcome = run(?o, (?calls)::ptr, fail);
+    if (!sel second.err) { ret 4; }
+    if (!sel second.err.failed) { ret 5; }
+    if (second.err.failed != -7) { ret 6; }
+    if (atomic.load(?calls) != 1) { ret 7; }
+    if (!is_failed(?o) || is_complete(?o)) { ret 8; }
+    ret 0;
+}
+
+test "once: nil operands are refused without touching state" {
+    var o: Once = make();
+    var calls: i64 = 0;
+    val no_init: Outcome = run(?o, (?calls)::ptr, (0::usize)::InitFun);
+    if (!sel no_init.err) { ret 1; }
+    if (!sel no_init.err.invalid) { ret 2; }
+    if (atomic.load(?calls) != 0 || is_failed(?o) || is_complete(?o)) { ret 3; }
     ret 0;
 }
