@@ -22,6 +22,7 @@ use std.sync.thread;
 use std.sync.worker_pool;
 use io_error: std.io.error;
 use io_runtime: std.io.runtime;
+use io_handle: std.io.handle;
 use file_api: std.io.file;
 use std.io.file.Capabilities;
 use std.io.file.Mapping;
@@ -53,6 +54,9 @@ use std.io.file.root_open;
 use std.io.file.shutdown_drain;
 use std.io.file.submit_read;
 use std.io.file.submit_write;
+use std.io.file.attach_secret_scratch;
+use std.io.file.submit_secret_read;
+use std.io.file.submit_secret_write;
 use std.io.file.transfer;
 use std.io.file.watch_close;
 use std.io.file.watch_open;
@@ -733,6 +737,455 @@ test "io.file: runtime close never exposes worker scratch" {
     if (sel repeated.err) { ret 16; }
     if (repeated.ok != 0) { ret 16; }
     if (!scope_ok(cancel.destroy(?scope)) || !ok_err(io_runtime.destroy(?runtime))) { ret 17; }
+    filesystem.close(?file);
+    cleanup_file(path);
+    ret 0;
+}
+
+# the welded fixtures below never spell `:>` on key bytes: the only
+# declassification is the one-bit verdict of an equality or a zero check,
+# which is what a caller persisting a key through this lane would also write
+fun secret_fill(data: *^u8, len: usize, byte: u8) {
+    var i: usize = 0;
+    for (i < len) {
+        data[i] = byte;
+        i = i + 1;
+    }
+}
+
+#[oblivious]
+fun secret_equal(a: *^u8, b: *^u8, len: usize) bool {
+    var diff: ^u8 = 0;
+    var i: usize = 0;
+    for (i < len) {
+        diff = diff | (a[i] ^ b[i]);
+        i = i + 1;
+    }
+    ret diff:>u8 == 0;
+}
+
+#[oblivious]
+fun secret_all(data: *^u8, len: usize, byte: u8) bool {
+    var diff: ^u8 = 0;
+    var i: usize = 0;
+    for (i < len) {
+        diff = diff | (data[i] ^ byte);
+        i = i + 1;
+    }
+    ret diff:>u8 == 0;
+}
+
+fun scratch_span_zero(file_adapter: *file_api.Adapter, offset: usize, len: usize) bool {
+    var mirror: [64]^u8;
+    if (len > 64) { ret false; }
+    if (os.secret_borrow_drain(file_adapter.secret_scratch, offset, ?mirror[0], len) != 0) { ret false; }
+    ret secret_all(?mirror[0], len, 0);
+}
+
+# a fresh empty file open for reading and writing, or an invalid handle
+fun create_read_write(path: Path) filesystem.File {
+    val raw: i64 = os.open(os.AT_FDCWD, path, os.O_CREAT | os.O_TRUNC | os.O_RDWR, 0o600);
+    if (raw < 0) { ret filesystem.File{handle: io_handle.invalid_file()}; }
+    ret filesystem.File{handle: io_handle.FileHandle{value: raw::usize}};
+}
+
+rec SecretFixture {
+    runtime:      io_runtime.Runtime;
+    requests:     [2]Request;
+    scratch:      [32]u8;
+    tasks:        [2]worker_pool.Task;
+    abort_tasks:  [2]worker_pool.Task;
+    threads:      [1]thread.Thread;
+    workers:      [1]worker_pool.Worker;
+    file_adapter: file_api.Adapter;
+    scope:        cancel.Scope;
+}
+
+# two requests of sixteen bytes on one worker, the secret scratch attached
+fun secret_fixture_make(fixture: *SecretFixture, secret_scratch: *^u8, secret_length: usize) i32 {
+    if (!ok_err(io_runtime.make(?fixture.runtime, 2))) { ret 1; }
+    if (!ok_err(make(?fixture.file_adapter, ?fixture.runtime, (?fixture.requests)::*Request, 2, (?fixture.scratch)::*u8, 32, 16, (?fixture.tasks)::*worker_pool.Task, (?fixture.abort_tasks)::*worker_pool.Task, (?fixture.threads)::*thread.Thread, (?fixture.workers)::*worker_pool.Worker, 1))) { ret 2; }
+    if (!ok_err(attach_secret_scratch(?fixture.file_adapter, secret_scratch, secret_length))) { ret 3; }
+    val made: cancel.Operation = cancel.make_root(?fixture.scope, false, time.Time{sec: 0, nsec: 0});
+    if (sel made.err) { ret 4; }
+    ret 0;
+}
+
+# a secret request is retired by the later of its resolution and its
+# dequeue, so a test that inspects the adapter after a completion first lets
+# the worker's arrival land
+fun wait_idle(file_adapter: *file_api.Adapter) bool {
+    var spins: usize = 0;
+    for (spins < 10000) {
+        if (file_api.active(file_adapter) == 0) { ret true; }
+        os.sleep(1000000);
+        spins = spins + 1;
+    }
+    ret false;
+}
+
+fun wait_secret(fixture: *SecretFixture, completion: *io_runtime.Completion) res[usize, io_error.Error] {
+    val waited: res[usize, io_error.Error] = wait_one(?fixture.runtime, completion);
+    if (sel waited.err) { ret waited; }
+    if (!wait_idle(?fixture.file_adapter)) { ret res[usize, io_error.Error].ok{0}; }
+    ret waited;
+}
+
+fun secret_fixture_destroy(fixture: *SecretFixture) i32 {
+    if (!ok_bool(shutdown_drain(?fixture.file_adapter))) { ret 1; }
+    if (!ok_err(destroy(?fixture.file_adapter))) { ret 2; }
+    if (!scope_ok(cancel.destroy(?fixture.scope))) { ret 3; }
+    io_runtime.close(?fixture.runtime);
+    if (!ok_err(io_runtime.destroy(?fixture.runtime))) { ret 4; }
+    ret 0;
+}
+
+test "io.file: a welded key is saved and reloaded byte-equal with no public staging copy" {
+    val path: Path = "mach-std-io-file-secret-key";
+    cleanup_file(path);
+    var file: filesystem.File = create_read_write(path);
+    if (!io_handle.file_is_valid(file.handle)) { ret 1; }
+    var secret_scratch: [32]^u8;
+    var fixture: SecretFixture;
+    val made: i32 = secret_fixture_make(?fixture, ?secret_scratch[0], 32);
+    if (made != 0) { ret 10 + made; }
+    var key: [16]^u8;
+    if (os.secret_random_fill(?key[0], 16) != 0) { ret 2; }
+    if (!ok_token(submit_secret_write(?fixture.file_adapter, ?fixture.scope, ?file, ?key[0], 16, 4, 91))) { ret 3; }
+    var completion: io_runtime.Completion;
+    val written: res[usize, io_error.Error] = wait_secret(?fixture, ?completion);
+    if (sel written.err) { ret 4; }
+    if (written.ok != 1 || completion.bytes != 16 || completion.has_error || completion.context != 91) { ret 5; }
+    if (file_api.active(?fixture.file_adapter) != 0) { ret 6; }
+    if (!scratch_span_zero(?fixture.file_adapter, 0, 32)) { ret 7; }
+    var reloaded: [16]^u8;
+    secret_fill(?reloaded[0], 16, 0xee);
+    if (!ok_token(submit_secret_read(?fixture.file_adapter, ?fixture.scope, ?file, ?reloaded[0], 16, 4, 92))) { ret 8; }
+    val read_back: res[usize, io_error.Error] = wait_secret(?fixture, ?completion);
+    if (sel read_back.err) { ret 9; }
+    if (read_back.ok != 1 || completion.bytes != 16 || completion.has_error || completion.end_of_stream || completion.context != 92) { ret 20; }
+    if (!secret_equal(?key[0], ?reloaded[0], 16)) { ret 21; }
+    if (file_api.active(?fixture.file_adapter) != 0) { ret 22; }
+    if (!scratch_span_zero(?fixture.file_adapter, 0, 32)) { ret 23; }
+    val destroyed: i32 = secret_fixture_destroy(?fixture);
+    if (destroyed != 0) { ret 30 + destroyed; }
+    if (!secret_all(?secret_scratch[0], 32, 0)) { ret 24; }
+    filesystem.close(?file);
+    cleanup_file(path);
+    ret 0;
+}
+
+test "io.file: secret submissions are refused before any effect" {
+    val path: Path = "mach-std-io-file-secret-refuse";
+    cleanup_file(path);
+    var file: filesystem.File = create_read_write(path);
+    if (!io_handle.file_is_valid(file.handle)) { ret 1; }
+    var runtime: io_runtime.Runtime;
+    if (!ok_err(io_runtime.make(?runtime, 2))) { ret 2; }
+    var requests: [2]Request;
+    var scratch: [32]u8;
+    var tasks: [2]worker_pool.Task;
+    var abort_tasks: [2]worker_pool.Task;
+    var threads: [1]thread.Thread;
+    var workers: [1]worker_pool.Worker;
+    var file_adapter: file_api.Adapter;
+    if (!ok_err(make(?file_adapter, ?runtime, (?requests)::*Request, 2, (?scratch)::*u8, 32, 16, (?tasks)::*worker_pool.Task, (?abort_tasks)::*worker_pool.Task, (?threads)::*thread.Thread, (?workers)::*worker_pool.Worker, 1))) { ret 3; }
+    var scope: cancel.Scope;
+    val made: cancel.Operation = cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+    if (sel made.err) { ret 4; }
+    var key: [16]^u8;
+    secret_fill(?key[0], 16, 0x42);
+    val unattached: res[io_runtime.Token, io_error.Error] = submit_secret_write(?file_adapter, ?scope, ?file, ?key[0], 16, 0, 1);
+    if (sel unattached.ok) { ret 5; }
+    if (unattached.err.kind != io_error.UNSUPPORTED) { ret 6; }
+    var small: [16]^u8;
+    val too_small: err[io_error.Error] = attach_secret_scratch(?file_adapter, ?small[0], 16);
+    if (sel too_small.ok) { ret 7; }
+    if (too_small.err.kind != io_error.RESOURCE_EXHAUSTED) { ret 8; }
+    val nil_scratch: err[io_error.Error] = attach_secret_scratch(?file_adapter, nil, 32);
+    if (sel nil_scratch.ok) { ret 9; }
+    var secret_scratch: [32]^u8;
+    if (!ok_err(attach_secret_scratch(?file_adapter, ?secret_scratch[0], 32))) { ret 10; }
+    val twice: err[io_error.Error] = attach_secret_scratch(?file_adapter, ?secret_scratch[0], 32);
+    if (sel twice.ok) { ret 11; }
+    if (twice.err.code != os.EBUSY) { ret 12; }
+    val nil_buffer: res[io_runtime.Token, io_error.Error] = submit_secret_read(?file_adapter, ?scope, ?file, nil, 4, 0, 2);
+    if (sel nil_buffer.ok) { ret 13; }
+    if (nil_buffer.err.kind != io_error.INVALID) { ret 14; }
+    var wide: [17]^u8;
+    val oversized: res[io_runtime.Token, io_error.Error] = submit_secret_write(?file_adapter, ?scope, ?file, ?wide[0], 17, 0, 3);
+    if (sel oversized.ok) { ret 15; }
+    if (oversized.err.kind != io_error.RESOURCE_EXHAUSTED) { ret 16; }
+    var closed: filesystem.File = filesystem.File{handle: io_handle.invalid_file()};
+    val invalid_file: res[io_runtime.Token, io_error.Error] = submit_secret_write(?file_adapter, ?scope, ?closed, ?key[0], 16, 0, 4);
+    if (sel invalid_file.ok) { ret 17; }
+    if (invalid_file.err.kind != io_error.INVALID) { ret 18; }
+    if (!scope_changed(cancel.cancel(?scope))) { ret 19; }
+    val cancelled_scope: res[io_runtime.Token, io_error.Error] = submit_secret_write(?file_adapter, ?scope, ?file, ?key[0], 16, 0, 5);
+    if (sel cancelled_scope.ok) { ret 20; }
+    if (cancelled_scope.err.kind != io_error.CANCELLED) { ret 21; }
+    if (!secret_all(?key[0], 16, 0x42)) { ret 22; }
+    if (!scratch_span_zero(?file_adapter, 0, 32)) { ret 23; }
+    if (file_api.active(?file_adapter) != 0 || io_runtime.pending(?runtime) != 0) { ret 24; }
+    var completion: io_runtime.Completion;
+    val queued: res[usize, io_error.Error] = io_runtime.poll(?runtime, ?completion, 1);
+    if (sel queued.err) { ret 25; }
+    if (queued.ok != 0) { ret 25; }
+    val metadata: res[filesystem.Metadata, io_error.Error] = filesystem.stat_of(file);
+    if (sel metadata.err) { ret 26; }
+    if (metadata.ok.size != 0) { ret 27; }
+    if (!ok_bool(shutdown_drain(?file_adapter))) { ret 28; }
+    val after_close: res[io_runtime.Token, io_error.Error] = submit_secret_read(?file_adapter, ?scope, ?file, ?key[0], 16, 0, 6);
+    if (sel after_close.ok) { ret 29; }
+    if (after_close.err.kind != io_error.CLOSED) { ret 30; }
+    if (!ok_err(destroy(?file_adapter))) { ret 31; }
+    if (!scope_ok(cancel.destroy(?scope))) { ret 32; }
+    io_runtime.close(?runtime);
+    if (!ok_err(io_runtime.destroy(?runtime))) { ret 33; }
+    filesystem.close(?file);
+    cleanup_file(path);
+    ret 0;
+}
+
+test "io.file: secret reads deliver exactly the prefix and leave the rest untouched" {
+    val path: Path = "mach-std-io-file-secret-partial";
+    cleanup_file(path);
+    if (fs_write_refused(filesystem.write_bytes(path, "secret", 6, 0o600))) { ret 1; }
+    val opened: res[filesystem.File, io_error.Error] = filesystem.open(path);
+    if (sel opened.err) { ret 2; }
+    var file: filesystem.File = opened.ok;
+    var secret_scratch: [32]^u8;
+    var fixture: SecretFixture;
+    val made: i32 = secret_fixture_make(?fixture, ?secret_scratch[0], 32);
+    if (made != 0) { ret 10 + made; }
+    var output: [8]^u8;
+    secret_fill(?output[0], 8, 0xee);
+    if (!ok_token(submit_secret_read(?fixture.file_adapter, ?fixture.scope, ?file, ?output[0], 8, 3, 93))) { ret 3; }
+    var completion: io_runtime.Completion;
+    val delivered: res[usize, io_error.Error] = wait_secret(?fixture, ?completion);
+    if (sel delivered.err) { ret 4; }
+    if (delivered.ok != 1 || completion.has_error || completion.end_of_stream) { ret 5; }
+    if (completion.bytes != 3) { ret 6; }
+    var expected: [3]^u8;
+    expected[0] = 'r';
+    expected[1] = 'e';
+    expected[2] = 't';
+    if (!secret_equal(?output[0], ?expected[0], 3)) { ret 7; }
+    if (!secret_all(?output[3], 5, 0xee)) { ret 8; }
+    if (!scratch_span_zero(?fixture.file_adapter, 0, 32)) { ret 9; }
+    secret_fill(?output[0], 8, 0xdd);
+    if (!ok_token(submit_secret_read(?fixture.file_adapter, ?fixture.scope, ?file, ?output[0], 8, 6, 94))) { ret 20; }
+    val eof: res[usize, io_error.Error] = wait_secret(?fixture, ?completion);
+    if (sel eof.err) { ret 21; }
+    if (eof.ok != 1 || completion.has_error || !completion.end_of_stream || completion.bytes != 0) { ret 22; }
+    if (!secret_all(?output[0], 8, 0xdd)) { ret 23; }
+    if (!ok_token(submit_secret_read(?fixture.file_adapter, ?fixture.scope, ?file, ?output[0], 0, 0, 95))) { ret 24; }
+    val empty: res[usize, io_error.Error] = wait_secret(?fixture, ?completion);
+    if (sel empty.err) { ret 25; }
+    if (empty.ok != 1 || completion.has_error || completion.end_of_stream || completion.bytes != 0) { ret 26; }
+    if (file_api.active(?fixture.file_adapter) != 0) { ret 27; }
+    val destroyed: i32 = secret_fixture_destroy(?fixture);
+    if (destroyed != 0) { ret 30 + destroyed; }
+    filesystem.close(?file);
+    cleanup_file(path);
+    ret 0;
+}
+
+test "io.file: secret writes persist exactly the submitted span" {
+    val path: Path = "mach-std-io-file-secret-span";
+    cleanup_file(path);
+    var file: filesystem.File = create_read_write(path);
+    if (!io_handle.file_is_valid(file.handle)) { ret 1; }
+    var secret_scratch: [32]^u8;
+    var fixture: SecretFixture;
+    val made: i32 = secret_fixture_make(?fixture, ?secret_scratch[0], 32);
+    if (made != 0) { ret 10 + made; }
+    var key: [16]^u8;
+    secret_fill(?key[0], 16, 0x5a);
+    if (!ok_token(submit_secret_write(?fixture.file_adapter, ?fixture.scope, ?file, ?key[0], 5, 2, 96))) { ret 2; }
+    secret_fill(?key[0], 16, 0x00);
+    var completion: io_runtime.Completion;
+    val written: res[usize, io_error.Error] = wait_secret(?fixture, ?completion);
+    if (sel written.err) { ret 3; }
+    if (written.ok != 1 || completion.has_error || completion.bytes != 5) { ret 4; }
+    var observed: [8]u8;
+    val observed_count: res[usize, io_error.Error] = read_at(file, (?observed)::*u8, 8, 0);
+    if (sel observed_count.err) { ret 5; }
+    if (observed_count.ok != 7) { ret 6; }
+    if (observed[0] != 0 || observed[1] != 0) { ret 7; }
+    var i: usize = 2;
+    for (i < 7) { if (observed[i] != 0x5a) { ret 8; } i = i + 1; }
+    if (!scratch_span_zero(?fixture.file_adapter, 0, 32)) { ret 9; }
+    if (!ok_token(submit_secret_write(?fixture.file_adapter, ?fixture.scope, ?file, ?key[0], 0, 0, 97))) { ret 20; }
+    val empty: res[usize, io_error.Error] = wait_secret(?fixture, ?completion);
+    if (sel empty.err) { ret 21; }
+    if (empty.ok != 1 || completion.has_error || completion.bytes != 0) { ret 22; }
+    val destroyed: i32 = secret_fixture_destroy(?fixture);
+    if (destroyed != 0) { ret 30 + destroyed; }
+    filesystem.close(?file);
+    cleanup_file(path);
+    ret 0;
+}
+
+test "io.file: secret cancellation settles with the borrow alive and the destination untouched" {
+    val path: Path = "mach-std-io-file-secret-cancel";
+    cleanup_file(path);
+    if (fs_write_refused(filesystem.write_bytes(path, "secret", 6, 0o600))) { ret 1; }
+    val opened: res[filesystem.File, io_error.Error] = filesystem.open(path);
+    if (sel opened.err) { ret 2; }
+    var file: filesystem.File = opened.ok;
+    var secret_scratch: [32]^u8;
+    var fixture: SecretFixture;
+    val made: i32 = secret_fixture_make(?fixture, ?secret_scratch[0], 32);
+    if (made != 0) { ret 10 + made; }
+    var entered: i64 = 0;
+    var release: i64 = 0;
+    var blocker: BlockTask = BlockTask{entered: ?entered, release: ?release};
+    val blocked: worker_pool.Status = worker_pool.submit(?fixture.file_adapter.pool, worker_pool.Task{context: ?blocker, run: block_worker});
+    if (!sel blocked.accepted) { ret 3; }
+    for (atomic.load(?entered) == 0) { os.thread_wait(?entered, 0); }
+    var output: [6]^u8;
+    secret_fill(?output[0], 6, 0x77);
+    val submitted: res[io_runtime.Token, io_error.Error] = submit_secret_read(?fixture.file_adapter, ?fixture.scope, ?file, ?output[0], 6, 0, 98);
+    if (sel submitted.err) { ret 4; }
+    val request: *Request = ?fixture.requests[0];
+    if (!request.secret || os.secret_borrow_size(request.borrow) != 6) { ret 5; }
+    if (!scope_changed(cancel.cancel(?fixture.scope))) { ret 6; }
+    if (os.secret_borrow_size(request.borrow) != 6) { ret 7; }
+    if (file_api.active(?fixture.file_adapter) != 1) { ret 8; }
+    atomic.store(?release, 1);
+    os.thread_wake(?release);
+    var completion: io_runtime.Completion;
+    val cancelled: res[usize, io_error.Error] = wait_secret(?fixture, ?completion);
+    if (sel cancelled.err) { ret 9; }
+    if (cancelled.ok != 1 || !completion.has_error || completion.error.kind != io_error.CANCELLED || completion.bytes != 0) { ret 20; }
+    if (!secret_all(?output[0], 6, 0x77)) { ret 21; }
+    if (os.secret_borrow_size(request.borrow) != 0 || request.secret) { ret 22; }
+    if (file_api.active(?fixture.file_adapter) != 0) { ret 23; }
+    if (!scratch_span_zero(?fixture.file_adapter, 0, 32)) { ret 24; }
+    val destroyed: i32 = secret_fixture_destroy(?fixture);
+    if (destroyed != 0) { ret 30 + destroyed; }
+    filesystem.close(?file);
+    cleanup_file(path);
+    ret 0;
+}
+
+test "io.file: a native fault after secret submission keeps storage valid and effects precise" {
+    var secret_scratch: [32]^u8;
+    var fixture: SecretFixture;
+    val made: i32 = secret_fixture_make(?fixture, ?secret_scratch[0], 32);
+    if (made != 0) { ret 10 + made; }
+    var stale: filesystem.File = filesystem.File{handle: io_handle.FileHandle{value: 1000000}};
+    var key: [16]^u8;
+    secret_fill(?key[0], 16, 0x9c);
+    if (!ok_token(submit_secret_write(?fixture.file_adapter, ?fixture.scope, ?stale, ?key[0], 16, 0, 99))) { ret 2; }
+    var completion: io_runtime.Completion;
+    val faulted: res[usize, io_error.Error] = wait_secret(?fixture, ?completion);
+    if (sel faulted.err) { ret 3; }
+    if (faulted.ok != 1 || !completion.has_error || completion.bytes != 0 || completion.context != 99) { ret 4; }
+    if (completion.error.kind != io_error.CLOSED || completion.error.operation != io_error.OP_WRITE) { ret 5; }
+    if (!secret_all(?key[0], 16, 0x9c)) { ret 6; }
+    if (file_api.active(?fixture.file_adapter) != 0) { ret 7; }
+    if (!scratch_span_zero(?fixture.file_adapter, 0, 32)) { ret 8; }
+    var output: [8]^u8;
+    secret_fill(?output[0], 8, 0x3b);
+    if (!ok_token(submit_secret_read(?fixture.file_adapter, ?fixture.scope, ?stale, ?output[0], 8, 0, 100))) { ret 9; }
+    val read_fault: res[usize, io_error.Error] = wait_secret(?fixture, ?completion);
+    if (sel read_fault.err) { ret 20; }
+    if (read_fault.ok != 1 || !completion.has_error || completion.bytes != 0 || completion.context != 100) { ret 21; }
+    if (completion.error.kind != io_error.CLOSED || completion.error.operation != io_error.OP_READ) { ret 22; }
+    if (!secret_all(?output[0], 8, 0x3b)) { ret 23; }
+    val request: *Request = ?fixture.requests[0];
+    if (request.secret || os.secret_borrow_size(request.borrow) != 0) { ret 24; }
+    if (file_api.active(?fixture.file_adapter) != 0) { ret 25; }
+    val destroyed: i32 = secret_fixture_destroy(?fixture);
+    if (destroyed != 0) { ret 30 + destroyed; }
+    ret 0;
+}
+
+test "io.file: secret and public requests share the adapter without crossing storage" {
+    val path: Path = "mach-std-io-file-secret-mixed";
+    cleanup_file(path);
+    var file: filesystem.File = create_read_write(path);
+    if (!io_handle.file_is_valid(file.handle)) { ret 1; }
+    var secret_scratch: [32]^u8;
+    var fixture: SecretFixture;
+    val made: i32 = secret_fixture_make(?fixture, ?secret_scratch[0], 32);
+    if (made != 0) { ret 10 + made; }
+    var key: [16]^u8;
+    secret_fill(?key[0], 16, 0x66);
+    var label: [4]u8;
+    memory.raw_copy((?label)::ptr, "pub!"::ptr, 4);
+    if (!ok_token(submit_secret_write(?fixture.file_adapter, ?fixture.scope, ?file, ?key[0], 16, 0, 101))) { ret 2; }
+    if (!ok_token(submit_write(?fixture.file_adapter, ?fixture.scope, ?file, (?label)::*u8, 4, 16, 102))) { ret 3; }
+    var completion: io_runtime.Completion;
+    var seen: usize = 0;
+    for (seen < 2) {
+        val next: res[usize, io_error.Error] = wait_secret(?fixture, ?completion);
+        if (sel next.err) { ret 4; }
+        if (next.ok != 1 || completion.has_error) { ret 5; }
+        if (completion.context == 101 && completion.bytes != 16) { ret 6; }
+        if (completion.context == 102 && completion.bytes != 4) { ret 7; }
+        seen = seen + 1;
+    }
+    var observed: [20]u8;
+    val observed_count: res[usize, io_error.Error] = read_at(file, (?observed)::*u8, 20, 0);
+    if (sel observed_count.err) { ret 8; }
+    if (observed_count.ok != 20) { ret 9; }
+    var i: usize = 0;
+    for (i < 16) { if (observed[i] != 0x66) { ret 20; } i = i + 1; }
+    if (!bytes_equal(((?observed)::usize + 16)::*u8, "pub!"::*u8, 4)) { ret 21; }
+    i = 0;
+    for (i < 32) { if (fixture.scratch[i] == 0x66) { ret 22; } i = i + 1; }
+    if (!scratch_span_zero(?fixture.file_adapter, 0, 32)) { ret 23; }
+    val destroyed: i32 = secret_fixture_destroy(?fixture);
+    if (destroyed != 0) { ret 30 + destroyed; }
+    filesystem.close(?file);
+    cleanup_file(path);
+    ret 0;
+}
+
+test "io.file: runtime close settles a queued secret read with the destination untouched" {
+    val path: Path = "mach-std-io-file-secret-close";
+    cleanup_file(path);
+    if (fs_write_refused(filesystem.write_bytes(path, "secret", 6, 0o600))) { ret 1; }
+    val opened: res[filesystem.File, io_error.Error] = filesystem.open(path);
+    if (sel opened.err) { ret 2; }
+    var file: filesystem.File = opened.ok;
+    var secret_scratch: [32]^u8;
+    var fixture: SecretFixture;
+    val made: i32 = secret_fixture_make(?fixture, ?secret_scratch[0], 32);
+    if (made != 0) { ret 10 + made; }
+    var entered: i64 = 0;
+    var release: i64 = 0;
+    var blocker: BlockTask = BlockTask{entered: ?entered, release: ?release};
+    val blocked: worker_pool.Status = worker_pool.submit(?fixture.file_adapter.pool, worker_pool.Task{context: ?blocker, run: block_worker});
+    if (!sel blocked.accepted) { ret 3; }
+    for (atomic.load(?entered) == 0) { os.thread_wait(?entered, 0); }
+    var output: [6]^u8;
+    secret_fill(?output[0], 6, 0x71);
+    if (!ok_token(submit_secret_read(?fixture.file_adapter, ?fixture.scope, ?file, ?output[0], 6, 0, 103))) { ret 4; }
+    val request: *Request = ?fixture.requests[0];
+    if (!ok_bool(io_runtime.close(?fixture.runtime))) { ret 5; }
+    var completion: io_runtime.Completion;
+    val early: res[usize, io_error.Error] = io_runtime.poll(?fixture.runtime, ?completion, 1);
+    if (sel early.err) { ret 6; }
+    if (early.ok != 0) { ret 6; }
+    if (os.secret_borrow_size(request.borrow) != 6) { ret 7; }
+    atomic.store(?release, 1);
+    os.thread_wake(?release);
+    if (!ok_bool(shutdown_drain(?fixture.file_adapter))) { ret 8; }
+    if (ok_err(destroy(?fixture.file_adapter))) { ret 9; }
+    if (os.secret_borrow_size(request.borrow) != 6 || file_api.active(?fixture.file_adapter) != 1) { ret 20; }
+    val closed: res[usize, io_error.Error] = wait_secret(?fixture, ?completion);
+    if (sel closed.err) { ret 21; }
+    if (closed.ok != 1 || !completion.has_error || completion.error.kind != io_error.CLOSED || completion.bytes != 0) { ret 22; }
+    if (!secret_all(?output[0], 6, 0x71)) { ret 23; }
+    if (os.secret_borrow_size(request.borrow) != 0 || request.secret || file_api.active(?fixture.file_adapter) != 0) { ret 24; }
+    if (!scratch_span_zero(?fixture.file_adapter, 0, 32)) { ret 25; }
+    if (!ok_err(destroy(?fixture.file_adapter))) { ret 26; }
+    if (!secret_all(?secret_scratch[0], 32, 0)) { ret 27; }
+    if (!scope_ok(cancel.destroy(?fixture.scope)) || !ok_err(io_runtime.destroy(?fixture.runtime))) { ret 28; }
     filesystem.close(?file);
     cleanup_file(path);
     ret 0;

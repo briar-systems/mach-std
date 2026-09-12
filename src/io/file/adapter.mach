@@ -36,6 +36,7 @@ val REQUEST_RUNNING:   i64 = 2;
 val REQUEST_CANCELLED: i64 = 3;
 val REQUEST_ABORTED:   i64 = 4;
 val REQUEST_QUIESCED:  i64 = 5;
+val REQUEST_PUBLISHED: i64 = 6;
 
 val ADAPTER_OPEN:     u8 = 0;
 val ADAPTER_DRAINING: u8 = 1;
@@ -46,6 +47,13 @@ val ADAPTER_RETIRED:       u8 = 5;
 val ADAPTER_POOL_DESTROYED: u8 = 6;
 val ADAPTER_RELEASING:     u8 = 7;
 
+# a secret request names its scratch span and read destination by borrow
+# handle only: no welded pointer is stored here, so the request stays a `ptr`
+# context the worker pool and the runtime can carry. a secret request is
+# retired by the later of two arrivals, its resolution (PUBLISHED, not FREE)
+# and the runtime dequeuing its completion; the dequeue is when the delivered
+# prefix lands in the caller's welded storage, and the retire is when the
+# scratch span is wiped and the borrow ends
 pub rec Request {
     adapter:             *Adapter;
     state:               i64;
@@ -55,6 +63,10 @@ pub rec Request {
     offset:              u64;
     scratch:             *u8;
     token:               io_runtime.Token;
+    secret:              bool;
+    scratch_offset:      usize;
+    arrivals:            usize;
+    borrow:              os.SecretBorrow;
 }
 
 # request, task, abort, worker, thread, and scratch storage are caller-owned
@@ -68,6 +80,8 @@ pub rec Adapter {
     scratch:          *u8;
     scratch_length:   usize;
     max_transfer:     usize;
+    secret_scratch:   os.SecretBorrow;
+    secret_attached:  bool;
     tasks:            *worker_pool.Task;
     abort_tasks:      *worker_pool.Task;
     threads:          *thread.Thread;
@@ -89,8 +103,53 @@ fun source_dispatch(context: ptr, native_context: usize, events: u32, status: i6
     ret false;
 }
 
+# the runtime dequeues a completion here before the caller sees it: a secret
+# read's delivered prefix reaches the caller's welded storage now and never
+# earlier or later. no native code can still touch the scratch span: the
+# worker resolved the request after its transfer returned, and the runtime
+# publishes a cancellation only after the worker quiesced
 fun source_release(context: ptr, completion: *io_runtime.Completion) {
-    ret;
+    val adapter: *Adapter = context::*Adapter;
+    mutex.lock(?adapter.lock);
+    var i: usize = 0;
+    for (i < adapter.request_capacity) {
+        val request: *Request = ?adapter.requests[i];
+        if (request.secret && atomic.load(?request.state) != REQUEST_FREE && token_equal(request.token, completion.token)) {
+            if (request.kind == io_runtime.FILE_READ && !completion.has_error && completion.bytes > 0) {
+                if (os.secret_borrow_copy(request.borrow, 0, adapter.secret_scratch, request.scratch_offset, completion.bytes) < 0) {
+                    panic.panic("std.io.file: secret read lost its borrow before delivery\n");
+                }
+            }
+            secret_arrive_locked(adapter, request);
+            mutex.unlock(?adapter.lock);
+            ret;
+        }
+        i = i + 1;
+    }
+    mutex.unlock(?adapter.lock);
+}
+
+# wipe the scratch span and end the borrow; every terminal path of a secret
+# request comes through here exactly once
+fun retire_secret_request(adapter: *Adapter, request: *Request) {
+    if (request.length > 0 && os.secret_borrow_wipe(adapter.secret_scratch, request.scratch_offset, request.length) < 0) {
+        panic.panic("std.io.file: secret scratch lost its borrow before the wipe\n");
+    }
+    if (request.kind == io_runtime.FILE_READ && request.length > 0) { os.secret_borrow_close(request.borrow); }
+    request.secret = false;
+}
+
+# a secret request is retired by the second of its two arrivals, the
+# resolution and the dequeue, in whichever order they come
+fun secret_arrive_locked(adapter: *Adapter, request: *Request) {
+    request.arrivals = request.arrivals + 1;
+    if (request.arrivals < 2) {
+        atomic.store(?request.state, REQUEST_PUBLISHED);
+        ret;
+    }
+    retire_secret_request(adapter, request);
+    atomic.store(?request.state, REQUEST_FREE);
+    adapter.active = adapter.active - 1;
 }
 
 fun source_cancel(context: ptr, token: io_runtime.Token, reason: io_error.Error) i64 {
@@ -119,9 +178,16 @@ fun source_cancel(context: ptr, token: io_runtime.Token, reason: io_error.Error)
     ret 0;
 }
 
+# a public request is free once resolved; a secret one also needs its
+# completion dequeued
 fun release_request(request: *Request) {
     val adapter: *Adapter = request.adapter;
     mutex.lock(?adapter.lock);
+    if (request.secret) {
+        secret_arrive_locked(adapter, request);
+        mutex.unlock(?adapter.lock);
+        ret;
+    }
     atomic.store(?request.state, REQUEST_FREE);
     adapter.active = adapter.active - 1;
     mutex.unlock(?adapter.lock);
@@ -170,7 +236,13 @@ fun execute_request(context: ptr) bool {
     }
 
     var result: i64 = 0;
-    if (request.kind == io_runtime.FILE_READ) {
+    if (request.secret && request.kind == io_runtime.FILE_READ) {
+        result = os.secret_borrow_read_at(request.file.handle.value::i32, request.adapter.secret_scratch, request.scratch_offset, request.length, request.offset);
+    }
+    or (request.secret) {
+        result = os.secret_borrow_write_at(request.file.handle.value::i32, request.adapter.secret_scratch, request.scratch_offset, request.length, request.offset);
+    }
+    or (request.kind == io_runtime.FILE_READ) {
         result = platform.read_at(request.file.handle.value::i32, request.scratch, request.length, request.offset);
     }
     or {
@@ -184,6 +256,10 @@ fun execute_request(context: ptr) bool {
     var resolved: err[io_error.Error];
     if (result < 0) {
         resolved = io_runtime.fail(request.adapter.runtime, request.token, failure(result, request_operation(request)));
+    }
+    or (request.secret && request.kind == io_runtime.FILE_READ) {
+        val count: usize = result::usize;
+        resolved = io_runtime.complete(request.adapter.runtime, request.token, count, request.file.handle.value, count == 0 && request.length != 0);
     }
     or (request.kind == io_runtime.FILE_READ) {
         val count: usize = result::usize;
@@ -246,12 +322,15 @@ pub fun make(
     adapter.active = 0;
     adapter.state = ADAPTER_OPEN;
     adapter.initialized = false;
+    adapter.secret_attached = false;
     adapter.lock = mutex.make();
     var i: usize = 0;
     for (i < request_capacity) {
         adapter.requests[i].adapter = adapter;
         adapter.requests[i].state = REQUEST_FREE;
         adapter.requests[i].scratch = (scratch::usize + i * max_transfer)::*u8;
+        adapter.requests[i].secret = false;
+        adapter.requests[i].scratch_offset = i * max_transfer;
         i = i + 1;
     }
     val registered: res[io_runtime.SourceToken, io_error.Error] = io_runtime.register_source(
@@ -297,6 +376,7 @@ fun submit_operation(adapter: *Adapter, scope: *cancel.Scope, file: *filesystem.
     request.file = @file;
     request.length = length;
     request.offset = offset;
+    request.secret = false;
     if (kind == io_runtime.FILE_WRITE && length > 0) { memory.raw_copy(request.scratch::ptr, buffer::ptr, length); }
     atomic.store(?request.state, REQUEST_QUEUED);
     var runtime_buffer: *u8 = buffer;
@@ -339,6 +419,125 @@ pub fun submit_read(adapter: *Adapter, scope: *cancel.Scope, file: *filesystem.F
 # write bytes are copied into bounded adapter storage before this call succeeds
 pub fun submit_write(adapter: *Adapter, scope: *cancel.Scope, file: *filesystem.File, buffer: *u8, length: usize, offset: u64, context: usize) res[io_runtime.Token, io_error.Error] {
     ret submit_operation(adapter, scope, file, buffer, length, offset, context, io_runtime.FILE_WRITE);
+}
+
+# lend welded scratch to the adapter for secret requests: one span of
+# max_transfer bytes per request, the same geometry as the public scratch.
+# the storage stays the caller's; the adapter wipes each span after its
+# request's terminal completion is dequeued, wipes the whole of it and ends
+# the borrow in destroy, and the caller releases it after that
+pub fun attach_secret_scratch(adapter: *Adapter, scratch: *^u8, scratch_length: usize) err[io_error.Error] {
+    if (adapter == nil || scratch == nil) { ret err[io_error.Error].err{failure(os.EINVAL, io_error.OP_CREATE)}; }
+    mutex.lock(?adapter.lock);
+    if (!adapter.initialized || adapter.state != ADAPTER_OPEN) {
+        mutex.unlock(?adapter.lock);
+        ret err[io_error.Error].err{failure(os.EBADF, io_error.OP_CREATE)};
+    }
+    if (adapter.secret_attached) {
+        mutex.unlock(?adapter.lock);
+        ret err[io_error.Error].err{failure(os.EBUSY, io_error.OP_CREATE)};
+    }
+    if (scratch_length < adapter.request_capacity * adapter.max_transfer) {
+        mutex.unlock(?adapter.lock);
+        ret err[io_error.Error].err{failure(os.ENOMEM, io_error.OP_CREATE)};
+    }
+    val opened: i64 = os.secret_borrow_open(scratch, scratch_length, ?adapter.secret_scratch);
+    if (opened < 0) {
+        mutex.unlock(?adapter.lock);
+        ret err[io_error.Error].err{failure(opened, io_error.OP_CREATE)};
+    }
+    adapter.secret_attached = true;
+    mutex.unlock(?adapter.lock);
+    ret err[io_error.Error].ok{};
+}
+
+fun submit_secret_operation(adapter: *Adapter, scope: *cancel.Scope, file: *filesystem.File, buffer: *^u8, length: usize, offset: u64, context: usize, kind: io_runtime.Kind) res[io_runtime.Token, io_error.Error] {
+    var normalized_kind: io_error.Operation = io_error.OP_READ;
+    if (kind == io_runtime.FILE_WRITE) { normalized_kind = io_error.OP_WRITE; }
+    if (adapter == nil || scope == nil || file == nil || !io_handle.file_is_valid(file.handle) || (buffer == nil && length != 0)) {
+        ret res[io_runtime.Token, io_error.Error].err{failure(os.EINVAL, normalized_kind)};
+    }
+    mutex.lock(?adapter.lock);
+    if (!adapter.initialized || adapter.state != ADAPTER_OPEN || !adapter.secret_attached || length > adapter.max_transfer) {
+        mutex.unlock(?adapter.lock);
+        var code: i64 = os.ENOMEM;
+        if (adapter.initialized && adapter.state != ADAPTER_OPEN) { code = os.EBADF; }
+        or (adapter.initialized && !adapter.secret_attached) { code = os.ENOTSUP; }
+        ret res[io_runtime.Token, io_error.Error].err{failure(code, normalized_kind)};
+    }
+    val request: *Request = claim_request(adapter);
+    if (request == nil) {
+        mutex.unlock(?adapter.lock);
+        ret res[io_runtime.Token, io_error.Error].err{failure(os.ENOMEM, normalized_kind)};
+    }
+    request.kind = kind;
+    request.file = @file;
+    request.length = length;
+    request.offset = offset;
+    request.secret = true;
+    request.arrivals = 0;
+    if (kind == io_runtime.FILE_READ && length > 0) {
+        val borrowed: i64 = os.secret_borrow_open(buffer, length, ?request.borrow);
+        if (borrowed < 0) {
+            request.secret = false;
+            request.state = REQUEST_FREE;
+            adapter.active = adapter.active - 1;
+            mutex.unlock(?adapter.lock);
+            ret res[io_runtime.Token, io_error.Error].err{failure(borrowed, normalized_kind)};
+        }
+    }
+    or (kind == io_runtime.FILE_READ) {
+        request.borrow = os.SecretBorrow{index: 0, generation: 0};
+    }
+    if (kind == io_runtime.FILE_WRITE && length > 0 && os.secret_borrow_fill(adapter.secret_scratch, request.scratch_offset, buffer, length) < 0) {
+        request.secret = false;
+        request.state = REQUEST_FREE;
+        adapter.active = adapter.active - 1;
+        mutex.unlock(?adapter.lock);
+        ret res[io_runtime.Token, io_error.Error].err{failure(os.EBADF, normalized_kind)};
+    }
+    atomic.store(?request.state, REQUEST_QUEUED);
+    val operation: io_runtime.Operation = io_runtime.Operation{
+        kind: kind,
+        resource: file.handle.value,
+        buffer: nil,
+        length: length,
+        offset: offset,
+        context: context,
+    };
+    val submitted: res[io_runtime.Token, io_error.Error] = io_runtime.submit_scoped_owned(adapter.runtime, adapter.source, scope, operation);
+    if (sel submitted.err) {
+        retire_secret_request(adapter, request);
+        request.state = REQUEST_FREE;
+        adapter.active = adapter.active - 1;
+        mutex.unlock(?adapter.lock);
+        ret res[io_runtime.Token, io_error.Error].err{submitted.err};
+    }
+    request.token = submitted.ok;
+    val queued: worker_pool.Status = worker_pool.try_submit(?adapter.pool, worker_pool.Task{context: request::ptr, run: execute_request});
+    if (!sel queued.accepted) {
+        atomic.store(?request.state, REQUEST_ABORTED);
+        mutex.unlock(?adapter.lock);
+        val resolved: err[io_error.Error] = io_runtime.fail(adapter.runtime, request.token, failure(os.EBUSY, io_error.OP_SUBMIT));
+        settle_resolution(request, resolved);
+        ret res[io_runtime.Token, io_error.Error].ok{request.token};
+    }
+    val token: io_runtime.Token = request.token;
+    mutex.unlock(?adapter.lock);
+    ret res[io_runtime.Token, io_error.Error].ok{token};
+}
+
+# the welded destination is borrowed until the completion is dequeued, and is
+# written exactly then with exactly the delivered prefix; on any error or
+# cancellation it is unchanged
+pub fun submit_secret_read(adapter: *Adapter, scope: *cancel.Scope, file: *filesystem.File, buffer: *^u8, length: usize, offset: u64, context: usize) res[io_runtime.Token, io_error.Error] {
+    ret submit_secret_operation(adapter, scope, file, buffer, length, offset, context, io_runtime.FILE_READ);
+}
+
+# welded bytes are copied into the attached secret scratch before this call
+# succeeds; the caller's storage is not borrowed past the return
+pub fun submit_secret_write(adapter: *Adapter, scope: *cancel.Scope, file: *filesystem.File, buffer: *^u8, length: usize, offset: u64, context: usize) res[io_runtime.Token, io_error.Error] {
+    ret submit_secret_operation(adapter, scope, file, buffer, length, offset, context, io_runtime.FILE_WRITE);
 }
 
 fun publish_aborted(request: *Request) {
@@ -467,6 +666,11 @@ pub fun destroy(adapter: *Adapter) err[io_error.Error] {
         ret err[io_error.Error].err{released.err};
     }
     mutex.lock(?adapter.lock);
+    if (adapter.secret_attached) {
+        os.secret_borrow_wipe(adapter.secret_scratch, 0, os.secret_borrow_size(adapter.secret_scratch));
+        os.secret_borrow_close(adapter.secret_scratch);
+        adapter.secret_attached = false;
+    }
     adapter.runtime = nil;
     adapter.requests = nil;
     adapter.scratch = nil;
