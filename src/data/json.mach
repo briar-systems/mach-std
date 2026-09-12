@@ -2,17 +2,19 @@
 #
 # this module hosts two emission surfaces over one escape core:
 #
-#   - the tree emitter (parse/emit): parses JSON text into a tree of Value
-#     nodes and emits a Value back to JSON text. strings are zero-copy pointers
-#     into the original input buffer (escape sequences are not unescaped:
-#     str_val holds the raw on-wire bytes); the caller must keep the input
-#     alive while values are in use.
+#   - the tree emitter (parse/emit/write_value): parses JSON text into a tree
+#     of Value nodes and emits a Value back to JSON text. strings are zero-copy
+#     pointers into the original input buffer (escape sequences are not
+#     unescaped: str_val holds the raw on-wire bytes); the caller must keep the
+#     input alive while values are in use, and releases the tree with dnit.
 #   - the streaming NDJSON emitter (Object/Array/field_*/write_json_string):
 #     writes JSON objects one-per-line through a caller-owned writer, for
 #     machine-consumed output streams. objects nest: a member value or an array
 #     element may itself be an object (field_object_begin / array_object_begin,
 #     closed with object_end_value), and only the top-level object_end writes
 #     the line terminator, so a whole nested object still lands on one line.
+#     every helper reports the writer's outcome, a WriteError whose payload is
+#     the prefix that call persisted before the failure.
 #
 # both surfaces escape string bodies through one escaper (escape_unit) with an
 # explicit policy:
@@ -40,16 +42,11 @@
 # make_string from already-logical bytes for emission. see mach-std#340.
 
 use std.types.canonical.res;
+use std.types.canonical.err;
 use std.types.bool.bool;
 use std.types.bool.true;
 use std.types.bool.false;
 use std.types.size.usize;
-use std.types.result.Result;
-use std.types.result.ok;
-use std.types.result.err;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
-use std.types.result.unwrap_err;
 use std.types.string.str;
 use std.memory.raw_copy;
 use std.allocator;
@@ -58,6 +55,7 @@ use std.io.writer.WriteError;
 use std.format;
 use std.text.utf8;
 use std.text.parse.parse_f64_len;
+use std.text.parse.ParseError;
 
 pub def Kind: u8;
 pub val NULL:   Kind = 0;
@@ -67,9 +65,28 @@ pub val STRING: Kind = 3;
 pub val ARRAY:  Kind = 4;
 pub val OBJECT: Kind = 5;
 
-val VALUE_SIZE: usize = $size_of(Value);
-val STR_SIZE:   usize = $size_of(str);
-val USIZE_SIZE: usize = $size_of(usize);
+# how many arrays and objects a value may nest inside before the parser
+# refuses
+#
+# every container descends through parse_value, so the depth is a count taken
+# straight from the document; without a bound the only limit is the stack the
+# process happens to have. this is far past any hand-written document and far
+# short of any stack the parser runs on.
+pub val MAX_DEPTH: usize = 128;
+
+# every way a parse or a string decode can fail
+# ---
+# syntax: the byte at the payload offset is not valid JSON (or, from
+#         value_string_decode, not a valid escape); the offset is into the
+#         source given to parse, or into the raw string bytes being decoded
+# depth:  a container at the payload offset nests deeper than MAX_DEPTH
+# alloc:  growing a container's storage was refused; everything the parse had
+#         acquired is released before it reports
+pub tag JsonError: u8 {
+    syntax: usize;
+    depth:  usize;
+    alloc:  allocator.Error;
+}
 
 # a parsed JSON value
 # ---
@@ -111,19 +128,15 @@ rec Parser {
 }
 
 # parse JSON text into a Value tree
+#
+# the tree's container storage comes from `alloc`; release it with dnit. a
+# parse that fails part way releases everything it acquired before reporting.
 # ---
 # src:     pointer to JSON source bytes
 # src_len: length of source in bytes
 # alloc:   allocator for array/object storage
-# ret:     root Value on success, or error message
-pub fun parse(src: *u8, src_len: usize, alloc: *allocator.Allocator) Result[Value, str] {
-    if (src == nil) {
-        ret err[Value, str]("source is nil");
-    }
-    if (alloc == nil) {
-        ret err[Value, str]("allocator is nil");
-    }
-
+# ret:     root Value on success, or the failure
+pub fun parse(src: *u8, src_len: usize, alloc: *allocator.Allocator) res[Value, JsonError] {
     var p: Parser;
     p.src = src;
     p.len = src_len;
@@ -131,17 +144,59 @@ pub fun parse(src: *u8, src_len: usize, alloc: *allocator.Allocator) Result[Valu
     p.alloc = alloc;
 
     skip_ws(?p);
-    val r: Result[Value, str] = parse_value(?p);
-    if (is_err[Value, str](r)) {
-        ret r;
-    }
+    val r: res[Value, JsonError] = parse_value(?p, 0);
+    if (sel r.err) { ret r; }
 
     skip_ws(?p);
     if (p.pos < p.len) {
-        ret err[Value, str]("trailing content after value");
+        var root: Value = r.ok;
+        dnit(alloc, ?root);
+        ret res[Value, JsonError].err{JsonError.syntax{p.pos}};
     }
 
     ret r;
+}
+
+# release the container storage under a value, leaving the value empty
+#
+# walks arrays and objects to any depth and returns every children, keys and
+# keys_len buffer to the allocator the tree was parsed with. scalars and
+# strings own nothing (a string points into the caller's input). every buffer
+# is released even when one refusal is reported; the first refusal is the
+# outcome. a released value is empty, so a second dnit is a no-op.
+# ---
+# alloc: the allocator the tree was parsed with
+# v:     the value whose storage to release
+# ret:   ok, or the first refusal the allocator reported
+pub fun dnit(alloc: *allocator.Allocator, v: *Value) err[allocator.Error] {
+    var failed: bool = false;
+    var cause: allocator.Error;
+
+    var i: usize = 0;
+    for (i < v.count) {
+        val child: err[allocator.Error] = dnit(alloc, ?v.children[i]);
+        if (sel child.err) { if (!failed) { failed = true; cause = child.err; } }
+        i = i + 1;
+    }
+
+    if (v.cap > 0) {
+        val c: err[allocator.Error] = allocator.deallocate[Value](alloc, v.children, v.cap);
+        if (sel c.err) { if (!failed) { failed = true; cause = c.err; } }
+        if (v.keys != nil) {
+            val k: err[allocator.Error] = allocator.deallocate[str](alloc, v.keys, v.cap);
+            if (sel k.err) { if (!failed) { failed = true; cause = k.err; } }
+            val l: err[allocator.Error] = allocator.deallocate[usize](alloc, v.keys_len, v.cap);
+            if (sel l.err) { if (!failed) { failed = true; cause = l.err; } }
+        }
+    }
+
+    v.children = nil;
+    v.keys = nil;
+    v.keys_len = nil;
+    v.count = 0;
+    v.cap = 0;
+    if (failed) { ret err[allocator.Error].err{cause}; }
+    ret err[allocator.Error].ok{};
 }
 
 # check if a value is null
@@ -235,20 +290,17 @@ pub fun value_string(v: *Value, len: *usize) *u8 {
 # v:   the value whose raw string bytes to decode (str_val/str_len)
 # buf: destination buffer for the decoded bytes
 # len: capacity of buf in bytes
-# ret: the decoded byte length on success (may exceed len), or an error message
-#      if the bytes hold a malformed escape (unknown escape, a '\u' without four
-#      hex digits, or an ill-formed surrogate pair)
-pub fun value_string_decode(v: *Value, buf: *u8, len: usize) Result[usize, str] {
+# ret: the decoded byte length on success (may exceed len), or syntax at the
+#      offset of a malformed escape (unknown escape, a '\u' without four hex
+#      digits, or an ill-formed surrogate pair)
+pub fun value_string_decode(v: *Value, buf: *u8, len: usize) res[usize, JsonError] {
     var b: BufWriter;
     b.data = buf;
     b.cap  = len;
     b.pos  = 0;
-    var w: writer.Writer;
-    w.ctx      = (?b)::ptr;
-    w.f_write = bufw_write;
-    val dr: Result[bool, str] = decode_bytes(?w, v.str_val::*u8, v.str_len);
-    if (is_err[bool, str](dr)) { ret err[usize, str](unwrap_err[bool, str](dr)); }
-    ret ok[usize, str](b.pos);
+    val dr: err[JsonError] = decode_bytes(?b, v.str_val::*u8, v.str_len);
+    if (sel dr.err) { ret res[usize, JsonError].err{dr.err}; }
+    ret res[usize, JsonError].ok{b.pos};
 }
 
 # get the number of children (array elements or object entries)
@@ -333,8 +385,22 @@ pub fun emit(v: *Value, buf: *u8, len: usize) usize {
     var w: writer.Writer;
     w.ctx      = (?b)::ptr;
     w.f_write = bufw_write;
-    emit_value(?w, v);
+    # the counting sink accepts every byte, so the outcome is always ok
+    write_value(?w, v);
     ret b.pos;
+}
+
+# emit a Value as JSON text through a writer
+#
+# the same rendering as emit, to any sink. the outcome is the writer's, with
+# the bytes persisted before a failure in its payload.
+# ---
+# w:   the writer to emit through
+# v:   value to emit
+# ret: ok, or the writer's failure with the persisted prefix
+pub fun write_value(w: *writer.Writer, v: *Value) err[WriteError] {
+    var e: Emit = Emit{w: w, total: 0};
+    ret emit_value(?e, v);
 }
 
 fun make_null() Value {
@@ -407,82 +473,58 @@ fun skip_ws(p: *Parser) {
     }
 }
 
-fun peek(p: *Parser) u8 {
-    if (p.pos >= p.len) { ret 0; }
-    ret p.src[p.pos];
+fun syntax_at(pos: usize) res[Value, JsonError] {
+    ret res[Value, JsonError].err{JsonError.syntax{pos}};
 }
 
-fun advance(p: *Parser) u8 {
-    if (p.pos >= p.len) { ret 0; }
-    val c: u8 = p.src[p.pos];
-    p.pos = p.pos + 1;
-    ret c;
-}
-
-fun expect(p: *Parser, c: u8) Result[bool, str] {
-    if (p.pos >= p.len || p.src[p.pos] != c) {
-        ret err[bool, str]("unexpected character");
-    }
-    p.pos = p.pos + 1;
-    ret ok[bool, str](true);
-}
-
-fun parse_value(p: *Parser) Result[Value, str] {
+fun parse_value(p: *Parser, depth: usize) res[Value, JsonError] {
     skip_ws(p);
-    if (p.pos >= p.len) {
-        ret err[Value, str]("unexpected end of input");
-    }
+    if (p.pos >= p.len) { ret syntax_at(p.pos); }
 
     val c: u8 = p.src[p.pos];
 
     if (c == 'n') { ret parse_null(p); }
     if (c == 't' || c == 'f') { ret parse_bool(p); }
     if (c == '"') { ret parse_string(p); }
-    if (c == '[') { ret parse_array(p); }
-    if (c == '{') { ret parse_object(p); }
+    if (c == '[') { ret parse_array(p, depth + 1); }
+    if (c == '{') { ret parse_object(p, depth + 1); }
     if (c == '-' || (c >= '0' && c <= '9')) { ret parse_number(p); }
 
-    ret err[Value, str]("unexpected character");
+    ret syntax_at(p.pos);
 }
 
-fun parse_null(p: *Parser) Result[Value, str] {
-    if (p.pos + 4 > p.len) {
-        ret err[Value, str]("unexpected end of input in null");
-    }
+fun parse_null(p: *Parser) res[Value, JsonError] {
+    if (p.pos + 4 > p.len) { ret syntax_at(p.len); }
     if (p.src[p.pos] != 'n' || p.src[p.pos + 1] != 'u' || p.src[p.pos + 2] != 'l' || p.src[p.pos + 3] != 'l') {
-        ret err[Value, str]("invalid null literal");
+        ret syntax_at(p.pos);
     }
     p.pos = p.pos + 4;
-    ret ok[Value, str](make_null());
+    ret res[Value, JsonError].ok{make_null()};
 }
 
-fun parse_bool(p: *Parser) Result[Value, str] {
+fun parse_bool(p: *Parser) res[Value, JsonError] {
     if (p.src[p.pos] == 't') {
-        if (p.pos + 4 > p.len) {
-            ret err[Value, str]("unexpected end of input in true");
-        }
+        if (p.pos + 4 > p.len) { ret syntax_at(p.len); }
         if (p.src[p.pos + 1] != 'r' || p.src[p.pos + 2] != 'u' || p.src[p.pos + 3] != 'e') {
-            ret err[Value, str]("invalid true literal");
+            ret syntax_at(p.pos);
         }
         p.pos = p.pos + 4;
-        ret ok[Value, str](make_bool(1));
+        ret res[Value, JsonError].ok{make_bool(1)};
     }
 
-    if (p.pos + 5 > p.len) {
-        ret err[Value, str]("unexpected end of input in false");
-    }
+    if (p.pos + 5 > p.len) { ret syntax_at(p.len); }
     if (p.src[p.pos + 1] != 'a' || p.src[p.pos + 2] != 'l' || p.src[p.pos + 3] != 's' || p.src[p.pos + 4] != 'e') {
-        ret err[Value, str]("invalid false literal");
+        ret syntax_at(p.pos);
     }
     p.pos = p.pos + 5;
-    ret ok[Value, str](make_bool(0));
+    ret res[Value, JsonError].ok{make_bool(0)};
 }
 
 # parse a JSON number (RFC 8259): optional minus, integer part, optional fraction
 # and optional exponent. a number with a fraction or exponent yields a float
 # value (parsed with correct rounding via parse_f64_len over the zero-copy span);
 # an integer-looking number keeps yielding an i64, unchanged.
-fun parse_number(p: *Parser) Result[Value, str] {
+fun parse_number(p: *Parser) res[Value, JsonError] {
     val start: usize = p.pos;
     var neg: bool = false;
     var is_float: bool = false;
@@ -491,7 +533,7 @@ fun parse_number(p: *Parser) Result[Value, str] {
         neg = true;
         p.pos = p.pos + 1;
         if (p.pos >= p.len || p.src[p.pos] < '0' || p.src[p.pos] > '9') {
-            ret err[Value, str]("invalid number: no digits after minus");
+            ret syntax_at(p.pos);
         }
     }
 
@@ -503,9 +545,7 @@ fun parse_number(p: *Parser) Result[Value, str] {
         p.pos = p.pos + 1;
     }
 
-    if (!has_digit) {
-        ret err[Value, str]("invalid number: no digits");
-    }
+    if (!has_digit) { ret syntax_at(p.pos); }
 
     if (p.pos < p.len && p.src[p.pos] == '.') {
         is_float = true;
@@ -515,9 +555,7 @@ fun parse_number(p: *Parser) Result[Value, str] {
             frac_digit = true;
             p.pos = p.pos + 1;
         }
-        if (!frac_digit) {
-            ret err[Value, str]("invalid number: no fraction digits");
-        }
+        if (!frac_digit) { ret syntax_at(p.pos); }
     }
 
     if (p.pos < p.len && (p.src[p.pos] == 'e' || p.src[p.pos] == 'E')) {
@@ -531,35 +569,33 @@ fun parse_number(p: *Parser) Result[Value, str] {
             exp_digit = true;
             p.pos = p.pos + 1;
         }
-        if (!exp_digit) {
-            ret err[Value, str]("invalid number: no exponent digits");
-        }
+        if (!exp_digit) { ret syntax_at(p.pos); }
     }
 
     if (is_float) {
         val span: str = (p.src::usize + start)::str;
-        val fr: Result[f64, str] = parse_f64_len(span, p.pos - start);
-        if (is_err[f64, str](fr)) {
-            ret err[Value, str](unwrap_err[f64, str](fr));
+        val fr: res[f64, ParseError] = parse_f64_len(span, p.pos - start);
+        if (sel fr.err) {
+            # the grammar above admits only what parse_f64_len accepts, so a
+            # refusal here names the span it could not read
+            ret syntax_at(start);
         }
-        ret ok[Value, str](make_float(unwrap_ok[f64, str](fr)));
+        ret res[Value, JsonError].ok{make_float(fr.ok)};
     }
 
     if (neg) { n = 0 - n; }
 
-    ret ok[Value, str](make_number(n));
+    ret res[Value, JsonError].ok{make_number(n)};
 }
 
-fun parse_string(p: *Parser) Result[Value, str] {
+fun parse_string(p: *Parser) res[Value, JsonError] {
     p.pos = p.pos + 1;
     val start: usize = p.pos;
 
     for (p.pos < p.len) {
         val c: u8 = p.src[p.pos];
         if (c == '\\') {
-            if (p.pos + 1 >= p.len) {
-                ret err[Value, str]("backslash at end of string");
-            }
+            if (p.pos + 1 >= p.len) { ret syntax_at(p.pos); }
             p.pos = p.pos + 2;
             cnt;
         }
@@ -567,154 +603,164 @@ fun parse_string(p: *Parser) Result[Value, str] {
             val slen: usize = p.pos - start;
             val sptr: str = (p.src::usize + start)::str;
             p.pos = p.pos + 1;
-            ret ok[Value, str](make_string(sptr, slen));
+            ret res[Value, JsonError].ok{make_string(sptr, slen)};
         }
         p.pos = p.pos + 1;
     }
 
-    ret err[Value, str]("unterminated string");
+    ret syntax_at(p.len);
 }
 
-fun children_grow(p: *Parser, v: *Value) Result[bool, str] {
+# double the children array (and, for an object, the parallel key arrays)
+#
+# a refused acquisition leaves the value exactly as it was; a growth that is
+# refused part way releases what it acquired first.
+fun grow(p: *Parser, v: *Value) err[JsonError] {
     var new_cap: usize = v.cap * 2;
-    if (v.cap == 0) {
-        new_cap = 4;
-    } or {
-        if (new_cap < v.cap) {
-            ret err[bool, str]("capacity overflow");
+    if (v.cap == 0) { new_cap = 4; }
+    or (new_cap < v.cap) { ret err[JsonError].err{JsonError.alloc{allocator.Error.overflow{}}}; }
+
+    val cr: res[*Value, allocator.Error] = allocator.allocate[Value](p.alloc, new_cap);
+    if (sel cr.err) { ret err[JsonError].err{JsonError.alloc{cr.err}}; }
+    val new_children: *Value = cr.ok;
+
+    var new_keys: *str = nil;
+    var new_lens: *usize = nil;
+    if (v.kind == OBJECT) {
+        val kr: res[*str, allocator.Error] = allocator.allocate[str](p.alloc, new_cap);
+        if (sel kr.err) {
+            allocator.deallocate[Value](p.alloc, new_children, new_cap);
+            ret err[JsonError].err{JsonError.alloc{kr.err}};
+        }
+        new_keys = kr.ok;
+
+        val lr: res[*usize, allocator.Error] = allocator.allocate[usize](p.alloc, new_cap);
+        if (sel lr.err) {
+            allocator.deallocate[str](p.alloc, new_keys, new_cap);
+            allocator.deallocate[Value](p.alloc, new_children, new_cap);
+            ret err[JsonError].err{JsonError.alloc{lr.err}};
+        }
+        new_lens = lr.ok;
+    }
+
+    if (v.count > 0) {
+        raw_copy(new_children::ptr, v.children::ptr, v.count * $size_of(Value));
+        if (v.kind == OBJECT) {
+            raw_copy(new_keys::ptr, v.keys::ptr, v.count * $size_of(str));
+            raw_copy(new_lens::ptr, v.keys_len::ptr, v.count * $size_of(usize));
+        }
+    }
+    if (v.cap > 0) {
+        allocator.deallocate[Value](p.alloc, v.children, v.cap);
+        if (v.kind == OBJECT) {
+            allocator.deallocate[str](p.alloc, v.keys, v.cap);
+            allocator.deallocate[usize](p.alloc, v.keys_len, v.cap);
         }
     }
 
-    val cr: res[*u8, allocator.Error] = allocator.allocate[u8](p.alloc, new_cap * VALUE_SIZE);
-    if (sel cr.err) { ret err[bool, str]("out of memory"); }
-    val new_children: *Value = cr.ok::*Value;
-
-    if (v.count > 0) {
-        raw_copy(new_children::ptr, v.children::ptr, v.count * VALUE_SIZE);
-    }
-
     v.children = new_children;
-    v.cap = new_cap;
-    ret ok[bool, str](true);
-}
-
-fun keys_grow(p: *Parser, v: *Value, new_cap: usize) Result[bool, str] {
-    val kr: res[*u8, allocator.Error] = allocator.allocate[u8](p.alloc, new_cap * STR_SIZE);
-    if (sel kr.err) { ret err[bool, str]("out of memory"); }
-    val new_keys: *str = kr.ok::*str;
-
-    val lr: res[*u8, allocator.Error] = allocator.allocate[u8](p.alloc, new_cap * USIZE_SIZE);
-    if (sel lr.err) {
-        allocator.deallocate[u8](p.alloc, new_keys::*u8, new_cap * STR_SIZE);
-        ret err[bool, str]("out of memory");
-    }
-    val new_lens: *usize = lr.ok::*usize;
-
-    if (v.count > 0) {
-        raw_copy(new_keys::ptr, v.keys::ptr, v.count * STR_SIZE);
-        raw_copy(new_lens::ptr, v.keys_len::ptr, v.count * USIZE_SIZE);
-    }
-
     v.keys = new_keys;
     v.keys_len = new_lens;
-    ret ok[bool, str](true);
+    v.cap = new_cap;
+    ret err[JsonError].ok{};
 }
 
-fun parse_array(p: *Parser) Result[Value, str] {
+# release a container built part way and report the failure
+fun abandon(p: *Parser, v: *Value, e: JsonError) res[Value, JsonError] {
+    dnit(p.alloc, v);
+    ret res[Value, JsonError].err{e};
+}
+
+fun parse_array(p: *Parser, depth: usize) res[Value, JsonError] {
+    if (depth > MAX_DEPTH) { ret res[Value, JsonError].err{JsonError.depth{p.pos}}; }
     p.pos = p.pos + 1;
     var v: Value = make_array();
 
     skip_ws(p);
     if (p.pos < p.len && p.src[p.pos] == ']') {
         p.pos = p.pos + 1;
-        ret ok[Value, str](v);
+        ret res[Value, JsonError].ok{v};
     }
 
     for (p.pos < p.len) {
-        val elem: Result[Value, str] = parse_value(p);
-        if (is_err[Value, str](elem)) { ret elem; }
+        val elem: res[Value, JsonError] = parse_value(p, depth);
+        if (sel elem.err) { ret abandon(p, ?v, elem.err); }
 
         if (v.count >= v.cap) {
-            val gr: Result[bool, str] = children_grow(p, ?v);
-            if (is_err[bool, str](gr)) { ret err[Value, str](unwrap_err[bool, str](gr)); }
+            val gr: err[JsonError] = grow(p, ?v);
+            if (sel gr.err) {
+                var orphan: Value = elem.ok;
+                dnit(p.alloc, ?orphan);
+                ret abandon(p, ?v, gr.err);
+            }
         }
-        v.children[v.count] = unwrap_ok[Value, str](elem);
+        v.children[v.count] = elem.ok;
         v.count = v.count + 1;
 
         skip_ws(p);
-        if (p.pos >= p.len) {
-            ret err[Value, str]("unterminated array");
-        }
+        if (p.pos >= p.len) { ret abandon(p, ?v, JsonError.syntax{p.pos}); }
         if (p.src[p.pos] == ']') {
             p.pos = p.pos + 1;
-            ret ok[Value, str](v);
+            ret res[Value, JsonError].ok{v};
         }
-        if (p.src[p.pos] != ',') {
-            ret err[Value, str]("expected ',' or ']' in array");
-        }
+        if (p.src[p.pos] != ',') { ret abandon(p, ?v, JsonError.syntax{p.pos}); }
         p.pos = p.pos + 1;
     }
 
-    ret err[Value, str]("unterminated array");
+    ret abandon(p, ?v, JsonError.syntax{p.pos});
 }
 
-fun parse_object(p: *Parser) Result[Value, str] {
+fun parse_object(p: *Parser, depth: usize) res[Value, JsonError] {
+    if (depth > MAX_DEPTH) { ret res[Value, JsonError].err{JsonError.depth{p.pos}}; }
     p.pos = p.pos + 1;
     var v: Value = make_object();
 
     skip_ws(p);
     if (p.pos < p.len && p.src[p.pos] == '}') {
         p.pos = p.pos + 1;
-        ret ok[Value, str](v);
+        ret res[Value, JsonError].ok{v};
     }
 
     for (p.pos < p.len) {
         skip_ws(p);
-        if (p.pos >= p.len || p.src[p.pos] != '"') {
-            ret err[Value, str]("expected string key in object");
-        }
+        if (p.pos >= p.len || p.src[p.pos] != '"') { ret abandon(p, ?v, JsonError.syntax{p.pos}); }
 
-        val key_res: Result[Value, str] = parse_string(p);
-        if (is_err[Value, str](key_res)) { ret key_res; }
-        val key_val: Value = unwrap_ok[Value, str](key_res);
+        val key_res: res[Value, JsonError] = parse_string(p);
+        if (sel key_res.err) { ret abandon(p, ?v, key_res.err); }
+        val key_val: Value = key_res.ok;
 
         skip_ws(p);
-        val colon: Result[bool, str] = expect(p, ':');
-        if (is_err[bool, str](colon)) {
-            ret err[Value, str]("expected ':' after object key");
-        }
+        if (p.pos >= p.len || p.src[p.pos] != ':') { ret abandon(p, ?v, JsonError.syntax{p.pos}); }
+        p.pos = p.pos + 1;
 
-        val val_res: Result[Value, str] = parse_value(p);
-        if (is_err[Value, str](val_res)) { ret val_res; }
+        val val_res: res[Value, JsonError] = parse_value(p, depth);
+        if (sel val_res.err) { ret abandon(p, ?v, val_res.err); }
 
         if (v.count >= v.cap) {
-            val gr: Result[bool, str] = children_grow(p, ?v);
-            if (is_err[bool, str](gr)) { ret err[Value, str](unwrap_err[bool, str](gr)); }
-
-            val kr: Result[bool, str] = keys_grow(p, ?v, v.cap);
-            if (is_err[bool, str](kr)) { ret err[Value, str](unwrap_err[bool, str](kr)); }
+            val gr: err[JsonError] = grow(p, ?v);
+            if (sel gr.err) {
+                var orphan: Value = val_res.ok;
+                dnit(p.alloc, ?orphan);
+                ret abandon(p, ?v, gr.err);
+            }
         }
 
         v.keys[v.count] = key_val.str_val;
         v.keys_len[v.count] = key_val.str_len;
-        v.children[v.count] = unwrap_ok[Value, str](val_res);
+        v.children[v.count] = val_res.ok;
         v.count = v.count + 1;
 
         skip_ws(p);
-        if (p.pos >= p.len) {
-            ret err[Value, str]("unterminated object");
-        }
+        if (p.pos >= p.len) { ret abandon(p, ?v, JsonError.syntax{p.pos}); }
         if (p.src[p.pos] == '}') {
             p.pos = p.pos + 1;
-            ret ok[Value, str](v);
+            ret res[Value, JsonError].ok{v};
         }
-        if (p.src[p.pos] != ',') {
-            ret err[Value, str]("expected ',' or '}' in object");
-        }
+        if (p.src[p.pos] != ',') { ret abandon(p, ?v, JsonError.syntax{p.pos}); }
         p.pos = p.pos + 1;
     }
 
-    ret err[Value, str]("unterminated object");
+    ret abandon(p, ?v, JsonError.syntax{p.pos});
 }
 
 # a counting writer over a fixed buffer: copies the bytes that fit and counts
@@ -730,17 +776,66 @@ rec BufWriter {
     pos:  usize;
 }
 
+# append one byte to a BufWriter, counting it whether or not it fits
+fun bufw_put(b: *BufWriter, c: u8) {
+    if (b.pos < b.cap) { b.data[b.pos] = c; }
+    b.pos = b.pos + 1;
+}
+
 # writer callback for BufWriter: copies the bytes that fit and advances pos by
 # the full request, always reporting a complete write.
 fun bufw_write(ctx: ptr, buf: *u8, len: usize) res[usize, WriteError] {
     val s: *BufWriter = ctx::*BufWriter;
     var i: usize = 0;
     for (i < len) {
-        if (s.pos < s.cap) { s.data[s.pos] = buf[i]; }
-        s.pos = s.pos + 1;
+        bufw_put(s, buf[i]);
         i = i + 1;
     }
     ret res[usize, WriteError].ok{len};
+}
+
+# a writer and the bytes this emission has persisted through it so far
+#
+# every emitting function writes through one of these, so a failure anywhere
+# in a call reports the whole prefix that call persisted, however deep the
+# write that failed.
+rec Emit {
+    w:     *writer.Writer;
+    total: usize;
+}
+
+# write bytes, adding to the running total or rebasing the failure onto it
+fun put(e: *Emit, buf: *u8, len: usize) err[WriteError] {
+    val r: res[usize, WriteError] = format.write_bytes(e.w, buf, len);
+    if (sel r.err) { ret err[WriteError].err{writer.advance(r.err, e.total)}; }
+    e.total = e.total + r.ok;
+    ret err[WriteError].ok{};
+}
+
+fun put_str(e: *Emit, s: str) err[WriteError] {
+    val r: res[usize, WriteError] = format.write_str(e.w, s);
+    if (sel r.err) { ret err[WriteError].err{writer.advance(r.err, e.total)}; }
+    e.total = e.total + r.ok;
+    ret err[WriteError].ok{};
+}
+
+fun put_byte(e: *Emit, c: u8) err[WriteError] {
+    val x: u8 = c;
+    ret put(e, ?x, 1);
+}
+
+fun put_i64(e: *Emit, v: i64) err[WriteError] {
+    val r: res[usize, WriteError] = format.write_i64(e.w, v);
+    if (sel r.err) { ret err[WriteError].err{writer.advance(r.err, e.total)}; }
+    e.total = e.total + r.ok;
+    ret err[WriteError].ok{};
+}
+
+fun put_f64(e: *Emit, v: f64) err[WriteError] {
+    val r: res[usize, WriteError] = format.write_f64(e.w, v);
+    if (sel r.err) { ret err[WriteError].err{writer.advance(r.err, e.total)}; }
+    e.total = e.total + r.ok;
+    ret err[WriteError].ok{};
 }
 
 # the escape policy for a JSON string body: how bytes >= 0x80 are rendered
@@ -765,30 +860,39 @@ val ESCAPE_ENSURE_ASCII: EscapePolicy = 1;
 # hold its continuation bytes within bounds, since a multi-byte decode reads
 # past `i`; a NUL or bad byte resynchronizes as one U+FFFD escape.
 # ---
-# w:      the writer to emit through
+# e:      the emission to write through
 # policy: the escape policy
 # s:      the source bytes
 # i:      the byte index to escape
-# ret:    the index of the next byte to process
-fun escape_unit(w: *writer.Writer, policy: EscapePolicy, s: *u8, i: usize) usize {
+# ret:    the index of the next byte to process, or the writer's failure
+fun escape_unit(e: *Emit, policy: EscapePolicy, s: *u8, i: usize) res[usize, WriteError] {
     val c: u8 = s[i];
-    if (c == '"')  { format.write_str(w, "\\\""); ret i + 1; }
-    if (c == '\\') { format.write_str(w, "\\\\"); ret i + 1; }
-    if (c == 0x08) { format.write_str(w, "\\b");  ret i + 1; }
-    if (c == 0x09) { format.write_str(w, "\\t");  ret i + 1; }
-    if (c == 0x0a) { format.write_str(w, "\\n");  ret i + 1; }
-    if (c == 0x0c) { format.write_str(w, "\\f");  ret i + 1; }
-    if (c == 0x0d) { format.write_str(w, "\\r");  ret i + 1; }
-    if (c < 0x20)  { write_u_hex(w, c::u32);   ret i + 1; }
-    if (c < 0x80)  { format.write_byte(w, c);     ret i + 1; }
-    if (policy == ESCAPE_VERBATIM) { format.write_byte(w, c); ret i + 1; }
-    ret write_utf8_escape(w, s, i);
+    var wr: err[WriteError];
+    var next: usize = i + 1;
+    if (c == '"')  { wr = put_str(e, "\\\""); }
+    or (c == '\\') { wr = put_str(e, "\\\\"); }
+    or (c == 0x08) { wr = put_str(e, "\\b"); }
+    or (c == 0x09) { wr = put_str(e, "\\t"); }
+    or (c == 0x0a) { wr = put_str(e, "\\n"); }
+    or (c == 0x0c) { wr = put_str(e, "\\f"); }
+    or (c == 0x0d) { wr = put_str(e, "\\r"); }
+    or (c < 0x20)  { wr = write_u_hex(e, c::u32); }
+    or (c < 0x80)  { wr = put_byte(e, c); }
+    or (policy == ESCAPE_VERBATIM) { wr = put_byte(e, c); }
+    or { ret write_utf8_escape(e, s, i); }
+    if (sel wr.err) { ret res[usize, WriteError].err{wr.err}; }
+    ret res[usize, WriteError].ok{next};
 }
 
 # escape s[0..slen) as a JSON string body (no surrounding quotes) under policy
-fun escape_bytes(w: *writer.Writer, policy: EscapePolicy, s: *u8, slen: usize) {
+fun escape_bytes(e: *Emit, policy: EscapePolicy, s: *u8, slen: usize) err[WriteError] {
     var i: usize = 0;
-    for (i < slen) { i = escape_unit(w, policy, s, i); }
+    for (i < slen) {
+        val r: res[usize, WriteError] = escape_unit(e, policy, s, i);
+        if (sel r.err) { ret err[WriteError].err{r.err}; }
+        i = r.ok;
+    }
+    ret err[WriteError].ok{};
 }
 
 # decode the UTF-8 sequence at `i` and emit it as a \uXXXX escape, returning the
@@ -802,11 +906,11 @@ fun escape_bytes(w: *writer.Writer, policy: EscapePolicy, s: *u8, slen: usize) {
 # sequence emits the U+FFFD replacement escape and consumes exactly one byte, so
 # the scan resynchronizes on the next byte.
 # ---
-# w: the writer to emit through
+# e: the emission to write through
 # s: the source (a NUL terminates any truncated sequence)
 # i: the index of the sequence's lead byte (>= 0x80)
-# ret: the index of the next byte to process
-fun write_utf8_escape(w: *writer.Writer, s: *u8, i: usize) usize {
+# ret: the index of the next byte to process, or the writer's failure
+fun write_utf8_escape(e: *Emit, s: *u8, i: usize) res[usize, WriteError] {
     val b0: u8 = s[i];
 
     # length, plus the tightened [lo, hi] range for the first continuation byte
@@ -824,8 +928,9 @@ fun write_utf8_escape(w: *writer.Writer, s: *u8, i: usize) usize {
     or (b0 >= 0xF1 && b0 <= 0xF3) { len = 4; cp = (b0 & 0x07)::u32; }
     or (b0 == 0xF4)               { len = 4; hi = 0x8F; cp = (b0 & 0x07)::u32; }
     or {
-        write_u_hex(w, 0xFFFD);
-        ret i + 1;
+        val bad: err[WriteError] = write_u_hex(e, 0xFFFD);
+        if (sel bad.err) { ret res[usize, WriteError].err{bad.err}; }
+        ret res[usize, WriteError].ok{i + 1};
     }
 
     var k: usize = 1;
@@ -838,16 +943,18 @@ fun write_utf8_escape(w: *writer.Writer, s: *u8, i: usize) usize {
         var chi: u8 = 0xBF;
         if (k == 1) { clo = lo; chi = hi; }
         if (cb < clo || cb > chi) {
-            write_u_hex(w, 0xFFFD);
-            ret i + 1;
+            val bad: err[WriteError] = write_u_hex(e, 0xFFFD);
+            if (sel bad.err) { ret res[usize, WriteError].err{bad.err}; }
+            ret res[usize, WriteError].ok{i + 1};
         }
         cp = (cp << 6) | (cb & 0x3F)::u32;
         j  = j + 1;
         k  = k + 1;
     }
 
-    write_codepoint(w, cp);
-    ret i + len;
+    val wr: err[WriteError] = write_codepoint(e, cp);
+    if (sel wr.err) { ret res[usize, WriteError].err{wr.err}; }
+    ret res[usize, WriteError].ok{i + len};
 }
 
 # emit a valid Unicode scalar as a \uXXXX escape, or a surrogate pair when
@@ -856,30 +963,31 @@ fun write_utf8_escape(w: *writer.Writer, s: *u8, i: usize) usize {
 # `cp` is a validated scalar (U+0000-U+10FFFF, never a surrogate), so the astral
 # branch always yields a well-formed high/low surrogate pair.
 # ---
-# w:  the writer to emit through
+# e:  the emission to write through
 # cp: the Unicode scalar value
-fun write_codepoint(w: *writer.Writer, cp: u32) {
-    if (cp <= 0xFFFF) {
-        write_u_hex(w, cp);
-        ret;
-    }
+fun write_codepoint(e: *Emit, cp: u32) err[WriteError] {
+    if (cp <= 0xFFFF) { ret write_u_hex(e, cp); }
     val v:  u32 = cp - 0x10000;
     val hi: u32 = 0xD800 + (v >> 10);
     val lo: u32 = 0xDC00 + (v & 0x3FF);
-    write_u_hex(w, hi);
-    write_u_hex(w, lo);
+    val first: err[WriteError] = write_u_hex(e, hi);
+    if (sel first.err) { ret first; }
+    ret write_u_hex(e, lo);
 }
 
 # emit a \u escape for a 16-bit value
 # ---
-# w:    the writer to emit through
+# e:    the emission to write through
 # code: the 16-bit value (only the low 16 bits are used)
-fun write_u_hex(w: *writer.Writer, code: u32) {
-    format.write_str(w, "\\u");
-    format.write_byte(w, hex_digit((code >> 12) & 0xF));
-    format.write_byte(w, hex_digit((code >> 8) & 0xF));
-    format.write_byte(w, hex_digit((code >> 4) & 0xF));
-    format.write_byte(w, hex_digit(code & 0xF));
+fun write_u_hex(e: *Emit, code: u32) err[WriteError] {
+    var esc: [6]u8;
+    esc[0] = '\\';
+    esc[1] = 'u';
+    esc[2] = hex_digit((code >> 12) & 0xF);
+    esc[3] = hex_digit((code >> 8) & 0xF);
+    esc[4] = hex_digit((code >> 4) & 0xF);
+    esc[5] = hex_digit(code & 0xF);
+    ret put(e, ?esc[0], 6);
 }
 
 # map a nibble (0-15) to its lowercase hexadecimal ASCII digit
@@ -892,90 +1000,86 @@ fun hex_digit(n: u32) u8 {
 }
 
 # decode s[0..slen) -- the raw wire bytes of a JSON string body, escapes intact
-# -- into logical bytes written through w. See value_string_decode for the
-# escape matrix and the malformed-escape error contract.
+# -- into logical bytes written into b. See value_string_decode for the escape
+# matrix and the malformed-escape contract.
 # ---
-# w:    the writer to emit decoded bytes through
+# b:    the counting buffer to decode into
 # s:    the raw string bytes
 # slen: the byte length of s
-# ret:  true on success, or an error message on a malformed escape
-fun decode_bytes(w: *writer.Writer, s: *u8, slen: usize) Result[bool, str] {
+# ret:  ok, or syntax at the offset of a malformed escape
+fun decode_bytes(b: *BufWriter, s: *u8, slen: usize) err[JsonError] {
     var i: usize = 0;
     for (i < slen) {
-        val ir: Result[usize, str] = decode_unit(w, s, i, slen);
-        if (is_err[usize, str](ir)) { ret err[bool, str](unwrap_err[usize, str](ir)); }
-        i = unwrap_ok[usize, str](ir);
+        val ir: res[usize, JsonError] = decode_unit(b, s, i, slen);
+        if (sel ir.err) { ret err[JsonError].err{ir.err}; }
+        i = ir.ok;
     }
-    ret ok[bool, str](true);
+    ret err[JsonError].ok{};
+}
+
+fun malformed(at: usize) res[usize, JsonError] {
+    ret res[usize, JsonError].err{JsonError.syntax{at}};
 }
 
 # decode one unit of `s` starting at `i` -- a verbatim byte or an escape sequence
-# -- writing the logical bytes through w and returning the next byte index.
+# -- writing the logical bytes into b and returning the next byte index.
 # ---
-# w:    the writer to emit through
+# b:    the counting buffer to decode into
 # s:    the raw string bytes
 # i:    the byte index to decode
 # slen: the byte length of s
-# ret:  the index of the next byte, or an error message on a malformed escape
-fun decode_unit(w: *writer.Writer, s: *u8, i: usize, slen: usize) Result[usize, str] {
+# ret:  the index of the next byte, or syntax at the malformed escape
+fun decode_unit(b: *BufWriter, s: *u8, i: usize, slen: usize) res[usize, JsonError] {
     val c: u8 = s[i];
     if (c != '\\') {
-        format.write_byte(w, c);
-        ret ok[usize, str](i + 1);
+        bufw_put(b, c);
+        ret res[usize, JsonError].ok{i + 1};
     }
-    if (i + 1 >= slen) {
-        ret err[usize, str]("trailing backslash in string");
-    }
+    if (i + 1 >= slen) { ret malformed(i); }
     val e: u8 = s[i + 1];
-    if (e == '"')  { format.write_byte(w, '"');  ret ok[usize, str](i + 2); }
-    if (e == '\\') { format.write_byte(w, '\\'); ret ok[usize, str](i + 2); }
-    if (e == '/')  { format.write_byte(w, '/');  ret ok[usize, str](i + 2); }
-    if (e == 'b')  { format.write_byte(w, 0x08); ret ok[usize, str](i + 2); }
-    if (e == 'f')  { format.write_byte(w, 0x0c); ret ok[usize, str](i + 2); }
-    if (e == 'n')  { format.write_byte(w, 0x0a); ret ok[usize, str](i + 2); }
-    if (e == 'r')  { format.write_byte(w, 0x0d); ret ok[usize, str](i + 2); }
-    if (e == 't')  { format.write_byte(w, 0x09); ret ok[usize, str](i + 2); }
-    if (e == 'u')  { ret decode_u_escape(w, s, i, slen); }
-    ret err[usize, str]("invalid escape sequence");
+    if (e == '"')  { bufw_put(b, '"');  ret res[usize, JsonError].ok{i + 2}; }
+    if (e == '\\') { bufw_put(b, '\\'); ret res[usize, JsonError].ok{i + 2}; }
+    if (e == '/')  { bufw_put(b, '/');  ret res[usize, JsonError].ok{i + 2}; }
+    if (e == 'b')  { bufw_put(b, 0x08); ret res[usize, JsonError].ok{i + 2}; }
+    if (e == 'f')  { bufw_put(b, 0x0c); ret res[usize, JsonError].ok{i + 2}; }
+    if (e == 'n')  { bufw_put(b, 0x0a); ret res[usize, JsonError].ok{i + 2}; }
+    if (e == 'r')  { bufw_put(b, 0x0d); ret res[usize, JsonError].ok{i + 2}; }
+    if (e == 't')  { bufw_put(b, 0x09); ret res[usize, JsonError].ok{i + 2}; }
+    if (e == 'u')  { ret decode_u_escape(b, s, i, slen); }
+    ret malformed(i + 1);
 }
 
-# decode a '\uXXXX' escape at `i` (the backslash) into UTF-8 written through w,
+# decode a '\uXXXX' escape at `i` (the backslash) into UTF-8 written into b,
 # combining a high+low surrogate pair into one astral code point. Returns the
-# index past the escape (or the pair), or an error on truncated/non-hex digits or
+# index past the escape (or the pair), or syntax on truncated/non-hex digits or
 # an ill-formed surrogate pair.
 # ---
-# w:    the writer to emit through
+# b:    the counting buffer to decode into
 # s:    the raw string bytes
 # i:    the index of the escape's backslash
 # slen: the byte length of s
-# ret:  the index of the next byte, or an error message
-fun decode_u_escape(w: *writer.Writer, s: *u8, i: usize, slen: usize) Result[usize, str] {
-    val hr: Result[u32, str] = read_hex4(s, i + 2, slen);
-    if (is_err[u32, str](hr)) { ret err[usize, str](unwrap_err[u32, str](hr)); }
-    val u: u32 = unwrap_ok[u32, str](hr);
+# ret:  the index of the next byte, or syntax at the malformed escape
+fun decode_u_escape(b: *BufWriter, s: *u8, i: usize, slen: usize) res[usize, JsonError] {
+    val hr: res[u32, JsonError] = read_hex4(s, i + 2, slen);
+    if (sel hr.err) { ret res[usize, JsonError].err{hr.err}; }
+    val u: u32 = hr.ok;
 
     if (u >= 0xD800 && u <= 0xDBFF) {
         val j: usize = i + 6;
-        if (j + 1 >= slen || s[j] != '\\' || s[j + 1] != 'u') {
-            ret err[usize, str]("unpaired high surrogate");
-        }
-        val lr: Result[u32, str] = read_hex4(s, j + 2, slen);
-        if (is_err[u32, str](lr)) { ret err[usize, str](unwrap_err[u32, str](lr)); }
-        val lo: u32 = unwrap_ok[u32, str](lr);
-        if (lo < 0xDC00 || lo > 0xDFFF) {
-            ret err[usize, str]("invalid low surrogate");
-        }
+        if (j + 1 >= slen || s[j] != '\\' || s[j + 1] != 'u') { ret malformed(j); }
+        val lr: res[u32, JsonError] = read_hex4(s, j + 2, slen);
+        if (sel lr.err) { ret res[usize, JsonError].err{lr.err}; }
+        val lo: u32 = lr.ok;
+        if (lo < 0xDC00 || lo > 0xDFFF) { ret malformed(j); }
         val cp: u32 = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00);
-        write_utf8_bytes(w, cp);
-        ret ok[usize, str](j + 6);
+        write_utf8_bytes(b, cp);
+        ret res[usize, JsonError].ok{j + 6};
     }
 
-    if (u >= 0xDC00 && u <= 0xDFFF) {
-        ret err[usize, str]("unexpected low surrogate");
-    }
+    if (u >= 0xDC00 && u <= 0xDFFF) { ret malformed(i); }
 
-    write_utf8_bytes(w, u);
-    ret ok[usize, str](i + 6);
+    write_utf8_bytes(b, u);
+    ret res[usize, JsonError].ok{i + 6};
 }
 
 # read the four hex digits of a '\uXXXX' escape starting at `i` (the first digit),
@@ -984,20 +1088,18 @@ fun decode_u_escape(w: *writer.Writer, s: *u8, i: usize, slen: usize) Result[usi
 # s:    the raw string bytes
 # i:    the index of the first hex digit
 # slen: the byte length of s
-# ret:  the decoded 16-bit value, or an error if truncated or non-hex
-fun read_hex4(s: *u8, i: usize, slen: usize) Result[u32, str] {
-    if (i + 4 > slen) {
-        ret err[u32, str]("truncated unicode escape");
-    }
+# ret:  the decoded 16-bit value, or syntax at the truncation or non-hex digit
+fun read_hex4(s: *u8, i: usize, slen: usize) res[u32, JsonError] {
+    if (i + 4 > slen) { ret res[u32, JsonError].err{JsonError.syntax{slen}}; }
     var v: u32 = 0;
     var k: usize = 0;
     for (k < 4) {
         val d: u32 = hex_nibble(s[i + k]);
-        if (d > 0xF) { ret err[u32, str]("invalid unicode escape hex"); }
+        if (d > 0xF) { ret res[u32, JsonError].err{JsonError.syntax{i + k}}; }
         v = (v << 4) | d;
         k = k + 1;
     }
-    ret ok[u32, str](v);
+    ret res[u32, JsonError].ok{v};
 }
 
 # map a hex ASCII digit to its 0-15 value, or 0x100 if the byte is not hex
@@ -1012,74 +1114,80 @@ fun hex_nibble(c: u8) u32 {
 }
 
 # encode a validated scalar (never a surrogate, <= U+10FFFF) as UTF-8 bytes
-# written through w.
+# written into b.
 # ---
-# w:  the writer to emit through
+# b:  the counting buffer to write into
 # cp: the Unicode scalar value
-fun write_utf8_bytes(w: *writer.Writer, cp: u32) {
+fun write_utf8_bytes(b: *BufWriter, cp: u32) {
     var tmp: [4]u8;
     val n: usize = utf8.encode(cp::utf8.Codepoint, ?tmp[0], 4);
-    format.write_bytes(w, ?tmp[0], n);
+    var i: usize = 0;
+    for (i < n) {
+        bufw_put(b, tmp[i]);
+        i = i + 1;
+    }
 }
 
-fun emit_value(w: *writer.Writer, v: *Value) {
-    if (v.kind == NULL) {
-        format.write_str(w, "null");
-        ret;
-    }
+fun emit_value(e: *Emit, v: *Value) err[WriteError] {
+    if (v.kind == NULL) { ret put_str(e, "null"); }
 
     if (v.kind == BOOL) {
-        if (v.bool_val != 0) {
-            format.write_str(w, "true");
-        } or {
-            format.write_str(w, "false");
-        }
-        ret;
+        if (v.bool_val != 0) { ret put_str(e, "true"); }
+        ret put_str(e, "false");
     }
 
     if (v.kind == NUMBER) {
-        if (v.is_float != 0) {
-            format.write_f64(w, v.float_val);
-        } or {
-            format.write_i64(w, v.num_val);
-        }
-        ret;
+        if (v.is_float != 0) { ret put_f64(e, v.float_val); }
+        ret put_i64(e, v.num_val);
     }
 
     if (v.kind == STRING) {
-        format.write_byte(w, '"');
-        escape_bytes(w, ESCAPE_VERBATIM, v.str_val::*u8, v.str_len);
-        format.write_byte(w, '"');
-        ret;
+        val open: err[WriteError] = put_byte(e, '"');
+        if (sel open.err) { ret open; }
+        val body: err[WriteError] = escape_bytes(e, ESCAPE_VERBATIM, v.str_val::*u8, v.str_len);
+        if (sel body.err) { ret body; }
+        ret put_byte(e, '"');
     }
 
     if (v.kind == ARRAY) {
-        format.write_byte(w, '[');
+        val open: err[WriteError] = put_byte(e, '[');
+        if (sel open.err) { ret open; }
         var i: usize = 0;
         for (i < v.count) {
-            if (i > 0) { format.write_byte(w, ','); }
-            emit_value(w, ?v.children[i]);
+            if (i > 0) {
+                val sep: err[WriteError] = put_byte(e, ',');
+                if (sel sep.err) { ret sep; }
+            }
+            val elem: err[WriteError] = emit_value(e, ?v.children[i]);
+            if (sel elem.err) { ret elem; }
             i = i + 1;
         }
-        format.write_byte(w, ']');
-        ret;
+        ret put_byte(e, ']');
     }
 
     if (v.kind == OBJECT) {
-        format.write_byte(w, '{');
+        val open: err[WriteError] = put_byte(e, '{');
+        if (sel open.err) { ret open; }
         var i: usize = 0;
         for (i < v.count) {
-            if (i > 0) { format.write_byte(w, ','); }
-            format.write_byte(w, '"');
-            escape_bytes(w, ESCAPE_VERBATIM, v.keys[i]::*u8, v.keys_len[i]);
-            format.write_byte(w, '"');
-            format.write_byte(w, ':');
-            emit_value(w, ?v.children[i]);
+            if (i > 0) {
+                val sep: err[WriteError] = put_byte(e, ',');
+                if (sel sep.err) { ret sep; }
+            }
+            val q1: err[WriteError] = put_byte(e, '"');
+            if (sel q1.err) { ret q1; }
+            val key: err[WriteError] = escape_bytes(e, ESCAPE_VERBATIM, v.keys[i]::*u8, v.keys_len[i]);
+            if (sel key.err) { ret key; }
+            val q2: err[WriteError] = put_str(e, "\":");
+            if (sel q2.err) { ret q2; }
+            val elem: err[WriteError] = emit_value(e, ?v.children[i]);
+            if (sel elem.err) { ret elem; }
             i = i + 1;
         }
-        format.write_byte(w, '}');
-        ret;
+        ret put_byte(e, '}');
     }
+
+    ret err[WriteError].ok{};
 }
 
 # an open JSON object in the streaming NDJSON emitter, tracking the comma
@@ -1105,21 +1213,24 @@ pub rec Array {
 # begin a JSON object, writing `{` and arming the first-member
 # state.
 # ---
-# w: the writer to emit through (must outlive the object)
-# o: the object state to initialise
-pub fun object_begin(w: *writer.Writer, o: *Object) {
+# w:   the writer to emit through (must outlive the object)
+# o:   the object state to initialise
+# ret: ok, or the writer's failure with the persisted prefix
+pub fun object_begin(w: *writer.Writer, o: *Object) err[WriteError] {
     o.w     = w;
     o.first = true;
-    format.write_byte(w, '{');
+    var e: Emit = Emit{w: w, total: 0};
+    ret put_byte(?e, '{');
 }
 
 # end a JSON object, writing `}` and the newline that terminates the
 # NDJSON line.
 # ---
-# o: the object to close
-pub fun object_end(o: *Object) {
-    object_end_value(o);
-    format.write_newline(o.w);
+# o:   the object to close
+# ret: ok, or the writer's failure with the persisted prefix
+pub fun object_end(o: *Object) err[WriteError] {
+    var e: Emit = Emit{w: o.w, total: 0};
+    ret put_str(?e, "}\n");
 }
 
 # close a nested object, writing `}` without the NDJSON line
@@ -1128,9 +1239,11 @@ pub fun object_end(o: *Object) {
 # Used for an object that is a member value or an array element, where the
 # enclosing container - not this object - owns the line boundary.
 # ---
-# o: the object to close
-pub fun object_end_value(o: *Object) {
-    format.write_byte(o.w, '}');
+# o:   the object to close
+# ret: ok, or the writer's failure with the persisted prefix
+pub fun object_end_value(o: *Object) err[WriteError] {
+    var e: Emit = Emit{w: o.w, total: 0};
+    ret put_byte(?e, '}');
 }
 
 # open an object-valued member: the key lead-in, then `{`,
@@ -1142,9 +1255,14 @@ pub fun object_end_value(o: *Object) {
 # o:     the open parent object
 # key:   the member key
 # child: the nested object state to initialise
-pub fun field_object_begin(o: *Object, key: *u8, child: *Object) {
-    member(o, key);
-    object_begin(o.w, child);
+# ret:   ok, or the writer's failure with the persisted prefix
+pub fun field_object_begin(o: *Object, key: *u8, child: *Object) err[WriteError] {
+    var e: Emit = Emit{w: o.w, total: 0};
+    val lead: err[WriteError] = member(?e, o, key);
+    if (sel lead.err) { ret lead; }
+    child.w     = o.w;
+    child.first = true;
+    ret put_byte(?e, '{');
 }
 
 # open an array-valued member: the key lead-in, then `[`,
@@ -1153,18 +1271,23 @@ pub fun field_object_begin(o: *Object, key: *u8, child: *Object) {
 # o:   the open parent object
 # key: the member key
 # arr: the array state to initialise
-pub fun field_array_begin(o: *Object, key: *u8, arr: *Array) {
-    member(o, key);
+# ret: ok, or the writer's failure with the persisted prefix
+pub fun field_array_begin(o: *Object, key: *u8, arr: *Array) err[WriteError] {
+    var e: Emit = Emit{w: o.w, total: 0};
+    val lead: err[WriteError] = member(?e, o, key);
+    if (sel lead.err) { ret lead; }
     arr.w     = o.w;
     arr.first = true;
-    format.write_byte(o.w, '[');
+    ret put_byte(?e, '[');
 }
 
 # close an array, writing `]`
 # ---
 # arr: the array to close
-pub fun array_end(arr: *Array) {
-    format.write_byte(arr.w, ']');
+# ret: ok, or the writer's failure with the persisted prefix
+pub fun array_end(arr: *Array) err[WriteError] {
+    var e: Emit = Emit{w: arr.w, total: 0};
+    ret put_byte(?e, ']');
 }
 
 # open an object element of `arr`: the element separator,
@@ -1174,10 +1297,17 @@ pub fun array_end(arr: *Array) {
 # ---
 # arr:   the open array
 # child: the element object state to initialise
-pub fun array_object_begin(arr: *Array, child: *Object) {
-    if (!arr.first) { format.write_byte(arr.w, ','); }
+# ret:   ok, or the writer's failure with the persisted prefix
+pub fun array_object_begin(arr: *Array, child: *Object) err[WriteError] {
+    var e: Emit = Emit{w: arr.w, total: 0};
+    if (!arr.first) {
+        val sep: err[WriteError] = put_byte(?e, ',');
+        if (sel sep.err) { ret sep; }
+    }
     arr.first = false;
-    object_begin(arr.w, child);
+    child.w     = arr.w;
+    child.first = true;
+    ret put_byte(?e, '{');
 }
 
 # emit a string-valued member (the value quoted and ASCII-escaped)
@@ -1185,9 +1315,12 @@ pub fun array_object_begin(arr: *Array, child: *Object) {
 # o:   the open object
 # key: the member key (ASCII, emitted verbatim between quotes)
 # v:   the null-terminated value, escaped; nil emits an empty string
-pub fun field_str(o: *Object, key: *u8, v: *u8) {
-    member(o, key);
-    write_json_string(o.w, v);
+# ret: ok, or the writer's failure with the persisted prefix
+pub fun field_str(o: *Object, key: *u8, v: *u8) err[WriteError] {
+    var e: Emit = Emit{w: o.w, total: 0};
+    val lead: err[WriteError] = member(?e, o, key);
+    if (sel lead.err) { ret lead; }
+    ret json_string(?e, v);
 }
 
 # emit a string-or-null member: the escaped value, or JSON
@@ -1196,22 +1329,25 @@ pub fun field_str(o: *Object, key: *u8, v: *u8) {
 # o:   the open object
 # key: the member key
 # v:   the null-terminated value, or nil for a JSON null
-pub fun field_str_or_null(o: *Object, key: *u8, v: *u8) {
-    member(o, key);
-    if (v == nil) {
-        format.write_str(o.w, "null");
-        ret;
-    }
-    write_json_string(o.w, v);
+# ret: ok, or the writer's failure with the persisted prefix
+pub fun field_str_or_null(o: *Object, key: *u8, v: *u8) err[WriteError] {
+    var e: Emit = Emit{w: o.w, total: 0};
+    val lead: err[WriteError] = member(?e, o, key);
+    if (sel lead.err) { ret lead; }
+    if (v == nil) { ret put_str(?e, "null"); }
+    ret json_string(?e, v);
 }
 
 # emit a JSON `null`-valued member
 # ---
 # o:   the open object
 # key: the member key
-pub fun field_null(o: *Object, key: *u8) {
-    member(o, key);
-    format.write_str(o.w, "null");
+# ret: ok, or the writer's failure with the persisted prefix
+pub fun field_null(o: *Object, key: *u8) err[WriteError] {
+    var e: Emit = Emit{w: o.w, total: 0};
+    val lead: err[WriteError] = member(?e, o, key);
+    if (sel lead.err) { ret lead; }
+    ret put_str(?e, "null");
 }
 
 # emit an integer-valued member
@@ -1219,9 +1355,12 @@ pub fun field_null(o: *Object, key: *u8) {
 # o:   the open object
 # key: the member key
 # v:   the integer value
-pub fun field_i64(o: *Object, key: *u8, v: i64) {
-    member(o, key);
-    format.write_i64(o.w, v);
+# ret: ok, or the writer's failure with the persisted prefix
+pub fun field_i64(o: *Object, key: *u8, v: i64) err[WriteError] {
+    var e: Emit = Emit{w: o.w, total: 0};
+    val lead: err[WriteError] = member(?e, o, key);
+    if (sel lead.err) { ret lead; }
+    ret put_i64(?e, v);
 }
 
 # emit a float-valued member
@@ -1234,9 +1373,12 @@ pub fun field_i64(o: *Object, key: *u8, v: i64) {
 # o:   the open object
 # key: the member key
 # v:   the float value
-pub fun field_f64(o: *Object, key: *u8, v: f64) {
-    member(o, key);
-    format.write_f64(o.w, v);
+# ret: ok, or the writer's failure with the persisted prefix
+pub fun field_f64(o: *Object, key: *u8, v: f64) err[WriteError] {
+    var e: Emit = Emit{w: o.w, total: 0};
+    val lead: err[WriteError] = member(?e, o, key);
+    if (sel lead.err) { ret lead; }
+    ret put_f64(?e, v);
 }
 
 # emit a boolean-valued member
@@ -1244,10 +1386,13 @@ pub fun field_f64(o: *Object, key: *u8, v: f64) {
 # o:   the open object
 # key: the member key
 # v:   the boolean value
-pub fun field_bool(o: *Object, key: *u8, v: bool) {
-    member(o, key);
-    if (v) { format.write_str(o.w, "true"); }
-    or     { format.write_str(o.w, "false"); }
+# ret: ok, or the writer's failure with the persisted prefix
+pub fun field_bool(o: *Object, key: *u8, v: bool) err[WriteError] {
+    var e: Emit = Emit{w: o.w, total: 0};
+    val lead: err[WriteError] = member(?e, o, key);
+    if (sel lead.err) { ret lead; }
+    if (v) { ret put_str(?e, "true"); }
+    ret put_str(?e, "false");
 }
 
 # write a bare JSON float number through the writer
@@ -1257,37 +1402,55 @@ pub fun field_bool(o: *Object, key: *u8, v: bool) {
 # write_json_string for a float, for use as an array element or standalone
 # value. an integer-valued float emits without a fractional part.
 # ---
-# w: the writer to emit through
-# v: the float value
-pub fun value_f64(w: *writer.Writer, v: f64) {
-    format.write_f64(w, v);
+# w:   the writer to emit through
+# v:   the float value
+# ret: ok, or the writer's failure with the persisted prefix
+pub fun value_f64(w: *writer.Writer, v: f64) err[WriteError] {
+    var e: Emit = Emit{w: w, total: 0};
+    ret put_f64(?e, v);
 }
 
 # write a JSON string literal under ESCAPE_ENSURE_ASCII: the
 # value quoted, every byte escaped to printable ASCII.
 # ---
-# w: the writer to emit through
-# s: the null-terminated value, or nil for an empty string
-pub fun write_json_string(w: *writer.Writer, s: *u8) {
-    format.write_byte(w, '"');
+# w:   the writer to emit through
+# s:   the null-terminated value, or nil for an empty string
+# ret: ok, or the writer's failure with the persisted prefix
+pub fun write_json_string(w: *writer.Writer, s: *u8) err[WriteError] {
+    var e: Emit = Emit{w: w, total: 0};
+    ret json_string(?e, s);
+}
+
+fun json_string(e: *Emit, s: *u8) err[WriteError] {
+    val open: err[WriteError] = put_byte(e, '"');
+    if (sel open.err) { ret open; }
     if (s != nil) {
         var i: usize = 0;
-        for (s[i] != 0) { i = escape_unit(w, ESCAPE_ENSURE_ASCII, s, i); }
+        for (s[i] != 0) {
+            val r: res[usize, WriteError] = escape_unit(e, ESCAPE_ENSURE_ASCII, s, i);
+            if (sel r.err) { ret err[WriteError].err{r.err}; }
+            i = r.ok;
+        }
     }
-    format.write_byte(w, '"');
+    ret put_byte(e, '"');
 }
 
 # write the key/colon lead-in of a member, prefixing a comma after the first
 # ---
+# e:   the emission to write through
 # o:   the open object
 # key: the member key (ASCII, emitted verbatim)
-fun member(o: *Object, key: *u8) {
-    if (!o.first) { format.write_byte(o.w, ','); }
+fun member(e: *Emit, o: *Object, key: *u8) err[WriteError] {
+    if (!o.first) {
+        val sep: err[WriteError] = put_byte(e, ',');
+        if (sel sep.err) { ret sep; }
+    }
     o.first = false;
-    format.write_byte(o.w, '"');
-    format.write_str(o.w, key::str);
-    format.write_byte(o.w, '"');
-    format.write_byte(o.w, ':');
+    val q1: err[WriteError] = put_byte(e, '"');
+    if (sel q1.err) { ret q1; }
+    val k: err[WriteError] = put_str(e, key::str);
+    if (sel k.err) { ret k; }
+    ret put_str(e, "\":");
 }
 
 use std.allocator.page;
@@ -1296,9 +1459,9 @@ test "json: parse null" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "null";
-    val r: Result[Value, str] = parse(src::*u8, 4, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 4, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     if (v.kind != NULL) { ret 1; }
     ret 0;
 }
@@ -1307,9 +1470,9 @@ test "json: parse true" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "true";
-    val r: Result[Value, str] = parse(src::*u8, 4, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 4, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     if (v.kind != BOOL) { ret 1; }
     if (v.bool_val != 1) { ret 1; }
     ret 0;
@@ -1319,9 +1482,9 @@ test "json: parse false" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "false";
-    val r: Result[Value, str] = parse(src::*u8, 5, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 5, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     if (v.kind != BOOL) { ret 1; }
     if (v.bool_val != 0) { ret 1; }
     ret 0;
@@ -1331,9 +1494,9 @@ test "json: parse positive number" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "42";
-    val r: Result[Value, str] = parse(src::*u8, 2, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 2, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     if (v.kind != NUMBER) { ret 1; }
     if (v.num_val != 42) { ret 1; }
     ret 0;
@@ -1343,9 +1506,9 @@ test "json: parse negative number" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "-7";
-    val r: Result[Value, str] = parse(src::*u8, 2, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 2, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     if (v.kind != NUMBER) { ret 1; }
     if (v.num_val != -7) { ret 1; }
     ret 0;
@@ -1355,9 +1518,9 @@ test "json: parse zero" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "0";
-    val r: Result[Value, str] = parse(src::*u8, 1, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 1, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     if (v.kind != NUMBER) { ret 1; }
     if (v.num_val != 0) { ret 1; }
     ret 0;
@@ -1367,9 +1530,9 @@ test "json: parse string" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "\"hello\"";
-    val r: Result[Value, str] = parse(src::*u8, 7, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 7, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     if (v.kind != STRING) { ret 1; }
     if (v.str_len != 5) { ret 1; }
     val sp: *u8 = v.str_val::*u8;
@@ -1382,9 +1545,9 @@ test "json: parse empty array" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "[]";
-    val r: Result[Value, str] = parse(src::*u8, 2, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 2, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     if (v.kind != ARRAY) { ret 1; }
     if (v.count != 0) { ret 1; }
     ret 0;
@@ -1394,9 +1557,9 @@ test "json: parse array with elements" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "[1,2,3]";
-    val r: Result[Value, str] = parse(src::*u8, 7, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 7, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     if (v.kind != ARRAY) { ret 1; }
     if (v.count != 3) { ret 1; }
     if (v.children[0].num_val != 1) { ret 1; }
@@ -1409,9 +1572,9 @@ test "json: parse empty object" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "{}";
-    val r: Result[Value, str] = parse(src::*u8, 2, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 2, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     if (v.kind != OBJECT) { ret 1; }
     if (v.count != 0) { ret 1; }
     ret 0;
@@ -1421,9 +1584,9 @@ test "json: parse object with entry" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "{\"a\":1}";
-    val r: Result[Value, str] = parse(src::*u8, 7, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 7, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     if (v.kind != OBJECT) { ret 1; }
     if (v.count != 1) { ret 1; }
     if (v.children[0].num_val != 1) { ret 1; }
@@ -1434,9 +1597,9 @@ test "json: parse nested object with array" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "{\"x\":[1,2]}";
-    val r: Result[Value, str] = parse(src::*u8, 11, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 11, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     if (v.kind != OBJECT) { ret 1; }
     if (v.count != 1) { ret 1; }
     val arr: *Value = ?v.children[0];
@@ -1451,9 +1614,9 @@ test "json: value_find on object" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "{\"a\":1,\"b\":2}";
-    val r: Result[Value, str] = parse(src::*u8, 13, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 13, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     val found: *Value = value_find(?v, "b");
     if (found == nil) { ret 1; }
     if (found.num_val != 2) { ret 1; }
@@ -1466,9 +1629,9 @@ test "json: emit null" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "null";
-    val r: Result[Value, str] = parse(src::*u8, 4, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 4, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     var buf: [16]u8;
     val n: usize = emit(?v, ?buf[0], 16);
     if (n != 4) { ret 1; }
@@ -1483,9 +1646,9 @@ test "json: emit number" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "123";
-    val r: Result[Value, str] = parse(src::*u8, 3, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 3, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     var buf: [16]u8;
     val n: usize = emit(?v, ?buf[0], 16);
     if (n != 3) { ret 1; }
@@ -1499,9 +1662,9 @@ test "json: emit true" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "true";
-    val r: Result[Value, str] = parse(src::*u8, 4, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 4, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     var buf: [16]u8;
     val n: usize = emit(?v, ?buf[0], 16);
     if (n != 4) { ret 1; }
@@ -1514,9 +1677,9 @@ test "json: roundtrip array" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "[1,2,3]";
-    val r: Result[Value, str] = parse(src::*u8, 7, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 7, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     var buf: [32]u8;
     val n: usize = emit(?v, ?buf[0], 32);
     if (n != 7) { ret 1; }
@@ -1532,9 +1695,9 @@ test "json: roundtrip object keys" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "{\"a\":1,\"b\":2}";
-    val r: Result[Value, str] = parse(src::*u8, 13, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 13, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     var buf: [32]u8;
     val n: usize = emit(?v, ?buf[0], 32);
     if (n != 13) { ret 1; }
@@ -1550,9 +1713,9 @@ test "json: whitespace tolerance" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "  { \"a\" : 1 } ";
-    val r: Result[Value, str] = parse(src::*u8, 14, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 14, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     if (v.kind != OBJECT) { ret 1; }
     if (v.count != 1) { ret 1; }
     ret 0;
@@ -1616,9 +1779,9 @@ test "json: emit escaped output reparses" {
     var buf: [32]u8;
     val n: usize = emit(?v, ?buf[0], 32);
     # the emitted document must parse cleanly through the module's own parser
-    val r: Result[Value, str] = parse(?buf[0], n, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val rv: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(?buf[0], n, ?a);
+    if (sel r.err) { ret 1; }
+    val rv: Value = r.ok;
     if (rv.kind != STRING) { ret 1; }
     ret 0;
 }
@@ -1652,9 +1815,9 @@ test "json: emit escapes object keys" {
     if (buf[8] != '1')  { ret 1; }
     if (buf[9] != '}')  { ret 1; }
     # and the emitted object re-parses cleanly
-    val r: Result[Value, str] = parse(?buf[0], n, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val rv: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(?buf[0], n, ?a);
+    if (sel r.err) { ret 1; }
+    val rv: Value = r.ok;
     if (rv.kind != OBJECT) { ret 1; }
     if (rv.count != 1) { ret 1; }
     ret 0;
@@ -1996,9 +2159,9 @@ fun f64_round_trips(v: f64) bool {
 
     var a: allocator.Allocator;
     page.make(?a);
-    val r: Result[Value, str] = parse(sink.buf, sink.len, ?a);
-    if (is_err[Value, str](r)) { ret false; }
-    val pv: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(sink.buf, sink.len, ?a);
+    if (sel r.err) { ret false; }
+    val pv: Value = r.ok;
     if (pv.kind != NUMBER) { ret false; }
     var got: f64 = 0.0;
     if (value_is_float(?pv)) { got = value_float(?pv); }
@@ -2032,9 +2195,9 @@ test "json: field_f64 member round trips" {
 
     var a: allocator.Allocator;
     page.make(?a);
-    val r: Result[Value, str] = parse(sink.buf, sink.len, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val pv: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(sink.buf, sink.len, ?a);
+    if (sel r.err) { ret 1; }
+    val pv: Value = r.ok;
     val fv: *Value = value_find(?pv, "v");
     if (fv == nil) { ret 1; }
     if (!value_is_float(fv)) { ret 1; }
@@ -2047,9 +2210,9 @@ test "json: field_f64 member round trips" {
 fun decode_check(raw: *u8, rawlen: usize, want: *u8, wantlen: usize) bool {
     val v: Value = make_string((raw::usize)::str, rawlen);
     var buf: [64]u8;
-    val dr: Result[usize, str] = value_string_decode(?v, ?buf[0], 64);
-    if (is_err[usize, str](dr)) { ret false; }
-    val n: usize = unwrap_ok[usize, str](dr);
+    val dr: res[usize, JsonError] = value_string_decode(?v, ?buf[0], 64);
+    if (sel dr.err) { ret false; }
+    val n: usize = dr.ok;
     if (n != wantlen) { ret false; }
     var i: usize = 0;
     for (i < n) {
@@ -2063,8 +2226,8 @@ fun decode_check(raw: *u8, rawlen: usize, want: *u8, wantlen: usize) bool {
 fun decode_rejects(raw: *u8, rawlen: usize) bool {
     val v: Value = make_string((raw::usize)::str, rawlen);
     var buf: [64]u8;
-    val dr: Result[usize, str] = value_string_decode(?v, ?buf[0], 64);
-    ret is_err[usize, str](dr);
+    val dr: res[usize, JsonError] = value_string_decode(?v, ?buf[0], 64);
+    ret sel dr.err;
 }
 
 # a body with no escapes decodes to itself, raw UTF-8 included.
@@ -2128,14 +2291,14 @@ test "json: decode buffer sizing" {
     val v: Value = make_string(((?raw[0])::usize)::str, 12);
 
     var probe: [1]u8;
-    val sr: Result[usize, str] = value_string_decode(?v, ?probe[0], 0);
-    if (is_err[usize, str](sr)) { ret 1; }
-    if (unwrap_ok[usize, str](sr) != 4) { ret 1; }
+    val sr: res[usize, JsonError] = value_string_decode(?v, ?probe[0], 0);
+    if (sel sr.err) { ret 1; }
+    if (sr.ok != 4) { ret 1; }
 
     var buf: [4]u8;
-    val dr: Result[usize, str] = value_string_decode(?v, ?buf[0], 4);
-    if (is_err[usize, str](dr)) { ret 1; }
-    if (unwrap_ok[usize, str](dr) != 4) { ret 1; }
+    val dr: res[usize, JsonError] = value_string_decode(?v, ?buf[0], 4);
+    if (sel dr.err) { ret 1; }
+    if (dr.ok != 4) { ret 1; }
     if (buf[0] != 0xF0 || buf[1] != 0x9F || buf[2] != 0x98 || buf[3] != 0x80) { ret 1; }
     ret 0;
 }
@@ -2203,15 +2366,15 @@ test "json: decode roundtrip emit then parse" {
     var wire: [32]u8;
     val wn: usize = emit(?src, ?wire[0], 32);
 
-    val r: Result[Value, str] = parse(?wire[0], wn, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val pv: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(?wire[0], wn, ?a);
+    if (sel r.err) { ret 1; }
+    val pv: Value = r.ok;
     if (pv.kind != STRING) { ret 1; }
 
     var buf: [16]u8;
-    val dr: Result[usize, str] = value_string_decode(?pv, ?buf[0], 16);
-    if (is_err[usize, str](dr)) { ret 1; }
-    if (unwrap_ok[usize, str](dr) != 5) { ret 1; }
+    val dr: res[usize, JsonError] = value_string_decode(?pv, ?buf[0], 16);
+    if (sel dr.err) { ret 1; }
+    if (dr.ok != 5) { ret 1; }
     var i: usize = 0;
     for (i < 5) {
         if (buf[i] != logical[i]) { ret 1; }
@@ -2227,16 +2390,16 @@ test "json: decode parsed string" {
     page.make(?a);
     # source document "a\nb" (a backslash-n between a and b)
     val src: str = "\"a\\nb\"";
-    val r: Result[Value, str] = parse(src::*u8, 6, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 6, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     if (v.kind != STRING) { ret 1; }
     # raw bytes are a \ n b (4); decoded are a <newline> b (3)
     if (v.str_len != 4) { ret 1; }
     var buf: [8]u8;
-    val dr: Result[usize, str] = value_string_decode(?v, ?buf[0], 8);
-    if (is_err[usize, str](dr)) { ret 1; }
-    if (unwrap_ok[usize, str](dr) != 3) { ret 1; }
+    val dr: res[usize, JsonError] = value_string_decode(?v, ?buf[0], 8);
+    if (sel dr.err) { ret 1; }
+    if (dr.ok != 3) { ret 1; }
     if (buf[0] != 'a' || buf[1] != 0x0a || buf[2] != 'b') { ret 1; }
     ret 0;
 }
@@ -2246,9 +2409,9 @@ test "json: parse float" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "3.14";
-    val r: Result[Value, str] = parse(src::*u8, 4, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 4, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     if (v.kind != NUMBER) { ret 1; }
     if (!value_is_float(?v)) { ret 1; }
     val f: f64 = value_float(?v);
@@ -2261,9 +2424,9 @@ test "json: parse negative float" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "-2.5";
-    val r: Result[Value, str] = parse(src::*u8, 4, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 4, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     if (!value_is_float(?v)) { ret 1; }
     val f: f64 = value_float(?v);
     if (f < -2.51 || f > -2.49) { ret 1; }
@@ -2275,9 +2438,9 @@ test "json: parse float exponent" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "1e3";
-    val r: Result[Value, str] = parse(src::*u8, 3, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 3, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     if (!value_is_float(?v)) { ret 1; }
     val f: f64 = value_float(?v);
     if (f < 999.0 || f > 1001.0) { ret 1; }
@@ -2289,9 +2452,9 @@ test "json: parse float frac and exponent" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "6.022E2";
-    val r: Result[Value, str] = parse(src::*u8, 7, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 7, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     if (!value_is_float(?v)) { ret 1; }
     val f: f64 = value_float(?v);
     if (f < 602.1 || f > 602.3) { ret 1; }
@@ -2303,9 +2466,9 @@ test "json: parse float negative exponent" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "5e-2";
-    val r: Result[Value, str] = parse(src::*u8, 4, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 4, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     if (!value_is_float(?v)) { ret 1; }
     val f: f64 = value_float(?v);
     if (f < 0.049 || f > 0.051) { ret 1; }
@@ -2318,9 +2481,9 @@ test "json: parse integer unchanged" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "42";
-    val r: Result[Value, str] = parse(src::*u8, 2, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 2, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     if (value_is_float(?v)) { ret 1; }
     if (value_number(?v) != 42) { ret 1; }
     val f: f64 = value_float(?v);
@@ -2333,9 +2496,9 @@ test "json: parse mixed number array" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "[1,2.5,3]";
-    val r: Result[Value, str] = parse(src::*u8, 9, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 9, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     if (v.kind != ARRAY || v.count != 3) { ret 1; }
     if (value_is_float(?v.children[0])) { ret 1; }
     if (value_number(?v.children[0]) != 1) { ret 1; }
@@ -2352,9 +2515,9 @@ test "json: parse float in object" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "{\"x\":1.5}";
-    val r: Result[Value, str] = parse(src::*u8, 9, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 9, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     val x: *Value = value_find(?v, "x");
     if (x == nil) { ret 1; }
     if (!value_is_float(x)) { ret 1; }
@@ -2368,8 +2531,8 @@ test "json: parse float rejects empty fraction" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "1.";
-    val r: Result[Value, str] = parse(src::*u8, 2, ?a);
-    if (!is_err[Value, str](r)) { ret 1; }
+    val r: res[Value, JsonError] = parse(src::*u8, 2, ?a);
+    if (!sel r.err) { ret 1; }
     ret 0;
 }
 
@@ -2378,8 +2541,8 @@ test "json: parse float rejects empty exponent" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "1e";
-    val r: Result[Value, str] = parse(src::*u8, 2, ?a);
-    if (!is_err[Value, str](r)) { ret 1; }
+    val r: res[Value, JsonError] = parse(src::*u8, 2, ?a);
+    if (!sel r.err) { ret 1; }
     ret 0;
 }
 
@@ -2388,8 +2551,8 @@ test "json: parse float rejects frac empty exponent" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "1.5e";
-    val r: Result[Value, str] = parse(src::*u8, 4, ?a);
-    if (!is_err[Value, str](r)) { ret 1; }
+    val r: res[Value, JsonError] = parse(src::*u8, 4, ?a);
+    if (!sel r.err) { ret 1; }
     ret 0;
 }
 
@@ -2398,9 +2561,9 @@ test "json: emit float" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "1.5";
-    val r: Result[Value, str] = parse(src::*u8, 3, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 3, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     var buf: [16]u8;
     val n: usize = emit(?v, ?buf[0], 16);
     if (n != 3) { ret 1; }
@@ -2416,9 +2579,9 @@ test "json: emit built float" {
     var buf: [16]u8;
     val n: usize = emit(?v, ?buf[0], 16);
     if (buf[0] != '2' || buf[1] != '.' || buf[2] != '5') { ret 1; }
-    val r: Result[Value, str] = parse(?buf[0], n, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val rv: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(?buf[0], n, ?a);
+    if (sel r.err) { ret 1; }
+    val rv: Value = r.ok;
     if (!value_is_float(?rv)) { ret 1; }
     ret 0;
 }
@@ -2428,16 +2591,254 @@ test "json: float roundtrip parse emit parse" {
     var a: allocator.Allocator;
     page.make(?a);
     val src: str = "3.14159";
-    val r: Result[Value, str] = parse(src::*u8, 7, ?a);
-    if (is_err[Value, str](r)) { ret 1; }
-    val v: Value = unwrap_ok[Value, str](r);
+    val r: res[Value, JsonError] = parse(src::*u8, 7, ?a);
+    if (sel r.err) { ret 1; }
+    val v: Value = r.ok;
     var buf: [32]u8;
     val n: usize = emit(?v, ?buf[0], 32);
-    val r2: Result[Value, str] = parse(?buf[0], n, ?a);
-    if (is_err[Value, str](r2)) { ret 1; }
-    val v2: Value = unwrap_ok[Value, str](r2);
+    val r2: res[Value, JsonError] = parse(?buf[0], n, ?a);
+    if (sel r2.err) { ret 1; }
+    val v2: Value = r2.ok;
     if (!value_is_float(?v2)) { ret 1; }
     val f: f64 = value_float(?v2);
     if (f < 3.14158 || f > 3.14160) { ret 1; }
+    ret 0;
+}
+
+use std.allocator.testing;
+use std.system.os;
+use io_error: std.io.error;
+
+# a document whose containers all grow past their first capacity, so every
+# acquisition site (children, keys, key lengths, and their regrowth) is hit
+fun growth_doc() str {
+    ret "{\"a\":[1,2,3,4,5,6],\"b\":{\"x\":1,\"y\":2,\"z\":3,\"w\":4,\"v\":5},\"c\":\"s\",\"d\":null,\"e\":true}";
+}
+
+# a parse followed by dnit leaves the allocator exactly where it started, and
+# a second dnit of the released tree is a no-op
+test "json: parse then dnit returns every byte" {
+    var tracker: testing.Testing;
+    val made: err[allocator.Error] = testing.make(?tracker);
+    if (sel made.err) { ret 1; }
+    fin { testing.dnit(?tracker); }
+    val a: *allocator.Allocator = testing.allocator_of(?tracker);
+
+    val src: str = growth_doc();
+    var n: usize = 0;
+    for (src[n] != 0) { n = n + 1; }
+    val r: res[Value, JsonError] = parse(src::*u8, n, a);
+    if (sel r.err) { ret 2; }
+    var v: Value = r.ok;
+    if (v.count != 5) { ret 3; }
+    if (testing.live_count(?tracker) == 0) { ret 4; }
+
+    val released: err[allocator.Error] = dnit(a, ?v);
+    if (sel released.err) { ret 5; }
+    if (testing.live_count(?tracker) != 0) { ret 6; }
+    if (v.count != 0 || v.cap != 0 || v.children != nil) { ret 7; }
+    val again: err[allocator.Error] = dnit(a, ?v);
+    if (sel again.err) { ret 8; }
+    if (testing.live_count(?tracker) != 0) { ret 9; }
+    ret 0;
+}
+
+# a document that fails part way releases what it acquired before reporting
+test "json: a failed parse strands nothing and names the offset" {
+    var tracker: testing.Testing;
+    val made: err[allocator.Error] = testing.make(?tracker);
+    if (sel made.err) { ret 1; }
+    fin { testing.dnit(?tracker); }
+    val a: *allocator.Allocator = testing.allocator_of(?tracker);
+
+    # the array and the nested object both allocated before the `x` is met
+    val src: str = "{\"a\":[1,2,3,4,5,{\"k\":1,\"j\":2}],\"b\":x}";
+    var n: usize = 0;
+    for (src[n] != 0) { n = n + 1; }
+    val r: res[Value, JsonError] = parse(src::*u8, n, a);
+    if (!sel r.err) { ret 2; }
+    if (!sel r.err.syntax) { ret 3; }
+    if (r.err.syntax != 35) { ret 4; }
+    if (testing.live_count(?tracker) != 0) { ret 5; }
+
+    # trailing content after a complete value releases the value
+    val src2: str = "[1,2] x";
+    val r2: res[Value, JsonError] = parse(src2::*u8, 7, a);
+    if (!sel r2.err) { ret 6; }
+    if (!sel r2.err.syntax) { ret 7; }
+    if (r2.err.syntax != 6) { ret 8; }
+    if (testing.live_count(?tracker) != 0) { ret 9; }
+    ret 0;
+}
+
+# each acquisition site refused in turn: the parse reports alloc, nothing is
+# leaked, and the allocator's refusal is the one reported
+test "json: growth refused at any acquisition releases everything" {
+    val src: str = growth_doc();
+    var n: usize = 0;
+    for (src[n] != 0) { n = n + 1; }
+
+    var ordinal: usize = 1;
+    for (ordinal <= 32) {
+        var tracker: testing.Testing;
+        val made: err[allocator.Error] = testing.make(?tracker);
+        if (sel made.err) { ret 1; }
+        testing.fail_at_ordinal(?tracker, ordinal);
+        val a: *allocator.Allocator = testing.allocator_of(?tracker);
+
+        val r: res[Value, JsonError] = parse(src::*u8, n, a);
+        var accepted: bool = false;
+        if (sel r.err) {
+            if (!sel r.err.alloc) { testing.dnit(?tracker); ret 2; }
+            if (!sel r.err.alloc.exhausted) { testing.dnit(?tracker); ret 3; }
+        }
+        if (sel r.ok) {
+            var v: Value = r.ok;
+            accepted = true;
+            dnit(a, ?v);
+        }
+        val leaked: bool = testing.live_count(?tracker) != 0 || testing.double_free_count(?tracker) != 0;
+        val attempts: usize = testing.attempt_count(?tracker);
+        testing.dnit(?tracker);
+        if (leaked) { ret 4; }
+        if (accepted) {
+            # the refusal never fired: every acquisition succeeded before it
+            if (attempts >= ordinal) { ret 5; }
+            if (ordinal < 4) { ret 6; }
+            ret 0;
+        }
+        if (attempts != ordinal) { ret 7; }
+        ordinal = ordinal + 1;
+    }
+    ret 8;
+}
+
+# build n open brackets followed by n close brackets
+fun nest_doc(buf: *u8, n: usize) usize {
+    var i: usize = 0;
+    for (i < n) { buf[i] = '['; i = i + 1; }
+    i = 0;
+    for (i < n) { buf[n + i] = ']'; i = i + 1; }
+    ret n + n;
+}
+
+# the bound is where it says it is: MAX_DEPTH nested arrays are accepted and
+# one more is refused as depth, with nothing stranded
+test "json: nesting past MAX_DEPTH is refused" {
+    var tracker: testing.Testing;
+    val made: err[allocator.Error] = testing.make(?tracker);
+    if (sel made.err) { ret 1; }
+    fin { testing.dnit(?tracker); }
+    val a: *allocator.Allocator = testing.allocator_of(?tracker);
+
+    var buf: [512]u8;
+    val ok_len: usize = nest_doc(?buf[0], MAX_DEPTH);
+    val fine: res[Value, JsonError] = parse(?buf[0], ok_len, a);
+    if (sel fine.err) { ret 2; }
+    var v: Value = fine.ok;
+    dnit(a, ?v);
+    if (testing.live_count(?tracker) != 0) { ret 3; }
+
+    val deep_len: usize = nest_doc(?buf[0], MAX_DEPTH + 1);
+    val deep: res[Value, JsonError] = parse(?buf[0], deep_len, a);
+    if (!sel deep.err) { ret 4; }
+    if (!sel deep.err.depth) { ret 5; }
+    if (deep.err.depth != MAX_DEPTH) { ret 6; }
+    if (testing.live_count(?tracker) != 0) { ret 7; }
+    ret 0;
+}
+
+# a scalar document's failures name the offending byte
+test "json: syntax failures carry the offset" {
+    var a: allocator.Allocator;
+    page.make(?a);
+
+    val cut: res[Value, JsonError] = parse("[1,2", 4, ?a);
+    if (!sel cut.err) { ret 1; }
+    if (!sel cut.err.syntax) { ret 1; }
+    if (cut.err.syntax != 4) { ret 1; }
+
+    val lit: res[Value, JsonError] = parse("trux", 4, ?a);
+    if (!sel lit.err) { ret 2; }
+    if (!sel lit.err.syntax) { ret 2; }
+    if (lit.err.syntax != 0) { ret 2; }
+
+    val colon: res[Value, JsonError] = parse("{\"a\" 1}", 7, ?a);
+    if (!sel colon.err) { ret 3; }
+    if (!sel colon.err.syntax) { ret 3; }
+    if (colon.err.syntax != 5) { ret 3; }
+
+    val empty: res[Value, JsonError] = parse("  ", 2, ?a);
+    if (!sel empty.err) { ret 4; }
+    if (!sel empty.err.syntax) { ret 4; }
+    if (empty.err.syntax != 2) { ret 4; }
+
+    val bad: Value = make_string("ab\\q", 4);
+    val esc: res[usize, JsonError] = value_string_decode(?bad, nil, 0);
+    if (!sel esc.err) { ret 5; }
+    if (!sel esc.err.syntax) { ret 5; }
+    if (esc.err.syntax != 3) { ret 5; }
+    ret 0;
+}
+
+# a sink that persists `cap` bytes and then fails natively
+rec FailSink {
+    buf: *u8;
+    cap: usize;
+    len: usize;
+}
+
+fun fail_sink_write(ctx: ptr, buf: *u8, len: usize) res[usize, WriteError] {
+    val s: *FailSink = ctx::*FailSink;
+    var i: usize = 0;
+    for (i < len) {
+        if (s.len >= s.cap) {
+            ret res[usize, WriteError].err{writer.native_failure(i, io_error.from_code(os.ENOSPC, io_error.OP_WRITE))};
+        }
+        s.buf[s.len] = buf[i];
+        s.len = s.len + 1;
+        i = i + 1;
+    }
+    ret res[usize, WriteError].ok{len};
+}
+
+# every streaming helper reports the bytes it persisted before the sink
+# failed, however many writes deep the failure was
+test "json: a streaming failure carries the persisted prefix" {
+    var out: [64]u8;
+    var s: FailSink;
+    s.buf = ?out[0];
+    s.cap = 12;
+    s.len = 0;
+    var w: writer.Writer;
+    w.ctx = (?s)::ptr;
+    w.f_write = fail_sink_write;
+
+    var o: Object;
+    val began: err[WriteError] = object_begin(?w, ?o);
+    if (sel began.err) { ret 1; }
+    val first: err[WriteError] = field_i64(?o, "n", 7);
+    if (sel first.err) { ret 2; }
+    # `{"n":7` is 6 bytes; `,"s":"a\"b"` needs 11 and the sink takes 6 more
+    val second: err[WriteError] = field_str(?o, "s", "a\"b");
+    if (!sel second.err) { ret 3; }
+    if (!sel second.err.native) { ret 4; }
+    if (writer.persisted(second.err) != 6) { ret 5; }
+    if (s.len != 12) { ret 6; }
+    if (out[6] != ',' || out[11] != '"') { ret 7; }
+
+    # a tree emission through write_value reports the same way
+    s.len = 0;
+    s.cap = 3;
+    var arr: Value = make_array();
+    var items: [2]Value;
+    items[0] = make_number(12);
+    items[1] = make_number(34);
+    arr.children = ?items[0];
+    arr.count = 2;
+    val tree: err[WriteError] = write_value(?w, ?arr);
+    if (!sel tree.err) { ret 8; }
+    if (writer.persisted(tree.err) != 3) { ret 9; }
+    if (out[0] != '[' || out[1] != '1' || out[2] != '2') { ret 10; }
     ret 0;
 }
