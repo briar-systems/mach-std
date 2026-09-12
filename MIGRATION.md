@@ -1222,7 +1222,7 @@ positioned layer retrying `EINTR` within the fill path's budget, giving up at
 it, passing a native failure through, and never touching the span before,
 during or after the provider (the scripted provider sees the pattern, the
 storage keeps it); dead handles and bad spans refused before the kernel.
-`std.io.file.tests` (seven tests): a 16-byte key from `secret_random_fill`
+`std.io.file.tests` (eight tests): a 16-byte key from `secret_random_fill`
 saved and reloaded byte-equal with no `:>` on key bytes anywhere in the test
 (the only declassification is the one-bit equality verdict) and no public
 copy (the public scratch is checked not to carry the key); every refusal
@@ -1236,15 +1236,20 @@ at offset two persisting exactly that span; cancellation of a queued read with
 the borrow alive until settlement and the destination untouched; a native
 fault after submission (descriptor 1000000, `EBADF`) on a write and on a read
 with the storage intact and the error precise; secret and public requests in
-one adapter with no crossing. Negative alias: `test/secret/verify.sh` refuses
+one adapter with no crossing; the runtime closed under a queued secret read,
+which settles `CLOSED` with the borrow alive until the dequeue and the
+destination untouched. Negative alias: `test/secret/verify.sh` refuses
 `*^u8` to `*u8` at compile time and censuses the borrow API for any `pub fun`
 returning `*u8` or `ptr`.
 
-Controls: the drain-side arrival dropped on a failed completion ("drop the wipe
-on the failure path") fails the native-fault test at its scratch and `active`
-checks; a read resolving `request.length` instead of the native count ("a
-partial read reports full length") fails the prefix test at `bytes` and at the
-untouched tail.
+Controls (each run under the v5 compiler, source restored after): the wipe
+removed from `retire_secret_request` fails six of the eight lane tests at
+their scratch checks, the native-fault test among them at the scratch left
+holding the key after the refused write (the failure path); the drain-side
+arrival dropped on a failed completion fails the cancellation, native-fault
+and runtime-close tests, each waiting out the idle bound because the request
+never retires; a read resolving `request.length` instead of the native count
+("a partial read reports full length") fails the prefix test at `bytes`.
 
 ## What the lanes owe
 
