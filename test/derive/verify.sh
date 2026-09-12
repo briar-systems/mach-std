@@ -30,12 +30,14 @@ use std.runtime;
 use std.system.os;
 use std.derive;
 use std.io.writer;
+use std.io.writer.WriteError;
+use std.types.canonical.res;
 use std.types.size.usize;
 use std.types.string.str;
 use R: std.types.result;
 
-fun sink(ctx: ptr, p: *u8, len: usize) R.Result[usize, str] {
-    ret R.ok[usize, str](len);
+fun sink(ctx: ptr, p: *u8, len: usize) res[usize, WriteError] {
+    ret res[usize, WriteError].ok{len};
 }
 
 $1
