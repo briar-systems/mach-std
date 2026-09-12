@@ -34,6 +34,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Welded secret buffers persist and reload through the file completion
+  adapter (std #550): `std.io.file.attach_secret_scratch`,
+  `submit_secret_write` and `submit_secret_read` take `*^u8` plus a length on
+  the public lane's requests, workers, cancellation settlement, partial
+  progress and completions, with the read prefix landing in the caller's
+  welded storage when its completion is dequeued and the scratch span wiped
+  when the request retires. `std.system.os.secret` gains the borrow table
+  (`Borrow`, `borrow_open`/`close`/`size`/`wipe`/`fill`/`drain`/`copy`,
+  `borrow_read_at`/`borrow_write_at`, forwarded as `os.secret_borrow_*`): a
+  welded pointer lent to an index-and-generation handle that is not an
+  address, the one boundary where the pointer reaches the kernel. Design,
+  per-outcome storage contents and wipe timing are in `MIGRATION.md`.
+
 - `std.filesystem.FsError` (`io`, `alloc`, `read`, `write`, `removal`,
   `exhausted`, `published`), the domain tag of the composite filesystem
   operations, and `std.io.error.Error.cleanup_code`, the first cleanup failure
