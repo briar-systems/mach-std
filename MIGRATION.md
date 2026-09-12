@@ -938,6 +938,17 @@ count assertions; the walk skipped on native failure fails only the
 externalization test; the Windows `EBADF` check removed fails the queue
 lifecycle test under wine at its wake-after-close step.
 
+Apparatus limit: qemu-user (the riscv64 CI lane) hands the host twice the
+guest's control length and reports back only what the guest's holds, and
+drops the records when the address copy fails after the host installed the
+descriptors, so under it the undersized-storage and externalization tests
+observe a leak the guest cannot see (measured: one and three descriptors).
+Both decline through `os.linux.running_under_user_emulation()`, which
+compares the kernel's name for the process image (`/proc/self/comm`) with
+the executable the command line names, the Linux counterpart of
+`windows.running_under_wine`. Native x86_64 runs them (the close-loop
+control fails both there); the production path never takes either shape.
+
 ## What the lanes owe
 
 - S2 to S4: migrate the modules in their domain tables to the representations
