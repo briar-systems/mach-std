@@ -55,13 +55,21 @@ decode() {
     esac
 }
 
+# exit status of a command whose own output goes to $probe_out / $probe_err,
+# never into the status this function reports
+probe_out=""
+probe_err=""
 run_status() {
     set +e
-    "$@"
+    "$@" >"$probe_out" 2>"$probe_err"
     local code=$?
     set -e
     echo "$code"
 }
+
+probe_out="$(mktemp)"
+probe_err="$(mktemp)"
+trap 'rm -f "$probe_out" "$probe_err"' EXIT
 
 for profile in debug release; do
     exe="$(cd "$(dirname "$(find "out/$target/$profile" -name 'darwin_probe' -type f -print -quit)")" && pwd)/darwin_probe"
@@ -81,13 +89,11 @@ for profile in debug release; do
     [ "$code" = "134" ] || fail "$profile: 'abort' reported status $code, expected SIGABRT (134)"
 
     # panic writes to stderr and exits 255, with nothing on stdout
-    err="$(mktemp)"; outp="$(mktemp)"
-    code="$(run_status "$exe" panic 2>"$err" >"$outp")"
+    code="$(run_status "$exe" panic)"
     [ "$code" = "255" ] || fail "$profile: 'panic' reported status $code"
-    grep -q 'mach-std-415 panic reached stderr' "$err" \
-        || { cat "$err"; fail "$profile: the panic message did not reach stderr"; }
-    [ ! -s "$outp" ] || fail "$profile: the panic wrote to stdout"
-    rm -f "$err" "$outp"
+    grep -q 'mach-std-415 panic reached stderr' "$probe_err" \
+        || { cat "$probe_err"; fail "$profile: the panic message did not reach stderr"; }
+    [ ! -s "$probe_out" ] || fail "$profile: the panic wrote to stdout"
 
     # entry captured argc, argv and envp
     report="$(MACH_STD_415=hello "$exe" args one "two words" '')"
@@ -100,7 +106,7 @@ for profile in debug release; do
     # process boundary observed by a parent: spawn, wait4, dup2, execve failure,
     # chdir failure, signal death, ECHILD
     code="$(run_status "$exe" child)"
-    [ "$code" = "0" ] || fail "$profile: $(decode "$code")"
+    [ "$code" = "0" ] || { cat "$probe_out"; fail "$profile: $(decode "$code")"; }
 done
 
 echo "OK: $target runtime exit, abort, panic, argv/envp capture and the spawned-child contracts hold in debug and release"
