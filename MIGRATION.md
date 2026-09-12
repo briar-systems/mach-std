@@ -22,7 +22,7 @@ mach `doc/design/tagged-values.md`; the compiler pin is
 | migration compiler | mach `dev` `b4ab85122e30bb24d733a024d549a9a05ef1a2c2`, built by the 4.30.0 seed (generation A `a881f3c2`) or through std's own bootstrap chain (fixpoint `b1fe8a87`) |
 | std base | `origin/dev` `c373e56` (std 1.0.2) |
 | bootstrap chain | `.github/actions/setup-mach/bootstrap.py`: published 4.26.5, bridge `878a8f66` single, audited `b65afb97` fixpoint, v5 `8464568d` fixpoint (std pin `168a9f76` at every stage). `8464568d` is `9a15ac3a6` plus the seeding removal (mach PR #3278: the compiler no longer seeds `res`, `opt` and `err` and no longer refuses a module that declares them); `9a15ac3a6` is `b4ab85122` plus the darwin build fix (mach PR #3277, the pinned std does not forward `O_NONBLOCK` on darwin) and is language-identical |
-| suite at this phase | 1185 passed, 0 failed under the v5 compiler `8464568d` on linux-x86_64 (1182 at S1 phase 1 under `9a15ac3a6`, 1157 on the base under both the 4.30.0 seed and the v5 compiler) |
+| suite at this phase | 1199 passed, 0 failed under the v5 compiler `8464568d` on linux-x86_64 after S3a (1185 at S1 phase 2, 1182 at S1 phase 1 under `9a15ac3a6`, 1157 on the base under both the 4.30.0 seed and the v5 compiler) |
 
 ## Compiler facts every lane must know
 
@@ -55,6 +55,15 @@ mach `doc/design/tagged-values.md`; the compiler pin is
   fresh `val` per iteration.
 - `$is_tag` is comptime-only (a `$if` gate), and `$if` cannot appear inside a
   runtime `if` body.
+- `sel` takes a place, never a call: `if (sel make(?r).err)` does not parse.
+  Bind the outcome (`val made: err[E] = make(?r);`) or, in a test that only
+  wants the yes/no, pass the value to a one-line predicate
+  (`fun ok_err(r: err[E]) bool { ret sel r.ok; }`), which S3a does in
+  `io.runtime`, `io.file.tests` and the runtime consumers. `||` opens no guard,
+  so `if (sel r.err || r.ok != 1) { ret 1; }` is rejected even though every
+  arm exits; split it into one `if` per term. A module that imports the
+  `std.types.result.err` helper spells the tag `canonical.err[E]`
+  (`use canonical: std.types.canonical;`).
 
 ## Representation rules
 
@@ -100,6 +109,16 @@ owner can rule; converting any row back to the census form is mechanical.
 | `collections.sort.binary_search` | `tag SearchPosition { found; insertion }` | `tag SearchPosition { insertion: usize; found: usize; }` | `insertion` is declared first so a zero-initialized position reads as absent at index zero, not as a match at zero |
 | `text.string.str_free` | `err[allocator.Error]` | `err[allocator.Error]` | as proposed; `str_dup` returns `res[str, allocator.Error]` (the census says `res[str, str]`, the same erasure correction) |
 | `OwnedString` | "S1 provides" | `std.types.string.OwnedString` with `owned_adopt`, `owned_dup`, `owned_release` | placed beside `str` and `StrError` in the S1 types module rather than in S2's `text.string` |
+
+S3a executed its rows as tabled with these corrections:
+
+| table row | table target | executed | why |
+| --- | --- | --- | --- |
+| `io.file.root_open` | `res[Root, io_error.Error]` | `root_open(root: *Root, path: Path) err[io_error.Error]` | a `Root` is address-bound: watches borrow `*Root` and admitted handle-relative work waits on its condition, so it is initialized in place like every other address-bound owner in the rules table |
+| `io.reader.read` at the end of the stream | "EOF distinct" | `err{ReadError.eof{0}}`, never `ok{0}` for a nonzero request | a source still reports the end as zero bytes (the POSIX shape); `read` classifies it once, so no consumer branches on `ok{0}` |
+| `io.writer.write` when the sink accepts nothing | not tabled | `err{WriteError.stalled{0}}` | the same classification for sinks; `write_all` no longer has to special-case a zero count |
+| `io.runtime.destroy` refusals | "retained facts in the error" | `EINVAL` when the runtime is not closed or already destroyed, `EBUSY` when live operations, queued completions, a native controller or a registered source remain | the two refusals were both `EINVAL`; a caller that must drain before destroying can now tell them apart |
+| `io.file.watch_close` | `err[io_error.Error]` | as tabled (was `bool`) | a never-opened watch is `EINVAL` on `OP_CLOSE` |
 
 ## Frozen core signatures
 
@@ -217,6 +236,51 @@ growth that is refused part way releases the buffers it acquired.
 | `types.canonical` | tests only until the compiler stops seeding; then the three declarations | yes |
 | `types.result`, `types.option` (`Result`, `Option`, `Void`, `ok`, `err`, `ok_void`, `void_of`, `some`, `none`, `is_*`, `unwrap*`) | retained on the migration branch only; removed by C5 after S2 to S8 and mach #3226 | removal owed |
 
+### I/O (S3a)
+
+| API | signature | frozen |
+| --- | --- | --- |
+| `io.reader.ReadFailure` | `pub rec ReadFailure { delivered: usize; error: io_error.Error; }` | yes |
+| `io.reader.ReadError` | `pub tag ReadError: u8 { eof: usize; would_block: usize; native: ReadFailure; alloc: A.Error; }` (every payload but `alloc` is the bytes delivered before the outcome) | yes |
+| `io.reader.ReadFun` | `fun(ptr, *u8, usize) res[usize, ReadError]` (a source returns the bytes it delivered, `ok{0}` at the end of the stream, or its native failure; `read` classifies) | yes |
+| `io.reader.read` | `fun(r: *Reader, buf: *u8, len: usize) res[usize, ReadError]` (`ok{0}` only for `len == 0`; the end of the stream is `eof{0}`; a native `WOULD_BLOCK` is `would_block{0}`) | yes |
+| `io.reader.read_exact` | `fun(r: *Reader, buf: *u8, len: usize) err[ReadError]` (the payload carries the bytes delivered before the outcome) | yes |
+| `io.reader.read_all` | `fun(a: *A.Allocator, r: *Reader) res[Vector[u8], ReadError]` (the caller owns the vector; on failure it is already released) | yes |
+| `io.reader.read_str` | `fun(a: *A.Allocator, r: *Reader) res[OwnedString, ReadError]` (extent is the buffer's capacity, released whole by `owned_release`) | yes |
+| `io.reader.native_failure` | `fun(delivered: usize, error: io_error.Error) ReadError` | yes |
+| `io.writer.WriteFailure` | `pub rec WriteFailure { written: usize; error: io_error.Error; }` | yes |
+| `io.writer.WriteError` | `pub tag WriteError: u8 { stalled: usize; would_block: usize; native: WriteFailure; }` (every payload is the persisted prefix) | yes |
+| `io.writer.WriteFun` | `fun(ptr, *u8, usize) res[usize, WriteError]` (a sink returns the bytes it accepted, `ok{0}` when it accepts nothing, or its native failure; `write` classifies) | yes |
+| `io.writer.write` | `fun(w: *Writer, buf: *u8, len: usize) res[usize, WriteError]` (`ok{0}` only for `len == 0`; nothing accepted is `stalled{0}`; a native `WOULD_BLOCK` is `would_block{0}`) | yes |
+| `io.writer.write_all`, `write_str` | `... err[WriteError]` (the payload carries the persisted prefix) | yes |
+| `io.writer.persisted` | `fun(error: WriteError) usize` | yes |
+| `io.writer.native_failure` | `fun(written: usize, error: io_error.Error) WriteError` | yes |
+| `io.lifecycle.StateError` | `pub tag StateError: u8 { invalid; closed; exhausted; active; inactive; stale; busy; }` (the state-machine domain tag: `sync.channel`, `sync.worker_pool`, `net.resolve.cancel` and `log.sink` import it; a lane needing a new fact appends a case) | yes |
+| `io.lifecycle.make` | `fun(lifecycle: *Lifecycle) err[StateError]` (in place) | yes |
+| `io.lifecycle.attach` | `fun(lifecycle: *Lifecycle, attachment: *Attachment) err[StateError]` (in place; `active` when already attached, `closed` past OPEN, `exhausted` at the counter's limit) | yes |
+| `io.lifecycle.settle` | `fun(attachment: *Attachment) res[bool, StateError]` (true when this settlement completed the owner's close; `inactive`, `stale`) | yes |
+| `io.lifecycle.settle_closed_child` | `fun(attachment: *Attachment, child: *Lifecycle) res[bool, StateError]` (`busy` while the child is not CLOSED) | yes |
+| `io.lifecycle.begin_close`, `begin_process_drain`, `fail`, `snapshot` | unchanged | yes |
+| `io.handle` | unchanged predicates | yes |
+| `io.runtime.make`, `release_source`, `unregister_source`, `complete`, `complete_copy`, `complete_batch`, `fail`, `complete_cancellation`, `cancel_timer`, `begin_native_control`, `wake`, `destroy` | `... err[io_error.Error]` | yes |
+| `io.runtime.retire_source`, `close` | `... res[bool, io_error.Error]` (already retired, already closed) | yes |
+| `io.runtime.register_source` | `... res[SourceToken, io_error.Error]`; `submit*`, `submit_timer*` `... res[Token, io_error.Error]`; `poll`, `wait` `... res[usize, io_error.Error]`; `prepare_wait` `res[WaitPlan, io_error.Error]`; `begin_close` `res[lifecycle.CloseResult, io_error.Error]` | yes |
+| `io.file.root_open` | `fun(root: *Root, path: Path) err[io_error.Error]` (in place) | yes |
+| `io.file.root_close`, `replace_confined`, `mapping_sync`, `mapping_close`, `watch_close` | `... err[io_error.Error]` | yes |
+| `io.file.open_confined`, `read_at`, `write_at`, `map`, `transfer`, `watch_open`, `watch_scan` | `... res[T, io_error.Error]` (`watch_open` answers whether the path exists) | yes |
+| `io.file.adapter.make`, `destroy` | `... err[io_error.Error]` (in place; `destroy` is `EBUSY` with active requests) | yes |
+| `io.file.adapter.submit_read`, `submit_write` | `... res[io_runtime.Token, io_error.Error]`; `shutdown_drain` `res[bool, io_error.Error]`; `shutdown_abort` `res[usize, io_error.Error]` | yes |
+| `io.error.Error` | unchanged record | yes |
+
+Contract: a reader source or writer sink never spells `eof`, `stalled` or
+`would_block` itself unless it wants to; it hands over bytes or a native
+failure and `read`/`write` classify. A composite operation's error payload is
+the whole prefix (`read_exact` after two partial reads reports the sum).
+`read_all` releases its vector before reporting; `read_str` adopts the vector's
+buffer whole. `WriteError` and `ReadError` are the domain tags the S2 and S4
+consumers (`format`, `print`, `input`, `terminal`, `log`, `data.json`) import;
+their shapes are frozen by this phase.
+
 ## Domain inventory
 
 Lanes are the roadmap's: S2 value/text/codec, S3 I/O, filesystem, process,
@@ -290,15 +354,15 @@ above. `types.result` and `types.option` remain for the unmigrated consumers.
 
 | module | outcome-bearing APIs | representation | S0 rule |
 | --- | --- | --- | --- |
-| `io.error` | `Error { kind; code; operation; cleanup_code }` | unchanged record; primary and cleanup causes stay separate fields | retained |
-| `io.reader` | `read` | `res[usize, ReadError]` with EOF, would-block and native failure distinct | result-payload |
-| | `read_exact` | `err[ReadError]` reporting incomplete progress | optional-error |
-| | `read_all`, `read_str` | `res[Vector[u8]\|OwnedString, ReadError]` with `alloc: allocator.Error` (translation shims at the two `vector.reserve` sites) | result-payload |
-| `io.writer` | `write` | `res[usize, WriteError]`; `write_all`, `write_str` `err[WriteError]` carrying the persisted prefix | result-payload, optional-error |
-| `io.handle`, `io.lifecycle` | predicates unchanged; `make`, `attach`, `settle`, `settle_closed_child` | `err[StateError]` or `res[bool, StateError]` per the state-transition rule, address-bound attachments initialized in place | state-operation |
-| `io.file` | `root_open`, `open_confined`, `map`, `transfer`, `watch_*`, `read_at`, `write_at` | `res[T, io_error.Error]` and `err[io_error.Error]` for unit successes; `watch_close` `err[io_error.Error]` | result-payload |
-| `io.file.adapter`, `io.runtime` | every `Result[bool, io_error.Error]` | `err[io_error.Error]`; token-returning submits `res[Token, io_error.Error]`; `close`, `destroy` keep retained-descriptor and queued-completion facts in the error | result-payload |
-| `io.file.posix`, `io.file.windows` | native `i64` | unchanged native boundary | native-boundary |
+| `io.error` | `Error { kind; code; operation }` | unchanged record (done, S3a) | retained |
+| `io.reader` | `read` | done (S3a): `res[usize, ReadError]` with EOF, would-block and native failure distinct | result-payload |
+| | `read_exact` | done (S3a): `err[ReadError]` reporting the delivered count | optional-error |
+| | `read_all`, `read_str` | done (S3a): `res[Vector[u8]\|OwnedString, ReadError]` with `alloc: allocator.Error`; the two `vector.reserve` shims are gone | result-payload |
+| `io.writer` | `write` | done (S3a): `res[usize, WriteError]`; `write_all`, `write_str` `err[WriteError]` carrying the persisted prefix | result-payload, optional-error |
+| `io.handle`, `io.lifecycle` | predicates unchanged; `make`, `attach`, `settle`, `settle_closed_child` | done (S3a): `err[StateError]` or `res[bool, StateError]` per the state-transition rule, address-bound attachments initialized in place | state-operation |
+| `io.file` | `root_open`, `open_confined`, `map`, `transfer`, `watch_*`, `read_at`, `write_at` | done (S3a): `res[T, io_error.Error]` and `err[io_error.Error]` for unit successes; `root_open` in place (correction above); `watch_close` `err[io_error.Error]` | result-payload |
+| `io.file.adapter`, `io.runtime` | every `Result[bool, io_error.Error]` | done (S3a): `err[io_error.Error]`; token-returning submits `res[Token, io_error.Error]`; `close`, `destroy` keep retained-descriptor and queued-completion facts in the error (`EINVAL` versus `EBUSY`) | result-payload |
+| `io.file.posix`, `io.file.windows` | native `i64` | unchanged native boundary (done, S3a) | native-boundary |
 | `filesystem` | `open`, `create`, `read`, `write`, `seek`, `identity_of`, `identity_link`, `stat_of_error` | `res[T, io_error.Error]` (already typed) | result-payload |
 | | `close`, `sync` | `err[io_error.Error]` | optional-error |
 | | `read_bytes`, `read_string`, `read_dir`, `stat_of`, `metadata`, `metadata_link`, `temp_create` | `res[T, io_error.Error\|FsError]` with `alloc: allocator.Error` distinct (translation shims at the `A.allocate`, `str_copy`, `vector.push` and `path.*` sites, 16 in this module) | result-payload |
@@ -396,7 +460,6 @@ phase (33 sites over 15 modules):
 | `compress.inflate` | 3 | S2/S8 |
 | `process.exec` | 2 | S3 |
 | `process.env` | 2 | S3 |
-| `io.reader` | 2 | S3 |
 | `format` | 2 | S2 |
 | `filesystem.transaction` | 2 | S3 |
 | `encoding.binary` | 1 | S2 |
@@ -405,6 +468,23 @@ phase (33 sites over 15 modules):
 
 The `system.os.*` hits of that string are the OS layer's own native
 messages, not shims.
+
+S3a removed `io.reader`'s two and, because the reader, writer, lifecycle and
+runtime signatures changed under their consumers, left typed-outcome shims of
+the same class: each consumer keeps its legacy carrier and spells the typed
+outcome as its old message or status. The owning lane removes them with the
+module's own return types:
+
+| module | shim | lane |
+| --- | --- | --- |
+| `filesystem` | `ERR_EOF`, `read_error_text`, `write_error_text` (the reader/writer callbacks now return the typed outcome; `read_bytes`, `read_string`, `write_bytes`, `replace_bytes_atomic` translate) | S3b |
+| `filesystem.transaction` | `write_error_text` around `sink_write`, `bytes_write_cb`, `write_subtree_file` | S3b |
+| `process.exec` | `read_error_text` around `read_all` in `output` | S3c |
+| `process.events`, `net.async`, `net.async.local`, `net.resolve` | `runtime_ok_*` predicates and `res`/`canonical.err` bindings at every `io_runtime` call; `net.async.wait` and `process.events.begin_runtime_drain` re-wrap the runtime's `res` in their `Result` | S3c |
+| `input` | `ERR_EOF`, `read_error_text` in `read_line_from` | S4 |
+| `format` | `ERR_SHORT_WRITE`, `write_error_text`, `capacity_exhausted` (the span, measure and test writers report `ENOSPC` natively) | S2 |
+| `derive`, `data.json` | writer callbacks return the typed outcome; no message shim | S2 |
+| `log.sink`, `log` | `ERR_SHORT_WRITE`, `report_write` folding a `WriteError` into a `WriteReport` | S4 |
 
 ## Prepared branches
 
