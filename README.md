@@ -74,21 +74,38 @@ borrowed across each read, including any raw or duplicated handle aliases.
 Concurrent receive, receive shutdown or close through another alias is invalid.
 Peer writes and operations on unrelated descriptors may run concurrently.
 
-On Darwin, local byte reads inspect without consuming, refuse any ancillary data
-or truncation with `UNSUPPORTED`, and otherwise consume at most the inspected
-byte count. Zero-length reads do not inspect the queue. A refusal leaves the
-socket open and its queued rights owned by that socket. The caller must still
-close the stream. It does not receive descriptors or silently discard rights.
-Native failures retain their cause, and only successful byte counts identify
-valid delivered data. Buffer contents on failure are unspecified.
+`net.local.stream_read` and the local async backend's reads deliver bytes only.
+A peer may attach descriptor rights to those bytes; the stream never hands them
+to the caller, and each platform has its own way of making sure they cannot
+occupy the caller's descriptor table:
 
-The local async backend performs inspection and consumption under its existing
-read lane ownership. Its buffer remains borrowed until completion. Refusal
-completes with zero delivered bytes and does not close the stream. The generic
-Darwin async backend accepts only IPv4/IPv6 socket handles, checked before
-registration. Use the local backend for local streams. Raw OS `sock_recv` and
-`sock_receive_message` retain native ancillary behavior and do not provide this
-byte-only contract.
+- Linux receives through `recvmsg(MSG_CMSG_CLOEXEC)` with control storage sized
+  for the kernel's descriptor bound (`SCM_MAX_FD`, 253, plus the credential
+  records `SO_PASSCRED` and `SO_PASSPIDFD` can prepend) and closes every
+  `SCM_RIGHTS` and `SCM_PIDFD` descriptor the storage reports. The bytes arrive
+  and the count is the outcome. A native failure after the kernel installed
+  rights is still walked, because the storage is zero-filled before the call and
+  the kernel writes records before it fails. `MSG_CTRUNC` means the kernel dropped
+  records it could not report, and it installs no descriptor it does not report,
+  so the walk over the reported ones is complete. `std.system.os.linux.
+  sock_recv_close_rights` is that primitive with caller-supplied storage;
+  `local_stream_recv` supplies the bound.
+- Darwin inspects without consuming (`MSG_PEEK` with one control header), refuses
+  any ancillary data or truncation with `UNSUPPORTED`, and otherwise consumes at
+  most the inspected byte count. Zero-length reads do not inspect the queue. A
+  refusal leaves the socket open and its queued rights owned by that socket; the
+  caller must still close the stream, which releases them. Native failures retain
+  their cause. Buffer contents on failure are unspecified.
+- Windows has no descriptor rights on local sockets; reads are plain.
+
+The local async backend reads under its existing read lane ownership with the
+same platform mechanism. Its buffer remains borrowed until completion. A Darwin
+refusal completes with zero delivered bytes and does not close the stream. The
+generic Linux and Darwin async backends accept only IPv4/IPv6 socket handles,
+checked before registration, so a local handle cannot reach a byte path that
+does not own rights. Use the local backend for local streams. Raw OS `sock_recv`
+and `sock_receive_message` retain native ancillary behavior and do not provide
+this byte-only contract.
 
 ### Secret-welded operating-system storage
 
