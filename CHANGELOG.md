@@ -7,52 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+## [2.0.0] - 2026-09-12
 
-- `std.types.canonical` pins the v5 canonical tags `res[T, E]`, `opt[T]` and
-  `err[E]` to the language contract (case order, case codes, zero defaults,
-  discriminator layout, reflection and nesting). The migration compiler still
-  seeds the three names; the declarations move into this module when it stops.
+The breaking result, option and tag migration for Mach 5.0.0 (std #617,
+#618). Every fallible or absent public outcome is spelled with the v5
+canonical tags `res[T, E]`, `opt[T]` and `err[E]` declared in
+`std.types.canonical`, with a closed domain error tag per module in place
+of strings, sentinels and optional-error returns. `MIGRATION.md` at the
+repository root is the retained-surface inventory: the representation rules,
+the frozen signatures per domain and the per-API tables. This changelog
+names the surface by domain and does not repeat those tables. Compatible
+additions after the v5 migration are assigned to std 2.1.0; 2.0.0 is the
+breaking surface and the fixes that shipped with it. Compiler and std
+version numbers are independent.
 
-- `std.allocator.Error` (`exhausted`, `overflow`, `invalid`, `release: i64`),
-  `std.types.string.StrError` (`alloc`, `bounds`), `std.types.semver.SemverError`
-  (`empty`, `syntax: usize`, `alloc`) and `std.collections.sort.SearchPosition`
-  (`insertion`, `found`).
+### Removed
 
-- `std.types.string.OwnedString` with `owned_adopt`, `owned_dup` and
-  `owned_release`: owned text that records its allocation extent, for producers
-  whose buffer may be larger than the text it holds.
-
-- `MIGRATION.md`, the std 2.0.0 retained-surface inventory: representation per
-  public outcome-bearing API, the frozen foundation signatures, the corrections
-  to the S0 census, the translation shims each later lane removes and what the
-  lanes owe.
-
-- The CI bootstrap chain gains the v5 migration compiler stage (mach
-  `b4ab85122`, fixpoint) after the audited 4.30 stage, so std compiles v5
-  syntax with a compiler it built from source.
-
-### Added
-
-- Welded secret buffers persist and reload through the file completion
-  adapter (std #550): `std.io.file.attach_secret_scratch`,
-  `submit_secret_write` and `submit_secret_read` take `*^u8` plus a length on
-  the public lane's requests, workers, cancellation settlement, partial
-  progress and completions, with the read prefix landing in the caller's
-  welded storage when its completion is dequeued and the scratch span wiped
-  when the request retires. `std.system.os.secret` gains the borrow table
-  (`Borrow`, `borrow_open`/`close`/`size`/`wipe`/`fill`/`drain`/`copy`,
-  `borrow_read_at`/`borrow_write_at`, forwarded as `os.secret_borrow_*`): a
-  welded pointer lent to an index-and-generation handle that is not an
-  address, the one boundary where the pointer reaches the kernel. Design,
-  per-outcome storage contents and wipe timing are in `MIGRATION.md`.
-
-- `std.filesystem.FsError` (`io`, `alloc`, `read`, `write`, `removal`,
-  `exhausted`, `published`), the domain tag of the composite filesystem
-  operations, and `std.io.error.Error.cleanup_code`, the first cleanup failure
-  observed beside a primary refusal.
+- `std.types.result` and `std.types.option` (`Result`, `Option`, `Void`,
+  `ok`, `err`, `ok_void`, `void_of`, `some`, `none`, `is_*`, `unwrap*`) and
+  their `std` forwards. No compatibility export survives: the three canonical
+  tags are the only outcome spelling, `sel place.case` is the test, the
+  guarded payload place is the read and `Type.case{...}` is the construction.
+  The compiler at mach `33d60001e` consumed nothing of the removed modules.
 
 ### Changed
+
+- **Breaking, by domain (Mach 5.0.0).** Each line names the domain and the
+  `MIGRATION.md` section holding its frozen signatures and per-API table:
+  - allocator, allocator backends and collections: `res[_, allocator.Error]`,
+    `err[allocator.Error]`, `opt` for absence, `SearchPosition` for
+    `binary_search`, backends and containers initialized in place
+    ("Frozen core signatures": `std.allocator`, Allocator backends,
+    Collections).
+  - types and text foundations (`types.string`, `view`, `path`, `semver`,
+    `text.string`): `StrError`, `SemverError`, `res`/`opt` constructors and
+    searches ("Frozen core signatures": Types).
+  - text, encoding, data and compression: `ParseError`, `FormatError`,
+    `InputError`, `EncodeError`, `DecodeError`, `JsonError`, `TomlError`,
+    `InflateError` with `Defect`, `Committed` and `Fault`; the gzip lifecycle
+    settles a stored failure and refuses input after `finish` ("Text,
+    encoding, data and compression (S2)", "Compression").
+  - I/O: `ReadError`, `WriteError`, `StateError`; readers, writers, handles,
+    the file adapter and the completion runtime return `res`/`err` over
+    `io_error.Error` with retained descriptors and queued completions in the
+    error ("I/O (S3a)").
+  - filesystem: handle operations `res[T, io_error.Error]` or
+    `err[io_error.Error]`, composite operations `res[T, FsError]` or
+    `err[FsError]` with `published` for a replacement whose directory flush
+    failed after the rename, `removal.Error` and `transaction.Error`
+    ("Filesystem (S3b)").
+  - process and network: `EnvError`, `exec.Error` with `retained` naming the
+    unreaped child, `ip.ParseError`, the socket, local, async and resolver
+    families over `io_error.Error` and `types.Error`, `lookup.Outcome` a tag
+    ("Process and network (S3c)").
+  - synchronization and clocks: `ThreadError`, `StateError`, `InitError`,
+    `channel.Status[T]`, `worker_pool.Status`, `condition.WaitStatus` and
+    `cancel.Reason` as tags, `time.Clock` `res[Time, io_error.Error]`
+    ("Synchronization and clocks (S4a)").
+  - crypto and random: `crypto.rand.fill` `err[io_error.Error]` with the
+    completed prefix left in the buffer; hashes, `ct` and `rand` unchanged
+    ("Crypto and random (S4a)").
+  - terminal and logging: `TermError`, `SinkError`, `WriteStatus`,
+    `EncodeStatus` and `ClockError` as tags, `WriteReport.error` and every
+    `ERR_*` string gone, sinks initialized in place ("Terminal and logging
+    (S4b)").
+  - runtime and OS, math and SIMD: the native boundary (foreign ABI widths,
+    native constants, negative errno, nil sentinels) is unchanged on purpose;
+    `math.mat4.mat4_inverse` is `opt[Mat4]` ("Runtime and OS", "Math and
+    SIMD").
+
+- `std.types.canonical` declares `res[T, E]`, `opt[T]` and `err[E]` as
+  ordinary std tags and pins them to the language contract (case order, case
+  codes, zero defaults, discriminator layout, reflection and nesting); the
+  compiler seeds nothing (mach #3226, PR #3278).
 
 - Linux local byte reads (`net.local.stream_read` and the local async backend)
   receive with `MSG_CMSG_CLOEXEC` and control storage sized for the kernel's
@@ -63,130 +90,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matching Darwin. `std.system.os.linux.running_under_user_emulation` names
   a user-mode emulator the way `windows.running_under_wine` names wine.
 
-- **Breaking, std 2.0.0 (Mach 5.0.0):** `std.filesystem`,
-  `std.filesystem.removal` and `std.filesystem.transaction` report outcomes
-  with the v5 canonical tags. Handle operations and single native effects
-  (`open`, `create`, `read`, `write`, `seek`, `close`, `sync`, `stat_of`,
-  `metadata`, `metadata_link`, `identity_of`, `identity_link`, `create_dir`,
-  `remove_file`, `remove_dir`, `rename`, `symlink`, `temp_close`,
-  `temp_remove`, `temp_close_and_remove`) return `res[T, io_error.Error]` or
-  `err[io_error.Error]`; the composite operations (`read_bytes`,
-  `read_string`, `read_dir`, `temp_create`, `write_bytes`,
-  `replace_bytes_atomic`, `create_dir_all`, `remove_all`) return
-  `res[T, FsError]` or `err[FsError]`, where a replacement whose directory
-  flush failed after the rename is `published`; `exists`, `is_file`, `is_dir`
-  and `is_symlink` answer `res[bool, io_error.Error]`, a path that names
-  nothing being a successful false and an unanswerable query the native
-  refusal. `stat_of_error` is gone (`stat_of` is typed), `ERR_EOF` is gone
-  and `Metadata.created` is `opt[Time]`. `write_bytes` reports a close failure
-  after a complete write and `create_dir_all` reports the creation's own
-  refusal. `removal.tree` and `private_tree` return `err[removal.Error]`.
-  In `transaction`, every unit effect returns `err[Error]`, every producer
-  `res[T, Error]`, `entry_identity` and `entry_read_all` `res[opt[T], Error]`,
-  `inventory_dnit` `err[allocator.Error]`; the `prepare` writer callback
-  returns `err[WriteError]` and the `validate` validator answers `bool`;
-  `BackupOutcome.failure` and `cleanup_failure` are `err[Error]`.
-  `transaction.ownership.initialize_claims` returns `err[removal.Error]`.
-
-- **Breaking, std 2.0.0 (Mach 5.0.0):** the allocator, the allocator backends,
-  the collections and the foundational types report outcomes with the v5
-  canonical tags. `allocate_raw`, `reallocate_raw`, `allocate`, `zallocate` and
-  `reallocate` return `res[_, allocator.Error]`; `deallocate_raw` and
-  `deallocate` return `err[allocator.Error]`; the interface callbacks return
-  `opt[ptr]`; every backend `make`/`init` and every container `dnit` returns
-  `err[allocator.Error]`; container growth returns `res[usize|bool,
-  allocator.Error]`; `pop`, `peek`, `get` return `opt`; `map.remove`,
-  `set.remove` and `slice.set` return `bool`; `binary_search` returns
-  `SearchPosition`; the string constructors return `res[str, StrError]`, the
-  string and view searches `opt`, the path constructors `res[Path,
-  allocator.Error]`, `semver_parse` `res[Semver, SemverError]`, `str_dup`
-  `res[str, allocator.Error]` and `str_free` `err[allocator.Error]`. An
-  allocator now refuses a zero or non-power-of-two alignment as `invalid`, and
-  a byte count that does not fit `usize` as `overflow`, before asking the
-  backend. `semver_parse` releases a copied prerelease when the build copy is
-  refused. The old `Result`, `Option` and `Void` remain for the modules that
-  have not migrated yet and are removed with the last of them.
 - Directory root opening and descent preserve the primary failure and first
   cleanup error, consuming newly acquired descriptors on a failed advance.
-
-- **Breaking, std 2.0.0 (Mach 5.0.0):** `process` and `net` report outcomes
-  with the v5 canonical tags. `process.env` declares `EnvError` (`native`,
-  `alloc`, `changed`): `get` and `value` return `opt` for an unset variable,
-  `current_dir` and `compare_names` return `res[_, EnvError]`. `process.exec`
-  declares the typed `Error` (`native`, `output`, `alloc`, `env`,
-  `empty_name`, `unset`, `not_found`, `ungrouped`, `unsupported`, `query`); every
-  operation returns `res[_, Error]`, `try_wait` `res[opt[ExitStatus], Error]`,
-  `terminate_child` and `terminate_group` `err[Error]`, and `retained` names
-  the unreaped child an error still owns. `process.events` returns
-  `err[io_error.Error]`, `res[opt[Event], io_error.Error]` and
-  `res[bool, io_error.Error]`. `net.ip` declares `ParseError` and the parsers
-  return `res[_, ParseError]`. The socket, local, async and resolver families
-  return `err[io_error.Error]` or `err[types.Error]` for unit successes and
-  `res` for values; `net.resolve.cancel` returns `res[bool, StateError]`,
-  `net.resolve.lines.next` `res[opt[usize], io_error.Error]`,
-  `net.resolve.service.lookup` `res[opt[u16], types.Error]` with the output
-  pointer removed, `net.dns` `res[bool, types.Error]`, and
-  `net.resolve.lookup.Outcome` is a tag. `net.resolve.conf.load` and
-  `net.resolve.hosts.collect` report open, read and close failures instead
-  of falling through to the defaults.
 
 - Process waits preserve complete Windows exit codes and explicit POSIX state
   observations. Typed wait failures retain native causes and unreaped child
   ownership. Windows cleanup retries keep process and group tokens valid.
-
-- **Breaking, std 2.0.0 (Mach 5.0.0):** synchronization, clocks and
-  cryptographic randomness report outcomes with the v5 canonical tags.
-  `sync.thread` spawn, `join` and `detach` return `err[ThreadError]`
-  (`invalid`, `exhausted`, `unsupported`, `native: i64`; `join_result` is
-  removed, `join` is checked). `sync.cancel.Reason` is a tag; `make_root`,
-  `make_child`, `init_registration` and `destroy` return `err[StateError]`,
-  `finish`, `unregister`, `cancel`, `timeout` and `expire` return
-  `res[bool, StateError]` (true when the call made the change), and
-  `get_deadline(scope)` returns `res[opt[Deadline], StateError]` without
-  output pointers. `sync.channel.Status[T]` is a tag carrying the element on
-  `received` (the receive output pointer is removed); `make` and `destroy`
-  return `err[StateError]` and `close` `res[bool, StateError]`.
-  `sync.worker_pool.Status` is a tag whose `spawn_failed` and `join_failed`
-  carry the `ThreadError`; `destroy` returns `err[StateError]`.
-  `sync.condition.WaitStatus` is a tag (`failed` keeps the native code).
-  `sync.once.run` returns `res[bool, InitError]` and an `InitFun` returns
-  `err[i64]`, so the initializer's failure is retained. `sync.semaphore.init`
-  and `release` return `err[StateError]`. `chrono.time.now` and `monotonic`
-  return `res[Time, io_error.Error]` (`time.Clock`), `since` and `until`
-  `res[Duration, io_error.Error]`; a failed clock is never the zero time.
-  `crypto.rand.fill` returns `err[io_error.Error]` with the completed prefix
-  left in the buffer (#617).
-
-- **Breaking, std 2.0.0 (Mach 5.0.0):** the terminal and the log report
-  outcomes with the v5 canonical tags. `terminal.enable_raw`, `disable_raw`
-  and `flush_input` return `err[TermError]` and `poll_key` and
-  `poll_key_decoded` return `res[opt[Key], TermError]` on Linux, Darwin and
-  Windows, where an empty queue is `none` and a native read failure is the
-  error; `TermError` (`std.terminal.error`, re-exported) nests the native
-  `io_error.Error` with `OP_OPTION` for a control call and `OP_READ` for a
-  poll, and the Windows backend decodes `GetLastError` through
-  `std.system.os.windows.last_error` instead of a fixed message.
-  `log.sink.SinkError` (`invalid`, `contract`, `malformed`, `clock`, `encode`,
-  `too_large`, `write: WriteError`, `queue_full`, `queue_closed`, `open`,
-  `unjoined`, `busy`, `queue: channel.StateError`,
-  `thread: thread.ThreadError`) is the domain tag; `WriteStatus` is a closed
-  tag whose `partial`, `failed` and `rejected` cases carry it, and
-  `WriteReport.error` and every `ERR_*` string are gone (`cause(report)`
-  answers `opt[SinkError]`). `logger`, `make`, `custom`, `from_writer`,
-  `console`, `file`, `pipe`, `queued` and `queued_with_config` return
-  `res[Sink|Logger, SinkError]` with `Direct` and `Queued` initialized in
-  place; `queued_close_drain`, `queued_join` and `queued_destroy` return
-  `err[SinkError]` (a failed native join is recorded and replayed, never
-  re-joined; destroy refuses `unjoined` and `busy` apart), and
-  `queued_close_abort` returns `res[usize, SinkError]` without the output
-  pointer. `log.record.EncodeStatus` is a closed tag (`encoded`,
-  `truncated`, `rejected`, `failed: EncodeError`) and `Encoded.error` is
-  gone. A log clock reports its refusal: `NowFun` returns `time.Clock`,
-  `clock_now` returns `res[Time, ClockError]`, and `log.write` and the global
-  `info`/`warn`/`error`/`debug` fail the write with `SinkError.clock` and
-  publish nothing instead of stamping the zero time. A direct adapter's
-  `write` cause must agree with its report about the persisted prefix or the
-  report is `malformed` (#617).
 
 - The eight `std.sync.atomic` wrappers (`load`, `store`, `cas`, `fetch_add`,
   `fetch_sub`, `exchange`, `fence`, `spin_hint`) are `#[inline]`: a release
@@ -214,21 +123,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drains buffered output, with terminal completion only after every member verifies.
   Later corruption and trailing junk fail instead of returning prefix success.
 
-- **Breaking, std 2.0.0 (Mach 5.0.0):** `std.compress.inflate`, `zlib` and `gzip`
-  report outcomes with the v5 canonical tags. `inflate` declares `Defect` (one
-  case per deflate and framing fault), `Committed`, `Fault` and `InflateError`
-  (`alloc`, `malformed`, `truncated`, `full`, `closed`, `finished`, `invalid`),
-  re-exported by the wrappers. `init` returns `res[T, InflateError]`, `dnit`
-  `err[allocator.Error]` (a refused release leaves the decoder owning its
-  window), `decompress` `res[Progress, InflateError]` with a failure carrying
-  the counts the call committed, `finish` `err[InflateError]` on inflate and
-  zlib and `res[Progress, InflateError]` on gzip because it drains,
-  `decompress_into` `res[usize, InflateError]` and `decompress_alloc`
-  `res[Vector[u8], InflateError]` with the vector already released on failure.
-  A gzip stream failure is stored and re-reported settled (nothing committed)
-  by every later call until `reset` or `dnit`; input after `finish` is
-  `finished`, a released decoder is `closed`. Nil-argument checks are gone.
-
 - Darwin CPU discovery uses public sysctlbyname with hw.activecpu, returning the
   current active count instead of the boot maximum and retaining a minimum of one.
 
@@ -240,6 +134,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Darwin virtual-memory primitives use typed public libSystem interfaces, preserving
   mapping ownership, native failure sentinels and heap publication ordering.
+
+### Added
+
+- Welded secret buffers persist and reload through the file completion
+  adapter (std #550): `std.io.file.attach_secret_scratch`,
+  `submit_secret_write` and `submit_secret_read` take `*^u8` plus a length on
+  the public lane's requests, workers, cancellation settlement, partial
+  progress and completions, with the read prefix landing in the caller's
+  welded storage when its completion is dequeued and the scratch span wiped
+  when the request retires. `std.system.os.secret` gains the borrow table
+  (`Borrow`, `borrow_open`/`close`/`size`/`wipe`/`fill`/`drain`/`copy`,
+  `borrow_read_at`/`borrow_write_at`, forwarded as `os.secret_borrow_*`): a
+  welded pointer lent to an index-and-generation handle that is not an
+  address, the one boundary where the pointer reaches the kernel. Design,
+  per-outcome storage contents and wipe timing are in `MIGRATION.md`.
+
+- `std.filesystem.FsError` (`io`, `alloc`, `read`, `write`, `removal`,
+  `exhausted`, `published`), the domain tag of the composite filesystem
+  operations, and `std.io.error.Error.cleanup_code`, the first cleanup failure
+  observed beside a primary refusal.
+
+- `std.types.string.OwnedString` with `owned_adopt`, `owned_dup` and
+  `owned_release`: owned text that records its allocation extent, for producers
+  whose buffer may be larger than the text it holds.
+
+- `MIGRATION.md`, the std 2.0.0 retained-surface inventory: representation per
+  public outcome-bearing API, the frozen foundation signatures, the corrections
+  to the S0 census, the translation shims each later lane removes and what the
+  lanes owe.
+
+- The CI bootstrap chain gains the v5 migration compiler stage (mach
+  `8464568d`, fixpoint) after the audited 4.30 stage, so std compiles v5
+  syntax with a compiler it built from source.
 
 ## [1.0.2] - 2026-09-10
 
