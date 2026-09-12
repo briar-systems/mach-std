@@ -32,7 +32,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `b4ab85122`, fixpoint) after the audited 4.30 stage, so std compiles v5
   syntax with a compiler it built from source.
 
+### Added
+
+- `std.filesystem.FsError` (`io`, `alloc`, `read`, `write`, `removal`,
+  `exhausted`, `published`), the domain tag of the composite filesystem
+  operations, and `std.io.error.Error.cleanup_code`, the first cleanup failure
+  observed beside a primary refusal.
+
 ### Changed
+
+- **Breaking, std 2.0.0 (Mach 5.0.0):** `std.filesystem`,
+  `std.filesystem.removal` and `std.filesystem.transaction` report outcomes
+  with the v5 canonical tags. Handle operations and single native effects
+  (`open`, `create`, `read`, `write`, `seek`, `close`, `sync`, `stat_of`,
+  `metadata`, `metadata_link`, `identity_of`, `identity_link`, `create_dir`,
+  `remove_file`, `remove_dir`, `rename`, `symlink`, `temp_close`,
+  `temp_remove`, `temp_close_and_remove`) return `res[T, io_error.Error]` or
+  `err[io_error.Error]`; the composite operations (`read_bytes`,
+  `read_string`, `read_dir`, `temp_create`, `write_bytes`,
+  `replace_bytes_atomic`, `create_dir_all`, `remove_all`) return
+  `res[T, FsError]` or `err[FsError]`, where a replacement whose directory
+  flush failed after the rename is `published`; `exists`, `is_file`, `is_dir`
+  and `is_symlink` answer `res[bool, io_error.Error]`, a path that names
+  nothing being a successful false and an unanswerable query the native
+  refusal. `stat_of_error` is gone (`stat_of` is typed), `ERR_EOF` is gone
+  and `Metadata.created` is `opt[Time]`. `write_bytes` reports a close failure
+  after a complete write and `create_dir_all` reports the creation's own
+  refusal. `removal.tree` and `private_tree` return `err[removal.Error]`.
+  In `transaction`, every unit effect returns `err[Error]`, every producer
+  `res[T, Error]`, `entry_identity` and `entry_read_all` `res[opt[T], Error]`,
+  `inventory_dnit` `err[allocator.Error]`; the `prepare` writer callback
+  returns `err[WriteError]` and the `validate` validator answers `bool`;
+  `BackupOutcome.failure` and `cleanup_failure` are `err[Error]`.
+  `transaction.ownership.initialize_claims` returns `err[removal.Error]`.
 
 - **Breaking, std 2.0.0 (Mach 5.0.0):** the allocator, the allocator backends,
   the collections and the foundational types report outcomes with the v5
@@ -52,6 +84,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend. `semver_parse` releases a copied prerelease when the build copy is
   refused. The old `Result`, `Option` and `Void` remain for the modules that
   have not migrated yet and are removed with the last of them.
+- Directory root opening and descent preserve the primary failure and first
+  cleanup error, consuming newly acquired descriptors on a failed advance.
 
 - **Breaking, std 2.0.0 (Mach 5.0.0):** synchronization, clocks and
   cryptographic randomness report outcomes with the v5 canonical tags.
@@ -81,6 +115,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   build folds each into its caller while retaining the instruction sequences
   and their memory-ordering effects (mach #3110, std #618).
 
+- Linux and Darwin expose `O_NONBLOCK` through their file-open interfaces.
+
+- Darwin local byte reads reject ancillary input before installing descriptor
+  rights and retain socket ownership on refusal. Local async reads share that
+  boundary. Generic Darwin async operations reject non-internet socket handles.
+
+- Directory enumeration uses an explicitly owned cursor and borrowed entries on
+  every backend. Darwin uses public fdopendir, readdir and closedir. Native record
+  lengths govern delivery, with terminal errors and explicit cleanup. Filesystem
+  directory collection and recursive removal retain primary and cleanup errors.
 
 - Completion queue wake and close reject nil owners consistently on Linux, Windows
   and Darwin, preserving live wake and repeated-close behavior.
