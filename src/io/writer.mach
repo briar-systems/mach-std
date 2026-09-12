@@ -1,32 +1,90 @@
 # generic writer interface
 #
-# backend-agnostic write interface using ctx + fn_ptr dispatch.
-# concrete implementations (fd, buffer, etc.) wire themselves via make().
+# backend-agnostic write interface using ctx + fn_ptr dispatch. concrete
+# sinks (fd, buffer, etc.) wire themselves via make().
+#
+# a sink hands over what it knows: the bytes it accepted, or the native
+# failure it hit. this module classifies the outcome once, in write(): zero
+# bytes accepted for a nonzero request is a stall, and a native failure whose
+# kind is WOULD_BLOCK is a would_block. a sink may also spell those cases
+# itself; write() passes them through unchanged. write_all and write_str carry
+# the persisted prefix in the error payload, so a caller always knows how many
+# bytes the sink accepted before the outcome.
 
-use R: std.types.result;
-use O: std.types.option;
+use std.types.canonical.res;
+use std.types.canonical.err;
 
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
+use std.system.os;
+use io_error: std.io.error;
 
-pub val ERR_SHORT_WRITE: str = "ERR_SHORT_WRITE";
+# a native failure and the bytes persisted before it
+pub rec WriteFailure {
+    written: usize;
+    error:   io_error.Error;
+}
+
+# every way a write can fail
+# ---
+# stalled:     the sink accepted nothing; payload is the persisted prefix
+# would_block: the sink stalled natively (EAGAIN); payload is the prefix
+# native:      the sink failed; payload carries the failure and the prefix
+pub tag WriteError: u8 {
+    stalled:     usize;
+    would_block: usize;
+    native:      WriteFailure;
+}
 
 # write callback type
 # ---
 # ptr: opaque context passed to the write callback
 # buf: buffer to write from
-# len: number of bytes to write
-# ret: bytes written on success or error message on failure
-pub def WriteFun: fun(ptr, *u8, usize) R.Result[usize, str];
+# len: number of bytes to write, never zero
+# ret: bytes accepted (zero when the sink stalls) or the failure
+pub def WriteFun: fun(ptr, *u8, usize) res[usize, WriteError];
 
 # generic write interface
 # ---
 # ctx:     opaque context passed to the write callback
-# f_write: write callback (ctx, buf, len) -> R.Result[usize, str]
+# f_write: write callback (ctx, buf, len) -> res[usize, WriteError]
 pub rec Writer {
     ctx:     ptr;
     f_write: WriteFun;
+}
+
+pub fun native_failure(written: usize, error: io_error.Error) WriteError {
+    ret WriteError.native{WriteFailure{written: written, error: error}};
+}
+
+# the bytes the sink persisted before the failure
+pub fun persisted(error: WriteError) usize {
+    if (sel error.stalled)     { ret error.stalled; }
+    if (sel error.would_block) { ret error.would_block; }
+    if (sel error.native)      { ret error.native.written; }
+    ret 0;
+}
+
+# a stall reported as a native error is the would_block case
+fun classify(error: WriteError) WriteError {
+    if (sel error.native) {
+        if (error.native.error.kind == io_error.WOULD_BLOCK) { ret WriteError.would_block{error.native.written}; }
+    }
+    ret error;
+}
+
+# add the bytes persisted by earlier calls to the error's prefix
+fun advance(error: WriteError, written: usize) WriteError {
+    if (sel error.stalled)     { ret WriteError.stalled{error.stalled + written}; }
+    if (sel error.would_block) { ret WriteError.would_block{error.would_block + written}; }
+    if (sel error.native) {
+        ret native_failure(error.native.written + written, error.native.error);
+    }
+    ret error;
 }
 
 # write up to len bytes from buf
@@ -34,10 +92,16 @@ pub rec Writer {
 # w:   writer to write to
 # buf: buffer to write from
 # len: maximum number of bytes to write
-# ret: bytes written on success or error message on failure
-pub fun write(w: *Writer, buf: *u8, len: usize) R.Result[usize, str] {
-    if (len == 0) { ret R.ok[usize, str](0); }
-    ret w.f_write(w.ctx, buf, len);
+# ret: bytes accepted, or stalled, would_block or the native failure; ok{0}
+#      only for a zero-length request
+pub fun write(w: *Writer, buf: *u8, len: usize) res[usize, WriteError] {
+    if (len == 0) { ret res[usize, WriteError].ok{0}; }
+    val outcome: res[usize, WriteError] = w.f_write(w.ctx, buf, len);
+    if (sel outcome.ok) {
+        if (outcome.ok == 0) { ret res[usize, WriteError].err{WriteError.stalled{0}}; }
+        ret outcome;
+    }
+    ret res[usize, WriteError].err{classify(outcome.err)};
 }
 
 # write exactly len bytes from buf
@@ -45,35 +109,176 @@ pub fun write(w: *Writer, buf: *u8, len: usize) R.Result[usize, str] {
 # w:   writer to write to
 # buf: buffer to write from
 # len: number of bytes to write
-# ret: error on failure
-pub fun write_all(w: *Writer, buf: *u8, len: usize) O.Option[str] {
-    if (len == 0) { ret O.none[str](); }
-
+# ret: the failure with the persisted prefix, or ok
+pub fun write_all(w: *Writer, buf: *u8, len: usize) err[WriteError] {
     var total: usize = 0;
     for (total < len) {
-        # write the remaining bytes in buf
-        val res: R.Result[usize, str] = write(w, ?buf[total], len - total);
-        if (R.is_err[usize, str](res)) {
-            ret O.some[str](R.unwrap_err[usize, str](res));
-        }
-
-        # update the total written and guard against a stalled write
-        val put: usize = R.unwrap_ok[usize, str](res);
-        if (put == 0) {
-            ret O.some[str](ERR_SHORT_WRITE);
-        }
-
-        total = total + put;
+        val outcome: res[usize, WriteError] = write(w, ?buf[total], len - total);
+        if (sel outcome.err) { ret err[WriteError].err{advance(outcome.err, total)}; }
+        total = total + outcome.ok;
     }
-
-    ret O.none[str]();
+    ret err[WriteError].ok{};
 }
 
 # write a null-terminated string
 # ---
 # w:   writer to write to
 # s:   string to write
-# ret: error on failure
-pub fun write_str(w: *Writer, s: str) O.Option[str] {
+# ret: the failure with the persisted prefix, or ok
+pub fun write_str(w: *Writer, s: str) err[WriteError] {
     ret write_all(w, s, str_len(s));
+}
+
+# a sink over a byte range that accepts at most `step` bytes per call and can
+# be scripted to stall or fail once `fail_after` bytes are persisted
+rec MemSink {
+    data:       *u8;
+    cap:        usize;
+    len:        usize;
+    step:       usize;
+    fail_after: usize;
+    fail_code:  i64;
+    stall:      bool;
+    calls:      usize;
+}
+
+fun mem_write(ctx: ptr, buf: *u8, n: usize) res[usize, WriteError] {
+    val m: *MemSink = ctx::*MemSink;
+    m.calls = m.calls + 1;
+    if (m.len >= m.fail_after) {
+        if (m.stall) { ret res[usize, WriteError].ok{0}; }
+        if (m.fail_code != 0) {
+            ret res[usize, WriteError].err{native_failure(0, io_error.from_code(m.fail_code, io_error.OP_WRITE))};
+        }
+    }
+    var amount: usize = n;
+    if (amount > m.step) { amount = m.step; }
+    if (amount > m.cap - m.len) { amount = m.cap - m.len; }
+    var i: usize = 0;
+    for (i < amount) {
+        m.data[m.len + i] = buf[i];
+        i = i + 1;
+    }
+    m.len = m.len + amount;
+    ret res[usize, WriteError].ok{amount};
+}
+
+fun mem_sink(m: *MemSink, data: *u8, cap: usize, step: usize) Writer {
+    m.data = data;
+    m.cap = cap;
+    m.len = 0;
+    m.step = step;
+    m.fail_after = cap;
+    m.fail_code = 0;
+    m.stall = false;
+    m.calls = 0;
+    ret Writer{ctx: m::ptr, f_write: mem_write};
+}
+
+fun bytes_equal(data: *u8, expected: str, len: usize) bool {
+    var i: usize = 0;
+    for (i < len) {
+        if (data[i] != expected[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+test "io.writer.write: accepted bytes, a stall and a native failure are distinct" {
+    var out: [8]u8;
+    var m: MemSink;
+    var w: Writer = mem_sink(?m, ?out[0], 8, 8);
+    val empty: res[usize, WriteError] = write(?w, "x", 0);
+    if (!sel empty.ok) { ret 1; }
+    if (empty.ok != 0) { ret 1; }
+    if (m.calls != 0) { ret 1; }
+    val put: res[usize, WriteError] = write(?w, "abc", 3);
+    if (!sel put.ok) { ret 2; }
+    if (put.ok != 3) { ret 2; }
+    if (!bytes_equal(?out[0], "abc", 3)) { ret 2; }
+    m.stall = true;
+    m.fail_after = 0;
+    val stalled: res[usize, WriteError] = write(?w, "d", 1);
+    if (!sel stalled.err) { ret 3; }
+    if (!sel stalled.err.stalled) { ret 4; }
+    if (stalled.err.stalled != 0) { ret 4; }
+    m.stall = false;
+    m.fail_code = os.EPIPE;
+    val failed: res[usize, WriteError] = write(?w, "d", 1);
+    if (!sel failed.err) { ret 5; }
+    if (!sel failed.err.native) { ret 6; }
+    if (failed.err.native.written != 0 || failed.err.native.error.kind != io_error.CLOSED || failed.err.native.error.operation != io_error.OP_WRITE) { ret 7; }
+    m.fail_code = os.EAGAIN;
+    val blocked: res[usize, WriteError] = write(?w, "d", 1);
+    if (!sel blocked.err) { ret 8; }
+    if (!sel blocked.err.would_block) { ret 9; }
+    if (blocked.err.would_block != 0) { ret 9; }
+    ret 0;
+}
+
+test "io.writer.write_all: short writes assemble the exact byte sequence" {
+    var out: [6]u8;
+    var m: MemSink;
+    var w: Writer = mem_sink(?m, ?out[0], 6, 2);
+    val done: err[WriteError] = write_all(?w, "abcdef", 6);
+    if (!sel done.ok) { ret 1; }
+    if (m.calls != 3) { ret 1; }
+    if (m.len != 6) { ret 1; }
+    if (!bytes_equal(?out[0], "abcdef", 6)) { ret 1; }
+    val none: err[WriteError] = write_all(?w, "x", 0);
+    if (!sel none.ok) { ret 2; }
+    if (m.calls != 3) { ret 2; }
+    ret 0;
+}
+
+test "io.writer.write_all: a stalled sink reports the persisted prefix" {
+    var out: [8]u8;
+    var m: MemSink;
+    var w: Writer = mem_sink(?m, ?out[0], 8, 2);
+    m.stall = true;
+    m.fail_after = 3;
+    val stalled: err[WriteError] = write_all(?w, "abcdef", 6);
+    if (!sel stalled.err) { ret 1; }
+    if (!sel stalled.err.stalled) { ret 2; }
+    if (stalled.err.stalled != 4 || persisted(stalled.err) != 4) { ret 3; }
+    if (!bytes_equal(?out[0], "abcd", 4)) { ret 4; }
+    ret 0;
+}
+
+test "io.writer.write_all: a failure after progress carries the prefix and the cause" {
+    var out: [8]u8;
+    var m: MemSink;
+    var w: Writer = mem_sink(?m, ?out[0], 8, 3);
+    m.fail_after = 3;
+    m.fail_code = os.ENOSPC;
+    val failed: err[WriteError] = write_all(?w, "abcdef", 6);
+    if (!sel failed.err) { ret 1; }
+    if (!sel failed.err.native) { ret 2; }
+    if (failed.err.native.written != 3 || persisted(failed.err) != 3) { ret 3; }
+    if (failed.err.native.error.kind != io_error.RESOURCE_EXHAUSTED || failed.err.native.error.code != os.ENOSPC) { ret 4; }
+    if (!bytes_equal(?out[0], "abc", 3)) { ret 5; }
+    m.fail_code = os.EAGAIN;
+    m.len = 0;
+    m.fail_after = 3;
+    val blocked: err[WriteError] = write_all(?w, "abcdef", 6);
+    if (!sel blocked.err) { ret 6; }
+    if (!sel blocked.err.would_block) { ret 7; }
+    if (blocked.err.would_block != 3) { ret 7; }
+    ret 0;
+}
+
+test "io.writer.write_str: the terminator is not written" {
+    var out: [8]u8;
+    out[5] = 7;
+    var m: MemSink;
+    var w: Writer = mem_sink(?m, ?out[0], 8, 8);
+    val done: err[WriteError] = write_str(?w, "hello");
+    if (!sel done.ok) { ret 1; }
+    if (m.len != 5) { ret 1; }
+    if (!bytes_equal(?out[0], "hello", 5)) { ret 1; }
+    if (out[5] != 7) { ret 1; }
+    val empty: err[WriteError] = write_str(?w, "");
+    if (!sel empty.ok) { ret 2; }
+    if (m.calls != 1) { ret 2; }
+    ret 0;
 }
