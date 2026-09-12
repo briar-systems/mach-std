@@ -39,5 +39,11 @@ Independent Python gzip decoding verifies those expected byte sequences before t
 native runs. Restoring first-member completion must fail the multi-member runtime
 test, rather than counting a compiler refusal or timeout as evidence.
 
-This is the stream lifecycle portion of #418. The final v5 result and error type
-migration remains tracked by #617 and #618 before #418 can close.
+Outcomes use the v5 forms frozen by #617 and #618: `decompress` and `finish` return
+`res[Progress, InflateError]`, `init` `res[Decompressor, InflateError]`, `dnit`
+`err[allocator.Error]`, and the one-shot wrappers `res[usize, InflateError]` and
+`res[Vector[u8], InflateError]`. A stream failure is stored as `opt[InflateError]`
+and every later call re-reports it settled, with nothing committed. The per-bullet
+acceptance for #418 on those forms is the table under Compression in `MIGRATION.md`,
+including the two mutation controls (first-member completion restored, and the
+settled re-report dropped) and the tests each one fails.
