@@ -53,6 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused. The old `Result`, `Option` and `Void` remain for the modules that
   have not migrated yet and are removed with the last of them.
 
+- Directory enumeration uses an explicitly owned cursor and borrowed entries on
+  every backend. Darwin uses public fdopendir, readdir and closedir. Native record
+  lengths govern delivery, with terminal errors and explicit cleanup. Filesystem
+  directory collection and recursive removal retain primary and cleanup errors.
 
 - Completion queue wake and close reject nil owners consistently on Linux, Windows
   and Darwin, preserving live wake and repeated-close behavior.
