@@ -337,6 +337,8 @@ val ENOSYS: i64 = -38;
 val SYS_FCHMODAT2: usize = 452;
 
 use os_shared: std.system.os.shared;
+fwd os_shared.DirectoryEntry;
+fwd os_shared.DirectoryInitResult;
 
 # kernel ABI types
 
@@ -423,13 +425,27 @@ pub rec timespec {
     tv_nsec: i64;
 }
 
-# directory entry from getdents64
-pub rec dirent64 {
-    d_ino:    u64;
-    d_off:    i64;
-    d_reclen: u16;
-    d_type:   u8;
-    d_name:   [256]u8;
+# only the initialized variable record is read through this native prefix
+rec LinuxDirectoryEntry {
+    inode: u64;
+    offset: i64;
+    record_length: u16;
+    type_hint: u8;
+    name: [1]u8;
+}
+
+# the largest aligned extent representable by getdents64's u16 record length
+val DIRECTORY_BUFFER_SIZE: usize = 65528;
+
+pub rec DirectoryCursor {
+    address: usize;
+    fd: i32;
+    active: bool;
+    ended: bool;
+    error: i64;
+    buffer: ptr;
+    offset: usize;
+    count: usize;
 }
 
 # path
@@ -447,6 +463,7 @@ pub val O_CREAT:     i32 = 64;
 pub val O_EXCL:      i32 = 128;
 pub val O_TRUNC:     i32 = 512;
 pub val O_APPEND:    i32 = 1024;
+pub val O_NONBLOCK:  i32 = 0o4000;
 
 # O_DIRECTORY, O_NOFOLLOW, and O_DIRECT are arch-gated, and ARM shifts them relative to
 # asm-generic. asm-generic/fcntl.h defines each under `#ifndef` precisely so an arch
@@ -1417,14 +1434,72 @@ pub fun make_dir(dirfd: i32, path: *u8, mode: i32) i64 {
     ret syscall3(SYS_MKDIRAT, dirfd::isize::usize, path::usize, mode::u32::usize);
 }
 
-# getdents64: read directory entries
-# ---
-# fd:    directory fd
-# dirp:  pointer to dirent64 buffer
-# count: buffer size in bytes
-# ret:   bytes read, 0 at end, or negative errno
-pub fun read_dir(fd: i32, dirp: *dirent64, count: usize) i64 {
-    ret syscall3(SYS_GETDENTS64, fd::isize::usize, dirp::usize, count);
+# fd and its aliases lend exclusive enumeration and seek access until close
+pub fun directory_init(out: *DirectoryCursor, fd: i32) DirectoryInitResult {
+    if (out == nil || (out.address != 0 && (out.address != out::usize || out.active))) {
+        ret DirectoryInitResult{code: EINVAL};
+    }
+    out.address = out::usize;
+    out.active = false;
+    var st: stat_t;
+    val checked: i64 = stat(fd, ?st);
+    if (checked < 0) { ret DirectoryInitResult{code: checked}; }
+    if ((stat_mode(?st) & S_IFMT) != S_IFDIR) { ret DirectoryInitResult{code: ENOTDIR}; }
+    val mapped: i64 = syscall6(SYS_MMAP, 0, DIRECTORY_BUFFER_SIZE,
+        (PROT_READ | PROT_WRITE)::u32::usize, (MAP_PRIVATE | MAP_ANONYMOUS)::u32::usize,
+        (-1)::isize::usize, 0);
+    if (mapped < 0) { ret DirectoryInitResult{code: mapped}; }
+    out.fd = fd;
+    out.buffer = mapped::usize::ptr;
+    out.offset = 0;
+    out.count = 0;
+    out.ended = false;
+    out.error = 0;
+    out.active = true;
+    ret DirectoryInitResult{};
+}
+
+fun directory_failure(cursor: *DirectoryCursor, code: i64) i64 {
+    cursor.error = code;
+    ret code;
+}
+
+pub fun directory_next(cursor: *DirectoryCursor, out: *DirectoryEntry) i64 {
+    if (cursor == nil || out == nil || cursor.address != cursor::usize || !cursor.active) { ret EINVAL; }
+    if (cursor.error < 0) { ret cursor.error; }
+    if (cursor.ended) { ret 0; }
+    if (cursor.offset == cursor.count) {
+        val count: i64 = syscall3(SYS_GETDENTS64, cursor.fd::isize::usize, cursor.buffer::usize, DIRECTORY_BUFFER_SIZE);
+        if (count < 0) { ret directory_failure(cursor, count); }
+        if (count == 0) { cursor.ended = true; ret 0; }
+        if (count::usize > DIRECTORY_BUFFER_SIZE) { ret directory_failure(cursor, EIO); }
+        cursor.offset = 0;
+        cursor.count = count::usize;
+    }
+    val name_offset: usize = $offset_of(LinuxDirectoryEntry, name);
+    val remaining: usize = cursor.count - cursor.offset;
+    if (remaining <= name_offset) { ret directory_failure(cursor, EIO); }
+    val native: *LinuxDirectoryEntry = (cursor.buffer::usize + cursor.offset)::*LinuxDirectoryEntry;
+    val extent: usize = native.record_length::usize;
+    if (extent <= name_offset || (extent & 7) != 0 || extent > remaining) { ret directory_failure(cursor, EIO); }
+    val name: *u8 = ?native.name[0];
+    val capacity: usize = extent - name_offset;
+    var length: usize = 0;
+    for (length < capacity && name[length] != 0) { length = length + 1; }
+    if (length == 0 || length == capacity) { ret directory_failure(cursor, EIO); }
+    @out = DirectoryEntry{name: name::str, length: length, type_hint: native.type_hint};
+    cursor.offset = cursor.offset + extent;
+    ret 1;
+}
+
+# consumes the owner, including when native release reports failure
+pub fun directory_close(cursor: *DirectoryCursor) i64 {
+    if (cursor == nil || cursor.address != cursor::usize) { ret EINVAL; }
+    if (!cursor.active) { ret 0; }
+    val buffer: ptr = cursor.buffer;
+    cursor.active = false;
+    cursor.buffer = nil;
+    ret deallocate(buffer, DIRECTORY_BUFFER_SIZE);
 }
 
 # faccessat: check file accessibility relative to a directory fd
@@ -2430,7 +2505,7 @@ pub val AF_INET:      i32 = 2;
 pub val AF_INET6:     i32 = 10;
 pub val SOCK_STREAM:  i32 = 1;
 pub val SOCK_DGRAM:   i32 = 2;
-pub val SOCK_NONBLOCK:i32 = 0x800;
+pub val SOCK_NONBLOCK:i32 = O_NONBLOCK;
 pub val SOCK_CLOEXEC: i32 = 0x80000;
 val F_GETFD: i32 = 1;
 val FD_CLOEXEC: i32 = 1;
@@ -2844,5 +2919,41 @@ test "std.system.os.process_status.linux: native continued encoding is not a sto
     if (continued.kind != os_shared.PROCESS_CONTINUED || continued.signal != 0 || continued.code != 0) { ret 1; }
     val stopped: os_shared.ProcessStatus = decode_process_status((17 << 8) | 0x7f);
     if (stopped.kind != os_shared.PROCESS_STOPPED || stopped.signal != 17) { ret 2; }
+    ret 0;
+}
+
+test "std.system.os.directory.linux: variable records and malformed successors preserve terminal failure" {
+    if ($offset_of(LinuxDirectoryEntry, record_length) != 16
+        || $offset_of(LinuxDirectoryEntry, type_hint) != 18
+        || $offset_of(LinuxDirectoryEntry, name) != 19) { ret 1; }
+    val base: str = "mach_directory_linux_record";
+    if (make_dir(AT_FDCWD, base, 0o700) < 0) { ret 2; }
+    fin { unlink(AT_FDCWD, base, AT_REMOVEDIR); }
+    val fd: i64 = open(AT_FDCWD, base, O_RDONLY | O_DIRECTORY, 0);
+    if (fd < 0) { ret 3; }
+    fin { close(fd::i32); }
+    var cursor: DirectoryCursor = DirectoryCursor{};
+    if (directory_init(?cursor, fd::i32).code < 0) { ret 4; }
+    fin { directory_close(?cursor); }
+    val first: *LinuxDirectoryEntry = cursor.buffer::*LinuxDirectoryEntry;
+    first.record_length = 320;
+    first.type_hint = 8;
+    val name: *u8 = ?first.name[0];
+    var index: usize = 0;
+    for (index < 300) { name[index] = 'a'; index = index + 1; }
+    name[300] = 0;
+    val second: *LinuxDirectoryEntry = (cursor.buffer::usize + 320)::*LinuxDirectoryEntry;
+    second.record_length = 16;
+    cursor.count = 344;
+    var entry: DirectoryEntry;
+    if (directory_next(?cursor, ?entry) != 1 || entry.length != 300
+        || entry.name[299] != 'a' || entry.name[300] != 0 || entry.type_hint != 8) { ret 5; }
+    entry = DirectoryEntry{name: "unchanged", length: 9, type_hint: 77};
+    if (directory_next(?cursor, ?entry) != EIO || entry.length != 9 || entry.type_hint != 77) { ret 6; }
+    second.record_length = 24;
+    second.name[0] = 'x';
+    @(second::usize + $offset_of(LinuxDirectoryEntry, name) + 1)::*u8 = 0;
+    if (directory_next(?cursor, ?entry) != EIO) { ret 7; }
+    if (directory_close(?cursor) != 0) { ret 8; }
     ret 0;
 }
