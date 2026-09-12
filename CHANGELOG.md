@@ -12,7 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The breaking result, option and tag migration for Mach 5.0.0 (std #617,
 #618). Every fallible or absent public outcome is spelled with the v5
 canonical tags `res[T, E]`, `opt[T]` and `err[E]` declared in
-`std.types.canonical`, with a closed domain error tag per module in place
+`std.types.result`, `std.types.option` and `std.types.error`, with a closed
+domain error tag per module in place
 of strings, sentinels and optional-error returns. `MIGRATION.md` at the
 repository root is the retained-surface inventory: the representation rules,
 the frozen signatures per domain and the per-API tables. This changelog
@@ -32,6 +33,13 @@ version numbers are independent.
 
 ### Changed
 
+- The canonical tags live in `std.types.result`, `std.types.option` and
+  `std.types.error`, one module per tag; `std.types.canonical` is gone and
+  a consumer spells `use std.types.result.res;`, `use std.types.option.opt;`
+  or `use std.types.error.err;`. The module names reuse the names the
+  removed legacy modules held; nothing in them is called `Result` or
+  `Option`. `std.lib.libstd` forwards the three under their leaf names and
+  `std.io.error` as `io_error` (std #617).
 - **Breaking, by domain (Mach 5.0.0).** Each line names the domain and the
   `MIGRATION.md` section holding its frozen signatures and per-API table:
   - allocator, allocator backends and collections: `res[_, allocator.Error]`,
@@ -76,10 +84,11 @@ version numbers are independent.
     `math.mat4.mat4_inverse` is `opt[Mat4]` ("Runtime and OS", "Math and
     SIMD").
 
-- `std.types.canonical` declares `res[T, E]`, `opt[T]` and `err[E]` as
-  ordinary std tags and pins them to the language contract (case order, case
-  codes, zero defaults, discriminator layout, reflection and nesting); the
-  compiler seeds nothing (mach #3226, PR #3278).
+- `std.types.result`, `std.types.option` and `std.types.error` declare
+  `res[T, E]`, `opt[T]` and `err[E]` as ordinary std tags, one module per
+  tag, and pin them to the language contract (case order, case codes, zero
+  defaults, discriminator layout, reflection and nesting); the compiler
+  seeds nothing (mach #3226, PR #3278).
 
 - Linux local byte reads (`net.local.stream_read` and the local async backend)
   receive with `MSG_CMSG_CLOEXEC` and control storage sized for the kernel's

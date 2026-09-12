@@ -31,7 +31,7 @@ use std.system.os;
 use std.derive;
 use std.io.writer;
 use std.io.writer.WriteError;
-use std.types.canonical.res;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 
