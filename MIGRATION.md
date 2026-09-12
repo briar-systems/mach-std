@@ -1186,7 +1186,11 @@ reports `EBUSY` rather than freeing a borrow a late dequeue could still write.
 A write's source storage is never changed by the lane and is not borrowed past
 the submit call; the persisted prefix is `bytes` (a native positioned write of
 a regular file delivers the whole span or fails, and the boundary reports a
-short native count as the prefix without retrying). A refused submission has
+short native count as the prefix without retrying). Cleanup errors: on Windows
+a failure to restore the pinned file pointer after a transfer that succeeded is
+reported as the outcome with the transfer's effect standing, as the public
+`read_at` and `write_at` report it; `borrow_close` cannot fail for a live
+handle, so the adapter's retire carries no cleanup code of its own. A refused submission has
 no effect: no runtime slot, no pool task, no scratch content (a write's scratch
 copy made before a runtime refusal is wiped on that path), no borrow.
 
