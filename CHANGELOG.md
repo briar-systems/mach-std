@@ -53,6 +53,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused. The old `Result`, `Option` and `Void` remain for the modules that
   have not migrated yet and are removed with the last of them.
 
+- **Breaking, std 2.0.0 (Mach 5.0.0):** `process` and `net` report outcomes
+  with the v5 canonical tags. `process.env` declares `EnvError` (`native`,
+  `alloc`, `changed`): `get` and `value` return `opt` for an unset variable,
+  `current_dir` and `compare_names` return `res[_, EnvError]`. `process.exec`
+  declares the typed `Error` (`native`, `output`, `alloc`, `env`,
+  `empty_name`, `unset`, `not_found`, `ungrouped`, `unsupported`); every
+  operation returns `res[_, Error]`, `try_wait` `res[opt[ExitStatus], Error]`,
+  `terminate_child` and `terminate_group` `err[Error]`, and `retained` names
+  the unreaped child an error still owns. `process.events` returns
+  `err[io_error.Error]`, `res[opt[Event], io_error.Error]` and
+  `res[bool, io_error.Error]`. `net.ip` declares `ParseError` and the parsers
+  return `res[_, ParseError]`. The socket, local, async and resolver families
+  return `err[io_error.Error]` or `err[types.Error]` for unit successes and
+  `res` for values; `net.resolve.cancel` returns `res[bool, StateError]`,
+  `net.resolve.lines.next` `res[opt[usize], io_error.Error]`,
+  `net.resolve.service.lookup` `res[opt[u16], types.Error]` with the output
+  pointer removed, `net.dns` `res[bool, types.Error]`, and
+  `net.resolve.lookup.Outcome` is a tag. `net.resolve.conf.load` and
+  `net.resolve.hosts.collect` report open, read and close failures instead
+  of falling through to the defaults.
+
 - Process waits preserve complete Windows exit codes and explicit POSIX state
   observations. Typed wait failures retain native causes and unreaped child
   ownership. Windows cleanup retries keep process and group tokens valid.
