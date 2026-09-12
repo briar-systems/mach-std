@@ -41,6 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Linux local byte reads (`net.local.stream_read` and the local async backend)
+  receive with `MSG_CMSG_CLOEXEC` and control storage sized for the kernel's
+  descriptor bound, and close every right a peer attached, including after a
+  native failure that followed installation. The generic Linux async backend
+  refuses non-internet socket handles before registration, as Darwin's does.
+  Completion queue wake on a closed queue is `EBADF` on Linux and Windows,
+  matching Darwin.
+
 - **Breaking, std 2.0.0 (Mach 5.0.0):** `std.filesystem`,
   `std.filesystem.removal` and `std.filesystem.transaction` report outcomes
   with the v5 canonical tags. Handle operations and single native effects

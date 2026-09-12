@@ -22,7 +22,7 @@ mach `doc/design/tagged-values.md`; the compiler pin is
 | migration compiler | mach `dev` `b4ab85122e30bb24d733a024d549a9a05ef1a2c2`, built by the 4.30.0 seed (generation A `a881f3c2`) or through std's own bootstrap chain (fixpoint `b1fe8a87`) |
 | std base | `origin/dev` `c373e56` (std 1.0.2) |
 | bootstrap chain | `.github/actions/setup-mach/bootstrap.py`: published 4.26.5, bridge `878a8f66` single, audited `b65afb97` fixpoint, v5 `8464568d` fixpoint (std pin `168a9f76` at every stage). `8464568d` is `9a15ac3a6` plus the seeding removal (mach PR #3278: the compiler no longer seeds `res`, `opt` and `err` and no longer refuses a module that declares them); `9a15ac3a6` is `b4ab85122` plus the darwin build fix (mach PR #3277, the pinned std does not forward `O_NONBLOCK` on darwin) and is language-identical |
-| suite at this phase | 1259 passed, 0 failed under the v5 compiler `8464568d` on linux-x86_64 after S8 on S3c (1256 after S3c on S2, 1241 after S2, 1216 after S3b, 1199 after S3a, 1208 after the two `feat/618` filesystem producer fixes landed, 1185 at S1 phase 2, 1182 at S1 phase 1 under `9a15ac3a6`, 1157 on the base under both the 4.30.0 seed and the v5 compiler) |
+| suite at this phase | 1274 passed, 0 failed under the v5 compiler on linux-x86_64 after S6 on `73de413` (1266 on `73de413`, 1259 after S8 on S3c, 1256 after S3c on S2, 1241 after S2, 1216 after S3b, 1199 after S3a, 1208 after the two `feat/618` filesystem producer fixes landed, 1185 at S1 phase 2, 1182 at S1 phase 1 under `9a15ac3a6`, 1157 on the base under both the 4.30.0 seed and the v5 compiler) |
 
 ## Compiler facts every lane must know
 
@@ -671,6 +671,8 @@ the control rests on.
 | `net.ip` | `ipv4_parse`, `ipv6_parse`, `addr_parse`, `endpoint_parse` | done (S3c): `res[T, ParseError]`; predicates unchanged | result-payload |
 | `net.socket`, `net.tcp`, `net.udp`, `net.local`, `net.local.endpoint`, `net.async`, `net.async.local` | every `Result[bool, io_error.Error]` | done (S3c): `err[io_error.Error]`; value results `res[T, io_error.Error]`; completion lifetimes and retained descriptors survive in the error; the `runtime_ok_*` predicates and re-wrapped runtime results are gone | result-payload |
 | `net.async.linux`, `darwin`, `windows`, `net.async.local.unix`, `net.async.local.windows`, `net.local.unix`, `net.local.windows` | native `i64` | unchanged native boundary (done, S3c) | native-boundary |
+| `net.local.stream_read`, `net.async.local` reads, `net.local.unix.read`, `os.linux.local_stream_recv`, `os.linux.sock_recv_close_rights` | bytes only under unwanted `SCM_RIGHTS` | done (S6): the platform mechanisms under "Local byte reception under unwanted rights" below; no signature changed, Linux closes every attached right, Darwin refuses before installing any (S3b landing of `a230488`), Windows has none; the generic `net.async.linux` backend refuses non-internet handles before registration like Darwin's | native-boundary |
+| `os.io_queue_wake` on a closed queue | `EBADF` on Linux, Darwin and Windows | done (S6): nil is `EINVAL` (`66e7e3d7`), closed is `EBADF` decided by the queue's own state on Linux and Windows rather than by what the native call happens to report (Windows reported `EINVAL` through `ERROR_INVALID_HANDLE`); repeated close stays `0` | native-boundary |
 | `net.resolve` | `make*` | done (S3c): `err[types.Error]`; `submit`, `submit_runtime` `res[Token, types.Error]`; `cancel` `res[bool, StateError]` (whether it changed the reason); `close`, `destroy`, `resolution_destroy` `err[types.Error]` keeping live resolution storage on failure | resolver-operation |
 | `net.resolve.shared` | `destroy`, `allocate_endpoints`, `set_canonical`, `append_unique`, `deduplicate` | done (S3c): `err[types.Error]` with the allocator's refusal carried as `OUT_OF_MEMORY` (correction above); `error` still constructs an error value; `valid`, `within_limits`, `canonical_fits` unchanged predicates | resolver-operation |
 | `net.resolve.lines` | `open` `err[io_error.Error]`; `next` `res[opt[usize], io_error.Error]` (EOF is `none`, the full line length on success); `close` surfaces cleanup failure | done (S3c) as tabled; a zero capacity is `EINVAL` (correction above) | resolver-lines |
@@ -821,6 +823,121 @@ create it: they are the wrappers' declared contract, independent of the size
 heuristic and of any future growth of a wrapper body. `#[inline]` has no
 effect at `-O0`, by that policy.
 
+## Local byte reception under unwanted rights (S6, std #618 and #415)
+
+`net.local.stream_read` and the local async backend's reads are a byte API. A
+local peer can attach descriptor rights to the bytes, and a kernel that installs
+those rights into the receiver's table on a path that does not report them is
+the resource hole this section closes. The mechanism is per platform, because
+the platforms' kernels disagree on what a receive does with rights.
+
+### Linux: observe under close-on-exec, then close
+
+Measured on this host (a C probe on a `socketpair` and on a bound listener,
+kernel 7.2, before the design was fixed):
+
+| receive | rights installed | reported |
+| --- | ---: | --- |
+| `read` (no control) | 0 | none, `MSG_CTRUNC` unobservable |
+| `recvmsg` with zero-length control | 0 | `MSG_CTRUNC` |
+| `recvmsg(MSG_PEEK)` with adequate control | all | all, and the record stays queued |
+| `recvmsg` with room for two of three | 2 | 2, `MSG_CTRUNC`, the third dropped by the kernel |
+| `recvmsg` with a bad `msg_name` from a bound peer | all | records written, then `-EFAULT`, message consumed |
+| `sendmsg` with 254 rights | refused `EINVAL` | `SCM_MAX_FD` is 253 |
+
+So on Linux a peek externalizes (Darwin's inspect-and-refuse would leak here),
+a plain `read` happens to discard, and the kernel installs nothing it does not
+report: `scm_detach_fds` writes each slot before `fd_install`, unwinds a slot it
+could not write, and drops what does not fit under `MSG_CTRUNC`. The bound per
+receive is `SCM_MAX_FD` (253): `sendmsg` refuses a larger set and a stream
+receive returns at most one set (`unix_stream_read_generic` stops after the
+record that carries it).
+
+The mechanism (`std.system.os.linux.sock_recv_close_rights`, supplied with the
+bound by `local_stream_recv`): `recvmsg(MSG_CMSG_CLOEXEC)` into control storage
+of `LOCAL_CONTROL_CAPACITY` (1088 bytes: `CMSG_SPACE(253 * 4)` plus the
+`SCM_CREDENTIALS` and `SCM_PIDFD` records `SO_PASSCRED` and `SO_PASSPIDFD` can
+prepend, pinned by test), zero-filled before the call; then a walk over the
+storage that closes every descriptor in every `SCM_RIGHTS` and `SCM_PIDFD`
+record, ending at the first header that is not a record. The walk runs whether
+or not the call succeeded, because a failure after externalization (the
+`msg_name` row) leaves the records in our storage but never updates the
+reported length; the zero fill is what makes the storage walkable then. The
+byte count is the outcome: Linux `close` always releases a descriptor whatever
+it reports, so there is no cleanup failure to carry beside the bytes.
+`MSG_CTRUNC` is handled by the kernel invariant above rather than by a branch:
+whatever was truncated was never installed, and everything installed is in the
+storage we walk.
+
+Why not a bigger buffer: the bound is the kernel's, not a guess, so "bigger"
+has no meaning past `SCM_MAX_FD`; a buffer chosen without the bound would
+only move the truncation point. Why not a process-wide descriptor scan: it
+cannot tell a right the peer sent from a descriptor another thread opened
+between the two scans, so it either closes the caller's unrelated descriptors
+or misses the rights; it is also unbounded work per read. The tests inventory
+`/proc/self/fd` because they own every descriptor in their process; production
+never does.
+
+Why not rely on the plain `read` discard: it is a property of `scm_recv`'s
+nil-control path, not a contract a byte API can cite, it is unobservable (no
+`MSG_CTRUNC`), and it cannot serve a caller that does ask for rights. The
+storage-taking primitive is the one shape both callers share: a rights-receiving
+API supplies its own storage and takes the records; the byte API supplies the
+bound and closes them.
+
+### Darwin: inspect, refuse before installing
+
+Native runs on both Darwin architectures (std #415, runs 34164086025 and
+34164821511) showed the kernel installing an unreported descriptor for a nil
+control pointer, for a plain `read`, and for a 12-byte control buffer that
+returned `MSG_CTRUNC`, while an adequate buffer reported it. Darwin has no
+`MSG_CMSG_CLOEXEC`. Its mechanism, landed by S3b from `a230488`, is
+`recvmsg(MSG_PEEK)` with one control header: any control length or
+`MSG_TRUNC | MSG_CTRUNC` refuses with `ENOTSUP` (`UNSUPPORTED`) before anything
+is consumed, otherwise `read` consumes exactly the peeked count. Its limits: a
+peer that attaches rights makes the stream unreadable until the owner closes it
+(the rights stay queued in the socket and close releases them, observed as pipe
+EOF in `test/socket-darwin`); a concurrent consumer through an alias between the
+peek and the read is a violation of the exclusive receive borrow, not a case the
+mechanism covers; and the peek's non-externalization is XNU behavior proven by
+the fixture's unchanged descriptor count, not a documented contract. Converting
+Darwin to observe-and-close would need its own bound (XNU refuses more than
+`UIPC_MAX_CMSG_FD` per record) and a native run this lane cannot execute; it is
+left as is.
+
+### Windows
+
+Local sockets carry no descriptor rights. Reads are plain, and the byte
+contract holds with no mechanism.
+
+### Completion queue wake and close
+
+Nil owner is `EINVAL` on all three platforms (`66e7e3d7`). Wake on a closed
+queue is `EBADF` on all three: Darwin from `kevent` on its `-1` sentinel, Linux
+and Windows now from an explicit check of their own sentinel (`-1` and `0`),
+where Windows used to report `EINVAL` through `ERROR_INVALID_HANDLE`. Repeated
+close is `0` everywhere. Recorded limit: a never-created (zero) `IoQueue` on
+Linux names descriptor 0 for both fields and is not a state the contract
+recognizes; create before use.
+
+### Acceptance (Linux, this host, `mach test .` under the v5 compiler)
+
+Tests in `src/net/local.mach` (`$if` linux), `src/net/async/local/unix.mach`,
+`src/net/async/linux.mach` and `src/system/os.mach`, each counting its own
+`/proc/self/fd` before and after: unwanted rights closed with an unrelated pipe
+verified untouched (numbers and contents); undersized control storage (room for
+two of three, and header-only) closing exactly what the kernel reported;
+pressure (32 rounds of two 253-right messages, then a 100-message burst);
+a hostile nonblocking peer attaching rights to every send of a 256 KiB stream,
+checked byte for byte; a native failure after externalization (`EFAULT` on the
+address destination from a bound peer) with the rights closed and the stream
+still usable; queued async reads completing with the bytes before and after
+the rights arrive; the generic backend refusing a local handle before claiming
+a token. Controls: the close loop dropped fails all six rights tests at their
+count assertions; the walk skipped on native failure fails only the
+externalization test; the Windows `EBADF` check removed fails the queue
+lifecycle test under wine at its wake-after-close step.
+
 ## What the lanes owe
 
 - S2 to S4: migrate the modules in their domain tables to the representations
@@ -839,7 +956,9 @@ effect at `-O0`, by that policy.
   S3b, `9dd151d` owed by S3c).
 - S5 to S8: behavior programs on top of S3's contracts (Darwin boundaries,
   ancillary rights, welded secret I/O, gzip lifecycle); no foundation change.
-  S8 is done: no signature changed, the acceptance is tabled per bullet.
+  S8 is done: no signature changed, the acceptance is tabled per bullet. S6 is
+  done: no signature changed, the mechanism per platform is under "Local byte
+  reception under unwanted rights".
 - C5: the compiler side is done (mach #3226, `8464568d` seeds nothing) and
   std declares the three tags in `std.types.canonical` with the `use` sweep
   (std #617, S1 phase 2). What remains: `std.types.result` and
