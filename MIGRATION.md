@@ -405,6 +405,10 @@ the prefix persisted.
 | `io.file.open_confined`, `read_at`, `write_at`, `map`, `transfer`, `watch_open`, `watch_scan` | `... res[T, io_error.Error]` (`watch_open` answers whether the path exists) | yes |
 | `io.file.adapter.make`, `destroy` | `... err[io_error.Error]` (in place; `destroy` is `EBUSY` with active requests) | yes |
 | `io.file.adapter.submit_read`, `submit_write` | `... res[io_runtime.Token, io_error.Error]`; `shutdown_drain` `res[bool, io_error.Error]`; `shutdown_abort` `res[usize, io_error.Error]` | yes |
+| `io.file.adapter.attach_secret_scratch` | `fun(adapter: *Adapter, scratch: *^u8, scratch_length: usize) err[io_error.Error]` (S7; in place, the storage stays the caller's until `destroy`) | yes |
+| `io.file.adapter.submit_secret_read`, `submit_secret_write` | `fun(adapter, scope, file, buffer: *^u8, length: usize, offset: u64, context: usize) res[io_runtime.Token, io_error.Error]` (S7) | yes |
+| `system.os.secret.Borrow` | `pub rec Borrow { index: u32; generation: u32; }` (S7; `os.SecretBorrow`) | yes |
+| `system.os.secret.borrow_*` | `borrow_open(data: *^u8, size, out: *Borrow) i64`, `borrow_close`, `borrow_size`, `borrow_wipe`, `borrow_fill`, `borrow_drain`, `borrow_copy`, `borrow_read_at(descriptor: i32, borrow, offset, len, file_offset: u64) i64`, `borrow_write_at` (S7; native `i64` boundary, forwarded as `os.secret_borrow_*`) | yes |
 | `io.error.Error` | `pub rec Error { kind: Kind; code: i64; operation: Operation; cleanup_code: i64; }` (`cleanup_code` added by S3b from `feat/618`, zero when no cleanup failed) | yes |
 
 Contract: a reader source or writer sink never spells `eof`, `stalled` or
@@ -693,6 +697,7 @@ the control rests on.
 | `io.file` | `root_open`, `open_confined`, `map`, `transfer`, `watch_*`, `read_at`, `write_at` | done (S3a): `res[T, io_error.Error]` and `err[io_error.Error]` for unit successes; `root_open` in place (correction above); `watch_close` `err[io_error.Error]` | result-payload |
 | `io.file.adapter`, `io.runtime` | every `Result[bool, io_error.Error]` | done (S3a): `err[io_error.Error]`; token-returning submits `res[Token, io_error.Error]`; `close`, `destroy` keep retained-descriptor and queued-completion facts in the error (`EINVAL` versus `EBUSY`) | result-payload |
 | `io.file.posix`, `io.file.windows` | native `i64` | unchanged native boundary (done, S3a) | native-boundary |
+| `io.file.adapter` secret lane | `attach_secret_scratch`, `submit_secret_read`, `submit_secret_write` | done (S7): `err[io_error.Error]` and `res[Token, io_error.Error]` on the frozen public shapes, `*^u8` plus length; the borrow table and positioned transfers in `system.os.secret` are native `i64` | result-payload, native-boundary |
 | `filesystem` | `open`, `create`, `read`, `write`, `seek`, `identity_of`, `identity_link`, `stat_of` | done (S3b): `res[T, io_error.Error]` (`stat_of_error` removed, correction above) | result-payload |
 | | `close`, `sync` | done (S3b): `err[io_error.Error]` | optional-error |
 | | `read_bytes`, `read_string`, `read_dir`, `temp_create` | done (S3b): `res[T, FsError]` with `alloc: allocator.Error` distinct; `stat_of`, `metadata`, `metadata_link` `res[Metadata, io_error.Error]` (correction above); the 16 translation shims are gone | result-payload |
@@ -1070,6 +1075,177 @@ the executable the command line names, the Linux counterpart of
 `windows.running_under_wine`. Native x86_64 runs them (the close-loop
 control fails both there); the production path never takes either shape.
 
+## Welded secret buffers through native completion (S7, std #550 and #618)
+
+A key held in `^`-welded storage can be persisted and reloaded through the
+file completion adapter without becoming public anywhere in the process: not
+in the caller, not in the library, and not in the runtime. The compiler's
+contract (mach `doc/language/secrecy.md`, "Welded-storage pointers", verified
+by N5 in `doc/design/secrecy-final-effects-3126.md` section 1) is what shapes
+the design, so it is stated first.
+
+### The constraint the compiler imposes
+
+A `*^u8` cannot be erased to `ptr`, `usize` or `*u8`, and the check is deep:
+a record with a `*^u8` field anywhere inside it cannot be erased either
+(`std.io.file.adapter.Request`, `Adapter`, `io.runtime.Slot` all are, because
+the worker pool takes a `ptr` task context, the runtime takes a `ptr` source
+context and the cancellation registry takes a `ptr` callback context). So no
+asynchronous mechanism in std can carry a welded pointer to the thread that
+issues the native call, by construction, and no cast is accepted in its place
+(std #550). A `*^u8` reaches native code through exactly two typed shapes,
+the same two the secret OS boundary already uses for `random_fill`: an inline
+asm operand (`mov rsi, {data}`) and an `ext fun` parameter declared `*^u8`.
+
+### The canonical borrow
+
+The canonical welded buffer in std is `*^u8` plus a length (`crypto.ct.zeroize`,
+`os.secret_allocate`, `os.secret_random_fill`); there is no `SecretBytes`
+record, and the welded arms of the adapter take the same shape:
+
+```
+attach_secret_scratch(adapter: *Adapter, scratch: *^u8, scratch_length: usize) err[io_error.Error]
+submit_secret_write(adapter, scope, file, buffer: *^u8, length, offset, context) res[io_runtime.Token, io_error.Error]
+submit_secret_read(adapter, scope, file, buffer: *^u8, length, offset, context)  res[io_runtime.Token, io_error.Error]
+```
+
+A write borrows the caller's storage only for the duration of the call: the
+bytes are copied into the attached welded scratch before it returns, as the
+public `submit_write` copies into the public scratch. A read borrows the
+caller's storage from a successful submission until its completion is
+dequeued, as the public `submit_read` does, and writes it exactly then with
+exactly the delivered prefix. The completion is the ordinary
+`io_runtime.Completion`: `bytes` is the delivered or persisted prefix,
+`has_error` with `error` is the outcome, `end_of_stream` marks a read at the
+end. The public entry points are unchanged in signature and behavior.
+
+### The one place the native pointer escapes
+
+`std.system.os.secret` now holds a **borrow table**: welded storage lent by
+its owner to a public handle `Borrow { index: u32; generation: u32 }`. The
+handle is not an address, cannot be dereferenced, cannot be turned into one,
+and unlocks only secret-to-secret operations: `borrow_fill` (welded in),
+`borrow_drain` (welded out), `borrow_copy` (handle to handle), `borrow_wipe`,
+and the two positioned transfers `borrow_read_at` and `borrow_write_at`. Those
+two are where the pointer leaves the process, as the `pread64`/`pwrite64`
+syscall argument on Linux (inline asm, `{data}` operand), the libSystem
+`pread`/`pwrite` parameter on Darwin (`ext fun` declared `*^u8`) and the
+`ReadFile`/`WriteFile` buffer with an `OVERLAPPED` offset on Windows (`ext
+fun` declared `*^u8`, the descriptor's handle and file pointer pinned by
+`windows.shared.positioned_begin`/`positioned_end`, the discipline the public
+`read_at` and `write_at` now share). Nothing in the boundary yields a `*u8`,
+`ptr` or integer view of a borrow, and `test/backends/verify-ir.py` keeps
+pinning that the boundary's IR materializes no `ptrtoint`/`inttoptr` and that
+the wipe precedes the native release. The table is process-wide and typed
+(its entries hold `*^u8`, so it lives in a `secret_allocate_typed` region and
+grows by doubling under a spinlock), the way a kernel keeps the descriptor
+table and user code keeps integers.
+
+A handle is as capable as the welded pointer it registers, except that it
+cannot be read in-process: code holding one can copy the bytes into welded
+storage it owns or hand them to the kernel, which is what the pointer itself
+allows. The registry does not weaken the type system; it is the typed shape
+of "the operation record the completion queue hands to the kernel".
+
+### How the adapter uses it
+
+`attach_secret_scratch` lends caller-owned welded storage of at least
+`request_capacity * max_transfer` bytes to the adapter (one span per request,
+the public scratch's geometry) and records the handle in the adapter; the
+adapter itself stores no welded pointer and stays a `ptr` context. A secret
+request records its scratch span offset and, for a read, the borrow handle of
+the caller's destination. The worker executes the transfer with
+`os.secret_borrow_read_at`/`write_at` on the scratch span and publishes the
+outcome with `io_runtime.complete` (no runtime copy: the runtime's
+`Operation.buffer` is nil) or `io_runtime.fail`.
+
+A secret request is retired by the later of two arrivals, its resolution on the
+worker (or the abort or refusal path) and the runtime dequeuing its completion
+(`source_release`, which the runtime calls before the caller sees it). The
+dequeue is when a successful read's delivered prefix is copied handle-to-handle
+from the scratch span into the caller's borrow. The retire is when the scratch
+span is wiped and the read borrow ends. Every terminal path arrives exactly
+twice (normal completion, native failure, cancellation before or after the
+worker ran, runtime close, adapter abort, a refused pool submission), because
+the runtime drains exactly one terminal completion per claimed slot; a request
+whose completion never drained stays PUBLISHED and holds `active`, so `destroy`
+reports `EBUSY` rather than freeing a borrow a late dequeue could still write.
+
+### What the caller's storage holds, per outcome
+
+| outcome | read destination | completion |
+| --- | --- | --- |
+| delivered `n > 0` bytes | bytes `0..n` are the file's, bytes `n..length` unchanged | `bytes = n`, no error |
+| end of stream | unchanged | `bytes = 0`, `end_of_stream` |
+| `length == 0` | unchanged | `bytes = 0` |
+| native failure (`EBADF` and the rest) | unchanged | `bytes = 0`, `has_error`, the native kind and `OP_READ` |
+| cancellation or deadline, before or after the transfer ran | unchanged | `bytes = 0`, `CANCELLED` or `TIMEOUT` |
+| runtime close, adapter abort | unchanged | `bytes = 0`, `CLOSED` or `CANCELLED` |
+| submission refused (`res.err`) | unchanged, never borrowed | none |
+
+A write's source storage is never changed by the lane and is not borrowed past
+the submit call; the persisted prefix is `bytes` (a native positioned write of
+a regular file delivers the whole span or fails, and the boundary reports a
+short native count as the prefix without retrying). A refused submission has
+no effect: no runtime slot, no pool task, no scratch content (a write's scratch
+copy made before a runtime refusal is wiped on that path), no borrow.
+
+### Who wipes what, when
+
+- The scratch span of a secret request is wiped by the adapter at retire, the
+  later of the resolution and the dequeue. Both are after the native transfer
+  returned: the worker resolves after its transfer, and the runtime publishes a
+  cancellation of a running request only after the worker quiesced. Native
+  code therefore never sees a span the adapter is wiping.
+- The whole attached scratch is wiped and its borrow ended in `destroy`, after
+  which the caller releases the storage (`os.secret_deallocate` or its own
+  frame). The caller wipes nothing for the adapter and the adapter wipes
+  nothing of the caller's: a read destination is written, never zeroed, and a
+  write source is copied, never zeroed.
+- The boundary's `borrow_close` neither wipes nor frees: a borrow was never
+  owned. `os.secret_deallocate` keeps wiping before releasing, and the IR
+  oracle keeps asserting the order.
+
+The ordering caveat that follows from "later of two arrivals": a caller that
+dequeues a completion may observe the scratch span not yet wiped for the
+instant before the worker's own arrival. `shutdown_drain` joins the workers, so
+after it (and before `destroy`) every span is wiped. Welded typing is a
+secrecy-typing property of the process; it is not encryption at rest and not a
+new durability mechanism: the bytes on disk are the bytes, protected by the
+file's mode and the confined root exactly as a public write's are.
+
+### Acceptance (Linux, this host, `mach test .` under the v5 compiler)
+
+`std.system.os.secret` (six tests): the table's lend, drain, fill, wipe,
+close, stale-handle and growth semantics; handle-to-handle copies; the
+positioned layer retrying `EINTR` within the fill path's budget, giving up at
+it, passing a native failure through, and never touching the span before,
+during or after the provider (the scripted provider sees the pattern, the
+storage keeps it); dead handles and bad spans refused before the kernel.
+`std.io.file.tests` (seven tests): a 16-byte key from `secret_random_fill`
+saved and reloaded byte-equal with no `:>` on key bytes anywhere in the test
+(the only declassification is the one-bit equality verdict) and no public
+copy (the public scratch is checked not to carry the key); every refusal
+(unattached lane `UNSUPPORTED`, undersized or nil scratch, double attach
+`EBUSY`, nil buffer `INVALID`, oversized `RESOURCE_EXHAUSTED`, invalid file,
+cancelled scope `CANCELLED`, after shutdown `CLOSED`) leaving the storage,
+the scratch, the runtime and the file untouched; a read of eight at offset
+three of a six-byte file delivering exactly three with the rest of the
+destination untouched, end of stream, and a zero-length read; a write of five
+at offset two persisting exactly that span; cancellation of a queued read with
+the borrow alive until settlement and the destination untouched; a native
+fault after submission (descriptor 1000000, `EBADF`) on a write and on a read
+with the storage intact and the error precise; secret and public requests in
+one adapter with no crossing. Negative alias: `test/secret/verify.sh` refuses
+`*^u8` to `*u8` at compile time and censuses the borrow API for any `pub fun`
+returning `*u8` or `ptr`.
+
+Controls: the drain-side arrival dropped on a failed completion ("drop the wipe
+on the failure path") fails the native-fault test at its scratch and `active`
+checks; a read resolving `request.length` instead of the native count ("a
+partial read reports full length") fails the prefix test at `bytes` and at the
+untouched tail.
+
 ## What the lanes owe
 
 - S2 to S4: migrate the modules in their domain tables to the representations
@@ -1091,7 +1267,10 @@ control fails both there); the production path never takes either shape.
   ancillary rights, welded secret I/O, gzip lifecycle); no foundation change.
   S8 is done: no signature changed, the acceptance is tabled per bullet. S6 is
   done: no signature changed, the mechanism per platform is under "Local byte
-  reception under unwanted rights".
+  reception under unwanted rights". S7 is done: the public shapes are
+  unchanged and three additive entry points plus the boundary's borrow table
+  are frozen above; the design is under "Welded secret buffers through native
+  completion".
 - C5: the compiler side is done (mach #3226, `8464568d` seeds nothing) and
   std declares the three tags in `std.types.canonical` with the `use` sweep
   (std #617, S1 phase 2). What remains: `std.types.result` and
