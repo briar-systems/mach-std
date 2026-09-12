@@ -594,6 +594,9 @@ module's own return types:
 | `format` | `ERR_SHORT_WRITE`, `write_error_text`, `capacity_exhausted` (the span, measure and test writers report `ENOSPC` natively) | S2 |
 | `derive`, `data.json` | writer callbacks return the typed outcome; no message shim | S2 |
 | `log.sink`, `log` | `ERR_SHORT_WRITE`, `report_write` folding a `WriteError` into a `WriteReport` | S4 |
+| `io.runtime`, `net.resolve`, `io.file.tests` | `transitioned`/`transition_changed`/`scope_changed` folding a refused `cancel.Transition` into the old false (S4a, call-site translation; the runtime and resolver already report their own `io_error`/`types.Error`, so the fold loses nothing a caller could read before) | S3c decides whether `net.resolve` surfaces the `StateError` |
+| `net.resolve` | `reason_code`/`reason_of` mirroring `cancellation.Reason` as the futex-waited integer word (not a carrier shim: the word is the native wait's representation) | stays |
+| `log.record` | `system_now` keeps the zero time for an unreadable clock | S4b |
 
 ## Prepared branches
 
