@@ -758,15 +758,91 @@ the control rests on.
 | `log`, `log.sink` | done (S4b): `WriteReport` retained with offered, persisted, truncation and a closed `WriteStatus` whose failing cases carry the `SinkError` (correction above); convenience functions return it; `logger`, `make`, `custom`, `from_writer`, `console`, `file`, `pipe`, `queued*` `res[Sink\|Logger, SinkError]` with `Direct` and `Queued` initialized in place (address-bound); `queued_close_drain`, `queued_join`, `queued_destroy` `err[SinkError]` preserving undelivered records and the thread failure, `queued_close_abort` `res[usize, SinkError]` (correction above); the `ERR_*` strings are gone |
 | `log.record` | done (S4b): unchanged values; `EncodeStatus` is a closed tag with `EncodeError` on its `failed` case; `NowFun` reports the clock's refusal and `clock_now` answers `Sample` (correction above) |
 
-### Runtime and OS (S4a portable done, S5 Darwin)
+### Runtime and OS (S4a portable done, S5 Darwin done)
 
 | module | representation |
 | --- | --- |
-| `system.os`, `system.os.linux.*`, `system.os.darwin.*`, `system.os.windows.*`, `system.os.shared`, `system.os.secret`, `system.os.darwin.libsystem` | done (S4a, not touched): unchanged native boundary: foreign ABI widths, native constants, negative errno and raw calling conventions; the portable producers above decode them. `allocate`, `deallocate`, `reallocate`, `secret_allocate`, `secret_deallocate` keep nil and `i64` |
+| `system.os`, `system.os.linux.*`, `system.os.darwin.*`, `system.os.windows.*`, `system.os.shared`, `system.os.secret`, `system.os.darwin.libsystem` | done (S4a, not touched): unchanged native boundary: foreign ABI widths, native constants, negative errno and raw calling conventions; the portable producers above decode them. `allocate`, `deallocate`, `reallocate`, `secret_allocate`, `secret_deallocate` keep nil and `i64`. done (S5): every darwin primitive is a libSystem call; no signature changed (the inventory below) |
 | `system.file_identity` | done (S4a, not touched): unchanged predicates and values |
-| `system.panic` | done (S4a, not touched): unchanged |
-| `runtime`, `runtime.linux.*`, `runtime.darwin.*`, `runtime.windows.*` | done (S4a, not touched): unchanged native entry and relocation boundary |
+| `system.panic` | done (S4a, not touched): unchanged. done (S5): the darwin arm is `write(2)` + `_exit(2)` through locally declared libSystem imports, arch-free like the windows arm |
+| `runtime`, `runtime.linux.*`, `runtime.darwin.*`, `runtime.windows.*` | done (S4a, not touched): unchanged native entry and relocation boundary. done (S5): both darwin entry points exit through `_rt_exit` -> `os.terminate` -> `_exit(2)`; the entry contracts (LC_MAIN on arm64, LC_UNIXTHREAD on x86_64) are unchanged |
 | `system.os.tests` | done (S4a): in-tree census tests; no call site needed migration |
+
+#### S5 Darwin remaining-call inventory (std #415)
+
+Taken at std `73de413cd` (S1 to S4a and S8 merged), against every darwin arm
+in `src/system/os/darwin*`, `src/process`, `src/runtime`, `src/net`,
+`src/filesystem`, `src/terminal` and the secret OS boundary. A "raw site" is
+an `svc 0x80` / `syscall` instruction or a `SYS_*` trap number reaching one.
+The census method is the one the backends leg now runs: the emitted darwin
+assembly of every std module (139 files per architecture) and the
+disassembled cross-built Mach-O contain no `svc` or `syscall` instruction on
+either architecture after S5; the pre-S5 image carried twelve.
+
+Common notes that apply to every row below. **errno**: libSystem reports
+failure through each function's documented sentinel (`-1`, `nil`) and leaves
+the number in the thread-local cell `__error()` reaches; the darwin layer
+reads it only after the sentinel fired (`ls.fail_errno`) and keeps its
+outward "negative errno" contract, so nothing above `std.system.os.darwin`
+changed. The pthread family returns its error directly and is negated
+without `fail_errno`. **bootstrap**: every image is dyld-loaded with
+`/usr/lib/libSystem.B.dylib` as its only `LC_LOAD_DYLIB` (spelled by install
+path so it is the same dependency dyld links implicitly), and dyld runs
+libSystem's initializers before `_start` on both entry conventions, so
+libSystem is callable from the first instruction of the runtime.
+**minimum platform**: every symbol S5 binds has been in libSystem since
+10.0; the highest floor anywhere in the darwin layer is 10.12
+(`clock_gettime`, `getentropy`, bound by earlier components); arm64 images carry
+`LC_BUILD_VERSION macos 11.0`, x86_64 images carry no version command. No
+floor moved in S5.
+
+| raw site at `73de413cd` | trap | supported interface (S5) | notes |
+| --- | --- | --- | --- |
+| `darwin.shared.syscall0..6` | the wrappers themselves | deleted after the last caller migrated (`terminate`, `abort`); the `darwin.mach` and per-arch `fwd` lines with them | no consumer outside the darwin layer ever called them |
+| `darwin.shared.fork` (hand-rolled two-register asm) | `SYS_FORK` 2 | `fork(2)` | libSystem's `fork` runs the atfork handlers libSystem registers (malloc, libpthread's per-thread state behind `__error()`), so the child is a process its own libSystem knows about; the raw trap left a child whose libSystem still believed it was the parent. **threading**: only the forking thread exists in the child; everything the child calls before `execve` is on the async-signal-safe list, except `getrlimit`, a lock-free trap wrapper |
+| `darwin.shared.vfork` (asm) | `SYS_VFORK` 66 | `vfork(2)` | kept for surface parity with `system.os.linux`; std has no caller. The wrapper promises the fork contract only; parent suspension is the platform's business |
+| `darwin.shared.exec` | `SYS_EXECVE` 59 | `execve(2)` | returns the negative errno only on failure |
+| `darwin.shared.wait` | `SYS_WAIT4` 7 | `wait4(2)` | `EINTR` retried up to `EINTR_MAX_RETRIES`; status decoding (`posix_status`, the 0x13 continued encoding) unchanged |
+| `darwin.shared.terminate_child` | `SYS_WAITID` 173 + `SYS_KILL` 37 | `waitid(2)` (`P_PID`, `WEXITED\|WNOHANG\|WNOWAIT`) + `kill(2)` | the ownership probe before the signal is unchanged; `siginfo_t` (104 bytes) is passed as opaque storage |
+| `darwin.shared.setpgid`, `getpgid` | 82, 151 | `setpgid(2)`, `getpgid(2)` | `pid_t` is `i32`; the layer's `i64` pids narrow at the boundary |
+| `darwin.shared.terminate_group`, `discard_spawn_child` | `SYS_KILL` 37 | `kill(2)` (negated pgid targets the group) | `ESRCH` on a reaped or absent target preserved |
+| `darwin.shared.close_inherited_fds` | `SYS_GETRLIMIT` 194 + `SYS_CLOSE` 6 | `getrlimit(2)` (`RLIMIT_NOFILE`, `rlimit{u64,u64}`) + `close(2)` | runs in the child; the `RLIM_INFINITY`/`>i32` fallback to 10240 unchanged |
+| `spawn_redirected_in_impl` child side | `SYS_SETPGID`, `SYS_DUP2` x3, `SYS_CHDIR`, `SYS_EXIT` x5 | `setpgid(2)`, `dup2(2)`, `chdir(2)`, `_exit(2)` | exit 126 for a failed redirect, group or chdir, 127 for a failed exec, unchanged; `_exit` so a failed child never runs the parent's handlers |
+| `darwin.shared.getpid` | `SYS_GETPID` 20 | `getpid(2)` | cannot fail |
+| `darwin.shared.terminate` | `SYS_EXIT` 1 | `_exit(2)` | not `exit(3)`: std registers no atexit handlers and the trap ran none; ends every thread, as linux's `exit_group` does. The `hlt`/`brk` after it remains an unreachable guard |
+| `darwin.shared.abort` | `SYS_GETPID` + `SYS_KILL` | `getpid(2)` + `kill(2)` (`SIGABRT`) then `terminate(255)` | a signal death under the default disposition, observed as 128+6 by a shell |
+| `runtime.darwin.aarch64._start` | `svc 0x80` (`x16 = 1`) after `bl main` | `bl _rt_exit` -> `os.terminate` -> `_exit(2)` | `x0` is main's return and `_rt_exit`'s argument; LC_MAIN register convention unchanged |
+| `runtime.darwin.x86_64._start` (both the LC_MAIN and LC_UNIXTHREAD arms) | `syscall` `0x2000001` after `call main` | `call _rt_exit` -> `os.terminate` -> `_exit(2)` | `rsp` is back at the 16-aligned call boundary after `main` returns; the entry-selection by `$mach.build.pie` unchanged |
+| `system.panic` darwin arm (x86_64 and aarch64 asm) | `syscall` `0x2000004` + `0x2000001` / `svc 0x80` 4 + 1 | `write(2)` + `_exit(2)`, declared in the arm | still dependency-free; both are lock-free trap wrappers, so a panic under a held malloc lock or in a signal context still terminates |
+
+Domains that were already on libSystem at `73de413cd`, with the import that
+proves each (all appear as `U` symbols in the cross-built images; the
+backends leg asserts the S5 and directory ones by exact spelling):
+
+| domain | imports | landed |
+| --- | --- | --- |
+| filesystem and descriptors | `openat` (variadic), `read`, `write`, `pread`, `pwrite`, `close`, `fsync`, `lseek`, `fstat`/`fstatat`/`fstatfs` (`$INODE64` on x86_64 only), `flock`, `unlinkat`, `renameat`, `symlink`, `mkdirat`, `faccessat`, `fcntl` (variadic), `fchmod`, `fchmodat`, `umask`, `getcwd`, `pipe` | #462 |
+| directory | `fdopendir`, `readdir` (`$INODE64` on x86_64), `closedir`, `fcntl(F_DUPFD_CLOEXEC)`; errno is cleared before `readdir` because EOF is a nil return that leaves errno alone (S5 pins that with a stale-errno test) | #415 directory component |
+| threads and the address-keyed wait | `pthread_create/join/detach/self/setname_np/getname_np/threadid_np`, `pthread_attr_*`, `pthread_mutex_*`, `pthread_cond_*` (a bucketed table replaces the private `__ulock_*`) | #415 thread component |
+| clocks and sleep | `clock_gettime`, `nanosleep` | #415 time component |
+| signals | `signal` (`ignore_sigpipe`), `sigaction` and `raise` (`process.events`) | #468, events component |
+| virtual memory | `mmap`, `munmap`, `mprotect`, `mlock`, `munlock`, `madvise`, `msync` | `42a28bad` |
+| ordinary entropy | `getentropy` (256-byte chunks) | `64d20f95` |
+| CPU discovery | `sysctlbyname("hw.activecpu")` | `f12675ac` |
+| completion queues | `kqueue`, `kevent` | `cd2d74c0` |
+| sockets, vectors, messages | `socket`, `bind`, `listen`, `accept`, `connect`, `sendto`, `recvfrom`, `shutdown`, `setsockopt`, `getsockopt`, `getsockname`, `getpeername`, `writev`, `sendmsg`, `recvmsg`; `net.local.unix` binds `chmod` and `getpeereid` | `8af976d0` |
+| terminal | `tcgetattr`, `tcsetattr`, `tcflush` | `8ca8f115` |
+| secret OS | `calloc`, `free`, `getentropy`; the typed owners reach `calloc`/`free` through `#[naked]` trampolines (`b _calloc`, `jmp _free`) that branch to the import stub and are not traps. `getentropy` refuses above 256 bytes with `EIO`, which S5 pins as the provider's native failure path | secret component |
+| environment | `environ`/`getenv` read the envp block the entry captured; no call | runtime |
+
+Verification of S5 on this host is cross-build only: `mach build` and the
+test dispatcher for `darwin-x86_64` and `darwin-aarch64`, `test/backends/
+verify.sh` (with the new Mach-O inspection) and `test/darwin/verify.sh
+--build-only`. Execution evidence is CI's two macos jobs, which run the
+native suite (`--include-deps`, 1290 -> 1309 tests on either darwin target;
+the linux count is unchanged at 1266 because every S5 test is
+target-gated), the existing process and terminate-child legs, and the new
+`test/darwin` probe. The suite counts in the pins above are linux counts.
 
 ### Math and SIMD (S2, done)
 
