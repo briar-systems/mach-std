@@ -9,8 +9,9 @@ import sys
 # the census guards one checkout's evidence: a compiler working in another checkout on
 # the same host (a peer worktree, a sibling clone) cannot interleave with this leg's
 # builds, so only processes whose working directory lies under this checkout count. a
-# process whose cwd cannot be read is kept, so a vanished or foreign-user compiler
-# still refuses rather than passing silently. `seen` in the record keeps the unfiltered
+# process whose cwd cannot be read for want of permission is kept, so a foreign-user
+# compiler still refuses rather than passing silently; one that vanished between the
+# listing and the read is gone and does not count. `seen` in the record keeps the unfiltered
 # list for the evidence
 def within_checkout(listing):
     root = Path(__file__).resolve().parents[2]
@@ -19,6 +20,9 @@ def within_checkout(listing):
         pid = line.split(' ', 1)[0]
         try:
             cwd = Path(os.readlink('/proc/' + pid + '/cwd')).resolve()
+        except FileNotFoundError:
+            # the process exited between the listing and this read; it is not running
+            continue
         except OSError:
             kept.append(line)
             continue
