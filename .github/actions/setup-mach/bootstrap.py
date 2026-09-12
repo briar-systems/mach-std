@@ -9,9 +9,14 @@ import tempfile
 
 
 census = runpy.run_path(str(Path(__file__).with_name('census.py')))['census']
+# (name, compiler source, std pin, mode). 'single' stages are one-way bridges built
+# once by the previous compiler. 'fixpoint' stages build A, B and C and require B == C.
+# the chain ends at the v5 migration compiler (mach#3218), which is what compiles
+# this library's v5 syntax; it is reached only through the audited 4.30 fixpoint.
 STAGES = [
-    ('bridge', '878a8f66a90127360dc23de4480241934fc1bf0d', '3ee8e709a8ed7baff6e93780ce9b3582a907a91f'),
-    ('audited', 'b65afb9704218e89998af5f71050ca315e7709a9', '168a9f760d7c0f7a182f3b0685081e62f1a4f682'),
+    ('bridge', '878a8f66a90127360dc23de4480241934fc1bf0d', '3ee8e709a8ed7baff6e93780ce9b3582a907a91f', 'single'),
+    ('audited', 'b65afb9704218e89998af5f71050ca315e7709a9', '168a9f760d7c0f7a182f3b0685081e62f1a4f682', 'fixpoint'),
+    ('v5', 'b4ab85122e30bb24d733a024d549a9a05ef1a2c2', '168a9f760d7c0f7a182f3b0685081e62f1a4f682', 'fixpoint'),
 ]
 
 
@@ -48,25 +53,25 @@ def main():
     record = evidence / 'provenance.json'
     record.write_text(json.dumps(provenance, indent=2), encoding='utf-8')
     with tempfile.TemporaryDirectory(prefix='mach-bootstrap-', dir=os.environ.get('RUNNER_TEMP')) as scratch:
-        for name, source_ref, std_ref in STAGES:
+        for name, source_ref, std_ref, mode in STAGES:
             source = Path(scratch) / name
             subprocess.run(['git', 'clone', '--quiet', 'https://github.com/briar-systems/mach', str(source)], check=True)
             subprocess.run(['git', 'checkout', '--detach', source_ref], cwd=source, check=True)
             subprocess.run(['git', 'submodule', 'update', '--init', '--recursive'], cwd=source, check=True)
             if git(source, 'rev-parse', 'HEAD') != source_ref or git(source / 'dep/std', 'rev-parse', 'HEAD') != std_ref:
                 raise RuntimeError('bootstrap source differs from its committed pins')
-            stage = dict(name=name, compiler=source_ref, std=std_ref, binaries={})
+            stage = dict(name=name, compiler=source_ref, std=std_ref, mode=mode, binaries={})
             provenance['stages'].append(stage)
-            for letter in (['H'] if name == 'bridge' else ['A', 'B', 'C']):
+            for letter in (['H'] if mode == 'single' else ['A', 'B', 'C']):
                 output = source / ('m' + letter + suffix)
                 run(name + '-' + letter, [str(compiler), 'build', '.', '--profile', 'debug', '-o', output.name], source, evidence)
                 stage['binaries'][letter] = digest(output)
                 compiler = output
                 record.write_text(json.dumps(provenance, indent=2), encoding='utf-8')
-            if name == 'audited':
+            if mode == 'fixpoint':
                 compiler = source / ('mB' + suffix)
                 if compiler.read_bytes() != (source / ('mC' + suffix)).read_bytes():
-                    raise RuntimeError('audited compiler B and C differ')
+                    raise RuntimeError(name + ' compiler B and C differ')
                 stage['fixpoint'] = True
             for checkout in [source, source / 'dep/std']:
                 if git(checkout, 'status', '--porcelain', '--untracked-files=no'):
@@ -74,7 +79,7 @@ def main():
         census('bootstrap-complete', evidence)
         installed = destination / ('mach' + suffix)
         shutil.copy2(compiler, installed)
-        provenance.update(fixpoint=True, sha256=digest(installed))
+        provenance.update(fixpoint=all(stage.get('fixpoint', False) for stage in provenance['stages'] if stage['mode'] == 'fixpoint'), sha256=digest(installed))
         record.write_text(json.dumps(provenance, indent=2), encoding='utf-8')
         with Path(os.environ['GITHUB_PATH']).open('a', encoding='utf-8') as output:
             output.write(str(destination) + '\n')
