@@ -67,6 +67,29 @@ owns no bytes and reports no overlap. Range validation uses inclusive endpoints,
 so a one-byte range at `usize::MAX` is valid while any range extending beyond it
 is malformed and reports overlap.
 
+### Local byte-stream receive ownership
+
+A local Stream has one closing owner. Its receive queue must be exclusively
+borrowed across each read, including any raw or duplicated handle aliases.
+Concurrent receive, receive shutdown or close through another alias is invalid.
+Peer writes and operations on unrelated descriptors may run concurrently.
+
+On Darwin, local byte reads inspect without consuming, refuse any ancillary data
+or truncation with `UNSUPPORTED`, and otherwise consume at most the inspected
+byte count. Zero-length reads do not inspect the queue. A refusal leaves the
+socket open and its queued rights owned by that socket. The caller must still
+close the stream. It does not receive descriptors or silently discard rights.
+Native failures retain their cause, and only successful byte counts identify
+valid delivered data. Buffer contents on failure are unspecified.
+
+The local async backend performs inspection and consumption under its existing
+read lane ownership. Its buffer remains borrowed until completion. Refusal
+completes with zero delivered bytes and does not close the stream. The generic
+Darwin async backend accepts only IPv4/IPv6 socket handles, checked before
+registration. Use the local backend for local streams. Raw OS `sock_recv` and
+`sock_receive_message` retain native ancillary behavior and do not provide this
+byte-only contract.
+
 ### Secret-welded operating-system storage
 
 `std.system.os.secret_allocate`, `secret_deallocate`, and

@@ -22,7 +22,7 @@ mach `doc/design/tagged-values.md`; the compiler pin is
 | migration compiler | mach `dev` `b4ab85122e30bb24d733a024d549a9a05ef1a2c2`, built by the 4.30.0 seed (generation A `a881f3c2`) or through std's own bootstrap chain (fixpoint `b1fe8a87`) |
 | std base | `origin/dev` `c373e56` (std 1.0.2) |
 | bootstrap chain | `.github/actions/setup-mach/bootstrap.py`: published 4.26.5, bridge `878a8f66` single, audited `b65afb97` fixpoint, v5 `8464568d` fixpoint (std pin `168a9f76` at every stage). `8464568d` is `9a15ac3a6` plus the seeding removal (mach PR #3278: the compiler no longer seeds `res`, `opt` and `err` and no longer refuses a module that declares them); `9a15ac3a6` is `b4ab85122` plus the darwin build fix (mach PR #3277, the pinned std does not forward `O_NONBLOCK` on darwin) and is language-identical |
-| suite at this phase | 1224 passed, 0 failed under the v5 compiler `8464568d` on linux-x86_64 and linux-riscv64 (qemu) after S2 (1199 after S3a, 1185 at S1 phase 2, 1182 at S1 phase 1 under `9a15ac3a6`, 1157 on the base under both the 4.30.0 seed and the v5 compiler) |
+| suite at this phase | 1241 passed, 0 failed under the v5 compiler `8464568d` on linux-x86_64 after S2 on S3b (1216 after S3b, 1199 after S3a, 1208 after the two `feat/618` filesystem producer fixes landed, 1185 at S1 phase 2, 1182 at S1 phase 1 under `9a15ac3a6`, 1157 on the base under both the 4.30.0 seed and the v5 compiler) |
 
 ## Compiler facts every lane must know
 
@@ -119,6 +119,22 @@ S3a executed its rows as tabled with these corrections:
 | `io.writer.write` when the sink accepts nothing | not tabled | `err{WriteError.stalled{0}}` | the same classification for sinks; `write_all` no longer has to special-case a zero count |
 | `io.runtime.destroy` refusals | "retained facts in the error" | `EINVAL` when the runtime is not closed or already destroyed, `EBUSY` when live operations, queued completions, a native controller or a registered source remain | the two refusals were both `EINVAL`; a caller that must drain before destroying can now tell them apart |
 | `io.file.watch_close` | `err[io_error.Error]` | as tabled (was `bool`) | a never-opened watch is `EINVAL` on `OP_CLOSE` |
+
+S3b executed its rows as tabled with these corrections:
+
+| table row | table target | executed | why |
+| --- | --- | --- | --- |
+| `filesystem.create_dir`, `remove_file`, `remove_dir`, `rename`, `symlink`, `temp_close`, `temp_remove`, `temp_close_and_remove` | `err[FsError]` | `err[io_error.Error]` | one native effect has one cause; wrapping it in the composite tag adds a layer no caller can use (the `types.path` constructors set the precedent: allocation is the only failure, so `allocator.Error` is the type). `temp_close_and_remove` runs both effects and reports the close failure with the removal's code in `cleanup_code` |
+| `filesystem.metadata`, `metadata_link`, `stat_of` | `res[T, io_error.Error\|FsError]` | `res[Metadata, io_error.Error]` | nothing allocates; `stat_of_error`, the typed twin of `stat_of`, is removed rather than kept as a second spelling |
+| `filesystem.exists`, `is_file`, `is_dir`, `is_symlink` | `res[bool, io_error.Error]` | as tabled, with `ENOTDIR` a successful false beside `ENOENT` | a path through a regular file names nothing, which is the question asked; `EACCES` and `ELOOP` are refusals |
+| `filesystem.Metadata.created` | not tabled | `opt[Time]` | the record's absence field is spelled canonically with the module |
+| `filesystem.read_dir`, `read_string`, `read_bytes`, `write_bytes` after a complete transfer | not tabled | a close failure is the outcome (`io` on `OP_CLOSE`) and owns nothing | the bytes are not known to have reached the file; before, `write_bytes` and `read_bytes` discarded it |
+| `filesystem.create_dir_all` | "cannot create directory" | the last creation's `io_error.Error` | the refusal exists and was being erased |
+| `filesystem.transaction.prepare` `write_cb` | `R.Result[R.Void, str]` | `fun(*W, *m_writer.Writer) err[WriteError]` | a producer writes through the writer and its outcome is the writer's frozen tag (`format` and `derive` produce the same, S2); the transaction folds any error into `REJECTED` and reads the sink's own native code first, exactly as before |
+| `filesystem.transaction.validate` `validator` | `R.Result[bool, str]` | `fun(*V, *u8, usize) bool` | false or an error were both `REJECTED`; the answer is a real yes/no |
+| `filesystem.transaction.BackupOutcome.failure`, `cleanup_failure` | not tabled | `err[Error]` fields | the report's two independent outcomes, spelled as the module's unit outcome |
+| `filesystem.transaction.ownership.initialize_claims` | unchanged `i64` | `err[removal.Error]` | `feat/618` `dac63cd` typed it (cursor and cleanup failures are two facts); landed as the canonical spelling. The other ownership operations stay native `i64` |
+| `io.error.Error` | unchanged record | gains `cleanup_code: i64` | `feat/618` `dac63cd`: the first cleanup failure observed beside a primary refusal, zero when none; every existing construction stays valid and S3a's frozen consumers are untouched |
 
 S2 executed its rows as tabled with these corrections:
 
@@ -345,7 +361,7 @@ the prefix persisted.
 | `io.file.open_confined`, `read_at`, `write_at`, `map`, `transfer`, `watch_open`, `watch_scan` | `... res[T, io_error.Error]` (`watch_open` answers whether the path exists) | yes |
 | `io.file.adapter.make`, `destroy` | `... err[io_error.Error]` (in place; `destroy` is `EBUSY` with active requests) | yes |
 | `io.file.adapter.submit_read`, `submit_write` | `... res[io_runtime.Token, io_error.Error]`; `shutdown_drain` `res[bool, io_error.Error]`; `shutdown_abort` `res[usize, io_error.Error]` | yes |
-| `io.error.Error` | unchanged record | yes |
+| `io.error.Error` | `pub rec Error { kind: Kind; code: i64; operation: Operation; cleanup_code: i64; }` (`cleanup_code` added by S3b from `feat/618`, zero when no cleanup failed) | yes |
 
 Contract: a reader source or writer sink never spells `eof`, `stalled` or
 `would_block` itself unless it wants to; it hands over bytes or a native
@@ -355,6 +371,49 @@ the whole prefix (`read_exact` after two partial reads reports the sum).
 buffer whole. `WriteError` and `ReadError` are the domain tags the S2 and S4
 consumers (`format`, `print`, `input`, `terminal`, `log`, `data.json`) import;
 their shapes are frozen by this phase.
+
+### Filesystem (S3b)
+
+| API | signature | frozen |
+| --- | --- | --- |
+| `filesystem.FsError` | `pub tag FsError: u8 { io: io_error.Error; alloc: A.Error; read: ReadError; write: WriteError; removal: removal.Error; exhausted; published: io_error.Error; }` | yes |
+| `filesystem.Metadata` | `pub rec Metadata { kind: Kind; size: usize; mode: u32; modified: Time; accessed: Time; created: opt[Time]; }` | yes |
+| `filesystem.open`, `create` | `... res[File, io_error.Error]` | yes |
+| `filesystem.close` | `fun(f: *File) err[io_error.Error]` (the handle is invalid afterwards whatever the outcome; a closed handle is `EBADF`) | yes |
+| `filesystem.sync` | `fun(f: File) err[io_error.Error]` | yes |
+| `filesystem.read`, `write` | `... res[usize, io_error.Error]`; `seek` `res[i64, io_error.Error]` | yes |
+| `filesystem.identity_of`, `identity_link` | `... res[Identity, io_error.Error]`; `stat_of`, `metadata`, `metadata_link` `res[Metadata, io_error.Error]` | yes |
+| `filesystem.exists`, `is_file`, `is_dir`, `is_symlink` | `fun(p: Path) res[bool, io_error.Error]` (`ENOENT` and `ENOTDIR` are `ok{false}`) | yes |
+| `filesystem.create_dir`, `remove_file`, `remove_dir`, `rename`, `symlink` | `... err[io_error.Error]` | yes |
+| `filesystem.read_bytes` | `fun(a, p) res[Vector[u8], FsError]`; `read_string` `res[str, FsError]` (extent `size + 1`; a shrunk file is `read{eof{delivered}}`) | yes |
+| `filesystem.read_dir` | `fun(a, p) res[Vector[str], FsError]` (names owned by the caller, released whole on failure) | yes |
+| `filesystem.write_bytes` | `fun(p, data, len, mode) err[FsError]` (`write` carries the persisted prefix) | yes |
+| `filesystem.replace_bytes_atomic` | `fun(a, p, data, len, file_mode, dir_mode) err[FsError]` (`published{flush}` after the rename, every other case before it with the destination untouched) | yes |
+| `filesystem.create_dir_all`, `remove_all` | `... err[FsError]` (`remove_all` refuses roots and dot names as `removal` with `containment`) | yes |
+| `filesystem.temp_create` | `fun(a, prefix) res[TempFile, FsError]` (`exhausted` after `TEMP_MAX_ATTEMPTS`) | yes |
+| `filesystem.temp_close`, `temp_remove`, `temp_close_and_remove` | `... err[io_error.Error]` (`temp_close_and_remove` runs both, close first, the removal's code in `cleanup_code`) | yes |
+| `filesystem.reader`, `writer`, `temp_path`, `meta_*`, `identity_equal` | unchanged | yes |
+| `filesystem.removal.Error` | `pub rec Error { code: i64; containment: bool; cleanup_code: i64; }` | yes |
+| `filesystem.removal.tree`, `private_tree` | `fun(dirfd: i32, name: str, removed: *usize, max_depth: usize) err[Error]`; `with_cleanup` `fun(result: err[Error], code: i64) err[Error]` | yes |
+| `filesystem.transaction.Error` | unchanged record (`kind`, `op`, `code`, `cleanup_code`) | yes |
+| `filesystem.transaction` unit effects (`root_open`, `root_open_child`, `root_dnit`, `entry_rename`, `entry_rename_alias`, `entry_unlink`, `entry_rmdir_if_empty`, `lock`, `unlock`, `borrow_worker`, `release_worker`, `claim`, `release_claim`, `inventory_push`, `prepare*`, `validate`, `abort`, `descent_dnit`) | `... err[Error]` (owners initialized in place, as before) | yes |
+| `filesystem.transaction` producers (`root_identity`, `entry_probe`, `root_remove_tree`, `entry_make_dir`, `transaction_staged_identity`, `transaction_staged_child_identity`, `commit`, `commit_replacing_owned`, `recover`, `descend`) | `... res[T, Error]` | yes |
+| `filesystem.transaction.entry_identity` | `res[opt[Identity], Error]`; `entry_read_all` `res[opt[usize], Error]` | yes |
+| `filesystem.transaction.inventory_dnit` | `fun(inv: *Inventory) err[allocator.Error]` | yes |
+| `filesystem.transaction.prepare[W]` | `write_cb: fun(*W, *m_writer.Writer) err[WriteError]`; `validate[V]` `validator: fun(*V, *u8, usize) bool` | yes |
+| `filesystem.transaction.BackupOutcome` | `failure: err[Error]; cleanup_failure: err[Error]` (other fields unchanged) | yes |
+| `filesystem.transaction.commit_with_backup` | unchanged (`BackupOutcome` by value) | yes |
+| `filesystem.transaction.ownership.initialize_claims` | `fun(held: *Lock) err[removal.Error]`; every other ownership operation native `i64` | yes |
+
+Contract: a composite filesystem operation names the step that refused and
+owns nothing on failure; a single native effect reports the native refusal
+with its operation. A cleanup failure never replaces the primary refusal: it
+rides in `io_error.Error.cleanup_code` (or `removal.Error.cleanup_code`) and
+becomes the outcome only when nothing else failed. The transaction's lifetime
+contracts (address-bound roots, locks, claims and workers; consumption of
+every valid prepared transaction by commit or abort; recovery only under the
+coordinator lock with no live claims) are unchanged; only the spelling of the
+outcomes moved.
 
 ## Domain inventory
 
@@ -442,14 +501,15 @@ above. `types.result` and `types.option` remain for the unmigrated consumers.
 | `io.file` | `root_open`, `open_confined`, `map`, `transfer`, `watch_*`, `read_at`, `write_at` | done (S3a): `res[T, io_error.Error]` and `err[io_error.Error]` for unit successes; `root_open` in place (correction above); `watch_close` `err[io_error.Error]` | result-payload |
 | `io.file.adapter`, `io.runtime` | every `Result[bool, io_error.Error]` | done (S3a): `err[io_error.Error]`; token-returning submits `res[Token, io_error.Error]`; `close`, `destroy` keep retained-descriptor and queued-completion facts in the error (`EINVAL` versus `EBUSY`) | result-payload |
 | `io.file.posix`, `io.file.windows` | native `i64` | unchanged native boundary (done, S3a) | native-boundary |
-| `filesystem` | `open`, `create`, `read`, `write`, `seek`, `identity_of`, `identity_link`, `stat_of_error` | `res[T, io_error.Error]` (already typed) | result-payload |
-| | `close`, `sync` | `err[io_error.Error]` | optional-error |
-| | `read_bytes`, `read_string`, `read_dir`, `stat_of`, `metadata`, `metadata_link`, `temp_create` | `res[T, io_error.Error\|FsError]` with `alloc: allocator.Error` distinct (translation shims at the `A.allocate`, `str_copy`, `vector.push` and `path.*` sites, 16 in this module) | result-payload |
-| | `write_bytes`, `replace_bytes_atomic`, `create_dir`, `remove_file`, `remove_dir`, `rename`, `symlink`, `create_dir_all`, `remove_all`, `temp_close`, `temp_remove`, `temp_close_and_remove` | `err[FsError]`; a failure after publication says so (sync after rename is a separate effect) | optional-error |
-| | `exists`, `is_file`, `is_dir`, `is_symlink` | `res[bool, io_error.Error]`: missing is a successful false, a native failure is the error | filesystem-query |
-| `filesystem.removal` | `tree`, `private_tree` | `err[Error]` | optional-error |
-| `filesystem.transaction` | every `O.Option[Error]` | `err[Error]`; `root_identity`, `entry_probe`, `commit`, `recover`, `root_remove_tree`, `descend`, `entry_make_dir` `res[T, Error]`; `entry_identity`, `entry_read_all` keep `res[opt[T], Error]`; `inventory_dnit` `err[allocator.Error]`; Roots, Locks, Claims, Workers keep their stronger lifetime contracts (translation shims at two `str_dup`/`str_copy_slice` sites) | result-payload, optional-error |
-| `filesystem.transaction.ownership` | native `i64` | unchanged (native status decoded by `transaction`) | native-boundary |
+| `filesystem` | `open`, `create`, `read`, `write`, `seek`, `identity_of`, `identity_link`, `stat_of` | done (S3b): `res[T, io_error.Error]` (`stat_of_error` removed, correction above) | result-payload |
+| | `close`, `sync` | done (S3b): `err[io_error.Error]` | optional-error |
+| | `read_bytes`, `read_string`, `read_dir`, `temp_create` | done (S3b): `res[T, FsError]` with `alloc: allocator.Error` distinct; `stat_of`, `metadata`, `metadata_link` `res[Metadata, io_error.Error]` (correction above); the 16 translation shims are gone | result-payload |
+| | `write_bytes`, `replace_bytes_atomic`, `create_dir_all`, `remove_all` | done (S3b): `err[FsError]`; a failure after publication is `published` (the directory flush after the rename is the separate effect) | optional-error |
+| | `create_dir`, `remove_file`, `remove_dir`, `rename`, `symlink`, `temp_close`, `temp_remove`, `temp_close_and_remove` | done (S3b): `err[io_error.Error]` (correction above) | optional-error |
+| | `exists`, `is_file`, `is_dir`, `is_symlink` | done (S3b): `res[bool, io_error.Error]`: a path that names nothing (`ENOENT`, `ENOTDIR`) is a successful false, a native failure is the error | filesystem-query |
+| `filesystem.removal` | `tree`, `private_tree` | done (S3b): `err[Error]`; `with_cleanup` folds a cleanup failure beside the primary | optional-error |
+| `filesystem.transaction` | every `O.Option[Error]` | done (S3b): `err[Error]`; `root_identity`, `entry_probe`, `commit`, `commit_replacing_owned`, `recover`, `root_remove_tree`, `descend`, `entry_make_dir`, the staged identities `res[T, Error]`; `entry_identity`, `entry_read_all` `res[opt[T], Error]`; `inventory_dnit` `err[allocator.Error]`; the writer callback `err[WriteError]` and the validator `bool` (corrections above); Roots, Locks, Claims, Workers keep their stronger lifetime contracts; the two translation shims are gone | result-payload, optional-error |
+| `filesystem.transaction.ownership` | native `i64` | done (S3b): unchanged except `initialize_claims` `err[removal.Error]` (correction above) | native-boundary |
 
 ### Process and network (S3)
 
@@ -533,16 +593,16 @@ phase (33 sites over 15 modules):
 
 | module | sites | lane |
 | --- | ---: | --- |
-| `filesystem` | 16 | S3 |
-| `data.toml` | 8, removed | S2 (done) |
-| `data.json` | 4, removed | S2 (done) |
-| `compress.inflate` | 3, removed | S2 (done) |
+| `filesystem` | 0 (16 removed by S3b) | S3 |
+| `data.toml` | 0 (8 removed by S2) | S2 |
+| `data.json` | 0 (4 removed by S2) | S2 |
+| `compress.inflate` | 0 (3 removed by S2) | S2/S8 |
 | `process.exec` | 2 | S3 |
 | `process.env` | 2 | S3 |
-| `format` | 2, removed | S2 (done) |
-| `filesystem.transaction` | 2, plus `sprint_text` around `format.sprint` (7 call sites, added by S2) | S3 |
-| `encoding.binary` | 1, removed | S2 (done) |
-| `compress.zlib`, `compress.gzip` | 1 each, removed | S2 (done) |
+| `format` | 0 (2 removed by S2) | S2 |
+| `filesystem.transaction` | 0 (2 removed by S3b), plus `sprint_text` around `format.sprint` (7 call sites, added by S2) | S3 |
+| `encoding.binary` | 0 (1 removed by S2) | S2 |
+| `compress.zlib`, `compress.gzip` | 0 (1 each removed by S2) | S2/S8 |
 | `net.resolve`, `net.resolve.shared` | 0 (typed `types.Error` and `bool` already) | S3 |
 
 The `system.os.*` hits of that string are the OS layer's own native
@@ -556,28 +616,29 @@ module's own return types:
 
 | module | shim | lane |
 | --- | --- | --- |
-| `filesystem` | `ERR_EOF`, `read_error_text`, `write_error_text` (the reader/writer callbacks now return the typed outcome; `read_bytes`, `read_string`, `write_bytes`, `replace_bytes_atomic` translate) | S3b |
-| `filesystem.transaction` | `write_error_text` around `sink_write`, `bytes_write_cb`, `write_subtree_file` | S3b |
+| `filesystem`, `filesystem.transaction` | removed by S3b (`FsError.read`/`write` carry the reader and writer tags whole; the transaction's writer callback returns `err[WriteError]`) | done |
+| `process.exec` | `file_exists` around `filesystem.is_file` (a query the platform cannot answer reads as absent) | S3c |
 | `process.exec` | `read_error_text` around `read_all` in `output` | S3c |
 | `process.events`, `net.async`, `net.async.local`, `net.resolve` | `runtime_ok_*` predicates and `res`/`canonical.err` bindings at every `io_runtime` call; `net.async.wait` and `process.events.begin_runtime_drain` re-wrap the runtime's `res` in their `Result` | S3c |
 | `input` | `ERR_EOF`, `read_error_text` in `read_line_from` | removed (S2): `InputError` nests the `ReadError` |
 | `format` | `ERR_SHORT_WRITE`, `write_error_text` | removed (S2): `WriteError` is the outcome; `capacity_exhausted` stays as the span sink's native `ENOSPC` report (correction above) |
 | `derive`, `data.json` | writer callbacks return the typed outcome; no message shim | done (S2) |
-| `filesystem.transaction` | `sprint_text` spelling `format.sprint`'s `FormatError` as `R.Result[str, str]` (`"out of memory"`) at seven call sites | S3b |
+| `filesystem.transaction` | `sprint_text` spelling `format.sprint`'s `FormatError` as `R.Result[str, str]` (`"out of memory"`) at seven call sites, left by S2 after S3b | S3c |
 | `log.sink`, `log` | `ERR_SHORT_WRITE`, `report_write` folding a `WriteError` into a `WriteReport` | S4 |
 
 ## Prepared branches
 
 - `origin/feat/618` (four commits): `dac63cd` directory cursors across native
-  backends, `9dd151d` process status and wait ownership (typed `exec.Error`,
-  full Windows exit codes), `66d545c` complete manifest profiles, `a230488`
-  byte-socket and directory-root ownership. `66d545c` is superseded: std 1.0.2
-  on `dev` already declares both profiles (and `{artifact.suffix}` landed with
-  mach #3222). The other three are S3's producer contracts (`exec.Error`,
-  `RemovalError`, typed `read_dir`); nothing in S1 depends on them. When
-  rebased they adopt the frozen signatures above (`vector.push`,
-  `A.allocate`, `str_dup`, `path.*`) and spell their carriers as `res`, `opt`
-  and `err` (`R.Result[ExitStatus, Error]` becomes `res[ExitStatus, Error]`,
+  backends and `a230488` byte-socket and directory-root ownership are landed
+  by S3b on the frozen signatures (the directory batch test seeks before its
+  first scan because btrfs hides entries created after the descriptor was
+  opened until a seek; `a230488`'s changelog line for process waits belongs
+  to `9dd151d` and was not taken). `9dd151d` process status and wait
+  ownership (typed `exec.Error`, full Windows exit codes) is S3c's. `66d545c`
+  is superseded: std 1.0.2 on `dev` already declares both profiles (and
+  `{artifact.suffix}` landed with mach #3222). When rebased, `9dd151d` adopts
+  the frozen signatures above and spells its carriers as `res`, `opt` and
+  `err` (`R.Result[ExitStatus, Error]` becomes `res[ExitStatus, Error]`,
   `O.Option[ExitStatus]` becomes `opt[ExitStatus]`).
 - `origin/feat/mach-3110` (`ad7add3` on top of feat/618): the eight
   `sync.atomic` inline annotations. Orthogonal to S1; lands with N6 under S4.
@@ -589,14 +650,15 @@ module's own return types:
   recorded here and in the S0 census, remove the translation shims listed
   above, and declare the domain error tags named in the tables (`ParseError`,
   `WriteError`, `EncodeError`, `JsonError`, `TomlError`, `InflateError`,
-  `FsError`, `EnvError`, `StateError`, `ThreadError`, `SinkError`,
-  `TermError`), each nesting `allocator.Error` where allocation is one of its
-  causes. S2 is done: `ParseError`, `FormatError`, `InputError`,
-  `EncodeError`, `DecodeError`, `JsonError`, `TomlError`, `InflateError` and
-  `Defect` are frozen above, and S8 inherits the compression lifecycle on
-  those shapes.
+  `FsError` (declared by S3b), `EnvError`, `StateError`, `ThreadError`,
+  `SinkError`, `TermError`), each nesting `allocator.Error` where allocation
+  is one of its causes. S2 is done: `ParseError`, `FormatError`,
+  `InputError`, `EncodeError`, `DecodeError`, `JsonError`, `TomlError`,
+  `InflateError` and `Defect` are frozen above, and S8 inherits the
+  compression lifecycle on those shapes.
 - S3 owns the operation and error contracts S5 to S7 consume, and lands
-  `feat/618`'s three producer fixes on the frozen foundations.
+  `feat/618`'s three producer fixes on the frozen foundations (two landed by
+  S3b, `9dd151d` owed by S3c).
 - S5 to S8: behavior programs on top of S3's contracts (Darwin boundaries,
   ancillary rights, welded secret I/O, gzip lifecycle); no foundation change.
 - C5: the compiler side is done (mach #3226, `8464568d` seeds nothing) and

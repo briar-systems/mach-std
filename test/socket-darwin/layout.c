@@ -27,6 +27,7 @@ CHECK(sendmsg, ssize_t (*)(int, const struct msghdr *, int));
 CHECK(recvmsg, ssize_t (*)(int, struct msghdr *, int));
 
 _Static_assert(SCM_RIGHTS == 1 && SOL_SOCKET == 0xffff, "rights header constants");
+_Static_assert(MSG_PEEK == 0x2 && sizeof(struct cmsghdr) == 12 && _Alignof(struct cmsghdr) == 4, "peek header ABI");
 _Static_assert(MSG_TRUNC == 0x10 && MSG_CTRUNC == 0x20, "message truncation flags");
 _Static_assert(AF_UNIX == 1, "local socket family");
 
