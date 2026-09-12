@@ -7,6 +7,7 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
 use std.types.string.str_equals;
+use std.types.canonical.res;
 use std.chrono.time;
 use std.chrono.time.Time;
 use std.chrono.date.Datetime;
@@ -16,11 +17,6 @@ use io_error: std.io.error;
 
 pub val MAX_RECORD_BYTES: usize = 8192;
 pub val MIN_TRUNCATED_BYTES: usize = 15;
-
-pub val ERR_INVALID_RECORD: str = "ERR_INVALID_RECORD";
-pub val ERR_RECORD_TOO_LARGE: str = "ERR_RECORD_TOO_LARGE";
-pub val ERR_BUFFER_TOO_SMALL: str = "ERR_BUFFER_TOO_SMALL";
-pub val ERR_LIMIT_TOO_SMALL: str = "ERR_LIMIT_TOO_SMALL";
 
 pub def Level: u8;
 pub val DEBUG: Level = 0;
@@ -39,7 +35,21 @@ pub def ClockOwnership: u8;
 pub val CLOCK_CONTEXT_NONE:     ClockOwnership = 0;
 pub val CLOCK_CONTEXT_BORROWED: ClockOwnership = 1;
 
-pub def NowFun: fun(ptr) Time;
+# a clock source samples the current time or reports why it could not
+pub def NowFun: fun(ptr) time.Clock;
+
+# every way a sample can fail
+# ---
+# invalid: the clock has no source, an unknown precision or an ownership that
+#          does not match its context
+# read:    the source refused; payload is its native failure
+pub tag ClockError: u8 {
+    invalid;
+    read: io_error.Error;
+}
+
+# the outcome of one sample, normalized to the clock's precision
+pub def Sample: res[Time, ClockError];
 
 # the clock context is borrowed and must outlive every logger using it
 pub rec Clock {
@@ -90,17 +100,38 @@ pub def OversizePolicy: u8;
 pub val OVERSIZE_REJECT:   OversizePolicy = 0;
 pub val OVERSIZE_TRUNCATE: OversizePolicy = 1;
 
-pub def EncodeStatus: u8;
-pub val ENCODED:          EncodeStatus = 0;
-pub val ENCODED_TRUNCATED: EncodeStatus = 1;
-pub val ENCODE_REJECTED:  EncodeStatus = 2;
-pub val ENCODE_INVALID:   EncodeStatus = 3;
+# every way an encoding can fail; nothing is emitted on any of them
+# ---
+# invalid: the record, policy, limit or buffer arguments are not encodable
+# buffer:  the caller's buffer cannot hold the encoding; payload is the bytes
+#          the full record needs
+# limit:   the truncation limit is below MIN_TRUNCATED_BYTES
+pub tag EncodeError: u8 {
+    invalid;
+    buffer: usize;
+    limit;
+}
 
+# the outcome of one encoding
+# ---
+# encoded:   the full record was emitted
+# truncated: whole leading tokens and a truncated=true marker were emitted
+# rejected:  the record exceeds the limit under OVERSIZE_REJECT; nothing was
+#            emitted and Encoded.required carries its size
+# failed:    the encoding could not proceed
+pub tag EncodeStatus: u8 {
+    encoded;
+    truncated;
+    rejected;
+    failed: EncodeError;
+}
+
+# len is the bytes emitted; required is the full record's size whenever the
+# record was valid enough to measure, zero otherwise
 pub rec Encoded {
     status:   EncodeStatus;
     len:      usize;
     required: usize;
-    error:    str;
 }
 
 rec Cursor {
@@ -111,12 +142,8 @@ rec Cursor {
     valid:   bool;
 }
 
-# the log clock keeps its zero-time convention for an unreadable clock
-# (clock_now does the same for an invalid clock); S4b migrates the surface
-fun system_now(ctx: ptr) Time {
-    val current: time.Clock = time.now();
-    if (sel current.ok) { ret current.ok; }
-    ret Time{sec: 0, nsec: 0};
+fun system_now(ctx: ptr) time.Clock {
+    ret time.now();
 }
 
 pub fun system_clock(precision: Precision) Clock {
@@ -144,9 +171,12 @@ pub fun clock_valid(c: *Clock) bool {
     ret c.ownership == CLOCK_CONTEXT_BORROWED;
 }
 
-pub fun clock_now(c: *Clock) Time {
-    if (!clock_valid(c)) { ret Time{sec: 0, nsec: 0}; }
-    ret normalize_time(c.f_now(c.ctx), c.precision);
+# sample the clock; a failed clock is never zero time
+pub fun clock_now(c: *Clock) Sample {
+    if (!clock_valid(c)) { ret Sample.err{ClockError.invalid{}}; }
+    val current: time.Clock = c.f_now(c.ctx);
+    if (sel current.err) { ret Sample.err{ClockError.read{current.err}}; }
+    ret Sample.ok{normalize_time(current.ok, c.precision)};
 }
 
 pub fun record_at(timestamp: Time, precision: Precision, level: Level, message: str, fields: *Field, field_count: usize) Record {
@@ -450,8 +480,12 @@ fun write_token(c: *Cursor, record: *Record, kind: u8, index: usize, first: bool
     or { field_token(c, ?record.fields[index], first); }
 }
 
-fun encoded(status: EncodeStatus, len: usize, required: usize, error: str) Encoded {
-    ret Encoded{status: status, len: len, required: required, error: error};
+fun encoded(status: EncodeStatus, len: usize, required: usize) Encoded {
+    ret Encoded{status: status, len: len, required: required};
+}
+
+fun encode_failed(error: EncodeError, required: usize) Encoded {
+    ret encoded(EncodeStatus.failed{error}, 0, required);
 }
 
 # encode one record into caller-owned storage
@@ -460,36 +494,36 @@ fun encoded(status: EncodeStatus, len: usize, required: usize, error: str) Encod
 # truncated=true, so the result remains a complete logfmt line.
 pub fun encode(record: *Record, data: *u8, cap: usize, limit: usize, policy: OversizePolicy) Encoded {
     if (!record_valid(record) || policy > OVERSIZE_TRUNCATE) {
-        ret encoded(ENCODE_INVALID, 0, 0, ERR_INVALID_RECORD);
+        ret encode_failed(EncodeError.invalid{}, 0);
     }
     if (limit == 0 || limit > MAX_RECORD_BYTES) {
-        ret encoded(ENCODE_INVALID, 0, 0, ERR_INVALID_RECORD);
+        ret encode_failed(EncodeError.invalid{}, 0);
     }
     if (cap > 0 && data == nil) {
-        ret encoded(ENCODE_INVALID, 0, 0, ERR_INVALID_RECORD);
+        ret encode_failed(EncodeError.invalid{}, 0);
     }
 
     var sizing: Cursor = cursor(nil, 0);
     full_record(?sizing, record);
-    if (!sizing.valid) { ret encoded(ENCODE_INVALID, 0, 0, ERR_INVALID_RECORD); }
+    if (!sizing.valid) { ret encode_failed(EncodeError.invalid{}, 0); }
     val required: usize = sizing.len;
 
     if (required <= limit) {
-        if (required > cap) { ret encoded(ENCODE_INVALID, 0, required, ERR_BUFFER_TOO_SMALL); }
+        if (required > cap) { ret encode_failed(EncodeError.buffer{required}, required); }
         var output: Cursor = cursor(data, cap);
         full_record(?output, record);
-        if (!output.valid) { ret encoded(ENCODE_INVALID, 0, required, ERR_BUFFER_TOO_SMALL); }
-        ret encoded(ENCODED, output.written, required, nil);
+        if (!output.valid) { ret encode_failed(EncodeError.buffer{required}, required); }
+        ret encoded(EncodeStatus.encoded{}, output.written, required);
     }
 
     if (policy == OVERSIZE_REJECT) {
-        ret encoded(ENCODE_REJECTED, 0, required, ERR_RECORD_TOO_LARGE);
+        ret encoded(EncodeStatus.rejected{}, 0, required);
     }
     if (limit < MIN_TRUNCATED_BYTES) {
-        ret encoded(ENCODE_INVALID, 0, required, ERR_LIMIT_TOO_SMALL);
+        ret encode_failed(EncodeError.limit{}, required);
     }
     if (limit > cap) {
-        ret encoded(ENCODE_INVALID, 0, required, ERR_BUFFER_TOO_SMALL);
+        ret encode_failed(EncodeError.buffer{required}, required);
     }
 
     var output: Cursor = cursor(data, cap);
@@ -526,9 +560,9 @@ pub fun encode(record: *Record, data: *u8, cap: usize, limit: usize, policy: Ove
     if (first) { put_str(?output, "truncated=true\n"); }
     or { put_str(?output, " truncated=true\n"); }
     if (!output.valid || output.written > limit) {
-        ret encoded(ENCODE_INVALID, 0, required, ERR_BUFFER_TOO_SMALL);
+        ret encode_failed(EncodeError.buffer{required}, required);
     }
-    ret encoded(ENCODED_TRUNCATED, output.written, required, nil);
+    ret encoded(EncodeStatus.truncated{}, output.written, required);
 }
 
 fun bytes_equal(data: *u8, len: usize, expected: str) bool {
@@ -557,14 +591,17 @@ test "log.record: typed fields encode after timestamp capture" {
     var record: Record = record_at(time.unix(0, 123456789), PRECISION_MILLIS, INFO, "hello\nworld", ?fields[0], 6);
     var output: [512]u8;
     val result: Encoded = encode(?record, (?output)::*u8, 512, 512, OVERSIZE_REJECT);
-    if (result.status != ENCODED) { ret 1; }
+    if (!sel result.status.encoded) { ret 1; }
     val expected: str = "timestamp=1970-01-01T00:00:00.123000000Z level=INFO message=\"hello\\nworld\" signed=-7 unsigned=9 ready=true body=0x00abff name=\"a\\\"b\" cause=error(kind=12,code=-22,operation=4,message=\"invalid argument\")\n";
     if (!bytes_equal((?output)::*u8, result.len, expected)) { ret 2; }
 
     var reserved: [1]Field;
     reserved[0] = field_bool("truncated", false);
     var invalid: Record = record_at(time.unix(0, 0), PRECISION_SECONDS, INFO, "reserved", ?reserved[0], 1);
-    if (encode(?invalid, (?output)::*u8, 512, 512, OVERSIZE_REJECT).status != ENCODE_INVALID) { ret 3; }
+    val refused: Encoded = encode(?invalid, (?output)::*u8, 512, 512, OVERSIZE_REJECT);
+    if (!sel refused.status.failed) { ret 3; }
+    if (!sel refused.status.failed.invalid) { ret 4; }
+    if (refused.len != 0 || refused.required != 0) { ret 5; }
     ret 0;
 }
 
@@ -573,36 +610,93 @@ test "log.record: reject and truncate policies are deterministic" {
     var output: [128]u8;
 
     val rejected: Encoded = encode(?record, (?output)::*u8, 128, 64, OVERSIZE_REJECT);
-    if (rejected.status != ENCODE_REJECTED || rejected.len != 0 || rejected.required <= 64) { ret 1; }
+    if (!sel rejected.status.rejected) { ret 1; }
+    if (rejected.len != 0 || rejected.required <= 64) { ret 2; }
 
     val truncated: Encoded = encode(?record, (?output)::*u8, 128, 64, OVERSIZE_TRUNCATE);
-    if (truncated.status != ENCODED_TRUNCATED || truncated.len > 64 || truncated.required != rejected.required) { ret 2; }
-    if (!bytes_equal((?output)::*u8, truncated.len, "timestamp=1970-01-01T00:00:00Z level=WARN truncated=true\n")) { ret 3; }
+    if (!sel truncated.status.truncated) { ret 3; }
+    if (truncated.len > 64 || truncated.required != rejected.required) { ret 4; }
+    if (!bytes_equal((?output)::*u8, truncated.len, "timestamp=1970-01-01T00:00:00Z level=WARN truncated=true\n")) { ret 5; }
 
     var minimum: [MIN_TRUNCATED_BYTES]u8;
     val minimal: Encoded = encode(?record, (?minimum)::*u8, MIN_TRUNCATED_BYTES, MIN_TRUNCATED_BYTES, OVERSIZE_TRUNCATE);
-    if (minimal.status != ENCODED_TRUNCATED || !bytes_equal((?minimum)::*u8, minimal.len, "truncated=true\n")) { ret 4; }
+    if (!sel minimal.status.truncated) { ret 6; }
+    if (!bytes_equal((?minimum)::*u8, minimal.len, "truncated=true\n")) { ret 7; }
+    ret 0;
+}
+
+test "log.record: encode failures name their cause and carry the required size" {
+    var record: Record = record_at(time.unix(0, 0), PRECISION_SECONDS, WARN, "a message too large for the configured record budget", nil, 0);
+    var output: [128]u8;
+
+    # the buffer is smaller than the full record under a limit that admits it
+    val small: Encoded = encode(?record, (?output)::*u8, 32, 128, OVERSIZE_REJECT);
+    if (!sel small.status.failed) { ret 1; }
+    if (!sel small.status.failed.buffer) { ret 2; }
+    if (small.status.failed.buffer != small.required || small.required <= 32 || small.len != 0) { ret 3; }
+
+    # the truncation limit cannot hold the marker
+    val tight: Encoded = encode(?record, (?output)::*u8, 128, MIN_TRUNCATED_BYTES - 1, OVERSIZE_TRUNCATE);
+    if (!sel tight.status.failed) { ret 4; }
+    if (!sel tight.status.failed.limit) { ret 5; }
+    if (tight.required != small.required || tight.len != 0) { ret 6; }
+
+    # a limit above the buffer under truncation is the buffer's fault
+    val over: Encoded = encode(?record, (?output)::*u8, 32, 64, OVERSIZE_TRUNCATE);
+    if (!sel over.status.failed) { ret 7; }
+    if (!sel over.status.failed.buffer) { ret 8; }
+
+    # a zero limit and an oversize policy are argument faults with no size
+    val zero: Encoded = encode(?record, (?output)::*u8, 128, 0, OVERSIZE_REJECT);
+    if (!sel zero.status.failed) { ret 9; }
+    if (!sel zero.status.failed.invalid) { ret 10; }
+    if (zero.required != 0) { ret 11; }
+    val policy: Encoded = encode(?record, (?output)::*u8, 128, 128, (OVERSIZE_TRUNCATE + 1)::OversizePolicy);
+    if (!sel policy.status.failed) { ret 12; }
+    if (!sel policy.status.failed.invalid) { ret 13; }
     ret 0;
 }
 
 rec TestClock {
     calls: i64;
     value: Time;
+    code:  i64;
 }
 
-fun test_now(ctx: ptr) Time {
+fun test_now(ctx: ptr) time.Clock {
     val source: *TestClock = ctx::*TestClock;
     source.calls = source.calls + 1;
-    ret source.value;
+    if (source.code != 0) { ret time.Clock.err{io_error.from_code(source.code, io_error.OP_READ)}; }
+    ret time.Clock.ok{source.value};
 }
 
 test "log.record: clock source precision and ownership are explicit" {
     var system: Clock = system_clock(PRECISION_NANOS);
     if (system.ownership != CLOCK_CONTEXT_NONE || !clock_valid(?system)) { ret 1; }
-    var source: TestClock = TestClock{calls: 0, value: time.unix(10, 987654321)};
+    var source: TestClock = TestClock{calls: 0, value: time.unix(10, 987654321), code: 0};
     var c: Clock = clock(?source, test_now, PRECISION_MICROS);
     if (c.ownership != CLOCK_CONTEXT_BORROWED || !clock_valid(?c)) { ret 2; }
-    val sampled: Time = clock_now(?c);
-    if (source.calls != 1 || sampled.sec != 10 || sampled.nsec != 987654000) { ret 3; }
+    val sampled: Sample = clock_now(?c);
+    if (sel sampled.err) { ret 3; }
+    if (source.calls != 1 || sampled.ok.sec != 10 || sampled.ok.nsec != 987654000) { ret 4; }
+    val live: Sample = clock_now(?system);
+    if (sel live.err) { ret 5; }
+    ret 0;
+}
+
+test "log.record: a refused or invalid clock is reported, never zero time" {
+    var source: TestClock = TestClock{calls: 0, value: time.unix(10, 0), code: -5};
+    var c: Clock = clock(?source, test_now, PRECISION_SECONDS);
+    val refused: Sample = clock_now(?c);
+    if (!sel refused.err) { ret 1; }
+    if (!sel refused.err.read) { ret 2; }
+    if (refused.err.read.code != -5 || refused.err.read.operation != io_error.OP_READ) { ret 3; }
+    if (source.calls != 1) { ret 4; }
+
+    var invalid: Clock = clock(?source, test_now, (PRECISION_NANOS + 1)::Precision);
+    val unsampled: Sample = clock_now(?invalid);
+    if (!sel unsampled.err) { ret 5; }
+    if (!sel unsampled.err.invalid) { ret 6; }
+    if (source.calls != 1) { ret 7; }
     ret 0;
 }

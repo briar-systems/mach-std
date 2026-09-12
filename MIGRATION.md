@@ -22,7 +22,7 @@ mach `doc/design/tagged-values.md`; the compiler pin is
 | migration compiler | mach `dev` `b4ab85122e30bb24d733a024d549a9a05ef1a2c2`, built by the 4.30.0 seed (generation A `a881f3c2`) or through std's own bootstrap chain (fixpoint `b1fe8a87`) |
 | std base | `origin/dev` `c373e56` (std 1.0.2) |
 | bootstrap chain | `.github/actions/setup-mach/bootstrap.py`: published 4.26.5, bridge `878a8f66` single, audited `b65afb97` fixpoint, v5 `8464568d` fixpoint (std pin `168a9f76` at every stage). `8464568d` is `9a15ac3a6` plus the seeding removal (mach PR #3278: the compiler no longer seeds `res`, `opt` and `err` and no longer refuses a module that declares them); `9a15ac3a6` is `b4ab85122` plus the darwin build fix (mach PR #3277, the pinned std does not forward `O_NONBLOCK` on darwin) and is language-identical |
-| suite at this phase | 1259 passed, 0 failed under the v5 compiler `8464568d` on linux-x86_64 after S8 on S3c (1256 after S3c on S2, 1241 after S2, 1216 after S3b, 1199 after S3a, 1208 after the two `feat/618` filesystem producer fixes landed, 1185 at S1 phase 2, 1182 at S1 phase 1 under `9a15ac3a6`, 1157 on the base under both the 4.30.0 seed and the v5 compiler) |
+| suite at this phase | 1278 passed, 0 failed under the v5 compiler `8464568d` on linux-x86_64 after S4b on S4a and S8 (1266 after S4a on S8, 1259 after S8 on S3c, 1256 after S3c on S2, 1241 after S2, 1216 after S3b, 1199 after S3a, 1208 after the two `feat/618` filesystem producer fixes landed, 1185 at S1 phase 2, 1182 at S1 phase 1 under `9a15ac3a6`, 1157 on the base under both the 4.30.0 seed and the v5 compiler) |
 
 ## Compiler facts every lane must know
 
@@ -186,6 +186,21 @@ S3c executed its rows as tabled with these corrections:
 | `sync.worker_pool.Status` | a closed tag | as proposed, `spawn_failed` and `join_failed` carry the `ThreadError` | the census prose asks the pool to preserve native refusals; `last_thread_error` still returns the `i64` code, 0 when none |
 | `sync.condition.WaitStatus` | a closed tag | `{ invalid; failed: i64; timed_out; notified; }` | a refused native wait keeps its code instead of collapsing into one failure case |
 | `chrono.time.now`, `monotonic` | `res[Time, io_error.Error]` | as proposed, spelled `time.Clock`; the error is `from_code(code, OP_READ)` | |
+
+## S4b corrections to the S0 census
+
+| census row | census target | executed | why |
+| --- | --- | --- | --- |
+| `log.sink.WriteReport.error` | `WriteReport` retained "with failure" | `error: str` removed; `WriteStatus` is a closed tag whose `partial`, `failed` and `rejected` cases carry the `SinkError`, and `cause(report)` answers `opt[SinkError]` | the failure had to become typed to remove the `report_write` shim, and a status-plus-optional-error pair lets a report claim `persisted` with an error or `failed` without one (three of the eighteen rows of the old report matrix tested exactly those lies); with the cause riding on the case they cannot be spelled |
+| `log.sink.queued_close_abort` | `err[SinkError]` with the `rejected_len` output pointer | `res[usize, SinkError]` (`Aborted`), the output pointer removed | the transferred count is the operation's value; a refused abort (storage too small) is `invalid` and leaves every record queued |
+| `log.sink.queued_close_drain` | `err[SinkError]` | as tabled; close is idempotent, the "already closed" boolean is not reported | a second drain changes nothing and refuses nothing; `queued_join` is the call whose state matters |
+| `log.sink.queued_join` | `err[SinkError]` "preserving thread failure" | as tabled; a failed native join is recorded as `thread: ThreadError` and replayed to every later joiner instead of re-joining the worker | the old code re-entered `thread.join` after a failure, which is invalid on a joined-or-failed handle; `queued_thread_error` still answers the `i64` code (0 when none, `ERROR_INVALID` for a sink never made) |
+| `log.sink.queued_destroy` refusals | `err[SinkError]` | `unjoined` before a completed join, `busy` while joiners wait, `queue: channel.StateError` when the channel refuses | three refusals were one `false` |
+| `log.record.NowFun`, `clock_now` | "unchanged values" (S4a left the question to S4b) | `NowFun` returns `time.Clock`; `clock_now` returns `Sample` = `res[Time, ClockError]` with `invalid` for a malformed clock and `read: io_error.Error` for a source that refused; `log.write` and the global `log_msg` fail the write with `SinkError.clock` and publish nothing | a failed clock is never zero time (the S4a clock rule); a record is never given a timestamp it did not have. `write_at` takes a caller timestamp and needs no clock |
+| `log.record.Encoded.error` | `EncodeStatus` a closed tag | `error: str` removed with the four `ERR_*` messages; `EncodeStatus` is `{ encoded; truncated; rejected; failed: EncodeError }` and `EncodeError` is `{ invalid; buffer: usize; limit; }` | `rejected` is the reject policy's outcome, not a failure; the failure cases nest so `SinkError.encode` can carry them without carrying the success cases |
+| `log.sink.SinkError.contract` | one `invalid` | `invalid` (nil, uninitialized or malformed argument) kept apart from `contract` (inconsistent delivery parameters) and `malformed` (an adapter's report broke the delivery contract) | the three are different programs' faults: the caller's argument, the caller's contract, the adapter |
+| `log.sink` direct report validation | (not in the census) | a `write` cause must agree with the report about the persisted prefix (`writer.persisted(e) == report.persisted`) or the report is `malformed` | the prefix now lives in two places; the validator refuses the disagreement |
+| `terminal.TermError` | "nesting the native cause" | `pub tag TermError: u8 { native: io_error.Error; }` in `std.terminal.error`, `OP_OPTION` for the mode and queue controls, `OP_READ` for a poll; the Windows backend decodes `GetLastError` through the OS layer's `last_error` (made `pub` and forwarded by `std.system.os.windows`) instead of a fixed message | one case today, a place to grow (a not-a-terminal classification would need per-backend decoding and is not attempted) |
 
 ## Frozen core signatures
 
@@ -530,6 +545,36 @@ the operation's outcome is the only return. A refused transition leaves the
 object exactly as it was, and the change/no-change boolean of a transition is
 carried in `res[bool, E]` with the invalid-state refusals kept apart in `E`.
 
+### Terminal and logging (S4b)
+
+| API | signature | frozen |
+| --- | --- | --- |
+| `terminal.error.TermError` | `pub tag TermError: u8 { native: io_error.Error; }` (re-exported by `std.terminal`) | yes |
+| `terminal.error.Operation`, `Poll` | `pub def Operation: err[TermError];` `pub def Poll: res[opt[key.Key], TermError];` | yes |
+| `terminal.error.control_failure`, `read_failure`, `code` | `fun(code: i64) TermError` (`OP_OPTION`, `OP_READ`); `fun(e: TermError) i64` | yes |
+| `terminal.enable_raw`, `disable_raw`, `flush_input` (every backend) | `fun() Operation` (a refused enable leaves raw mode inactive, a refused disable leaves it active) | yes |
+| `terminal.poll_key`, `poll_key_decoded` (every backend) | `fun() Poll` (`ok{none}` when nothing is waiting) | yes |
+| `terminal.is_raw`, `terminal.key` | unchanged | yes |
+| `log.record.EncodeError` | `pub tag EncodeError: u8 { invalid; buffer: usize; limit; }` | yes |
+| `log.record.EncodeStatus`, `Encoded` | `pub tag EncodeStatus: u8 { encoded; truncated; rejected; failed: EncodeError; }` `pub rec Encoded { status: EncodeStatus; len: usize; required: usize; }` | yes |
+| `log.record.ClockError`, `NowFun`, `Sample`, `clock_now` | `pub tag ClockError: u8 { invalid; read: io_error.Error; }` `pub def NowFun: fun(ptr) time.Clock;` `pub def Sample: res[Time, ClockError];` `fun(c: *Clock) Sample` | yes |
+| `log.sink.SinkError` | `pub tag SinkError: u8 { invalid; contract; malformed; clock: record.ClockError; encode: record.EncodeError; too_large: usize; write: WriteError; queue_full; queue_closed; open; unjoined; busy; queue: channel.StateError; thread: thread.ThreadError; }` | yes |
+| `log.sink.WriteStatus`, `WriteReport` | `pub tag WriteStatus: u8 { persisted; partial: SinkError; failed: SinkError; rejected: SinkError; dropped; enqueued; suppressed; }` `pub rec WriteReport { status: WriteStatus; offered: usize; persisted: usize; truncated: bool; }` | yes |
+| `log.sink.report`, `persisted`, `partial`, `failed`, `rejected`, `dropped`, `enqueued`, `suppressed`, `cause`, `report_write` | `report(status, offered, persisted, truncated)`; `partial`/`failed(offered, persisted, e)`; `rejected(offered, e)`; `cause(r) opt[SinkError]`; `report_write(len, res[usize, WriteError]) WriteReport` | yes |
+| `log.sink.Created`, `Operation`, `Aborted` | `pub def Created: res[Sink, SinkError];` `pub def Operation: err[SinkError];` `pub def Aborted: res[usize, SinkError];` | yes |
+| `log.sink.make`, `custom`, `from_writer`, `console`, `file`, `pipe`, `queued`, `queued_with_config` | `... Created` (`Direct` and `Queued` initialized in place; a refused `queued*` leaves `Queued` uninitialized with its channel released) | yes |
+| `log.sink.direct_contract`, `queued_contract` | `... res[Contract, SinkError]` | yes |
+| `log.sink.queued_close_drain`, `queued_join`, `queued_destroy` | `fun(queued: *Queued) Operation` | yes |
+| `log.sink.queued_close_abort` | `fun(queued: *Queued, rejected: *QueuedRecord, capacity: usize) Aborted` | yes |
+| `log.sink.publish`, `PublishFun`, `queued_stats`, `queued_thread_error`, `contract_valid`, `pipe_target_atomic_limit` | unchanged shapes over the new `WriteReport` | yes |
+| `log.Made`, `log.logger` | `pub def Made: res[Logger, sink.SinkError];` `fun(output: *sink.Sink, clock: record.Clock, min_level: record.Level) Made` | yes |
+| `log.emit`, `write`, `write_at`, `*_report`, `set_writer`, `set_level` | unchanged shapes over the new `WriteReport` (`write` fails with `SinkError.clock` when the clock refuses) | yes |
+
+An adapter reports its own failure as a `WriteError` (`writer.native_failure`
+for a native cause, `stalled{prefix}` for a short accept); the sink validates
+that the cause and the report agree about the persisted prefix. Neither
+domain allocates, so neither tag nests `allocator.Error`.
+
 ## Domain inventory
 
 Lanes are the roadmap's: S2 value/text/codec, S3 I/O, filesystem, process,
@@ -699,19 +744,19 @@ the control rests on.
 | `chrono.time.now`, `monotonic` | done (S4a): `time.Clock` = `res[Time, io_error.Error]`; `since`, `until` `time.Elapsed` = `res[Duration, io_error.Error]`; a failed clock is never zero time. Consumers with an error channel propagate the clock's `io_error.Error`; a deadline pre-check with no channel skips the check on failure and leaves the deadline to the native timed wait |
 | `chrono.time` comparisons and components, `chrono.duration`, `chrono.date`, `chrono.format` | done (S4a): unchanged values and predicates |
 
-### Terminal (S4)
+### Terminal (S4b, done)
 
 | module | representation |
 | --- | --- |
-| `terminal`, `terminal.linux`, `terminal.darwin`, `terminal.windows` | `enable_raw`, `disable_raw`, `flush_input` `err[TermError]`; `poll_key` `res[opt[Key], TermError]` (no key is absence, native read failure is the error); `is_raw` unchanged |
-| `terminal.key` | unchanged predicates and `Key` |
+| `terminal`, `terminal.linux`, `terminal.darwin`, `terminal.windows` | done (S4b): `enable_raw`, `disable_raw`, `flush_input` `err[TermError]`; `poll_key`, `poll_key_decoded` `res[opt[Key], TermError]` (no key is absence, native read failure is the error); `is_raw` unchanged; `TermError` declared in `std.terminal.error` (correction above) and every backend compiled cross-target |
+| `terminal.key` | done (S4b, not touched): unchanged predicates and `Key` |
 
-### Logging (S4)
+### Logging (S4b, done)
 
 | module | representation |
 | --- | --- |
-| `log`, `log.sink` | `WriteReport` retained with offered, persisted, suppression, truncation and failure; convenience functions return it; `logger`, `make`, `custom`, `from_writer`, `console`, `file`, `pipe`, `queued*` `res[Sink\|Logger, SinkError]` with queued sinks initialized in place (address-bound); `queued_close_*`, `queued_join`, `queued_destroy` `err[SinkError]` preserving undelivered records and thread failure |
-| `log.record` | unchanged values; `EncodeStatus` becomes a closed tag. S4a touched only the clock consumers: `system_now` reads `time.now()` and keeps the log clock's existing zero-time convention for an unreadable clock (the same one `clock_now` applies to an invalid clock), and `log.log_msg` stamps through `record.clock_now`; S4b decides whether `NowFun` reports the clock's refusal |
+| `log`, `log.sink` | done (S4b): `WriteReport` retained with offered, persisted, truncation and a closed `WriteStatus` whose failing cases carry the `SinkError` (correction above); convenience functions return it; `logger`, `make`, `custom`, `from_writer`, `console`, `file`, `pipe`, `queued*` `res[Sink\|Logger, SinkError]` with `Direct` and `Queued` initialized in place (address-bound); `queued_close_drain`, `queued_join`, `queued_destroy` `err[SinkError]` preserving undelivered records and the thread failure, `queued_close_abort` `res[usize, SinkError]` (correction above); the `ERR_*` strings are gone |
+| `log.record` | done (S4b): unchanged values; `EncodeStatus` is a closed tag with `EncodeError` on its `failed` case; `NowFun` reports the clock's refusal and `clock_now` answers `Sample` (correction above) |
 
 ### Runtime and OS (S4a portable done, S5 Darwin)
 
@@ -771,7 +816,7 @@ module's own return types:
 | `format` | `ERR_SHORT_WRITE`, `write_error_text` | removed (S2): `WriteError` is the outcome; `capacity_exhausted` stays as the span sink's native `ENOSPC` report (correction above) |
 | `derive`, `data.json` | writer callbacks return the typed outcome; no message shim | done (S2) |
 | `filesystem.transaction` | `sprint_text` spelling `format.sprint`'s `FormatError` as `R.Result[str, str]` (`"out of memory"`) at seven call sites, left by S2 after S3b (removed, S3c: `sprint_name` returns `res[str, Error]` with the allocator refusal as `MEMORY` on the caller's `Op`, `abs_of` and the tests read `format.sprint`'s `res` directly) | S3c |
-| `log.sink`, `log` | `ERR_SHORT_WRITE`, `report_write` folding a `WriteError` into a `WriteReport` | S4 |
+| `log.sink`, `log` | `ERR_SHORT_WRITE`, `report_write` folding a `WriteError` into a `WriteReport` (removed, S4b: `report_write` keeps the `WriteError` whole as `SinkError.write` on the report's `partial` or `failed` case, and the global `log_msg` writes stderr through `filesystem.writer` so both paths fold the same way) | S4b |
 | `io.runtime`, `net.resolve`, `net.async`, `net.async.local`, `io.file.tests`, the native and fault fixtures | `transitioned`/`transition_changed`/`scope_changed` folding a refused `cancel.Transition` into the old false, `scope_ok` folding a refused `cancel.Operation` (S4a, call-site translation; the runtime and resolver already report their own `io_error`/`types.Error`, so the fold loses nothing a caller could read before) | stays |
 | `net.resolve` | `reason_code`/`reason_of` mirroring `cancellation.Reason` as the futex-waited integer word (not a carrier shim: the word is the native wait's representation) | stays |
 | `log.record` | `system_now` keeps the zero time for an unreadable clock | S4b |
@@ -829,7 +874,8 @@ effect at `-O0`, by that policy.
   `WriteError`, `EncodeError`, `JsonError`, `TomlError`, `InflateError`,
   `FsError` (declared by S3b), `EnvError`, `StateError`, `ThreadError`,
   `SinkError`, `TermError`), each nesting `allocator.Error` where allocation
-  is one of its causes. S2 is done: `ParseError`, `FormatError`,
+  is one of its causes. S4b is done: `TermError`, `SinkError`, `ClockError`
+  and `log.record.EncodeError` are frozen above. S2 is done: `ParseError`, `FormatError`,
   `InputError`, `EncodeError`, `DecodeError`, `JsonError`, `TomlError`,
   `InflateError` and `Defect` are frozen above, and S8 accepted the
   compression lifecycle on those shapes (the per-bullet table under

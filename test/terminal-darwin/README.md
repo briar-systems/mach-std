@@ -10,9 +10,9 @@ The probe checks:
 
 - The SDK termios layout, constants and typed C function signatures against Mach.
 - `/dev/null` rejects raw mode and flushing with the same producer errors as the
-  native C calls. The wrappers preserve those negative-errno messages, leave raw
-  mode inactive and permit an inactive disable. A closed input descriptor produces
-  a poll error.
+  native C calls. The wrappers preserve those negative errno codes in
+  `TermError.native`, leave raw mode inactive and permit an inactive disable. A
+  closed input descriptor produces a poll error carrying `EBADF`.
 - Raw mode clears only `ICANON` and `ECHO` and sets `VMIN` and `VTIME` to zero.
 - Enabling with `TCSAFLUSH` removes earlier queued input.
 - Polling returns an available byte and then reports an empty queue.

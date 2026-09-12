@@ -1,6 +1,7 @@
 # atomic structured logging with explicit record and sink contracts
 
-use R: std.types.result;
+use std.types.canonical.res;
+use std.types.canonical.opt;
 use std.types.bool.bool;
 use std.types.bool.true;
 use std.types.bool.false;
@@ -8,7 +9,8 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
 use std.io.writer;
-use std.system.os;
+use io_error: std.io.error;
+use std.filesystem;
 use std.sync.atomic;
 use std.sync.mutex;
 use std.chrono.time;
@@ -17,10 +19,6 @@ use std.log.sink;
 
 fwd record.MAX_RECORD_BYTES;
 fwd record.MIN_TRUNCATED_BYTES;
-fwd record.ERR_INVALID_RECORD;
-fwd record.ERR_RECORD_TOO_LARGE;
-fwd record.ERR_BUFFER_TOO_SMALL;
-fwd record.ERR_LIMIT_TOO_SMALL;
 fwd record.Level;
 fwd record.DEBUG;
 fwd record.INFO;
@@ -36,6 +34,8 @@ fwd record.ClockOwnership;
 fwd record.CLOCK_CONTEXT_NONE;
 fwd record.CLOCK_CONTEXT_BORROWED;
 fwd record.NowFun;
+fwd record.ClockError;
+fwd record.Sample;
 fwd record.Clock;
 fwd record.FieldKind;
 fwd record.FIELD_I64;
@@ -50,11 +50,8 @@ fwd record.Record;
 fwd record.OversizePolicy;
 fwd record.OVERSIZE_REJECT;
 fwd record.OVERSIZE_TRUNCATE;
+fwd record.EncodeError;
 fwd record.EncodeStatus;
-fwd record.ENCODED;
-fwd record.ENCODED_TRUNCATED;
-fwd record.ENCODE_REJECTED;
-fwd record.ENCODE_INVALID;
 fwd record.Encoded;
 fwd record.system_clock;
 fwd record.clock;
@@ -70,18 +67,12 @@ fwd record.field_error;
 fwd record.level_name;
 fwd encode_record: record.encode;
 
+fwd sink.SinkError;
+fwd sink.Created;
+fwd sink.Operation;
+fwd sink.Aborted;
 fwd sink.WriteStatus;
-fwd sink.WRITE_PERSISTED;
-fwd sink.WRITE_PARTIAL;
-fwd sink.WRITE_FAILED;
-fwd sink.WRITE_REJECTED;
-fwd sink.WRITE_DROPPED;
-fwd sink.WRITE_ENQUEUED;
-fwd sink.WRITE_SUPPRESSED;
 fwd sink.WriteReport;
-fwd sink.ERR_QUEUE_FULL;
-fwd sink.ERR_QUEUE_CLOSED;
-fwd sink.ERR_QUEUE_SPAWN_FAILED;
 fwd sink.Delivery;
 fwd sink.DELIVERY_DIRECT;
 fwd sink.DELIVERY_BOUNDED_QUEUED;
@@ -105,7 +96,12 @@ fwd sink.report;
 fwd sink.persisted;
 fwd sink.partial;
 fwd sink.failed;
+fwd sink.rejected;
+fwd sink.dropped;
+fwd sink.enqueued;
 fwd sink.suppressed;
+fwd sink.cause;
+fwd sink.report_write;
 fwd sink.contract_valid;
 fwd sink.queued_contract;
 fwd sink_make: sink.make;
@@ -125,8 +121,6 @@ fwd sink.queued_stats;
 fwd sink.queued_thread_error;
 fwd sink.queued_destroy;
 
-pub val ERR_INVALID_LOGGER: str = "ERR_INVALID_LOGGER";
-
 # the sink and borrowed clock context must outlive the logger
 pub rec Logger {
     output:    *sink.Sink;
@@ -134,11 +128,18 @@ pub rec Logger {
     min_level: i64;
 }
 
-pub fun logger(output: *sink.Sink, clock: record.Clock, min_level: record.Level) R.Result[Logger, str] {
-    if (output == nil || !sink.contract_valid(output.contract) || !record.clock_valid(?clock) || min_level > record.OFF) {
-        ret R.err[Logger, str](ERR_INVALID_LOGGER);
+# a made logger, or why it could not be made
+pub def Made: res[Logger, sink.SinkError];
+
+# ---
+# ret: the logger; invalid for a nil sink, an invalid clock or a level past
+#      OFF, contract for a sink whose contract is inconsistent
+pub fun logger(output: *sink.Sink, clock: record.Clock, min_level: record.Level) Made {
+    if (output == nil || !record.clock_valid(?clock) || min_level > record.OFF) {
+        ret Made.err{sink.SinkError.invalid{}};
     }
-    ret R.ok[Logger, str](Logger{output: output, clock: clock, min_level: min_level::i64});
+    if (!sink.contract_valid(output.contract)) { ret Made.err{sink.SinkError.contract{}}; }
+    ret Made.ok{Logger{output: output, clock: clock, min_level: min_level::i64}};
 }
 
 pub fun logger_set_level(log: *Logger, level: record.Level) {
@@ -146,10 +147,11 @@ pub fun logger_set_level(log: *Logger, level: record.Level) {
     atomic.store(?log.min_level, level::i64);
 }
 
+# encode and publish one record; the report's offered count is the full
+# record's size and truncated tells whether the sink saw a shortened line
 pub fun emit(log: *Logger, entry: *record.Record) sink.WriteReport {
-    if (log == nil || log.output == nil || entry == nil || !sink.contract_valid(log.output.contract)) {
-        ret sink.failed(0, 0, ERR_INVALID_LOGGER);
-    }
+    if (log == nil || log.output == nil || entry == nil) { ret sink.failed(0, 0, sink.SinkError.invalid{}); }
+    if (!sink.contract_valid(log.output.contract)) { ret sink.failed(0, 0, sink.SinkError.contract{}); }
     if (entry.level::i64 < atomic.load(?log.min_level)) { ret sink.suppressed(); }
 
     var data: [record.MAX_RECORD_BYTES]u8;
@@ -160,34 +162,27 @@ pub fun emit(log: *Logger, entry: *record.Record) sink.WriteReport {
         log.output.contract.max_record,
         log.output.contract.oversize,
     );
-    if (encoded.status == record.ENCODE_REJECTED) {
-        ret sink.report(sink.WRITE_REJECTED, encoded.required, 0, false, encoded.error);
-    }
-    if (encoded.status == record.ENCODE_INVALID) {
-        ret sink.failed(encoded.required, 0, encoded.error);
-    }
+    if (sel encoded.status.rejected) { ret sink.rejected(encoded.required, sink.SinkError.too_large{encoded.required}); }
+    if (sel encoded.status.failed) { ret sink.failed(encoded.required, 0, sink.SinkError.encode{encoded.status.failed}); }
 
     val published: sink.WriteReport = sink.publish(log.output, (?data)::*u8, encoded.len);
-    ret sink.report(
-        published.status,
-        encoded.required,
-        published.persisted,
-        encoded.status == record.ENCODED_TRUNCATED,
-        published.error,
-    );
+    ret sink.report(published.status, encoded.required, published.persisted, sel encoded.status.truncated);
 }
 
 pub fun write_at(log: *Logger, timestamp: time.Time, level: record.Level, message: str, fields: *record.Field, field_count: usize) sink.WriteReport {
-    if (log == nil) { ret sink.failed(0, 0, ERR_INVALID_LOGGER); }
+    if (log == nil) { ret sink.failed(0, 0, sink.SinkError.invalid{}); }
     var entry: record.Record = record.record_at(timestamp, log.clock.precision, level, message, fields, field_count);
     ret emit(log, ?entry);
 }
 
+# stamp and publish; a clock that cannot be sampled fails the write and
+# publishes nothing, since a record is never given a time it did not have
 pub fun write(log: *Logger, level: record.Level, message: str, fields: *record.Field, field_count: usize) sink.WriteReport {
-    if (log == nil) { ret sink.failed(0, 0, ERR_INVALID_LOGGER); }
+    if (log == nil) { ret sink.failed(0, 0, sink.SinkError.invalid{}); }
     if (level::i64 < atomic.load(?log.min_level)) { ret sink.suppressed(); }
-    val timestamp: time.Time = record.clock_now(?log.clock);
-    ret write_at(log, timestamp, level, message, fields, field_count);
+    val sampled: record.Sample = record.clock_now(?log.clock);
+    if (sel sampled.err) { ret sink.failed(0, 0, sink.SinkError.clock{sampled.err}); }
+    ret write_at(log, sampled.ok, level, message, fields, field_count);
 }
 
 var level_val: i64 = record.INFO::i64;
@@ -211,20 +206,14 @@ pub fun set_writer(output: *writer.Writer) {
     atomic.store(?writer_set, 1);
 }
 
+# one serialized write through the configured writer, or stderr
 fun global_publish(data: *u8, len: usize) sink.WriteReport {
     mutex.lock(?out_lock);
-    var result: sink.WriteReport;
+    var output: writer.Writer = filesystem.writer(filesystem.STDERR);
     if (atomic.load(?writer_set) != 0) {
-        var output: writer.Writer = writer.Writer{ctx: out_ctx, f_write: out_fn::writer.WriteFun};
-        result = sink.report_write(len, writer.write(?output, data, len));
+        output = writer.Writer{ctx: out_ctx, f_write: out_fn::writer.WriteFun};
     }
-    or {
-        val count: i64 = os.write(os.STDERR_FD, data, len);
-        if (count < 0) { result = sink.failed(len, 0, os.message(count)); }
-        or (count == 0 && len > 0) { result = sink.failed(len, 0, sink.ERR_SHORT_WRITE); }
-        or (count::usize < len) { result = sink.partial(len, count::usize, sink.ERR_SHORT_WRITE); }
-        or { result = sink.persisted(len); }
-    }
+    val result: sink.WriteReport = sink.report_write(len, writer.write(?output, data, len));
     mutex.unlock(?out_lock);
     ret result;
 }
@@ -232,7 +221,9 @@ fun global_publish(data: *u8, len: usize) sink.WriteReport {
 fun log_msg(level: record.Level, message: str) sink.WriteReport {
     if (level::i64 < atomic.load(?level_val)) { ret sink.suppressed(); }
     var clock: record.Clock = record.system_clock(record.PRECISION_NANOS);
-    var entry: record.Record = record.record_at(record.clock_now(?clock), record.PRECISION_NANOS, level, message, nil, 0);
+    val sampled: record.Sample = record.clock_now(?clock);
+    if (sel sampled.err) { ret sink.failed(0, 0, sink.SinkError.clock{sampled.err}); }
+    var entry: record.Record = record.record_at(sampled.ok, record.PRECISION_NANOS, level, message, nil, 0);
     var data: [record.MAX_RECORD_BYTES]u8;
     val encoded: record.Encoded = record.encode(
         ?entry,
@@ -241,12 +232,8 @@ fun log_msg(level: record.Level, message: str) sink.WriteReport {
         record.MAX_RECORD_BYTES,
         record.OVERSIZE_REJECT,
     );
-    if (encoded.status == record.ENCODE_REJECTED) {
-        ret sink.report(sink.WRITE_REJECTED, encoded.required, 0, false, encoded.error);
-    }
-    if (encoded.status != record.ENCODED) {
-        ret sink.failed(encoded.required, 0, encoded.error);
-    }
+    if (sel encoded.status.rejected) { ret sink.rejected(encoded.required, sink.SinkError.too_large{encoded.required}); }
+    if (sel encoded.status.failed) { ret sink.failed(encoded.required, 0, sink.SinkError.encode{encoded.status.failed}); }
     ret global_publish((?data)::*u8, encoded.len);
 }
 
@@ -268,7 +255,9 @@ rec Capture {
 
 fun capture_write(ctx: ptr, data: *u8, len: usize) sink.WriteReport {
     val capture: *Capture = ctx::*Capture;
-    if (len > 512 - capture.len) { ret sink.failed(len, 0, "capture full"); }
+    if (len > 512 - capture.len) {
+        ret sink.failed(len, 0, sink.SinkError.write{writer.native_failure(0, io_error.from_code(-28, io_error.OP_WRITE))});
+    }
     var i: usize = 0;
     for (i < len) {
         capture.data[capture.len + i] = data[i];
@@ -282,12 +271,14 @@ fun capture_write(ctx: ptr, data: *u8, len: usize) sink.WriteReport {
 rec TestClock {
     calls: usize;
     value: time.Time;
+    code:  i64;
 }
 
-fun fixed_now(ctx: ptr) time.Time {
+fun fixed_now(ctx: ptr) time.Clock {
     val source: *TestClock = ctx::*TestClock;
     source.calls = source.calls + 1;
-    ret source.value;
+    if (source.code != 0) { ret time.Clock.err{io_error.from_code(source.code, io_error.OP_READ)}; }
+    ret time.Clock.ok{source.value};
 }
 
 fun bytes_equal(data: *u8, len: usize, expected: str) bool {
@@ -305,19 +296,21 @@ test "log: logger serializes and publishes one structured record" {
     capture.len = 0;
     capture.calls = 0;
     var direct: sink.Direct;
-    val sr: R.Result[sink.Sink, str] = sink.custom(?direct, ?capture, capture_write, 512, record.OVERSIZE_REJECT, 0);
-    if (R.is_err[sink.Sink, str](sr)) { ret 1; }
-    var output: sink.Sink = R.unwrap_ok[sink.Sink, str](sr);
-    var source: TestClock = TestClock{calls: 0, value: time.unix(0, 999999999)};
-    val lr: R.Result[Logger, str] = logger(?output, record.clock(?source, fixed_now, record.PRECISION_SECONDS), record.DEBUG);
-    if (R.is_err[Logger, str](lr)) { ret 2; }
-    var log: Logger = R.unwrap_ok[Logger, str](lr);
+    val sr: sink.Created = sink.custom(?direct, ?capture, capture_write, 512, record.OVERSIZE_REJECT, 0);
+    if (sel sr.err) { ret 1; }
+    var output: sink.Sink = sr.ok;
+    var source: TestClock = TestClock{calls: 0, value: time.unix(0, 999999999), code: 0};
+    val lr: Made = logger(?output, record.clock(?source, fixed_now, record.PRECISION_SECONDS), record.DEBUG);
+    if (sel lr.err) { ret 2; }
+    var log: Logger = lr.ok;
     var fields: [1]record.Field;
     fields[0] = record.field_bool("ready", true);
     val result: sink.WriteReport = write(?log, record.INFO, "service started", ?fields[0], 1);
-    if (result.status != sink.WRITE_PERSISTED || result.truncated || capture.calls != 1 || source.calls != 1) { ret 3; }
+    if (!sel result.status.persisted) { ret 3; }
+    if (result.truncated || capture.calls != 1 || source.calls != 1) { ret 4; }
     val expected: str = "timestamp=1970-01-01T00:00:00Z level=INFO message=\"service started\" ready=true\n";
-    if (!bytes_equal((?capture.data)::*u8, capture.len, expected)) { ret 4; }
+    if (!bytes_equal((?capture.data)::*u8, capture.len, expected)) { ret 5; }
+    if (result.offered != capture.len || result.persisted != capture.len) { ret 6; }
     ret 0;
 }
 
@@ -326,25 +319,50 @@ test "log: logger reports rejected and truncated records" {
     capture.len = 0;
     capture.calls = 0;
     var direct: sink.Direct;
-    var source: TestClock = TestClock{calls: 0, value: time.unix(0, 0)};
+    var source: TestClock = TestClock{calls: 0, value: time.unix(0, 0), code: 0};
 
-    val reject_sr: R.Result[sink.Sink, str] = sink.custom(?direct, ?capture, capture_write, 64, record.OVERSIZE_REJECT, 0);
-    if (R.is_err[sink.Sink, str](reject_sr)) { ret 1; }
-    var reject_sink: sink.Sink = R.unwrap_ok[sink.Sink, str](reject_sr);
-    val reject_lr: R.Result[Logger, str] = logger(?reject_sink, record.clock(?source, fixed_now, record.PRECISION_SECONDS), record.DEBUG);
-    if (R.is_err[Logger, str](reject_lr)) { ret 2; }
-    var reject_log: Logger = R.unwrap_ok[Logger, str](reject_lr);
+    val reject_sr: sink.Created = sink.custom(?direct, ?capture, capture_write, 64, record.OVERSIZE_REJECT, 0);
+    if (sel reject_sr.err) { ret 1; }
+    var reject_sink: sink.Sink = reject_sr.ok;
+    val reject_lr: Made = logger(?reject_sink, record.clock(?source, fixed_now, record.PRECISION_SECONDS), record.DEBUG);
+    if (sel reject_lr.err) { ret 2; }
+    var reject_log: Logger = reject_lr.ok;
     val rejected: sink.WriteReport = write(?reject_log, record.INFO, "this message cannot fit in sixty four bytes", nil, 0);
-    if (rejected.status != sink.WRITE_REJECTED || rejected.persisted != 0 || capture.calls != 0) { ret 3; }
+    if (!sel rejected.status.rejected) { ret 3; }
+    if (!sel rejected.status.rejected.too_large) { ret 4; }
+    if (rejected.status.rejected.too_large != rejected.offered || rejected.offered <= 64 || rejected.persisted != 0 || capture.calls != 0) { ret 5; }
 
-    val truncate_sr: R.Result[sink.Sink, str] = sink.custom(?direct, ?capture, capture_write, 64, record.OVERSIZE_TRUNCATE, 0);
-    if (R.is_err[sink.Sink, str](truncate_sr)) { ret 4; }
-    var truncate_sink: sink.Sink = R.unwrap_ok[sink.Sink, str](truncate_sr);
-    val truncate_lr: R.Result[Logger, str] = logger(?truncate_sink, record.clock(?source, fixed_now, record.PRECISION_SECONDS), record.DEBUG);
-    if (R.is_err[Logger, str](truncate_lr)) { ret 5; }
-    var truncate_log: Logger = R.unwrap_ok[Logger, str](truncate_lr);
+    val truncate_sr: sink.Created = sink.custom(?direct, ?capture, capture_write, 64, record.OVERSIZE_TRUNCATE, 0);
+    if (sel truncate_sr.err) { ret 6; }
+    var truncate_sink: sink.Sink = truncate_sr.ok;
+    val truncate_lr: Made = logger(?truncate_sink, record.clock(?source, fixed_now, record.PRECISION_SECONDS), record.DEBUG);
+    if (sel truncate_lr.err) { ret 7; }
+    var truncate_log: Logger = truncate_lr.ok;
     val truncated: sink.WriteReport = write(?truncate_log, record.INFO, "this message cannot fit in sixty four bytes", nil, 0);
-    if (truncated.status != sink.WRITE_PERSISTED || !truncated.truncated || truncated.persisted > 64 || capture.calls != 1) { ret 6; }
+    if (!sel truncated.status.persisted) { ret 8; }
+    if (!truncated.truncated || truncated.persisted > 64 || truncated.offered != rejected.offered || capture.calls != 1) { ret 9; }
+    ret 0;
+}
+
+test "log: an invalid record fails the write with the encode cause" {
+    var capture: Capture;
+    capture.len = 0;
+    capture.calls = 0;
+    var direct: sink.Direct;
+    val sr: sink.Created = sink.custom(?direct, ?capture, capture_write, 128, record.OVERSIZE_REJECT, 0);
+    if (sel sr.err) { ret 1; }
+    var output: sink.Sink = sr.ok;
+    var source: TestClock = TestClock{calls: 0, value: time.unix(0, 0), code: 0};
+    val lr: Made = logger(?output, record.clock(?source, fixed_now, record.PRECISION_SECONDS), record.DEBUG);
+    if (sel lr.err) { ret 2; }
+    var log: Logger = lr.ok;
+    var fields: [1]record.Field;
+    fields[0] = record.field_bool("timestamp", true);
+    val result: sink.WriteReport = write(?log, record.INFO, "reserved key", ?fields[0], 1);
+    if (!sel result.status.failed) { ret 3; }
+    if (!sel result.status.failed.encode) { ret 4; }
+    if (!sel result.status.failed.encode.invalid) { ret 5; }
+    if (result.persisted != 0 || capture.calls != 0) { ret 6; }
     ret 0;
 }
 
@@ -353,22 +371,113 @@ test "log: level suppression samples no timestamp and publishes nothing" {
     capture.len = 0;
     capture.calls = 0;
     var direct: sink.Direct;
-    val sr: R.Result[sink.Sink, str] = sink.custom(?direct, ?capture, capture_write, 128, record.OVERSIZE_REJECT, 0);
-    if (R.is_err[sink.Sink, str](sr)) { ret 1; }
-    var output: sink.Sink = R.unwrap_ok[sink.Sink, str](sr);
-    var source: TestClock = TestClock{calls: 0, value: time.unix(0, 0)};
-    val lr: R.Result[Logger, str] = logger(?output, record.clock(?source, fixed_now, record.PRECISION_SECONDS), record.WARN);
-    if (R.is_err[Logger, str](lr)) { ret 2; }
-    var log: Logger = R.unwrap_ok[Logger, str](lr);
+    val sr: sink.Created = sink.custom(?direct, ?capture, capture_write, 128, record.OVERSIZE_REJECT, 0);
+    if (sel sr.err) { ret 1; }
+    var output: sink.Sink = sr.ok;
+    var source: TestClock = TestClock{calls: 0, value: time.unix(0, 0), code: 0};
+    val lr: Made = logger(?output, record.clock(?source, fixed_now, record.PRECISION_SECONDS), record.WARN);
+    if (sel lr.err) { ret 2; }
+    var log: Logger = lr.ok;
     val result: sink.WriteReport = write(?log, record.INFO, "suppressed", nil, 0);
-    if (result.status != sink.WRITE_SUPPRESSED || source.calls != 0 || capture.calls != 0) { ret 3; }
+    if (!sel result.status.suppressed) { ret 3; }
+    if (source.calls != 0 || capture.calls != 0) { ret 4; }
+    ret 0;
+}
+
+test "log: a refused clock fails the write and publishes nothing" {
+    var capture: Capture;
+    capture.len = 0;
+    capture.calls = 0;
+    var direct: sink.Direct;
+    val sr: sink.Created = sink.custom(?direct, ?capture, capture_write, 128, record.OVERSIZE_REJECT, 0);
+    if (sel sr.err) { ret 1; }
+    var output: sink.Sink = sr.ok;
+    var source: TestClock = TestClock{calls: 0, value: time.unix(0, 0), code: -22};
+    val lr: Made = logger(?output, record.clock(?source, fixed_now, record.PRECISION_SECONDS), record.DEBUG);
+    if (sel lr.err) { ret 2; }
+    var log: Logger = lr.ok;
+    val result: sink.WriteReport = write(?log, record.INFO, "unstamped", nil, 0);
+    if (!sel result.status.failed) { ret 3; }
+    if (!sel result.status.failed.clock) { ret 4; }
+    if (!sel result.status.failed.clock.read) { ret 5; }
+    if (result.status.failed.clock.read.code != -22 || source.calls != 1 || capture.calls != 0) { ret 6; }
+
+    # a caller-supplied timestamp needs no clock
+    val stamped: sink.WriteReport = write_at(?log, time.unix(5, 0), record.INFO, "stamped", nil, 0);
+    if (!sel stamped.status.persisted) { ret 7; }
+    if (source.calls != 1 || capture.calls != 1) { ret 8; }
+    ret 0;
+}
+
+test "log: logger refusals name the argument and the contract" {
+    var capture: Capture;
+    var direct: sink.Direct;
+    var source: TestClock = TestClock{calls: 0, value: time.unix(0, 0), code: 0};
+    val clock: record.Clock = record.clock(?source, fixed_now, record.PRECISION_SECONDS);
+    val no_sink: Made = logger(nil, clock, record.DEBUG);
+    if (!sel no_sink.err) { ret 1; }
+    if (!sel no_sink.err.invalid) { ret 2; }
+
+    val sr: sink.Created = sink.custom(?direct, ?capture, capture_write, 128, record.OVERSIZE_REJECT, 0);
+    if (sel sr.err) { ret 3; }
+    var output: sink.Sink = sr.ok;
+    val bad_level: Made = logger(?output, clock, (record.OFF + 1)::record.Level);
+    if (!sel bad_level.err) { ret 4; }
+    if (!sel bad_level.err.invalid) { ret 5; }
+    val bad_clock: Made = logger(?output, record.clock(?source, fixed_now, (record.PRECISION_NANOS + 1)::record.Precision), record.DEBUG);
+    if (!sel bad_clock.err) { ret 6; }
+    if (!sel bad_clock.err.invalid) { ret 7; }
+
+    var broken: sink.Sink = output;
+    broken.contract.max_record = 0;
+    val bad_contract: Made = logger(?broken, clock, record.DEBUG);
+    if (!sel bad_contract.err) { ret 8; }
+    if (!sel bad_contract.err.contract) { ret 9; }
+    val unwritten: sink.WriteReport = write(nil, record.INFO, "nowhere", nil, 0);
+    if (!sel unwritten.status.failed) { ret 10; }
+    if (!sel unwritten.status.failed.invalid) { ret 11; }
     ret 0;
 }
 
 test "log: compatibility level controls remain stable" {
     set_level(record.OFF);
-    if (debug_report("suppressed").status != sink.WRITE_SUPPRESSED) { set_level(record.INFO); ret 1; }
-    if (error_report("suppressed").status != sink.WRITE_SUPPRESSED) { set_level(record.INFO); ret 2; }
+    val low: sink.WriteReport = debug_report("suppressed");
+    val high: sink.WriteReport = error_report("suppressed");
     set_level(record.INFO);
+    if (!sel low.status.suppressed) { ret 1; }
+    if (!sel high.status.suppressed) { ret 2; }
+    ret 0;
+}
+
+rec GlobalCapture {
+    len:   usize;
+    calls: usize;
+    data:  [256]u8;
+}
+
+fun global_capture_write(ctx: ptr, data: *u8, len: usize) res[usize, writer.WriteError] {
+    val capture: *GlobalCapture = ctx::*GlobalCapture;
+    var i: usize = 0;
+    for (i < len && capture.len < 256) {
+        capture.data[capture.len] = data[i];
+        capture.len = capture.len + 1;
+        i = i + 1;
+    }
+    capture.calls = capture.calls + 1;
+    ret res[usize, writer.WriteError].ok{i};
+}
+
+test "log: the global writer receives one persisted record per message" {
+    var capture: GlobalCapture;
+    capture.len = 0;
+    capture.calls = 0;
+    var output: writer.Writer = writer.Writer{ctx: ?capture, f_write: global_capture_write};
+    set_writer(?output);
+    set_level(record.DEBUG);
+    val result: sink.WriteReport = info_report("global");
+    set_level(record.INFO);
+    if (!sel result.status.persisted) { ret 1; }
+    if (capture.calls != 1 || result.persisted != capture.len || result.offered != capture.len) { ret 2; }
+    if (capture.len < 40 || capture.data[capture.len - 1] != '\n') { ret 3; }
     ret 0;
 }
