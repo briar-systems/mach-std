@@ -1,10 +1,36 @@
 # shared resource close and drain state
 
+use std.types.canonical.res;
+use std.types.canonical.err;
 use std.types.bool.bool;
 use std.types.bool.true;
 use std.types.bool.false;
 use std.types.size.usize;
 use std.sync.mutex;
+
+# every way a state transition can be refused
+#
+# the domain error tag for state machines: lifecycles and their attachments
+# here, and the queued sinks, channels, pools and resolvers that later lanes
+# migrate. a case names the fact that refused the transition; the receiver is
+# left exactly as it was.
+# ---
+# invalid:   a nil receiver or an argument outside the closed set
+# closed:    the owner has left the open state and admits no new work
+# exhausted: a bounded counter or table is full
+# active:    the object is already attached, registered or open
+# inactive:  the object is not attached, registered or open
+# stale:     the object belongs to an earlier generation of its owner
+# busy:      outstanding work forbids the transition
+pub tag StateError: u8 {
+    invalid;
+    closed;
+    exhausted;
+    active;
+    inactive;
+    stale;
+    busy;
+}
 
 pub def State: u8;
 pub val OPEN: State = 0;
@@ -65,8 +91,9 @@ fun snapshot_locked(lifecycle: *Lifecycle) Snapshot {
     };
 }
 
-pub fun make(lifecycle: *Lifecycle) bool {
-    if (lifecycle == nil) { ret false; }
+# initializes a lifecycle in place; the storage is address-bound from here on
+pub fun make(lifecycle: *Lifecycle) err[StateError] {
+    if (lifecycle == nil) { ret err[StateError].err{StateError.invalid{}}; }
     var generation: u32 = lifecycle.generation + 1;
     if (generation == 0) { generation = 1; }
     lifecycle.state = OPEN;
@@ -77,15 +104,22 @@ pub fun make(lifecycle: *Lifecycle) bool {
     lifecycle.submitted = 0;
     lifecycle.settled = 0;
     lifecycle.lock = mutex.make();
-    ret true;
+    ret err[StateError].ok{};
 }
 
-pub fun attach(lifecycle: *Lifecycle, attachment: *Attachment) bool {
-    if (lifecycle == nil || attachment == nil || attachment.active) { ret false; }
+# initializes an attachment in place against an open lifecycle; the attachment
+# is address-bound until it settles
+pub fun attach(lifecycle: *Lifecycle, attachment: *Attachment) err[StateError] {
+    if (lifecycle == nil || attachment == nil) { ret err[StateError].err{StateError.invalid{}}; }
+    if (attachment.active) { ret err[StateError].err{StateError.active{}}; }
     mutex.lock(?lifecycle.lock);
-    if (lifecycle.state != OPEN || lifecycle.submitted == (-1)::u64) {
+    if (lifecycle.state != OPEN) {
         mutex.unlock(?lifecycle.lock);
-        ret false;
+        ret err[StateError].err{StateError.closed{}};
+    }
+    if (lifecycle.submitted == (-1)::u64) {
+        mutex.unlock(?lifecycle.lock);
+        ret err[StateError].err{StateError.exhausted{}};
     }
     lifecycle.submitted = lifecycle.submitted + 1;
     attachment.owner = lifecycle;
@@ -93,16 +127,22 @@ pub fun attach(lifecycle: *Lifecycle, attachment: *Attachment) bool {
     attachment.sequence = lifecycle.submitted;
     attachment.active = true;
     mutex.unlock(?lifecycle.lock);
-    ret true;
+    ret err[StateError].ok{};
 }
 
-pub fun settle(attachment: *Attachment) bool {
-    if (attachment == nil || !attachment.active || attachment.owner == nil) { ret false; }
+# settles an attachment; true when this settlement completed the owner's close
+pub fun settle(attachment: *Attachment) res[bool, StateError] {
+    if (attachment == nil) { ret res[bool, StateError].err{StateError.invalid{}}; }
+    if (!attachment.active || attachment.owner == nil) { ret res[bool, StateError].err{StateError.inactive{}}; }
     val lifecycle: *Lifecycle = attachment.owner;
     mutex.lock(?lifecycle.lock);
-    if (!attachment.active || attachment.generation != lifecycle.generation) {
+    if (!attachment.active) {
         mutex.unlock(?lifecycle.lock);
-        ret false;
+        ret res[bool, StateError].err{StateError.inactive{}};
+    }
+    if (attachment.generation != lifecycle.generation) {
+        mutex.unlock(?lifecycle.lock);
+        ret res[bool, StateError].err{StateError.stale{}};
     }
     attachment.active = false;
     attachment.owner = nil;
@@ -110,7 +150,7 @@ pub fun settle(attachment: *Attachment) bool {
     val complete: bool = lifecycle.state == CLOSING && lifecycle.settled == lifecycle.submitted;
     if (complete) { lifecycle.state = CLOSED; }
     mutex.unlock(?lifecycle.lock);
-    ret complete;
+    ret res[bool, StateError].ok{complete};
 }
 
 pub fun begin_close(lifecycle: *Lifecycle, mode: Mode, cause: Cause) CloseResult {
@@ -167,22 +207,47 @@ pub fun snapshot(lifecycle: *Lifecycle) Snapshot {
     ret current;
 }
 
-pub fun settle_closed_child(attachment: *Attachment, child: *Lifecycle) bool {
-    if (attachment == nil || child == nil || snapshot(child).state != CLOSED) { ret false; }
+# settles the parent's attachment for a child that has fully closed; a child
+# still open or draining is busy and the attachment stays active
+pub fun settle_closed_child(attachment: *Attachment, child: *Lifecycle) res[bool, StateError] {
+    if (attachment == nil || child == nil) { ret res[bool, StateError].err{StateError.invalid{}}; }
+    if (snapshot(child).state != CLOSED) { ret res[bool, StateError].err{StateError.busy{}}; }
     ret settle(attachment);
+}
+
+fun attached(lifecycle: *Lifecycle, attachment: *Attachment) bool {
+    val r: err[StateError] = attach(lifecycle, attachment);
+    ret sel r.ok;
+}
+
+fun completed(attachment: *Attachment) bool {
+    val r: res[bool, StateError] = settle(attachment);
+    ret sel r.ok && r.ok;
 }
 
 test "lifecycle: close rejects attachment and completes after exact settlement" {
     var lifecycle: Lifecycle;
-    if (!make(?lifecycle)) { ret 1; }
+    val made: err[StateError] = make(?lifecycle);
+    if (sel made.err) { ret 1; }
     var first: Attachment;
     var second: Attachment;
-    if (!attach(?lifecycle, ?first) || !attach(?lifecycle, ?second)) { ret 2; }
+    if (!attached(?lifecycle, ?first) || !attached(?lifecycle, ?second)) { ret 2; }
     val closing: CloseResult = begin_close(?lifecycle, GRACEFUL, EXPLICIT);
     var rejected: Attachment;
-    if (!closing.started || closing.complete || closing.snapshot.outstanding != 2 || attach(?lifecycle, ?rejected)) { ret 3; }
-    if (settle(?first) || settle(?first)) { ret 4; }
-    if (!settle(?second)) { ret 5; }
+    if (!closing.started || closing.complete || closing.snapshot.outstanding != 2) { ret 3; }
+    val refused: err[StateError] = attach(?lifecycle, ?rejected);
+    if (!sel refused.err) { ret 30; }
+    if (!sel refused.err.closed) { ret 31; }
+    if (rejected.active) { ret 31; }
+    val partial: res[bool, StateError] = settle(?first);
+    if (!sel partial.ok) { ret 4; }
+    if (partial.ok) { ret 4; }
+    val twice: res[bool, StateError] = settle(?first);
+    if (!sel twice.err) { ret 40; }
+    if (!sel twice.err.inactive) { ret 41; }
+    val last: res[bool, StateError] = settle(?second);
+    if (!sel last.ok) { ret 5; }
+    if (!last.ok) { ret 5; }
     val duplicate: CloseResult = begin_close(?lifecycle, GRACEFUL, EXPLICIT);
     if (duplicate.started || duplicate.escalated || !duplicate.complete || duplicate.snapshot.state != CLOSED) { ret 6; }
     ret 0;
@@ -192,13 +257,13 @@ test "lifecycle: abortive escalation retains initiation and terminal causes" {
     var lifecycle: Lifecycle;
     make(?lifecycle);
     var operation: Attachment;
-    if (!attach(?lifecycle, ?operation)) { ret 1; }
+    if (!attached(?lifecycle, ?operation)) { ret 1; }
     val graceful: CloseResult = begin_close(?lifecycle, GRACEFUL, PROCESS_TERMINATION);
     val abortive: CloseResult = begin_close(?lifecycle, ABORTIVE, CANCELLATION);
     val duplicate: CloseResult = begin_close(?lifecycle, ABORTIVE, DEADLINE);
     if (!graceful.started || !abortive.escalated || duplicate.escalated) { ret 2; }
     if (abortive.snapshot.mode != ABORTIVE || abortive.snapshot.cause != PROCESS_TERMINATION || abortive.snapshot.terminal_cause != CANCELLATION) { ret 3; }
-    if (!settle(?operation) || snapshot(?lifecycle).state != CLOSED) { ret 4; }
+    if (!completed(?operation) || snapshot(?lifecycle).state != CLOSED) { ret 4; }
     ret 0;
 }
 
@@ -206,13 +271,13 @@ test "lifecycle: the first abortive cause wins deadline and cancellation races" 
     var lifecycle: Lifecycle;
     make(?lifecycle);
     var operation: Attachment;
-    if (!attach(?lifecycle, ?operation)) { ret 1; }
+    if (!attached(?lifecycle, ?operation)) { ret 1; }
     if (!begin_close(?lifecycle, GRACEFUL, EXPLICIT).started) { ret 2; }
     val deadline: CloseResult = begin_close(?lifecycle, ABORTIVE, DEADLINE);
     val cancellation: CloseResult = begin_close(?lifecycle, ABORTIVE, CANCELLATION);
     if (!deadline.escalated || cancellation.escalated) { ret 3; }
     if (cancellation.snapshot.cause != EXPLICIT || cancellation.snapshot.terminal_cause != DEADLINE) { ret 4; }
-    if (!settle(?operation)) { ret 5; }
+    if (!completed(?operation)) { ret 5; }
     ret 0;
 }
 
@@ -234,11 +299,52 @@ test "lifecycle: a closed child settles its parent drain" {
     make(?child);
     var child_link: Attachment;
     var child_operation: Attachment;
-    if (!attach(?parent, ?child_link) || !attach(?child, ?child_operation)) { ret 1; }
+    if (!attached(?parent, ?child_link) || !attached(?child, ?child_operation)) { ret 1; }
     if (!begin_process_drain(?parent).started) { ret 2; }
     if (!begin_process_drain(?child).started) { ret 3; }
-    if (!settle(?child_operation)) { ret 4; }
-    if (!settle_closed_child(?child_link, ?child)) { ret 5; }
+    val early: res[bool, StateError] = settle_closed_child(?child_link, ?child);
+    if (!sel early.err) { ret 40; }
+    if (!sel early.err.busy) { ret 41; }
+    if (!child_link.active) { ret 41; }
+    if (!completed(?child_operation)) { ret 4; }
+    val drained: res[bool, StateError] = settle_closed_child(?child_link, ?child);
+    if (!sel drained.ok) { ret 5; }
+    if (!drained.ok) { ret 5; }
     if (snapshot(?parent).state != CLOSED) { ret 6; }
+    ret 0;
+}
+
+test "lifecycle: refused transitions name their cause and change nothing" {
+    val nil_made: err[StateError] = make(nil);
+    if (!sel nil_made.err) { ret 1; }
+    if (!sel nil_made.err.invalid) { ret 2; }
+    var lifecycle: Lifecycle;
+    make(?lifecycle);
+    var attachment: Attachment;
+    val nil_attach: err[StateError] = attach(?lifecycle, nil);
+    if (!sel nil_attach.err) { ret 3; }
+    if (!sel nil_attach.err.invalid) { ret 4; }
+    if (!attached(?lifecycle, ?attachment)) { ret 5; }
+    val again: err[StateError] = attach(?lifecycle, ?attachment);
+    if (!sel again.err) { ret 6; }
+    if (!sel again.err.active) { ret 7; }
+    if (snapshot(?lifecycle).outstanding != 1) { ret 7; }
+    var stale: Attachment;
+    if (!attached(?lifecycle, ?stale)) { ret 8; }
+    make(?lifecycle);
+    val regenerated: res[bool, StateError] = settle(?stale);
+    if (!sel regenerated.err) { ret 9; }
+    if (!sel regenerated.err.stale) { ret 10; }
+    if (!stale.active) { ret 10; }
+    val nil_settle: res[bool, StateError] = settle(nil);
+    if (!sel nil_settle.err) { ret 11; }
+    if (!sel nil_settle.err.invalid) { ret 12; }
+    var never: Attachment;
+    val unattached: res[bool, StateError] = settle(?never);
+    if (!sel unattached.err) { ret 13; }
+    if (!sel unattached.err.inactive) { ret 14; }
+    val nil_child: res[bool, StateError] = settle_closed_child(?stale, nil);
+    if (!sel nil_child.err) { ret 15; }
+    if (!sel nil_child.err.invalid) { ret 16; }
     ret 0;
 }
