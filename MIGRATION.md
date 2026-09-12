@@ -22,7 +22,7 @@ mach `doc/design/tagged-values.md`; the compiler pin is
 | migration compiler | mach `dev` `b4ab85122e30bb24d733a024d549a9a05ef1a2c2`, built by the 4.30.0 seed (generation A `a881f3c2`) or through std's own bootstrap chain (fixpoint `b1fe8a87`) |
 | std base | `origin/dev` `c373e56` (std 1.0.2) |
 | bootstrap chain | `.github/actions/setup-mach/bootstrap.py`: published 4.26.5, bridge `878a8f66` single, audited `b65afb97` fixpoint, v5 `8464568d` fixpoint (std pin `168a9f76` at every stage). `8464568d` is `9a15ac3a6` plus the seeding removal (mach PR #3278: the compiler no longer seeds `res`, `opt` and `err` and no longer refuses a module that declares them); `9a15ac3a6` is `b4ab85122` plus the darwin build fix (mach PR #3277, the pinned std does not forward `O_NONBLOCK` on darwin) and is language-identical |
-| suite at this phase | 1275 passed, 0 failed under the v5 compiler `8464568d` on linux-x86_64 after S4b on S4a (1265 after S4a merged S3c, 1256 after S3c on S2, 1241 after S2, 1216 after S3b, 1199 after S3a, 1208 after the two `feat/618` filesystem producer fixes landed, 1185 at S1 phase 2, 1182 at S1 phase 1 under `9a15ac3a6`, 1157 on the base under both the 4.30.0 seed and the v5 compiler) |
+| suite at this phase | 1278 passed, 0 failed under the v5 compiler `8464568d` on linux-x86_64 after S4b on S4a and S8 (1266 after S4a on S8, 1259 after S8 on S3c, 1256 after S3c on S2, 1241 after S2, 1216 after S3b, 1199 after S3a, 1208 after the two `feat/618` filesystem producer fixes landed, 1185 at S1 phase 2, 1182 at S1 phase 1 under `9a15ac3a6`, 1157 on the base under both the 4.30.0 seed and the v5 compiler) |
 
 ## Compiler facts every lane must know
 
@@ -630,14 +630,46 @@ above. `types.result` and `types.option` remain for the unmigrated consumers.
 | `data.toml` | `get`, `get_str`, `get_table`, `get_array`, `array_get`, `table_key`, `table_value` | done (S2): `opt[*Value]`, `opt[str]`, `opt[*Table]`, `opt[*Array]`, `opt[*Value]`, `opt[str]`, `opt[*Value]` (census rows, correction above) | optional-value |
 | `derive` | `eq[T]` unchanged; `fmt[T]` | done (S2): `res[usize, WriteError]` | result-payload |
 
-### Compression (S2 types done, S8 lifecycle)
+### Compression (S2 types, S8 lifecycle, done)
 
 | module | outcome-bearing APIs | representation | S0 rule |
 | --- | --- | --- | --- |
 | `compress.inflate`, `zlib`, `gzip` | `init` | done (S2): `res[Inflater\|Decompressor, InflateError]` with `alloc` the only case raised (the window is the only acquisition; the shim at the window allocation is gone) | result-payload |
 | | `dnit` | done (S2): `err[allocator.Error]` | allocator-release |
-| | `decompress`, `finish`, `decompress_into`, `decompress_alloc` | done (S2): `res[Progress, InflateError]` where a failure after progress carries the committed input and output counts; `finish` is `err[InflateError]` on inflate and zlib (correction above); concatenated members, explicit EOF, sticky failure (`opt[InflateError]`, re-reported `settled`), truncation and CRC verdicts are preserved for S8 with their tests passing unchanged in form; the `V.ensure` growth shims are gone | result-payload |
+| | `decompress`, `finish`, `decompress_into`, `decompress_alloc` | done (S2, accepted S8): `res[Progress, InflateError]` where a failure after progress carries the committed input and output counts; `finish` is `err[InflateError]` on inflate and zlib (correction above); concatenated members, explicit EOF, sticky failure (`opt[InflateError]`, re-reported `settled`), truncation and CRC verdicts are preserved on the frozen forms with the acceptance below; the `V.ensure` growth shims are gone | result-payload |
 | | `is_done` | unchanged predicate | predicate-or-transition |
+
+S8 is the acceptance pass for std #418 (complete gzip-stream lifecycle) on
+the forms S2 froze. No signature changed. Each bullet of the issue is
+demonstrated by a named test in `src/compress/gzip.mach`, run under the v5
+compiler; the fixtures are the ones already in the tree (Python `gzip` at
+levels 6 and 9, the `gzip` CLI with a stored filename, the procedural 12000
+byte member, the 276 byte streaming member, the empty member, the FHCRC
+member and the six negative members), and no new compressed stream was
+generated.
+
+| #418 bullet | test | what it pins |
+| --- | --- | --- |
+| concatenated members, every split point | `gzip: all member split points preserve output and independent framing` | four members (level 6, empty, CLI, FHCRC; 242 bytes to 152) at every two-chunk split with 1, 17 and 4096 byte output, then the whole stream through `decompress_into` |
+| explicit EOF | `gzip: EOF completion failure reset and destruction have explicit states` | a verified member boundary is `NEED_INPUT` until `finish`; `finish` is `DONE` and idempotent with zero counts; `decompress` after it is `finished`; `finish` on an empty stream is `truncated`; the split sweep additionally refuses `DONE` before EOF and `NEED_INPUT` after it (`t_split` exits 4 and 5) |
+| draining after EOF | `gzip: finishing drains buffered matches through output backpressure` | one byte of output per call: `finish` returns `OUTPUT_FULL` with zero consumed at least twice before `DONE`, and every cut of the input drains what was buffered before the `truncated` verdict |
+| sticky failure re-reported `settled` on every later call | `gzip: a stored failure is re-reported settled by every later call` | after a `truncated` finish and after a `malformed` (checksum) second member, two rounds of `decompress` with fresh valid input and `finish` each re-report the same case and defect with `consumed` and `written` zero; `reset` clears it and the decoder decodes again |
+| committed input and output counts on failure after progress | `gzip: a failure after progress carries the committed counts across members` | whole-call `decompress_into` reports `malformed{checksum, 125, 85}` over both members; the streaming call that fails reports only its own `{54, 34}`; the re-report is `{0, 0}` |
+| truncation and CRC verdicts distinct | `gzip: later corruption truncation and trailing junk never return prefix success` (with `gzip: corrupt crc32 trailer is rejected`, `gzip: member cut before its trailer is rejected`) | a corrupt second-member crc32 is `malformed.checksum`, a corrupt length `malformed.length`, bad magic, reserved flag and FHCRC each their own defect; every cut of the second member (72 to 126 bytes), a one-byte junk tail and an empty input are `truncated` with every byte consumed |
+| partial-output cleanup after a failed `decompress_alloc` | `gzip: a malformed later member releases allocated prefix output`, `gzip: a truncated later member releases allocated prefix output`, `gzip: allocation refusal frees the window and cumulative output` | the caller owns nothing: the tracking allocator has zero live blocks and zero double frees after a malformed second member, a truncated second member (verdict `truncated{827, >= 12000}`) and a refusal at every acquisition ordinal (the window, then each vector growth up to 24000 bytes) |
+| first-member regression control | `gzip: all member split points preserve output and independent framing` (mutation, not a test) | restoring member-boundary completion in `pump` (`G_BETWEEN` sets `G_DONE` without consulting `eof` or remaining input) fails this test at exit 1 and eight others (later corruption, EOF states, drain, refusal, prefix cleanup, committed counts, sticky re-report, truncated cleanup); 16 of 25 pass, so a runtime failure and not a compiler refusal is the evidence |
+| `init` and `dnit` under a refusing allocator | `gzip: init and dnit under a refusing allocator` | the window is the only acquisition: `init`, `decompress_into` and `decompress_alloc` report `alloc.exhausted` with zero live blocks when it is refused; a refused release is `release{-16}` from the backend, the decoder keeps its window and still decodes a stream, an accepted release and a second one are ok, and a released decoder is `closed` from `decompress` and `finish` |
+
+Mutation control for the sticky re-report: dropping the
+`if (sel z.failure.some)` re-report from `decompress` and `finish` fails
+`gzip: a stored failure is re-reported settled by every later call` at exit
+5 (a `decompress` after a `truncated` finish answers `finished` instead of
+the settled `truncated{0, 0}`) and `gzip: EOF completion failure reset and
+destruction have explicit states` at exit 8; the other 23 pass. The
+`malformed` half of the sticky test is not discriminating on its own,
+because the decoder's state does not advance past a failed trailer check and
+would re-derive the same defect, which is why the truncated case is the one
+the control rests on.
 
 ### Crypto and random (S4a, done)
 
@@ -756,13 +788,13 @@ phase (33 sites over 15 modules):
 | `filesystem` | 0 (16 removed by S3b) | S3 |
 | `data.toml` | 0 (8 removed by S2) | S2 |
 | `data.json` | 0 (4 removed by S2) | S2 |
-| `compress.inflate` | 0 (3 removed by S2) | S2/S8 |
+| `compress.inflate` | 0 (3 removed by S2) | S2 |
 | `process.exec` | 2 (removed, S3c) | S3 |
 | `process.env` | 2 (removed, S3c) | S3 |
 | `format` | 0 (2 removed by S2) | S2 |
 | `filesystem.transaction` | 0 (2 removed by S3b), plus `sprint_text` around `format.sprint` (7 call sites, added by S2, removed by S3c) | S3 |
 | `encoding.binary` | 0 (1 removed by S2) | S2 |
-| `compress.zlib`, `compress.gzip` | 0 (1 each removed by S2) | S2/S8 |
+| `compress.zlib`, `compress.gzip` | 0 (1 each removed by S2) | S2 |
 | `net.resolve`, `net.resolve.shared` | 0 (typed `types.Error` and `bool` already; the `bool` carriers are `err`/`res` since S3c) | S3 |
 
 The `system.os.*` hits of that string are the OS layer's own native
@@ -845,13 +877,15 @@ effect at `-O0`, by that policy.
   is one of its causes. S4b is done: `TermError`, `SinkError`, `ClockError`
   and `log.record.EncodeError` are frozen above. S2 is done: `ParseError`, `FormatError`,
   `InputError`, `EncodeError`, `DecodeError`, `JsonError`, `TomlError`,
-  `InflateError` and `Defect` are frozen above, and S8 inherits the
-  compression lifecycle on those shapes.
+  `InflateError` and `Defect` are frozen above, and S8 accepted the
+  compression lifecycle on those shapes (the per-bullet table under
+  Compression).
 - S3 owns the operation and error contracts S5 to S7 consume, and lands
   `feat/618`'s three producer fixes on the frozen foundations (two landed by
   S3b, `9dd151d` owed by S3c).
 - S5 to S8: behavior programs on top of S3's contracts (Darwin boundaries,
   ancillary rights, welded secret I/O, gzip lifecycle); no foundation change.
+  S8 is done: no signature changed, the acceptance is tabled per bullet.
 - C5: the compiler side is done (mach #3226, `8464568d` seeds nothing) and
   std declares the three tags in `std.types.canonical` with the `use` sweep
   (std #617, S1 phase 2). What remains: `std.types.result` and

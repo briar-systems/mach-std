@@ -192,6 +192,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drains buffered output, with terminal completion only after every member verifies.
   Later corruption and trailing junk fail instead of returning prefix success.
 
+- **Breaking, std 2.0.0 (Mach 5.0.0):** `std.compress.inflate`, `zlib` and `gzip`
+  report outcomes with the v5 canonical tags. `inflate` declares `Defect` (one
+  case per deflate and framing fault), `Committed`, `Fault` and `InflateError`
+  (`alloc`, `malformed`, `truncated`, `full`, `closed`, `finished`, `invalid`),
+  re-exported by the wrappers. `init` returns `res[T, InflateError]`, `dnit`
+  `err[allocator.Error]` (a refused release leaves the decoder owning its
+  window), `decompress` `res[Progress, InflateError]` with a failure carrying
+  the counts the call committed, `finish` `err[InflateError]` on inflate and
+  zlib and `res[Progress, InflateError]` on gzip because it drains,
+  `decompress_into` `res[usize, InflateError]` and `decompress_alloc`
+  `res[Vector[u8], InflateError]` with the vector already released on failure.
+  A gzip stream failure is stored and re-reported settled (nothing committed)
+  by every later call until `reset` or `dnit`; input after `finish` is
+  `finished`, a released decoder is `closed`. Nil-argument checks are gone.
+
 - Darwin CPU discovery uses public sysctlbyname with hw.activecpu, returning the
   current active count instead of the boot maximum and retaining a minimum of one.
 
