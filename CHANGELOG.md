@@ -52,6 +52,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend. `semver_parse` releases a copied prerelease when the build copy is
   refused. The old `Result`, `Option` and `Void` remain for the modules that
   have not migrated yet and are removed with the last of them.
+- Directory root opening and descent preserve the primary failure and first
+  cleanup error, consuming newly acquired descriptors on a failed advance.
+
+- Linux and Darwin expose `O_NONBLOCK` through their file-open interfaces.
+
+- Darwin local byte reads reject ancillary input before installing descriptor
+  rights and retain socket ownership on refusal. Local async reads share that
+  boundary. Generic Darwin async operations reject non-internet socket handles.
 
 - Directory enumeration uses an explicitly owned cursor and borrowed entries on
   every backend. Darwin uses public fdopendir, readdir and closedir. Native record

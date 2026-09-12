@@ -136,7 +136,7 @@ pub val OP_REMOVE:    Op = 7;
 pub rec Error {
     kind: ErrorKind;
     op:   Op;
-    # the errno when `kind` is IO, otherwise 0
+    # underlying producer errno when available, including native unsupported errors
     code: i64;
     # first independent cleanup failure
     cleanup_code: i64;
@@ -147,13 +147,19 @@ pub fun error(kind: ErrorKind, op: Op) Error {
 }
 
 pub fun io_error(op: Op, code: i64) Error {
-    if (code == os.ENOTSUP) { ret error(UNSUPPORTED, op); }
+    if (code == os.ENOTSUP) { ret Error{kind: UNSUPPORTED, op: op, code: code}; }
     ret Error{kind: IO, op: op, code: code};
+}
+
+fun with_cleanup_error(primary: Error, closed: i64) Error {
+    var result: Error = primary;
+    if (closed < 0 && result.cleanup_code == 0) { result.cleanup_code = closed; }
+    ret result;
 }
 
 fun removal_error(op: Op, source: removal.Error) Error {
     var result: Error = io_error(op, source.code);
-    if (source.containment) { result = error(CONTAINMENT, op); }
+    if (source.containment) { result = Error{kind: CONTAINMENT, op: op, code: source.code}; }
     result.cleanup_code = source.cleanup_code;
     ret result;
 }
@@ -310,13 +316,18 @@ fun free_component(component: *ComponentScratch) {
 # base: absolute or process-relative path of the anchor directory
 # rel:  canonical relative path beneath `base`, or empty for `base` itself
 # ret: none when initialized in caller-provided final storage
+# failure retains the primary cause and first cleanup error, with no new root
+# descriptors passed to close are consumed even when close reports an error
 pub fun root_open(out: *Root, base: Path, rel: Path) O.Option[Error] {
     if (out == nil) { ret O.some[Error](error(INVALID, OP_ROOT_OPEN)); }
     val opened: R.Result[i32, Error] = open_root_descriptor(base, rel);
     if (R.is_err[i32, Error](opened)) { ret O.some[Error](R.unwrap_err[i32, Error](opened)); }
     val fd: i32 = R.unwrap_ok[i32, Error](opened);
     val initialized: i64 = ownership.root_init(out, fd);
-    if (initialized < 0) { os.close(fd); ret O.some[Error](error(INVALID, OP_ROOT_OPEN)); }
+    if (initialized < 0) {
+        val closed: i64 = os.close(fd);
+        ret O.some[Error](with_cleanup_error(error(INVALID, OP_ROOT_OPEN), closed));
+    }
     ret O.none[Error]();
 }
 
@@ -332,8 +343,7 @@ pub fun root_open_child(out: *Root, parent: *Root, leaf: str) O.Option[Error] {
     val initialized: i64 = ownership.root_init(out, fd);
     if (initialized < 0) {
         val closed: i64 = os.close(fd);
-        if (closed < 0) { ret O.some[Error](io_error(OP_ROOT_OPEN, closed)); }
-        ret O.some[Error](error(INVALID, OP_ROOT_OPEN));
+        ret O.some[Error](with_cleanup_error(error(INVALID, OP_ROOT_OPEN), closed));
     }
     ret O.none[Error]();
 }
@@ -349,8 +359,8 @@ fun open_root_descriptor(base: Path, rel: Path) R.Result[i32, Error] {
         ret R.ok[i32, Error](fd);
     }
     if (!rel_is_canonical(rel)) {
-        os.close(fd);
-        ret R.err[i32, Error](error(CONTAINMENT, OP_ROOT_OPEN));
+        val closed: i64 = os.close(fd);
+        ret R.err[i32, Error](with_cleanup_error(error(CONTAINMENT, OP_ROOT_OPEN), closed));
     }
 
     val n: usize = str_len(rel);
@@ -361,19 +371,32 @@ fun open_root_descriptor(base: Path, rel: Path) R.Result[i32, Error] {
 
         val copied: R.Result[ComponentScratch, Error] = copy_component(rel, start, end, OP_ROOT_OPEN);
         if (R.is_err[ComponentScratch, Error](copied)) {
-            os.close(fd);
-            ret R.err[i32, Error](R.unwrap_err[ComponentScratch, Error](copied));
+            val closed: i64 = os.close(fd);
+            ret R.err[i32, Error](with_cleanup_error(R.unwrap_err[ComponentScratch, Error](copied), closed));
         }
         var component: ComponentScratch = R.unwrap_ok[ComponentScratch, Error](copied);
         val next: R.Result[i32, Error] = verified_directory(fd, component.name, OP_ROOT_OPEN);
         free_component(?component);
-        os.close(fd);
-        if (R.is_err[i32, Error](next)) { ret R.err[i32, Error](R.unwrap_err[i32, Error](next)); }
-        fd = R.unwrap_ok[i32, Error](next);
+        val closed: i64 = os.close(fd);
+        val advanced: R.Result[i32, Error] = root_step_result(next, closed);
+        if (R.is_err[i32, Error](advanced)) { ret advanced; }
+        fd = R.unwrap_ok[i32, Error](advanced);
         start = end + 1;
     }
 
     ret R.ok[i32, Error](fd);
+}
+
+# next owns a descriptor only on success, and the prior descriptor is consumed
+fun root_step_result(next: R.Result[i32, Error], closed: i64) R.Result[i32, Error] {
+    if (R.is_err[i32, Error](next)) {
+        ret R.err[i32, Error](with_cleanup_error(R.unwrap_err[i32, Error](next), closed));
+    }
+    if (closed < 0) {
+        val cleanup: i64 = os.close(R.unwrap_ok[i32, Error](next));
+        ret R.err[i32, Error](with_cleanup_error(io_error(OP_ROOT_OPEN, closed), cleanup));
+    }
+    ret next;
 }
 
 # release a publication root
@@ -694,6 +717,10 @@ pub fun entry_read_all(r: *Root, leaf: str, out: *u8,
 # holder is not residue and is never swept.
 pub val LOCK_LEAF: str = ".mach-txn-lock";
 
+pub fun coordinator_entry(name: str) bool {
+    ret str_equals(name, LOCK_LEAF) || str_equals(name, ownership.CLAIMS_LEAF);
+}
+
 # an exclusive claim on a publication root
 #
 # while held, no other process can take the same claim. the operating system
@@ -873,6 +900,9 @@ pub rec PrepareOptions {
     precondition: Precondition;
     # omitted fields retain the zero-valued metadata-only access contract
     prior_access: identities.Access;
+    # file-only final permission mode, independent of the process umask
+    # false keeps ordinary creation permissions, unsupported backends refuse true
+    exact_mode: bool;
     durability: DurabilityRequest;
 }
 
@@ -1049,7 +1079,10 @@ fun transaction_cleanup_retaining(t: *Transaction, remove: bool, op: Op, residue
 
 fun prepare_failed(t: *Transaction, e: Error) O.Option[Error] {
     val cleaned: O.Option[Error] = transaction_cleanup(t, true, OP_PREPARE);
-    if (O.is_some[Error](cleaned)) { ret cleaned; }
+    if (O.is_some[Error](cleaned)) {
+        val cleanup: Error = O.unwrap[Error](cleaned);
+        ret O.some[Error](with_cleanup_error(e, cleanup.code));
+    }
     ret O.some[Error](e);
 }
 
@@ -1058,6 +1091,7 @@ fun begin_prepare(out: *Transaction, alloc: *A.Allocator, destination: *Claim,
     if (out == nil || alloc == nil || options.precondition > PRE_ABSENT || options.prior_access > READ_AUTHORIZED || options.durability.level > DUR_FULL) {
         ret O.some[Error](error(INVALID, OP_PREPARE));
     }
+    if (options.exact_mode && kind != ENTRY_FILE) { ret O.some[Error](error(INVALID, OP_PREPARE)); }
     if (out.address != 0 && (out.address != out::usize || out.state != STATE_SPENT)) {
         ret O.some[Error](error(INVALID, OP_PREPARE));
     }
@@ -1259,7 +1293,8 @@ fun make_staging_dir(alloc: *A.Allocator, dirfd: i32, mode: i32,
 # destination: the session-owned reservation borrowed until commit or abort
 # write_ctx:   context handed back to `write_cb`
 # write_cb:    produces the content; an error aborts the prepare
-# mode:        permission bits for the staged file
+# mode:        creation permission bits, or final file bits when exact_mode is true
+# exact modes are applied after writing and before the requested durability barrier
 # want_digest: compute the sha-256 of what was written
 # ret:         none when out owns a prepared transaction
 pub fun prepare[W](out: *Transaction, alloc: *A.Allocator, destination: *Claim,
@@ -1278,9 +1313,16 @@ pub fun prepare[W](out: *Transaction, alloc: *A.Allocator, destination: *Claim,
     val written: R.Result[R.Void, str] = write_cb(write_ctx, ?writer);
     if (sink.failed_code < 0) { ret prepare_failed(out, io_error(OP_PREPARE, sink.failed_code)); }
     if (R.is_err[R.Void, str](written)) { ret prepare_failed(out, error(REJECTED, OP_PREPARE)); }
+    if (options.exact_mode) {
+        val finalized: i64 = os.set_mode(out.staging_fd, mode);
+        if (finalized < 0) { ret prepare_failed(out, io_error(OP_PREPARE, finalized)); }
+    }
     var st: os.stat_t;
     val observed: i64 = os.stat(out.staging_fd, ?st);
     if (observed < 0) { ret prepare_failed(out, io_error(OP_PREPARE, observed)); }
+    if (options.exact_mode && (os.stat_mode(?st) & 0o7777) != (mode::u32 & 0o7777)) {
+        ret prepare_failed(out, error(UNSUPPORTED, OP_PREPARE));
+    }
     out.len = st.st_size::usize;
     out.has_digest = want_digest;
     if (want_digest) { sha256.final(?sink.digest_state, ?out.digest[0]); }
@@ -1488,7 +1530,9 @@ fun prepare_barrier(t: *Transaction, fd: i32) O.Option[Error] {
 # finish consumption after an effect, preserving cleanup failures
 fun commit_failed(t: *Transaction, remove: bool, failure: Error) R.Result[Outcome, Error] {
     val cleaned: O.Option[Error] = transaction_cleanup(t, remove, OP_COMMIT);
-    if (O.is_some[Error](cleaned)) { ret R.err[Outcome, Error](O.unwrap[Error](cleaned)); }
+    if (O.is_some[Error](cleaned)) {
+        ret R.err[Outcome, Error](with_cleanup_error(failure, O.unwrap[Error](cleaned).code));
+    }
     ret R.err[Outcome, Error](failure);
 }
 
@@ -1859,10 +1903,13 @@ fun verified_directory(dirfd: i32, name: str, op: Op) R.Result[i32, Error] {
     val fd: i32 = opened::i32;
     var after: os.stat_t;
     val checked: i64 = os.stat(fd, ?after);
-    if (checked < 0) { os.close(fd); ret R.err[i32, Error](io_error(op, checked)); }
+    if (checked < 0) {
+        val closed: i64 = os.close(fd);
+        ret R.err[i32, Error](with_cleanup_error(io_error(op, checked), closed));
+    }
     if ((os.stat_mode(?after) & os.S_IFMT) != os.S_IFDIR) {
-        os.close(fd);
-        ret R.err[i32, Error](error(CONTAINMENT, op));
+        val closed: i64 = os.close(fd);
+        ret R.err[i32, Error](with_cleanup_error(error(CONTAINMENT, op), closed));
     }
     ret R.ok[i32, Error](fd);
 }
@@ -1909,7 +1956,7 @@ fun resolve_backup(dirfd: i32, leaf: str, backupfd: i32) R.Result[bool, Error] {
 fun owned_replace_failed(t: *Transaction, backupfd: i32, remove: bool, failure: Error) R.Result[Outcome, Error] {
     if (backupfd >= 0) {
         val closed: i64 = os.close(backupfd);
-        if (closed < 0) { ret commit_failed(t, remove, io_error(OP_COMMIT, closed)); }
+        if (closed < 0) { ret commit_failed(t, remove, with_cleanup_error(failure, closed)); }
     }
     ret commit_failed(t, remove, failure);
 }
@@ -2012,33 +2059,41 @@ fun recover_entries(alloc: *A.Allocator, r: *Root, leaf: str) R.Result[usize, Er
         if (R.is_err[bool, Error](resolved)) { ret R.err[usize, Error](R.unwrap_err[bool, Error](resolved)); }
         if (closed < 0) { ret R.err[usize, Error](io_error(OP_RECOVER, closed)); }
     }
-    val rewound: i64 = os.seek(r.dirfd, 0, os.SEEK_SET);
-    if (rewound < 0) { ret R.err[usize, Error](io_error(OP_RECOVER, rewound)); }
-    var names: Vector[str] = vector.init[str](alloc);
-    val listed: O.Option[Error] = list_entries(alloc, r.dirfd, ?names);
-    if (O.is_some[Error](listed)) {
-        free_names(alloc, ?names);
-        ret R.err[usize, Error](O.unwrap[Error](listed));
-    }
     var removed: usize = 0;
-    var failure: O.Option[Error] = O.none[Error]();
-    var i: usize = 0;
-    for (i < names.len && O.is_none[Error](failure)) {
-        val name: str = names.data[i];
-        i = i + 1;
-        if (!staging_residue(name)) { cnt; }
-        var count: usize = 0;
-        val cleaned: O.Option[removal.Error] = removal.private_tree(r.dirfd, name, ?count, MAX_REMOVE_DEPTH);
-        var result: O.Option[Error] = O.none[Error]();
-        if (O.is_some[removal.Error](cleaned)) {
-            val e: removal.Error = O.unwrap[removal.Error](cleaned);
-            result = O.some[Error](removal_error(OP_RECOVER, e));
+    for {
+        val rewound: i64 = os.seek(r.dirfd, 0, os.SEEK_SET);
+        if (rewound < 0) { ret R.err[usize, Error](io_error(OP_RECOVER, rewound)); }
+        var cursor: os.DirectoryCursor = os.DirectoryCursor{};
+        val initialized: os.DirectoryInitResult = os.directory_init(?cursor, r.dirfd);
+        if (initialized.code < 0) {
+            var failure: Error = io_error(OP_RECOVER, initialized.code);
+            failure.cleanup_code = initialized.cleanup_code;
+            ret R.err[usize, Error](failure);
         }
-        if (O.is_some[Error](result)) { failure = result; cnt; }
-        removed = removed + 1;
+        val before: usize = removed;
+        var failure: O.Option[Error] = O.none[Error]();
+        for {
+            var entry: os.DirectoryEntry;
+            val next: i64 = os.directory_next(?cursor, ?entry);
+            if (next < 0) { failure = O.some[Error](io_error(OP_RECOVER, next)); brk; }
+            if (next == 0) { brk; }
+            if (!staging_residue(entry.name)) { cnt; }
+            var count: usize = 0;
+            val cleaned: O.Option[removal.Error] = removal.private_tree(r.dirfd, entry.name, ?count, MAX_REMOVE_DEPTH);
+            if (O.is_some[removal.Error](cleaned)) {
+                failure = O.some[Error](removal_error(OP_RECOVER, O.unwrap[removal.Error](cleaned)));
+                brk;
+            }
+            if (count != 0) { removed = removed + 1; }
+        }
+        val closed: i64 = os.directory_close(?cursor);
+        if (O.is_some[Error](failure)) {
+            ret R.err[usize, Error](with_cleanup_error(O.unwrap[Error](failure), closed));
+        }
+        if (closed < 0) { ret R.err[usize, Error](io_error(OP_RECOVER, closed)); }
+        # rescan after mutation so native directory buffering cannot hide residue
+        if (before == removed) { ret R.ok[usize, Error](removed); }
     }
-    free_names(alloc, ?names);
-    if (O.is_some[Error](failure)) { ret R.err[usize, Error](O.unwrap[Error](failure)); }
     ret R.ok[usize, Error](removed);
 }
 
@@ -2066,6 +2121,7 @@ pub rec Descent {
 # base:  absolute path of the anchor directory
 # rel:   canonical relative path beneath `base`
 # ret: true when out owns the first missing location, false when all of rel exists
+# failure retains the primary cause and first cleanup error, with no new descent
 pub fun descend(out: *Descent, alloc: *A.Allocator, base: Path, rel: Path) R.Result[bool, Error] {
     if (out == nil || alloc == nil || str_empty(base)) {
         ret R.err[bool, Error](error(INVALID, OP_ROOT_OPEN));
@@ -2092,8 +2148,8 @@ pub fun descend(out: *Descent, alloc: *A.Allocator, base: Path, rel: Path) R.Res
 
         val comp_r: res[str, StrError] = str_copy_slice(alloc, rel, start, end - start);
         if (sel comp_r.err) {
-            os.close(fd);
-            ret R.err[bool, Error](error(MEMORY, OP_ROOT_OPEN));
+            val closed: i64 = os.close(fd);
+            ret R.err[bool, Error](with_cleanup_error(error(MEMORY, OP_ROOT_OPEN), closed));
         }
         val comp: str = comp_r.ok;
 
@@ -2104,42 +2160,47 @@ pub fun descend(out: *Descent, alloc: *A.Allocator, base: Path, rel: Path) R.Res
             if (end < n) {
                 val rem_r: res[str, StrError] = str_copy_slice(alloc, rel, end + 1, n - end - 1);
                 if (sel rem_r.err) {
-                    os.close(fd); str_free(alloc, comp);
-                    ret R.err[bool, Error](error(MEMORY, OP_ROOT_OPEN));
+                    val closed: i64 = os.close(fd);
+                    str_free(alloc, comp);
+                    ret R.err[bool, Error](with_cleanup_error(error(MEMORY, OP_ROOT_OPEN), closed));
                 }
                 remainder = rem_r.ok;
             }
             val initialized: i64 = ownership.root_init(?out.root, fd);
             if (initialized < 0) {
-                os.close(fd);
+                val closed: i64 = os.close(fd);
                 str_free(alloc, comp);
                 str_free(alloc, remainder);
-                ret R.err[bool, Error](error(INVALID, OP_ROOT_OPEN));
+                ret R.err[bool, Error](with_cleanup_error(error(INVALID, OP_ROOT_OPEN), closed));
             }
             out.first_missing = comp;
             out.remainder = remainder;
             ret R.ok[bool, Error](true);
         }
         if (sr < 0) {
-            os.close(fd); str_free(alloc, comp);
-            ret R.err[bool, Error](io_error(OP_ROOT_OPEN, sr));
+            val closed: i64 = os.close(fd);
+            str_free(alloc, comp);
+            ret R.err[bool, Error](with_cleanup_error(io_error(OP_ROOT_OPEN, sr), closed));
         }
         if ((os.stat_mode(?st) & os.S_IFMT) != os.S_IFDIR) {
-            os.close(fd); str_free(alloc, comp);
-            ret R.err[bool, Error](error(CONTAINMENT, OP_ROOT_OPEN));
+            val closed: i64 = os.close(fd);
+            str_free(alloc, comp);
+            ret R.err[bool, Error](with_cleanup_error(error(CONTAINMENT, OP_ROOT_OPEN), closed));
         }
 
         val next: R.Result[i32, Error] = verified_directory(fd, comp, OP_ROOT_OPEN);
         str_free(alloc, comp);
-        os.close(fd);
-        if (R.is_err[i32, Error](next)) {
-            ret R.err[bool, Error](R.unwrap_err[i32, Error](next));
+        val closed: i64 = os.close(fd);
+        val advanced: R.Result[i32, Error] = root_step_result(next, closed);
+        if (R.is_err[i32, Error](advanced)) {
+            ret R.err[bool, Error](R.unwrap_err[i32, Error](advanced));
         }
-        fd = R.unwrap_ok[i32, Error](next);
+        fd = R.unwrap_ok[i32, Error](advanced);
         start = end + 1;
     }
 
-    os.close(fd);
+    val closed: i64 = os.close(fd);
+    if (closed < 0) { ret R.err[bool, Error](io_error(OP_ROOT_OPEN, closed)); }
     ret R.ok[bool, Error](false);
 }
 
@@ -2284,6 +2345,52 @@ fun partial_then_fail(p: *PartialThenFail, w: *m_writer.Writer) R.Result[R.Void,
     m_writer.write_all(w, "partial", 7);
     p.wrote = 7;
     ret R.err[R.Void, str]("producer failed");
+}
+
+test "std.filesystem.transaction.root_open: close errors preserve the primary failure" {
+    val refused: R.Result[i32, Error] = R.err[i32, Error](error(CONTAINMENT, OP_ROOT_OPEN));
+    val clean: R.Result[i32, Error] = root_step_result(refused, 0);
+    if (R.is_ok[i32, Error](clean)) { ret 1; }
+    val original: Error = R.unwrap_err[i32, Error](clean);
+    if (original.kind != CONTAINMENT || original.op != OP_ROOT_OPEN || original.code != 0 || original.cleanup_code != 0) { ret 2; }
+    val failed: R.Result[i32, Error] = root_step_result(refused, os.EIO);
+    if (R.is_ok[i32, Error](failed)) { ret 3; }
+    val primary: Error = R.unwrap_err[i32, Error](failed);
+    if (primary.kind != CONTAINMENT || primary.op != OP_ROOT_OPEN || primary.code != 0 || primary.cleanup_code != os.EIO) { ret 4; }
+    val repeated: R.Result[i32, Error] = root_step_result(failed, os.EBADF);
+    if (R.is_ok[i32, Error](repeated) || R.unwrap_err[i32, Error](repeated).cleanup_code != os.EIO) { ret 5; }
+    val io: R.Result[i32, Error] = root_step_result(R.err[i32, Error](io_error(OP_ROOT_OPEN, os.EACCES)), os.EIO);
+    if (R.is_ok[i32, Error](io)) { ret 6; }
+    val cause: Error = R.unwrap_err[i32, Error](io);
+    if (cause.kind != IO || cause.op != OP_ROOT_OPEN || cause.code != os.EACCES || cause.cleanup_code != os.EIO) { ret 7; }
+    ret 0;
+}
+
+test "std.filesystem.transaction.root_open: failed advance consumes the newly opened descriptor" {
+    var alloc: A.Allocator;
+    val page_r: err[A.Error] = page.make(?alloc);
+    if (sel page_r.err) { ret 1; }
+    val scratch: R.Result[str, str] = scratch_root(?alloc);
+    if (R.is_err[str, str](scratch)) { ret 2; }
+    val base: str = R.unwrap_ok[str, str](scratch);
+    fin { fs.remove_all(?alloc, base); str_free(?alloc, base); }
+    val opened: R.Result[i32, Error] = open_root_descriptor(base, "");
+    if (R.is_err[i32, Error](opened)) { ret 3; }
+    val fd: i32 = R.unwrap_ok[i32, Error](opened);
+    val kept: R.Result[i32, Error] = root_step_result(opened, 0);
+    if (R.is_err[i32, Error](kept) || R.unwrap_ok[i32, Error](kept) != fd) { os.close(fd); ret 4; }
+    var st: os.stat_t;
+    if (os.stat(fd, ?st) < 0) { os.close(fd); ret 5; }
+    val failed: R.Result[i32, Error] = root_step_result(kept, os.EIO);
+    if (R.is_ok[i32, Error](failed)) { os.close(fd); ret 6; }
+    val failure: Error = R.unwrap_err[i32, Error](failed);
+    if (failure.kind != IO || failure.op != OP_ROOT_OPEN || failure.code != os.EIO || failure.cleanup_code != 0) { ret 7; }
+    if (os.stat(fd, ?st) != os.EBADF) { ret 8; }
+    val cleanup: R.Result[i32, Error] = root_step_result(R.ok[i32, Error](-1), os.EIO);
+    if (R.is_ok[i32, Error](cleanup)) { ret 9; }
+    val both: Error = R.unwrap_err[i32, Error](cleanup);
+    if (both.kind != IO || both.code != os.EIO || both.cleanup_code != os.EBADF) { ret 10; }
+    ret 0;
 }
 
 test "std.filesystem.transaction.root_open: refuses a symlinked ancestor" {
@@ -3005,6 +3112,82 @@ test "std.filesystem.transaction.recover: removes only this module's residue" {
     fs.remove_all(?alloc, root);
     str_free(?alloc, root);
     ret bad;
+}
+
+fun t_recovery_entry_name(out: *u8, index: usize, residue: bool) {
+    var width: usize = 160;
+    var i: usize = 0;
+    if (residue) {
+        val prefix: str = ".machtxn.";
+        for (i < str_len(prefix)) { out[i] = prefix[i]; i = i + 1; }
+        width = i + 16;
+    }
+    for (i < width) { out[i] = 'a'; i = i + 1; }
+    out[width] = 0;
+    val hex: str = "0123456789abcdef";
+    var value: usize = index;
+    i = width;
+    for (i > width - 4) {
+        i = i - 1;
+        out[i] = hex[value % 16];
+        value = value / 16;
+    }
+}
+
+fun t_recovery_streaming(a: *A.Allocator, session: *TestSession, base: str) i32 {
+    val root: *Root = session.held.root;
+    var name: [161]u8;
+    var i: usize = 0;
+    # ordinary names alone exceed one native directory buffer
+    for (i < 512) {
+        t_recovery_entry_name(?name[0], i, false);
+        if (t_fixture_write(root, (?name[0])::str, "keep") != 0) { ret 1; }
+        if (i % 8 == 0) {
+            t_recovery_entry_name(?name[0], i, true);
+            if (i % 16 == 0) {
+                if (os.make_dir(root.dirfd, (?name[0])::str, 0o700) < 0) { ret 2; }
+            }
+            or {
+                if (t_fixture_write(root, (?name[0])::str, "residue") != 0) { ret 3; }
+            }
+        }
+        i = i + 1;
+    }
+    if (t_fixture_write(root, ".machtxn.not-residue", "keep") != 0) { ret 4; }
+    var tracker: testing.Testing;
+    val tracker_r: err[A.Error] = testing.make(?tracker);
+    if (sel tracker_r.err) { ret 5; }
+    fin { testing.dnit(?tracker); }
+    testing.fail_at_ordinal(?tracker, 1);
+    val swept: R.Result[usize, Error] = recover(testing.allocator_of(?tracker), ?session.held, "");
+    if (R.is_err[usize, Error](swept)) { ret 6; }
+    if (R.unwrap_ok[usize, Error](swept) != 64 || !session.held.initialized) { ret 7; }
+    if (tracker.attempts != 0 || testing.leaked(?tracker) || testing.double_free_count(?tracker) != 0) { ret 8; }
+    i = 0;
+    for (i < 512) {
+        t_recovery_entry_name(?name[0], i, false);
+        var bytes: [4]u8;
+        val read: R.Result[O.Option[usize], Error] = entry_read_all(root, (?name[0])::str, ?bytes[0], 4);
+        if (R.is_err[O.Option[usize], Error](read)) { ret 9; }
+        val length: O.Option[usize] = R.unwrap_ok[O.Option[usize], Error](read);
+        if (O.is_none[usize](length) || O.unwrap[usize](length) != 4) { ret 10; }
+        if (bytes[0] != 'k' || bytes[1] != 'e' || bytes[2] != 'e' || bytes[3] != 'p') { ret 11; }
+        if (i % 8 == 0) {
+            t_recovery_entry_name(?name[0], i, true);
+            if (!entry_absent(root.dirfd, (?name[0])::str)) { ret 12; }
+        }
+        i = i + 1;
+    }
+    if (entry_absent(root.dirfd, ".machtxn.not-residue")) { ret 13; }
+    val again: R.Result[usize, Error] = recover(testing.allocator_of(?tracker), ?session.held, "");
+    if (R.is_err[usize, Error](again) || R.unwrap_ok[usize, Error](again) != 0) { ret 14; }
+    if (tracker.attempts != 0 || !session.held.initialized) { ret 15; }
+    if (t_reserve(session, "after-recovery") == nil) { ret 16; }
+    ret 0;
+}
+
+test "std.filesystem.transaction.recover: streaming mutation preserves entries without per-name allocation" {
+    ret t_journal_run(t_recovery_streaming);
 }
 
 test "std.filesystem.transaction.recover: a crash between prepare and commit leaves recoverable residue only" {
@@ -5802,5 +5985,85 @@ test "std.filesystem.transaction.staged_child_identity: journal observes the exa
     if (R.is_err[O.Option[Identity], Error](after)) { ret 15; }
     val observed: O.Option[Identity] = R.unwrap_ok[O.Option[Identity], Error](after);
     if (O.is_none[Identity](observed) || !identity_equal(R.unwrap_ok[Identity, Error](before), O.unwrap[Identity](observed))) { ret 16; }
+    ret 0;
+}
+
+test "std.filesystem.transaction.exact_mode: file permissions finalize before publication or refuse" {
+    var alloc: A.Allocator;
+    val page_r: err[A.Error] = page.make(?alloc);
+    if (sel page_r.err) { ret 1; }
+    val scratch: R.Result[str, str] = scratch_root(?alloc);
+    if (R.is_err[str, str](scratch)) { ret 2; }
+    val base: str = R.unwrap_ok[str, str](scratch);
+    fin { fs.remove_all(?alloc, base); str_free(?alloc, base); }
+    var root: Root;
+    if (O.is_some[Error](root_open(?root, base, ""))) { ret 3; }
+    fin { root_dnit(?root); }
+    var session: TestSession;
+    if (O.is_some[Error](t_session_init(?session, ?alloc, ?root))) { ret 4; }
+    fin { t_session_dnit(?session); }
+    val destination: *Claim = t_reserve(?session, "out");
+    if (destination == nil) { ret 5; }
+    var transaction: Transaction;
+    val options: PrepareOptions = PrepareOptions{precondition: PRE_ABSENT, exact_mode: true, durability: durability_file(true)};
+    val prepared: O.Option[Error] = prepare_bytes(?transaction, ?alloc, destination, "exact", 5, 0o774, false, options);
+    $if ($mach.build.os == $mach.os.windows) {
+        if (O.is_none[Error](prepared)) { abort(?transaction); ret 6; }
+        val failure: Error = O.unwrap[Error](prepared);
+        if (failure.kind != UNSUPPORTED || failure.op != OP_PREPARE || failure.code != os.ENOTSUP || failure.cleanup_code != 0) { ret 7; }
+        if (destination.active || payload_entry_count(?alloc, base) != 0) { ret 8; }
+        ret 0;
+    }
+    $or {
+        if (O.is_some[Error](prepared)) { ret 9; }
+        var staged: os.stat_t;
+        if (os.stat(transaction.staging_fd, ?staged) < 0 || (os.stat_mode(?staged) & 0o7777) != 0o774) { abort(?transaction); ret 10; }
+        if (!transaction.content_flushed) { abort(?transaction); ret 11; }
+        val committed: R.Result[Outcome, Error] = commit(?transaction);
+        if (R.is_err[Outcome, Error](committed)) { ret 12; }
+        var published: os.stat_t;
+        if (os.stat_path(root.dirfd, "out", ?published, os.AT_SYMLINK_NOFOLLOW) < 0 || (os.stat_mode(?published) & 0o7777) != 0o774) { ret 13; }
+        if (!t_backup_contents(?root, "out", "exact") || destination.active) { ret 14; }
+        ret 0;
+    }
+}
+
+test "std.filesystem.transaction.exact_mode: directory and subtree requests refuse before borrowing" {
+    var alloc: A.Allocator;
+    val page_r: err[A.Error] = page.make(?alloc);
+    if (sel page_r.err) { ret 1; }
+    val scratch: R.Result[str, str] = scratch_root(?alloc);
+    if (R.is_err[str, str](scratch)) { ret 2; }
+    val base: str = R.unwrap_ok[str, str](scratch);
+    fin { fs.remove_all(?alloc, base); str_free(?alloc, base); }
+    var root: Root;
+    if (O.is_some[Error](root_open(?root, base, ""))) { ret 3; }
+    fin { root_dnit(?root); }
+    var session: TestSession;
+    if (O.is_some[Error](t_session_init(?session, ?alloc, ?root))) { ret 4; }
+    fin { t_session_dnit(?session); }
+    val destination: *Claim = t_reserve(?session, "out");
+    if (destination == nil) { ret 5; }
+    var transaction: Transaction;
+    val options: PrepareOptions = PrepareOptions{precondition: PRE_ABSENT, exact_mode: true, durability: durability_none()};
+    val directory: O.Option[Error] = prepare_dir(?transaction, ?alloc, destination, 0o774, options);
+    if (O.is_none[Error](directory) || O.unwrap[Error](directory).kind != INVALID || destination.active) { ret 6; }
+    var inventory: Inventory = inventory_init(?alloc);
+    fin { inventory_dnit(?inventory); }
+    val subtree: O.Option[Error] = prepare_subtree(?transaction, ?alloc, destination, ?inventory, 0o774, options);
+    if (O.is_none[Error](subtree) || O.unwrap[Error](subtree).kind != INVALID || destination.active) { ret 7; }
+    if (payload_entry_count(?alloc, base) != 0) { ret 8; }
+    ret 0;
+}
+
+test "std.filesystem.transaction.error: producer codes survive semantic classification" {
+    val native: Error = io_error(OP_PREPARE, os.ENOTSUP);
+    if (native.kind != UNSUPPORTED || native.code != os.ENOTSUP) { ret 1; }
+    val semantic: Error = error(UNSUPPORTED, OP_PREPARE);
+    if (semantic.kind != UNSUPPORTED || semantic.code != 0) { ret 2; }
+    val removed: Error = removal_error(OP_PREPARE, removal.Error{code: os.EINVAL, containment: true});
+    if (removed.kind != CONTAINMENT || removed.code != os.EINVAL) { ret 3; }
+    val combined: Error = with_cleanup_error(native, removed.code);
+    if (combined.kind != UNSUPPORTED || combined.code != os.ENOTSUP || combined.cleanup_code != os.EINVAL) { ret 4; }
     ret 0;
 }
