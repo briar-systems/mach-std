@@ -7,7 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `std.types.canonical` pins the v5 canonical tags `res[T, E]`, `opt[T]` and
+  `err[E]` to the language contract (case order, case codes, zero defaults,
+  discriminator layout, reflection and nesting). The migration compiler still
+  seeds the three names; the declarations move into this module when it stops.
+
+- `std.allocator.Error` (`exhausted`, `overflow`, `invalid`, `release: i64`),
+  `std.types.string.StrError` (`alloc`, `bounds`), `std.types.semver.SemverError`
+  (`empty`, `syntax: usize`, `alloc`) and `std.collections.sort.SearchPosition`
+  (`insertion`, `found`).
+
+- `std.types.string.OwnedString` with `owned_adopt`, `owned_dup` and
+  `owned_release`: owned text that records its allocation extent, for producers
+  whose buffer may be larger than the text it holds.
+
+- `MIGRATION.md`, the std 2.0.0 retained-surface inventory: representation per
+  public outcome-bearing API, the frozen foundation signatures, the corrections
+  to the S0 census, the translation shims each later lane removes and what the
+  lanes owe.
+
+- The CI bootstrap chain gains the v5 migration compiler stage (mach
+  `b4ab85122`, fixpoint) after the audited 4.30 stage, so std compiles v5
+  syntax with a compiler it built from source.
+
 ### Changed
+
+- **Breaking, std 2.0.0 (Mach 5.0.0):** the allocator, the allocator backends,
+  the collections and the foundational types report outcomes with the v5
+  canonical tags. `allocate_raw`, `reallocate_raw`, `allocate`, `zallocate` and
+  `reallocate` return `res[_, allocator.Error]`; `deallocate_raw` and
+  `deallocate` return `err[allocator.Error]`; the interface callbacks return
+  `opt[ptr]`; every backend `make`/`init` and every container `dnit` returns
+  `err[allocator.Error]`; container growth returns `res[usize|bool,
+  allocator.Error]`; `pop`, `peek`, `get` return `opt`; `map.remove`,
+  `set.remove` and `slice.set` return `bool`; `binary_search` returns
+  `SearchPosition`; the string constructors return `res[str, StrError]`, the
+  string and view searches `opt`, the path constructors `res[Path,
+  allocator.Error]`, `semver_parse` `res[Semver, SemverError]`, `str_dup`
+  `res[str, allocator.Error]` and `str_free` `err[allocator.Error]`. An
+  allocator now refuses a zero or non-power-of-two alignment as `invalid`, and
+  a byte count that does not fit `usize` as `overflow`, before asking the
+  backend. `semver_parse` releases a copied prerelease when the build copy is
+  refused. The old `Result`, `Option` and `Void` remain for the modules that
+  have not migrated yet and are removed with the last of them.
+
 
 - Completion queue wake and close reject nil owners consistently on Linux, Windows
   and Darwin, preserving live wake and repeated-close behavior.
