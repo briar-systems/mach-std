@@ -16,6 +16,9 @@ use local_types: std.net.local.types;
 use std.net.async.types;
 use std.io.runtime;
 use std.sync.mutex;
+use std.types.size.isize;
+use std.types.canonical.res;
+use io_error: std.io.error;
 
 $if ($mach.build.os == $mach.os.linux) {
     use native: std.system.os.linux;
@@ -925,4 +928,134 @@ fun stream_shutdown_write(resource: usize) i64 {
 
 fun socket_close(resource: usize) i64 {
     ret native.sock_close(resource);
+}
+
+$if ($mach.build.os == $mach.os.linux) {
+    # the test's own inventory of its descriptor table, never a production mechanism
+    fun test_descriptor_count() i64 {
+        val directory: i64 = native.open(native.AT_FDCWD, "/proc/self/fd", native.O_RDONLY | native.O_DIRECTORY, 0);
+        if (directory < 0) { ret directory; }
+        var cursor: native.DirectoryCursor = native.DirectoryCursor{};
+        val initialized: native.DirectoryInitResult = native.directory_init(?cursor, directory::i32);
+        if (initialized.code != 0) { native.close(directory::i32); ret initialized.code; }
+        var count: i64 = 0;
+        var entry: native.DirectoryEntry;
+        var next: i64 = native.directory_next(?cursor, ?entry);
+        for (next > 0) {
+            if (entry.name[0] != '.') { count = count + 1; }
+            next = native.directory_next(?cursor, ?entry);
+        }
+        native.directory_close(?cursor);
+        native.close(directory::i32);
+        if (next < 0) { ret next; }
+        ret count - 1;
+    }
+
+    fun test_send_rights(handle: usize, data: *u8, length: usize, descriptor: i32, count: usize) i64 {
+        var control: [1032]u8;
+        val record_length: usize = 16 + count * 4;
+        @((?control[0])::*usize) = record_length;
+        @((?control[8])::*i32) = native.SOL_SOCKET;
+        @((?control[12])::*i32) = native.SCM_RIGHTS;
+        var i: usize = 0;
+        for (i < count) {
+            @((?control[16 + i * 4])::*i32) = descriptor;
+            i = i + 1;
+        }
+        var vector: native.IoVector = native.IoVector{data: data, length: length};
+        ret native.sock_send_message(handle, ?vector, 1, nil, 0, ?control[0], (record_length + 7) & ~7::usize);
+    }
+
+    fun test_endpoint_name(output: *u8) usize {
+        val prefix: *u8 = "/tmp/mach-std-local-618-";
+        var length: usize = 0;
+        for (prefix[length] != 0) {
+            output[length] = prefix[length];
+            length = length + 1;
+        }
+        var process: u64 = native.getpid()::u64;
+        var digits: [20]u8;
+        var count: usize = 0;
+        if (process == 0) { digits[0] = '0'; count = 1; }
+        for (process != 0) {
+            digits[count] = '0' + (process % 10)::u8;
+            process = process / 10;
+            count = count + 1;
+        }
+        var i: usize = 0;
+        for (i < count) {
+            output[length] = digits[count - i - 1];
+            length = length + 1;
+            i = i + 1;
+        }
+        output[length] = '.';
+        output[length + 1] = 's';
+        output[length + 2] = 'o';
+        output[length + 3] = 'c';
+        output[length + 4] = 'k';
+        output[length + 5] = 0;
+        ret length + 5;
+    }
+
+    test "async local: queued reads close unwanted rights and complete with the bytes" {
+        var pipe: [2]i32;
+        if (native.pipe(?pipe[0]) < 0) { ret 1; }
+        fin { native.close(pipe[0]); native.close(pipe[1]); }
+        var path: [108]u8;
+        val path_length: usize = test_endpoint_name(?path[0]);
+        val endpoint_result: res[endpoint.Endpoint, io_error.Error] = endpoint.filesystem_bytes(?path[0], path_length);
+        if (sel endpoint_result.err) { ret 2; }
+        val bound: endpoint.Endpoint = endpoint_result.ok;
+        var listener: local_types.Listener;
+        listener.handle = (-1)::isize::usize;
+        listener.endpoint = bound;
+        listener.ownership = local_types.OWNED;
+        listener.has_node_identity = false;
+        val options: local_types.ListenOptions = local_types.ListenOptions{
+            backlog: 4, ownership: local_types.OWNED, stale: local_types.REMOVE_STALE_SOCKET,
+            permissions: local_types.INHERIT_PERMISSIONS,
+        };
+        if (local_impl.listen(?listener, bound, options) < 0) { ret 3; }
+        fin { local_impl.close_listener(?listener); }
+        var client: local_types.Stream;
+        if (local_impl.connect(?client, bound, true) < 0) { ret 4; }
+        fin { if (client.handle != (-1)::isize::usize) { native.sock_close(client.handle); } }
+        var server: local_types.Stream;
+        if (local_impl.accept(?listener, ?server, false) < 0) { ret 5; }
+        fin { native.sock_close(server.handle); }
+        var queue: shared.IoQueue;
+        if (native.io_queue_create(?queue) < 0) { ret 6; }
+        fin { native.io_queue_close(?queue); }
+        var backend: Backend;
+        if (make(?backend, ?queue, 4, 1) < 0) { ret 7; }
+        fin { destroy(?backend); }
+        val before: i64 = test_descriptor_count();
+        if (before < 0) { ret 8; }
+        var buffer: [64]u8;
+        var token: types.Token;
+        # the read is queued before any bytes exist, then the peer attaches rights to them
+        if (submit_read(?backend, client.handle, ?buffer[0], 64, 618, ?token) < 0) { ret 9; }
+        if (poll(?backend, 0) != 0) { ret 10; }
+        if (test_send_rights(server.handle, "abc", 3, pipe[0], 16) != 3) { ret 11; }
+        if (poll(?backend, 1000) != 1) { ret 12; }
+        var result: types.NativeCompletion;
+        if (completion(?backend, 0, ?result) < 0) { ret 13; }
+        if (result.context != 618 || result.status != 0 || result.bytes != 3 || result.end_of_stream) { ret 14; }
+        if (buffer[0] != 'a' || buffer[1] != 'b' || buffer[2] != 'c') { ret 15; }
+        if (test_descriptor_count() != before) { ret 16; }
+        # rights already queued when the read is submitted complete on the first drive
+        if (test_send_rights(server.handle, "d", 1, pipe[0], native.SCM_MAX_FD) != 1) { ret 17; }
+        if (submit_read(?backend, client.handle, ?buffer[0], 64, 619, ?token) < 0) { ret 18; }
+        if (poll(?backend, 1000) != 1 || completion(?backend, 0, ?result) < 0) { ret 19; }
+        if (result.context != 619 || result.status != 0 || result.bytes != 1 || buffer[0] != 'd') { ret 20; }
+        if (test_descriptor_count() != before) { ret 21; }
+        if (submit_close(?backend, client.handle, 620, ?token) < 0) { ret 22; }
+        client.handle = (-1)::isize::usize;
+        if (poll(?backend, 1000) != 1 || completion(?backend, 0, ?result) < 0) { ret 23; }
+        if (result.context != 620 || result.status != 0) { ret 24; }
+        if (test_descriptor_count() != before - 1) { ret 25; }
+        var byte: u8 = 0;
+        if (native.write(pipe[1], "k", 1) != 1 || native.read(pipe[0], ?byte, 1) != 1 || byte != 'k') { ret 26; }
+        ret 0;
+    }
 }
