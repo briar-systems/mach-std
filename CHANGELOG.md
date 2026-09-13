@@ -146,6 +146,12 @@ version numbers are independent.
 
 ### Added
 
+- A publication root can keep its transaction control files under a separate
+  home (std #642, mach #3310): `filesystem.transaction.root_open_with_home`,
+  `root_adopt_home` and `root_home_fd` place the lock sentinel, claims
+  directory and backup container under the home instead of beside the
+  destination, a child of a homed root is homed at `home/leaf`, and roots
+  opened without a home are unchanged.
 - Welded secret buffers persist and reload through the file completion
   adapter (std #550): `std.io.file.attach_secret_scratch`,
   `submit_secret_write` and `submit_secret_read` take `*^u8` plus a length on
