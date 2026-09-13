@@ -30,12 +30,13 @@ use std.runtime;
 use std.system.os;
 use std.derive;
 use std.io.writer;
+use std.io.writer.WriteError;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
-use R: std.types.result;
 
-fun sink(ctx: ptr, p: *u8, len: usize) R.Result[usize, str] {
-    ret R.ok[usize, str](len);
+fun sink(ctx: ptr, p: *u8, len: usize) res[usize, WriteError] {
+    ret res[usize, WriteError].ok{len};
 }
 
 $1
@@ -100,7 +101,8 @@ rec P1 { d: P2; tag: u8; }
     if (derive.eq[P1](?a, ?b)) { slot = slot + 1; }
     slot = slot + (derive.hash[P1](?a))::i64;
     derive.clone[P1](?c, ?a);
-    if (R.is_err[usize, str](derive.fmt[P1](?w, ?a))) { slot = slot + 1; }
+    val shown: res[usize, WriteError] = derive.fmt[P1](?w, ?a);
+    if (sel shown.err) { slot = slot + 1; }
 '
 
 refuses "eq refuses a union field" '
@@ -123,7 +125,8 @@ refuses "fmt refuses a str field, which is a reference" '
 rec HasS { n: i64; s: str; }
 ' '
     var a: HasS;
-    if (R.is_err[usize, str](derive.fmt[HasS](?w, ?a))) { slot = slot + 1; }
+    val shown: res[usize, WriteError] = derive.fmt[HasS](?w, ?a);
+    if (sel shown.err) { slot = slot + 1; }
 ' "$ref_msg"
 
 refuses "clone refuses an array field" '

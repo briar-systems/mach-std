@@ -1,50 +1,68 @@
 # stable owners for cooperative root claims and filesystem-enforced leaf reservations
 use std.types.bool.bool;
-use std.types.bool.true;
+use std.filesystem.removal;
+use std.sync.atomic;
+use std.sync.mutex;
+use std.sync.thread;
+use std.system.os;
 use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.string.str_len;
 use std.types.string.str_empty;
 use std.types.string.str_equals;
-use std.system.os;
-use std.sync.mutex;
-use std.sync.atomic;
-use std.sync.thread;
+use std.types.string.str_len;
 
-$if ($mach.build.os == $mach.os.linux) { use native: std.system.os.linux; }
+$if ($mach.build.os == $mach.os.linux)  { use native: std.system.os.linux; }
 $or ($mach.build.os == $mach.os.darwin) { use native: std.system.os.darwin; }
 
-pub val LOCK_LEAF: str = ".mach-txn-lock";
+pub val LOCK_LEAF:   str = ".mach-txn-lock";
 pub val CLAIMS_LEAF: str = ".machtxn.claims";
 
 # initialized owners stay at their original address until destruction
 pub rec Root {
     dirfd: i32;
-    address: usize;
-    gate: mutex.Mutex;
-    claimed: bool;
+    # the control directory holding the lock sentinel, claims and backups:
+    # negative when the root directory is its own home, closed at destruction
+    # only when derivation opened it
+    home_fd:    i32;
+    home_owned: bool;
+    address:    usize;
+    gate:       mutex.Mutex;
+    claimed:    bool;
+}
+
+# the directory this module's control files live in
+pub fun control_fd(root: *Root) i32 {
+    if (root.home_fd >= 0) { ret root.home_fd; }
+    ret root.dirfd;
+}
+
+pub fun root_homed(root: *Root) bool {
+    ret root_valid(root) && root.home_fd >= 0;
 }
 
 pub rec Lock {
-    fd: i32;
-    claims_fd: i32;
-    address: usize;
-    root: *Root;
-    gate: mutex.Mutex;
-    borrowers: usize;
+    fd:          i32;
+    claims_fd:   i32;
+    address:     usize;
+    root:        *Root;
+    gate:        mutex.Mutex;
+    borrowers:   usize;
     initialized: bool;
-    recovering: bool;
-    closing: bool;
+    recovering:  bool;
+    closing:     bool;
 }
 
 # name is borrowed from the destination claim and remains valid through release
 pub rec Borrow {
-    address: usize;
-    owner: *Lock;
-    name: str;
+    address:  usize;
+    owner:    *Lock;
+    name:     str;
     claim_fd: i32;
-    active: bool;
+    active:   bool;
 }
 
 pub fun root_valid(root: *Root) bool {
@@ -69,44 +87,82 @@ pub fun borrow_valid(borrow: *Borrow) bool {
 
 # takes descriptor ownership only on success
 pub fun root_init(out: *Root, fd: i32) i64 {
-    if (out == nil || fd < 0) { ret os.EINVAL; }
+    ret root_init_with_home(out, fd, -1, false);
+}
+
+# `home_fd` is the control directory, owned by the root only when `owned`;
+# a borrowed home stays the caller's to keep alive through the root's use
+pub fun root_init_with_home(out: *Root, fd: i32, home_fd: i32, owned: bool) i64 {
+    if (out == nil || fd < 0)                                              { ret os.EINVAL; }
     if (out.address != 0 && (out.address != out::usize || out.dirfd >= 0)) { ret os.EINVAL; }
-    out.dirfd = fd;
-    out.gate = mutex.make();
-    out.claimed = false;
-    out.address = out::usize;
+    out.dirfd      = fd;
+    out.home_fd    = home_fd;
+    out.home_owned = owned && home_fd >= 0;
+    out.gate       = mutex.make();
+    out.claimed    = false;
+    out.address    = out::usize;
+    ret 0;
+}
+
+# give an unclaimed root a borrowed home, releasing one it owned
+pub fun root_set_home(root: *Root, home_fd: i32) i64 {
+    if (!root_valid(root)) { ret os.EINVAL; }
+    mutex.lock(?root.gate);
+    if (root.claimed) {
+        mutex.unlock(?root.gate);
+        ret os.EINVAL;
+    }
+    val previous: i32  = root.home_fd;
+    val owned:    bool = root.home_owned;
+    root.home_fd    = home_fd;
+    root.home_owned = false;
+    mutex.unlock(?root.gate);
+    if (owned) { ret os.close(previous); }
     ret 0;
 }
 
 pub fun root_destroy(root: *Root) i64 {
-    if (root == nil) { ret os.EINVAL; }
-    if (root.address == 0) { ret 0; }
+    if (root == nil)                 { ret os.EINVAL; }
+    if (root.address == 0)           { ret 0; }
     if (root.address != root::usize) { ret os.EINVAL; }
     mutex.lock(?root.gate);
-    if (root.claimed) { mutex.unlock(?root.gate); ret os.EINVAL; }
-    val fd: i32 = root.dirfd;
-    root.dirfd = -1;
+    if (root.claimed) {
+        mutex.unlock(?root.gate);
+        ret os.EINVAL;
+    }
+    val fd:      i32  = root.dirfd;
+    val home_fd: i32  = root.home_fd;
+    val owned:   bool = root.home_owned;
+    root.dirfd      = -1;
+    root.home_fd    = -1;
+    root.home_owned = false;
     mutex.unlock(?root.gate);
     if (fd < 0) { ret 0; }
-    ret os.close(fd);
+    var result: i64 = os.close(fd);
+    if (owned) {
+        val closed: i64 = os.close(home_fd);
+        if (result >= 0) { result = closed; }
+    }
+    ret result;
 }
 
 fun nofollow(flags: i32) i32 {
     $if ($mach.build.os != $mach.os.windows) { ret flags | native.O_NOFOLLOW; }
-    $or { ret flags; }
+    $or                                      { ret flags; }
 }
 
-fun directory(dirfd: i32, name: str) i64 {
+fun directory(dirfd: i32, name: str) res[i32, removal.Error] {
     val opened: i64 = os.open(dirfd, name, nofollow(os.O_RDONLY | os.O_DIRECTORY), 0);
-    if (opened < 0) { ret opened; }
-    var st: os.stat_t;
+    if (opened < 0) { ret res[i32, removal.Error].err{removal.Error{code: opened}}; }
+    var st:      os.stat_t;
     val checked: i64 = os.stat(opened::i32, ?st);
-    if (checked < 0) { os.close(opened::i32); ret checked; }
-    if ((os.stat_mode(?st) & os.S_IFMT) != os.S_IFDIR) {
-        os.close(opened::i32);
-        ret os.ENOTDIR;
+    var code:    i64 = checked;
+    if (code >= 0 && (os.stat_mode(?st) & os.S_IFMT) != os.S_IFDIR) { code = os.ENOTDIR; }
+    if (code < 0) {
+        val closed: i64 = os.close(opened::i32);
+        ret res[i32, removal.Error].err{removal.Error{code: code, cleanup_code: closed}};
     }
-    ret opened;
+    ret res[i32, removal.Error].ok{opened::i32};
 }
 
 fun root_unclaim(root: *Root) {
@@ -116,55 +172,65 @@ fun root_unclaim(root: *Root) {
 }
 
 pub fun acquire(out: *Lock, root: *Root) i64 {
-    if (out == nil || !root_valid(root)) { ret os.EINVAL; }
+    if (out == nil || !root_valid(root))                                { ret os.EINVAL; }
     if (out.address != 0 && (out.address != out::usize || out.fd >= 0)) { ret os.EINVAL; }
     mutex.lock(?root.gate);
-    if (root.dirfd < 0 || root.claimed) { mutex.unlock(?root.gate); ret os.EAGAIN; }
+    if (root.dirfd < 0 || root.claimed) {
+        mutex.unlock(?root.gate);
+        ret os.EAGAIN;
+    }
     root.claimed = true;
-    val dirfd: i32 = root.dirfd;
+    val dirfd: i32 = control_fd(root);
     mutex.unlock(?root.gate);
     var completed: bool = false;
-    fin { if (!completed) { root_unclaim(root); } }
+    fin {
+        if (!completed) { root_unclaim(root); }
+    }
     val capabilities: i64 = os.publication_capabilities(dirfd);
-    if (capabilities < 0) { ret capabilities; }
+    if (capabilities < 0)                            { ret capabilities; }
     if ((capabilities & os.PUBLICATION_CLAIMS) == 0) { ret os.ENOTSUP; }
     val raw: i64 = os.open(dirfd, LOCK_LEAF, nofollow(os.O_CREAT | os.O_WRONLY), 0o600);
     if (raw < 0) { ret raw; }
     val fd: i32 = raw::i32;
-    fin { if (!completed) { os.close(fd); } }
-    var st: os.stat_t;
+    fin {
+        if (!completed) { os.close(fd); }
+    }
+    var st:      os.stat_t;
     val checked: i64 = os.stat(fd, ?st);
-    if (checked < 0) { ret checked; }
+    if (checked < 0)                                   { ret checked; }
     if ((os.stat_mode(?st) & os.S_IFMT) != os.S_IFREG) { ret os.EINVAL; }
     val locked: i64 = os.lock_fd(fd, os.LOCK_EX | os.LOCK_NB);
     if (locked < 0) { ret locked; }
-    out.fd = fd;
-    out.claims_fd = -1;
-    out.root = root;
-    out.gate = mutex.make();
-    out.borrowers = 0;
+    out.fd          = fd;
+    out.claims_fd   = -1;
+    out.root        = root;
+    out.gate        = mutex.make();
+    out.borrowers   = 0;
     out.initialized = false;
-    out.recovering = false;
-    out.closing = false;
-    out.address = out::usize;
-    completed = true;
+    out.recovering  = false;
+    out.closing     = false;
+    out.address     = out::usize;
+    completed       = true;
     ret 0;
 }
 
 pub fun release_lock(held: *Lock) i64 {
-    if (held == nil) { ret os.EINVAL; }
-    if (held.address == 0) { ret 0; }
+    if (held == nil)                 { ret os.EINVAL; }
+    if (held.address == 0)           { ret 0; }
     if (held.address != held::usize) { ret os.EINVAL; }
     mutex.lock(?held.gate);
     if (held.borrowers != 0 || held.recovering || held.closing) {
         mutex.unlock(?held.gate);
         ret os.EINVAL;
     }
-    if (held.fd < 0) { mutex.unlock(?held.gate); ret 0; }
+    if (held.fd < 0) {
+        mutex.unlock(?held.gate);
+        ret 0;
+    }
     held.closing = true;
-    val fd: i32 = held.fd;
-    val claims_fd: i32 = held.claims_fd;
-    val root: *Root = held.root;
+    val fd:        i32   = held.fd;
+    val claims_fd: i32   = held.claims_fd;
+    val root:      *Root = held.root;
     mutex.unlock(?held.gate);
     var result: i64 = 0;
     if (claims_fd >= 0) { result = os.close(claims_fd); }
@@ -172,10 +238,10 @@ pub fun release_lock(held: *Lock) i64 {
     if (result >= 0) { result = closed; }
     root_unclaim(root);
     mutex.lock(?held.gate);
-    held.fd = -1;
-    held.claims_fd = -1;
+    held.fd          = -1;
+    held.claims_fd   = -1;
     held.initialized = false;
-    held.closing = false;
+    held.closing     = false;
     mutex.unlock(?held.gate);
     ret result;
 }
@@ -183,7 +249,7 @@ pub fun release_lock(held: *Lock) i64 {
 fun component(name: str) bool {
     if (str_empty(name) || str_equals(name, ".") || str_equals(name, "..")) { ret false; }
     val len: usize = str_len(name);
-    var i: usize = 0;
+    var i:   usize = 0;
     for (i < len) {
         if (name[i] == '/' || name[i] == '\\') { ret false; }
         i = i + 1;
@@ -192,21 +258,24 @@ fun component(name: str) bool {
 }
 
 fun register(out: *Borrow, held: *Lock) i64 {
-    if (out == nil || !lock_valid(held)) { ret os.EINVAL; }
+    if (out == nil || !lock_valid(held))                               { ret os.EINVAL; }
     if (out.address != 0 && (out.address != out::usize || out.active)) { ret os.EINVAL; }
     mutex.lock(?held.gate);
     if (held.fd < 0 || held.closing || held.recovering || !held.initialized) {
         mutex.unlock(?held.gate);
         ret os.EINVAL;
     }
-    if (held.borrowers == ~0::usize) { mutex.unlock(?held.gate); ret os.EINVAL; }
+    if (held.borrowers == ~0::usize) {
+        mutex.unlock(?held.gate);
+        ret os.EINVAL;
+    }
     held.borrowers = held.borrowers + 1;
     mutex.unlock(?held.gate);
-    out.address = out::usize;
-    out.owner = held;
-    out.name = nil;
+    out.address  = out::usize;
+    out.owner    = held;
+    out.name     = nil;
     out.claim_fd = -1;
-    out.active = true;
+    out.active   = true;
     ret 0;
 }
 
@@ -221,8 +290,11 @@ pub fun borrow_leaf(out: *Borrow, held: *Lock, name: str) i64 {
     if (registered < 0) { ret registered; }
     val raw: i64 = os.open(held.claims_fd, name,
         nofollow(os.O_CREAT | os.O_EXCL | os.O_WRONLY), 0o600);
-    if (raw < 0) { release_borrow(out); ret raw; }
-    out.name = name;
+    if (raw < 0) {
+        release_borrow(out);
+        ret raw;
+    }
+    out.name     = name;
     out.claim_fd = raw::i32;
     ret 0;
 }
@@ -230,10 +302,10 @@ pub fun borrow_leaf(out: *Borrow, held: *Lock, name: str) i64 {
 # even failed claim cleanup consumes the borrow and leaves recoverable residue
 pub fun release_borrow(borrow: *Borrow) i64 {
     if (!borrow_valid(borrow)) { ret os.EINVAL; }
-    val held: *Lock = borrow.owner;
-    var result: i64 = 0;
+    val held:   *Lock = borrow.owner;
+    var result: i64   = 0;
     if (borrow.claim_fd >= 0) {
-        result = os.close(borrow.claim_fd);
+        result          = os.close(borrow.claim_fd);
         borrow.claim_fd = -1;
     }
     if (borrow.name != nil) {
@@ -264,59 +336,62 @@ pub fun begin_recovery(held: *Lock) i64 {
 pub fun end_recovery(held: *Lock, admit: bool) i64 {
     if (!lock_valid(held)) { ret os.EINVAL; }
     mutex.lock(?held.gate);
-    if (!held.recovering) { mutex.unlock(?held.gate); ret os.EINVAL; }
+    if (!held.recovering) {
+        mutex.unlock(?held.gate);
+        ret os.EINVAL;
+    }
     if (!admit) { held.initialized = false; }
     held.recovering = false;
     mutex.unlock(?held.gate);
     ret 0;
 }
 
-fun clear_claims(dirfd: i32) i64 {
-    var buffer: [8192]u8;
-    for (true) {
+fun clear_claims(dirfd: i32) err[removal.Error] {
+    for {
         val rewind: i64 = os.seek(dirfd, 0, os.SEEK_SET);
-        if (rewind < 0) { ret rewind; }
-        val count: i64 = os.read_dir(dirfd, (?buffer[0])::*os.dirent64, 8192);
-        if (count < 0) { ret count; }
-        if (count == 0) { ret 0; }
-        if (count > 8192) { ret os.EIO; }
-        var removed: bool = false;
-        var at: usize = 0;
-        for (at < count::usize) {
-            val minimum: usize = $offset_of(os.dirent64, d_name) + 1;
-            if (count::usize - at < minimum) { ret os.EIO; }
-            val entry: *os.dirent64 = ((?buffer[0])::usize + at)::*os.dirent64;
-            val length: usize = entry.d_reclen::usize;
-            if (length < minimum || length > count::usize - at) { ret os.EIO; }
-            val name: *u8 = ?entry.d_name[0];
-            val capacity: usize = length - $offset_of(os.dirent64, d_name);
-            var end: usize = 0;
-            for (end < capacity && name[end] != 0) { end = end + 1; }
-            if (end == capacity || end == 0) { ret os.EIO; }
-            if (!str_equals(name::str, ".") && !str_equals(name::str, "..")) {
-                if (!component(name::str)) { ret os.EINVAL; }
-                var st: os.stat_t;
-                val inspected: i64 = os.stat_path(dirfd, name, ?st, os.AT_SYMLINK_NOFOLLOW);
-                if (inspected < 0) { ret inspected; }
-                if ((os.stat_mode(?st) & os.S_IFMT) != os.S_IFREG || st.st_size != 0) { ret os.EINVAL; }
-                val unlinked: i64 = os.unlink(dirfd, name, 0);
-                if (unlinked < 0) { ret unlinked; }
-                removed = true;
-            }
-            at = at + length;
+        if (rewind < 0) { ret err[removal.Error].err{removal.Error{code: rewind}}; }
+        var cursor:      os.DirectoryCursor     = os.DirectoryCursor{};
+        val initialized: os.DirectoryInitResult = os.directory_init(?cursor, dirfd);
+        if (initialized.code < 0) {
+            ret err[removal.Error].err{removal.Error{code: initialized.code, cleanup_code: initialized.cleanup_code}};
         }
-        if (!removed) { ret 0; }
+        var removed: bool               = false;
+        val scanned: i64                = clear_claims_pass(dirfd, ?cursor, ?removed);
+        var result:  err[removal.Error] = err[removal.Error].ok{};
+        if (scanned < 0) { result = err[removal.Error].err{removal.Error{code: scanned}}; }
+        val completed: err[removal.Error] = removal.with_cleanup(result, os.directory_close(?cursor));
+        if (sel completed.err) { ret completed; }
+        if (!removed)          { ret err[removal.Error].ok{}; }
+    }
+    ret err[removal.Error].ok{};
+}
+
+fun clear_claims_pass(dirfd: i32, cursor: *os.DirectoryCursor, removed: *bool) i64 {
+    for {
+        var entry: os.DirectoryEntry;
+        val next:  i64 = os.directory_next(cursor, ?entry);
+        if (next <= 0) { ret next; }
+        val name: str = entry.name;
+        if (str_equals(name, ".") || str_equals(name, "..")) { cnt; }
+        if (!component(name))                                { ret os.EINVAL; }
+        var st:        os.stat_t;
+        val inspected: i64 = os.stat_path(dirfd, name, ?st, os.AT_SYMLINK_NOFOLLOW);
+        if (inspected < 0)                                                    { ret inspected; }
+        if ((os.stat_mode(?st) & os.S_IFMT) != os.S_IFREG || st.st_size != 0) { ret os.EINVAL; }
+        val unlinked: i64 = os.unlink(dirfd, name, 0);
+        if (unlinked < 0) { ret unlinked; }
+        @removed = true;
     }
     ret 0;
 }
 
 # fresh creation inherits the root namespace instead of trusting stale directory flags
-pub fun initialize_claims(held: *Lock) i64 {
-    if (!lock_valid(held)) { ret os.EINVAL; }
+pub fun initialize_claims(held: *Lock) err[removal.Error] {
+    if (!lock_valid(held)) { ret err[removal.Error].err{removal.Error{code: os.EINVAL}}; }
     mutex.lock(?held.gate);
     if (!held.recovering || held.borrowers != 0 || held.closing) {
         mutex.unlock(?held.gate);
-        ret os.EINVAL;
+        ret err[removal.Error].err{removal.Error{code: os.EINVAL}};
     }
     held.initialized = false;
     val previous: i32 = held.claims_fd;
@@ -324,28 +399,31 @@ pub fun initialize_claims(held: *Lock) i64 {
     mutex.unlock(?held.gate);
     if (previous >= 0) {
         val closed: i64 = os.close(previous);
-        if (closed < 0) { ret closed; }
+        if (closed < 0) { ret err[removal.Error].err{removal.Error{code: closed}}; }
     }
-    val dirfd: i32 = held.root.dirfd;
-    val prior: i64 = directory(dirfd, CLAIMS_LEAF);
-    if (prior >= 0) {
-        val cleared: i64 = clear_claims(prior::i32);
-        val closed: i64 = os.close(prior::i32);
-        if (cleared < 0) { ret cleared; }
-        if (closed < 0) { ret closed; }
+    val dirfd: i32                     = control_fd(held.root);
+    val prior: res[i32, removal.Error] = directory(dirfd, CLAIMS_LEAF);
+    if (sel prior.ok) {
+        val fd:        i32                = prior.ok;
+        val cleared:   err[removal.Error] = clear_claims(fd);
+        val completed: err[removal.Error] = removal.with_cleanup(cleared, os.close(fd));
+        if (sel completed.err) { ret completed; }
         val removed: i64 = os.unlink(dirfd, CLAIMS_LEAF, os.AT_REMOVEDIR);
-        if (removed < 0) { ret removed; }
+        if (removed < 0) { ret err[removal.Error].err{removal.Error{code: removed}}; }
     }
-    or (prior != os.ENOENT) { ret prior; }
+    or (sel prior.err) {
+        val error: removal.Error = prior.err;
+        if (error.code != os.ENOENT || error.cleanup_code < 0) { ret err[removal.Error].err{error}; }
+    }
     val made: i64 = os.make_dir(dirfd, CLAIMS_LEAF, 0o700);
-    if (made < 0) { ret made; }
-    val opened: i64 = directory(dirfd, CLAIMS_LEAF);
-    if (opened < 0) { ret opened; }
+    if (made < 0) { ret err[removal.Error].err{removal.Error{code: made}}; }
+    val opened: res[i32, removal.Error] = directory(dirfd, CLAIMS_LEAF);
+    if (sel opened.err) { ret err[removal.Error].err{opened.err}; }
     mutex.lock(?held.gate);
-    held.claims_fd = opened::i32;
+    held.claims_fd   = opened.ok;
     held.initialized = true;
     mutex.unlock(?held.gate);
-    ret 0;
+    ret err[removal.Error].ok{};
 }
 
 test "std.filesystem.transaction.ownership: live borrows prevent recovery and owner destruction" {
@@ -361,7 +439,10 @@ test "std.filesystem.transaction.ownership: live borrows prevent recovery and ow
     val opened: i64 = os.open(os.AT_FDCWD, base, os.O_RDONLY | os.O_DIRECTORY, 0);
     if (opened < 0) { ret 2; }
     var root: Root;
-    if (root_init(?root, opened::i32) < 0) { os.close(opened::i32); ret 3; }
+    if (root_init(?root, opened::i32) < 0) {
+        os.close(opened::i32);
+        ret 3;
+    }
     fin { root_destroy(?root); }
     var copied_root: Root = root;
     if (root_destroy(?copied_root) != os.EINVAL || !root_valid(?root)) { ret 4; }
@@ -373,27 +454,34 @@ test "std.filesystem.transaction.ownership: live borrows prevent recovery and ow
     if (release_lock(?copied_lock) != os.EINVAL || !lock_valid(?held)) { ret 7; }
     var worker: Borrow;
     if (borrow_worker(?worker, ?held) != os.EINVAL) { ret 21; }
-    if (begin_recovery(?held) < 0) { ret 22; }
-    val initialized: i64 = initialize_claims(?held);
+    if (begin_recovery(?held) < 0)                  { ret 22; }
+    val initialized: err[removal.Error] = initialize_claims(?held);
     end_recovery(?held, true);
-    if (initialized < 0) { ret 23; }
-    if (borrow_worker(?worker, ?held) < 0) { ret 8; }
+    if (sel initialized.err)                                                    { ret 23; }
+    if (borrow_worker(?worker, ?held) < 0)                                      { ret 8; }
     if (begin_recovery(?held) != os.EINVAL || release_lock(?held) != os.EINVAL) { ret 9; }
-    if (release_borrow(?worker) < 0 || release_borrow(?worker) != os.EINVAL) { ret 10; }
-    var first: Borrow;
-    var second: Borrow;
+    if (release_borrow(?worker) < 0 || release_borrow(?worker) != os.EINVAL)    { ret 10; }
+    var first:     Borrow;
+    var second:    Borrow;
     var duplicate: Borrow;
     if (borrow_leaf(?first, ?held, "first") < 0) { ret 11; }
-    fin { if (borrow_valid(?first)) { release_borrow(?first); } }
+    fin {
+        if (borrow_valid(?first)) { release_borrow(?first); }
+    }
     if (borrow_leaf(?duplicate, ?held, "first") != os.EEXIST || held.borrowers != 1) { ret 12; }
-    if (borrow_leaf(?second, ?held, "second") < 0 || held.borrowers != 2) { ret 13; }
-    fin { if (borrow_valid(?second)) { release_borrow(?second); } }
+    if (borrow_leaf(?second, ?held, "second") < 0 || held.borrowers != 2)            { ret 13; }
+    fin {
+        if (borrow_valid(?second)) { release_borrow(?second); }
+    }
     var copied_borrow: Borrow = first;
-    if (release_borrow(?copied_borrow) != os.EINVAL || held.borrowers != 2) { ret 14; }
-    if (begin_recovery(?held) != os.EINVAL || release_lock(?held) != os.EINVAL) { ret 15; }
+    if (release_borrow(?copied_borrow) != os.EINVAL || held.borrowers != 2)               { ret 14; }
+    if (begin_recovery(?held) != os.EINVAL || release_lock(?held) != os.EINVAL)           { ret 15; }
     if (release_borrow(?first) < 0 || release_borrow(?second) < 0 || held.borrowers != 0) { ret 16; }
-    if (begin_recovery(?held) < 0) { ret 17; }
-    if (borrow_worker(?worker, ?held) != os.EINVAL) { end_recovery(?held, true); ret 18; }
+    if (begin_recovery(?held) < 0)                                                        { ret 17; }
+    if (borrow_worker(?worker, ?held) != os.EINVAL) {
+        end_recovery(?held, true);
+        ret 18;
+    }
     end_recovery(?held, true);
     if (release_lock(?held) < 0 || release_lock(?held) < 0) { ret 19; }
     if (root_destroy(?root) < 0 || root_destroy(?root) < 0) { ret 20; }
@@ -404,30 +492,40 @@ fun t_namespace(base: str) i32 {
     val opened: i64 = os.open(os.AT_FDCWD, base, os.O_RDONLY | os.O_DIRECTORY, 0);
     if (opened < 0) { ret 1; }
     var root: Root;
-    if (root_init(?root, opened::i32) < 0) { os.close(opened::i32); ret 2; }
+    if (root_init(?root, opened::i32) < 0) {
+        os.close(opened::i32);
+        ret 2;
+    }
     fin { root_destroy(?root); }
     val upper: i64 = os.open(root.dirfd, "A", nofollow(os.O_CREAT | os.O_EXCL | os.O_WRONLY), 0o600);
     if (upper < 0) { ret 3; }
     os.close(upper::i32);
-    fin { os.unlink(root.dirfd, "A", 0); os.unlink(root.dirfd, "a", 0); }
+    fin {
+        os.unlink(root.dirfd, "A", 0);
+        os.unlink(root.dirfd, "a", 0);
+    }
     val lower: i64 = os.open(root.dirfd, "a", nofollow(os.O_CREAT | os.O_EXCL | os.O_WRONLY), 0o600);
-    if (lower >= 0) { os.close(lower::i32); }
+    if (lower >= 0)         { os.close(lower::i32); }
     or (lower != os.EEXIST) { ret 4; }
     var held: Lock;
     if (acquire(?held, ?root) < 0) { ret 5; }
     fin { release_lock(?held); }
     if (begin_recovery(?held) < 0) { ret 6; }
-    val initialized: i64 = initialize_claims(?held);
+    val initialized: err[removal.Error] = initialize_claims(?held);
     end_recovery(?held, true);
-    if (initialized < 0) { ret 7; }
-    var first: Borrow;
+    if (sel initialized.err) { ret 7; }
+    var first:  Borrow;
     var second: Borrow;
     if (borrow_leaf(?first, ?held, "A") < 0) { ret 8; }
-    fin { if (borrow_valid(?first)) { release_borrow(?first); } }
+    fin {
+        if (borrow_valid(?first)) { release_borrow(?first); }
+    }
     val next: i64 = borrow_leaf(?second, ?held, "a");
-    fin { if (borrow_valid(?second)) { release_borrow(?second); } }
+    fin {
+        if (borrow_valid(?second)) { release_borrow(?second); }
+    }
     if (lower == os.EEXIST && next != os.EEXIST) { ret 9; }
-    if (lower >= 0 && next < 0) { ret 10; }
+    if (lower >= 0 && next < 0)                  { ret 10; }
     ret 0;
 }
 
@@ -454,47 +552,51 @@ test "std.filesystem.transaction.ownership: malformed claims close admission unt
     val opened: i64 = os.open(os.AT_FDCWD, base, os.O_RDONLY | os.O_DIRECTORY, 0);
     if (opened < 0) { ret 2; }
     var root: Root;
-    if (root_init(?root, opened::i32) < 0) { os.close(opened::i32); ret 3; }
+    if (root_init(?root, opened::i32) < 0) {
+        os.close(opened::i32);
+        ret 3;
+    }
     fin { root_destroy(?root); }
     var held: Lock;
     if (acquire(?held, ?root) < 0) { ret 4; }
     fin { release_lock(?held); }
     if (begin_recovery(?held) < 0) { ret 5; }
-    val initial: i64 = initialize_claims(?held);
+    val initial: err[removal.Error] = initialize_claims(?held);
     end_recovery(?held, true);
-    if (initial < 0) { ret 6; }
+    if (sel initial.err) { ret 6; }
     val raw: i64 = os.open(held.claims_fd, "foreign", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600);
     if (raw < 0) { ret 7; }
     val written: i64 = os.write(raw::i32, "x", 1);
-    val closed: i64 = os.close(raw::i32);
+    val closed:  i64 = os.close(raw::i32);
     if (written != 1 || closed < 0) { ret 8; }
-    if (begin_recovery(?held) < 0) { ret 9; }
-    val refused: i64 = initialize_claims(?held);
+    if (begin_recovery(?held) < 0)  { ret 9; }
+    val refused: err[removal.Error] = initialize_claims(?held);
     end_recovery(?held, true);
-    if (refused != os.EINVAL) { ret 10; }
+    if (sel refused.ok)                { ret 10; }
+    if (refused.err.code != os.EINVAL) { ret 10; }
     var worker: Borrow;
     if (borrow_worker(?worker, ?held) != os.EINVAL) { ret 11; }
     var st: os.stat_t;
     if (os.stat_path(root.dirfd, ".machtxn.claims/foreign", ?st, os.AT_SYMLINK_NOFOLLOW) < 0 || st.st_size != 1) { ret 12; }
-    if (os.unlink(root.dirfd, ".machtxn.claims/foreign", 0) < 0) { ret 13; }
-    if (begin_recovery(?held) < 0) { ret 14; }
-    val repaired: i64 = initialize_claims(?held);
+    if (os.unlink(root.dirfd, ".machtxn.claims/foreign", 0) < 0)                                                 { ret 13; }
+    if (begin_recovery(?held) < 0)                                                                               { ret 14; }
+    val repaired: err[removal.Error] = initialize_claims(?held);
     end_recovery(?held, true);
-    if (repaired < 0 || borrow_worker(?worker, ?held) < 0) { ret 15; }
-    if (release_borrow(?worker) < 0) { ret 16; }
+    if (sel repaired.err || borrow_worker(?worker, ?held) < 0) { ret 15; }
+    if (release_borrow(?worker) < 0)                           { ret 16; }
     ret 0;
 }
 
 rec ClaimWorker {
-    held: *Lock;
-    name: str;
-    ready: i64;
-    phase: i64;
+    held:   *Lock;
+    name:   str;
+    ready:  i64;
+    phase:  i64;
     result: i64;
 }
 
 fun claim_worker(raw: *u8) {
-    val ctx: *ClaimWorker = raw::*ClaimWorker;
+    val ctx:  *ClaimWorker = raw::*ClaimWorker;
     var leaf: Borrow;
     ctx.result = borrow_leaf(?leaf, ctx.held, ctx.name);
     atomic.store(?ctx.ready, 1);
@@ -516,25 +618,32 @@ test "std.filesystem.transaction.ownership: admitted sibling workers progress un
     val raw: i64 = os.open(os.AT_FDCWD, base, os.O_RDONLY | os.O_DIRECTORY, 0);
     if (raw < 0) { ret 2; }
     var root: Root;
-    if (root_init(?root, raw::i32) < 0) { os.close(raw::i32); ret 3; }
+    if (root_init(?root, raw::i32) < 0) {
+        os.close(raw::i32);
+        ret 3;
+    }
     fin { root_destroy(?root); }
     var held: Lock;
     if (acquire(?held, ?root) < 0) { ret 4; }
     fin { release_lock(?held); }
     if (begin_recovery(?held) < 0) { ret 5; }
-    val initialized: i64 = initialize_claims(?held);
+    val initialized: err[removal.Error] = initialize_claims(?held);
     end_recovery(?held, true);
-    if (initialized < 0) { ret 6; }
-    var first_admission: Borrow;
+    if (sel initialized.err) { ret 6; }
+    var first_admission:  Borrow;
     var second_admission: Borrow;
     if (borrow_worker(?first_admission, ?held) < 0) { ret 7; }
-    fin { if (borrow_valid(?first_admission)) { release_borrow(?first_admission); } }
+    fin {
+        if (borrow_valid(?first_admission)) { release_borrow(?first_admission); }
+    }
     if (borrow_worker(?second_admission, ?held) < 0) { ret 8; }
-    fin { if (borrow_valid(?second_admission)) { release_borrow(?second_admission); } }
+    fin {
+        if (borrow_valid(?second_admission)) { release_borrow(?second_admission); }
+    }
     if (begin_recovery(?held) != os.EINVAL) { ret 9; }
-    var first: ClaimWorker = ClaimWorker{held: ?held, name: "first", ready: 0, phase: 0, result: 0};
-    var second: ClaimWorker = ClaimWorker{held: ?held, name: "second", ready: 0, phase: 0, result: 0};
-    var first_thread: thread.Thread;
+    var first:         ClaimWorker = ClaimWorker{held: ?held, name: "first", ready: 0, phase: 0, result: 0};
+    var second:        ClaimWorker = ClaimWorker{held: ?held, name: "second", ready: 0, phase: 0, result: 0};
+    var first_thread:  thread.Thread;
     var second_thread: thread.Thread;
     thread.spawn_with(claim_worker, (?first)::*u8, ?first_thread);
     if (first_thread.tid < 0) { ret 10; }
@@ -554,23 +663,23 @@ test "std.filesystem.transaction.ownership: admitted sibling workers progress un
     for (atomic.load(?second.ready) == 0) { os.thread_wait(?second.ready, 0); }
     if (first.result < 0 || second.result < 0 || held.borrowers != 4) { ret 12; }
     var duplicate: Borrow;
-    val refused: i64 = borrow_leaf(?duplicate, ?held, "first");
-    if (borrow_valid(?duplicate)) { release_borrow(?duplicate); }
-    if (refused != os.EEXIST || held.borrowers != 4) { ret 13; }
+    val refused:   i64 = borrow_leaf(?duplicate, ?held, "first");
+    if (borrow_valid(?duplicate))                                               { release_borrow(?duplicate); }
+    if (refused != os.EEXIST || held.borrowers != 4)                            { ret 13; }
     if (begin_recovery(?held) != os.EINVAL || release_lock(?held) != os.EINVAL) { ret 14; }
     atomic.store(?first.phase, 2);
     os.thread_wake(?first.phase);
     thread.join(?first_thread);
     if (first.result < 0 || release_borrow(?first_admission) < 0) { ret 15; }
     var next: Borrow;
-    if (borrow_leaf(?next, ?held, "first") < 0) { ret 16; }
+    if (borrow_leaf(?next, ?held, "first") < 0)           { ret 16; }
     if (release_borrow(?next) < 0 || held.borrowers != 2) { ret 17; }
-    if (begin_recovery(?held) != os.EINVAL) { ret 18; }
+    if (begin_recovery(?held) != os.EINVAL)               { ret 18; }
     atomic.store(?second.phase, 2);
     os.thread_wake(?second.phase);
     thread.join(?second_thread);
     if (second.result < 0 || release_borrow(?second_admission) < 0 || held.borrowers != 0) { ret 19; }
-    if (begin_recovery(?held) < 0) { ret 20; }
+    if (begin_recovery(?held) < 0)                                                         { ret 20; }
     end_recovery(?held, true);
     ret 0;
 }

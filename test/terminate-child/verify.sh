@@ -29,6 +29,7 @@ decode() {
         30) echo "failed to spawn after earlier terminate/reap cycles" ;;
         31) echo "repeated terminate/reap cycle failed" ;;
         32) echo "an invalid child PID was not EINVAL" ;;
+        33|34|35) echo "the typed terminate_child refusal did not report ECHILD with the child retained" ;;
         *) echo "unexpected exit code $1" ;;
     esac
 }

@@ -1,3 +1,11 @@
+# secret IR contract: the wipe precedes the native release, no integer pointer
+# alias is materialized, and no test-only inspection enters production IR.
+# under the v5 inlining policy (mach N6, PR #3270) an #[oblivious] callee is
+# inlined only into an oblivious caller, so the oblivious `wipe` stays a call
+# in the public `release_all` in both profiles rather than becoming the inlined
+# zero-byte store, and the ordering is asserted on that call. `wipe_typed` is
+# not oblivious, so release inlines it into `release_typed` as its asm
+# byte-store loop; release accepts either the call or that inlined `asm`.
 from pathlib import Path
 import re
 import sys
@@ -48,17 +56,16 @@ def verify(secret_text, main_text, profile):
     if re.search(r'std[.]system[.]os[.]secret[.](scripted_fill|all_zero|reset_probe_fill|interrupted_fill|probe_release|probe_typed_release)', secret.text):
         raise ValueError('test-only secret inspection entered production IR')
     body = secret.function('std.system.os.secret.release_all').splitlines()
-    wipe = first(body, secret.zero_byte if profile == 'release' else
-                 lambda line: secret.call(line, 'void', '@"std.system.os.secret.wipe"'), 'release wipe')
+    wipe = first(body, lambda line: secret.call(line, 'void', '@"std.system.os.secret.wipe"'), 'release wipe')
     release = first(body, lambda line: secret.call(line, 'i64', '%p3'), 'native release call')
     if wipe >= release:
         raise ValueError('native release precedes secret wipe')
     typed = main.function('std.system.os.secret.release_typed$backends.main.SecretRecord').splitlines()
     typed_release = first(typed, lambda line: main.call(line, 'i64', '%p3'), 'typed native release call')
-    if profile != 'release':
-        typed_wipe = first(typed, lambda line: main.call(line, 'void', '@"std.system.os.secret.wipe_typed$backends.main.SecretRecord"'), 'typed release wipe')
-        if typed_wipe >= typed_release:
-            raise ValueError('native typed release precedes full-layout wipe')
+    typed_wipe = first(typed, lambda line: main.call(line, 'void', '@"std.system.os.secret.wipe_typed$backends.main.SecretRecord"')
+                       or (profile == 'release' and re.match(r'\s+asm\b', line) is not None), 'typed release wipe')
+    if typed_wipe >= typed_release:
+        raise ValueError('native typed release precedes full-layout wipe')
     return secret, body, wipe, release
 
 

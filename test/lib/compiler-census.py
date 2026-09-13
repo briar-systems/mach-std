@@ -6,6 +6,31 @@ import subprocess
 import sys
 
 
+# the census guards one checkout's evidence: a compiler working in another checkout on
+# the same host (a peer worktree, a sibling clone) cannot interleave with this leg's
+# builds, so only processes whose working directory lies under this checkout count. a
+# process whose cwd cannot be read for want of permission is kept, so a foreign-user
+# compiler still refuses rather than passing silently; one that vanished between the
+# listing and the read is gone and does not count. `seen` in the record keeps the unfiltered
+# list for the evidence
+def within_checkout(listing):
+    root = Path(__file__).resolve().parents[2]
+    kept = []
+    for line in listing.splitlines():
+        pid = line.split(' ', 1)[0]
+        try:
+            cwd = Path(os.readlink('/proc/' + pid + '/cwd')).resolve()
+        except FileNotFoundError:
+            # the process exited between the listing and this read; it is not running
+            continue
+        except OSError:
+            kept.append(line)
+            continue
+        if cwd == root or root in cwd.parents:
+            kept.append(line)
+    return '\n'.join(kept)
+
+
 def census(label, evidence):
     if os.name == 'nt':
         command = ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
@@ -18,10 +43,14 @@ def census(label, evidence):
                    r'^(\S*/)?(mach|m[0-9A-Za-z]*|A|B|C|D)(\.exe)? (build|test)( |$)']
     result = subprocess.run(command, capture_output=True, text=True)
     valid = not result.stderr.strip() and result.returncode in ((0,) if os.name == 'nt' else (0, 1))
-    active = result.stdout.strip() not in ('', '[]', 'null')
+    processes = result.stdout.strip()
+    if os.name != 'nt':
+        processes = within_checkout(processes)
+    active = processes not in ('', '[]', 'null')
     record = dict(time=datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                  label=label, command=command, active=active, processes=result.stdout.strip(),
-                  valid=valid, status=result.returncode, stderr=result.stderr)
+                  label=label, command=command, active=active, processes=processes,
+                  seen=result.stdout.strip(), valid=valid, status=result.returncode,
+                  stderr=result.stderr)
     with (evidence / 'census.jsonl').open('a') as output:
         output.write(json.dumps(record) + '\n')
     print(json.dumps(record), file=sys.stderr, flush=True)
