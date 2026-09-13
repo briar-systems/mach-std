@@ -23,6 +23,14 @@
 # the journal prefix and `.mach-txn-lock` are reserved case-insensitively on every
 # platform. callers never place unrelated content in these namespaces.
 #
+# a root opened with a control home keeps its lock sentinel, claims directory
+# and backup container under the home instead of beside the destination, so a
+# publication into a source tree leaves nothing there but the destination.
+# staging stays in the destination directory for the one-step rename. a child
+# derived from a homed root is homed at `home/leaf`, created on demand, so
+# two destinations never share a claims directory. the home must be on the
+# destination's filesystem, and the reserved names apply in both places.
+#
 # descriptor-relative nofollow walks preserve containment when ancestor names
 # change. filesystem-qualified locks and claims enforce cooperative ownership.
 # presence and type queries are observations only. same-object preparation alone
@@ -343,19 +351,72 @@ pub fun root_open(out: *Root, base: Path, rel: Path) err[Error] {
     ret err[Error].ok{};
 }
 
-# derive an independently owned root from a held directory capability
-# the caller keeps parent alive and reserves leaf across derivation and use
-# no ancestor pathname is reconstructed and a symlink leaf is refused
-pub fun root_open_child(out: *Root, parent: *Root, leaf: str) err[Error] {
-    if (out == nil || !ownership.root_valid(parent)) { ret err[Error].err{error(INVALID, OP_ROOT_OPEN)}; }
-    if (!leaf_is_component(leaf))                    { ret err[Error].err{error(CONTAINMENT, OP_ROOT_OPEN)}; }
-    val opened: res[i32, Error] = verified_directory(parent.dirfd, leaf, OP_ROOT_OPEN);
+# open a publication root whose control files live under `home`
+#
+# the lock sentinel, claims directory and backup container are placed in the
+# home directory rather than beside the destination. the home is borrowed:
+# the caller keeps it alive through the root's use. a home on another
+# filesystem cannot receive an owned-replacement backup by rename.
+# ---
+# home: an open root over the control directory
+pub fun root_open_with_home(out: *Root, base: Path, rel: Path, home: *Root) err[Error] {
+    if (out == nil || !ownership.root_valid(home)) { ret err[Error].err{error(INVALID, OP_ROOT_OPEN)}; }
+    val opened: res[i32, Error] = open_root_descriptor(base, rel);
     if (sel opened.err) { ret err[Error].err{opened.err}; }
     val fd:          i32 = opened.ok;
-    val initialized: i64 = ownership.root_init(out, fd);
+    val initialized: i64 = ownership.root_init_with_home(out, fd, home.dirfd, false);
     if (initialized < 0) {
         val closed: i64 = os.close(fd);
         ret err[Error].err{with_cleanup_error(error(INVALID, OP_ROOT_OPEN), closed)};
+    }
+    ret err[Error].ok{};
+}
+
+# home an open root that is not locked: the same borrowed-home contract as
+# `root_open_with_home`, for a root reached by descent rather than by path
+pub fun root_adopt_home(r: *Root, home: *Root) err[Error] {
+    if (!ownership.root_valid(home)) { ret err[Error].err{error(INVALID, OP_ROOT_OPEN)}; }
+    val adopted: i64 = ownership.root_set_home(r, home.dirfd);
+    if (adopted == os.EINVAL) { ret err[Error].err{error(INVALID, OP_ROOT_OPEN)}; }
+    if (adopted < 0)          { ret err[Error].err{io_error(OP_ROOT_OPEN, adopted)}; }
+    ret err[Error].ok{};
+}
+
+# derive an independently owned root from a held directory capability
+# the caller keeps parent alive and reserves leaf across derivation and use
+# no ancestor pathname is reconstructed and a symlink leaf is refused
+# a child of a homed root is homed at `home/leaf`, created when absent
+pub fun root_open_child(out: *Root, parent: *Root, leaf: str) err[Error] {
+    if (out == nil || !ownership.root_valid(parent)) { ret err[Error].err{error(INVALID, OP_ROOT_OPEN)}; }
+    if (!leaf_is_component(leaf))                    { ret err[Error].err{error(CONTAINMENT, OP_ROOT_OPEN)}; }
+    val homed: bool = ownership.root_homed(parent);
+    if (homed && !publication_leaf(leaf)) { ret err[Error].err{error(CONTAINMENT, OP_ROOT_OPEN)}; }
+    val opened: res[i32, Error] = verified_directory(parent.dirfd, leaf, OP_ROOT_OPEN);
+    if (sel opened.err) { ret err[Error].err{opened.err}; }
+    val fd:      i32 = opened.ok;
+    var home_fd: i32 = -1;
+    if (homed) {
+        val made: i64 = os.make_dir(parent.home_fd, leaf, 0o700);
+        if (made < 0 && made != os.EEXIST) {
+            val closed: i64 = os.close(fd);
+            ret err[Error].err{with_cleanup_error(io_error(OP_ROOT_OPEN, made), closed)};
+        }
+        val home: res[i32, Error] = verified_directory(parent.home_fd, leaf, OP_ROOT_OPEN);
+        if (sel home.err) {
+            val closed: i64 = os.close(fd);
+            ret err[Error].err{with_cleanup_error(home.err, closed)};
+        }
+        home_fd = home.ok;
+    }
+    val initialized: i64 = ownership.root_init_with_home(out, fd, home_fd, true);
+    if (initialized < 0) {
+        val closed:  i64 = os.close(fd);
+        var cleanup: i64 = closed;
+        if (home_fd >= 0) {
+            val home_closed: i64 = os.close(home_fd);
+            if (cleanup >= 0) { cleanup = home_closed; }
+        }
+        ret err[Error].err{with_cleanup_error(error(INVALID, OP_ROOT_OPEN), cleanup)};
     }
     ret err[Error].ok{};
 }
@@ -427,6 +488,13 @@ pub fun root_dnit(r: *Root) err[Error] {
 pub fun root_fd(r: *Root) i32 {
     if (!ownership.root_valid(r)) { ret -1; }
     ret r.dirfd;
+}
+
+# the directory holding the root's lock sentinel, claims and backups: the
+# root itself unless it was opened with a home. the root retains ownership.
+pub fun root_home_fd(r: *Root) i32 {
+    if (!ownership.root_valid(r)) { ret -1; }
+    ret ownership.control_fd(r);
 }
 
 # the identity of the root directory itself
@@ -1018,6 +1086,7 @@ pub rec Transaction {
     state:           u8;
     destination:     *Claim;
     dirfd:           i32;
+    homefd:          i32;
     leaf:            str;
     staging_name:    str;
     staging_fd:      i32;
@@ -1104,7 +1173,8 @@ fun begin_prepare(out: *Transaction, alloc: *A.Allocator, destination: *Claim,
     val borrowed: err[Error] = borrow_claim(destination, OP_PREPARE);
     if (sel borrowed.err) { ret borrowed; }
     @out = Transaction{address: out::usize, state: STATE_PREPARING, destination: destination,
-        dirfd:           destination.owner.root.dirfd, leaf: destination.leaf, staging_fd: -1,
+        dirfd:           destination.owner.root.dirfd, homefd: ownership.control_fd(destination.owner.root),
+        leaf:            destination.leaf, staging_fd: -1,
         prior_fd:        -1, kind: kind, alloc: alloc, options: options,
         content_flushed: options.durability.level != DUR_NONE};
     if (options.precondition == PRE_SAME_OBJECT) {
@@ -2012,7 +2082,7 @@ pub fun commit_replacing_owned[T](t: *Transaction, ctx: *T,
     val holds: res[bool, Error] = precondition_holds(t);
     if (sel holds.err) { ret commit_failed(t, true, holds.err); }
     if (!holds.ok)     { ret commit_failed(t, true, error(PRECONDITION, OP_COMMIT)); }
-    val opened: res[i32, Error] = open_backup_container(t.dirfd, false);
+    val opened: res[i32, Error] = open_backup_container(t.homefd, false);
     if (sel opened.err) { ret commit_failed(t, true, opened.err); }
     var backupfd: i32 = opened.ok;
     if (backupfd >= 0) {
@@ -2035,7 +2105,7 @@ pub fun commit_replacing_owned[T](t: *Transaction, ctx: *T,
     val staging_closed: err[Error] = close_staging(t);
     if (sel staging_closed.err) { ret owned_replace_failed(t, backupfd, true, staging_closed.err); }
     if (backupfd < 0) {
-        val created: res[i32, Error] = open_backup_container(t.dirfd, true);
+        val created: res[i32, Error] = open_backup_container(t.homefd, true);
         if (sel created.err) { ret commit_failed(t, true, created.err); }
         backupfd = created.ok;
     }
@@ -2089,7 +2159,7 @@ pub fun recover(alloc: *A.Allocator, held: *Lock, leaf: str) res[usize, Error] {
 fun recover_entries(alloc: *A.Allocator, r: *Root, leaf: str) res[usize, Error] {
     if (!str_empty(leaf)) {
         if (!publication_leaf(leaf)) { ret res[usize, Error].err{error(CONTAINMENT, OP_RECOVER)}; }
-        val opened: res[i32, Error] = open_backup_container(r.dirfd, false);
+        val opened: res[i32, Error] = open_backup_container(ownership.control_fd(r), false);
         if (sel opened.err) { ret res[usize, Error].err{opened.err}; }
         val backupfd: i32              = opened.ok;
         val resolved: res[bool, Error] = resolve_backup(r.dirfd, leaf, backupfd);
@@ -3488,6 +3558,231 @@ test "std.filesystem.transaction.lock: the sentinel is not residue and survives 
 
     fs.remove_all(?alloc, root);
     str_free(?alloc, root);
+    ret bad;
+}
+
+# true when `dir` holds exactly the entry `name`, or nothing when `name` is empty
+fun listing_only(alloc: *A.Allocator, dir: str, name: str) bool {
+    val r: res[Vector[str], fs.FsError] = fs.read_dir(alloc, dir);
+    if (sel r.err) { ret false; }
+    var v:     Vector[str] = r.ok;
+    var exact: bool        = v.len == 1 && str_equals(v.data[0], name);
+    if (str_empty(name)) { exact = v.len == 0; }
+    var i: usize = 0;
+    for (i < v.len) {
+        str_free(alloc, v.data[i]);
+        i = i + 1;
+    }
+    vector.dnit[str](?v);
+    ret exact;
+}
+
+fun listing_has(alloc: *A.Allocator, dir: str, name: str) bool {
+    val r: res[Vector[str], fs.FsError] = fs.read_dir(alloc, dir);
+    if (sel r.err) { ret false; }
+    var v:     Vector[str] = r.ok;
+    var found: bool        = false;
+    var i:     usize       = 0;
+    for (i < v.len) {
+        if (str_equals(v.data[i], name)) { found = true; }
+        str_free(alloc, v.data[i]);
+        i = i + 1;
+    }
+    vector.dnit[str](?v);
+    ret found;
+}
+
+# a scratch tree with a destination directory and a separate control home,
+# both opened: `dest` is homed at `home`
+rec HomedFixture {
+    root:      str;
+    dest:      str;
+    home:      str;
+    home_root: Root;
+    dest_root: Root;
+}
+
+fun t_homed_init(out: *HomedFixture, alloc: *A.Allocator) i32 {
+    val root_r: res[str, fs.FsError] = scratch_root(alloc);
+    if (sel root_r.err) { ret 1; }
+    out.root = root_r.ok;
+    out.dest = abs_of(alloc, out.root, "dest");
+    out.home = abs_of(alloc, out.root, "home");
+    if (fs_refused(fs.create_dir(out.dest, 0o755)) || fs_refused(fs.create_dir(out.home, 0o700))) { ret 2; }
+    if (failed(root_open(?out.home_root, out.home, "")))                                          { ret 3; }
+    if (failed(root_open_with_home(?out.dest_root, out.root, "dest", ?out.home_root)))            { ret 4; }
+    ret 0;
+}
+
+fun t_homed_dnit(f: *HomedFixture, alloc: *A.Allocator) {
+    root_dnit(?f.dest_root);
+    root_dnit(?f.home_root);
+    fs.remove_all(alloc, f.root);
+    str_free(alloc, f.dest);
+    str_free(alloc, f.home);
+    str_free(alloc, f.root);
+}
+
+test "std.filesystem.transaction.root_open_with_home: a rewrite leaves nothing but the destination beside it" {
+    var alloc:  A.Allocator;
+    val page_r: err[A.Error] = page.make(?alloc);
+    if (sel page_r.err) { ret 1; }
+    var f:        HomedFixture;
+    val prepared: i32 = t_homed_init(?f, ?alloc);
+    fin { t_homed_dnit(?f, ?alloc); }
+    if (prepared != 0) { ret 10 + prepared; }
+    val dest: str = abs_of(?alloc, f.dest, "out");
+    fin { str_free(?alloc, dest); }
+    fs.write_bytes(dest, "before", 6, 0o644);
+
+    var session: TestSession;
+    if (failed(t_session_init(?session, ?alloc, ?f.dest_root))) { ret 20; }
+    var bad:       i32               = 0;
+    val recovered: res[usize, Error] = recover(?alloc, ?session.held, "");
+    if (sel recovered.err) { bad = 21; }
+    var t_storage: Transaction;
+    val t:         err[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?session, "out"), "after", 5, 0o644, false,
+        PrepareOptions{precondition: PRE_SAME_OBJECT, prior_access: READ_AUTHORIZED, durability: durability_none()});
+    if (bad == 0 && sel t.err) { bad = 22; }
+    or {
+        # the staged entry is beside the destination while in flight
+        if (bad == 0 && !listing_has(?alloc, f.dest, t_storage.staging_name)) { bad = 23; }
+        val committed: res[Outcome, Error] = commit(?t_storage);
+        if (bad == 0 && sel committed.err) { bad = 24; }
+    }
+    if (bad == 0 && !listing_only(?alloc, f.dest, "out"))                { bad = 25; }
+    if (bad == 0 && !listing_has(?alloc, f.home, LOCK_LEAF))             { bad = 26; }
+    if (bad == 0 && !listing_has(?alloc, f.home, ownership.CLAIMS_LEAF)) { bad = 27; }
+    val got: opt[str] = read_back(?alloc, f.root, "dest/out");
+    if (bad == 0 && (absent(got) || !str_equals(some_of[str](got), "after"))) { bad = 28; }
+    t_session_dnit(?session);
+    if (bad == 0 && !listing_only(?alloc, f.dest, "out")) { bad = 29; }
+
+    # a derived child is homed at home/leaf, created on demand, and the child
+    # directory itself stays clean through a lock
+    if (bad == 0 && fs_refused(fs.create_dir(abs_of(?alloc, f.dest, "sub"), 0o755))) { bad = 30; }
+    var child: Root;
+    if (bad == 0 && failed(root_open_child(?child, ?f.dest_root, "sub"))) { bad = 31; }
+    or (bad == 0) {
+        var held: Lock;
+        if (failed(lock(?held, ?child))) { bad = 32; }
+        or {
+            if (res_failed[usize](recover(?alloc, ?held, "")))   { bad = 33; }
+            if (bad == 0 && !listing_has(?alloc, f.home, "sub")) { bad = 34; }
+            unlock(?held);
+        }
+        val sub_home: str = abs_of(?alloc, f.home, "sub");
+        if (bad == 0 && !listing_has(?alloc, sub_home, LOCK_LEAF))             { bad = 35; }
+        if (bad == 0 && !listing_has(?alloc, sub_home, ownership.CLAIMS_LEAF)) { bad = 36; }
+        str_free(?alloc, sub_home);
+        if (bad == 0 && !listing_only(?alloc, abs_of(?alloc, f.dest, "sub"), "")) { bad = 37; }
+        root_dnit(?child);
+    }
+    # a reserved name cannot be derived beneath a homed root
+    var reserved: Root;
+    if (bad == 0 && !failed(root_open_child(?reserved, ?f.dest_root, LOCK_LEAF))) {
+        root_dnit(?reserved);
+        bad = 38;
+    }
+    ret bad;
+}
+
+test "std.filesystem.transaction.lock: concurrent lockers of one home exclude each other" {
+    var alloc:  A.Allocator;
+    val page_r: err[A.Error] = page.make(?alloc);
+    if (sel page_r.err) { ret 1; }
+    var f:        HomedFixture;
+    val prepared: i32 = t_homed_init(?f, ?alloc);
+    fin { t_homed_dnit(?f, ?alloc); }
+    if (prepared != 0) { ret 10 + prepared; }
+    # a second root over the same destination through the same home
+    var again: Root;
+    if (failed(root_open_with_home(?again, f.root, "dest", ?f.home_root))) { ret 20; }
+    fin { root_dnit(?again); }
+    # the same destination through a separate home does not contend
+    val other: str = abs_of(?alloc, f.root, "other");
+    fin { str_free(?alloc, other); }
+    if (fs_refused(fs.create_dir(other, 0o700))) { ret 21; }
+    var other_home: Root;
+    if (failed(root_open(?other_home, other, ""))) { ret 22; }
+    fin { root_dnit(?other_home); }
+    var elsewhere: Root;
+    if (failed(root_open_with_home(?elsewhere, f.root, "dest", ?other_home))) { ret 23; }
+    fin { root_dnit(?elsewhere); }
+
+    var bad:   i32 = 0;
+    var first: Lock;
+    if (failed(lock(?first, ?f.dest_root))) { ret 24; }
+    var second:  Lock;
+    val refused: err[Error] = lock(?second, ?again);
+    if (sel refused.ok) {
+        unlock(?second);
+        bad = 25;
+    }
+    or (error_of(refused).kind != LOCK_HELD) { bad = 26; }
+    var third: Lock;
+    if (bad == 0 && failed(lock(?third, ?elsewhere))) { bad = 27; }
+    or (bad == 0)                                     { unlock(?third); }
+    # a root that adopts the home contends through it as well
+    var adopted: Root;
+    if (bad == 0 && failed(root_open(?adopted, f.root, "dest"))) { bad = 40; }
+    or (bad == 0) {
+        if (failed(root_adopt_home(?adopted, ?f.home_root))) { bad = 41; }
+        var fifth: Lock;
+        val held:  err[Error] = lock(?fifth, ?adopted);
+        if (sel held.ok) {
+            unlock(?fifth);
+            bad = 42;
+        }
+        or (error_of(held).kind != LOCK_HELD) { bad = 43; }
+        root_dnit(?adopted);
+    }
+    # the destination directory never receives a sentinel
+    if (bad == 0 && listing_has(?alloc, f.dest, LOCK_LEAF)) { bad = 28; }
+    unlock(?first);
+    # release readmits through the home
+    var fourth: Lock;
+    if (bad == 0 && failed(lock(?fourth, ?again))) { bad = 29; }
+    or (bad == 0)                                  { unlock(?fourth); }
+    ret bad;
+}
+
+test "std.filesystem.transaction.recover: an interrupted prepare recovers through the home" {
+    var alloc:  A.Allocator;
+    val page_r: err[A.Error] = page.make(?alloc);
+    if (sel page_r.err) { ret 1; }
+    var f:        HomedFixture;
+    val prepared: i32 = t_homed_init(?f, ?alloc);
+    fin { t_homed_dnit(?f, ?alloc); }
+    if (prepared != 0) { ret 10 + prepared; }
+    val dest: str = abs_of(?alloc, f.dest, "out");
+    fin { str_free(?alloc, dest); }
+    fs.write_bytes(dest, "published", 9, 0o644);
+
+    var session: TestSession;
+    if (failed(t_session_init(?session, ?alloc, ?f.dest_root))) { ret 20; }
+    fin { t_session_dnit(?session); }
+    var bad:       i32        = 0;
+    var t_storage: Transaction;
+    val t:         err[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?session, "out"), "unfinished", 10, 0o644, false,
+        PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
+    if (sel t.err) { ret 21; }
+    # process death closes descriptors but leaves the staged entry beside the destination
+    val abandoned: *Transaction = ?t_storage;
+    if (os.close(abandoned.staging_fd) < 0) { bad = 22; }
+    abandoned.staging_fd = -1;
+    transaction_cleanup(abandoned, false, OP_ABORT);
+    if (bad == 0 && payload_entry_count(?alloc, f.dest) != 2) { bad = 23; }
+
+    # the sweep reads the home for its claims and the destination for residue
+    val swept: res[usize, Error] = t_end_batch_and_recover(?session, "out");
+    if (bad == 0 && (res_failed[usize](swept) || res_value[usize](swept) != 1)) { bad = 24; }
+    if (bad == 0 && !listing_only(?alloc, f.dest, "out"))                       { bad = 25; }
+    val after: opt[str] = read_back(?alloc, f.root, "dest/out");
+    if (bad == 0 && (absent(after) || !str_equals(some_of[str](after), "published"))) { bad = 26; }
+    if (bad == 0 && !listing_has(?alloc, f.home, ownership.CLAIMS_LEAF))              { bad = 27; }
+    # admission is open again after recovery through the home
+    if (bad == 0 && t_reserve(?session, "out") == nil) { bad = 28; }
     ret bad;
 }
 
