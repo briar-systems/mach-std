@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `log.record.field_text(key, data, len)`: a length-delimited text field rendered and escaped like `field_string`, for views that carry no terminator (#599).
+
 ## [2.0.0] - 2026-09-12
 
 The breaking result, option and tag migration for Mach 5.0.0 (std #617,
