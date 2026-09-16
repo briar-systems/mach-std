@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-09-16
+
+### Added
+- CI holds std's freestanding build to a checked-in list. `test/freestanding/verify.sh`
+  builds every module for `freestanding-x86_64` and fails when a listed module
+  stops building, when a module that builds is not listed, or when the list
+  names a module that does not exist. The list starts at the 36 modules that
+  build today (#684).
+- `io.error.make(kind, operation)` builds an error std raised itself, with no
+  native code behind it: `code` and `cleanup_code` are 0. A caller that needs a
+  synthetic error states its kind here instead of borrowing an errno (#687).
+- `io.error.Kind` gains `NOT_FOUND`, `EXISTS`, `NOT_DIRECTORY`,
+  `IS_DIRECTORY`, `NOT_EMPTY`, `NAME_TOO_LONG`, `BUSY`, `IO`, `RANGE`,
+  `NO_CHILD` and `LOOP`, numbered 15 to 25 after `OTHER`. Existing values keep
+  their numbers. `from_code` does not produce the new kinds yet, so every code
+  classifies exactly as before (#687).
+
+### Changed
+- CI follows the family contract in briar-systems/.github (briar-systems/mach#3447).
+  One `ci.yml` calls the shared library pipeline and ends in a `gate` job. linux
+  x86_64, windows x86_64 and darwin aarch64 run on every pull request into dev.
+  arm64 linux, darwin x86_64, riscv64 under qemu and the cross-backend build run
+  on pull requests into main, on a dispatch that names them, and on every
+  release. Nothing runs on push. Each host's verifiers run from
+  `.github/ci/verify.sh`, `mach fmt --check` now runs, and the compiler is the
+  family's pinned mach release, 5.1.0 where CI used 5.0.0 (#699).
+- `mach.toml` declares `windows-x86_64`, so std's own manifest builds its
+  windows artifact. This needs mach 5.1.0 or later for the debug profile,
+  which earlier releases refuse on windows (#699).
+- The backend artifact checks call every libSystem import they name. mach 5.1.0
+  binds only the imports a program can reach, so the darwin checks no longer
+  saw `_fstat`, `_getentropy` and the process imports in a probe that never
+  called them (#699).
+- **Behaviour change.** A fixed-capacity sink in `std.format`, `std.derive`
+  and `std.data.json` reports running out of room as
+  `io.error.make(RESOURCE_EXHAUSTED, OP_WRITE)`. The kind is unchanged, but
+  `code` is now 0 instead of the target's `ENOSPC` (#687).
+- The allocator interface documents backend release failures as a negative
+  backend native code rather than an errno (#687).
+
+### Fixed
+- **Security.** On Windows, an owner-only mode (no group or other bits, such as
+  0600 or 0700) is now enforced. Files and directories created with such a
+  mode, through `open`, `make_dir` and everything built on them
+  (`filesystem.create`, `write_bytes`, `create_dir`, `replace_bytes_atomic`,
+  transactions), get a protected DACL with one ACE granting only the current
+  user, who is also made the owner. Before this, the mode was ignored and the
+  object inherited its parent's default DACL, so other principals could read a
+  0600 private key. A directory's ACE is inherited by what is later created in
+  it, since Windows lets any principal traverse past a directory's own DACL by
+  default (#703).
+- **Security.** On Windows, `set_mode` and `set_mode_at` apply the same
+  owner-only mapping instead of always returning `ENOTSUP`. Any other mode,
+  including group or other bits and setuid, setgid or sticky bits, has no
+  faithful Windows form, so it still returns `ENOTSUP` (kind `UNSUPPORTED`) and
+  leaves the object unchanged. `set_mode_at` refuses a reparse point rather than
+  following it (#703).
+- On Windows, `stat` and `stat_path` report the mode an owner-only protected
+  DACL enforces (for example `0600` or `0700`) instead of always reporting
+  `0644` for files and `0755` for directories. Any other DACL still reports
+  those defaults (#703).
+- std now links `advapi32.dll` on Windows (#703).
+- Transactional directory preparation widens an owner-denying directory to
+  owner access while its children are built and restores the requested mode
+  afterwards, on Windows as on other platforms. `filesystem.removal` likewise
+  widens a private directory it has to descend into. Both steps used to be
+  skipped on Windows, which would now leave a 0000 directory unbuildable (#703).
+
 ## [3.1.0] - 2026-09-16
 
 ### Added
