@@ -6,6 +6,7 @@ $if ($mach.build.os != $mach.os.windows) {
 
 use std.io.runtime;
 use std.memory;
+use std.memory.table;
 use std.net.async.types;
 use std.net.ip;
 use std.sync.mutex;
@@ -75,54 +76,65 @@ pub rec Operation {
     transferred:    u32;
     native_flags:   u32;
     result:         i64;
+    index:          u32;
+    next_free:      u32;
 }
 
 pub rec Backend {
-    queue:          *shared.IoQueue;
-    operations:     *Operation;
-    attached:       *usize;
-    native:         *windows.IoCompletion;
-    preserved:      *windows.IoCompletion;
-    completions:    *types.NativeCompletion;
-    capacity:       usize;
-    active:         usize;
-    ready:          usize;
-    next:           usize;
-    attached_count: usize;
-    lock:           mutex.Mutex;
-    io_lock:        mutex.Mutex;
+    queue:           *shared.IoQueue;
+    operations:      table.Table;
+    attached:        table.Table;
+    preserved:       table.Table;
+    completions:     table.Table;
+    native:          *windows.IoCompletion;
+    operation_slots: usize;
+    attached_slots:  usize;
+    free_operation:  u32;
+    active:          usize;
+    ready:           usize;
+    attached_count:  usize;
+    lock:            mutex.Mutex;
+    io_lock:         mutex.Mutex;
+}
+
+val NONE: u32 = 0xffffffff;
+# readiness is harvested in fixed batches, so the batch is not a capacity
+val NATIVE_BATCH: usize = 256;
+
+fun operation_at(backend: *Backend, index: usize) *Operation {
+    ret table.at(?backend.operations, index)::*Operation;
+}
+
+fun attached_at(backend: *Backend, index: usize) *usize {
+    ret table.at(?backend.attached, index)::*usize;
+}
+
+fun preserved_at(backend: *Backend, index: usize) *windows.IoCompletion {
+    ret table.at(?backend.preserved, index)::*windows.IoCompletion;
+}
+
+fun completion_at(backend: *Backend, index: usize) *types.NativeCompletion {
+    ret table.at(?backend.completions, index)::*types.NativeCompletion;
 }
 
 pub fun aliases(backend: *Backend, data: *u8, len: usize) bool {
     if (!memory.range_valid(data, len)) { ret true; }
     if (len == 0)                       { ret false; }
     if (!memory.range_valid(backend::*u8, $size_of(Backend)) ||
-        backend.queue == nil || backend.capacity == 0) {
+        backend.queue == nil || backend.operations.capacity == 0) {
         ret true;
     }
-    var operation_bytes:  usize = 0;
-    var attached_bytes:   usize = 0;
-    var native_bytes:     usize = 0;
-    var completion_bytes: usize = 0;
-    if (!memory.range_scaled(backend.capacity, $size_of(Operation),
-        ?operation_bytes) ||
-        !memory.range_scaled(backend.capacity, $size_of(usize),
-        ?attached_bytes) ||
-        !memory.range_scaled(backend.capacity, $size_of(windows.IoCompletion),
-        ?native_bytes) ||
-        !memory.range_scaled(backend.capacity, $size_of(types.NativeCompletion),
-        ?completion_bytes)) { ret true; }
+    var native_bytes: usize = 0;
+    if (!memory.range_scaled(NATIVE_BATCH, $size_of(windows.IoCompletion),
+        ?native_bytes)) { ret true; }
     ret memory.ranges_overlap(backend::*u8, $size_of(Backend), data, len) ||
         memory.ranges_overlap(backend.queue::*u8, $size_of(shared.IoQueue),
         data, len) ||
-        memory.ranges_overlap(backend.operations::*u8, operation_bytes,
-        data, len) ||
-        memory.ranges_overlap(backend.attached::*u8, attached_bytes,
-        data, len) ||
-        memory.ranges_overlap(backend.native::*u8, native_bytes, data, len) ||
-        memory.ranges_overlap(backend.preserved::*u8, native_bytes, data, len) ||
-        memory.ranges_overlap(backend.completions::*u8, completion_bytes,
-        data, len);
+        table.aliases(?backend.operations, data, len) ||
+        table.aliases(?backend.attached, data, len) ||
+        table.aliases(?backend.preserved, data, len) ||
+        table.aliases(?backend.completions, data, len) ||
+        memory.ranges_overlap(backend.native::*u8, native_bytes, data, len);
 }
 
 val SLOT_FREE:            u8    = 0;
@@ -150,20 +162,20 @@ fun zero_overlapped(overlapped: *NativeOverlapped) {
 }
 
 fun operation_for(backend: *Backend, token: types.Token) *Operation {
-    if (token.index::usize >= backend.capacity) { ret nil; }
-    val operation: *Operation = ?backend.operations[token.index::usize];
+    if (token.index::usize >= backend.operation_slots) { ret nil; }
+    val operation: *Operation = operation_at(backend, token.index::usize);
     if (operation.state == SLOT_FREE || operation.generation != token.generation) { ret nil; }
     ret operation;
 }
 
 fun operation_from_context(backend: *Backend, context: usize) *Operation {
-    var i: usize = 0;
-    for (i < backend.capacity) {
-        val operation: *Operation = ?backend.operations[i];
-        if (operation.state != SLOT_FREE && (?operation.overlapped)::usize == context) { ret operation; }
-        i = i + 1;
-    }
-    ret nil;
+    val offset: usize = $offset_of(Operation, overlapped);
+    if (context < offset) { ret nil; }
+    val index: usize = table.index_of(?backend.operations, context - offset);
+    if (index == table.NO_INDEX || index >= backend.operation_slots) { ret nil; }
+    val operation: *Operation = operation_at(backend, index);
+    if (operation.state == SLOT_FREE) { ret nil; }
+    ret operation;
 }
 
 fun clear_borrowed(operation: *Operation) {
@@ -185,17 +197,38 @@ fun clear_borrowed(operation: *Operation) {
     operation.message.control.data = nil;
 }
 
+# the completion and preserved tables track the operation table, so publishing
+# and preserving a completion always have somewhere to land
+fun operation_append(backend: *Backend) bool {
+    if (backend.operation_slots > 0xffffffff) { ret false; }
+    if (backend.operation_slots == backend.operations.capacity &&
+        !table.grow(?backend.operations)) { ret false; }
+    if (!table.reserve(?backend.completions, backend.operations.capacity) ||
+        !table.reserve(?backend.preserved, backend.operations.capacity)) { ret false; }
+    val index: usize      = backend.operation_slots;
+    val entry: *Operation = operation_at(backend, index);
+    entry.state             = SLOT_FREE;
+    entry.generation        = 0;
+    entry.index             = index::u32;
+    entry.resource          = INVALID_SOCKET;
+    entry.auxiliary         = INVALID_SOCKET;
+    entry.vector_count      = 0;
+    entry.peer              = nil;
+    entry.packets           = nil;
+    entry.buffer.data       = nil;
+    entry.buffer.length     = 0;
+    entry.next_free         = backend.free_operation;
+    backend.free_operation  = index::u32;
+    backend.operation_slots = index + 1;
+    ret true;
+}
+
 fun claim_locked(backend: *Backend, kind: runtime.Kind, resource: usize, context: usize, token: *types.Token) *Operation {
-    if (backend.active == backend.capacity) { ret nil; }
-    var index:   usize = backend.next;
-    var scanned: usize = 0;
-    for (scanned < backend.capacity && backend.operations[index].state != SLOT_FREE) {
-        index   = (index + 1) % backend.capacity;
-        scanned = scanned + 1;
-    }
-    if (scanned == backend.capacity) { ret nil; }
-    val operation:  *Operation = ?backend.operations[index];
-    var generation: u32        = operation.generation + 1;
+    if (backend.free_operation == NONE && !operation_append(backend)) { ret nil; }
+    val index:     usize      = backend.free_operation::usize;
+    val operation: *Operation = operation_at(backend, index);
+    backend.free_operation = operation.next_free;
+    var generation: u32 = operation.generation + 1;
     if (generation == 0) { generation = 1; }
     zero_overlapped(?operation.overlapped);
     operation.state        = SLOT_ACTIVE;
@@ -214,23 +247,24 @@ fun claim_locked(backend: *Backend, kind: runtime.Kind, resource: usize, context
     operation.native_flags = 0;
     operation.result       = 0;
     backend.active         = backend.active + 1;
-    backend.next           = (index + 1) % backend.capacity;
     @token                 = types.Token{index: index::u32, generation: generation};
     ret operation;
 }
 
 fun release_locked(backend: *Backend, operation: *Operation) {
     clear_borrowed(operation);
-    operation.state     = SLOT_FREE;
-    operation.resource  = INVALID_SOCKET;
-    operation.auxiliary = INVALID_SOCKET;
-    backend.active      = backend.active - 1;
+    operation.state        = SLOT_FREE;
+    operation.resource     = INVALID_SOCKET;
+    operation.auxiliary    = INVALID_SOCKET;
+    operation.next_free    = backend.free_operation;
+    backend.free_operation = operation.index;
+    backend.active         = backend.active - 1;
 }
 
 fun has_control_locked(backend: *Backend, resource: usize) bool {
     var i: usize = 0;
-    for (i < backend.capacity) {
-        val operation: *Operation = ?backend.operations[i];
+    for (i < backend.operation_slots) {
+        val operation: *Operation = operation_at(backend, i);
         if (operation.state != SLOT_FREE && operation.resource == resource && (operation.kind == runtime.SHUTDOWN || operation.kind == runtime.CLOSE)) { ret true; }
         i = i + 1;
     }
@@ -239,8 +273,8 @@ fun has_control_locked(backend: *Backend, resource: usize) bool {
 
 fun has_write_locked(backend: *Backend, resource: usize, except: *Operation) bool {
     var i: usize = 0;
-    for (i < backend.capacity) {
-        val operation: *Operation = ?backend.operations[i];
+    for (i < backend.operation_slots) {
+        val operation: *Operation = operation_at(backend, i);
         if (operation != except && operation.state != SLOT_FREE && operation.resource == resource && (operation.kind == runtime.WRITE || operation.kind == runtime.SEND_TO)) { ret true; }
         i = i + 1;
     }
@@ -249,8 +283,8 @@ fun has_write_locked(backend: *Backend, resource: usize, except: *Operation) boo
 
 fun has_operation_locked(backend: *Backend, resource: usize, except: *Operation) bool {
     var i: usize = 0;
-    for (i < backend.capacity) {
-        val operation: *Operation = ?backend.operations[i];
+    for (i < backend.operation_slots) {
+        val operation: *Operation = operation_at(backend, i);
         if (operation != except && operation.state != SLOT_FREE && operation.resource == resource) { ret true; }
         i = i + 1;
     }
@@ -259,8 +293,8 @@ fun has_operation_locked(backend: *Backend, resource: usize, except: *Operation)
 
 fun progress_controls_locked(backend: *Backend) {
     var i: usize = 0;
-    for (i < backend.capacity) {
-        val operation: *Operation = ?backend.operations[i];
+    for (i < backend.operation_slots) {
+        val operation: *Operation = operation_at(backend, i);
         if (operation.state == SLOT_CONTROL_PENDING && operation.kind == runtime.SHUTDOWN && !has_write_locked(backend, operation.resource, operation)) {
             operation.result = windows.sock_shutdown(operation.resource, windows.SHUT_WR);
             operation.state  = SLOT_CONTROL_READY;
@@ -282,8 +316,8 @@ fun push_completion_locked(
     status: i64,
     end_of_stream: bool,
 ) bool {
-    if (backend.ready == backend.capacity) { ret false; }
-    backend.completions[backend.ready] = types.NativeCompletion{
+    if (backend.ready == backend.completions.capacity) { ret false; }
+    @completion_at(backend, backend.ready) = types.NativeCompletion{
         context:       context,
         kind:          kind,
         bytes:         bytes,
@@ -298,8 +332,8 @@ fun push_completion_locked(
 
 fun emit_control_locked(backend: *Backend) {
     var i: usize = 0;
-    for (i < backend.capacity && backend.ready < backend.capacity) {
-        val operation: *Operation = ?backend.operations[i];
+    for (i < backend.operation_slots && backend.ready < backend.completions.capacity) {
+        val operation: *Operation = operation_at(backend, i);
         if (operation.state == SLOT_CONTROL_READY) {
             push_completion_locked(backend, operation.context, operation.kind, 0, 0, operation.resource, operation.result, false);
             release_locked(backend, operation);
@@ -308,97 +342,68 @@ fun emit_control_locked(backend: *Backend) {
     }
 }
 
-pub fun make(backend: *Backend, queue: *shared.IoQueue, capacity: usize, source_id: u16) i64 {
-    if (backend == nil || queue == nil || queue.handle == 0 || capacity == 0 || capacity > 0xffff || source_id == 0) { ret invalid(); }
-    val operation_size:   usize = $size_of(Operation);
-    val native_size:      usize = $size_of(windows.IoCompletion);
-    val completion_size:  usize = $size_of(types.NativeCompletion);
-    val attached_size:    usize = $size_of(usize);
-    val operation_bytes:  usize = operation_size * capacity;
-    val native_bytes:     usize = native_size * capacity;
-    val completion_bytes: usize = completion_size * capacity;
-    val attached_bytes:   usize = attached_size * capacity;
-    if (operation_bytes / operation_size != capacity || native_bytes / native_size != capacity || completion_bytes / completion_size != capacity || attached_bytes / attached_size != capacity) { ret windows.ENOMEM; }
-    backend.operations = windows.allocate(operation_bytes)::*Operation;
-    if (backend.operations == nil) { ret windows.ENOMEM; }
+# initial is the size the backend starts at: the operation, completion,
+# preserved and attachment tables grow on demand
+pub fun make(backend: *Backend, queue: *shared.IoQueue, initial: usize, source_id: u16) i64 {
+    if (backend == nil || queue == nil || queue.handle == 0 || initial == 0 || source_id == 0) { ret invalid(); }
+    var native_bytes: usize = 0;
+    if (!memory.range_scaled(NATIVE_BATCH, $size_of(windows.IoCompletion), ?native_bytes)) { ret windows.ENOMEM; }
+
+    if (!table.make(?backend.operations, $size_of(Operation), initial)) { ret windows.ENOMEM; }
+    if (!table.make(?backend.completions, $size_of(types.NativeCompletion), initial) ||
+        !table.make(?backend.preserved, $size_of(windows.IoCompletion), initial) ||
+        !table.make(?backend.attached, $size_of(usize), initial)) {
+        table.destroy(?backend.attached);
+        table.destroy(?backend.preserved);
+        table.destroy(?backend.completions);
+        table.destroy(?backend.operations);
+        ret windows.ENOMEM;
+    }
     backend.native = windows.allocate(native_bytes)::*windows.IoCompletion;
     if (backend.native == nil) {
-        windows.deallocate(backend.operations::ptr, operation_bytes);
-        backend.operations = nil;
+        table.destroy(?backend.attached);
+        table.destroy(?backend.preserved);
+        table.destroy(?backend.completions);
+        table.destroy(?backend.operations);
         ret windows.ENOMEM;
     }
-    backend.preserved = windows.allocate(native_bytes)::*windows.IoCompletion;
-    if (backend.preserved == nil) {
-        windows.deallocate(backend.native::ptr, native_bytes);
-        windows.deallocate(backend.operations::ptr, operation_bytes);
-        backend.native     = nil;
-        backend.operations = nil;
-        ret windows.ENOMEM;
-    }
-    backend.attached = windows.allocate(attached_bytes)::*usize;
-    if (backend.attached == nil) {
-        windows.deallocate(backend.preserved::ptr, native_bytes);
-        windows.deallocate(backend.native::ptr, native_bytes);
-        windows.deallocate(backend.operations::ptr, operation_bytes);
-        backend.attached   = nil;
-        backend.preserved  = nil;
-        backend.native     = nil;
-        backend.operations = nil;
-        ret windows.ENOMEM;
-    }
-    backend.completions = windows.allocate(completion_bytes)::*types.NativeCompletion;
-    if (backend.completions == nil) {
-        windows.deallocate(backend.attached::ptr, attached_bytes);
-        windows.deallocate(backend.preserved::ptr, native_bytes);
-        windows.deallocate(backend.native::ptr, native_bytes);
-        windows.deallocate(backend.operations::ptr, operation_bytes);
-        backend.attached   = nil;
-        backend.preserved  = nil;
-        backend.native     = nil;
-        backend.operations = nil;
-        ret windows.ENOMEM;
-    }
-    backend.queue          = queue;
-    backend.capacity       = capacity;
-    backend.active         = 0;
-    backend.ready          = 0;
-    backend.next           = 0;
-    backend.attached_count = 0;
-    backend.lock           = mutex.make();
-    backend.io_lock        = mutex.make();
-    var i: usize = 0;
-    for (i < capacity) {
-        backend.operations[i].state      = SLOT_FREE;
-        backend.operations[i].generation = 0;
-        backend.operations[i].resource   = INVALID_SOCKET;
-        backend.operations[i].auxiliary  = INVALID_SOCKET;
-        backend.attached[i]              = INVALID_SOCKET;
-        i                                = i + 1;
-    }
+    backend.queue           = queue;
+    backend.operation_slots = 0;
+    backend.attached_slots  = 0;
+    backend.free_operation  = NONE;
+    backend.active          = 0;
+    backend.ready           = 0;
+    backend.attached_count  = 0;
+    backend.lock            = mutex.make();
+    backend.io_lock         = mutex.make();
     ret 0;
 }
 
 fun socket_attach(backend: *Backend, resource: usize) i64 {
     if (backend == nil || backend.queue == nil || resource == INVALID_SOCKET) { ret invalid(); }
     mutex.lock(?backend.lock);
-    var free: usize = backend.capacity;
+    var free: usize = backend.attached_slots;
     var i:    usize = 0;
-    for (i < backend.capacity) {
-        if (backend.attached[i] == resource) {
+    for (i < backend.attached_slots) {
+        if (@attached_at(backend, i) == resource) {
             mutex.unlock(?backend.lock);
             ret 0;
         }
-        if (free == backend.capacity && backend.attached[i] == INVALID_SOCKET) { free = i; }
+        if (free == backend.attached_slots && @attached_at(backend, i) == INVALID_SOCKET) { free = i; }
         i = i + 1;
     }
-    if (free == backend.capacity) {
-        mutex.unlock(?backend.lock);
-        ret windows.ENOMEM;
+    if (free == backend.attached_slots) {
+        if (!table.reserve(?backend.attached, free + 1)) {
+            mutex.unlock(?backend.lock);
+            ret windows.ENOMEM;
+        }
+        @attached_at(backend, free) = INVALID_SOCKET;
+        backend.attached_slots      = free + 1;
     }
     val result: i64 = windows.io_queue_attach(backend.queue, resource);
     if (result >= 0) {
-        backend.attached[free] = resource;
-        backend.attached_count = backend.attached_count + 1;
+        @attached_at(backend, free) = resource;
+        backend.attached_count      = backend.attached_count + 1;
     }
     mutex.unlock(?backend.lock);
     ret result;
@@ -406,10 +411,10 @@ fun socket_attach(backend: *Backend, resource: usize) i64 {
 
 fun socket_detach_locked(backend: *Backend, resource: usize) {
     var i: usize = 0;
-    for (i < backend.capacity) {
-        if (backend.attached[i] == resource) {
-            backend.attached[i]    = INVALID_SOCKET;
-            backend.attached_count = backend.attached_count - 1;
+    for (i < backend.attached_slots) {
+        if (@attached_at(backend, i) == resource) {
+            @attached_at(backend, i) = INVALID_SOCKET;
+            backend.attached_count   = backend.attached_count - 1;
             ret;
         }
         i = i + 1;
@@ -776,8 +781,8 @@ pub fun submit_close(backend: *Backend, resource: usize, context: usize, token: 
     }
     operation.state = SLOT_CONTROL_PENDING;
     var i: usize = 0;
-    for (i < backend.capacity) {
-        val pending: *Operation = ?backend.operations[i];
+    for (i < backend.operation_slots) {
+        val pending: *Operation = operation_at(backend, i);
         if (pending != operation && pending.state == SLOT_ACTIVE && pending.resource == resource) {
             windows.io_queue_cancel(resource, (?pending.overlapped)::ptr);
             pending.state  = SLOT_CANCEL_READY;
@@ -797,7 +802,7 @@ fun restore_preserved(backend: *Backend, count: usize, wake: bool) i64 {
     var result: i64   = 0;
     var i:      usize = 0;
     for (i < count) {
-        val restored: i64 = windows.io_queue_restore(backend.queue, backend.preserved[i]);
+        val restored: i64 = windows.io_queue_restore(backend.queue, @preserved_at(backend, i));
         if (result >= 0 && restored < 0) { result = restored; }
         i = i + 1;
     }
@@ -866,12 +871,12 @@ pub fun cancel(backend: *Backend, token: types.Token) i64 {
         or ((native.events & windows.IO_EVENT_WAKE) != 0) {
             preserved_wake = true;
         }
-        or (preserved_count == backend.capacity) {
+        or (preserved_count == backend.preserved.capacity) {
             result = windows.ENOMEM;
         }
         or {
-            backend.preserved[preserved_count] = native;
-            preserved_count                    = preserved_count + 1;
+            @preserved_at(backend, preserved_count) = native;
+            preserved_count                         = preserved_count + 1;
         }
     }
     if (found) {
@@ -1077,14 +1082,14 @@ pub fun poll(backend: *Backend, timeout_ms: i32) i64 {
     if (immediately_ready != 0) { ret immediately_ready::i64; }
 
     mutex.lock(?backend.io_lock);
-    val count: i64 = windows.io_queue_poll(backend.queue, backend.native, backend.capacity, timeout_ms);
+    val count: i64 = windows.io_queue_poll(backend.queue, backend.native, NATIVE_BATCH, timeout_ms);
     if (count <= 0) {
         mutex.unlock(?backend.io_lock);
         ret count;
     }
     mutex.lock(?backend.lock);
     var i: usize = 0;
-    for (i < count::usize && backend.ready < backend.capacity) {
+    for (i < count::usize && backend.ready < backend.completions.capacity) {
         consume_native_locked(backend, backend.native[i]);
         i = i + 1;
     }
@@ -1098,7 +1103,7 @@ pub fun poll(backend: *Backend, timeout_ms: i32) i64 {
 
 pub fun completion(backend: *Backend, index: usize, out: *types.NativeCompletion) i64 {
     if (backend == nil || out == nil || index >= backend.ready) { ret invalid(); }
-    @out = backend.completions[index];
+    @out = @completion_at(backend, index);
     ret 0;
 }
 
@@ -1109,26 +1114,19 @@ pub fun destroy(backend: *Backend) i64 {
         mutex.unlock(?backend.lock);
         ret windows.EBUSY;
     }
-    val operation_bytes:  usize = $size_of(Operation) * backend.capacity;
-    val native_bytes:     usize = $size_of(windows.IoCompletion) * backend.capacity;
-    val completion_bytes: usize = $size_of(types.NativeCompletion) * backend.capacity;
-    val attached_bytes:   usize = $size_of(usize) * backend.capacity;
-    windows.deallocate(backend.completions::ptr, completion_bytes);
-    windows.deallocate(backend.attached::ptr, attached_bytes);
-    windows.deallocate(backend.preserved::ptr, native_bytes);
-    windows.deallocate(backend.native::ptr, native_bytes);
-    windows.deallocate(backend.operations::ptr, operation_bytes);
-    backend.completions    = nil;
-    backend.attached       = nil;
-    backend.preserved      = nil;
-    backend.native         = nil;
-    backend.operations     = nil;
-    backend.capacity       = 0;
-    backend.active         = 0;
-    backend.ready          = 0;
-    backend.next           = 0;
-    backend.attached_count = 0;
-    backend.queue          = nil;
+    windows.deallocate(backend.native::ptr, $size_of(windows.IoCompletion) * NATIVE_BATCH);
+    table.destroy(?backend.attached);
+    table.destroy(?backend.preserved);
+    table.destroy(?backend.completions);
+    table.destroy(?backend.operations);
+    backend.native          = nil;
+    backend.operation_slots = 0;
+    backend.attached_slots  = 0;
+    backend.free_operation  = NONE;
+    backend.active          = 0;
+    backend.ready           = 0;
+    backend.attached_count  = 0;
+    backend.queue           = nil;
     mutex.unlock(?backend.lock);
     ret 0;
 }
@@ -1437,9 +1435,9 @@ test "async windows: cancellation quiesces borrowed accept storage" {
     var second:      types.Token;
     if (submit_accept(?backend, listener, ?first_peer, 20, ?first) < 0 || submit_accept(?backend, listener, ?second_peer, 21, ?second) < 0) { ret 1; }
     var third: types.Token;
-    if (submit_accept(?backend, listener, nil, 22, ?third) != windows.ENOMEM)                                                                      { ret 1; }
-    if (cancel(?backend, first) < 0 || cancel(?backend, second) < 0)                                                                               { ret 1; }
-    if (backend.operations[first.index::usize].auxiliary != INVALID_SOCKET || backend.operations[second.index::usize].auxiliary != INVALID_SOCKET) { ret 1; }
+    if (submit_accept(?backend, listener, nil, 22, ?third) != windows.ENOMEM)                                                                              { ret 1; }
+    if (cancel(?backend, first) < 0 || cancel(?backend, second) < 0)                                                                                       { ret 1; }
+    if (operation_at(?backend, first.index::usize).auxiliary != INVALID_SOCKET || operation_at(?backend, second.index::usize).auxiliary != INVALID_SOCKET) { ret 1; }
     first_peer.port  = 0xffff;
     second_peer.port = 0xffff;
     var attempts: usize = 0;
@@ -1784,7 +1782,7 @@ test "async windows: cancellation preserves earlier IOCP packets" {
     val sent:                 i64   = windows.sock_send(first_client, ?output, 1);
     var earlier:              windows.IoCompletion;
     val earlier_count:        i64   = windows.io_queue_poll(?queue, ?earlier, 1, 1000);
-    val first_native_context: usize = (?backend.operations[first_token.index::usize].overlapped)::usize;
+    val first_native_context: usize = (?operation_at(?backend, first_token.index::usize).overlapped)::usize;
     var earlier_restored:     i64   = windows.EIO;
     if (earlier_count == 1 && earlier.context == first_native_context) {
         earlier_restored = windows.io_queue_restore(?queue, earlier);

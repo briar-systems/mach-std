@@ -7,6 +7,7 @@ $if ($mach.build.os != $mach.os.linux) {
 
 use std.io.runtime;
 use std.memory;
+use std.memory.table;
 use std.net.async.types;
 use std.net.ip;
 use std.sync.mutex;
@@ -25,6 +26,8 @@ fwd types.NativeCompletion;
 pub rec Operation {
     state:          u8;
     generation:     u32;
+    index:          u32;
+    completion:     types.NativeCompletion;
     kind:           runtime.Kind;
     resource:       usize;
     context:        usize;
@@ -47,6 +50,7 @@ pub rec Operation {
 rec Resource {
     state:        u8;
     generation:   u32;
+    index:        u32;
     resource:     usize;
     read_head:    u32;
     read_tail:    u32;
@@ -59,121 +63,127 @@ rec Resource {
     next_free:    u32;
 }
 
-rec QueuedCompletion {
-    value:           types.NativeCompletion;
-    operation_index: u32;
+pub rec Backend {
+    queue:           *shared.IoQueue;
+    source_id:       u16;
+    operations:      table.Table;
+    resources:       table.Table;
+    ready:           table.Table;
+    resource_map:    *u32;
+    native:          *linux.IoCompletion;
+    operation_slots: usize;
+    resource_slots:  usize;
+    map_capacity:    usize;
+    live:            usize;
+    resource_count:  usize;
+    free_operation:  u32;
+    free_resource:   u32;
+    queued_head:     u32;
+    queued_tail:     u32;
+    queued_count:    usize;
+    ready_count:     usize;
+    sequence:        u64;
+    lock:            mutex.Mutex;
 }
 
-pub rec Backend {
-    queue:          *shared.IoQueue;
-    source_id:      u16;
-    operations:     *Operation;
-    resources:      *Resource;
-    resource_map:   *u32;
-    native:         *linux.IoCompletion;
-    queued:         *QueuedCompletion;
-    ready:          *types.NativeCompletion;
-    capacity:       usize;
-    map_capacity:   usize;
-    live:           usize;
-    resource_count: usize;
-    free_operation: u32;
-    free_resource:  u32;
-    queued_head:    usize;
-    queued_tail:    usize;
-    queued_count:   usize;
-    ready_count:    usize;
-    sequence:       u64;
-    lock:           mutex.Mutex;
+fun operation_at(backend: *Backend, index: usize) *Operation {
+    ret table.at(?backend.operations, index)::*Operation;
+}
+
+fun resource_at(backend: *Backend, index: usize) *Resource {
+    ret table.at(?backend.resources, index)::*Resource;
+}
+
+fun ready_at(backend: *Backend, index: usize) *types.NativeCompletion {
+    ret table.at(?backend.ready, index)::*types.NativeCompletion;
 }
 
 pub fun aliases(backend: *Backend, data: *u8, len: usize) bool {
     if (!memory.range_valid(data, len)) { ret true; }
     if (len == 0)                       { ret false; }
     if (!memory.range_valid(backend::*u8, $size_of(Backend)) ||
-        backend.queue == nil || backend.capacity == 0 ||
+        backend.queue == nil || backend.operations.capacity == 0 ||
         backend.map_capacity == 0) { ret true; }
-    var operation_bytes: usize = 0;
-    var resource_bytes:  usize = 0;
-    var map_bytes:       usize = 0;
-    var native_bytes:    usize = 0;
-    var queued_bytes:    usize = 0;
-    var ready_bytes:     usize = 0;
-    if (!memory.range_scaled(backend.capacity, $size_of(Operation),
-        ?operation_bytes) ||
-        !memory.range_scaled(backend.capacity, $size_of(Resource),
-        ?resource_bytes) ||
-        !memory.range_scaled(backend.map_capacity, $size_of(u32), ?map_bytes) ||
-        !memory.range_scaled(backend.capacity, $size_of(linux.IoCompletion),
-        ?native_bytes) ||
-        !memory.range_scaled(backend.capacity, $size_of(QueuedCompletion),
-        ?queued_bytes) ||
-        !memory.range_scaled(backend.capacity, $size_of(types.NativeCompletion),
-        ?ready_bytes)) { ret true; }
+    var map_bytes:    usize = 0;
+    var native_bytes: usize = 0;
+    if (!memory.range_scaled(backend.map_capacity, $size_of(u32), ?map_bytes) ||
+        !memory.range_scaled(NATIVE_BATCH, $size_of(linux.IoCompletion),
+        ?native_bytes)) { ret true; }
     ret memory.ranges_overlap(backend::*u8, $size_of(Backend), data, len) ||
         memory.ranges_overlap(backend.queue::*u8, $size_of(shared.IoQueue),
         data, len) ||
-        memory.ranges_overlap(backend.operations::*u8, operation_bytes,
-        data, len) ||
-        memory.ranges_overlap(backend.resources::*u8, resource_bytes,
-        data, len) ||
+        table.aliases(?backend.operations, data, len) ||
+        table.aliases(?backend.resources, data, len) ||
+        table.aliases(?backend.ready, data, len) ||
         memory.ranges_overlap(backend.resource_map::*u8, map_bytes,
         data, len) ||
-        memory.ranges_overlap(backend.native::*u8, native_bytes, data, len) ||
-        memory.ranges_overlap(backend.queued::*u8, queued_bytes, data, len) ||
-        memory.ranges_overlap(backend.ready::*u8, ready_bytes, data, len);
+        memory.ranges_overlap(backend.native::*u8, native_bytes, data, len);
 }
 
-val SLOT_FREE:        u8  = 0;
-val SLOT_ACTIVE:      u8  = 1;
-val SLOT_QUEUED:      u8  = 2;
-val RESOURCE_FREE:    u8  = 0;
-val RESOURCE_ACTIVE:  u8  = 1;
-val LANE_NONE:        u8  = 0;
-val LANE_READ:        u8  = 1;
-val LANE_WRITE:       u8  = 2;
-val NONE:             u32 = 0xffffffff;
-val MAP_TOMBSTONE:    u32 = 0xffffffff;
-val IN_PROGRESS:      i64 = -115;
-val MSG_TRUNC:        i32 = 0x20;
-val IP_PKTINFO:       i32 = 8;
-val IPV6_RECVPKTINFO: i32 = 49;
-val IPV6_PKTINFO:     i32 = 50;
+val SLOT_FREE:       u8  = 0;
+val SLOT_ACTIVE:     u8  = 1;
+val SLOT_QUEUED:     u8  = 2;
+val RESOURCE_FREE:   u8  = 0;
+val RESOURCE_ACTIVE: u8  = 1;
+val LANE_NONE:       u8  = 0;
+val LANE_READ:       u8  = 1;
+val LANE_WRITE:      u8  = 2;
+val NONE:            u32 = 0xffffffff;
+# readiness is harvested in fixed batches, so the batch is not a capacity
+val NATIVE_BATCH:     usize = 256;
+val MAP_TOMBSTONE:    u32   = 0xffffffff;
+val IN_PROGRESS:      i64   = -115;
+val MSG_TRUNC:        i32   = 0x20;
+val IP_PKTINFO:       i32   = 8;
+val IPV6_RECVPKTINFO: i32   = 49;
+val IPV6_PKTINFO:     i32   = 50;
 
 fun invalid() i64 {
     ret linux.EINVAL;
 }
 
+# the wire context is a 16-bit source id, a 32-bit resource index and a 16-bit
+# generation. the index is wide enough that memory bounds the table before it
+# does; the generation is what makes a stale completion detectable, and 16 bits
+# means an index must be recycled a multiple of 65535 times between a context
+# being orphaned and arriving for a stale one to pass as live
 fun token_context(backend: *Backend, token: types.Token) usize {
-    ret ((backend.source_id::u64 << 48) | ((token.index::u64 + 1) << 32) | token.generation::u64)::usize;
+    ret ((backend.source_id::u64 << 48) | (token.index::u64 << 16) | token.generation::u64)::usize;
 }
 
 fun context_token(backend: *Backend, context: usize, token: *types.Token) bool {
-    val raw:   u64 = context::u64;
-    val index: u64 = (raw >> 32) & 0xffff;
-    if ((raw >> 48)::u16 != backend.source_id || index == 0 || token == nil) { ret false; }
-    token.index      = (index - 1)::u32;
-    token.generation = raw::u32;
+    val raw: u64 = context::u64;
+    if ((raw >> 48)::u16 != backend.source_id || token == nil) { ret false; }
+    token.index      = ((raw >> 16) & 0xffffffff)::u32;
+    token.generation = (raw & 0xffff)::u32;
     ret token.generation != 0;
 }
 
+# a resource generation stays inside the wire field, so the stored value and the
+# encoded one are the same number and no comparison is made on a truncation
+fun next_wire_generation(current: u32) u32 {
+    val generation: u32 = current + 1;
+    if (generation > 0xffff) { ret 1; }
+    ret generation;
+}
+
 fun operation_for(backend: *Backend, token: types.Token) *Operation {
-    if (token.index::usize >= backend.capacity) { ret nil; }
-    val operation: *Operation = ?backend.operations[token.index::usize];
+    if (token.index::usize >= backend.operation_slots) { ret nil; }
+    val operation: *Operation = operation_at(backend, token.index::usize);
     if (operation.state != SLOT_ACTIVE || operation.generation != token.generation) { ret nil; }
     ret operation;
 }
 
 fun operation_any(backend: *Backend, token: types.Token) *Operation {
-    if (token.index::usize >= backend.capacity) { ret nil; }
-    val operation: *Operation = ?backend.operations[token.index::usize];
+    if (token.index::usize >= backend.operation_slots) { ret nil; }
+    val operation: *Operation = operation_at(backend, token.index::usize);
     if (operation.state == SLOT_FREE || operation.generation != token.generation) { ret nil; }
     ret operation;
 }
 
 fun resource_for(backend: *Backend, token: types.Token) *Resource {
-    if (token.index::usize >= backend.capacity) { ret nil; }
-    val resource: *Resource = ?backend.resources[token.index::usize];
+    if (token.index::usize >= backend.resource_slots) { ret nil; }
+    val resource: *Resource = resource_at(backend, token.index::usize);
     if (resource.state != RESOURCE_ACTIVE || resource.generation != token.generation) { ret nil; }
     ret resource;
 }
@@ -197,7 +207,7 @@ fun resource_lookup(backend: *Backend, resource: usize) *Resource {
         val entry: u32 = backend.resource_map[slot];
         if (entry == 0) { ret nil; }
         if (entry != MAP_TOMBSTONE) {
-            val candidate: *Resource = ?backend.resources[(entry - 1)::usize];
+            val candidate: *Resource = resource_at(backend, (entry - 1)::usize);
             if (candidate.state == RESOURCE_ACTIVE && candidate.resource == resource) { ret candidate; }
         }
         slot    = (slot + 1) & (backend.map_capacity - 1);
@@ -207,7 +217,7 @@ fun resource_lookup(backend: *Backend, resource: usize) *Resource {
 }
 
 fun resource_map_insert(backend: *Backend, index: u32) bool {
-    val resource:  usize = backend.resources[index::usize].resource;
+    val resource:  usize = resource_at(backend, index::usize).resource;
     var slot:      usize = resource_hash(resource) & (backend.map_capacity - 1);
     var tombstone: usize = backend.map_capacity;
     var scanned:   usize = 0;
@@ -230,7 +240,7 @@ fun resource_map_insert(backend: *Backend, index: u32) bool {
 }
 
 fun resource_map_remove(backend: *Backend, index: u32) {
-    val resource: usize = backend.resources[index::usize].resource;
+    val resource: usize = resource_at(backend, index::usize).resource;
     var slot:     usize = resource_hash(resource) & (backend.map_capacity - 1);
     var scanned:  usize = 0;
     for (scanned < backend.map_capacity) {
@@ -245,18 +255,68 @@ fun resource_map_remove(backend: *Backend, index: u32) {
     }
 }
 
+# the map holds indices, so a rehash may move it while every resource stays put
+fun rehash_resources(backend: *Backend) bool {
+    val required: usize = required_map_capacity(backend.resources.capacity);
+    if (required == 0 || required <= backend.map_capacity) { ret required != 0; }
+    var bytes: usize = 0;
+    if (!memory.range_scaled(required, $size_of(u32), ?bytes)) { ret false; }
+    val fresh: *u32 = linux.allocate(bytes)::*u32;
+    if (fresh == nil) { ret false; }
+    val previous:          *u32  = backend.resource_map;
+    val previous_capacity: usize = backend.map_capacity;
+    var i:                 usize = 0;
+    for (i < required) {
+        fresh[i] = 0;
+        i        = i + 1;
+    }
+    backend.resource_map = fresh;
+    backend.map_capacity = required;
+    i                    = 0;
+    for (i < backend.resource_slots) {
+        val resource: *Resource = resource_at(backend, i);
+        if (resource.state == RESOURCE_ACTIVE && !resource_map_insert(backend, i::u32)) {
+            backend.resource_map = previous;
+            backend.map_capacity = previous_capacity;
+            linux.deallocate(fresh::ptr, bytes);
+            ret false;
+        }
+        i = i + 1;
+    }
+    linux.deallocate(previous::ptr, $size_of(u32) * previous_capacity);
+    ret true;
+}
+
+fun resource_append(backend: *Backend) bool {
+    if (backend.resource_slots > 0xffffffff) { ret false; }
+    if (backend.resource_slots == backend.resources.capacity) {
+        if (!table.grow(?backend.resources) || !rehash_resources(backend)) { ret false; }
+    }
+    val index:    usize     = backend.resource_slots;
+    val resource: *Resource = resource_at(backend, index);
+    resource.state         = RESOURCE_FREE;
+    resource.generation    = 0;
+    resource.index         = index::u32;
+    resource.armed         = false;
+    resource.closing       = false;
+    resource.write_closed  = false;
+    resource.next_free     = backend.free_resource;
+    backend.free_resource  = index::u32;
+    backend.resource_slots = index + 1;
+    ret true;
+}
+
 fun resource_acquire(backend: *Backend, native: usize, created: *bool) *Resource {
     val existing: *Resource = resource_lookup(backend, native);
     if (existing != nil) {
         @created = false;
         ret existing;
     }
-    if (backend.free_resource == NONE) { ret nil; }
+    if (backend.free_resource == NONE && !resource_append(backend)) { ret nil; }
     val index:    u32       = backend.free_resource;
-    val resource: *Resource = ?backend.resources[index::usize];
+    val resource: *Resource = resource_at(backend, index::usize);
     backend.free_resource = resource.next_free;
-    var generation: u32 = resource.generation + 1;
-    if (generation == 0) { generation = 1; }
+    val generation: u32 = next_wire_generation(resource.generation);
     resource.state        = RESOURCE_ACTIVE;
     resource.generation   = generation;
     resource.resource     = native;
@@ -280,7 +340,7 @@ fun resource_acquire(backend: *Backend, native: usize, created: *bool) *Resource
 }
 
 fun resource_release_unwatched(backend: *Backend, resource: *Resource) {
-    val index: u32 = ((resource::usize - backend.resources::usize) / $size_of(Resource))::u32;
+    val index: u32 = resource.index;
     resource_map_remove(backend, index);
     resource.state         = RESOURCE_FREE;
     resource.armed         = false;
@@ -295,10 +355,29 @@ fun resource_release(backend: *Backend, resource: *Resource) {
     resource_release_unwatched(backend, resource);
 }
 
+# the ready table is held at the operation table's size, so a finished
+# operation always has somewhere to publish
+fun operation_append(backend: *Backend) bool {
+    if (backend.operation_slots > 0xffffffff) { ret false; }
+    if (backend.operation_slots == backend.operations.capacity &&
+        !table.grow(?backend.operations)) { ret false; }
+    if (!table.reserve(?backend.ready, backend.operations.capacity)) { ret false; }
+    val index:     usize      = backend.operation_slots;
+    val operation: *Operation = operation_at(backend, index);
+    operation.state         = SLOT_FREE;
+    operation.generation    = 0;
+    operation.index         = index::u32;
+    operation.previous      = NONE;
+    operation.next          = backend.free_operation;
+    backend.free_operation  = index::u32;
+    backend.operation_slots = index + 1;
+    ret true;
+}
+
 fun operation_claim(backend: *Backend, kind: runtime.Kind, native: usize, context: usize, token: *types.Token) *Operation {
-    if (backend.live == backend.capacity || backend.free_operation == NONE) { ret nil; }
+    if (backend.free_operation == NONE && !operation_append(backend)) { ret nil; }
     val index:     u32        = backend.free_operation;
-    val operation: *Operation = ?backend.operations[index::usize];
+    val operation: *Operation = operation_at(backend, index::usize);
     backend.free_operation = operation.next;
     var generation: u32 = operation.generation + 1;
     if (generation == 0) { generation = 1; }
@@ -319,19 +398,20 @@ fun operation_claim(backend: *Backend, kind: runtime.Kind, native: usize, contex
 }
 
 fun operation_release(backend: *Backend, index: u32) {
-    val operation: *Operation = ?backend.operations[index::usize];
+    val operation: *Operation = operation_at(backend, index::usize);
     operation.state        = SLOT_FREE;
+    operation.previous     = NONE;
     operation.next         = backend.free_operation;
     backend.free_operation = index;
     backend.live           = backend.live - 1;
 }
 
 fun operation_index(backend: *Backend, operation: *Operation) u32 {
-    ret ((operation::usize - backend.operations::usize) / $size_of(Operation))::u32;
+    ret operation.index;
 }
 
 fun resource_index(backend: *Backend, resource: *Resource) u32 {
-    ret ((resource::usize - backend.resources::usize) / $size_of(Resource))::u32;
+    ret resource.index;
 }
 
 fun enqueue(backend: *Backend, resource: *Resource, operation: *Operation, lane: u8) {
@@ -341,13 +421,13 @@ fun enqueue(backend: *Backend, resource: *Resource, operation: *Operation, lane:
     if (lane == LANE_READ) {
         operation.previous = resource.read_tail;
         if (resource.read_tail == NONE) { resource.read_head = index; }
-        or                              { backend.operations[resource.read_tail::usize].next = index; }
+        or                              { operation_at(backend, resource.read_tail::usize).next = index; }
         resource.read_tail = index;
     }
     or {
         operation.previous = resource.write_tail;
         if (resource.write_tail == NONE) { resource.write_head = index; }
-        or                               { backend.operations[resource.write_tail::usize].next = index; }
+        or                               { operation_at(backend, resource.write_tail::usize).next = index; }
         resource.write_tail = index;
     }
 }
@@ -357,35 +437,52 @@ fun unlink(backend: *Backend, resource: *Resource, operation: *Operation) {
     val next:     u32 = operation.next;
     if (operation.lane == LANE_READ) {
         if (previous == NONE) { resource.read_head = next; }
-        or                    { backend.operations[previous::usize].next = next; }
+        or                    { operation_at(backend, previous::usize).next = next; }
         if (next == NONE)     { resource.read_tail = previous; }
-        or                    { backend.operations[next::usize].previous = previous; }
+        or                    { operation_at(backend, next::usize).previous = previous; }
     }
     or (operation.lane == LANE_WRITE) {
         if (previous == NONE) { resource.write_head = next; }
-        or                    { backend.operations[previous::usize].next = next; }
+        or                    { operation_at(backend, previous::usize).next = next; }
         if (next == NONE)     { resource.write_tail = previous; }
-        or                    { backend.operations[next::usize].previous = previous; }
+        or                    { operation_at(backend, next::usize).previous = previous; }
     }
     operation.previous = NONE;
     operation.next     = NONE;
     operation.lane     = LANE_NONE;
 }
 
+# a finished operation carries its own completion and the queue links them, so
+# the finished queue is never a table that has to be sized
 fun finish(backend: *Backend, resource: *Resource, operation: *Operation, status: i64, bytes: usize, items: usize, native_resource: usize, end_of_stream: bool) {
     unlink(backend, resource, operation);
-    val index: u32 = operation_index(backend, operation);
-    backend.queued[backend.queued_tail].value.context       = operation.context;
-    backend.queued[backend.queued_tail].value.kind          = operation.kind;
-    backend.queued[backend.queued_tail].value.bytes         = bytes;
-    backend.queued[backend.queued_tail].value.items         = items;
-    backend.queued[backend.queued_tail].value.resource      = native_resource;
-    backend.queued[backend.queued_tail].value.status        = status;
-    backend.queued[backend.queued_tail].value.end_of_stream = end_of_stream;
-    backend.queued[backend.queued_tail].operation_index     = index;
-    backend.queued_tail                                     = (backend.queued_tail + 1) % backend.capacity;
-    backend.queued_count                                    = backend.queued_count + 1;
-    operation.state                                         = SLOT_QUEUED;
+    val index: u32 = operation.index;
+    operation.completion.context       = operation.context;
+    operation.completion.kind          = operation.kind;
+    operation.completion.bytes         = bytes;
+    operation.completion.items         = items;
+    operation.completion.resource      = native_resource;
+    operation.completion.status        = status;
+    operation.completion.end_of_stream = end_of_stream;
+    operation.previous                 = backend.queued_tail;
+    operation.next                     = NONE;
+    if (backend.queued_tail == NONE) { backend.queued_head = index; }
+    or                               { operation_at(backend, backend.queued_tail::usize).next = index; }
+    backend.queued_tail  = index;
+    backend.queued_count = backend.queued_count + 1;
+    operation.state      = SLOT_QUEUED;
+}
+
+fun queued_unlink(backend: *Backend, operation: *Operation) {
+    val previous: u32 = operation.previous;
+    val next:     u32 = operation.next;
+    if (previous == NONE) { backend.queued_head = next; }
+    or                    { operation_at(backend, previous::usize).next = next; }
+    if (next == NONE)     { backend.queued_tail = previous; }
+    or                    { operation_at(backend, next::usize).previous = previous; }
+    operation.previous   = NONE;
+    operation.next       = NONE;
+    backend.queued_count = backend.queued_count - 1;
 }
 
 fun would_block(status: i64) bool {
@@ -466,9 +563,9 @@ fun attempt(backend: *Backend, resource: *Resource, operation: *Operation) bool 
 fun fail_resource(backend: *Backend, resource: *Resource, status: i64) {
     for (resource.read_head != NONE || resource.write_head != NONE) {
         var index: u32 = resource.read_head;
-        if (index == NONE)                                                                                                                      { index = resource.write_head; }
-        or (resource.write_head != NONE && backend.operations[resource.write_head::usize].sequence < backend.operations[index::usize].sequence) { index = resource.write_head; }
-        val operation: *Operation = ?backend.operations[index::usize];
+        if (index == NONE)                                                                                                                            { index = resource.write_head; }
+        or (resource.write_head != NONE && operation_at(backend, resource.write_head::usize).sequence < operation_at(backend, index::usize).sequence) { index = resource.write_head; }
+        val operation: *Operation = operation_at(backend, index::usize);
         finish(backend, resource, operation, status, 0, 0, operation.resource, false);
     }
 }
@@ -481,7 +578,7 @@ fun arm_resource(backend: *Backend, resource: *Resource) {
         linux.io_queue_unwatch(backend.queue, resource.resource);
         resource.armed = false;
         if (resource.close_index != NONE) {
-            val close_operation: *Operation = ?backend.operations[resource.close_index::usize];
+            val close_operation: *Operation = operation_at(backend, resource.close_index::usize);
             resource.close_index = NONE;
             val closed: i64 = socket_close(resource.resource);
             finish(backend, resource, close_operation, closed, 0, 0, resource.resource, false);
@@ -489,14 +586,14 @@ fun arm_resource(backend: *Backend, resource: *Resource) {
         resource_release_unwatched(backend, resource);
         ret;
     }
-    val token:  types.Token = types.Token{index: resource_index(backend, resource), generation: resource.generation};
+    val token:  types.Token = types.Token{index: resource.index, generation: resource.generation};
     val status: i64         = linux.io_queue_watch(backend.queue, resource.resource, token_context(backend, token), events);
     if (status < 0) {
         fail_resource(backend, resource, status);
         linux.io_queue_unwatch(backend.queue, resource.resource);
         resource.armed = false;
         if (resource.close_index != NONE) {
-            val close_operation: *Operation = ?backend.operations[resource.close_index::usize];
+            val close_operation: *Operation = operation_at(backend, resource.close_index::usize);
             resource.close_index = NONE;
             val closed: i64 = socket_close(resource.resource);
             finish(backend, resource, close_operation, closed, 0, 0, resource.resource, false);
@@ -512,13 +609,13 @@ fun drive_resource(backend: *Backend, resource: *Resource, events: u32) {
     if ((events & linux.IO_EVENT_READ) != 0 || failure) {
         var progress: bool = true;
         for (progress && resource.read_head != NONE) {
-            progress = attempt(backend, resource, ?backend.operations[resource.read_head::usize]);
+            progress = attempt(backend, resource, operation_at(backend, resource.read_head::usize));
         }
     }
     if ((events & linux.IO_EVENT_WRITE) != 0 || failure) {
         var progress: bool = true;
         for (progress && resource.write_head != NONE) {
-            progress = attempt(backend, resource, ?backend.operations[resource.write_head::usize]);
+            progress = attempt(backend, resource, operation_at(backend, resource.write_head::usize));
         }
     }
     arm_resource(backend, resource);
@@ -567,89 +664,58 @@ fun submission_done(backend: *Backend, resource: *Resource) {
     linux.io_queue_wake(backend.queue);
 }
 
-pub fun make(backend: *Backend, queue: *shared.IoQueue, capacity: usize, source_id: u16) i64 {
-    if (backend == nil || queue == nil || capacity == 0 || capacity > 0xffff || source_id == 0) { ret invalid(); }
-    val map_capacity: usize = required_map_capacity(capacity);
+# initial is the size the backend starts at: the operation, resource and ready
+# tables grow on demand and the resource map rehashes with them
+pub fun make(backend: *Backend, queue: *shared.IoQueue, initial: usize, source_id: u16) i64 {
+    if (backend == nil || queue == nil || initial == 0 || source_id == 0) { ret invalid(); }
+    val map_capacity: usize = required_map_capacity(initial);
     if (map_capacity == 0) { ret linux.ENOMEM; }
-    val operation_size:  usize = $size_of(Operation);
-    val resource_size:   usize = $size_of(Resource);
-    val map_size:        usize = $size_of(u32);
-    val native_size:     usize = $size_of(linux.IoCompletion);
-    val queued_size:     usize = $size_of(QueuedCompletion);
-    val ready_size:      usize = $size_of(types.NativeCompletion);
-    val operation_bytes: usize = operation_size * capacity;
-    val resource_bytes:  usize = resource_size * capacity;
-    val map_bytes:       usize = map_size * map_capacity;
-    val native_bytes:    usize = native_size * capacity;
-    val queued_bytes:    usize = queued_size * capacity;
-    val ready_bytes:     usize = ready_size * capacity;
-    if (operation_bytes / operation_size != capacity || resource_bytes / resource_size != capacity || map_bytes / map_size != map_capacity || native_bytes / native_size != capacity || queued_bytes / queued_size != capacity || ready_bytes / ready_size != capacity) { ret linux.ENOMEM; }
+    var map_bytes:    usize = 0;
+    var native_bytes: usize = 0;
+    if (!memory.range_scaled(map_capacity, $size_of(u32), ?map_bytes) ||
+        !memory.range_scaled(NATIVE_BATCH, $size_of(linux.IoCompletion), ?native_bytes)) { ret linux.ENOMEM; }
 
-    backend.operations = linux.allocate(operation_bytes)::*Operation;
-    if (backend.operations == nil) { ret linux.ENOMEM; }
-    backend.resources = linux.allocate(resource_bytes)::*Resource;
-    if (backend.resources == nil) {
-        linux.deallocate(backend.operations::ptr, operation_bytes);
-        backend.operations = nil;
+    if (!table.make(?backend.operations, $size_of(Operation), initial)) { ret linux.ENOMEM; }
+    if (!table.make(?backend.resources, $size_of(Resource), initial) ||
+        !table.make(?backend.ready, $size_of(types.NativeCompletion), initial)) {
+        table.destroy(?backend.ready);
+        table.destroy(?backend.resources);
+        table.destroy(?backend.operations);
         ret linux.ENOMEM;
     }
     backend.resource_map = linux.allocate(map_bytes)::*u32;
     if (backend.resource_map == nil) {
-        linux.deallocate(backend.resources::ptr, resource_bytes);
-        linux.deallocate(backend.operations::ptr, operation_bytes);
+        table.destroy(?backend.ready);
+        table.destroy(?backend.resources);
+        table.destroy(?backend.operations);
         ret linux.ENOMEM;
     }
     backend.native = linux.allocate(native_bytes)::*linux.IoCompletion;
     if (backend.native == nil) {
         linux.deallocate(backend.resource_map::ptr, map_bytes);
-        linux.deallocate(backend.resources::ptr, resource_bytes);
-        linux.deallocate(backend.operations::ptr, operation_bytes);
+        backend.resource_map = nil;
+        table.destroy(?backend.ready);
+        table.destroy(?backend.resources);
+        table.destroy(?backend.operations);
         ret linux.ENOMEM;
     }
-    backend.queued = linux.allocate(queued_bytes)::*QueuedCompletion;
-    if (backend.queued == nil) {
-        linux.deallocate(backend.native::ptr, native_bytes);
-        linux.deallocate(backend.resource_map::ptr, map_bytes);
-        linux.deallocate(backend.resources::ptr, resource_bytes);
-        linux.deallocate(backend.operations::ptr, operation_bytes);
-        ret linux.ENOMEM;
-    }
-    backend.ready = linux.allocate(ready_bytes)::*types.NativeCompletion;
-    if (backend.ready == nil) {
-        linux.deallocate(backend.queued::ptr, queued_bytes);
-        linux.deallocate(backend.native::ptr, native_bytes);
-        linux.deallocate(backend.resource_map::ptr, map_bytes);
-        linux.deallocate(backend.resources::ptr, resource_bytes);
-        linux.deallocate(backend.operations::ptr, operation_bytes);
-        ret linux.ENOMEM;
-    }
-    backend.queue          = queue;
-    backend.source_id      = source_id;
-    backend.capacity       = capacity;
-    backend.map_capacity   = map_capacity;
-    backend.live           = 0;
-    backend.resource_count = 0;
-    backend.free_operation = 0;
-    backend.free_resource  = 0;
-    backend.queued_head    = 0;
-    backend.queued_tail    = 0;
-    backend.queued_count   = 0;
-    backend.ready_count    = 0;
-    backend.sequence       = 1;
-    backend.lock           = mutex.make();
+
+    backend.queue           = queue;
+    backend.source_id       = source_id;
+    backend.map_capacity    = map_capacity;
+    backend.operation_slots = 0;
+    backend.resource_slots  = 0;
+    backend.live            = 0;
+    backend.resource_count  = 0;
+    backend.free_operation  = NONE;
+    backend.free_resource   = NONE;
+    backend.queued_head     = NONE;
+    backend.queued_tail     = NONE;
+    backend.queued_count    = 0;
+    backend.ready_count     = 0;
+    backend.sequence        = 1;
+    backend.lock            = mutex.make();
     var i: usize = 0;
-    for (i < capacity) {
-        backend.operations[i].state      = SLOT_FREE;
-        backend.operations[i].generation = 0;
-        backend.operations[i].next       = (i + 1)::u32;
-        backend.resources[i].state       = RESOURCE_FREE;
-        backend.resources[i].generation  = 0;
-        backend.resources[i].next_free   = (i + 1)::u32;
-        i                                = i + 1;
-    }
-    backend.operations[capacity - 1].next     = NONE;
-    backend.resources[capacity - 1].next_free = NONE;
-    i                                         = 0;
     for (i < map_capacity) {
         backend.resource_map[i] = 0;
         i                       = i + 1;
@@ -796,7 +862,7 @@ pub fun submit_close(backend: *Backend, native: usize, context: usize, token: *t
     resource.closing     = true;
     resource.close_index = operation_index(backend, operation);
     for (resource.read_head != NONE) {
-        val read_operation: *Operation = ?backend.operations[resource.read_head::usize];
+        val read_operation: *Operation = operation_at(backend, resource.read_head::usize);
         finish(backend, resource, read_operation, linux.ECANCELED, 0, 0, native, false);
     }
     submission_done(backend, resource);
@@ -812,37 +878,15 @@ pub fun cancel(backend: *Backend, token: types.Token) i64 {
         ret linux.EBADF;
     }
     if (operation.state == SLOT_QUEUED) {
-        var offset:  usize = 0;
-        var found:   bool  = false;
-        var removed: types.NativeCompletion;
-        for (offset < backend.queued_count && !found) {
-            val position: usize = (backend.queued_head + offset) % backend.capacity;
-            if (backend.queued[position].operation_index == token.index) {
-                removed = backend.queued[position].value;
-                var current: usize = offset;
-                for (current + 1 < backend.queued_count) {
-                    val from: usize = (backend.queued_head + current + 1) % backend.capacity;
-                    val to:   usize = (backend.queued_head + current) % backend.capacity;
-                    backend.queued[to] = backend.queued[from];
-                    current            = current + 1;
-                }
-                backend.queued_tail  = (backend.queued_tail + backend.capacity - 1) % backend.capacity;
-                backend.queued_count = backend.queued_count - 1;
-                found                = true;
-            }
-            offset = offset + 1;
-        }
-        if (!found) {
-            mutex.unlock(?backend.lock);
-            ret linux.EBADF;
-        }
+        val removed: types.NativeCompletion = operation.completion;
+        queued_unlink(backend, operation);
         operation_release(backend, token.index);
         mutex.unlock(?backend.lock);
         if (removed.kind == runtime.ACCEPT && removed.status == 0) { socket_close(removed.resource); }
         linux.io_queue_wake(backend.queue);
         ret 0;
     }
-    val resource: *Resource = ?backend.resources[operation.resource_index::usize];
+    val resource: *Resource = resource_at(backend, operation.resource_index::usize);
     if (operation.kind == runtime.CLOSE) {
         resource.close_index = NONE;
         unlink(backend, resource, operation);
@@ -867,12 +911,12 @@ pub fun cancel(backend: *Backend, token: types.Token) i64 {
 fun publish_ready(backend: *Backend) usize {
     var count: usize = 0;
     for (backend.queued_count > 0) {
-        val queued: QueuedCompletion = backend.queued[backend.queued_head];
-        backend.ready[count] = queued.value;
-        operation_release(backend, queued.operation_index);
-        backend.queued_head  = (backend.queued_head + 1) % backend.capacity;
-        backend.queued_count = backend.queued_count - 1;
-        count                = count + 1;
+        val index:     u32        = backend.queued_head;
+        val operation: *Operation = operation_at(backend, index::usize);
+        @ready_at(backend, count) = operation.completion;
+        queued_unlink(backend, operation);
+        operation_release(backend, index);
+        count = count + 1;
     }
     backend.ready_count = count;
     ret count;
@@ -920,7 +964,7 @@ pub fun poll(backend: *Backend, timeout_ms: i32) i64 {
 
     var native_timeout: i32 = timeout_ms;
     if (already_ready) { native_timeout = 0; }
-    val count: i64 = linux.io_queue_poll(backend.queue, backend.native, backend.capacity, native_timeout);
+    val count: i64 = linux.io_queue_poll(backend.queue, backend.native, NATIVE_BATCH, native_timeout);
     mutex.lock(?backend.lock);
     var i: usize = 0;
     if (count > 0) {
@@ -947,7 +991,7 @@ pub fun poll(backend: *Backend, timeout_ms: i32) i64 {
 
 pub fun completion(backend: *Backend, index: usize, out: *types.NativeCompletion) i64 {
     if (backend == nil || out == nil || index >= backend.ready_count) { ret invalid(); }
-    @out = backend.ready[index];
+    @out = @ready_at(backend, index);
     ret 0;
 }
 
@@ -958,28 +1002,22 @@ pub fun destroy(backend: *Backend) i64 {
         mutex.unlock(?backend.lock);
         ret linux.EBUSY;
     }
-    val operation_bytes: usize = $size_of(Operation) * backend.capacity;
-    val resource_bytes:  usize = $size_of(Resource) * backend.capacity;
-    val map_bytes:       usize = $size_of(u32) * backend.map_capacity;
-    val native_bytes:    usize = $size_of(linux.IoCompletion) * backend.capacity;
-    val queued_bytes:    usize = $size_of(QueuedCompletion) * backend.capacity;
-    val ready_bytes:     usize = $size_of(types.NativeCompletion) * backend.capacity;
-    linux.deallocate(backend.ready::ptr, ready_bytes);
-    linux.deallocate(backend.queued::ptr, queued_bytes);
+    val map_bytes:    usize = $size_of(u32) * backend.map_capacity;
+    val native_bytes: usize = $size_of(linux.IoCompletion) * NATIVE_BATCH;
     linux.deallocate(backend.native::ptr, native_bytes);
     linux.deallocate(backend.resource_map::ptr, map_bytes);
-    linux.deallocate(backend.resources::ptr, resource_bytes);
-    linux.deallocate(backend.operations::ptr, operation_bytes);
-    backend.ready        = nil;
-    backend.queued       = nil;
-    backend.native       = nil;
-    backend.resource_map = nil;
-    backend.resources    = nil;
-    backend.operations   = nil;
-    backend.capacity     = 0;
-    backend.map_capacity = 0;
-    backend.ready_count  = 0;
-    backend.queue        = nil;
+    table.destroy(?backend.ready);
+    table.destroy(?backend.resources);
+    table.destroy(?backend.operations);
+    backend.native          = nil;
+    backend.resource_map    = nil;
+    backend.operation_slots = 0;
+    backend.resource_slots  = 0;
+    backend.map_capacity    = 0;
+    backend.ready_count     = 0;
+    backend.queued_head     = NONE;
+    backend.queued_tail     = NONE;
+    backend.queue           = nil;
     mutex.unlock(?backend.lock);
     ret 0;
 }
@@ -1564,7 +1602,47 @@ test "async linux: reset completes a pending read once" {
     ret 0;
 }
 
-test "async linux: timeout cancellation releases saturated storage" {
+# the old encoding packed the index into 16 bits and make refused past 65535
+test "async linux: a resource index past the old bound survives the wire" {
+    var queue: shared.IoQueue;
+    if (linux.io_queue_create(?queue) < 0) { ret 1; }
+    var backend: Backend;
+    if (make(?backend, ?queue, 1, 7) < 0) {
+        linux.io_queue_close(?queue);
+        ret 2;
+    }
+    var appended: usize = 0;
+    for (appended < 70000) {
+        if (!resource_append(?backend)) {
+            destroy(?backend);
+            linux.io_queue_close(?queue);
+            ret 3;
+        }
+        appended = appended + 1;
+    }
+    val first:   *Resource   = resource_at(?backend, 0);
+    val high:    types.Token = types.Token{index: 69999, generation: 0xffff};
+    var round:   types.Token;
+    val encoded: usize       = token_context(?backend, high);
+    val decoded: bool        = context_token(?backend, encoded, ?round);
+    val foreign: usize       = ((encoded::u64) ^ (1::u64 << 48))::usize;
+    var ignored: types.Token;
+    val zero:    usize       = token_context(?backend, types.Token{index: 69999, generation: 0});
+    val valid:   bool        = backend.resource_slots == 70000 &&
+        decoded && round.index == 69999 && round.generation == 0xffff &&
+        !context_token(?backend, foreign, ?ignored) &&
+        !context_token(?backend, zero, ?ignored) &&
+        next_wire_generation(0xffff) == 1 &&
+        next_wire_generation(1) == 2 &&
+        resource_at(?backend, 0) == first &&
+        resource_at(?backend, 69999).index == 69999;
+    val destroyed: i64 = destroy(?backend);
+    linux.io_queue_close(?queue);
+    if (!valid || destroyed < 0) { ret 4; }
+    ret 0;
+}
+
+test "async linux: storage grows past the initial size and recycles" {
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
@@ -1599,20 +1677,26 @@ test "async linux: timeout cancellation releases saturated storage" {
     storage[0] = 0xa1;
     storage[1] = 0xb2;
     storage[2] = 0xc3;
-    var tokens:             [3]types.Token;
-    val first:              i64  = submit_read(?backend, server, ?storage[0], 1, 89, ?tokens[0]);
-    val second:             i64  = submit_read(?backend, server, ?storage[1], 1, 90, ?tokens[1]);
-    val timed_out:          i64  = poll(?backend, 5);
-    val saturated:          i64  = submit_read(?backend, server, ?storage[2], 1, 91, ?tokens[2]);
-    val cancel_first:       i64  = cancel(?backend, tokens[0]);
-    val replacement:        i64  = submit_read(?backend, server, ?storage[2], 1, 92, ?tokens[2]);
-    val generation_changed: bool = tokens[2].index == tokens[0].index && tokens[2].generation != tokens[0].generation;
-    val cancel_second:      i64  = cancel(?backend, tokens[1]);
-    val cancel_replacement: i64  = cancel(?backend, tokens[2]);
-    var byte:               u8   = 'x';
-    val sent:               i64  = linux.sock_send(client, ?byte, 1);
-    val after:              i64  = poll(?backend, 0);
-    val valid:              bool = first == 0 && second == 0 && timed_out == 0 && saturated == linux.ENOMEM && cancel_first == 0 && replacement == 0 && generation_changed && cancel_second == 0 && cancel_replacement == 0 && sent == 1 && after == 0 && storage[0] == 0xa1 && storage[1] == 0xb2 && storage[2] == 0xc3 && backend.live == 0 && backend.resource_count == 0;
+    var tokens:    [3]types.Token;
+    val first:     i64 = submit_read(?backend, server, ?storage[0], 1, 89, ?tokens[0]);
+    val second:    i64 = submit_read(?backend, server, ?storage[1], 1, 90, ?tokens[1]);
+    val timed_out: i64 = poll(?backend, 5);
+    # the third operation is past the initial size and grows the table
+    val grown:              i64        = submit_read(?backend, server, ?storage[2], 1, 91, ?tokens[2]);
+    val grew:               bool       = backend.operations.capacity == 4 && tokens[2].index == 2;
+    val held:               *Operation = operation_at(?backend, tokens[0].index::usize);
+    val cancel_first:       i64        = cancel(?backend, tokens[0]);
+    var reused:             types.Token;
+    val replacement:        i64        = submit_read(?backend, server, ?storage[2], 1, 92, ?reused);
+    val generation_changed: bool       = reused.index == tokens[0].index && reused.generation != tokens[0].generation;
+    val stable:             bool       = operation_at(?backend, tokens[0].index::usize) == held;
+    val cancel_second:      i64        = cancel(?backend, tokens[1]);
+    val cancel_third:       i64        = cancel(?backend, tokens[2]);
+    val cancel_replacement: i64        = cancel(?backend, reused);
+    var byte:               u8         = 'x';
+    val sent:               i64        = linux.sock_send(client, ?byte, 1);
+    val after:              i64        = poll(?backend, 0);
+    val valid:              bool       = first == 0 && second == 0 && timed_out == 0 && grown == 0 && grew && stable && cancel_first == 0 && replacement == 0 && generation_changed && cancel_second == 0 && cancel_third == 0 && cancel_replacement == 0 && sent == 1 && after == 0 && storage[0] == 0xa1 && storage[1] == 0xb2 && storage[2] == 0xc3 && backend.live == 0 && backend.resource_count == 0;
     linux.sock_close(server);
     linux.sock_close(client);
     linux.sock_close(listener);
@@ -1780,7 +1864,7 @@ test "async linux: queued accept cancellation closes handle" {
     var token:     types.Token;
     val submitted: i64   = submit_accept(?backend, listener, ?peer, 44, ?token);
     var accepted:  usize = (-1)::usize;
-    if (submitted == 0 && backend.queued_count == 1) { accepted = backend.queued[backend.queued_head].value.resource; }
+    if (submitted == 0 && backend.queued_count == 1) { accepted = operation_at(?backend, backend.queued_head::usize).completion.resource; }
     val cancelled: i64  = cancel(?backend, token);
     val closed:    i64  = linux.sock_close(accepted);
     val valid:     bool = submitted == 0 && cancelled == 0 && accepted != (-1)::usize && closed == linux.EBADF && backend.live == 0 && backend.queued_count == 0 && backend.resource_count == 0;
