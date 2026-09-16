@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.1] - 2026-09-16
+
+### Fixed
+- The native suite is green again on every platform, which is what failed the
+  3.0.0 release workflow and left 3.0.0 unpublished. The local-socket and
+  Windows accept tests still asserted that a third submission against a runtime
+  or backend made at two is refused. #653 made that size initial, so the tests
+  now assert that the submission grows the table and that every operation
+  settles exactly once. The net.async accept, fairness and batching tests
+  assumed that loopback bytes and handshakes are readable as soon as the send
+  returns, and that a `wait` after a submission never comes back empty. darwin
+  delivers loopback asynchronously, and a consumed submission wake ends a
+  `wait`. The tests now tolerate both, and the fairness and batching tests
+  still fail against the pre-#658 `wait` (#673). No library code changed.
+
 ## [3.0.0] - 2026-09-16
 
 ### Added
