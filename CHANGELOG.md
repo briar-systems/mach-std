@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A spawned child whose redirected stream is the descriptor it already is, such
+  as `stdout_fd = 1` or `stderr_fd = 2`, now runs. On linux aarch64 and riscv64
+  the redirect used `dup3`, which refuses a descriptor onto itself, so the child
+  exited 126 before exec. On every linux arch and on darwin, such a stream now
+  also survives exec when it was close-on-exec: the redirect clears the flag
+  instead of duplicating, where `dup2` onto itself used to leave it set. Windows
+  hands handles to the child without duplicating them and was not affected
+  (#722).
+
 ### Added
 - `std.system.capability`: comptime flags for the OS capability groups a
   target provides, `HOSTED`, `HAS_PAGES`, `HAS_CLOCK`, `HAS_ENTROPY`,
