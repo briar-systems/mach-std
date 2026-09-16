@@ -16,6 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flag is set on linux, darwin and windows, and none is set on any other target
   (#685).
 
+### Changed
+- Core modules keep their test-only code, and the test-only imports of
+  `std.allocator.page`, `std.allocator.testing` and `std.system.os`, behind
+  `std.system.capability.HOSTED`, so importing them no longer pulls in the OS
+  layer. `io.error.from_code` and `io.error.message`, and
+  `std.terminal.error`'s `control_failure` and `read_failure`, exist only where
+  the OS layer does. Nothing changes on linux, darwin or windows. 57 modules
+  now build for a freestanding target, up from 37: the collections, compress,
+  `data.json`, `data.toml`, `derive`, `encoding.binary`, `format`, `io.error`,
+  `io.reader`, `io.writer`, `terminal.error`, `types.semver` and
+  `allocator.arena` (#686).
+
 ## [3.2.0] - 2026-09-16
 
 ### Added
