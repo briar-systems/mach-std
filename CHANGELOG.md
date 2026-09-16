@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-09-16
+
 ### Added
 - `io.runtime.wait`'s batching is now covered by a test: one call may return a
   completion that was already queued together with one its own native collect
