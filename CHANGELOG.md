@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `std.allocator.heap`: a general-purpose size-class heap that reuses freed blocks and is safe to share between threads (#657). Small requests are carved from per-class spans with a free list per span, spans return to a cache every class draws from, and larger requests get a span of their own. Alignment is honored for every request, a resize stays in place while the block still fits and still uses half of it, and releasing a pointer the heap never handed out is refused with `-22` as `allocator.Error.release`. Backing memory comes from a `heap.Source`, with a native mapper member, an `Allocator`-backed member, and support for a grow-only source that can never return memory. No existing consumer's allocator changed.
+
 ## [2.1.0] - 2026-09-13
 
 ### Added
