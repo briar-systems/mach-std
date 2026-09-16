@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.1] - 2026-09-16
+
 ### Fixed
 - The native suite is green again on every platform, which is what failed the
   3.0.0 release workflow and left 3.0.0 unpublished. The local-socket and
