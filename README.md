@@ -132,6 +132,61 @@ The `^` qualifier enforces secret data flow. These primitives do not lock pages,
 exclude them from swap or process dumps, isolate them across process creation,
 add guard pages, or resist a debugger with process access.
 
+### The size-class heap
+
+`std.allocator.heap` is the general-purpose allocator: it reuses freed blocks,
+it is safe to share between threads, and it satisfies the `std.allocator`
+interface, so it drops in wherever an `Allocator` is taken. It is an addition.
+No existing consumer's allocator changed; a caller gets the heap only by asking
+for it.
+
+```mach
+var src: heap.Source;
+var h:   heap.Heap;
+var a:   allocator.Allocator;
+
+heap.native_source(?src);
+heap.init(?h, ?src, 0);
+heap.make(?a, ?h);
+```
+
+Requests up to `heap.MAX_SMALL` (8 KiB) are rounded to one of 32 size classes
+and carved from a 64 KiB span serving that one class. Each span owns the free
+list of its own blocks, so allocation is a pop and release is a push, and a
+span that runs empty returns to a cache every class draws from, which is what
+lets one class hand memory to another. A request above the class ceiling gets a
+span of its own, sized to the request rather than rounded to a class.
+
+Alignment is honored for every request. A small request whose alignment exceeds
+16 bytes is served by the first class that is a multiple of it, and a request
+aligned beyond a span is placed by address inside a span of its own. A resize
+stays in place while the block still holds the request and still uses half of
+it, and otherwise moves to the right class and copies the overlap; a growth
+past the block's class and a shrink that frees at least half both move.
+
+`heap.zallocate_raw` skips the zeroing pass for a block carved from a region
+the source delivered zero-filled, and zeroes anything reused.
+
+The backing memory comes from a `heap.Source`, a two-call contract of
+`fn_obtain` and `fn_release`. `heap.native_source` maps and unmaps through the
+platform mapper; `heap.allocator_source` draws spans from another `Allocator`.
+A source that cannot return memory, such as a `memory.grow` host, leaves
+`fn_release` nil, and the heap then retains every span for reuse rather than
+releasing it. `init` takes a byte budget for retained empty spans, and a heap
+over a source that cannot release holds them past that budget because there is
+nowhere else for them to go.
+
+The span header, not the caller's arguments, is the authority on a block's
+class. A `size` argument larger than the block's class is a contract violation
+and is refused. Releasing a pointer this heap never handed out is refused with
+`-22` (`EINVAL`) carried as `allocator.Error.release`: the heap checks that the
+address is a block start of a span this heap owns, so a pointer from another
+heap, an interior address, or a span header is rejected without disturbing the
+heap. This is detection, not a guarantee. A pointer from an unrelated mapping
+can fault when the heap probes for a span header, exactly as passing a foreign
+pointer to any allocator may. `heap.check` walks every span and verifies the
+heap's own invariants for a caller that suspects corruption.
+
 ## Contributing
 
 Contributions are welcome! If you find a bug or have a feature request, please open an issue on GitHub. If you'd like to contribute code, please fork the repository and submit a pull request.

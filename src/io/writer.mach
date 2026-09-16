@@ -129,6 +129,153 @@ pub fun write_str(w: *Writer, s: str) err[WriteError] {
     ret write_all(w, s, str_len(s));
 }
 
+# a writer that stages bytes in a caller-provided buffer
+#
+# ctx for a Writer whose sink batches into `buf` and forwards full buffers to
+# `inner`. the caller owns the storage and the flush: nothing leaves the
+# buffer until it fills, a request at least as large as the capacity goes
+# straight through, or flush() is called.
+#
+# accounting. a byte count returned by the staging sink is provisional: the
+# bytes are in the buffer, not at the inner writer. `pushed` is the
+# authoritative count of bytes the inner writer took over this buffer's life,
+# and a caller that must report a true total reads it after flush(). the
+# staging sink still reports a per-call prefix the way an unbuffered sink
+# does, measured against the bytes it had already handed back, so a failure
+# that loses only bytes from the current call is exact; a failure that loses
+# bytes acknowledged by an earlier call cannot be spelled as a negative prefix
+# and reports zero, which is why `pushed` exists.
+#
+# a failure is sticky. the first refusal from the inner writer is retained,
+# every later staging call and flush() replays it with a zero prefix, and the
+# staged bytes are dropped, so a caller driving a long format stops at the
+# failure instead of formatting into a buffer that will never reach the sink.
+# ---
+# inner:  the writer full buffers are forwarded to
+# buf:    caller-owned staging storage
+# cap:    capacity of buf in bytes
+# len:    bytes currently staged
+# taken:  bytes the staging sink has handed back as accepted
+# pushed: bytes the inner writer has persisted over this buffer's life
+# failed: true once the inner writer has refused
+# error:  the first refusal, retained for replay
+pub rec Buffered {
+    inner:  *Writer;
+    buf:    *u8;
+    cap:    usize;
+    len:    usize;
+    taken:  usize;
+    pushed: usize;
+    failed: bool;
+    error:  WriteError;
+}
+
+# the same failure with its persisted prefix replaced
+pub fun reprefix(error: WriteError, written: usize) WriteError {
+    if (sel error.stalled)     { ret WriteError.stalled{written}; }
+    if (sel error.would_block) { ret WriteError.would_block{written}; }
+    if (sel error.native)      { ret native_failure(written, error.native.error); }
+    ret error;
+}
+
+# hand the staged bytes to the inner writer, retaining a refusal
+fun push(b: *Buffered) bool {
+    if (b.len == 0) { ret true; }
+    val staged: usize           = b.len;
+    val done:   err[WriteError] = write_all(b.inner, b.buf, staged);
+    b.len = 0;
+    if (sel done.err) {
+        b.pushed = b.pushed + persisted(done.err);
+        b.failed = true;
+        b.error  = reprefix(done.err, 0);
+        ret false;
+    }
+    b.pushed = b.pushed + staged;
+    ret true;
+}
+
+# the prefix of the current call the inner writer ended up taking
+fun call_prefix(b: *Buffered, base: usize) usize {
+    if (b.pushed > base) { ret b.pushed - base; }
+    ret 0;
+}
+
+fun buffered_write(ctx: ptr, p: *u8, n: usize) res[usize, WriteError] {
+    val b: *Buffered = ctx::*Buffered;
+    if (b.failed) { ret res[usize, WriteError].err{reprefix(b.error, 0)}; }
+
+    val base: usize = b.taken;
+    var off:  usize = 0;
+    for (off < n) {
+        if (b.len == b.cap) {
+            if (!push(b)) { ret res[usize, WriteError].err{reprefix(b.error, call_prefix(b, base))}; }
+        }
+        # a remainder at least as large as the buffer would only be copied to be
+        # pushed whole, so it goes straight through
+        if (b.len == 0 && n - off >= b.cap) {
+            val bulk: usize           = n - off;
+            val done: err[WriteError] = write_all(b.inner, ?p[off], bulk);
+            if (sel done.err) {
+                b.pushed = b.pushed + persisted(done.err);
+                b.failed = true;
+                b.error  = reprefix(done.err, 0);
+                ret res[usize, WriteError].err{reprefix(b.error, call_prefix(b, base))};
+            }
+            b.pushed = b.pushed + bulk;
+            off      = n;
+            cnt;
+        }
+        var take: usize = n - off;
+        val room: usize = b.cap - b.len;
+        if (take > room) { take = room; }
+        var i: usize = 0;
+        for (i < take) {
+            b.buf[b.len + i] = p[off + i];
+            i                = i + 1;
+        }
+        b.len = b.len + take;
+        off   = off + take;
+    }
+    b.taken = b.taken + n;
+    ret res[usize, WriteError].ok{n};
+}
+
+# wire a buffered writer over inner
+# ---
+# b:     buffer state, owned by the caller for the writer's whole life
+# inner: writer full buffers are forwarded to
+# buf:   staging storage, owned by the caller
+# cap:   capacity of buf in bytes; zero degrades to an unbuffered passthrough
+# ret:   a Writer staging into b
+pub fun buffered(b: *Buffered, inner: *Writer, buf: *u8, cap: usize) Writer {
+    b.inner  = inner;
+    b.buf    = buf;
+    b.cap    = cap;
+    b.len    = 0;
+    b.taken  = 0;
+    b.pushed = 0;
+    b.failed = false;
+    b.error  = WriteError.stalled{0};
+    ret Writer{ctx: b::ptr, f_write: buffered_write};
+}
+
+# hand every staged byte to the inner writer
+# ---
+# b:   buffer to drain
+# ret: the refusal with the prefix of the staged bytes it took, or ok
+pub fun flush(b: *Buffered) err[WriteError] {
+    if (b.failed)   { ret err[WriteError].err{reprefix(b.error, 0)}; }
+    if (b.len == 0) { ret err[WriteError].ok{}; }
+    val before: usize = b.pushed;
+    if (!push(b)) { ret err[WriteError].err{reprefix(b.error, b.pushed - before)}; }
+    ret err[WriteError].ok{};
+}
+
+# bytes the inner writer has taken over this buffer's life
+pub fun pushed(b: *Buffered) usize {
+    ret b.pushed;
+}
+
 # a sink over a byte range that accepts at most `step` bytes per call and can
 # be scripted to stall or fail once `fail_after` bytes are persisted
 rec MemSink {
@@ -280,5 +427,150 @@ test "io.writer.write_str: the terminator is not written" {
     val empty: err[WriteError] = write_str(?w, "");
     if (!sel empty.ok) { ret 2; }
     if (m.calls != 1)  { ret 2; }
+    ret 0;
+}
+
+test "io.writer.buffered: bytes stage until the buffer fills" {
+    var out:   [32]u8;
+    var m:     MemSink;
+    var inner: Writer = mem_sink(?m, ?out[0], 32, 64);
+    var stage: [4]u8;
+    var b:     Buffered;
+    var bw:    Writer = buffered(?b, ?inner, ?stage[0], 4);
+
+    val first: err[WriteError] = write_all(?bw, "abc", 3);
+    if (!sel first.ok)   { ret 1; }
+    if (m.calls != 0)    { ret 1; }
+    if (pushed(?b) != 0) { ret 1; }
+
+    # "def" fills the buffer at 'd' and pushes "abcd", staging "ef"
+    val second: err[WriteError] = write_all(?bw, "def", 3);
+    if (!sel second.ok)                   { ret 2; }
+    if (m.calls != 1)                     { ret 2; }
+    if (m.len != 4)                       { ret 2; }
+    if (pushed(?b) != 4)                  { ret 2; }
+    if (!bytes_equal(?out[0], "abcd", 4)) { ret 2; }
+
+    val done: err[WriteError] = flush(?b);
+    if (!sel done.ok)                       { ret 3; }
+    if (m.calls != 2)                       { ret 3; }
+    if (pushed(?b) != 6)                    { ret 3; }
+    if (!bytes_equal(?out[0], "abcdef", 6)) { ret 3; }
+
+    # a flush with nothing staged costs no call
+    val again: err[WriteError] = flush(?b);
+    if (!sel again.ok) { ret 4; }
+    if (m.calls != 2)  { ret 4; }
+    ret 0;
+}
+
+test "io.writer.buffered: a request at least the buffer's size goes straight through" {
+    var out:   [32]u8;
+    var m:     MemSink;
+    var inner: Writer = mem_sink(?m, ?out[0], 32, 64);
+    var stage: [4]u8;
+    var b:     Buffered;
+    var bw:    Writer = buffered(?b, ?inner, ?stage[0], 4);
+
+    val bulk: err[WriteError] = write_all(?bw, "0123456789", 10);
+    if (!sel bulk.ok)                            { ret 1; }
+    if (m.calls != 1)                            { ret 1; }
+    if (b.len != 0)                              { ret 1; }
+    if (pushed(?b) != 10)                        { ret 1; }
+    if (!bytes_equal(?out[0], "0123456789", 10)) { ret 1; }
+
+    # staged bytes are pushed ahead of the passthrough, in order
+    val head: err[WriteError] = write_all(?bw, "ab", 2);
+    if (!sel head.ok) { ret 2; }
+    if (m.calls != 1) { ret 2; }
+
+    val tail: err[WriteError] = write_all(?bw, "cdefghij", 8);
+    if (!sel tail.ok)                             { ret 3; }
+    if (m.calls != 3)                             { ret 3; }
+    if (pushed(?b) != 20)                         { ret 3; }
+    if (!bytes_equal(?out[10], "abcdefghij", 10)) { ret 3; }
+    ret 0;
+}
+
+test "io.writer.buffered: a failing inner writer reports the exact persisted prefix" {
+    var out:   [32]u8;
+    var m:     MemSink;
+    var inner: Writer = mem_sink(?m, ?out[0], 32, 2);
+    var stage: [8]u8;
+    var b:     Buffered;
+    var bw:    Writer = buffered(?b, ?inner, ?stage[0], 8);
+    m.fail_after = 2;
+    m.fail_code  = os.ENOSPC;
+
+    # staging cannot fail: the inner writer has not been reached yet
+    val staged: err[WriteError] = write_all(?bw, "abcd", 4);
+    if (!sel staged.ok) { ret 1; }
+    if (m.calls != 0)   { ret 1; }
+
+    # the flush takes 2 of the 4 staged bytes and reports that prefix
+    val failed: err[WriteError] = flush(?b);
+    if (!sel failed.err)                           { ret 2; }
+    if (!sel failed.err.native)                    { ret 3; }
+    if (failed.err.native.written != 2)            { ret 4; }
+    if (persisted(failed.err) != 2)                { ret 4; }
+    if (failed.err.native.error.code != os.ENOSPC) { ret 5; }
+    if (pushed(?b) != 2)                           { ret 6; }
+    if (!bytes_equal(?out[0], "ab", 2))            { ret 7; }
+
+    # the refusal is sticky: later writes replay it with no prefix of their own
+    # and reach no further into the inner writer
+    val calls: usize           = m.calls;
+    val after: err[WriteError] = write_all(?bw, "efgh", 4);
+    if (!sel after.err)                { ret 8; }
+    if (!sel after.err.native)         { ret 9; }
+    if (after.err.native.written != 0) { ret 10; }
+    if (m.calls != calls)              { ret 11; }
+    if (pushed(?b) != 2)               { ret 12; }
+
+    val refused: err[WriteError] = flush(?b);
+    if (!sel refused.err)            { ret 13; }
+    if (persisted(refused.err) != 0) { ret 14; }
+    if (m.calls != calls)            { ret 15; }
+    ret 0;
+}
+
+test "io.writer.buffered: a stalled inner writer keeps its case through the buffer" {
+    var out:   [32]u8;
+    var m:     MemSink;
+    var inner: Writer = mem_sink(?m, ?out[0], 32, 2);
+    var stage: [8]u8;
+    var b:     Buffered;
+    var bw:    Writer = buffered(?b, ?inner, ?stage[0], 8);
+    m.fail_after = 2;
+    m.stall      = true;
+
+    val staged: err[WriteError] = write_all(?bw, "abcd", 4);
+    if (!sel staged.ok) { ret 1; }
+
+    val stalled: err[WriteError] = flush(?b);
+    if (!sel stalled.err)         { ret 2; }
+    if (!sel stalled.err.stalled) { ret 3; }
+    if (stalled.err.stalled != 2) { ret 4; }
+    if (pushed(?b) != 2)          { ret 5; }
+    ret 0;
+}
+
+test "io.writer.buffered: a zero-capacity buffer degrades to a passthrough" {
+    var out:   [16]u8;
+    var m:     MemSink;
+    var inner: Writer = mem_sink(?m, ?out[0], 16, 64);
+    var b:     Buffered;
+    var bw:    Writer = buffered(?b, ?inner, nil, 0);
+
+    val done: err[WriteError] = write_all(?bw, "abc", 3);
+    if (!sel done.ok)                    { ret 1; }
+    if (m.calls != 1)                    { ret 2; }
+    if (b.len != 0)                      { ret 3; }
+    if (pushed(?b) != 3)                 { ret 4; }
+    if (!bytes_equal(?out[0], "abc", 3)) { ret 5; }
+
+    val drained: err[WriteError] = flush(?b);
+    if (!sel drained.ok) { ret 6; }
+    if (m.calls != 1)    { ret 7; }
     ret 0;
 }
