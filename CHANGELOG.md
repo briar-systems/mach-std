@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - `format`: literal text between holes now reaches the writer as one call per maximal run rather than one per byte, and padding is written in chunks of up to 32 fill bytes rather than one byte at a time. Output is unchanged (#654).
 - `print`: `printf`, `eprintf`, `printlnf`, `eprintlnf`, `println` and `eprintln` format into a 512-byte stack buffer and flush once before returning. A call whose output fits the buffer issues one write. Nothing is held across calls, so ordering and the interleaving of stdout and stderr are unchanged, and the reported byte count is the bytes that reached the fd (#654).
+- `std.allocator.heap`: a general-purpose size-class heap that reuses freed blocks and is safe to share between threads (#657). Small requests are carved from per-class spans with a free list per span, spans return to a cache every class draws from, and larger requests get a span of their own. Alignment is honored for every request, a resize stays in place while the block still fits and still uses half of it, and releasing a pointer the heap never handed out is refused with `-22` as `allocator.Error.release`. Backing memory comes from a `heap.Source`, with a native mapper member, an `Allocator`-backed member, and support for a grow-only source that can never return memory. No existing consumer's allocator changed.
 
 ## [2.1.0] - 2026-09-13
 
