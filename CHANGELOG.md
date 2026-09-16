@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- A `net.resolve` resolver on an `io.runtime` no longer claims native events
+  that belong to other sources. Its dispatch returned "claimed" whenever it
+  published a result, and the runtime stops offering an event at the first
+  claim, so a resolver registered before a `net.async` driver could swallow a
+  socket's oneshot readiness. The socket was then never re-armed and its
+  pending operation never completed. The resolver owns no native context and
+  now never claims one, and `io.runtime.DispatchFun` documents the rule
+  (#715).
 - On windows, a pending `net.async` datagram receive batch completes as soon as
   a datagram is available and carries every datagram already queued, up to its
   count, as on linux and darwin. It used to wait until the whole batch had
