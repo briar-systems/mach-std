@@ -37,7 +37,7 @@ mach_run test "$here" --target "$target" --profile "$profile" --include-deps --l
     || fail "$target suite could not be listed"
 
 required=(
-    'src/system/os/secret.mach'
+    'src/memory/secret.mach'
     'src/sync/thread.mach'
     'src/process/exec.mach'
     'src/filesystem.mach'
