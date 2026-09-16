@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `0644` for files and `0755` for directories. Any other DACL still reports
   those defaults (#703).
 - std now links `advapi32.dll` on Windows (#703).
+- Transactional directory preparation widens an owner-denying directory to
+  owner access while its children are built and restores the requested mode
+  afterwards, on Windows as on other platforms. `filesystem.removal` likewise
+  widens a private directory it has to descend into. Both steps used to be
+  skipped on Windows, which would now leave a 0000 directory unbuildable (#703).
 
 ## [3.1.0] - 2026-09-16
 
