@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- CI follows the family contract in briar-systems/.github (briar-systems/mach#3447).
+  One `ci.yml` calls the shared library pipeline and ends in a `gate` job. linux
+  x86_64, windows x86_64 and darwin aarch64 run on every pull request into dev.
+  arm64 linux, darwin x86_64, riscv64 under qemu and the cross-backend build run
+  on pull requests into main, on a dispatch that names them, and on every
+  release. Nothing runs on push. Each host's verifiers run from
+  `.github/ci/verify.sh`, `mach fmt --check` now runs, and the compiler is the
+  family's pinned mach release (#699).
+
 ## [3.1.0] - 2026-09-16
 
 ### Added
