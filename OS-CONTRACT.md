@@ -17,7 +17,7 @@ $if (capability.HAS_FILES) {
 
 Every group is present on linux, darwin and windows. None is present on any other target, freestanding included. `HOSTED` is the core group, which every other group implies.
 
-A target that claims a group exports every member listed here. `src/system/capability/conformance.mach` names every member of every group, so a missing member fails the build on any target that claims the group.
+A target that claims a group exports every member listed here. `src/system/capability/conformance.mach` names every member of every group that the per-OS module supplies, so a missing member fails the build on any target that claims the group. Members `std.system.os` defines itself (the `secret_*` wrappers, `temp_dir`, `unlink_force`, `realtime`, `monotonic` and `message`) exist wherever the module compiles, so the test doesn't name them. The test also keeps the positioned secret transfers inside the files lane, which `test/secret/verify.sh` enforces.
 
 | flag | group | purpose |
 | --- | --- | --- |
