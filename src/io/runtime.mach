@@ -94,9 +94,12 @@ pub def CancelFun:   fun(ptr, Token, io_error.Error) i64;
 pub def ReleaseFun:  fun(ptr, *Completion);
 pub val CANCELLATION_PENDING: i64 = 1;
 
+# wait is false when the driver must not poll: the runtime is closed or a
+# caller woke it, and woken says which
 pub rec WaitPlan {
     wait:       bool;
     timeout_ms: i32;
+    woken:      bool;
 }
 
 val SLOT_FREE:       u8 = 0;
@@ -189,8 +192,12 @@ pub rec Runtime {
     native_controls: usize;
     lifecycle:       lifecycle.Lifecycle;
     destroyed:       bool;
-    lock:            mutex.Mutex;
-    native_lock:     mutex.Mutex;
+    # a caller's wake, pending until a wait or a wait plan answers it
+    woken:       bool;
+    lock:        mutex.Mutex;
+    native_lock: mutex.Mutex;
+    # held for a whole native control, so a waiter can yield to one
+    control_lock: mutex.Mutex;
 }
 
 # the caller excludes concurrent destruction while querying stable ownership
@@ -345,9 +352,11 @@ pub fun make(runtime: *Runtime, initial: usize) err[io_error.Error] {
     runtime.next_source_tag = 1;
     runtime.native_controls = 0;
     lifecycle.make(?runtime.lifecycle);
-    runtime.destroyed   = false;
-    runtime.lock        = mutex.make();
-    runtime.native_lock = mutex.make();
+    runtime.destroyed    = false;
+    runtime.woken        = false;
+    runtime.lock         = mutex.make();
+    runtime.native_lock  = mutex.make();
+    runtime.control_lock = mutex.make();
     val code: i64 = os.io_queue_create(?runtime.queue);
     if (code < 0) {
         os.deallocate(runtime.native_events::ptr, native_event_bytes);
@@ -1116,11 +1125,10 @@ fun settle_expired_locked(runtime: *Runtime) time.Clock {
     ret now;
 }
 
-# drains completions and expires due deadlines without entering the native wait
-pub fun poll(runtime: *Runtime, output: *Completion, output_capacity: usize) res[usize, io_error.Error] {
-    if (runtime == nil || output == nil || output_capacity == 0) {
-        ret res[usize, io_error.Error].err{invalid(io_error.OP_WAIT)};
-    }
+# drains completions and expires due deadlines
+# a wait's return answers a pending caller wake, which answer_wake takes and
+# reports through woken
+fun take(runtime: *Runtime, output: *Completion, output_capacity: usize, answer_wake: bool, woken: *bool) res[usize, io_error.Error] {
     mutex.lock(?runtime.lock);
     if (runtime.destroyed) {
         mutex.unlock(?runtime.lock);
@@ -1132,11 +1140,34 @@ pub fun poll(runtime: *Runtime, output: *Completion, output_capacity: usize) res
         ret res[usize, io_error.Error].err{settled.err};
     }
     val written: usize = drain(runtime, output, output_capacity);
+    if (answer_wake && (written > 0 || runtime.woken)) {
+        @woken        = runtime.woken;
+        runtime.woken = false;
+    }
     mutex.unlock(?runtime.lock);
     ret res[usize, io_error.Error].ok{written};
 }
 
+# drains completions and expires due deadlines without entering the native wait
+# a pending caller wake stays pending for the next wait or wait plan
+pub fun poll(runtime: *Runtime, output: *Completion, output_capacity: usize) res[usize, io_error.Error] {
+    if (runtime == nil || output == nil || output_capacity == 0) {
+        ret res[usize, io_error.Error].err{invalid(io_error.OP_WAIT)};
+    }
+    var woken: bool = false;
+    ret take(runtime, output, output_capacity, false, ?woken);
+}
+
 # prepares another subsystem to wait on the runtime's native queue
+#
+# the driver polls the queue for at most timeout_ms and then drains with poll.
+# the queue also carries the runtime's own wakes, so a poll that returns with
+# nothing drained is not a reason to stop: the driver prepares again with the
+# time it has left, and ends early only on a plan with woken set, which answers
+# a caller's wake. a plan with wait unset must not be polled.
+# ---
+# timeout_ms: relative bound on the driver's poll, -1 for unbounded
+# ret:        the plan, or the runtime's refusal
 pub fun prepare_wait(runtime: *Runtime, timeout_ms: i32) res[WaitPlan, io_error.Error] {
     if (runtime == nil || timeout_ms < -1) {
         ret res[WaitPlan, io_error.Error].err{invalid(io_error.OP_WAIT)};
@@ -1151,22 +1182,29 @@ pub fun prepare_wait(runtime: *Runtime, timeout_ms: i32) res[WaitPlan, io_error.
         mutex.unlock(?runtime.lock);
         ret res[WaitPlan, io_error.Error].err{settled.err};
     }
+    if (runtime.woken) {
+        runtime.woken = false;
+        mutex.unlock(?runtime.lock);
+        ret res[WaitPlan, io_error.Error].ok{WaitPlan{wait: false, timeout_ms: 0, woken: true}};
+    }
     if (lifecycle.snapshot(?runtime.lifecycle).state == lifecycle.CLOSED) {
         mutex.unlock(?runtime.lock);
-        ret res[WaitPlan, io_error.Error].ok{WaitPlan{wait: false, timeout_ms: 0}};
+        ret res[WaitPlan, io_error.Error].ok{WaitPlan{wait: false, timeout_ms: 0, woken: false}};
     }
     var native_timeout: i32 = timer_timeout(runtime, timeout_ms, settled.ok);
     # ready completions forbid blocking, not collecting readiness
     if (runtime.count != 0) { native_timeout = 0; }
     mutex.unlock(?runtime.lock);
-    ret res[WaitPlan, io_error.Error].ok{WaitPlan{wait: true, timeout_ms: native_timeout}};
+    ret res[WaitPlan, io_error.Error].ok{WaitPlan{wait: true, timeout_ms: native_timeout, woken: false}};
 }
 
 pub fun begin_native_control(runtime: *Runtime) err[io_error.Error] {
     if (runtime == nil) { ret err[io_error.Error].err{invalid(io_error.OP_WAIT)}; }
+    mutex.lock(?runtime.control_lock);
     mutex.lock(?runtime.lock);
     if (runtime.destroyed) {
         mutex.unlock(?runtime.lock);
+        mutex.unlock(?runtime.control_lock);
         ret err[io_error.Error].err{invalid(io_error.OP_WAIT)};
     }
     runtime.native_controls = runtime.native_controls + 1;
@@ -1176,6 +1214,7 @@ pub fun begin_native_control(runtime: *Runtime) err[io_error.Error] {
         mutex.lock(?runtime.lock);
         runtime.native_controls = runtime.native_controls - 1;
         mutex.unlock(?runtime.lock);
+        mutex.unlock(?runtime.control_lock);
         ret err[io_error.Error].err{io_error.from_code(wake_result, io_error.OP_WAKE)};
     }
     mutex.lock(?runtime.native_lock);
@@ -1187,15 +1226,17 @@ pub fun end_native_control(runtime: *Runtime) {
     runtime.native_controls = runtime.native_controls - 1;
     mutex.unlock(?runtime.lock);
     mutex.unlock(?runtime.native_lock);
+    mutex.unlock(?runtime.control_lock);
 }
 
-fun native_poll(runtime: *Runtime, timeout_ms: i32) i64 {
+# controlled reports a poll skipped for a pending native control
+fun native_poll(runtime: *Runtime, timeout_ms: i32, controlled: *bool) i64 {
     mutex.lock(?runtime.lock);
-    val destroyed:  bool = runtime.destroyed;
-    val controlled: bool = runtime.native_controls != 0;
+    val destroyed: bool = runtime.destroyed;
+    @controlled = runtime.native_controls != 0;
     mutex.unlock(?runtime.lock);
-    if (destroyed)  { ret os.EBADF; }
-    if (controlled) { ret 0; }
+    if (destroyed)   { ret os.EBADF; }
+    if (@controlled) { ret 0; }
     ret native_os.io_queue_poll(
         ?runtime.queue,
         runtime.native_events::*native_os.IoCompletion,
@@ -1246,18 +1287,17 @@ fun flush_sources(runtime: *Runtime) {
 }
 
 # collects native readiness and publishes every source's queued completions
-# woken reports a consumed wake, which the caller owes a return for
+# controlled reports that a native control cut the collection short
 # the caller owns native_lock
-fun collect_native(runtime: *Runtime, timeout_ms: i32, woken: *bool) i64 {
+fun collect_native(runtime: *Runtime, timeout_ms: i32, controlled: *bool) i64 {
     var total:   i64 = 0;
     var timeout: i32 = timeout_ms;
     for (true) {
-        val waited: i64 = native_poll(runtime, timeout);
+        val waited: i64 = native_poll(runtime, timeout, controlled);
         if (waited < 0) { ret waited; }
         var i: usize = 0;
         for (i < waited::usize) {
             val event: NativeEvent = runtime.native_events[i];
-            if ((event.events & native_os.IO_EVENT_WAKE) != 0) { @woken = true; }
             dispatch_sources(runtime, event);
             i = i + 1;
         }
@@ -1270,62 +1310,111 @@ fun collect_native(runtime: *Runtime, timeout_ms: i32, woken: *bool) i64 {
     ret total;
 }
 
-# timeout_ms is relative and uses -1 for an unbounded wait
-# the caller owns output and may reuse it after this call returns
+# the relative time left before deadline, rounded up so a wait never ends short
+fun remaining_ms(timeout_ms: i32, deadline: time.Time, now: time.Time) i32 {
+    if (timeout_ms <= 0)                  { ret timeout_ms; }
+    if (!time.time_before(now, deadline)) { ret 0; }
+    val left: i64 = time.time_sub(deadline, now);
+    ret ((left + 999999) / 1000000)::i32;
+}
+
+# waits for completions
+#
+# returns 0 only when timeout_ms has passed, a caller called wake, or the
+# runtime is closed with nothing left to return. the runtime's own wakes, such
+# as the one a submission posts, never end a wait early: the wait keeps waiting
+# for the time that remains. a return that carries completions also answers a
+# pending wake.
+# ---
+# output:          completions are written here; the caller owns it and may
+#                  reuse it after this call returns
+# output_capacity: the most completions one call writes
+# timeout_ms:      relative bound, 0 to collect without blocking, -1 for
+#                  unbounded
+# ret:             the number of completions written, or the refusal
 pub fun wait(runtime: *Runtime, output: *Completion, output_capacity: usize, timeout_ms: i32) res[usize, io_error.Error] {
     if (runtime == nil || output == nil || output_capacity == 0 || timeout_ms < -1) {
         ret res[usize, io_error.Error].err{invalid(io_error.OP_WAIT)};
     }
-    mutex.lock(?runtime.native_lock);
-    mutex.lock(?runtime.lock);
-    val destroyed: bool = runtime.destroyed;
-    mutex.unlock(?runtime.lock);
-    if (destroyed) {
-        mutex.unlock(?runtime.native_lock);
-        ret res[usize, io_error.Error].err{invalid(io_error.OP_WAIT)};
+    var deadline: time.Time;
+    if (timeout_ms > 0) {
+        val start: time.Clock = time.monotonic();
+        if (sel start.err) { ret res[usize, io_error.Error].err{start.err}; }
+        deadline = time.time_add(start.ok, timeout_ms::i64 * 1000000);
     }
     # readiness is collected without blocking before completions are returned,
     # so a resource that completes at submission cannot keep the native queue
     # from being polled
-    var woken:     bool = false;
-    val collected: i64  = collect_native(runtime, 0, ?woken);
-    mutex.unlock(?runtime.native_lock);
-    if (collected < 0) {
-        ret res[usize, io_error.Error].err{io_error.from_code(collected, io_error.OP_WAIT)};
+    var native_timeout: i32  = 0;
+    var controlled:     bool = false;
+    for (true) {
+        # a native control holds control_lock until it ends, so yielding to it
+        # here keeps the unfair native_lock from starving it
+        if (controlled) {
+            mutex.lock(?runtime.control_lock);
+            mutex.unlock(?runtime.control_lock);
+        }
+        mutex.lock(?runtime.native_lock);
+        mutex.lock(?runtime.lock);
+        val destroyed: bool = runtime.destroyed;
+        mutex.unlock(?runtime.lock);
+        if (destroyed) {
+            mutex.unlock(?runtime.native_lock);
+            ret res[usize, io_error.Error].err{invalid(io_error.OP_WAIT)};
+        }
+        controlled = false;
+        val collected: i64 = collect_native(runtime, native_timeout, ?controlled);
+        mutex.unlock(?runtime.native_lock);
+        if (collected < 0) {
+            ret res[usize, io_error.Error].err{io_error.from_code(collected, io_error.OP_WAIT)};
+        }
+        var woken:   bool                       = false;
+        val drained: res[usize, io_error.Error] = take(runtime, output, output_capacity, true, ?woken);
+        if (sel drained.err)         { ret drained; }
+        if (drained.ok > 0 || woken) { ret drained; }
+        var remaining: i32 = timeout_ms;
+        if (timeout_ms > 0) {
+            val now: time.Clock = time.monotonic();
+            if (sel now.err) { ret res[usize, io_error.Error].err{now.err}; }
+            remaining = remaining_ms(timeout_ms, deadline, now.ok);
+        }
+        # the first pass never blocked, so a zero timeout is answered here
+        if (remaining == 0) { ret res[usize, io_error.Error].ok{0}; }
+        val prepared: res[WaitPlan, io_error.Error] = prepare_wait(runtime, remaining);
+        if (sel prepared.err)  { ret res[usize, io_error.Error].err{prepared.err}; }
+        if (!prepared.ok.wait) { ret res[usize, io_error.Error].ok{0}; }
+        native_timeout = prepared.ok.timeout_ms;
     }
-    val initial: res[usize, io_error.Error] = poll(runtime, output, output_capacity);
-    if (sel initial.err) { ret initial; }
-    if (initial.ok > 0)  { ret initial; }
-    # this call consumed the wake that a blocking poll would have returned on,
-    # so it owes that return rather than a wait
-    if (woken) { ret res[usize, io_error.Error].ok{0}; }
-    val prepared: res[WaitPlan, io_error.Error] = prepare_wait(runtime, timeout_ms);
-    if (sel prepared.err) { ret res[usize, io_error.Error].err{prepared.err}; }
-    val plan: WaitPlan = prepared.ok;
-    if (!plan.wait) { ret res[usize, io_error.Error].ok{0}; }
-
-    mutex.lock(?runtime.native_lock);
-    val waited: i64 = collect_native(runtime, plan.timeout_ms, ?woken);
-    mutex.unlock(?runtime.native_lock);
-    if (waited < 0) {
-        ret res[usize, io_error.Error].err{io_error.from_code(waited, io_error.OP_WAIT)};
-    }
-    ret poll(runtime, output, output_capacity);
+    ret res[usize, io_error.Error].ok{0};
 }
 
-# interrupts a blocked wait, with notifications coalesced by the native queue
-pub fun wake(runtime: *Runtime) err[io_error.Error] {
+fun post_wake(runtime: *Runtime, caller: bool) err[io_error.Error] {
     if (runtime == nil) {
         ret err[io_error.Error].err{invalid(io_error.OP_WAKE)};
     }
     mutex.lock(?runtime.lock);
     val destroyed: bool = runtime.destroyed;
     var code:      i64  = os.EINVAL;
-    if (!destroyed) { code = os.io_queue_wake(?runtime.queue); }
+    if (!destroyed) {
+        if (caller) { runtime.woken = true; }
+        code = os.io_queue_wake(?runtime.queue);
+    }
     mutex.unlock(?runtime.lock);
     if (destroyed) { ret err[io_error.Error].err{invalid(io_error.OP_WAKE)}; }
     if (code < 0)  { ret err[io_error.Error].err{io_error.from_code(code, io_error.OP_WAKE)}; }
     ret err[io_error.Error].ok{};
+}
+
+# ends a blocked wait early, or the next wait if none is blocked
+# wakes coalesce: one wait answers every wake that came before its return
+pub fun wake(runtime: *Runtime) err[io_error.Error] {
+    ret post_wake(runtime, true);
+}
+
+# makes a blocked wait collect every source again without ending it
+# a source that queues completions off the native queue calls this, not wake
+pub fun notify(runtime: *Runtime) err[io_error.Error] {
+    ret post_wake(runtime, false);
 }
 
 # close rejects new work and queues one terminal completion for every active operation
@@ -1855,6 +1944,147 @@ test "runtime: wake is retained until the next wait" {
     ret 0;
 }
 
+fun elapsed_ms(start: time.Time) i64 {
+    val now: time.Clock = time.monotonic();
+    if (sel now.err) { ret -1; }
+    ret time.time_sub(now.ok, start) / 1000000;
+}
+
+# a submission wake is the runtime's own and must not end a wait (#676)
+test "runtime: a submission wake does not end a wait early" {
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    val start: time.Clock = time.monotonic();
+    if (sel start.err) { ret 2; }
+    var scope: cancel.Scope;
+    if (!succeeded(cancel.make_root(?scope, true, time.time_add(start.ok, 60000000000)))) { ret 3; }
+    # a deadline scope makes the submission post a wake on the native queue
+    val submitted: res[Token, io_error.Error] = submit_scoped(?runtime, ?scope, test_operation(READ, 91));
+    if (sel submitted.err) { ret 4; }
+    var output: [1]Completion;
+    val waited: res[usize, io_error.Error] = wait(?runtime, ?output[0], 1, 200);
+    val took:   i64                        = elapsed_ms(start.ok);
+    if (sel waited.err)                                         { ret 5; }
+    if (waited.ok != 0)                                         { ret 6; }
+    if (took < 200)                                             { ret 7; }
+    if (!ok_err(complete(?runtime, submitted.ok, 0, 0, false))) { ret 8; }
+    val drained: res[usize, io_error.Error] = wait(?runtime, ?output[0], 1, 0);
+    if (!(sel drained.ok && drained.ok == 1)) { ret 9; }
+    if (!succeeded(cancel.destroy(?scope)))   { ret 10; }
+    close(?runtime);
+    if (!ok_err(destroy(?runtime))) { ret 11; }
+    ret 0;
+}
+
+rec NotifyContext {
+    runtime: *Runtime;
+    started: *i64;
+    delay:   i64;
+    wake:    bool;
+}
+
+fun notify_worker(arg: *u8) {
+    val context: *NotifyContext = arg::*NotifyContext;
+    for (atomic.load(context.started) == 0) { atomic.spin_hint(); }
+    os.sleep(context.delay);
+    notify(context.runtime);
+    if (context.wake) {
+        os.sleep(context.delay);
+        wake(context.runtime);
+    }
+}
+
+# an internal wake mid-wait resumes with the time left, not the whole timeout
+test "runtime: an internal wake keeps the wait's deadline" {
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    var started: i64           = 0;
+    var context: NotifyContext = NotifyContext{runtime: ?runtime, started: ?started, delay: 400000000, wake: false};
+    var worker:  thread.Thread;
+    thread.spawn_with(notify_worker, (?context)::*u8, ?worker);
+    if (worker.tid < 0) { ret 2; }
+    val start: time.Clock = time.monotonic();
+    if (sel start.err) { ret 3; }
+    atomic.store(?started, 1);
+    var output: [1]Completion;
+    val waited: res[usize, io_error.Error] = wait(?runtime, ?output[0], 1, 600);
+    val took:   i64                        = elapsed_ms(start.ok);
+    thread.join(?worker);
+    if (sel waited.err) { ret 4; }
+    if (waited.ok != 0) { ret 5; }
+    if (took < 600)     { ret 6; }
+    # restarting the full timeout after the wake would take at least 1000
+    if (took >= 950) { ret 7; }
+    close(?runtime);
+    if (!ok_err(destroy(?runtime))) { ret 8; }
+    ret 0;
+}
+
+test "runtime: a caller wake ends a wait that an internal wake did not" {
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    var started: i64           = 0;
+    var context: NotifyContext = NotifyContext{runtime: ?runtime, started: ?started, delay: 100000000, wake: true};
+    var worker:  thread.Thread;
+    thread.spawn_with(notify_worker, (?context)::*u8, ?worker);
+    if (worker.tid < 0) { ret 2; }
+    val start: time.Clock = time.monotonic();
+    if (sel start.err) { ret 3; }
+    atomic.store(?started, 1);
+    var output: [1]Completion;
+    val waited: res[usize, io_error.Error] = wait(?runtime, ?output[0], 1, 10000);
+    val took:   i64                        = elapsed_ms(start.ok);
+    thread.join(?worker);
+    if (sel waited.err) { ret 4; }
+    if (waited.ok != 0) { ret 5; }
+    if (took < 200)     { ret 6; }
+    if (took >= 9000)   { ret 7; }
+    close(?runtime);
+    if (!ok_err(destroy(?runtime))) { ret 8; }
+    ret 0;
+}
+
+test "runtime: a return with completions answers a pending wake" {
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    val submitted: res[Token, io_error.Error] = submit(?runtime, test_operation(READ, 92));
+    if (sel submitted.err)                                      { ret 2; }
+    if (!ok_err(wake(?runtime)))                                { ret 3; }
+    if (!ok_err(complete(?runtime, submitted.ok, 1, 0, false))) { ret 4; }
+    var output: [1]Completion;
+    val first:  res[usize, io_error.Error] = wait(?runtime, ?output[0], 1, -1);
+    if (!(sel first.ok && first.ok == 1)) { ret 5; }
+    # the wake's native event is still queued, but it was already answered
+    val start: time.Clock = time.monotonic();
+    if (sel start.err) { ret 6; }
+    val second: res[usize, io_error.Error] = wait(?runtime, ?output[0], 1, 100);
+    val took:   i64                        = elapsed_ms(start.ok);
+    if (!(sel second.ok && second.ok == 0)) { ret 7; }
+    if (took < 100)                         { ret 8; }
+    close(?runtime);
+    if (!ok_err(destroy(?runtime))) { ret 9; }
+    ret 0;
+}
+
+test "runtime: a wait plan reports and answers only a caller wake" {
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    if (!ok_err(notify(?runtime)))  { ret 2; }
+    val internal: res[WaitPlan, io_error.Error] = prepare_wait(?runtime, 5);
+    if (sel internal.err)                       { ret 3; }
+    if (!internal.ok.wait || internal.ok.woken) { ret 3; }
+    if (!ok_err(wake(?runtime)))                { ret 4; }
+    val woken: res[WaitPlan, io_error.Error] = prepare_wait(?runtime, 5);
+    if (sel woken.err)                    { ret 5; }
+    if (woken.ok.wait || !woken.ok.woken) { ret 5; }
+    val after: res[WaitPlan, io_error.Error] = prepare_wait(?runtime, 5);
+    if (sel after.err)                    { ret 6; }
+    if (!after.ok.wait || after.ok.woken) { ret 6; }
+    close(?runtime);
+    if (!ok_err(destroy(?runtime))) { ret 7; }
+    ret 0;
+}
+
 test "runtime: sustained mixed completions remain bounded and fair" {
     var runtime: Runtime;
     if (!ok_err(make(?runtime, 16))) { ret 1; }
@@ -2082,7 +2312,8 @@ test "runtime wait and destroy serialize both native ownership interleavings" {
         ret 3;
     }
     mutex.lock(?runtime.native_lock);
-    val stale_wait: i64 = native_poll(?runtime, plan.timeout_ms);
+    var stale_controlled: bool = false;
+    val stale_wait:       i64  = native_poll(?runtime, plan.timeout_ms, ?stale_controlled);
     mutex.unlock(?runtime.native_lock);
     if (stale_wait != os.EBADF) { ret 4; }
 
@@ -2110,7 +2341,8 @@ test "runtime wait and destroy serialize both native ownership interleavings" {
         thread.join(?worker);
         ret 8;
     }
-    val owned_wait: i64 = native_poll(?runtime, second_plan.timeout_ms);
+    var owned_controlled: bool = false;
+    val owned_wait:       i64  = native_poll(?runtime, second_plan.timeout_ms, ?owned_controlled);
     mutex.unlock(?runtime.native_lock);
     thread.join(?worker);
     if (owned_wait < 0 || atomic.load(?destroyed) != 1) { ret 9; }
