@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- CI follows the family contract in briar-systems/.github (briar-systems/mach#3447).
+  One `ci.yml` calls the shared library pipeline and ends in a `gate` job. linux
+  x86_64, windows x86_64 and darwin aarch64 run on every pull request into dev.
+  arm64 linux, darwin x86_64, riscv64 under qemu and the cross-backend build run
+  on pull requests into main, on a dispatch that names them, and on every
+  release. Nothing runs on push. Each host's verifiers run from
+  `.github/ci/verify.sh`, `mach fmt --check` now runs, and the compiler is the
+  family's pinned mach release, 5.1.0 where CI used 5.0.0 (#699).
+- `mach.toml` declares `windows-x86_64`, so std's own manifest builds its
+  windows artifact. This needs mach 5.1.0 or later for the debug profile,
+  which earlier releases refuse on windows (#699).
+- The backend artifact checks call every libSystem import they name. mach 5.1.0
+  binds only the imports a program can reach, so the darwin checks no longer
+  saw `_fstat`, `_getentropy` and the process imports in a probe that never
+  called them (#699).
+
 ## [3.1.0] - 2026-09-16
 
 ### Added
