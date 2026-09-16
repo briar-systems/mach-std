@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `io.runtime.wait` collects native readiness without blocking on every call,
+  before it returns ready completions, so a resource whose operations complete
+  at submission no longer keeps `epoll_wait` from being reached and starves
+  every other watched resource. A wake consumed by that collection still ends
+  the call, so `wake` keeps interrupting the next `wait`. `io.runtime.prepare_wait`
+  reports the same for an external driver: ready completions now yield a plan
+  that polls with a zero timeout instead of one that declines to poll at all
+  (#658).
+
 ## [2.1.0] - 2026-09-13
 
 ### Added
