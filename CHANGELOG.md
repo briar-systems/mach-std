@@ -7,15 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-- `io.runtime.wait` collects native readiness without blocking on every call,
-  before it returns ready completions, so a resource whose operations complete
-  at submission no longer keeps `epoll_wait` from being reached and starves
-  every other watched resource. A wake consumed by that collection still ends
-  the call, so `wake` keeps interrupting the next `wait`. `io.runtime.prepare_wait`
-  reports the same for an external driver: ready completions now yield a plan
-  that polls with a zero timeout instead of one that declines to poll at all
-  (#658).
 ### Added
 - `memory.table`: chunked element storage whose live elements never move. A
   table appends a chunk to a fixed inline directory instead of reallocating, so
@@ -57,12 +48,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   readiness buffer from the slot capacity. Source dispatch iterates registered
   sources rather than the whole slot capacity, and slot and operation claims
   take from a free list rather than scanning (#653).
+
+## [2.2.0] - 2026-09-16
+
+### Fixed
+- `io.runtime.wait` collects native readiness without blocking on every call,
+  before it returns ready completions, so a resource whose operations complete
+  at submission no longer keeps `epoll_wait` from being reached and starves
+  every other watched resource. A wake consumed by that collection still ends
+  the call, so `wake` keeps interrupting the next `wait`. `io.runtime.prepare_wait`
+  reports the same for an external driver: ready completions now yield a plan
+  that polls with a zero timeout instead of one that declines to poll at all
+  (#658).
+### Added
+- `std.allocator.heap`: a general-purpose size-class heap that reuses freed blocks and is safe to share between threads (#657). Small requests are carved from per-class spans with a free list per span, spans return to a cache every class draws from, and larger requests get a span of their own. Alignment is honored for every request, a resize stays in place while the block still fits and still uses half of it, and releasing a pointer the heap never handed out is refused with `-22` as `allocator.Error.release`. Backing memory comes from a `heap.Source`, with a native mapper member, an `Allocator`-backed member, and support for a grow-only source that can never return memory. No existing consumer's allocator changed.
 - `io.writer.Buffered`, `io.writer.buffered`, `io.writer.flush` and `io.writer.pushed`: a writer that stages bytes in caller-owned storage and forwards full buffers to an inner writer, with an explicit flush, sticky failure and a request at or above the buffer's size passed straight through. `pushed` is the authoritative count of bytes the inner writer took, so a caller can report a true total after a staged pass (#654).
 - `io.writer.reprefix`: the same `WriteError` with its persisted prefix replaced, for restating a failure against a count the caller measured itself (#654).
 ### Changed
 - `format`: literal text between holes now reaches the writer as one call per maximal run rather than one per byte, and padding is written in chunks of up to 32 fill bytes rather than one byte at a time. Output is unchanged (#654).
 - `print`: `printf`, `eprintf`, `printlnf`, `eprintlnf`, `println` and `eprintln` format into a 512-byte stack buffer and flush once before returning. A call whose output fits the buffer issues one write. Nothing is held across calls, so ordering and the interleaving of stdout and stderr are unchanged, and the reported byte count is the bytes that reached the fd (#654).
-- `std.allocator.heap`: a general-purpose size-class heap that reuses freed blocks and is safe to share between threads (#657). Small requests are carved from per-class spans with a free list per span, spans return to a cache every class draws from, and larger requests get a span of their own. Alignment is honored for every request, a resize stays in place while the block still fits and still uses half of it, and releasing a pointer the heap never handed out is refused with `-22` as `allocator.Error.release`. Backing memory comes from a `heap.Source`, with a native mapper member, an `Allocator`-backed member, and support for a grow-only source that can never return memory. No existing consumer's allocator changed.
 
 ## [2.1.0] - 2026-09-13
 
