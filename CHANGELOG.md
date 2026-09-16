@@ -37,6 +37,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `data.json`, `data.toml`, `derive`, `encoding.binary`, `format`, `io.error`,
   `io.reader`, `io.writer`, `terminal.error`, `types.semver` and
   `allocator.arena` (#686).
+- `std.chrono.time`'s `Time` and its arithmetic no longer need the OS
+  layer. `now`, `monotonic`, `since` and `until` exist only where the clock
+  group does (`std.system.capability.HAS_CLOCK`). `std.types.path.separator`
+  is a target constant rather than a read of `std.system.os`. In
+  `std.log.record`, `system_clock` also requires the clock group, a record with
+  a caller-supplied timestamp or clock works on every target, and an error
+  field includes its native message only where the OS layer can translate the
+  code. Nothing changes on linux, darwin or windows. `chrono.time`,
+  `chrono.date`, `chrono.format`, `types.path` and `log.record` now build
+  freestanding, 62 modules in all (#690).
+- `OS-CONTRACT.md` documents the `std.system.os` contract: its
+  capability groups, the members of each group as of 3.x, and the assumptions
+  a user-supplied implementation can rely on. `std.system.capability.conformance`
+  names every member of every group a target claims, so a missing member fails
+  the build (#691).
 
 ## [3.2.1] - 2026-09-16
 
