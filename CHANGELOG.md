@@ -19,6 +19,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exactly (#390).
 - `std.simd.reduce`: `dot_i32x4` and `dot_u32x4` (wrapping), and
   `hsum_i64x2` and `hsum_u64x2` (#390).
+- `io.runtime.notify(runtime)`: wakes a blocked `wait` so it collects every
+  source again without ending it. A source that queues completions off the
+  native queue calls this instead of `wake`. `net.resolve` now does (#676).
+- `io.runtime.WaitPlan.woken`: set when `prepare_wait` answers a caller's
+  `wake`. Such a plan also has `wait` unset (#676).
+
+### Changed
+- **Behaviour change.** Only a caller's `io.runtime.wake` ends
+  `io.runtime.wait` early. `wait` returns 0 only when its timeout has passed, a
+  caller woke the runtime, or the runtime is closed with nothing left to
+  return. The runtime's own wakes, such as the one a submission posts, no
+  longer end a wait: it keeps waiting for the time that remains. This reverses
+  the empty return #658 documented in 2.2.0. A return that carries completions
+  also answers a pending wake. Callers that already loop on an empty return
+  stay correct and now see fewer of them (#676).
+- An external driver built on `io.runtime.prepare_wait` follows the same
+  contract: a poll that comes back with nothing drained is not a reason to
+  stop, so the driver prepares again with the time it has left and ends early
+  only on a plan with `woken` set. `prepare_wait` consumes the caller wake it
+  reports (#676).
+- The `net.async`, `net.resolve` and `io.file` tests wait once where they used
+  to retry an empty wait, so they exercise the contract directly (#676).
 
 ## [3.0.1] - 2026-09-16
 
