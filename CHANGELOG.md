@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-09-16
+
 ### Added
 - `std.simd.matmul`: exact widening integer dot products and matrix
   multiplication. `dot_i8`, `dot_u8`, `dot_i16`, `dot_u16` and `matmul_i8`,
