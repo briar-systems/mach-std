@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.1] - 2026-09-16
+
+Tested with mach 5.2.1, the family CI seed.
+
 ### Fixed
 - A `net.resolve` resolver on an `io.runtime` no longer claims native events
   that belong to other sources. Its dispatch returned "claimed" whenever it
