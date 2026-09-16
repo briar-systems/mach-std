@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `std.simd.matmul`: exact widening integer dot products and matrix
+  multiplication. `dot_i8`, `dot_u8`, `dot_i16`, `dot_u16` and `matmul_i8`,
+  `matmul_u8`, `matmul_i16`, `matmul_u16` widen both operands to the
+  accumulator's lanes before they multiply (i8 to i32x4, u8 to u32x4, i16 to
+  i64x2, u16 to u64x2), since mach has no widening vector operator. A result is
+  exact up to the `TERMS_*` bound for its element type, and a longer sum returns
+  `Error.terms` instead of wrapping. Matrices are dense and row-major. i32 and
+  u32 elements are not offered because no wider lane exists to accumulate them
+  exactly (#390).
+- `std.simd.reduce`: `dot_i32x4` and `dot_u32x4` (wrapping), and
+  `hsum_i64x2` and `hsum_u64x2` (#390).
 - `io.runtime.notify(runtime)`: wakes a blocked `wait` so it collects every
   source again without ending it. A source that queues completions off the
   native queue calls this instead of `wake`. `net.resolve` now does (#676).
