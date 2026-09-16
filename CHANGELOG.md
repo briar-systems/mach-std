@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-09-16
+
 ### Added
 - CI holds std's freestanding build to a checked-in list. `test/freestanding/verify.sh`
   builds every module for `freestanding-x86_64` and fails when a listed module
