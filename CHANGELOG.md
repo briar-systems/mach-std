@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-09-16
+
+### Added
+- `io.runtime.wait`'s batching is now covered by a test: one call may return a
+  completion that was already queued together with one its own native collect
+  produced, so a consumer must not act on a call carrying at most one completion
+  per resource (#670). Nothing changed in the runtime; the behaviour was
+  unasserted and a downstream consumer built on the opposite assumption.
+- `memory.table`: chunked element storage whose live elements never move. A
+  table appends a chunk to a fixed inline directory instead of reallocating, so
+  an address handed out stays valid for the life of the table and only the
+  index-to-address mapping has to be recomputed. `make`, `grow`, `reserve`,
+  `at`, `index_of`, `destroy` and `aliases` (#653).
+- `io.runtime.capacity(runtime)`: the slot table's current size, which is what
+  the runtime has grown to rather than anything it was promised (#653).
+
+### Changed
+- **Breaking.** `io.runtime.make(runtime, initial)` takes an initial size, not
+  a maximum. The slot, timer and source tables grow on demand and only memory
+  bounds them, so a submission past the initial size grows the runtime instead
+  of returning `RESOURCE_EXHAUSTED`. A server no longer has to know its peak
+  concurrency at startup (#653).
+- **Breaking.** `io.runtime.Runtime` no longer has a `capacity` field. Read the
+  current size with `io.runtime.capacity(runtime)` and the size the runtime was
+  made at with `runtime.initial`. `net.async.make` and `net.async.local.make`
+  size themselves from `runtime.initial` and grow with the runtime (#653).
+- Growth moves nothing a completion context or a caller holds a pointer to. The
+  runtime's slots, timers and sources, the `net.async` drivers' slot, listener
+  and stream tables, and every backend's operation, resource, completion and
+  attachment tables are `memory.table`s: a growth appends a chunk and leaves
+  every live element at the address it already had. A completion queued against
+  a slot now lives in that slot and the queue links slots, so there is no second
+  ring to size (#653).
+- **Breaking.** The linux and unix backends' completion context is now a 16-bit
+  source id, a 32-bit resource index and a 16-bit generation, in place of a
+  16-bit source id, a 16-bit index and a 32-bit generation. The index no longer
+  bounds the resource table at 65535 and `make` no longer refuses an initial
+  size above `0xffff`. The narrower generation is what stale-completion
+  detection costs: a resource index has to be recycled a multiple of 65535
+  times between a context being orphaned and arriving for a stale completion to
+  pass as live, where it was a multiple of 2^32. Generations are allocated
+  inside the wire field, so the stored value and the encoded one are the same
+  number and no comparison is made across a truncation (#653).
+- The runtime and every backend harvest native readiness in fixed 256-entry
+  batches and drain a full batch without blocking, rather than sizing the
+  readiness buffer from the slot capacity. Source dispatch iterates registered
+  sources rather than the whole slot capacity, and slot and operation claims
+  take from a free list rather than scanning (#653).
+
 ## [2.2.0] - 2026-09-16
 
 ### Fixed
