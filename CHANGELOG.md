@@ -40,6 +40,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   continuation observations (#692).
 - `std.filesystem.native` holds `stat_mode`, `unlink_force` and `temp_dir`
   (#692).
+- `std.process.exec.spawn_shell(command, cwd, envp)` starts a command through
+  the host interpreter without waiting. `run_shell` is built on it. The
+  interpreter choice is a per-OS table in `std.process.exec`: `/bin/sh -c`
+  on posix, and on windows `%ComSpec%` (falling back to the System32
+  `cmd.exe`) with the verbatim `"<shell>" /s /c "<command>"` line (#692).
+- `std.system.os.windows.spawn_command_line(application, command_line, envp,
+  cwd)` spawns from a verbatim native command line. It is a per-OS escape
+  hatch outside the contract: the contract's argv spawns encode arguments with
+  the CRT convention, which cmd.exe does not parse (#692).
 
 ### Changed
 - **Breaking.** Native codes classify with the full kind set. A code that used
@@ -126,8 +135,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   | `os.unlink_force` | `std.filesystem.native.unlink_force` |
   | `os.temp_dir` | `std.filesystem.native.temp_dir` |
   | `os.NOT_FOUND` | `os.error_kind(n) == io.error.NOT_FOUND` |
+  | `os.spawn_shell(command, envp, cwd) i64` | `std.process.exec.spawn_shell(command, cwd, envp) res[Child, Error]` |
 
-  The sockaddr and status helpers are also gone from the per-OS modules.
+  The sockaddr and status helpers, and `spawn_shell`, are also gone from the
+  per-OS modules.
+
+  What stays in the contract, on purpose: `ProcessStatus` with its
+  `PROCESS_*` kind and stage values, since the native wait and spawn
+  primitives produce them. `getenv` reports an unset variable as `ENOENT`
+  rather than moving a sentinel to its caller. `stat_mode`, `unlink_force`
+  and `temp_dir` sit in the leaf module `std.filesystem.native` because
+  `std.filesystem`, its removal and transaction modules, and `std.net.local`
+  all use them.
 
 ## [3.2.0] - 2026-09-16
 
