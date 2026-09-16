@@ -58,6 +58,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `std.system.os.panic_sink(msg, len)` writes to the error stream and ends the
   process. The per-OS panic arms in `std.system.panic` are these sinks (#694).
 
+- `std.io.handle.socket(value)` wraps a native socket the process has just
+  opened or accepted, stamping the handle with a process-wide opening. Every
+  std socket constructor uses it (#716).
+- `std.net.async.stream(completion)` turns a successful accept or connect
+  completion into the stream the driver knows, opening included (#716).
+- `io.runtime.Completion.opening` and `io.runtime.complete_opened`: a completion
+  that hands over a socket carries its opening (#716).
+- `std.system.os.linux.io_queue_rearm` and `std.system.os.darwin.io_queue_rearm`
+  re-arm a registration the caller made, and `duplicate_to(from, to)` in the
+  same modules replaces a descriptor number in one step (#716).
+
 ### Changed
 - **Breaking.** Native codes classify with the full kind set. A code that used
   to be `OTHER` now gets its own kind: `EIO` is `IO`, `ENOENT` is `NOT_FOUND`,
@@ -164,6 +175,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `std.memory.secret.borrow_read_at` and `borrow_write_at` take
     `file: usize`.
   - `std.net.resolve.lines.Reader.fd` is a `usize`.
+
+- **Breaking.** A socket a `net.async` driver has seen is closed through the
+  driver (`submit_stream_close`, `submit_datagram_close`). `io.handle.SocketHandle`
+  gains an `opening`, and the linux, darwin and windows backends key their state
+  by native value and opening together. A socket closed outside its driver is
+  detected on the next submission through either handle:
+  - its pending work completes `CLOSED` with code 0
+  - a submission through the old handle is refused the same way
+  - the socket that now holds the native value keeps its own state and
+    registration
+
+  Before, the backends keyed state by the native value alone, so a reused value
+  inherited the old socket's pending operations, and a later cancel could
+  unregister the new owner (#716).
+- **Breaking.** `std.system.os.linux.io_queue_watch` only registers: a
+  descriptor that is already registered is refused with `EEXIST` instead of
+  being taken over, and a caller re-arms its own registration with
+  `io_queue_rearm`. A backend resource unregisters only a registration it made
+  (#716).
+- **Migration.** Close a socket a driver knows through that driver. hedge's
+  `listener.close_connection` (`tcp.stream_close` on a driver-tracked stream) is
+  the known case. Build accepted and connected streams with
+  `net.async.stream(completion)`, and wrap any other native socket once with
+  `io.handle.socket` and pass that handle around: two handles wrapped from one
+  live socket look like two sockets, and the driver treats the older one as
+  closed (#716).
 
 ### Removed
 - **Breaking.** `io.error.from_code` and `io.error.message`. Use
