@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- CI holds std's freestanding build to a checked-in list. `test/freestanding/verify.sh`
+  builds every module for `freestanding-x86_64` and fails when a listed module
+  stops building, when a module that builds is not listed, or when the list
+  names a module that does not exist. The list starts at the 36 modules that
+  build today (#684).
+
 ### Changed
 - CI follows the family contract in briar-systems/.github (briar-systems/mach#3447).
   One `ci.yml` calls the shared library pipeline and ends in a `gate` job. linux
