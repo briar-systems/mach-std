@@ -1113,11 +1113,13 @@ pub fun prepare_wait(runtime: *Runtime, timeout_ms: i32) res[WaitPlan, io_error.
         mutex.unlock(?runtime.lock);
         ret res[WaitPlan, io_error.Error].err{settled.err};
     }
-    if (lifecycle.snapshot(?runtime.lifecycle).state == lifecycle.CLOSED || runtime.count != 0) {
+    if (lifecycle.snapshot(?runtime.lifecycle).state == lifecycle.CLOSED) {
         mutex.unlock(?runtime.lock);
         ret res[WaitPlan, io_error.Error].ok{WaitPlan{wait: false, timeout_ms: 0}};
     }
-    val native_timeout: i32 = timer_timeout(runtime, timeout_ms, settled.ok);
+    var native_timeout: i32 = timer_timeout(runtime, timeout_ms, settled.ok);
+    # ready completions forbid blocking, not collecting readiness
+    if (runtime.count != 0) { native_timeout = 0; }
     mutex.unlock(?runtime.lock);
     ret res[WaitPlan, io_error.Error].ok{WaitPlan{wait: true, timeout_ms: native_timeout}};
 }
@@ -1205,6 +1207,23 @@ fun flush_sources(runtime: *Runtime) {
     });
 }
 
+# collects native readiness and publishes every source's queued completions
+# woken reports a consumed wake, which the caller owes a return for
+# the caller owns native_lock
+fun collect_native(runtime: *Runtime, timeout_ms: i32, woken: *bool) i64 {
+    val waited: i64 = native_poll(runtime, timeout_ms);
+    if (waited < 0) { ret waited; }
+    var i: usize = 0;
+    for (i < waited::usize) {
+        val event: NativeEvent = runtime.native_events[i];
+        if ((event.events & native_os.IO_EVENT_WAKE) != 0) { @woken = true; }
+        dispatch_sources(runtime, event);
+        i = i + 1;
+    }
+    flush_sources(runtime);
+    ret waited;
+}
+
 # timeout_ms is relative and uses -1 for an unbounded wait
 # the caller owns output and may reuse it after this call returns
 pub fun wait(runtime: *Runtime, output: *Completion, output_capacity: usize, timeout_ms: i32) res[usize, io_error.Error] {
@@ -1219,29 +1238,32 @@ pub fun wait(runtime: *Runtime, output: *Completion, output_capacity: usize, tim
         mutex.unlock(?runtime.native_lock);
         ret res[usize, io_error.Error].err{invalid(io_error.OP_WAIT)};
     }
-    flush_sources(runtime);
+    # readiness is collected without blocking before completions are returned,
+    # so a resource that completes at submission cannot keep the native queue
+    # from being polled
+    var woken:     bool = false;
+    val collected: i64  = collect_native(runtime, 0, ?woken);
     mutex.unlock(?runtime.native_lock);
+    if (collected < 0) {
+        ret res[usize, io_error.Error].err{io_error.from_code(collected, io_error.OP_WAIT)};
+    }
     val initial: res[usize, io_error.Error] = poll(runtime, output, output_capacity);
     if (sel initial.err) { ret initial; }
     if (initial.ok > 0)  { ret initial; }
+    # this call consumed the wake that a blocking poll would have returned on,
+    # so it owes that return rather than a wait
+    if (woken) { ret res[usize, io_error.Error].ok{0}; }
     val prepared: res[WaitPlan, io_error.Error] = prepare_wait(runtime, timeout_ms);
     if (sel prepared.err) { ret res[usize, io_error.Error].err{prepared.err}; }
     val plan: WaitPlan = prepared.ok;
     if (!plan.wait) { ret res[usize, io_error.Error].ok{0}; }
 
     mutex.lock(?runtime.native_lock);
-    val waited: i64 = native_poll(runtime, plan.timeout_ms);
+    val waited: i64 = collect_native(runtime, plan.timeout_ms, ?woken);
+    mutex.unlock(?runtime.native_lock);
     if (waited < 0) {
-        mutex.unlock(?runtime.native_lock);
         ret res[usize, io_error.Error].err{io_error.from_code(waited, io_error.OP_WAIT)};
     }
-    var i: usize = 0;
-    for (i < waited::usize) {
-        dispatch_sources(runtime, runtime.native_events[i]);
-        i = i + 1;
-    }
-    flush_sources(runtime);
-    mutex.unlock(?runtime.native_lock);
     ret poll(runtime, output, output_capacity);
 }
 
@@ -1496,8 +1518,9 @@ test "runtime: external wait preparation never consumes completions" {
     if (sel submitted.err)                                      { ret 1; }
     if (!ok_err(complete(?runtime, submitted.ok, 3, 0, false))) { ret 1; }
     val blocked: res[WaitPlan, io_error.Error] = prepare_wait(?runtime, 7);
-    if (sel blocked.err) { ret 1; }
-    if (blocked.ok.wait) { ret 1; }
+    if (sel blocked.err)            { ret 1; }
+    if (!blocked.ok.wait)           { ret 1; }
+    if (blocked.ok.timeout_ms != 0) { ret 1; }
     var output:  Completion;
     val drained: res[usize, io_error.Error] = poll(?runtime, ?output, 1);
     if (sel drained.err)      { ret 1; }
