@@ -16,6 +16,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flag is set on linux, darwin and windows, and none is set on any other target
   (#685).
 
+## [3.2.1] - 2026-09-16
+
+Tested with mach 5.2.1, the family CI seed.
+
+### Fixed
+- A `net.resolve` resolver on an `io.runtime` no longer claims native events
+  that belong to other sources. Its dispatch returned "claimed" whenever it
+  published a result, and the runtime stops offering an event at the first
+  claim, so a resolver registered before a `net.async` driver could swallow a
+  socket's oneshot readiness. The socket was then never re-armed and its
+  pending operation never completed. The resolver owns no native context and
+  now never claims one, and `io.runtime.DispatchFun` documents the rule
+  (#715).
+- On windows, a pending `net.async` datagram receive batch completes as soon as
+  a datagram is available and carries every datagram already queued, up to its
+  count, as on linux and darwin. It used to wait until the whole batch had
+  arrived, so a server that kept `receive_batch(16)` pending waited for sixteen
+  datagrams under light traffic. After the first datagram the windows backend
+  now takes only datagrams that are already queued, with a synchronous
+  receive, and never posts a receive that could wait. The batch contract is
+  documented on `submit_receive_batch` (#718).
+- The `net.async` packet record documents `capacity` and `length`. A send
+  refuses a length above the packet's capacity, which the windows backend
+  already enforced (#711).
+- `net.async` has regression coverage for a pending datagram receive under
+  load: a flood past the receive buffer with one thread and with a submitting
+  thread, and scoped batch-of-one sends with cancelled child scopes and table
+  growth. The #711 stall report traced to the caller, not std, so no library
+  behaviour changed for it (#711).
+
 ## [3.2.0] - 2026-09-16
 
 ### Added
