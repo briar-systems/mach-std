@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `net.async.submit_listener_close(driver, scope, listener, context)` closes a
+  TCP listener the driver knows about, so the backend unregisters it. Every
+  accept still pending on it completes cancelled, and the listener's handle is
+  invalidated. A listener that has had an accept submitted is closed this way,
+  not with `tcp.listener_close`, the same as streams and datagram sockets
+  close through `submit_stream_close` and `submit_datagram_close` (#724).
 - `std.system.capability`: comptime flags for the OS capability groups a
   target provides, `HOSTED`, `HAS_PAGES`, `HAS_CLOCK`, `HAS_ENTROPY`,
   `HAS_THREADS`, `HAS_FILES`, `HAS_IO_QUEUE`, `HAS_SOCKETS` and `HAS_PROCESS`.
