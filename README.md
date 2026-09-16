@@ -36,8 +36,9 @@ Changes that invalidate an existing supported combination require a major releas
 Version compatibility does not silently move an application's dependency pin.
 
 Std 2.0.0 is the dependency of the Mach 5.0.0 implementation. CI builds and
-tests it with the published 5.0.0 release, downloaded and verified against its
-SHA256SUMS. Compiler and std version numbers are independent.
+tests std with the published mach release pinned for the whole family in
+[briar-systems/.github](https://github.com/briar-systems/.github), downloaded and
+verified against its SHA256SUMS. Compiler and std version numbers are independent.
 
 ## Documentation
 
