@@ -6,6 +6,7 @@ use io_handle: std.io.handle;
 use std.io.lifecycle;
 use io_runtime: std.io.runtime;
 use std.memory;
+use table: std.memory.table;
 use std.net.ip;
 use socket_api: std.net.socket;
 use std.net.tcp;
@@ -79,8 +80,8 @@ pub rec Driver {
     runtime:           *io_runtime.Runtime;
     source:            io_runtime.SourceToken;
     backend:           impl.Backend;
-    slots:             *Slot;
-    capacity:          usize;
+    slots:             table.Table;
+    slot_count:        usize;
     backend_destroyed: bool;
     lock:              mutex.Mutex;
 }
@@ -90,16 +91,34 @@ pub fun aliases(driver: *Driver, data: *u8, len: usize) bool {
     if (!memory.range_valid(data, len)) { ret true; }
     if (len == 0)                       { ret false; }
     if (!memory.range_valid(driver::*u8, $size_of(Driver)) ||
-        driver.runtime == nil || driver.capacity == 0 ||
+        driver.runtime == nil || driver.slots.capacity == 0 ||
         driver.backend_destroyed) { ret true; }
-    var slot_bytes: usize = 0;
-    if (!memory.range_scaled(driver.capacity, $size_of(Slot), ?slot_bytes)) {
-        ret true;
-    }
     ret memory.ranges_overlap(driver::*u8, $size_of(Driver), data, len) ||
-        memory.ranges_overlap(driver.slots::*u8, slot_bytes, data, len) ||
+        table.aliases(?driver.slots, data, len) ||
         io_runtime.aliases(driver.runtime, data, len) ||
         impl.aliases(?driver.backend, data, len);
+}
+
+fun slot_at(driver: *Driver, index: usize) *Slot {
+    ret table.at(?driver.slots, index)::*Slot;
+}
+
+fun init_slot(driver: *Driver, index: usize) {
+    val slot: *Slot = slot_at(driver, index);
+    slot.state         = SLOT_FREE;
+    slot.generation    = 0;
+    slot.native_active = false;
+    slot.owns_resource = false;
+}
+
+# the runtime owns the index space, so the driver grows to whatever it hands out
+fun ensure_slot(driver: *Driver, index: usize) *Slot {
+    if (!table.reserve(?driver.slots, index + 1)) { ret nil; }
+    for (driver.slot_count <= index) {
+        init_slot(driver, driver.slot_count);
+        driver.slot_count = driver.slot_count + 1;
+    }
+    ret slot_at(driver, index);
 }
 
 fun invalid(operation: io_error.Operation) io_error.Error {
@@ -136,8 +155,8 @@ fun context_token(context: usize, token: *io_runtime.Token) bool {
 }
 
 fun slot_for(driver: *Driver, token: io_runtime.Token) *Slot {
-    if (token.index::usize >= driver.capacity) { ret nil; }
-    val slot: *Slot = ?driver.slots[token.index::usize];
+    if (token.index::usize >= driver.slot_count) { ret nil; }
+    val slot: *Slot = slot_at(driver, token.index::usize);
     if (slot.state != SLOT_ACTIVE || slot.generation != token.generation) { ret nil; }
     ret slot;
 }
@@ -199,32 +218,19 @@ fun source_release(context: ptr, completion: *io_runtime.Completion) {
     mutex.unlock(?driver.lock);
 }
 
+# the driver starts at the runtime's initial size and grows with it
 pub fun make(driver: *Driver, runtime: *io_runtime.Runtime) err[io_error.Error] {
-    if (driver == nil || runtime == nil || runtime.capacity == 0) {
+    if (driver == nil || runtime == nil || runtime.initial == 0) {
         ret err[io_error.Error].err{invalid(io_error.OP_CREATE)};
     }
-    val capacity:  usize = runtime.capacity;
-    val slot_size: usize = $size_of(Slot);
-    val bytes:     usize = slot_size * capacity;
-    if (bytes / slot_size != capacity) {
-        ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
-    }
-    driver.slots = os.allocate(bytes)::*Slot;
-    if (driver.slots == nil) {
+    val capacity: usize = runtime.initial;
+    if (!table.make(?driver.slots, $size_of(Slot), capacity)) {
         ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
     }
     driver.runtime           = runtime;
-    driver.capacity          = capacity;
+    driver.slot_count        = 0;
     driver.backend_destroyed = false;
     driver.lock              = mutex.make();
-    var i: usize = 0;
-    for (i < capacity) {
-        driver.slots[i].state         = SLOT_FREE;
-        driver.slots[i].generation    = 0;
-        driver.slots[i].native_active = false;
-        driver.slots[i].owns_resource = false;
-        i                             = i + 1;
-    }
     val registered: res[io_runtime.SourceToken, io_error.Error] = io_runtime.register_source(
         runtime,
         driver::ptr,
@@ -233,20 +239,16 @@ pub fun make(driver: *Driver, runtime: *io_runtime.Runtime) err[io_error.Error] 
         source_release,
     );
     if (sel registered.err) {
-        os.deallocate(driver.slots::ptr, bytes);
-        driver.slots    = nil;
-        driver.runtime  = nil;
-        driver.capacity = 0;
+        table.destroy(?driver.slots);
+        driver.runtime = nil;
         ret err[io_error.Error].err{registered.err};
     }
     driver.source = registered.ok;
     val code: i64 = impl.make(?driver.backend, ?runtime.queue, capacity, io_runtime.source_id(driver.source));
     if (code < 0) {
         io_runtime.unregister_source(runtime, driver.source);
-        os.deallocate(driver.slots::ptr, bytes);
-        driver.slots    = nil;
-        driver.runtime  = nil;
-        driver.capacity = 0;
+        table.destroy(?driver.slots);
+        driver.runtime = nil;
         ret err[io_error.Error].err{io_error.from_code(code, io_error.OP_CREATE)};
     }
     ret err[io_error.Error].ok{};
@@ -275,11 +277,15 @@ fun claim_locked(
         ret res[bool, io_error.Error].err{submitted.err};
     }
     @token = submitted.ok;
-    if (token.index::usize >= driver.capacity || driver.slots[token.index::usize].state != SLOT_FREE) {
+    val slot: *Slot = ensure_slot(driver, token.index::usize);
+    if (slot == nil) {
+        io_runtime.fail(driver.runtime, @token, exhausted(io_error.OP_SUBMIT));
+        ret res[bool, io_error.Error].ok{false};
+    }
+    if (slot.state != SLOT_FREE) {
         io_runtime.fail(driver.runtime, @token, io_error.from_code(os.EBUSY, io_error.OP_SUBMIT));
         ret res[bool, io_error.Error].ok{false};
     }
-    val slot: *Slot = ?driver.slots[token.index::usize];
     slot.state         = SLOT_ACTIVE;
     slot.generation    = token.generation;
     slot.native_active = false;
@@ -626,8 +632,8 @@ pub fun destroy(driver: *Driver) err[io_error.Error] {
     }
     mutex.lock(?driver.lock);
     var i: usize = 0;
-    for (i < driver.capacity) {
-        if (driver.slots[i].state != SLOT_FREE) {
+    for (i < driver.slot_count) {
+        if (slot_at(driver, i).state != SLOT_FREE) {
             mutex.unlock(?driver.lock);
             ret err[io_error.Error].err{io_error.from_code(os.EBUSY, io_error.OP_CLOSE)};
         }
@@ -653,11 +659,9 @@ pub fun destroy(driver: *Driver) err[io_error.Error] {
         ret err[io_error.Error].err{released_source.err};
     }
     mutex.lock(?driver.lock);
-    val bytes:    usize = $size_of(Slot) * driver.capacity;
-    val released: i64   = os.deallocate(driver.slots::ptr, bytes);
-    driver.slots    = nil;
-    driver.runtime  = nil;
-    driver.capacity = 0;
+    val released: i64 = table.destroy(?driver.slots);
+    driver.slot_count = 0;
+    driver.runtime    = nil;
     mutex.unlock(?driver.lock);
     if (released < 0) {
         ret err[io_error.Error].err{io_error.from_code(released, io_error.OP_CLOSE)};
@@ -673,10 +677,13 @@ test "async network: ownership query includes driver backend and runtime" {
         !aliases((~(0::usize) - 1)::*Driver, ?external[0], 1) ||
         !ok_err(io_runtime.make(?runtime, 2))) { ret 1; }
     var partial: impl.Backend;
-    partial.queue    = ?runtime.queue;
-    partial.capacity = 2;
+    partial.queue = ?runtime.queue;
     $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
-        partial.map_capacity = 4;
+        partial.operations.capacity = 2;
+        partial.map_capacity        = 4;
+    }
+    $or {
+        partial.capacity = 2;
     }
     if (!impl.aliases(?partial, ?external[0], 1) ||
         !impl.aliases((~(0::usize) - 1)::*impl.Backend,
@@ -685,19 +692,18 @@ test "async network: ownership query includes driver backend and runtime" {
     val make_result: err[io_error.Error] = make(?driver, ?runtime);
     if (sel make_result.err) { ret 3; }
     if (!aliases(?driver, (?driver)::*u8, $size_of(Driver)) ||
-        !aliases(?driver, driver.slots::*u8, $size_of(Slot) * 2) ||
+        !aliases(?driver, driver.slots.chunks[0]::*u8, $size_of(Slot) * 2) ||
         !aliases(?driver, (?driver.backend)::*u8, $size_of(impl.Backend)) ||
-        !aliases(?driver, driver.backend.operations::*u8, 1) ||
-        !aliases(?driver, runtime.slots::*u8, 1) ||
+        !aliases(?driver, driver.backend.operations.chunks[0]::*u8, 1) ||
+        !aliases(?driver, runtime.slots.chunks[0]::*u8, 1) ||
         aliases(?driver, ?external[0], 8) ||
         aliases(?driver, (~(0::usize))::*u8, 1) ||
         !aliases(?driver, (~(0::usize) - 1)::*u8, 3)) { ret 4; }
     $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
-        if (!aliases(?driver, driver.backend.resources::*u8, 1) ||
+        if (!aliases(?driver, driver.backend.resources.chunks[0]::*u8, 1) ||
             !aliases(?driver, driver.backend.resource_map::*u8, 1) ||
             !aliases(?driver, driver.backend.native::*u8, 1) ||
-            !aliases(?driver, driver.backend.queued::*u8, 1) ||
-            !aliases(?driver, driver.backend.ready::*u8, 1)) { ret 5; }
+            !aliases(?driver, driver.backend.ready.chunks[0]::*u8, 1)) { ret 5; }
     }
     $or {
         if (!aliases(?driver, driver.backend.attached::*u8, 1) ||
