@@ -50,6 +50,19 @@ fun scope_changed(r: cancel.Transition) bool {
     ret false;
 }
 
+# a submission leaves a wake pending and a wait that consumes it may return
+# empty, which is observable wherever loopback delivery lags the send
+fun wait_one(driver: *Driver, output: *io_runtime.Completion) bool {
+    var attempt: usize = 0;
+    for (attempt < 4) {
+        val waited: res[usize, io_error.Error] = wait(driver, output, 1, 1000);
+        if (sel waited.err) { ret false; }
+        if (waited.ok == 1) { ret true; }
+        attempt = attempt + 1;
+    }
+    ret false;
+}
+
 $if ($mach.build.os == $mach.os.linux) {
     use impl: std.net.async.linux;
 }
@@ -743,10 +756,9 @@ test "async network: graceful and abortive stream close traces are distinct" {
     if (sel accept_result.err) { ret 6; }
     val client_result: res[tcp.Stream, io_error.Error] = tcp.connect(endpoint_result.ok);
     if (sel client_result.err) { ret 6; }
-    var client:      tcp.Stream                 = client_result.ok;
-    var output:      io_runtime.Completion;
-    val accept_wait: res[usize, io_error.Error] = wait(?driver, ?output, 1, 1000);
-    if (!(sel accept_wait.ok && accept_wait.ok == 1)
+    var client: tcp.Stream = client_result.ok;
+    var output: io_runtime.Completion;
+    if (!wait_one(?driver, ?output)
         || output.has_error
         || output.kind != io_runtime.ACCEPT
         || output.context != 120) {
@@ -1042,6 +1054,12 @@ val STARVED_PEERS:  usize = 8;
 val STARVED_ROUNDS: usize = 16;
 val STARVED_BUFFER: usize = 64;
 
+# a queued completion keeps wait from blocking, so a loop that always has one
+# is paced instead, bounding it by time rather than by how fast it spins
+val PACED_ROUNDS:  usize = 2000;
+val PACE_NSEC:     i64   = 1000000;
+val PAIR_ATTEMPTS: usize = 10;
+
 # one resource whose writes complete at submission must not keep the native
 # queue from being polled for every other resource's readiness
 test "async network: a resource completing at submission starves no reader" {
@@ -1068,8 +1086,7 @@ test "async network: a resource completing at submission starves no reader" {
         val client_result: res[tcp.Stream, io_error.Error] = tcp.connect(endpoint_result.ok);
         if (sel client_result.err) { ret 7; }
         clients[i] = client_result.ok;
-        val waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 1, 1000);
-        if (!(sel waited.ok && waited.ok == 1)
+        if (!wait_one(?driver, ?output[0])
             || output[0].has_error
             || output[0].kind != io_runtime.ACCEPT) {
             ret 8;
@@ -1106,7 +1123,8 @@ test "async network: a resource completing at submission starves no reader" {
     var reads:  usize = 0;
     var writes: usize = 0;
     var rounds: usize = 0;
-    for (reads < STARVED_PEERS && rounds < STARVED_ROUNDS) {
+    for (reads < STARVED_PEERS && rounds < PACED_ROUNDS) {
+        if (rounds != 0) { os.sleep(PACE_NSEC); }
         val waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 16, 1000);
         if (sel waited.err) { ret 12; }
         var j: usize = 0;
@@ -1156,11 +1174,14 @@ test "async network: a resource completing at submission starves no reader" {
 # together with one its own collect has just produced, so a consumer that acts
 # on a call carrying at most one completion per resource is wrong.
 #
-# this pins #658's behaviour rather than a version-independent rule. measured
-# against the pre-#658 shape, where wait flushed without collecting, it returns
-# the queued write alone and this fails at 13. a batch of more than one was
-# always possible there, but only out of a single collect, never mixing a queued
+# this pins #658's behaviour rather than a version-independent rule. against the
+# pre-#658 shape, where wait flushed without collecting, every attempt returns
+# the queued write alone and this fails at 17. a batch of more than one was always
+# possible there, but only out of a single collect, never mixing a queued
 # completion with a fresh one (#670).
+#
+# darwin can land the byte after the send returns, so an attempt whose wait
+# misses it settles the read alone and starts over with a longer pause.
 test "async network: one wait returns a queued completion and a collected one together" {
     var runtime: io_runtime.Runtime;
     if (!ok_err(io_runtime.make(?runtime, 16))) { ret 1; }
@@ -1180,56 +1201,69 @@ test "async network: one wait returns a queued completion and a collected one to
     if (sel accepted.err) { ret 6; }
     val client_result: res[tcp.Stream, io_error.Error] = tcp.connect(endpoint_result.ok);
     if (sel client_result.err) { ret 7; }
-    var client:  tcp.Stream                 = client_result.ok;
-    val settled: res[usize, io_error.Error] = wait(?driver, ?output[0], 1, 1000);
-    if (!(sel settled.ok && settled.ok == 1) || output[0].kind != io_runtime.ACCEPT) { ret 8; }
+    var client: tcp.Stream = client_result.ok;
+    if (!wait_one(?driver, ?output[0]) || output[0].kind != io_runtime.ACCEPT) { ret 8; }
     var server: tcp.Stream = tcp.Stream{handle: io_handle.SocketHandle{value: output[0].resource}};
 
-    # the read is armed before its peer writes, so its completion can only come
-    # from this runtime's own native collect
-    var inbound: [4]u8;
-    val reading: res[io_runtime.Token, io_error.Error] = submit_read(?driver, ?scope, ?server, ?inbound[0], 4, 701);
-    if (sel reading.err) { ret 9; }
-    # the write fits the send buffer, so it completes inside its own submission
-    # and is queued behind the collect rather than produced by it
+    var inbound:  [4]u8;
     var outbound: [4]u8;
+    var payload:  [1]u8;
     outbound[0] = 9;
-    val writing: res[io_runtime.Token, io_error.Error] = submit_write(?driver, ?scope, ?server, ?outbound[0], 4, 702);
-    if (sel writing.err) { ret 10; }
-    var payload: [1]u8;
-    payload[0] = 3;
-    val sent: res[usize, io_error.Error] = tcp.stream_write(?client, ?payload[0], 1);
-    if (!(sel sent.ok && sent.ok == 1)) { ret 11; }
-
-    val batch: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, 1000);
-    if (sel batch.err) { ret 12; }
-    if (batch.ok != 2) { ret 13; }
-    var reads:  usize = 0;
-    var writes: usize = 0;
-    var i:      usize = 0;
-    for (i < batch.ok) {
-        if (output[i].has_error)                { ret 14; }
-        if (output[i].kind == io_runtime.READ)  { reads = reads + 1; }
-        or (output[i].kind == io_runtime.WRITE) { writes = writes + 1; }
-        or                                      { ret 15; }
-        i = i + 1;
+    payload[0]  = 3;
+    var paired:  bool  = false;
+    var attempt: usize = 0;
+    var pause:   i64   = PACE_NSEC;
+    for (!paired && attempt < PAIR_ATTEMPTS) {
+        # the read is armed before its peer writes, so its completion can only
+        # come from this runtime's own native collect
+        val reading: res[io_runtime.Token, io_error.Error] = submit_read(?driver, ?scope, ?server, ?inbound[0], 4, 701);
+        if (sel reading.err) { ret 9; }
+        # the write fits the send buffer, so it completes inside its own
+        # submission and is queued behind the collect rather than produced by it
+        val writing: res[io_runtime.Token, io_error.Error] = submit_write(?driver, ?scope, ?server, ?outbound[0], 4, 702);
+        if (sel writing.err) { ret 10; }
+        val sent: res[usize, io_error.Error] = tcp.stream_write(?client, ?payload[0], 1);
+        if (!(sel sent.ok && sent.ok == 1)) { ret 11; }
+        # the pause changes when the byte lands, not what the wait may return
+        os.sleep(pause);
+        val batch: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, 1000);
+        if (sel batch.err) { ret 12; }
+        var reads:  usize = 0;
+        var writes: usize = 0;
+        var i:      usize = 0;
+        for (i < batch.ok) {
+            if (output[i].has_error)                { ret 13; }
+            if (output[i].kind == io_runtime.READ)  { reads = reads + 1; }
+            or (output[i].kind == io_runtime.WRITE) { writes = writes + 1; }
+            or                                      { ret 14; }
+            i = i + 1;
+        }
+        if (writes != 1 || reads > 1) { ret 15; }
+        if (reads == 1) {
+            paired = true;
+        }
+        or {
+            if (!wait_one(?driver, ?output[0]) || output[0].has_error || output[0].kind != io_runtime.READ) { ret 16; }
+            pause = pause * 2;
+        }
+        attempt = attempt + 1;
     }
-    if (reads != 1 || writes != 1) { ret 16; }
+    if (!paired) { ret 17; }
 
     var guard: usize = 0;
     for (io_runtime.pending(?runtime) > 0 && guard < 16) {
         val drained: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, 1000);
-        if (sel drained.err) { ret 17; }
+        if (sel drained.err) { ret 18; }
         guard = guard + 1;
     }
-    if (io_runtime.pending(?runtime) != 0) { ret 18; }
+    if (io_runtime.pending(?runtime) != 0) { ret 19; }
 
     tcp.stream_close(?server);
     tcp.stream_close(?client);
-    if (refused(tcp.listener_close(?listener))) { ret 19; }
-    if (!scope_ok(cancel.destroy(?scope)))      { ret 20; }
-    if (refused(destroy(?driver)))              { ret 21; }
-    if (!ok_bool(io_runtime.close(?runtime)))   { ret 22; }
-    if (!ok_err(io_runtime.destroy(?runtime)))  { ret 23; }
+    if (refused(tcp.listener_close(?listener))) { ret 20; }
+    if (!scope_ok(cancel.destroy(?scope)))      { ret 21; }
+    if (refused(destroy(?driver)))              { ret 22; }
+    if (!ok_bool(io_runtime.close(?runtime)))   { ret 23; }
+    if (!ok_err(io_runtime.destroy(?runtime)))  { ret 24; }
     ret 0;
 }
