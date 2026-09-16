@@ -2,7 +2,7 @@
 
 `verify.sh` builds `darwin_probe` against this checkout's std in both profiles
 and observes it from outside the process: the exit status the kernel reports
-for a `main` return, `os.terminate`, `os.abort` (a SIGABRT death) and a panic
+for a `main` return, `os.exit`, `os.abort` (a SIGABRT death) and a panic
 (255, with the message on stderr and nothing on stdout); the argument and
 environment blocks the entry captured, printed back by the `args` subcommand;
 and, through the `child` subcommand, the same contracts observed by a parent

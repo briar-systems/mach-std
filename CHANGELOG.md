@@ -49,6 +49,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cwd)` spawns from a verbatim native command line. It is a per-OS escape
   hatch outside the contract: the contract's argv spawns encode arguments with
   the CRT convention, which cmd.exe does not parse (#692).
+- `std.system.os.INVALID_HANDLE`, the handle no resource has, and
+  `os.stdin()`, `os.stdout()`, `os.stderr()` and `os.working_dir()`, the
+  process's standard handles and the directory handle that resolves a path
+  against the working directory. They are functions because a future
+  implementation may only learn them at run time (#694).
+- `std.system.os.exit(status: u32)` ends the process, and
+  `std.system.os.panic_sink(msg, len)` writes to the error stream and ends the
+  process. The per-OS panic arms in `std.system.panic` are these sinks (#694).
 
 ### Changed
 - **Breaking.** Native codes classify with the full kind set. A code that used
@@ -98,6 +106,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sentinel, which shared the native code space with `EPERM` (#692).
 - **Breaking.** The sockaddr layout is written once in `std.net.ip`.
   `to_sockaddr` and `from_sockaddr` no longer go through the OS layer (#692).
+- **Breaking.** Every descriptor that crosses the `std.system.os` contract is
+  a pointer-width handle (`usize`), not an `i32` (#694). A primitive that makes
+  a handle writes it through an out parameter and returns only a status, so a
+  handle value can never be read as a negative native code:
+  - `read`, `write`, `close`, `sync_fd`, `stat`, `set_mode`, `file_identity`,
+    `publication_capabilities`, `seek`, `lock_fd`, `map_file`,
+    `directory_init`, `read_at_secret` and `write_at_secret` take
+    `handle: usize`.
+  - `set_mode_at`, `identity_at`, `stat_path`, `unlink`, `make_dir`, `access`
+    and `rename` take `dir: usize` directory handles.
+  - `open(dir, path, flags, mode, out: *usize) i64` returns 0 and writes the
+    handle, where it used to return the descriptor.
+  - `retain_identity_at(dir, path, access, out, handle: *usize) i64` does the
+    same.
+  - `pipe(read_end: *usize, write_end: *usize) i64` replaces `pipe(fds: *i32)`.
+  - `spawn_redirected` and `spawn_redirected_in` take `usize` standard
+    handles, and `INVALID_HANDLE` keeps the parent's, where `-1` did.
+  - A missing handle is `INVALID_HANDLE`, never a negative value: a `usize`
+    compared with `< 0` is always false.
+
+  Worked example:
+
+  ```mach
+  # before
+  val fd: i64 = os.open(os.AT_FDCWD, path, os.O_RDONLY, 0);
+  if (fd < 0) { ret fail(fd); }
+  val n: i64 = os.read(fd::i32, buf, len);
+  os.close(fd::i32);
+
+  # after
+  var fd:     usize = os.INVALID_HANDLE;
+  val opened: i64   = os.open(os.working_dir(), path, os.O_RDONLY, 0, ?fd);
+  if (opened < 0) { ret fail(opened); }
+  val n: i64 = os.read(fd, buf, len);
+  os.close(fd);
+  ```
+
+  A pipe: `var r: usize; var w: usize; os.pipe(?r, ?w);` replaces
+  `var fds: [2]i32; os.pipe(?fds[0]);`. Code that needs a raw native
+  descriptor, for example to pass it through `SCM_RIGHTS`, uses the per-OS
+  module (`std.system.os.linux` and friends), which keeps its native `i32`
+  shape.
+- **Breaking.** The descriptors std's own APIs hold or accept are handles too
+  (#694):
+  - `std.filesystem.transaction.root_fd` and `root_home_fd` return `usize`,
+    and `INVALID_HANDLE` for an invalid root.
+  - `std.filesystem.transaction.ownership`: `control_fd`, `root_init`,
+    `root_init_with_home` and `root_set_home` use `usize`, and so do the `Root`,
+    `Lock` and `Borrow` descriptor fields.
+  - `std.filesystem.removal.tree` and `private_tree` take a `usize` directory
+    handle.
+  - `std.filesystem.native.unlink_force` takes `dir: usize`.
+  - `std.process.exec.spawn_redirected`, `spawn_redirected_grouped`,
+    `spawn_redirected_in` and `spawn_redirected_in_grouped` take `usize`
+    handles, and `os.INVALID_HANDLE` inherits the parent's stream.
+  - `std.memory.secret.borrow_read_at` and `borrow_write_at` take
+    `file: usize`.
+  - `std.net.resolve.lines.Reader.fd` is a `usize`.
 
 ### Removed
 - **Breaking.** `io.error.from_code` and `io.error.message`. Use
@@ -147,6 +213,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `temp_dir` sit in the leaf module `std.filesystem.native` because
   `std.filesystem`, its removal and transaction modules, and `std.net.local`
   all use them.
+- **Breaking.** `std.system.os.STDIN_FD`, `STDOUT_FD`, `STDERR_FD` and
+  `AT_FDCWD`. Use `os.stdin()`, `os.stdout()`, `os.stderr()` and
+  `os.working_dir()`. The per-OS modules keep the native constants (#694).
+- **Breaking.** `std.system.os.terminate`. Use `os.exit(status: u32)` (#694).
 
 ## [3.2.0] - 2026-09-16
 
