@@ -37,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   code. Nothing changes on linux, darwin or windows. `chrono.time`,
   `chrono.date`, `chrono.format`, `types.path` and `log.record` now build
   freestanding, 62 modules in all (#690).
+- `OS-CONTRACT.md` documents the `std.system.os` contract: its
+  capability groups, the members of each group as of 3.x, and the assumptions
+  a user-supplied implementation can rely on. `std.system.capability.conformance`
+  names every member of every group a target claims, so a missing member fails
+  the build (#691).
 
 ## [3.2.0] - 2026-09-16
 
