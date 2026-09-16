@@ -13,6 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stops building, when a module that builds is not listed, or when the list
   names a module that does not exist. The list starts at the 36 modules that
   build today (#684).
+- `io.error.make(kind, operation)` builds an error std raised itself, with no
+  native code behind it: `code` and `cleanup_code` are 0. A caller that needs a
+  synthetic error states its kind here instead of borrowing an errno (#687).
+- `io.error.Kind` gains `NOT_FOUND`, `EXISTS`, `NOT_DIRECTORY`,
+  `IS_DIRECTORY`, `NOT_EMPTY`, `NAME_TOO_LONG`, `BUSY`, `IO`, `RANGE`,
+  `NO_CHILD` and `LOOP`, numbered 15 to 25 after `OTHER`. Existing values keep
+  their numbers. `from_code` does not produce the new kinds yet, so every code
+  classifies exactly as before (#687).
 
 ### Changed
 - CI follows the family contract in briar-systems/.github (briar-systems/mach#3447).
@@ -30,6 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   binds only the imports a program can reach, so the darwin checks no longer
   saw `_fstat`, `_getentropy` and the process imports in a probe that never
   called them (#699).
+- **Behaviour change.** A fixed-capacity sink in `std.format`, `std.derive`
+  and `std.data.json` reports running out of room as
+  `io.error.make(RESOURCE_EXHAUSTED, OP_WRITE)`. The kind is unchanged, but
+  `code` is now 0 instead of the target's `ENOSPC` (#687).
+- The allocator interface documents backend release failures as a negative
+  backend native code rather than an errno (#687).
 
 ### Fixed
 - **Security.** On Windows, an owner-only mode (no group or other bits, such as
