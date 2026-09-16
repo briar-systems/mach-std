@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `io.writer.Buffered`, `io.writer.buffered`, `io.writer.flush` and `io.writer.pushed`: a writer that stages bytes in caller-owned storage and forwards full buffers to an inner writer, with an explicit flush, sticky failure and a request at or above the buffer's size passed straight through. `pushed` is the authoritative count of bytes the inner writer took, so a caller can report a true total after a staged pass (#654).
+- `io.writer.reprefix`: the same `WriteError` with its persisted prefix replaced, for restating a failure against a count the caller measured itself (#654).
+
+### Changed
+
+- `format`: literal text between holes now reaches the writer as one call per maximal run rather than one per byte, and padding is written in chunks of up to 32 fill bytes rather than one byte at a time. Output is unchanged (#654).
+- `print`: `printf`, `eprintf`, `printlnf`, `eprintlnf`, `println` and `eprintln` format into a 512-byte stack buffer and flush once before returning. A call whose output fits the buffer issues one write. Nothing is held across calls, so ordering and the interleaving of stdout and stderr are unchanged, and the reported byte count is the bytes that reached the fd (#654).
+
 ## [2.1.0] - 2026-09-13
 
 ### Added
