@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `std.system.capability`: comptime flags for the OS capability groups a
+  target provides, `HOSTED`, `HAS_PAGES`, `HAS_CLOCK`, `HAS_ENTROPY`,
+  `HAS_THREADS`, `HAS_FILES`, `HAS_IO_QUEUE`, `HAS_SOCKETS` and `HAS_PROCESS`.
+  A module gates on them with `$if`, which discards an OS-bound branch before
+  resolution. The module imports nothing OS-bound and builds freestanding. Every
+  flag is set on linux, darwin and windows, and none is set on any other target
+  (#685).
+
 ## [3.1.0] - 2026-09-16
 
 ### Added
