@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `io.runtime.wait`'s batching is now covered by a test: one call may return a
+  completion that was already queued together with one its own native collect
+  produced, so a consumer must not act on a call carrying at most one completion
+  per resource (#670). Nothing changed in the runtime; the behaviour was
+  unasserted and a downstream consumer built on the opposite assumption.
 - `memory.table`: chunked element storage whose live elements never move. A
   table appends a chunk to a fixed inline directory instead of reallocating, so
   an address handed out stays valid for the life of the table and only the
