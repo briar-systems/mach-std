@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.4.0] - 2026-09-17
+
+Rebuild everything that links std, do not just recompile against the new
+sources. `buffers.Source` and `buffers.SecretSource` each grew by one word
+(`fn_lanes`). Source that builds these records still compiles unchanged, but an
+object file built against 5.3.x that stores or passes one uses the old layout,
+still links, and misreads the lane count.
+
+### Added
+- `buffers.source_lanes`, `buffers.secret_source_lanes` and `buffers.lanes`
+  report how many per-lane budgets a source reads at account open, 0 when it
+  declares none. `Source` and `SecretSource` gain an `fn_lanes` member, set by
+  `buffers.source` and `buffers.secret_source`. A caller with a fixed-size
+  budget array should check the count and refuse a source whose count differs:
+  opening an account reads exactly that many budgets from the pointer it is
+  given, so a shorter array is read past its end and the stray words become
+  budgets. A hand-written `Source` or `SecretSource` that leaves `fn_lanes` out
+  still compiles and reports 0, and a wrapper should forward the member of the
+  source it wraps (#804).
+
+### Changed
+- A std module that needs an OS capability the target lacks now refuses a
+  freestanding build with exactly one diagnostic naming what it needs, for
+  example `std.filesystem needs the files capability
+  (std.system.capability.HAS_FILES)`, instead of hundreds of resolution errors.
+  Each OS-bound module gates its OS-bound imports on the capability flags it
+  uses directly. `std.system.os`, `std.system.panic` and `std.runtime` say they
+  need a linux, darwin or windows target, and the per-OS runtime and terminal
+  modules name their own target. `std.system.os.secret` no longer repeats
+  `std.system.os`'s refusal. `test/freestanding/verify.sh` enforces the single
+  diagnostic for every module that does not build (#695).
+
+### Documentation
+- The README states what the version number promises. The driver and library
+  modules are covered. The seven `std.net.async` backend modules may change
+  signatures in a minor release. Calling past a driver is expected, so a
+  caller that does should check this file when upgrading (#799, #802).
+
 ## [5.3.0] - 2026-09-17
 
 Rebuild everything that links std before running it on 5.3.0. The runtime's
