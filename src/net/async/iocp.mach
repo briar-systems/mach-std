@@ -1,0 +1,833 @@
+# per-socket bookkeeping shared by the windows completion port backends
+#
+# the core decides what each state change on a socket makes due and makes no
+# native call itself, so a backend performs whatever a decision asks for and
+# every decision costs the same whatever else the backend holds. a backend
+# embeds one Link in each operation and hands the core the operation table and
+# the link's offset, so the core never owns or moves an operation
+
+use std.allocator;
+use std.io.runtime;
+use std.memory;
+use std.memory.table;
+use std.net.async.types;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+pub val NONE: u32 = 0xffffffff;
+
+pub val FREE:   u8 = 0;
+pub val ACTIVE: u8 = 1;
+# a driver cancel that waits for the operation's packet itself
+pub val CANCELLED: u8 = 2;
+# settled with its result once its aborted packet arrives
+pub val CANCEL_READY: u8 = 3;
+# a control waiting for its socket to allow it
+pub val CONTROL_PENDING: u8 = 4;
+# settled with its result without a packet
+pub val CONTROL_READY: u8 = 5;
+# a read-lane request held back so it posts in submission order
+pub val DEFERRED: u8 = 6;
+
+pub val ACQUIRED: u8 = 0;
+pub val CREATED:  u8 = 1;
+# the handle's socket was closed and its value reused by a newer opening
+pub val STALE:     u8 = 2;
+pub val EXHAUSTED: u8 = 3;
+
+val LANE_OTHER:    u8 = 0;
+val LANE_READ:     u8 = 1;
+val LANE_READABLE: u8 = 2;
+val LANE_WRITE:    u8 = 3;
+val LANE_CONTROL:  u8 = 4;
+
+# the lane of each runtime kind, indexed by the kind's value
+val LANES: [17]u8 = [17]u8{
+    LANE_OTHER,
+    LANE_OTHER,
+    LANE_READ,
+    LANE_WRITE,
+    LANE_OTHER,
+    LANE_WRITE,
+    LANE_OTHER,
+    LANE_OTHER,
+    LANE_OTHER,
+    LANE_OTHER,
+    LANE_OTHER,
+    LANE_CONTROL,
+    LANE_CONTROL,
+    LANE_OTHER,
+    LANE_OTHER,
+    LANE_OTHER,
+    LANE_READABLE,
+};
+
+# the core's part of an operation, embedded in the backend's operation record
+# ---
+# state:     one of the slot states above, changed only through the core
+# kind:      the runtime kind the operation was joined with
+# socket:    index of the socket record the operation belongs to
+# sock_prev: previous operation on the same socket
+# sock_next: next operation on the same socket
+# lane_prev: previous operation on the one lane list the state implies
+# lane_next: next operation on that lane list
+# result:    the status a ready or cancel-ready operation settles with
+pub rec Link {
+    state:     u8;
+    kind:      runtime.Kind;
+    socket:    u32;
+    sock_prev: u32;
+    sock_next: u32;
+    lane_prev: u32;
+    lane_next: u32;
+    result:    i64;
+}
+
+# one native socket under one opening
+# ---
+# socket:            the native socket value
+# opening:           the opening of the handle the record was acquired for
+# ops_head:          first operation on the socket
+# ops_tail:          last operation on the socket
+# op_count:          operations on the socket, the control included
+# inflight_reads:    read-lane operations whose native request is outstanding
+# inflight_readable: the readiness waits among them
+# inflight_writes:   write-lane operations on the socket, in any state
+# deferred_head:     oldest held read-lane operation
+# deferred_tail:     newest held read-lane operation
+# control:           the socket's one shutdown or close, or NONE
+# mapped:            whether a submit for the socket value finds this record
+# associated:        whether the socket is associated with the completion port
+# live:              whether the record is in use
+pub rec Socket {
+    socket:            usize;
+    opening:           u64;
+    ops_head:          u32;
+    ops_tail:          u32;
+    op_count:          usize;
+    inflight_reads:    usize;
+    inflight_readable: usize;
+    inflight_writes:   usize;
+    deferred_head:     u32;
+    deferred_tail:     u32;
+    control:           u32;
+    mapped:            bool;
+    associated:        bool;
+    live:              bool;
+    index:             u32;
+    next_free:         u32;
+}
+
+# ---
+# allocator:    where the socket table and map come from
+# link_offset:  offset of the Link inside the backend's operation record
+# socket_map:   open-addressed map from socket value to record index plus one
+# mapped_count: records a submit can find
+# live_count:   records in use, mapped or still draining
+# ready_head:   oldest operation in the control-ready state
+# pending_head: an operation in the control-pending state
+# steps:        map probes and list iterations, for the scaling tests
+pub rec Core {
+    allocator:    allocator.Allocator;
+    link_offset:  usize;
+    sockets:      table.Table;
+    socket_slots: usize;
+    free_socket:  u32;
+    socket_map:   *u32;
+    map_capacity: usize;
+    mapped_count: usize;
+    live_count:   usize;
+    ready_head:   u32;
+    ready_tail:   u32;
+    pending_head: u32;
+    pending_tail: u32;
+    steps:        u64;
+}
+
+pub fun link(core: *Core, ops: *table.Table, index: u32) *Link {
+    ret (table.at(ops, index::usize)::usize + core.link_offset)::*Link;
+}
+
+pub fun socket_at(core: *Core, index: u32) *Socket {
+    ret table.at(?core.sockets, index::usize)::*Socket;
+}
+
+fun lane_of(kind: runtime.Kind) u8 {
+    if (kind::usize >= $length_of([17]u8)) { ret LANE_OTHER; }
+    ret LANES[kind::usize];
+}
+
+fun read_lane(lane: u8) bool {
+    ret lane == LANE_READ || lane == LANE_READABLE;
+}
+
+# a cancelled or cancel-ready request still holds its native request
+fun in_flight(state: u8) bool {
+    ret state == ACTIVE || state == CANCELLED || state == CANCEL_READY;
+}
+
+fun required_map_capacity(capacity: usize) usize {
+    if (capacity > 0x3fffffff) { ret 0; }
+    val required: usize = capacity * 2;
+    var size:     usize = 1;
+    for (size < required) { size = size * 2; }
+    ret size;
+}
+
+# socket values share their low bits, so the product's high bits are folded in
+fun socket_hash(socket: usize) usize {
+    val product: usize = socket * 11400714819323198485;
+    ret product ^ (product >> 32);
+}
+
+fun map_bytes(capacity: usize, bytes: *usize) bool {
+    ret memory.range_scaled(capacity, $size_of(u32), bytes);
+}
+
+fun map_allocate(core: *Core, capacity: usize) *u32 {
+    var bytes: usize = 0;
+    if (!map_bytes(capacity, ?bytes)) { ret nil; }
+    val got: res[ptr, allocator.Error] = allocator.allocate_raw(?core.allocator, bytes, $align_of(u32));
+    if (sel got.err) { ret nil; }
+    val map: *u32  = got.ok::*u32;
+    var i:   usize = 0;
+    for (i < capacity) {
+        map[i] = 0;
+        i      = i + 1;
+    }
+    ret map;
+}
+
+fun map_release(core: *Core, map: *u32, capacity: usize) {
+    var bytes: usize = 0;
+    if (map == nil || !map_bytes(capacity, ?bytes)) { ret; }
+    allocator.deallocate_raw(?core.allocator, map::ptr, bytes, $align_of(u32));
+}
+
+# the socket table starts at initial records and grows on demand
+pub fun make(core: *Core, a: *allocator.Allocator, link_offset: usize, initial: usize) bool {
+    if (core == nil || a == nil || initial == 0) { ret false; }
+    core.allocator    = @a;
+    core.link_offset  = link_offset;
+    core.socket_slots = 0;
+    core.free_socket  = NONE;
+    core.mapped_count = 0;
+    core.live_count   = 0;
+    core.ready_head   = NONE;
+    core.ready_tail   = NONE;
+    core.pending_head = NONE;
+    core.pending_tail = NONE;
+    core.steps        = 0;
+    core.socket_map   = nil;
+    core.map_capacity = 0;
+    if (!table.make(?core.sockets, ?core.allocator, $size_of(Socket), initial)) { ret false; }
+    val capacity: usize = required_map_capacity(core.sockets.capacity);
+    if (capacity != 0) { core.socket_map = map_allocate(core, capacity); }
+    if (core.socket_map == nil) {
+        table.destroy(?core.sockets);
+        ret false;
+    }
+    core.map_capacity = capacity;
+    ret true;
+}
+
+pub fun destroy(core: *Core) {
+    if (core == nil) { ret; }
+    map_release(core, core.socket_map, core.map_capacity);
+    table.destroy(?core.sockets);
+    core.socket_map   = nil;
+    core.map_capacity = 0;
+    core.socket_slots = 0;
+    core.free_socket  = NONE;
+    core.mapped_count = 0;
+    core.live_count   = 0;
+    core.ready_head   = NONE;
+    core.ready_tail   = NONE;
+    core.pending_head = NONE;
+    core.pending_tail = NONE;
+}
+
+pub fun aliases(core: *Core, data: *u8, len: usize) bool {
+    var bytes: usize = 0;
+    if (!map_bytes(core.map_capacity, ?bytes)) { ret true; }
+    ret table.aliases(?core.sockets, data, len) ||
+        memory.ranges_overlap(core.socket_map::*u8, bytes, data, len);
+}
+
+# the mapped record for a socket value, or NONE
+pub fun lookup(core: *Core, socket: usize) u32 {
+    val mask:    usize = core.map_capacity - 1;
+    var slot:    usize = socket_hash(socket) & mask;
+    var scanned: usize = 0;
+    for (scanned < core.map_capacity) {
+        core.steps = core.steps + 1;
+        val entry: u32 = core.socket_map[slot];
+        if (entry == 0)                                  { ret NONE; }
+        if (socket_at(core, entry - 1).socket == socket) { ret entry - 1; }
+        slot    = (slot + 1) & mask;
+        scanned = scanned + 1;
+    }
+    ret NONE;
+}
+
+fun map_insert(core: *Core, index: u32) bool {
+    val mask:    usize = core.map_capacity - 1;
+    var slot:    usize = socket_hash(socket_at(core, index).socket) & mask;
+    var scanned: usize = 0;
+    for (scanned < core.map_capacity) {
+        core.steps = core.steps + 1;
+        if (core.socket_map[slot] == 0) {
+            core.socket_map[slot] = index + 1;
+            ret true;
+        }
+        slot    = (slot + 1) & mask;
+        scanned = scanned + 1;
+    }
+    ret false;
+}
+
+# linear probing deletes by shifting the rest of the probe run back, so no
+# tombstone is ever left and a lookup ends at the first empty slot
+fun map_remove(core: *Core, index: u32) {
+    val mask:    usize = core.map_capacity - 1;
+    var hole:    usize = socket_hash(socket_at(core, index).socket) & mask;
+    var scanned: usize = 0;
+    for (core.socket_map[hole] != index + 1) {
+        core.steps = core.steps + 1;
+        if (core.socket_map[hole] == 0 || scanned == core.map_capacity) { ret; }
+        hole    = (hole + 1) & mask;
+        scanned = scanned + 1;
+    }
+    core.socket_map[hole] = 0;
+    var next: usize = (hole + 1) & mask;
+    for (core.socket_map[next] != 0) {
+        core.steps = core.steps + 1;
+        val entry: u32   = core.socket_map[next];
+        val home:  usize = socket_hash(socket_at(core, entry - 1).socket) & mask;
+        # an entry may fill the hole only if its home is not after the hole
+        if (((next - home) & mask) >= ((next - hole) & mask)) {
+            core.socket_map[hole] = entry;
+            core.socket_map[next] = 0;
+            hole                  = next;
+        }
+        next = (next + 1) & mask;
+    }
+}
+
+# the map holds indices, so a rehash may move it while every record stays put
+fun rehash(core: *Core) bool {
+    val required: usize = required_map_capacity(core.sockets.capacity);
+    if (required == 0 || required <= core.map_capacity) { ret required != 0; }
+    val fresh: *u32 = map_allocate(core, required);
+    if (fresh == nil) { ret false; }
+    val previous:          *u32  = core.socket_map;
+    val previous_capacity: usize = core.map_capacity;
+    core.socket_map   = fresh;
+    core.map_capacity = required;
+    var i: usize = 0;
+    for (i < core.socket_slots) {
+        val record: *Socket = socket_at(core, i::u32);
+        if (record.live && record.mapped && !map_insert(core, i::u32)) {
+            core.socket_map   = previous;
+            core.map_capacity = previous_capacity;
+            map_release(core, fresh, required);
+            ret false;
+        }
+        i = i + 1;
+    }
+    map_release(core, previous, previous_capacity);
+    ret true;
+}
+
+fun socket_append(core: *Core) bool {
+    if (core.socket_slots >= 0xffffffff) { ret false; }
+    if (core.socket_slots == core.sockets.capacity) {
+        if (!table.grow(?core.sockets) || !rehash(core)) { ret false; }
+    }
+    val index:  usize   = core.socket_slots;
+    val record: *Socket = socket_at(core, index::u32);
+    record.live       = false;
+    record.mapped     = false;
+    record.index      = index::u32;
+    record.next_free  = core.free_socket;
+    core.free_socket  = index::u32;
+    core.socket_slots = index + 1;
+    ret true;
+}
+
+fun free_record(core: *Core, index: u32) {
+    val record: *Socket = socket_at(core, index);
+    record.live      = false;
+    record.next_free = core.free_socket;
+    core.free_socket = index;
+    core.live_count  = core.live_count - 1;
+}
+
+# the record a submit for socket under opening joins. an older opening is a
+# handle whose socket was closed outside the driver and reused; a newer one
+# drops the stale record, whose operations settle in the background
+# ---
+# index: receives the record on ACQUIRED or CREATED
+# ret:   ACQUIRED, CREATED, STALE or EXHAUSTED
+pub fun acquire(core: *Core, ops: *table.Table, socket: usize, opening: u64, index: *u32) u8 {
+    val existing: u32 = lookup(core, socket);
+    if (existing != NONE) {
+        val found: *Socket = socket_at(core, existing);
+        # openings only grow, so the older of two openings is the socket that was closed
+        if (opening < found.opening) { ret STALE; }
+        if (opening == found.opening) {
+            @index = existing;
+            ret ACQUIRED;
+        }
+        drop_stale(core, ops, existing);
+    }
+    if (core.free_socket == NONE && !socket_append(core)) { ret EXHAUSTED; }
+    val fresh:  u32     = core.free_socket;
+    val record: *Socket = socket_at(core, fresh);
+    core.free_socket         = record.next_free;
+    record.socket            = socket;
+    record.opening           = opening;
+    record.ops_head          = NONE;
+    record.ops_tail          = NONE;
+    record.op_count          = 0;
+    record.inflight_reads    = 0;
+    record.inflight_readable = 0;
+    record.inflight_writes   = 0;
+    record.deferred_head     = NONE;
+    record.deferred_tail     = NONE;
+    record.control           = NONE;
+    record.associated        = false;
+    record.live              = true;
+    record.mapped            = true;
+    core.live_count          = core.live_count + 1;
+    if (!map_insert(core, fresh)) {
+        record.mapped = false;
+        free_record(core, fresh);
+        ret EXHAUSTED;
+    }
+    core.mapped_count = core.mapped_count + 1;
+    @index            = fresh;
+    ret CREATED;
+}
+
+# the operations still pending on a socket closed outside the driver settle as
+# stale. the close aborted their native requests, so each outstanding packet is
+# on its way or already consumed
+fun drop_stale(core: *Core, ops: *table.Table, index: u32) {
+    var current: u32 = socket_at(core, index).ops_head;
+    for (current != NONE) {
+        val next: u32 = link(core, ops, current).sock_next;
+        abort(core, ops, current, true, types.STATUS_STALE);
+        current = next;
+    }
+    unmap(core, index);
+}
+
+# an operation on a socket that is going away settles with status: an active
+# request once its aborted packet arrives, a held request at once, and a
+# pending control too when controls is set
+# ---
+# ret: whether the request was active, so the caller must abort it natively
+pub fun abort(core: *Core, ops: *table.Table, index: u32, controls: bool, status: i64) bool {
+    core.steps = core.steps + 1;
+    val state: u8 = link(core, ops, index).state;
+    if (state == ACTIVE) {
+        transition(core, ops, index, CANCEL_READY, status);
+        ret true;
+    }
+    if (state == DEFERRED || (controls && state == CONTROL_PENDING)) {
+        transition(core, ops, index, CONTROL_READY, status);
+    }
+    ret false;
+}
+
+# a submit no longer finds the record, so a reused socket value attaches fresh.
+# the record is recycled once its last operation leaves
+pub fun unmap(core: *Core, index: u32) {
+    val record: *Socket = socket_at(core, index);
+    if (!record.mapped) { ret; }
+    map_remove(core, index);
+    record.mapped     = false;
+    core.mapped_count = core.mapped_count - 1;
+    if (record.op_count == 0) { free_record(core, index); }
+}
+
+fun lane_push(core: *Core, ops: *table.Table, head: *u32, tail: *u32, index: u32) {
+    val entry: *Link = link(core, ops, index);
+    entry.lane_prev = @tail;
+    entry.lane_next = NONE;
+    if (@tail == NONE) { @head = index; }
+    or                 { link(core, ops, @tail).lane_next = index; }
+    @tail = index;
+}
+
+fun lane_unlink(core: *Core, ops: *table.Table, head: *u32, tail: *u32, index: u32) {
+    val entry: *Link = link(core, ops, index);
+    if (entry.lane_prev == NONE) { @head = entry.lane_next; }
+    or                           { link(core, ops, entry.lane_prev).lane_next = entry.lane_next; }
+    if (entry.lane_next == NONE) { @tail = entry.lane_prev; }
+    or                           { link(core, ops, entry.lane_next).lane_prev = entry.lane_prev; }
+    entry.lane_prev = NONE;
+    entry.lane_next = NONE;
+}
+
+# every state change goes through here, so the lane lists and the socket's in
+# flight counts always agree with the states
+pub fun transition(core: *Core, ops: *table.Table, index: u32, state: u8, result: i64) {
+    val entry:    *Link   = link(core, ops, index);
+    val record:   *Socket = socket_at(core, entry.socket);
+    val previous: u8      = entry.state;
+    if (previous == DEFERRED) {
+        lane_unlink(core, ops, ?record.deferred_head, ?record.deferred_tail, index);
+    }
+    or (previous == CONTROL_PENDING) {
+        lane_unlink(core, ops, ?core.pending_head, ?core.pending_tail, index);
+    }
+    or (previous == CONTROL_READY) {
+        lane_unlink(core, ops, ?core.ready_head, ?core.ready_tail, index);
+    }
+    val lane: u8 = lane_of(entry.kind);
+    if (read_lane(lane) && in_flight(previous) && !in_flight(state)) {
+        record.inflight_reads = record.inflight_reads - 1;
+        if (lane == LANE_READABLE) { record.inflight_readable = record.inflight_readable - 1; }
+    }
+    or (read_lane(lane) && !in_flight(previous) && in_flight(state)) {
+        record.inflight_reads = record.inflight_reads + 1;
+        if (lane == LANE_READABLE) { record.inflight_readable = record.inflight_readable + 1; }
+    }
+    entry.state  = state;
+    entry.result = result;
+    if (state == DEFERRED) {
+        lane_push(core, ops, ?record.deferred_head, ?record.deferred_tail, index);
+    }
+    or (state == CONTROL_PENDING) {
+        lane_push(core, ops, ?core.pending_head, ?core.pending_tail, index);
+    }
+    or (state == CONTROL_READY) {
+        lane_push(core, ops, ?core.ready_head, ?core.ready_tail, index);
+    }
+}
+
+# whether a read-lane request submitted now must wait behind the socket's
+# earlier ones: a readiness wait and the reads around it settle in submission
+# order, since a zero-byte receive posted beside a read could find the read's
+# bytes already taken and report a false end of stream. other reads post at once
+pub fun must_defer(core: *Core, sock: u32, kind: runtime.Kind) bool {
+    val lane: u8 = lane_of(kind);
+    if (!read_lane(lane)) { ret false; }
+    val record: *Socket = socket_at(core, sock);
+    if (record.deferred_head != NONE) { ret true; }
+    ret record.inflight_reads > 0 && (record.inflight_readable > 0 || lane == LANE_READABLE);
+}
+
+# a free operation joins the socket record in state
+pub fun join(core: *Core, ops: *table.Table, sock: u32, index: u32, kind: runtime.Kind, state: u8) {
+    val record: *Socket = socket_at(core, sock);
+    val entry:  *Link   = link(core, ops, index);
+    entry.state     = FREE;
+    entry.kind      = kind;
+    entry.socket    = sock;
+    entry.result    = 0;
+    entry.lane_prev = NONE;
+    entry.lane_next = NONE;
+    entry.sock_prev = record.ops_tail;
+    entry.sock_next = NONE;
+    if (record.ops_tail == NONE) { record.ops_head = index; }
+    or                           { link(core, ops, record.ops_tail).sock_next = index; }
+    record.ops_tail = index;
+    record.op_count = record.op_count + 1;
+    val lane: u8 = lane_of(kind);
+    if (lane == LANE_WRITE)   { record.inflight_writes = record.inflight_writes + 1; }
+    if (lane == LANE_CONTROL) { record.control = index; }
+    transition(core, ops, index, state, 0);
+}
+
+# the operation leaves its socket and becomes free
+# ---
+# ret: the socket record, or NONE once the record was recycled
+pub fun release(core: *Core, ops: *table.Table, index: u32) u32 {
+    val entry:  *Link   = link(core, ops, index);
+    val sock:   u32     = entry.socket;
+    val record: *Socket = socket_at(core, sock);
+    transition(core, ops, index, FREE, 0);
+    if (entry.sock_prev == NONE) { record.ops_head = entry.sock_next; }
+    or                           { link(core, ops, entry.sock_prev).sock_next = entry.sock_next; }
+    if (entry.sock_next == NONE) { record.ops_tail = entry.sock_prev; }
+    or                           { link(core, ops, entry.sock_next).sock_prev = entry.sock_prev; }
+    entry.sock_prev = NONE;
+    entry.sock_next = NONE;
+    record.op_count = record.op_count - 1;
+    if (lane_of(entry.kind) == LANE_WRITE) { record.inflight_writes = record.inflight_writes - 1; }
+    if (record.control == index)           { record.control = NONE; }
+    if (record.op_count == 0 && !record.mapped) {
+        free_record(core, sock);
+        ret NONE;
+    }
+    ret sock;
+}
+
+# the oldest held read-lane request, now active, once nothing in flight holds
+# it back. the caller posts it
+# ---
+# ret: the operation to post, or NONE
+pub fun take_deferred(core: *Core, ops: *table.Table, sock: u32) u32 {
+    val record: *Socket = socket_at(core, sock);
+    val head:   u32     = record.deferred_head;
+    if (head == NONE) { ret NONE; }
+    core.steps = core.steps + 1;
+    val lane: u8 = lane_of(link(core, ops, head).kind);
+    if (record.inflight_reads > 0 && (record.inflight_readable > 0 || lane == LANE_READABLE)) { ret NONE; }
+    transition(core, ops, head, ACTIVE, 0);
+    ret head;
+}
+
+# settle what the socket's control is now waiting on. a close becomes ready
+# once it is the socket's last operation. a shutdown is due once no write is
+# left, and the caller shuts the socket down and moves it to ready
+# ---
+# ret: a shutdown that is due, or NONE
+pub fun progress(core: *Core, ops: *table.Table, sock: u32) u32 {
+    val record:  *Socket = socket_at(core, sock);
+    val control: u32     = record.control;
+    if (control == NONE) { ret NONE; }
+    val entry: *Link = link(core, ops, control);
+    if (entry.state != CONTROL_PENDING) { ret NONE; }
+    if (entry.kind == runtime.CLOSE && record.op_count == 1) {
+        transition(core, ops, control, CONTROL_READY, entry.result);
+        ret NONE;
+    }
+    if (entry.kind == runtime.SHUTDOWN && record.inflight_writes == 0) { ret control; }
+    ret NONE;
+}
+
+use std.allocator.page;
+
+rec TestOperation {
+    padding: [24]u8;
+    link:    Link;
+}
+
+rec TestBed {
+    allocator: allocator.Allocator;
+    ops:       table.Table;
+    core:      Core;
+    slots:     usize;
+}
+
+fun test_bed(bed: *TestBed, operations: usize, sockets: usize) bool {
+    val paged: err[allocator.Error] = page.make(?bed.allocator);
+    if (sel paged.err)                                                              { ret false; }
+    if (!table.make(?bed.ops, ?bed.allocator, $size_of(TestOperation), operations)) { ret false; }
+    bed.slots = 0;
+    ret make(?bed.core, ?bed.allocator, $offset_of(TestOperation, link), sockets);
+}
+
+fun test_bed_destroy(bed: *TestBed) {
+    destroy(?bed.core);
+    table.destroy(?bed.ops);
+}
+
+# a fresh operation index joined to sock
+fun test_join(bed: *TestBed, sock: u32, kind: runtime.Kind, state: u8) u32 {
+    if (bed.slots == bed.ops.capacity && !table.grow(?bed.ops)) { ret NONE; }
+    val index: u32 = bed.slots::u32;
+    bed.slots = bed.slots + 1;
+    join(?bed.core, ?bed.ops, sock, index, kind, state);
+    ret index;
+}
+
+fun test_acquire(bed: *TestBed, socket: usize, opening: u64) u32 {
+    var index: u32 = NONE;
+    val got:   u8  = acquire(?bed.core, ?bed.ops, socket, opening, ?index);
+    if (got != CREATED && got != ACQUIRED) { ret NONE; }
+    ret index;
+}
+
+# windows socket values are multiples of four
+fun test_socket(i: usize) usize {
+    ret 0x100 + i * 4;
+}
+
+# probes per insert, lookup and delete stay bounded as the map grows, and the
+# backward shift leaves every surviving socket reachable
+fun test_map_scale(count: usize) i32 {
+    var bed: TestBed;
+    if (!test_bed(?bed, 4, 4)) { ret 1; }
+    fin { test_bed_destroy(?bed); }
+    var i: usize = 0;
+    for (i < count) {
+        if (test_acquire(?bed, test_socket(i), 1) != i::u32) { ret 2; }
+        i = i + 1;
+    }
+    if (bed.core.mapped_count != count || bed.core.map_capacity < count * 2) { ret 3; }
+    var before: u64 = bed.core.steps;
+    i = 0;
+    for (i < count) {
+        if (lookup(?bed.core, test_socket(i)) != i::u32) { ret 4; }
+        i = i + 1;
+    }
+    if (bed.core.steps - before > (count * 2)::u64)    { ret 5; }
+    if (lookup(?bed.core, test_socket(count)) != NONE) { ret 6; }
+    before = bed.core.steps;
+    i      = 0;
+    for (i < count) {
+        unmap(?bed.core, i::u32);
+        i = i + 2;
+    }
+    if (bed.core.steps - before > (count * 2)::u64) { ret 7; }
+    before = bed.core.steps;
+    i      = 0;
+    for (i < count) {
+        val found: u32 = lookup(?bed.core, test_socket(i));
+        if (i % 2 == 0 && found != NONE)   { ret 8; }
+        if (i % 2 == 1 && found != i::u32) { ret 9; }
+        i = i + 1;
+    }
+    if (bed.core.steps - before > (count * 2)::u64)     { ret 10; }
+    if (bed.core.live_count != count - (count + 1) / 2) { ret 11; }
+    # freed records are reused before the table grows
+    val capacity: usize = bed.core.sockets.capacity;
+    i = 0;
+    for (i < count) {
+        if (test_acquire(?bed, test_socket(i), 1) == NONE) { ret 12; }
+        i = i + 2;
+    }
+    if (bed.core.sockets.capacity != capacity || bed.core.live_count != count) { ret 13; }
+    ret 0;
+}
+
+test "async iocp: socket map probes stay flat from 1k to 100k sockets" {
+    val sizes: [3]usize = [3]usize{1000, 10000, 100000};
+    var i:     usize    = 0;
+    for (i < 3) {
+        val failed: i32 = test_map_scale(sizes[i]);
+        if (failed != 0) { ret 20 * (i::i32 + 1) + failed; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test "async iocp: held reads post in submission order" {
+    var bed: TestBed;
+    if (!test_bed(?bed, 4, 4)) { ret 1; }
+    fin { test_bed_destroy(?bed); }
+    val sock: u32 = test_acquire(?bed, test_socket(1), 1);
+    if (sock == NONE) { ret 2; }
+    # reads beside a read post at once
+    if (must_defer(?bed.core, sock, runtime.READ)) { ret 3; }
+    val read: u32 = test_join(?bed, sock, runtime.READ, ACTIVE);
+    if (must_defer(?bed.core, sock, runtime.READ))      { ret 4; }
+    if (!must_defer(?bed.core, sock, runtime.READABLE)) { ret 5; }
+    if (must_defer(?bed.core, sock, runtime.WRITE))     { ret 6; }
+    val first:  u32 = test_join(?bed, sock, runtime.READABLE, DEFERRED);
+    val second: u32 = test_join(?bed, sock, runtime.READABLE, DEFERRED);
+    # anything behind a held request is held too
+    if (!must_defer(?bed.core, sock, runtime.READ)) { ret 7; }
+    val third: u32 = test_join(?bed, sock, runtime.READ, DEFERRED);
+    val last:  u32 = test_join(?bed, sock, runtime.READ, DEFERRED);
+    if (take_deferred(?bed.core, ?bed.ops, sock) != NONE)  { ret 8; }
+    if (release(?bed.core, ?bed.ops, read) != sock)        { ret 9; }
+    if (take_deferred(?bed.core, ?bed.ops, sock) != first) { ret 10; }
+    if (take_deferred(?bed.core, ?bed.ops, sock) != NONE)  { ret 11; }
+    # a cancelled wait still holds its native request
+    transition(?bed.core, ?bed.ops, first, CANCELLED, 0);
+    if (take_deferred(?bed.core, ?bed.ops, sock) != NONE) { ret 12; }
+    release(?bed.core, ?bed.ops, first);
+    if (take_deferred(?bed.core, ?bed.ops, sock) != second) { ret 13; }
+    release(?bed.core, ?bed.ops, second);
+    # two plain reads post together once no wait is in flight
+    if (take_deferred(?bed.core, ?bed.ops, sock) != third) { ret 14; }
+    if (take_deferred(?bed.core, ?bed.ops, sock) != last)  { ret 15; }
+    if (take_deferred(?bed.core, ?bed.ops, sock) != NONE)  { ret 16; }
+    val record: *Socket = socket_at(?bed.core, sock);
+    if (record.inflight_reads != 2 || record.inflight_readable != 0 || record.op_count != 2) { ret 17; }
+    # a wait held behind a read leaves when it is dropped, and the read behind it posts
+    val wait:  u32 = test_join(?bed, sock, runtime.READABLE, DEFERRED);
+    val after: u32 = test_join(?bed, sock, runtime.READ, DEFERRED);
+    release(?bed.core, ?bed.ops, wait);
+    if (take_deferred(?bed.core, ?bed.ops, sock) != after) { ret 18; }
+    ret 0;
+}
+
+test "async iocp: taking a held read costs the same behind 100k waits" {
+    var bed: TestBed;
+    if (!test_bed(?bed, 4, 4)) { ret 1; }
+    fin { test_bed_destroy(?bed); }
+    val sock: u32   = test_acquire(?bed, test_socket(1), 1);
+    val read: u32   = test_join(?bed, sock, runtime.READ, ACTIVE);
+    var i:    usize = 0;
+    for (i < 100000) {
+        if (!must_defer(?bed.core, sock, runtime.READABLE)) { ret 2; }
+        test_join(?bed, sock, runtime.READABLE, DEFERRED);
+        i = i + 1;
+    }
+    val before: u64 = bed.core.steps;
+    release(?bed.core, ?bed.ops, read);
+    if (take_deferred(?bed.core, ?bed.ops, sock) != read + 1) { ret 3; }
+    if (take_deferred(?bed.core, ?bed.ops, sock) != NONE)     { ret 4; }
+    if (bed.core.steps - before > 2)                          { ret 5; }
+    ret 0;
+}
+
+test "async iocp: controls progress on the state changes they wait for" {
+    var bed: TestBed;
+    if (!test_bed(?bed, 4, 4)) { ret 1; }
+    fin { test_bed_destroy(?bed); }
+    val sock:     u32     = test_acquire(?bed, test_socket(1), 1);
+    val write:    u32     = test_join(?bed, sock, runtime.SEND_TO, ACTIVE);
+    val read:     u32     = test_join(?bed, sock, runtime.READ, ACTIVE);
+    val shutdown: u32     = test_join(?bed, sock, runtime.SHUTDOWN, CONTROL_PENDING);
+    val record:   *Socket = socket_at(?bed.core, sock);
+    if (record.control != shutdown || bed.core.pending_head != shutdown) { ret 2; }
+    if (progress(?bed.core, ?bed.ops, sock) != NONE)                     { ret 3; }
+    release(?bed.core, ?bed.ops, write);
+    if (progress(?bed.core, ?bed.ops, sock) != shutdown) { ret 4; }
+    transition(?bed.core, ?bed.ops, shutdown, CONTROL_READY, -5);
+    if (bed.core.pending_head != NONE || bed.core.ready_head != shutdown || link(?bed.core, ?bed.ops, shutdown).result != -5) { ret 5; }
+    release(?bed.core, ?bed.ops, shutdown);
+    if (record.control != NONE || bed.core.ready_head != NONE) { ret 6; }
+
+    # a close waits for the socket's last other operation
+    val close: u32 = test_join(?bed, sock, runtime.CLOSE, CONTROL_PENDING);
+    link(?bed.core, ?bed.ops, close).result = 7;
+    transition(?bed.core, ?bed.ops, read, CANCEL_READY, -9);
+    unmap(?bed.core, sock);
+    if (lookup(?bed.core, test_socket(1)) != NONE)                                                                    { ret 7; }
+    if (progress(?bed.core, ?bed.ops, sock) != NONE)                                                                  { ret 8; }
+    if (bed.core.ready_head != NONE)                                                                                  { ret 9; }
+    if (release(?bed.core, ?bed.ops, read) != sock)                                                                   { ret 10; }
+    if (progress(?bed.core, ?bed.ops, sock) != NONE)                                                                  { ret 11; }
+    if (bed.core.ready_head != close || bed.core.ready_tail != close || link(?bed.core, ?bed.ops, close).result != 7) { ret 12; }
+    if (release(?bed.core, ?bed.ops, close) != NONE)                                                                  { ret 13; }
+    if (bed.core.live_count != 0 || bed.core.mapped_count != 0 || bed.core.ready_head != NONE)                        { ret 14; }
+    ret 0;
+}
+
+test "async iocp: a newer opening drops the stale record" {
+    var bed: TestBed;
+    if (!test_bed(?bed, 4, 4)) { ret 1; }
+    fin { test_bed_destroy(?bed); }
+    val old:      u32 = test_acquire(?bed, test_socket(1), 2);
+    val active:   u32 = test_join(?bed, old, runtime.READ, ACTIVE);
+    val held:     u32 = test_join(?bed, old, runtime.READABLE, DEFERRED);
+    val shutdown: u32 = test_join(?bed, old, runtime.SHUTDOWN, CONTROL_PENDING);
+    var index:    u32 = NONE;
+    if (acquire(?bed.core, ?bed.ops, test_socket(1), 1, ?index) != STALE)                    { ret 2; }
+    if (acquire(?bed.core, ?bed.ops, test_socket(1), 2, ?index) != ACQUIRED || index != old) { ret 3; }
+    if (acquire(?bed.core, ?bed.ops, test_socket(1), 3, ?index) != CREATED || index == old)  { ret 4; }
+    val fresh: u32 = index;
+    if (link(?bed.core, ?bed.ops, active).state != CANCEL_READY || link(?bed.core, ?bed.ops, active).result != types.STATUS_STALE) { ret 5; }
+    if (link(?bed.core, ?bed.ops, held).state != CONTROL_READY || link(?bed.core, ?bed.ops, held).result != types.STATUS_STALE)    { ret 6; }
+    if (link(?bed.core, ?bed.ops, shutdown).state != CONTROL_READY)                                                                { ret 7; }
+    if (bed.core.ready_head != held || bed.core.ready_tail != shutdown || bed.core.pending_head != NONE)                           { ret 8; }
+    if (socket_at(?bed.core, old).deferred_head != NONE || socket_at(?bed.core, old).mapped)                                       { ret 9; }
+    if (lookup(?bed.core, test_socket(1)) != fresh || bed.core.mapped_count != 1 || bed.core.live_count != 2)                      { ret 10; }
+    release(?bed.core, ?bed.ops, held);
+    release(?bed.core, ?bed.ops, shutdown);
+    if (release(?bed.core, ?bed.ops, active) != NONE || bed.core.live_count != 1) { ret 11; }
+    ret 0;
+}

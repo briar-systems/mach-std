@@ -6,6 +6,10 @@
 # generic linux and darwin net.async backends accept only ip socket handles,
 # checked before registration, so a local handle never reaches a byte path that
 # does not own rights: use this backend for local streams.
+#
+# cancellation follows std.net.async: on windows a cancelled operation completes
+# once its aborted request reports back, and a read whose data raced the cancel
+# completes cancelled with its bytes lost (submit_read, discarded_reads)
 
 use std.allocator;
 use std.allocator.page;
@@ -596,7 +600,8 @@ fun source_cancel(context: ptr, token: io_runtime.Token, reason: io_error.Error)
     var code: i64   = 0;
     if (slot != nil && slot.native_active) {
         code = impl.cancel(?driver.backend, slot.native);
-        if (code >= 0) { slot.native_active = false; }
+        # a pending cancellation keeps the kernel's hold until its packet is published
+        if (code >= 0 && code != io_runtime.CANCELLATION_PENDING) { slot.native_active = false; }
     }
     mutex.unlock(?driver.lock);
     io_runtime.end_native_control(driver.runtime);
@@ -1033,6 +1038,13 @@ fun submit_buffer(
     ret res[io_runtime.Token, io_error.Error].ok{token};
 }
 
+# cancelling a read is not free on every platform. on windows a read the kernel
+# already holds is aborted asynchronously, and if data arrived first the read
+# still completes as cancelled: its bytes are discarded although the peer
+# considers them delivered, and the stream has silently lost them. a caller that
+# needs every byte must not cancel a pending read to stop waiting. use a
+# deadline, then keep reading until the stream drains. discarded_reads counts
+# the reads this happened to
 pub fun submit_read(driver: *Driver, scope: *cancel.Scope, stream: *Stream, buffer: *u8, length: usize, context: usize) res[io_runtime.Token, io_error.Error] {
     ret submit_buffer(driver, scope, io_runtime.READ, stream, buffer, length, context);
 }
@@ -1044,6 +1056,10 @@ pub fun submit_readable(driver: *Driver, scope: *cancel.Scope, stream: *Stream, 
     ret submit_buffer(driver, scope, io_runtime.READABLE, stream, nil, 0, context);
 }
 
+# cancelling a write does not unsend it. on windows a write the kernel already
+# holds is aborted asynchronously, and if it finished first it still completes
+# as cancelled although its bytes may have reached the peer. treat a cancelled
+# write's stream as being in an unknown position
 pub fun submit_write(driver: *Driver, scope: *cancel.Scope, stream: *Stream, buffer: *u8, length: usize, context: usize) res[io_runtime.Token, io_error.Error] {
     ret submit_buffer(driver, scope, io_runtime.WRITE, stream, buffer, length, context);
 }
@@ -1226,6 +1242,13 @@ fun resolve_native_locked(driver: *Driver, native: async_types.NativeCompletion)
         ret;
     }
     slot.native_active = false;
+    if (native.status == async_types.STATUS_CANCELLED) {
+        val cancelled: err[io_error.Error] = io_runtime.complete_cancellation(driver.runtime, token);
+        if (sel cancelled.err) {
+            panic.panic("std.net.async.local: asynchronous cancellation lost operation ownership\n");
+        }
+        ret;
+    }
     var resolved: err[io_error.Error];
     if (native.status < 0) {
         resolved = io_runtime.fail(driver.runtime, token, os.error(native.status, operation_for_kind(native.kind)));
@@ -1235,6 +1258,40 @@ fun resolve_native_locked(driver: *Driver, native: async_types.NativeCompletion)
     }
     if (sel resolved.err && native.kind == io_runtime.ACCEPT && native.status >= 0 && native.resource != io_handle.INVALID_VALUE) {
         os.sock_close(native.resource);
+    }
+}
+
+# reads cancelled on this driver whose data had already arrived, so their bytes
+# were discarded (see submit_read). a nonzero count means the peer sent bytes
+# this program never saw: a protocol that cannot lose bytes must stop cancelling
+# pending reads. always 0 on linux and darwin, which never discard a read
+# ---
+# driver: the driver to query
+# bytes:  receives the total bytes discarded, when not nil
+# ret:    the number of discarded reads since make
+pub fun discarded_reads(driver: *Driver, bytes: *u64) u64 {
+    if (bytes != nil)                           { @bytes = 0; }
+    if (driver == nil || driver.runtime == nil) { ret 0; }
+    $if ($mach.build.os == $mach.os.windows) {
+        ret impl.discarded_reads(?driver.backend, bytes);
+    }
+    $or {
+        ret 0;
+    }
+}
+
+# operations cancelled on this driver whose native request has not yet
+# reported back. each one keeps the driver busy, so a destroy that keeps
+# refusing with a nonzero count is waiting for the kernel, which a caller
+# settles by continuing to wait. always 0 on linux and darwin, which cancel
+# synchronously
+pub fun awaiting_cancellations(driver: *Driver) usize {
+    if (driver == nil || driver.runtime == nil) { ret 0; }
+    $if ($mach.build.os == $mach.os.windows) {
+        ret impl.awaiting_cancellations(?driver.backend);
+    }
+    $or {
+        ret 0;
     }
 }
 
@@ -1394,9 +1451,9 @@ test "async local: ownership query includes driver backend and runtime" {
             !aliases(?driver, driver.backend.ready.chunks[0]::*u8, 1)) { ret 5; }
     }
     $or {
-        if (!aliases(?driver, driver.backend.attached.chunks[0]::*u8, 1) ||
+        if (!aliases(?driver, driver.backend.core.sockets.chunks[0]::*u8, 1) ||
+            !aliases(?driver, driver.backend.core.socket_map::*u8, 1) ||
             !aliases(?driver, driver.backend.native::*u8, 1) ||
-            !aliases(?driver, driver.backend.preserved.chunks[0]::*u8, 1) ||
             !aliases(?driver, driver.backend.completions.chunks[0]::*u8, 1)) { ret 5; }
     }
     if (refused(destroy(?driver)) ||
