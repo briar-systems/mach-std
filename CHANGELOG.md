@@ -26,7 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `sync.cancel` locks per scope instead of per tree. attach and unregister
   take only their scope's lock, so threads registering on separate child
   scopes no longer contend. At 8 threads on per-thread children, attach plus
-  unregister totals 78M/s, where it was 5.8M/s. A scope shared by threads still
+  unregister totals 78M/s, where it was 5.8M/s. Single-threaded use is
+  slower: about 6% on attach and unregister, and about 12% on the full
+  make_child, attach, unregister and destroy lifecycle, because destroy now
+  takes the parent's lock and then the scope's. A scope shared by threads still
   serializes, and the module now documents per-worker roots and per-connection
   child scopes as the intended shape. `Scope.callback_count` is now an atomic
   `i64`, which leaves the size of `Scope` unchanged (#754).
