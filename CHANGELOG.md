@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.1.0] - 2026-09-17
+
+Requires mach 5.2.0 or later. Tested with mach 5.2.1, the family CI seed.
+
 ### Added
 - `std.process.limits`: read and set the open-file limit. `open_files()` returns
   a `FileLimit` with the soft limit in force, the hard limit, and the highest
