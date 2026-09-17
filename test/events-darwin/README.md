@@ -1,6 +1,6 @@
 # Darwin completion boundary
 
-This focused fixture uses the published Mach 4.30 compiler in debug and release
+This focused fixture uses the mach release pinned for the family in briar-systems/.github in debug and release
 on both Darwin architectures. It changes no public completion API.
 
 The SDK C gate checks public kqueue/kevent signatures, constants and native
