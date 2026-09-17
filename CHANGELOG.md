@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The license copyright is held by Briar Systems LLC. The MIT terms are unchanged (#765).
+
 ## [4.2.0] - 2026-09-17
 
 Requires mach 5.2.0 or later. Tested with mach 5.2.1, the family CI seed.
