@@ -324,6 +324,7 @@ pub rec Pool {
     slot_top:            u32;
     empty_head:          u32;
     slots_in_use:        usize;
+    slots_retained:      usize;
     slots_reserved:      usize;
     plain:               A.Allocator;
     notify:              fun(ptr, u64);
@@ -393,7 +394,14 @@ fun slot_at(pool: *Pool, index: u32) *Slot {
     ret table.at(?pool.slots, index::usize)::*Slot;
 }
 
-# slots demanded by in-use slots plus every unused reservation, kept backed
+# every slot already owned or promised: held chunks, retained chunks and unused
+# reservations. a retained chunk keeps its slot while it waits for reuse, so
+# leaving it out undercounts the table and a fresh chunk finds no slot (#775)
+fun slots_committed(pool: *Pool) usize {
+    ret pool.slots_in_use + pool.slots_retained + pool.slots_reserved;
+}
+
+# keep demand slots backed
 fun ensure_slots(pool: *Pool, demand: usize) bool {
     if (demand > 0xfffffffe) { ret false; }
     ret table.reserve(?pool.slots, demand);
@@ -576,12 +584,7 @@ fun acquire_locked(pool: *Pool, account: *Account, request: Request, register: b
         ret refusal(Status.blocked{}, reason);
     }
     # a slot inside the reservation is already backed; past it the table may grow
-    val inside: bool = account.chunks < account.reserved_slots;
-    if (!inside && !ensure_slots(pool, pool.slots_in_use + pool.slots_reserved + 1)) {
-        pool.refusals = pool.refusals + 1;
-        if (register) { register_waiter(pool, account); }
-        ret refusal(Status.blocked{}, Reason.memory{});
-    }
+    val inside:       bool  = account.chunks < account.reserved_slots;
     var secret_chunk: bool  = request.secret;
     var chunk_align:  usize = align;
     if (class_index != OVERSIZE) {
@@ -596,13 +599,20 @@ fun acquire_locked(pool: *Pool, account: *Account, request: Request, register: b
         val cls: *ClassState = ?pool.classes[class_index::usize];
         index = cls.retained_head;
         val kept: *Slot = slot_at(pool, index);
-        cls.retained_head = kept.next;
-        cls.retained      = cls.retained - 1;
-        address           = kept.address;
-        welded            = kept.welded;
-        wgen              = kept.welded_gen;
+        cls.retained_head   = kept.next;
+        cls.retained        = cls.retained - 1;
+        pool.slots_retained = pool.slots_retained - 1;
+        address             = kept.address;
+        welded              = kept.welded;
+        wgen                = kept.welded_gen;
     }
     or {
+        # a retained chunk brings its own slot, a fresh one needs one more
+        if (!inside && !ensure_slots(pool, slots_committed(pool) + 1)) {
+            pool.refusals = pool.refusals + 1;
+            if (register) { register_waiter(pool, account); }
+            ret refusal(Status.blocked{}, Reason.memory{});
+        }
         var backed: bool = false;
         if (secret_chunk) {
             backed = welded_allocate(bytes, ?welded, ?wgen);
@@ -610,6 +620,16 @@ fun acquire_locked(pool: *Pool, account: *Account, request: Request, register: b
         or {
             address = plain_allocate(pool, bytes, chunk_align);
             backed  = address != 0;
+        }
+        if (backed) {
+            index = take_slot(pool);
+            # the demand above keeps a slot free, but a missing one is still a
+            # refusal that gives the backing back, never a write through nil
+            if (index == NONE) {
+                if (secret_chunk) { welded_release(welded, wgen, bytes); }
+                or                { A.deallocate_raw(?pool.plain, address::ptr, bytes, chunk_align); }
+                backed = false;
+            }
         }
         if (!backed) {
             pool.refusals = pool.refusals + 1;
@@ -619,7 +639,6 @@ fun acquire_locked(pool: *Pool, account: *Account, request: Request, register: b
             if (register) { register_waiter(pool, account); }
             ret refusal(Status.blocked{}, Reason.memory{});
         }
-        index                    = take_slot(pool);
         pool.backing_allocations = pool.backing_allocations + 1;
         if (class_index != OVERSIZE) {
             pool.classes[class_index::usize].backing = pool.classes[class_index::usize].backing + 1;
@@ -707,10 +726,11 @@ fun release_locked(pool: *Pool, account: *Account, chunk: Chunk, wake: bool) Rea
         cls.releases = cls.releases + 1;
         if (cls.secret) { welded_wipe(slot.welded, slot.welded_gen, cls.size); }
         if (cls.retained < cls.high_water) {
-            slot.state        = SLOT_RETAINED;
-            slot.next         = cls.retained_head;
-            cls.retained_head = chunk.ref.index;
-            cls.retained      = cls.retained + 1;
+            slot.state          = SLOT_RETAINED;
+            slot.next           = cls.retained_head;
+            cls.retained_head   = chunk.ref.index;
+            cls.retained        = cls.retained + 1;
+            pool.slots_retained = pool.slots_retained + 1;
         }
         or {
             slot_release(pool, slot, cls.size, cls.align);
@@ -790,9 +810,10 @@ pub fun destroy(pool: *Pool) bool {
             slot_release(pool, slot, cls.size, cls.align);
             index = slot.next;
         }
-        cls.retained_head = NONE;
-        cls.retained      = 0;
-        c                 = c + 1;
+        pool.slots_retained = pool.slots_retained - cls.retained;
+        cls.retained_head   = NONE;
+        cls.retained        = 0;
+        c                   = c + 1;
     }
     table.destroy(?pool.slots);
     pool.made = false;
@@ -836,7 +857,7 @@ pub fun open_account(pool: *Pool, account: *Account, handle: u64, budgets: *usiz
         }
         slots = (reserve + smallest - 1) / smallest;
     }
-    if (!ensure_slots(pool, pool.slots_in_use + pool.slots_reserved + slots)) {
+    if (!ensure_slots(pool, slots_committed(pool) + slots)) {
         leave(pool);
         ret Reason.memory{};
     }
@@ -1522,6 +1543,62 @@ $if (capability.HOSTED) {
         if (!sel large.status.ok || large.chunk.class != OVERSIZE || large.chunk.data != nil) { ret 10; }
         if (secret(?pool, large.chunk) == nil)                                                { ret 11; }
         if (!is_none(release(?pool, ?account, large.chunk)))                                  { ret 12; }
+        ret 0;
+    }
+
+    # retained chunks keep their slots, so a fresh chunk after a full retain
+    # must still find one (#775, from mach-tls's interop harness)
+    test "buffers: a fresh chunk after retained releases takes a new slot" {
+        var arena: Arena;
+        if (!arena_make(?arena, 1 << 22)) { ret 1; }
+        fin { arena_free(?arena); }
+        var classes: [6]ClassConfig = [6]ClassConfig{
+            ClassConfig{size: 512, align: 0, secret: false, high_water: 4},
+            ClassConfig{size: 4096, align: 0, secret: false, high_water: 4},
+            ClassConfig{size: 17408, align: 0, secret: false, high_water: 4},
+            ClassConfig{size: 512, align: 0, secret: true, high_water: 4},
+            ClassConfig{size: 4096, align: 0, secret: true, high_water: 4},
+            ClassConfig{size: 17408, align: 0, secret: true, high_water: 4},
+        };
+        var config: Config = test_config(?classes[0], 6, 1 << 21);
+        config.initial_slots = 8;
+        var pool: Pool;
+        if (!make(?pool, config, ?arena.counted)) { ret 2; }
+        fin { destroy(?pool); }
+        var b:       [2]usize;
+        var account: Account;
+        if (!is_none(open_account(?pool, ?account, 1, budgets_of(1 << 20, ?b[0]), 0))) { ret 3; }
+        fin { close_account(?pool, ?account); }
+        var held: [8]Chunk;
+        var i:    usize = 0;
+        for (i < 8) {
+            var size: usize = 100;
+            if (i >= 4) { size = 1000; }
+            val got: Acquired = acquire(?pool, ?account, ask(size), false);
+            if (!sel got.status.ok) { ret 4; }
+            held[i] = got.chunk;
+            i       = i + 1;
+        }
+        i = 0;
+        for (i < 8) {
+            if (!is_none(release(?pool, ?account, held[i]))) { ret 5; }
+            i = i + 1;
+        }
+        var snap: Snapshot;
+        snapshot(?pool, ?snap);
+        if (snap.classes[0].retained != 4 || snap.classes[1].retained != 4) { ret 6; }
+        val fresh: Acquired = acquire(?pool, ?account, ask(10000), false);
+        if (!sel fresh.status.ok || fresh.chunk.class != 2)  { ret 7; }
+        if (!is_none(release(?pool, ?account, fresh.chunk))) { ret 8; }
+        # a slot table the demand undercounts refuses, and gives the backing back
+        val allocs: usize = arena.count.allocs;
+        val frees:  usize = arena.count.frees;
+        pool.slot_top   = pool.slots.capacity::u32;
+        pool.empty_head = NONE;
+        val refused: Acquired = acquire(?pool, ?account, ask(100000), false);
+        if (!sel refused.reason.memory)                                         { ret 9; }
+        if (arena.count.allocs != allocs + 1 || arena.count.frees != frees + 1) { ret 10; }
+        if (account.held != 0 || account.chunks != 0 || pool.slots_in_use != 0) { ret 11; }
         ret 0;
     }
 
