@@ -4,6 +4,8 @@ $if ($mach.build.os != $mach.os.linux && $mach.build.os != $mach.os.darwin) {
     $error("std.net.async.local.unix: requires linux or darwin target");
 }
 
+use std.allocator;
+use std.allocator.page;
 use io_error: std.io.error;
 use std.io.runtime;
 use std.memory;
@@ -17,6 +19,7 @@ use std.system.os.shared;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
 use std.types.result.res;
 use std.types.size.isize;
 use std.types.size.usize;
@@ -63,14 +66,17 @@ rec Resource {
     write_tail:   u32;
     close_index:  u32;
     armed:        bool;
+    watched:      bool;
     closing:      bool;
     write_closed: bool;
     next_free:    u32;
 }
 
 pub rec Backend {
-    queue:           *shared.IoQueue;
-    source_id:       u16;
+    queue:     *shared.IoQueue;
+    source_id: u16;
+    # where every table's chunks come from
+    allocator:       allocator.Allocator;
     operations:      table.Table;
     resources:       table.Table;
     ready:           table.Table;
@@ -322,6 +328,7 @@ fun resource_acquire(backend: *Backend, resource_value: usize, created: *bool) *
     resource.state        = RESOURCE_ACTIVE;
     resource.generation   = generation;
     resource.resource     = resource_value;
+    resource.watched      = false;
     resource.read_head    = NONE;
     resource.read_tail    = NONE;
     resource.write_head   = NONE;
@@ -343,6 +350,7 @@ fun resource_acquire(backend: *Backend, resource_value: usize, created: *bool) *
 
 fun resource_release_unwatched(backend: *Backend, resource: *Resource) {
     val index: u32 = resource.index;
+    resource.watched = false;
     resource_map_remove(backend, index);
     resource.state         = RESOURCE_FREE;
     resource.armed         = false;
@@ -352,9 +360,15 @@ fun resource_release_unwatched(backend: *Backend, resource: *Resource) {
 }
 
 fun resource_release(backend: *Backend, resource: *Resource) {
-    native.io_queue_unwatch(backend.queue, resource.resource);
-    resource.armed = false;
+    unwatch_owned(backend, resource);
     resource_release_unwatched(backend, resource);
+}
+
+# a resource removes only the registration it made itself
+fun unwatch_owned(backend: *Backend, resource: *Resource) {
+    if (resource.watched) { native.io_queue_unwatch(backend.queue, resource.resource); }
+    resource.watched = false;
+    resource.armed   = false;
 }
 
 # the ready table is held at the operation table's size, so a finished
@@ -549,8 +563,7 @@ fun arm_resource(backend: *Backend, resource: *Resource) {
     if (resource.read_head != NONE)  { events = events | native.IO_EVENT_READ; }
     if (resource.write_head != NONE) { events = events | native.IO_EVENT_WRITE; }
     if (events == 0) {
-        native.io_queue_unwatch(backend.queue, resource.resource);
-        resource.armed = false;
+        unwatch_owned(backend, resource);
         if (resource.close_index != NONE) {
             val close_operation: *Operation = operation_at(backend, resource.close_index::usize);
             resource.close_index = NONE;
@@ -561,11 +574,12 @@ fun arm_resource(backend: *Backend, resource: *Resource) {
         ret;
     }
     val token:  types.Token = types.Token{index: resource.index, generation: resource.generation};
-    val status: i64         = native.io_queue_watch(backend.queue, resource.resource, token_context(backend, token), events);
+    var status: i64         = 0;
+    if (resource.watched) { status = native.io_queue_rearm(backend.queue, resource.resource, token_context(backend, token), events); }
+    or                    { status = native.io_queue_watch(backend.queue, resource.resource, token_context(backend, token), events); }
     if (status < 0) {
         fail_resource(backend, resource, status);
-        native.io_queue_unwatch(backend.queue, resource.resource);
-        resource.armed = false;
+        unwatch_owned(backend, resource);
         if (resource.close_index != NONE) {
             val close_operation: *Operation = operation_at(backend, resource.close_index::usize);
             resource.close_index = NONE;
@@ -575,7 +589,8 @@ fun arm_resource(backend: *Backend, resource: *Resource) {
         resource_release_unwatched(backend, resource);
         ret;
     }
-    resource.armed = true;
+    resource.watched = true;
+    resource.armed   = true;
 }
 
 fun drive_resource(backend: *Backend, resource: *Resource, events: u32) {
@@ -635,9 +650,11 @@ pub fun make(backend: *Backend, queue: *shared.IoQueue, initial: usize, source_i
     if (!memory.range_scaled(map_capacity, $size_of(u32), ?map_bytes) ||
         !memory.range_scaled(NATIVE_BATCH, $size_of(native.IoCompletion), ?native_bytes)) { ret native.ENOMEM; }
 
-    if (!table.make(?backend.operations, $size_of(Operation), initial)) { ret native.ENOMEM; }
-    if (!table.make(?backend.resources, $size_of(Resource), initial) ||
-        !table.make(?backend.ready, $size_of(types.NativeCompletion), initial)) {
+    val allocated: err[allocator.Error] = page.make(?backend.allocator);
+    if (sel allocated.err)                                                                  { ret native.ENOMEM; }
+    if (!table.make(?backend.operations, ?backend.allocator, $size_of(Operation), initial)) { ret native.ENOMEM; }
+    if (!table.make(?backend.resources, ?backend.allocator, $size_of(Resource), initial) ||
+        !table.make(?backend.ready, ?backend.allocator, $size_of(types.NativeCompletion), initial)) {
         table.destroy(?backend.ready);
         table.destroy(?backend.resources);
         table.destroy(?backend.operations);
@@ -818,8 +835,7 @@ pub fun cancel(backend: *Backend, token: types.Token) i64 {
         unlink(backend, resource, operation);
         operation_release(backend, token.index);
         fail_resource(backend, resource, native.ECANCELED);
-        native.io_queue_unwatch(backend.queue, resource.resource);
-        resource.armed = false;
+        unwatch_owned(backend, resource);
         socket_close(resource.resource);
         resource_release_unwatched(backend, resource);
         mutex.unlock(?backend.lock);

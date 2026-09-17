@@ -1,5 +1,7 @@
 # bounded portable operation-completion ownership
 
+use std.allocator;
+use std.allocator.page;
 use std.chrono.time;
 use io_error: std.io.error;
 use std.io.lifecycle;
@@ -71,6 +73,7 @@ pub rec Completion {
     bytes:         usize;
     items:         usize;
     resource:      usize;
+    opening:       u64;
     has_error:     bool;
     error:         io_error.Error;
     end_of_stream: bool;
@@ -175,7 +178,9 @@ pub val DESTROYED: u8 = 3;
 
 # one thread owns wait and dequeue, while submission and resolution may be concurrent
 pub rec Runtime {
-    queue:           os.IoQueue;
+    queue: os.IoQueue;
+    # where every table's chunks come from
+    allocator:       allocator.Allocator;
     slots:           table.Table;
     timers:          table.Table;
     sources:         table.Table;
@@ -241,11 +246,11 @@ pub fun capacity(runtime: *Runtime) usize {
 }
 
 fun invalid(operation: io_error.Operation) io_error.Error {
-    ret io_error.from_code(os.EINVAL, operation);
+    ret io_error.make(io_error.INVALID, operation);
 }
 
 fun exhausted(operation: io_error.Operation) io_error.Error {
-    ret io_error.from_code(os.ENOMEM, operation);
+    ret io_error.make(io_error.RESOURCE_EXHAUSTED, operation);
 }
 
 fun init_slot(runtime: *Runtime, index: usize) {
@@ -260,7 +265,7 @@ fun init_slot(runtime: *Runtime, index: usize) {
     slot.cancellation_active    = false;
     slot.cancellation_pending   = false;
     slot.lifecycle_cancellation = false;
-    slot.terminal_error         = io_error.from_code(0, io_error.OP_UNKNOWN);
+    slot.terminal_error         = io_error.make(io_error.OTHER, io_error.OP_UNKNOWN);
     slot.attachment.owner       = nil;
     slot.attachment.generation  = 0;
     slot.attachment.sequence    = 0;
@@ -326,11 +331,13 @@ pub fun make(runtime: *Runtime, initial: usize) err[io_error.Error] {
         ?native_event_bytes)) {
         ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
     }
-    if (!table.make(?runtime.slots, $size_of(Slot), initial)) {
+    val allocated: err[allocator.Error] = page.make(?runtime.allocator);
+    if (sel allocated.err) { ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)}; }
+    if (!table.make(?runtime.slots, ?runtime.allocator, $size_of(Slot), initial)) {
         ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
     }
-    if (!table.make(?runtime.timers, $size_of(TimerEntry), initial) ||
-        !table.make(?runtime.sources, $size_of(Source), SOURCE_INITIAL) ||
+    if (!table.make(?runtime.timers, ?runtime.allocator, $size_of(TimerEntry), initial) ||
+        !table.make(?runtime.sources, ?runtime.allocator, $size_of(Source), SOURCE_INITIAL) ||
         !reserve_timers(runtime)) {
         release_tables(runtime);
         ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
@@ -366,7 +373,7 @@ pub fun make(runtime: *Runtime, initial: usize) err[io_error.Error] {
         release_tables(runtime);
         runtime.native_events = nil;
         runtime.destroyed     = true;
-        ret err[io_error.Error].err{io_error.from_code(code, io_error.OP_CREATE)};
+        ret err[io_error.Error].err{os.error(code, io_error.OP_CREATE)};
     }
     ret err[io_error.Error].ok{};
 }
@@ -402,7 +409,7 @@ pub fun register_source(
     mutex.lock(?runtime.lock);
     if (runtime.destroyed || lifecycle.snapshot(?runtime.lifecycle).state != lifecycle.OPEN) {
         mutex.unlock(?runtime.lock);
-        ret res[SourceToken, io_error.Error].err{io_error.from_code(os.EBADF, io_error.OP_CREATE)};
+        ret res[SourceToken, io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_CREATE)};
     }
     if (runtime.next_source_tag > 0xffff) {
         mutex.unlock(?runtime.lock);
@@ -436,7 +443,7 @@ pub fun register_source(
         source.state   = SOURCE_RETIRED;
         source.context = nil;
         mutex.unlock(?runtime.lock);
-        ret res[SourceToken, io_error.Error].err{io_error.from_code(os.EBADF, io_error.OP_CREATE)};
+        ret res[SourceToken, io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_CREATE)};
     }
     runtime.source_count    = runtime.source_count + 1;
     runtime.next_source_tag = runtime.next_source_tag + 1;
@@ -458,7 +465,7 @@ pub fun retire_source(runtime: *Runtime, token: SourceToken) res[bool, io_error.
     }
     if (source.live != 0 || source.busy != 0) {
         mutex.unlock(?runtime.lock);
-        ret res[bool, io_error.Error].err{io_error.from_code(os.EBUSY, io_error.OP_CLOSE)};
+        ret res[bool, io_error.Error].err{io_error.make(io_error.BUSY, io_error.OP_CLOSE)};
     }
     source.state = SOURCE_RETIRED;
     mutex.unlock(?runtime.lock);
@@ -481,7 +488,7 @@ pub fun release_source(runtime: *Runtime, token: SourceToken) err[io_error.Error
     if (sel settled.ok && settled.ok) { wake_result = os.io_queue_wake(?runtime.queue); }
     mutex.unlock(?runtime.lock);
     if (wake_result < 0) {
-        ret err[io_error.Error].err{io_error.from_code(wake_result, io_error.OP_WAKE)};
+        ret err[io_error.Error].err{os.error(wake_result, io_error.OP_WAKE)};
     }
     ret err[io_error.Error].ok{};
 }
@@ -498,17 +505,17 @@ pub fun source_id(token: SourceToken) u16 {
 
 # a fresh index is appended and an index is never recycled while it is live,
 # so growth adds storage and moves nothing
-fun claim_locked(runtime: *Runtime, operation: Operation, source_index: u32, token: *Token) i64 {
+fun claim_locked(runtime: *Runtime, operation: Operation, source_index: u32, token: *Token) err[io_error.Kind] {
     if (runtime.destroyed || lifecycle.snapshot(?runtime.lifecycle).state != lifecycle.OPEN) {
-        ret os.EBADF;
+        ret err[io_error.Kind].err{io_error.CLOSED};
     }
     var index: usize = free_pop(runtime);
     if (index == NO_SLOT) {
         # a token index is 32 bits wide on every backend
-        if (runtime.slot_count > 0xffffffff) { ret os.ENOMEM; }
+        if (runtime.slot_count > 0xffffffff) { ret err[io_error.Kind].err{io_error.RESOURCE_EXHAUSTED}; }
         if (runtime.slot_count == runtime.slots.capacity &&
-            !table.grow(?runtime.slots)) { ret os.ENOMEM; }
-        if (!reserve_timers(runtime)) { ret os.ENOMEM; }
+            !table.grow(?runtime.slots)) { ret err[io_error.Kind].err{io_error.RESOURCE_EXHAUSTED}; }
+        if (!reserve_timers(runtime)) { ret err[io_error.Kind].err{io_error.RESOURCE_EXHAUSTED}; }
         index = runtime.slot_count;
         init_slot(runtime, index);
         runtime.slot_count = runtime.slot_count + 1;
@@ -523,13 +530,13 @@ fun claim_locked(runtime: *Runtime, operation: Operation, source_index: u32, tok
     slot.cancellation_active    = false;
     slot.cancellation_pending   = false;
     slot.lifecycle_cancellation = false;
-    slot.terminal_error         = io_error.from_code(0, io_error.OP_UNKNOWN);
+    slot.terminal_error         = io_error.make(io_error.OTHER, io_error.OP_UNKNOWN);
     slot.source_index           = source_index;
     cancel.init_registration(?slot.cancellation);
     val attached: err[lifecycle.StateError] = lifecycle.attach(?runtime.lifecycle, ?slot.attachment);
     if (sel attached.err) {
         free_push(runtime, index);
-        ret os.EBADF;
+        ret err[io_error.Kind].err{io_error.CLOSED};
     }
     slot.state   = SLOT_ACTIVE;
     runtime.live = runtime.live + 1;
@@ -538,16 +545,16 @@ fun claim_locked(runtime: *Runtime, operation: Operation, source_index: u32, tok
         source.live = source.live + 1;
     }
     @token = Token{index: index::u32, generation: generation};
-    ret 0;
+    ret err[io_error.Kind].ok{};
 }
 
 pub fun submit(runtime: *Runtime, operation: Operation) res[Token, io_error.Error] {
     if (runtime == nil) { ret res[Token, io_error.Error].err{invalid(io_error.OP_SUBMIT)}; }
     mutex.lock(?runtime.lock);
-    var token: Token;
-    val code:  i64 = claim_locked(runtime, operation, NO_SOURCE, ?token);
+    var token:   Token;
+    val claimed: err[io_error.Kind] = claim_locked(runtime, operation, NO_SOURCE, ?token);
     mutex.unlock(?runtime.lock);
-    if (code < 0) { ret res[Token, io_error.Error].err{io_error.from_code(code, io_error.OP_SUBMIT)}; }
+    if (sel claimed.err) { ret res[Token, io_error.Error].err{io_error.make(claimed.err, io_error.OP_SUBMIT)}; }
     ret res[Token, io_error.Error].ok{token};
 }
 
@@ -558,10 +565,10 @@ pub fun submit_owned(runtime: *Runtime, source_token: SourceToken, operation: Op
         mutex.unlock(?runtime.lock);
         ret res[Token, io_error.Error].err{invalid(io_error.OP_SUBMIT)};
     }
-    var token: Token;
-    val code:  i64 = claim_locked(runtime, operation, source_token.index, ?token);
+    var token:   Token;
+    val claimed: err[io_error.Kind] = claim_locked(runtime, operation, source_token.index, ?token);
     mutex.unlock(?runtime.lock);
-    if (code < 0) { ret res[Token, io_error.Error].err{io_error.from_code(code, io_error.OP_SUBMIT)}; }
+    if (sel claimed.err) { ret res[Token, io_error.Error].err{io_error.make(claimed.err, io_error.OP_SUBMIT)}; }
     ret res[Token, io_error.Error].ok{token};
 }
 
@@ -667,7 +674,7 @@ fun timer_remove_token(runtime: *Runtime, token: Token, purpose: u8) bool {
 
 # a completion lives in its own slot and the queue links slots, so there is no
 # second table to size and a slot holds at most one queued completion
-fun enqueue(runtime: *Runtime, token: Token, slot: *Slot, bytes: usize, items: usize, resource: usize, has_error: bool, failure: io_error.Error, eof: bool) {
+fun enqueue(runtime: *Runtime, token: Token, slot: *Slot, bytes: usize, items: usize, resource: usize, opening: u64, has_error: bool, failure: io_error.Error, eof: bool) {
     slot.completion = Completion{
         token:         token,
         kind:          slot.operation.kind,
@@ -675,6 +682,7 @@ fun enqueue(runtime: *Runtime, token: Token, slot: *Slot, bytes: usize, items: u
         bytes:         bytes,
         items:         items,
         resource:      resource,
+        opening:       opening,
         has_error:     has_error,
         error:         failure,
         end_of_stream: eof,
@@ -688,9 +696,9 @@ fun enqueue(runtime: *Runtime, token: Token, slot: *Slot, bytes: usize, items: u
 }
 
 fun cancellation_error(reason: cancel.Reason) io_error.Error {
-    if (sel reason.timed_out) { ret io_error.from_code(os.ETIMEDOUT, io_error.OP_WAIT); }
-    if (sel reason.cancelled) { ret io_error.from_code(os.ECANCELED, io_error.OP_WAIT); }
-    ret io_error.from_code(os.EBADF, io_error.OP_SUBMIT);
+    if (sel reason.timed_out) { ret io_error.make(io_error.TIMEOUT, io_error.OP_WAIT); }
+    if (sel reason.cancelled) { ret io_error.make(io_error.CANCELLED, io_error.OP_WAIT); }
+    ret io_error.make(io_error.CLOSED, io_error.OP_SUBMIT);
 }
 
 # a refused transition counts as not made, the same as the old false
@@ -700,10 +708,10 @@ fun transitioned(transition: cancel.Transition) bool {
 }
 
 fun close_error(cause: lifecycle.Cause) io_error.Error {
-    if (cause == lifecycle.DEADLINE)     { ret io_error.from_code(os.ETIMEDOUT, io_error.OP_CLOSE); }
-    if (cause == lifecycle.CANCELLATION) { ret io_error.from_code(os.ECANCELED, io_error.OP_CLOSE); }
-    if (cause == lifecycle.FAILURE)      { ret io_error.from_code(os.EIO, io_error.OP_CLOSE); }
-    ret io_error.from_code(os.EBADF, io_error.OP_CLOSE);
+    if (cause == lifecycle.DEADLINE)     { ret io_error.make(io_error.TIMEOUT, io_error.OP_CLOSE); }
+    if (cause == lifecycle.CANCELLATION) { ret io_error.make(io_error.CANCELLED, io_error.OP_CLOSE); }
+    if (cause == lifecycle.FAILURE)      { ret io_error.make(io_error.IO, io_error.OP_CLOSE); }
+    ret io_error.make(io_error.CLOSED, io_error.OP_CLOSE);
 }
 
 fun remove_slot_timers(runtime: *Runtime, token: Token) {
@@ -758,7 +766,7 @@ fun scope_cancel_complete(context: ptr, reason: cancel.Reason) {
     val token:     Token = Token{index: slot.index, generation: slot.generation};
     var published: bool  = false;
     if (slot.state == SLOT_CANCELLING && !slot.cancellation_pending) {
-        enqueue(runtime, token, slot, 0, 0, 0, true, slot.terminal_error, false);
+        enqueue(runtime, token, slot, 0, 0, 0, 0, true, slot.terminal_error, false);
         published = true;
     }
     slot.cancellation_active = false;
@@ -834,18 +842,18 @@ fun submit_scoped_with_source(
     }
     var source_index: u32 = NO_SOURCE;
     if (owned) { source_index = source_token.index; }
-    var token: Token;
-    val code:  i64 = claim_locked(runtime, operation, source_index, ?token);
-    if (code < 0) {
+    var token:   Token;
+    val claimed: err[io_error.Kind] = claim_locked(runtime, operation, source_index, ?token);
+    if (sel claimed.err) {
         mutex.unlock(?runtime.lock);
-        ret res[Token, io_error.Error].err{io_error.from_code(code, io_error.OP_SUBMIT)};
+        ret res[Token, io_error.Error].err{io_error.make(claimed.err, io_error.OP_SUBMIT)};
     }
     if (needs_wake) {
         val wake_result: i64 = os.io_queue_wake(?runtime.queue);
         if (wake_result < 0) {
             release_claim_locked(runtime, token);
             mutex.unlock(?runtime.lock);
-            ret res[Token, io_error.Error].err{io_error.from_code(wake_result, io_error.OP_WAKE)};
+            ret res[Token, io_error.Error].err{os.error(wake_result, io_error.OP_WAKE)};
         }
     }
     val attached: cancel.Reason = attach_scope_locked(runtime, token, scope);
@@ -872,13 +880,13 @@ pub fun submit_scoped_owned(
     ret submit_scoped_with_source(runtime, source_token, true, scope, operation);
 }
 
-fun resolve_with_copy(runtime: *Runtime, token: Token, source: *u8, copy: bool, bytes: usize, items: usize, resource: usize, has_error: bool, failure: io_error.Error, eof: bool) err[io_error.Error] {
+fun resolve_with_copy(runtime: *Runtime, token: Token, source: *u8, copy: bool, bytes: usize, items: usize, resource: usize, opening: u64, has_error: bool, failure: io_error.Error, eof: bool) err[io_error.Error] {
     if (runtime == nil) { ret err[io_error.Error].err{invalid(io_error.OP_SUBMIT)}; }
     mutex.lock(?runtime.lock);
     val slot: *Slot = slot_for(runtime, token);
     if (slot == nil) {
         mutex.unlock(?runtime.lock);
-        ret err[io_error.Error].err{io_error.from_code(os.EBADF, io_error.OP_SUBMIT)};
+        ret err[io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_SUBMIT)};
     }
     if (copy && (slot.operation.kind != FILE_READ || bytes > slot.operation.length || (bytes > 0 && (source == nil || slot.operation.buffer == nil)))) {
         mutex.unlock(?runtime.lock);
@@ -886,36 +894,45 @@ fun resolve_with_copy(runtime: *Runtime, token: Token, source: *u8, copy: bool, 
     }
     if (slot.cancellation_active && !transitioned(cancel.unregister(?slot.cancellation))) {
         mutex.unlock(?runtime.lock);
-        ret err[io_error.Error].err{io_error.from_code(os.EBADF, io_error.OP_SUBMIT)};
+        ret err[io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_SUBMIT)};
     }
     slot.cancellation_active = false;
     remove_slot_timers(runtime, token);
     if (copy && bytes > 0) { memory.raw_copy(slot.operation.buffer::ptr, source::ptr, bytes); }
-    enqueue(runtime, token, slot, bytes, items, resource, has_error, failure, eof);
+    enqueue(runtime, token, slot, bytes, items, resource, opening, has_error, failure, eof);
     val wake_result: i64 = os.io_queue_wake(?runtime.queue);
     mutex.unlock(?runtime.lock);
     if (wake_result < 0) {
-        ret err[io_error.Error].err{io_error.from_code(wake_result, io_error.OP_WAKE)};
+        ret err[io_error.Error].err{os.error(wake_result, io_error.OP_WAKE)};
     }
     ret err[io_error.Error].ok{};
 }
 
 fun resolve(runtime: *Runtime, token: Token, bytes: usize, items: usize, resource: usize, has_error: bool, failure: io_error.Error, eof: bool) err[io_error.Error] {
-    ret resolve_with_copy(runtime, token, nil, false, bytes, items, resource, has_error, failure, eof);
+    ret resolve_with_copy(runtime, token, nil, false, bytes, items, resource, 0, has_error, failure, eof);
 }
 
 pub fun complete(runtime: *Runtime, token: Token, bytes: usize, resource: usize, end_of_stream: bool) err[io_error.Error] {
-    ret resolve(runtime, token, bytes, 0, resource, false, io_error.from_code(0, io_error.OP_UNKNOWN), end_of_stream);
+    ret resolve(runtime, token, bytes, 0, resource, false, io_error.make(io_error.OTHER, io_error.OP_UNKNOWN), end_of_stream);
 }
 
 # copy is atomic with terminal publication and loses cleanly to close or cancellation
 pub fun complete_copy(runtime: *Runtime, token: Token, source: *u8, bytes: usize, resource: usize, end_of_stream: bool) err[io_error.Error] {
-    ret resolve_with_copy(runtime, token, source, true, bytes, 0, resource, false, io_error.from_code(0, io_error.OP_UNKNOWN), end_of_stream);
+    ret resolve_with_copy(runtime, token, source, true, bytes, 0, resource, 0, false, io_error.make(io_error.OTHER, io_error.OP_UNKNOWN), end_of_stream);
+}
+
+# a completion that hands the caller a socket it did not open itself, such as
+# an accepted or a connected one, also carries that socket's opening
+# ---
+# resource: the native socket
+# opening:  the opening its handle was stamped with (std.io.handle)
+pub fun complete_opened(runtime: *Runtime, token: Token, resource: usize, opening: u64) err[io_error.Error] {
+    ret resolve_with_copy(runtime, token, nil, false, 0, 0, resource, opening, false, io_error.make(io_error.OTHER, io_error.OP_UNKNOWN), false);
 }
 
 # batch completions report byte progress and completed item count separately
 pub fun complete_batch(runtime: *Runtime, token: Token, bytes: usize, items: usize, resource: usize) err[io_error.Error] {
-    ret resolve(runtime, token, bytes, items, resource, false, io_error.from_code(0, io_error.OP_UNKNOWN), false);
+    ret resolve(runtime, token, bytes, items, resource, false, io_error.make(io_error.OTHER, io_error.OP_UNKNOWN), false);
 }
 
 pub fun fail(runtime: *Runtime, token: Token, failure: io_error.Error) err[io_error.Error] {
@@ -928,22 +945,22 @@ pub fun complete_cancellation(runtime: *Runtime, token: Token) err[io_error.Erro
     mutex.lock(?runtime.lock);
     if (token.index::usize >= runtime.slot_count) {
         mutex.unlock(?runtime.lock);
-        ret err[io_error.Error].err{io_error.from_code(os.EBADF, io_error.OP_SUBMIT)};
+        ret err[io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_SUBMIT)};
     }
     val slot: *Slot = slot_at(runtime, token.index::usize);
     if (slot.generation != token.generation || slot.state != SLOT_CANCELLING || !slot.cancellation_pending) {
         mutex.unlock(?runtime.lock);
-        ret err[io_error.Error].err{io_error.from_code(os.EBADF, io_error.OP_SUBMIT)};
+        ret err[io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_SUBMIT)};
     }
     slot.cancellation_pending = false;
     if (slot.cancellation_active) {
         mutex.unlock(?runtime.lock);
         ret err[io_error.Error].ok{};
     }
-    enqueue(runtime, token, slot, 0, 0, 0, true, slot.terminal_error, false);
+    enqueue(runtime, token, slot, 0, 0, 0, 0, true, slot.terminal_error, false);
     val wake_result: i64 = os.io_queue_wake(?runtime.queue);
     mutex.unlock(?runtime.lock);
-    if (wake_result < 0) { ret err[io_error.Error].err{io_error.from_code(wake_result, io_error.OP_WAKE)}; }
+    if (wake_result < 0) { ret err[io_error.Error].err{os.error(wake_result, io_error.OP_WAKE)}; }
     ret err[io_error.Error].ok{};
 }
 
@@ -955,14 +972,14 @@ pub fun submit_timer(runtime: *Runtime, deadline: time.Time, context: usize) res
     }
     val operation: Operation = Operation{kind: TIMER, resource: 0, buffer: nil, length: 0, offset: 0, context: context};
     mutex.lock(?runtime.lock);
-    var token: Token;
-    val code:  i64 = claim_locked(runtime, operation, NO_SOURCE, ?token);
-    if (code == 0) {
+    var token:   Token;
+    val claimed: err[io_error.Kind] = claim_locked(runtime, operation, NO_SOURCE, ?token);
+    if (sel claimed.ok) {
         val wake_result: i64 = os.io_queue_wake(?runtime.queue);
         if (wake_result < 0) {
             release_claim_locked(runtime, token);
             mutex.unlock(?runtime.lock);
-            ret res[Token, io_error.Error].err{io_error.from_code(wake_result, io_error.OP_WAKE)};
+            ret res[Token, io_error.Error].err{os.error(wake_result, io_error.OP_WAKE)};
         }
         timer_push(runtime, TimerEntry{
             deadline: deadline,
@@ -972,7 +989,7 @@ pub fun submit_timer(runtime: *Runtime, deadline: time.Time, context: usize) res
         });
     }
     mutex.unlock(?runtime.lock);
-    if (code < 0) { ret res[Token, io_error.Error].err{io_error.from_code(code, io_error.OP_SUBMIT)}; }
+    if (sel claimed.err) { ret res[Token, io_error.Error].err{io_error.make(claimed.err, io_error.OP_SUBMIT)}; }
     ret res[Token, io_error.Error].ok{token};
 }
 
@@ -985,17 +1002,17 @@ pub fun submit_timer_scoped(runtime: *Runtime, scope: *cancel.Scope, deadline: t
     cancel.expire(scope, now.ok);
     val operation: Operation = Operation{kind: TIMER, resource: 0, buffer: nil, length: 0, offset: 0, context: context};
     mutex.lock(?runtime.lock);
-    var token: Token;
-    val code:  i64 = claim_locked(runtime, operation, NO_SOURCE, ?token);
-    if (code < 0) {
+    var token:   Token;
+    val claimed: err[io_error.Kind] = claim_locked(runtime, operation, NO_SOURCE, ?token);
+    if (sel claimed.err) {
         mutex.unlock(?runtime.lock);
-        ret res[Token, io_error.Error].err{io_error.from_code(code, io_error.OP_SUBMIT)};
+        ret res[Token, io_error.Error].err{io_error.make(claimed.err, io_error.OP_SUBMIT)};
     }
     val wake_result: i64 = os.io_queue_wake(?runtime.queue);
     if (wake_result < 0) {
         release_claim_locked(runtime, token);
         mutex.unlock(?runtime.lock);
-        ret res[Token, io_error.Error].err{io_error.from_code(wake_result, io_error.OP_WAKE)};
+        ret res[Token, io_error.Error].err{os.error(wake_result, io_error.OP_WAKE)};
     }
     val attached: cancel.Reason = attach_scope_locked(runtime, token, scope);
     if (!sel attached.active) {
@@ -1020,18 +1037,18 @@ pub fun cancel_timer(runtime: *Runtime, token: Token) err[io_error.Error] {
     val slot: *Slot = slot_for(runtime, token);
     if (slot == nil || slot.operation.kind != TIMER || !timer_remove_token(runtime, token, TIMER_OPERATION)) {
         mutex.unlock(?runtime.lock);
-        ret err[io_error.Error].err{io_error.from_code(os.EBADF, io_error.OP_SUBMIT)};
+        ret err[io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_SUBMIT)};
     }
     if (slot.cancellation_active && !transitioned(cancel.unregister(?slot.cancellation))) {
         mutex.unlock(?runtime.lock);
-        ret err[io_error.Error].err{io_error.from_code(os.EBADF, io_error.OP_SUBMIT)};
+        ret err[io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_SUBMIT)};
     }
     slot.cancellation_active = false;
     timer_remove_token(runtime, token, TIMER_SCOPE_DEADLINE);
-    enqueue(runtime, token, slot, 0, 0, 0, true, io_error.from_code(os.ECANCELED, io_error.OP_WAIT), false);
+    enqueue(runtime, token, slot, 0, 0, 0, 0, true, io_error.make(io_error.CANCELLED, io_error.OP_WAIT), false);
     val wake_result: i64 = os.io_queue_wake(?runtime.queue);
     mutex.unlock(?runtime.lock);
-    if (wake_result < 0) { ret err[io_error.Error].err{io_error.from_code(wake_result, io_error.OP_WAKE)}; }
+    if (wake_result < 0) { ret err[io_error.Error].err{os.error(wake_result, io_error.OP_WAKE)}; }
     ret err[io_error.Error].ok{};
 }
 
@@ -1045,7 +1062,7 @@ fun timers_expire(runtime: *Runtime, now: time.Time) *cancel.Scope {
             if (!slot.cancellation_active || transitioned(cancel.unregister(?slot.cancellation))) {
                 slot.cancellation_active = false;
                 timer_remove_token(runtime, entry.token, TIMER_SCOPE_DEADLINE);
-                enqueue(runtime, entry.token, slot, 0, 0, 0, false, io_error.from_code(0, io_error.OP_UNKNOWN), false);
+                enqueue(runtime, entry.token, slot, 0, 0, 0, 0, false, io_error.make(io_error.OTHER, io_error.OP_UNKNOWN), false);
             }
         }
     }
@@ -1218,7 +1235,7 @@ pub fun begin_native_control(runtime: *Runtime) err[io_error.Error] {
         runtime.native_controls = runtime.native_controls - 1;
         mutex.unlock(?runtime.lock);
         mutex.unlock(?runtime.control_lock);
-        ret err[io_error.Error].err{io_error.from_code(wake_result, io_error.OP_WAKE)};
+        ret err[io_error.Error].err{os.error(wake_result, io_error.OP_WAKE)};
     }
     mutex.lock(?runtime.native_lock);
     ret err[io_error.Error].ok{};
@@ -1232,20 +1249,23 @@ pub fun end_native_control(runtime: *Runtime) {
     mutex.unlock(?runtime.control_lock);
 }
 
+# the number of native events collected
 # controlled reports a poll skipped for a pending native control
-fun native_poll(runtime: *Runtime, timeout_ms: i32, controlled: *bool) i64 {
+fun native_poll(runtime: *Runtime, timeout_ms: i32, controlled: *bool) res[usize, io_error.Error] {
     mutex.lock(?runtime.lock);
     val destroyed: bool = runtime.destroyed;
     @controlled = runtime.native_controls != 0;
     mutex.unlock(?runtime.lock);
-    if (destroyed)   { ret os.EBADF; }
-    if (@controlled) { ret 0; }
-    ret native_os.io_queue_poll(
+    if (destroyed)   { ret res[usize, io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_WAIT)}; }
+    if (@controlled) { ret res[usize, io_error.Error].ok{0}; }
+    val polled: i64 = native_os.io_queue_poll(
         ?runtime.queue,
         runtime.native_events::*native_os.IoCompletion,
         NATIVE_BATCH,
         timeout_ms,
     );
+    if (polled < 0) { ret res[usize, io_error.Error].err{os.error(polled, io_error.OP_WAIT)}; }
+    ret res[usize, io_error.Error].ok{polled::usize};
 }
 
 fun dispatch_source(runtime: *Runtime, index: usize, event: NativeEvent) bool {
@@ -1292,25 +1312,26 @@ fun flush_sources(runtime: *Runtime) {
 # collects native readiness and publishes every source's queued completions
 # controlled reports that a native control cut the collection short
 # the caller owns native_lock
-fun collect_native(runtime: *Runtime, timeout_ms: i32, controlled: *bool) i64 {
-    var total:   i64 = 0;
-    var timeout: i32 = timeout_ms;
+fun collect_native(runtime: *Runtime, timeout_ms: i32, controlled: *bool) res[usize, io_error.Error] {
+    var total:   usize = 0;
+    var timeout: i32   = timeout_ms;
     for (true) {
-        val waited: i64 = native_poll(runtime, timeout, controlled);
-        if (waited < 0) { ret waited; }
-        var i: usize = 0;
-        for (i < waited::usize) {
+        val polled: res[usize, io_error.Error] = native_poll(runtime, timeout, controlled);
+        if (sel polled.err) { ret polled; }
+        val waited: usize = polled.ok;
+        var i:      usize = 0;
+        for (i < waited) {
             val event: NativeEvent = runtime.native_events[i];
             dispatch_sources(runtime, event);
             i = i + 1;
         }
         total = total + waited;
         # a full batch may have left readiness behind, so drain without blocking
-        if (waited::usize < NATIVE_BATCH) { brk; }
+        if (waited < NATIVE_BATCH) { brk; }
         timeout = 0;
     }
     flush_sources(runtime);
-    ret total;
+    ret res[usize, io_error.Error].ok{total};
 }
 
 # the relative time left before deadline, rounded up so a wait never ends short
@@ -1366,11 +1387,9 @@ pub fun wait(runtime: *Runtime, output: *Completion, output_capacity: usize, tim
             ret res[usize, io_error.Error].err{invalid(io_error.OP_WAIT)};
         }
         controlled = false;
-        val collected: i64 = collect_native(runtime, native_timeout, ?controlled);
+        val collected: res[usize, io_error.Error] = collect_native(runtime, native_timeout, ?controlled);
         mutex.unlock(?runtime.native_lock);
-        if (collected < 0) {
-            ret res[usize, io_error.Error].err{io_error.from_code(collected, io_error.OP_WAIT)};
-        }
+        if (sel collected.err) { ret res[usize, io_error.Error].err{collected.err}; }
         var woken:   bool                       = false;
         val drained: res[usize, io_error.Error] = take(runtime, output, output_capacity, true, ?woken);
         if (sel drained.err)         { ret drained; }
@@ -1397,14 +1416,14 @@ fun post_wake(runtime: *Runtime, caller: bool) err[io_error.Error] {
     }
     mutex.lock(?runtime.lock);
     val destroyed: bool = runtime.destroyed;
-    var code:      i64  = os.EINVAL;
+    var code:      i64;
     if (!destroyed) {
         if (caller) { runtime.woken = true; }
         code = os.io_queue_wake(?runtime.queue);
     }
     mutex.unlock(?runtime.lock);
     if (destroyed) { ret err[io_error.Error].err{invalid(io_error.OP_WAKE)}; }
-    if (code < 0)  { ret err[io_error.Error].err{io_error.from_code(code, io_error.OP_WAKE)}; }
+    if (code < 0)  { ret err[io_error.Error].err{os.error(code, io_error.OP_WAKE)}; }
     ret err[io_error.Error].ok{};
 }
 
@@ -1473,7 +1492,7 @@ pub fun begin_close(runtime: *Runtime, mode: lifecycle.Mode, cause: lifecycle.Ca
                     }
                     if (slot.state == SLOT_CANCELLING && cancel_code != CANCELLATION_PENDING) {
                         slot.cancellation_pending = false;
-                        enqueue(runtime, token, slot, 0, 0, 0, true, closed_error, false);
+                        enqueue(runtime, token, slot, 0, 0, 0, 0, true, closed_error, false);
                     }
                     or (slot.state != SLOT_CANCELLING && slot.state != SLOT_QUEUED) {
                         mutex.unlock(?runtime.lock);
@@ -1486,7 +1505,7 @@ pub fun begin_close(runtime: *Runtime, mode: lifecycle.Mode, cause: lifecycle.Ca
     }
     val code: i64 = os.io_queue_wake(?runtime.queue);
     mutex.unlock(?runtime.lock);
-    if (code < 0) { ret res[lifecycle.CloseResult, io_error.Error].err{io_error.from_code(code, io_error.OP_CLOSE)}; }
+    if (code < 0) { ret res[lifecycle.CloseResult, io_error.Error].err{os.error(code, io_error.OP_CLOSE)}; }
     ret res[lifecycle.CloseResult, io_error.Error].ok{closing};
 }
 
@@ -1504,24 +1523,24 @@ fun destroy_with_native_ownership(runtime: *Runtime) err[io_error.Error] {
     }
     if (runtime.live != 0 || runtime.count != 0 || runtime.native_controls != 0) {
         mutex.unlock(?runtime.lock);
-        ret err[io_error.Error].err{io_error.from_code(os.EBUSY, io_error.OP_CLOSE)};
+        ret err[io_error.Error].err{io_error.make(io_error.BUSY, io_error.OP_CLOSE)};
     }
     var i: usize = 0;
     for (i < runtime.source_slots) {
         if (source_at(runtime, i).state != SOURCE_UNUSED) {
             mutex.unlock(?runtime.lock);
-            ret err[io_error.Error].err{io_error.from_code(os.EBUSY, io_error.OP_CLOSE)};
+            ret err[io_error.Error].err{io_error.make(io_error.BUSY, io_error.OP_CLOSE)};
         }
         i = i + 1;
     }
     val native_events: *NativeEvent = runtime.native_events;
     runtime.destroyed = true;
     mutex.unlock(?runtime.lock);
-    val queue_result:  i64 = os.io_queue_close(?runtime.queue);
-    val source_result: i64 = table.destroy(?runtime.sources);
-    val timer_result:  i64 = table.destroy(?runtime.timers);
-    val slot_result:   i64 = table.destroy(?runtime.slots);
-    val native_result: i64 = os.deallocate(native_events::ptr, $size_of(NativeEvent) * NATIVE_BATCH);
+    val queue_result:  i64                  = os.io_queue_close(?runtime.queue);
+    val source_result: err[allocator.Error] = table.destroy(?runtime.sources);
+    val timer_result:  err[allocator.Error] = table.destroy(?runtime.timers);
+    val slot_result:   err[allocator.Error] = table.destroy(?runtime.slots);
+    val native_result: i64                  = os.deallocate(native_events::ptr, $size_of(NativeEvent) * NATIVE_BATCH);
     runtime.native_events = nil;
     runtime.slot_count    = 0;
     runtime.source_slots  = 0;
@@ -1529,8 +1548,8 @@ fun destroy_with_native_ownership(runtime: *Runtime) err[io_error.Error] {
     runtime.free_tail     = NO_SLOT;
     runtime.head          = NO_SLOT;
     runtime.tail          = NO_SLOT;
-    if (queue_result < 0)                                                              { ret err[io_error.Error].err{io_error.from_code(queue_result, io_error.OP_CLOSE)}; }
-    if (timer_result < 0 || source_result < 0 || native_result < 0 || slot_result < 0) { ret err[io_error.Error].err{io_error.from_code(os.EIO, io_error.OP_CLOSE)}; }
+    if (queue_result < 0)                                                                          { ret err[io_error.Error].err{os.error(queue_result, io_error.OP_CLOSE)}; }
+    if (sel timer_result.err || sel source_result.err || native_result < 0 || sel slot_result.err) { ret err[io_error.Error].err{io_error.make(io_error.IO, io_error.OP_CLOSE)}; }
     ret err[io_error.Error].ok{};
 }
 
@@ -2315,10 +2334,10 @@ test "runtime wait and destroy serialize both native ownership interleavings" {
         ret 3;
     }
     mutex.lock(?runtime.native_lock);
-    var stale_controlled: bool = false;
-    val stale_wait:       i64  = native_poll(?runtime, plan.timeout_ms, ?stale_controlled);
+    var stale_controlled: bool                       = false;
+    val stale_wait:       res[usize, io_error.Error] = native_poll(?runtime, plan.timeout_ms, ?stale_controlled);
     mutex.unlock(?runtime.native_lock);
-    if (stale_wait != os.EBADF) { ret 4; }
+    if (!(sel stale_wait.err && stale_wait.err.kind == io_error.CLOSED)) { ret 4; }
 
     if (!ok_err(make(?runtime, 1))) { ret 5; }
     val second_prepared: res[WaitPlan, io_error.Error] = prepare_wait(?runtime, -1);
@@ -2344,11 +2363,11 @@ test "runtime wait and destroy serialize both native ownership interleavings" {
         thread.join(?worker);
         ret 8;
     }
-    var owned_controlled: bool = false;
-    val owned_wait:       i64  = native_poll(?runtime, second_plan.timeout_ms, ?owned_controlled);
+    var owned_controlled: bool                       = false;
+    val owned_wait:       res[usize, io_error.Error] = native_poll(?runtime, second_plan.timeout_ms, ?owned_controlled);
     mutex.unlock(?runtime.native_lock);
     thread.join(?worker);
-    if (owned_wait < 0 || atomic.load(?destroyed) != 1) { ret 9; }
+    if (sel owned_wait.err || atomic.load(?destroyed) != 1) { ret 9; }
 
     if (!ok_err(make(?runtime, 1))
         || !ok_bool(close(?runtime))) {

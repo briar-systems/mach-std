@@ -158,13 +158,17 @@ for target in "${targets[@]}"; do
 
         secret_ir="out/$target/$profile/ir/std/system/os/secret.ir"
         secret_asm="out/$target/$profile/asm/std/system/os/secret.s"
+        storage_ir="out/$target/$profile/ir/std/memory/secret.ir"
+        storage_asm="out/$target/$profile/asm/std/memory/secret.s"
         main_ir="out/$target/$profile/ir/backends/main.ir"
         main_asm="out/$target/$profile/asm/backends/main.s"
         [ -f "$secret_ir" ] || fail "$target $profile: secret OS IR missing"
         [ -f "$secret_asm" ] || fail "$target $profile: secret OS assembly missing"
+        [ -f "$storage_ir" ] || fail "$target $profile: secret storage IR missing"
+        [ -f "$storage_asm" ] || fail "$target $profile: secret storage assembly missing"
         [ -f "$main_ir" ] || fail "$target $profile: typed boundary IR missing"
         [ -f "$main_asm" ] || fail "$target $profile: typed boundary assembly missing"
-        python3 "$here/verify-ir.py" "$secret_ir" "$main_ir" "$profile" \
+        python3 "$here/verify-ir.py" "$secret_ir" "$storage_ir" "$main_ir" "$profile" \
             || fail "$target $profile: secret IR contract failed"
         case "$target" in
             linux-*)
@@ -214,19 +218,19 @@ for target in "${targets[@]}"; do
                 ;;
         esac
         if [ "$profile" = release ]; then
-            release_body="$(sed -n '/std.system.os.secret.deallocate:/,/std.system.os.secret.random_fill:/p' "$secret_asm")"
+            release_body="$(sed -n '/std.memory.secret.deallocate:/,/std.memory.secret.random_fill:/p' "$storage_asm")"
             # the oblivious wipe stays a call under the v5 inlining policy (mach
             # N6, PR #3270), so the call site counts as the wipe here
-            wipe_line="$(echo "$release_body" | grep -n -m1 -E 'mov byte \[[^]]+\], 0|strb wzr|sb zero|std\.system\.os\.secret\.wipe([^_]|$)' | cut -d: -f1 || true)"
+            wipe_line="$(echo "$release_body" | grep -n -m1 -E 'mov byte \[[^]]+\], 0|strb wzr|sb zero|std\.memory\.secret\.wipe([^_]|$)' | cut -d: -f1 || true)"
             case "$target" in
                 linux-*)
-                    release_line="$(echo "$release_body" | grep -n -m1 -E 'syscall|ecall|svc' | cut -d: -f1 || true)"
+                    release_line="$(echo "$release_body" | grep -n -m1 -E 'syscall|ecall|svc|native_release' | cut -d: -f1 || true)"
                     ;;
                 darwin-*)
-                    release_line="$(echo "$release_body" | grep -n -m1 '_free' | cut -d: -f1 || true)"
+                    release_line="$(echo "$release_body" | grep -n -m1 -E '_free|native_release' | cut -d: -f1 || true)"
                     ;;
                 windows-*)
-                    release_line="$(echo "$release_body" | grep -n -m1 'VirtualFree' | cut -d: -f1 || true)"
+                    release_line="$(echo "$release_body" | grep -n -m1 -E 'VirtualFree|native_release' | cut -d: -f1 || true)"
                     ;;
             esac
             [ -n "$wipe_line" ] || fail "$target release: secret release wipe missing from assembly"
@@ -234,7 +238,7 @@ for target in "${targets[@]}"; do
             [ "$wipe_line" -lt "$release_line" ] \
                 || fail "$target release: native release precedes secret wipe in assembly"
 
-            typed_release_body="$(sed -n '/# std.system.os.secret.release_typed\$backends.main.SecretRecord:/,/^# /p' "$main_asm")"
+            typed_release_body="$(sed -n '/# std.memory.secret.release_typed\$backends.main.SecretRecord:/,/^# /p' "$main_asm")"
             typed_wipe_line="$(echo "$typed_release_body" | grep -n -m1 -E 'mov byte \[[^]]+\], 0|strb wzr|sb zero' | cut -d: -f1 || true)"
             case "$target" in
                 *-x86_64)
