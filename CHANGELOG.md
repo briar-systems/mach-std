@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one per operation. N operations under one scope hold a single heap entry, and
   submission and completion cost stays flat from 1k to 100k operations. Expiry
   still ends every operation still registered in the scope (#741).
+- The license copyright is held by Briar Systems LLC. The MIT terms are unchanged (#765).
 
 ### Removed
 - **Breaking:** `time.monotonic`. Use `time.instant` (#752).
