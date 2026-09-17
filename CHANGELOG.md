@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Releases run through the family's shared release workflow (briar-systems/.github
+  `mach-release.yml`): it verifies the tag, version and changelog section, runs
+  the full CI, then publishes. The release-archive check that no test-only fault
+  module ships now runs in CI on every x86_64-linux run (#735).
+
 ## [4.0.1] - 2026-09-16
 
 Requires mach 5.2.0 or later. Tested with mach 5.2.1, the family CI seed.
