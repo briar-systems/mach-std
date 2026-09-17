@@ -21,7 +21,7 @@ A target that claims a group exports every member listed here. `src/system/capab
 
 | flag | group | purpose |
 | --- | --- | --- |
-| `HOSTED` | core | required by every hosted std module: the error constants, the translation of a native code into an `io.error.Error` (`error`, `error_kind`, `error_message`, `message`), and process termination |
+| `HOSTED` | core | required by every hosted std module: the translation of a native code into an `io.error.Error` (`error`, `error_kind`, `error_message`, `message`), and process termination |
 | `HAS_PAGES` | pages | page allocation, protection, locking and advice, and secret-welded storage |
 | `HAS_CLOCK` | clock | the realtime and monotonic clocks, and sleep |
 | `HAS_ENTROPY` | entropy | cryptographic random fill, public and secret |
@@ -35,7 +35,7 @@ A target that claims a group exports every member listed here. `src/system/capab
 
 ### core (`HOSTED`)
 
-`E2BIG`, `EACCES`, `EADDRINUSE`, `EAGAIN`, `EBADF`, `EBUSY`, `ECANCELED`, `ECHILD`, `ECONNABORTED`, `ECONNREFUSED`, `ECONNRESET`, `EEXIST`, `EFAULT`, `EHOSTUNREACH`, `EINTR`, `EINVAL`, `EIO`, `EISDIR`, `EMFILE`, `ENAMETOOLONG`, `ENETUNREACH`, `ENFILE`, `ENODEV`, `ENOENT`, `ENOMEM`, `ENOSPC`, `ENOTCONN`, `ENOTDIR`, `ENOTEMPTY`, `ENOTSUP`, `ENXIO`, `EPERM`, `EPIPE`, `ERANGE`, `EROFS`, `ESRCH`, `ETIMEDOUT`, `ETXTBSY`, `NOT_FOUND`, `abort`, `error`, `error_kind`, `error_message`, `message`, `terminate`
+`NOT_FOUND`, `abort`, `error`, `error_kind`, `error_message`, `message`, `terminate`
 
 ### pages (`HAS_PAGES`)
 
@@ -73,7 +73,7 @@ A target that claims a group exports every member listed here. `src/system/capab
 
 The contract is designed so that a user-supplied implementation, for a kernel or UEFI, can provide it without changing any consumer. It holds to these assumptions:
 
-- **A1, codes.** A fallible primitive returns `i64`: `>= 0` is success and `< 0` is an opaque native code. Only the implementation interprets a code. In 3.x the `E*` constants are still on the portable surface. From 4.0.0 they are not, and `os.error_kind(code)` is the only portable reading of a code.
+- **A1, codes.** A fallible primitive returns `i64`: `>= 0` is success and `< 0` is an opaque native code. Only the implementation interprets a code. The `E*` constants are not on the portable surface, only in the per-OS modules, and `os.error_kind(code)` is the only portable reading of a code.
 - **A2, handles.** Resources are pointer-width opaque values. In 3.x descriptors are still `i32`. From 4.0.0 they are `usize` handles, a primitive that creates one returns it through an out parameter, and the standard handles are functions.
 - **A3, no ambient process model.** Nothing assumes environment variables, a working directory, signals, standard streams or a process table unless it belongs to the group that provides them (process, files).
 - **A4, secret shape.** Primitives that touch secret-welded storage take `*^u8` and never downgrade it.

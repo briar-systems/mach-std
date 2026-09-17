@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behind it (#688).
 - `ELOOP` on linux and windows, where windows maps
   `ERROR_CANT_RESOLVE_FILENAME` to it (#688).
+- `std.filesystem.removal.Error` has a `kind`. `removal.from_native(code)`
+  builds one for a native failure and `removal.contained()` for a component or
+  depth removal refuses (#693).
+- `std.process.exec.Failure` has a `kind`, the portable classification of the
+  failure (#693).
 
 ### Changed
 - **Breaking.** Native codes classify with the full kind set. A code that used
@@ -36,12 +41,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking.** `std.terminal.control_failure` and `read_failure` are defined
   in `std.terminal`. `std.terminal.error` holds only the outcome tags and
   `code` (#688).
+- **Breaking.** Modules outside the OS layer compare kinds, never errno.
+  A refusal std makes on its own carries a kind and code 0, a native failure
+  keeps its code, and a raw primitive return is read with `os.error_kind`
+  (#693). This changes what several public results hold:
+  - `std.filesystem.removal.Error.code` is 0 for a refusal, and an entry name
+    a native listing returns that is not a single component is a containment
+    refusal, not `EIO`.
+  - `std.filesystem.transaction.ownership` functions return
+    `err[removal.Error]` instead of an `i64` code.
+  - `std.filesystem.transaction` maps an ownership refusal to its own kinds:
+    invalid use is `INVALID`, a held root lock is `LOCK_HELD`, an unsupported
+    backend is `UNSUPPORTED`, and a claim that already exists or a claims
+    entry that is not a directory is `CONFLICT`. A native `EINVAL` elsewhere
+    in a publication is `IO` with its code.
+  - `std.process.exec.Failure.code` is 0 when the refusal is the module's own,
+    such as waiting on a child that was never spawned.
+  - `std.io.file`, `std.io.file.adapter`, `std.filesystem`, `std.process.events`
+    and `std.net.local` report their own refusals with `io.error.make`.
+  - `std.net.local.endpoint.to_sockaddr` and `from_sockaddr` return
+    `err[io_error.Kind]` instead of an `i64` code.
+  - `std.net.resolve` completions that fail carry the resolver's kind directly
+    (`NO_NAME` is `NOT_FOUND`, `TEMPORARY` is `WOULD_BLOCK`) and keep the
+    resolver's native code when there is one.
+  - `std.process.events` reports a failed windows console handler install or
+    restore with its native error instead of `EINVAL`.
 
 ### Removed
 - **Breaking.** `io.error.from_code` and `io.error.message`. Use
   `std.system.os.error` and `std.system.os.message`, or `io.error.make` for an
   error with no native code. `std.io.error` no longer depends on the OS layer
   and builds freestanding, and so does `std.terminal.error` (#688).
+- **Breaking.** The 38 `E*` constants on `std.system.os` (`EPERM` through
+  `ECANCELED`). Compare `std.system.os.error_kind(code)` with an `io.error`
+  kind. The per-OS modules (`std.system.os.linux`, `.darwin`, `.windows`) keep
+  their constants for code that is already OS-specific. `std.io.writer` no
+  longer depends on the OS layer and builds freestanding (#693).
 
 ## [3.3.0] - 2026-09-16
 
