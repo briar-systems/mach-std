@@ -7,20 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.0] - 2026-09-17
+
+Rebuild everything that links std before running it on 5.2.0. The layout of
+the Windows `net.async` and `net.async.local` backend records changed, and so
+did their `Driver`. A build made against 5.1.x still links and runs without any
+compile error, but it reads those records the old way, which is not safe. No
+source change is needed. std now declares `mach = "^5.3"`, so it builds with
+mach 5.3.0 or later within 5.x.
+
 ### Behavior changes
 - On Windows, cancelling a `net.async` operation the kernel already holds no
   longer blocks. The cancel returns at once, and the operation completes as
   cancelled once the aborted request reports back. `destroy` refuses with
   `EBUSY` until it does, and `awaiting_cancellations(driver)` shows how many
   are outstanding (#744).
-- On Windows, a read whose data arrived before its cancel still completes as
-  cancelled, and its bytes are discarded although the peer considers them
-  delivered. A caller that needs every byte must not cancel a pending read to
-  stop waiting, and should use a deadline and keep reading until the stream
-  drains instead. `discarded_reads(driver, bytes)` counts these reads and the
-  bytes they lost, and also counts datagram receives lost the same way. A write
-  that finished before its cancel may have reached the peer although it
-  completes as cancelled (#744).
+- On Windows, a write that finished before its cancel may have reached the
+  peer although it completes as cancelled (#744).
+
+### Known divergence, being changed
+On Windows, a read or datagram receive whose data arrived before its cancel
+completes as cancelled and its bytes are discarded, although the peer
+considers them delivered. Linux and Darwin read only after readiness is
+dispatched, so a cancel there never loses bytes. This is not settled
+behavior: #793 changes it so that a cancelled completion carries the bytes it
+received, planned for 5.3.0. Do not build on the discard. Until then, a caller
+that cancels a read it still wants bytes from can lose them on Windows, even
+where a higher layer promises to keep what the transport gave it, so use a
+deadline and keep reading until the stream drains instead. 5.1.x lost the same
+bytes without counting them. `discarded_reads(driver, bytes)` now counts the
+reads and the bytes (#744, #793).
 
 ### Added
 - `net.async.discarded_reads` and `net.async.awaiting_cancellations`, with the
