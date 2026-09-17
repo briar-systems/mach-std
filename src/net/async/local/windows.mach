@@ -4,13 +4,10 @@ $if ($mach.build.os != $mach.os.windows) {
     $error("std.net.async.local.windows: requires windows target");
 }
 
-use std.allocator;
-use std.allocator.page;
 use io_error: std.io.error;
 use std.io.runtime;
-use std.memory;
-use std.memory.table;
 use std.net.async.iocp;
+use std.net.async.iocp.port;
 use std.net.async.types;
 use std.net.local.endpoint;
 use local_types: std.net.local.types;
@@ -27,106 +24,24 @@ use std.types.size.usize;
 
 fwd types.Token;
 fwd types.NativeCompletion;
+fwd port.Backend;
+fwd port.aliases;
+fwd port.cancel;
+fwd port.flush;
+fwd port.dispatch;
+fwd port.poll;
+fwd port.completion;
+fwd port.destroy;
 
-rec NativeOverlapped {
-    internal:      usize;
-    internal_high: usize;
-    offset:        u32;
-    offset_high:   u32;
-    event:         usize;
-}
-
-rec NativeBuffer {
-    length: u32;
-    data:   *u8;
-}
-
-# kernel-visible fields stay stable until their completion packet is consumed
-# ---
-# link: state, kind, socket record and list membership, owned by the iocp core
+# a local stream request needs nothing beyond the completion port layer's part
 pub rec Operation {
-    overlapped:   NativeOverlapped;
-    link:         iocp.Link;
-    generation:   u32;
-    resource:     usize;
-    auxiliary:    usize;
-    context:      usize;
-    buffer:       NativeBuffer;
-    address:      [288]u8;
-    transferred:  u32;
-    native_flags: u32;
-    index:        u32;
-    next_free:    u32;
+    header: port.Header;
 }
-
-# a bounded IOCP backend for af_unix streams
-# ---
-# core: the socket records, their map and the control lists
-pub rec Backend {
-    queue:     *shared.IoQueue;
-    source_id: u16;
-    # where every table's chunks come from
-    allocator:       allocator.Allocator;
-    operations:      table.Table;
-    preserved:       table.Table;
-    completions:     table.Table;
-    core:            iocp.Core;
-    native:          *windows.IoCompletion;
-    operation_slots: usize;
-    free_operation:  u32;
-    active:          usize;
-    ready:           usize;
-    lock:            mutex.Mutex;
-    io_lock:         mutex.Mutex;
-}
-
-# readiness is harvested in fixed batches, so the batch is not a capacity
-val NATIVE_BATCH: usize = 256;
 
 # the local backend has no handle openings, so every record is acquired under one
 val OPENING: u64 = 0;
 
-fun operation_at(backend: *Backend, index: usize) *Operation {
-    ret table.at(?backend.operations, index)::*Operation;
-}
-
-fun preserved_at(backend: *Backend, index: usize) *windows.IoCompletion {
-    ret table.at(?backend.preserved, index)::*windows.IoCompletion;
-}
-
-fun completion_at(backend: *Backend, index: usize) *types.NativeCompletion {
-    ret table.at(?backend.completions, index)::*types.NativeCompletion;
-}
-
-fun socket_record(backend: *Backend, sock: u32) *iocp.Socket {
-    ret iocp.socket_at(?backend.core, sock);
-}
-
-pub fun aliases(backend: *Backend, data: *u8, len: usize) bool {
-    if (!memory.range_valid(data, len)) { ret true; }
-    if (len == 0)                       { ret false; }
-    if (!memory.range_valid(backend::*u8, $size_of(Backend)) ||
-        backend.queue == nil || backend.operations.capacity == 0) {
-        ret true;
-    }
-    var native_bytes: usize = 0;
-    if (!memory.range_scaled(NATIVE_BATCH, $size_of(windows.IoCompletion),
-        ?native_bytes)) { ret true; }
-    ret memory.ranges_overlap(backend::*u8, $size_of(Backend), data, len) ||
-        memory.ranges_overlap(backend.queue::*u8, $size_of(shared.IoQueue),
-        data, len) ||
-        table.aliases(?backend.operations, data, len) ||
-        table.aliases(?backend.preserved, data, len) ||
-        table.aliases(?backend.completions, data, len) ||
-        iocp.aliases(?backend.core, data, len) ||
-        memory.ranges_overlap(backend.native::*u8, native_bytes, data, len);
-}
-
 val INVALID_SOCKET: usize = (-1)::usize;
-
-fun invalid() i64 {
-    ret windows.EINVAL;
-}
 
 # the sockaddr for value, or the native code for the reason it has none
 fun encode(value: endpoint.Endpoint, address: *u8, length: *usize) i64 {
@@ -136,260 +51,34 @@ fun encode(value: endpoint.Endpoint, address: *u8, length: *usize) i64 {
     ret windows.EINVAL;
 }
 
-fun zero_overlapped(overlapped: *NativeOverlapped) {
-    overlapped.internal      = 0;
-    overlapped.internal_high = 0;
-    overlapped.offset        = 0;
-    overlapped.offset_high   = 0;
-    overlapped.event         = 0;
+fun clear_operation(header: *port.Header) {}
+
+fun finish_accept(header: *port.Header) i64 {
+    ret 0;
 }
 
-fun operation_for(backend: *Backend, token: types.Token) *Operation {
-    if (token.index::usize >= backend.operation_slots) { ret nil; }
-    val operation: *Operation = operation_at(backend, token.index::usize);
-    if (operation.link.state == iocp.FREE || operation.generation != token.generation) { ret nil; }
-    ret operation;
-}
-
-# the IOCP context is the overlapped's own address, which the table never moves
-fun operation_from_context(backend: *Backend, context: usize) *Operation {
-    val offset: usize = $offset_of(Operation, overlapped);
-    if (context < offset) { ret nil; }
-    val index: usize = table.index_of(?backend.operations, context - offset);
-    if (index == table.NO_INDEX || index >= backend.operation_slots) { ret nil; }
-    val operation: *Operation = operation_at(backend, index);
-    if (operation.link.state == iocp.FREE) { ret nil; }
-    ret operation;
-}
-
-fun clear_borrowed(operation: *Operation) {
-    operation.buffer.data   = nil;
-    operation.buffer.length = 0;
-}
-
-# the completion and preserved tables track the operation table, so publishing
-# and preserving a completion always have somewhere to land
-fun operation_append(backend: *Backend) bool {
-    if (backend.operation_slots >= iocp.NONE::usize) { ret false; }
-    if (backend.operation_slots == backend.operations.capacity &&
-        !table.grow(?backend.operations)) { ret false; }
-    if (!table.reserve(?backend.completions, backend.operations.capacity) ||
-        !table.reserve(?backend.preserved, backend.operations.capacity)) { ret false; }
-    val index: usize      = backend.operation_slots;
-    val entry: *Operation = operation_at(backend, index);
-    entry.link.state        = iocp.FREE;
-    entry.generation        = 0;
-    entry.index             = index::u32;
-    entry.resource          = INVALID_SOCKET;
-    entry.auxiliary         = INVALID_SOCKET;
-    entry.buffer.data       = nil;
-    entry.buffer.length     = 0;
-    entry.next_free         = backend.free_operation;
-    backend.free_operation  = index::u32;
-    backend.operation_slots = index + 1;
-    ret true;
-}
-
-# a free operation joins the socket record sock in state
-fun claim_locked(backend: *Backend, sock: u32, kind: runtime.Kind, resource: usize, context: usize, state: u8, token: *types.Token) *Operation {
-    if (backend.free_operation == iocp.NONE && !operation_append(backend)) { ret nil; }
-    val index:     usize      = backend.free_operation::usize;
-    val operation: *Operation = operation_at(backend, index);
-    backend.free_operation = operation.next_free;
-    var generation: u32 = operation.generation + 1;
-    if (generation == 0) { generation = 1; }
-    zero_overlapped(?operation.overlapped);
-    operation.generation   = generation;
-    operation.resource     = resource;
-    operation.auxiliary    = INVALID_SOCKET;
-    operation.context      = context;
-    operation.transferred  = 0;
-    operation.native_flags = 0;
-    backend.active         = backend.active + 1;
-    iocp.join(?backend.core, ?backend.operations, sock, index::u32, kind, state);
-    @token = types.Token{index: index::u32, generation: generation};
-    ret operation;
-}
-
-fun read_lane(kind: runtime.Kind) bool {
-    ret kind == runtime.READ || kind == runtime.READABLE;
-}
-
-fun post_receive_locked(operation: *Operation) i64 {
-    ret windows.sock_async_receive(operation.resource, (?operation.buffer)::ptr, 1, ?operation.native_flags, (?operation.overlapped)::ptr);
-}
-
-# act on what a state change on the socket made due: its held read-lane
-# requests post oldest first, and a shutdown with no write left runs
-fun settle_socket_locked(backend: *Backend, sock: u32) {
-    for (true) {
-        val next: u32 = iocp.take_deferred(?backend.core, ?backend.operations, sock);
-        if (next == iocp.NONE) { brk; }
-        val posted: i64 = post_receive_locked(operation_at(backend, next::usize));
-        if (posted < 0) { iocp.transition(?backend.core, ?backend.operations, next, iocp.CONTROL_READY, posted); }
-    }
-    val due: u32 = iocp.progress(?backend.core, ?backend.operations, sock);
-    if (due != iocp.NONE) {
-        val shut: i64 = windows.sock_shutdown(operation_at(backend, due::usize).resource, windows.SHUT_WR);
-        iocp.transition(?backend.core, ?backend.operations, due, iocp.CONTROL_READY, shut);
-    }
-}
-
-fun release_locked(backend: *Backend, operation: *Operation) {
-    val sock: u32 = iocp.release(?backend.core, ?backend.operations, operation.index);
-    clear_borrowed(operation);
-    operation.resource     = INVALID_SOCKET;
-    operation.auxiliary    = INVALID_SOCKET;
-    operation.next_free    = backend.free_operation;
-    backend.free_operation = operation.index;
-    backend.active         = backend.active - 1;
-    if (sock != iocp.NONE) { settle_socket_locked(backend, sock); }
-}
-
-fun push_completion_locked(
-    backend: *Backend,
-    context: usize,
-    kind: runtime.Kind,
-    bytes: usize,
-    items: usize,
-    resource: usize,
-    status: i64,
-    end_of_stream: bool,
-) bool {
-    if (backend.ready == backend.completions.capacity) { ret false; }
-    @completion_at(backend, backend.ready) = types.NativeCompletion{
-        context:       context,
-        kind:          kind,
-        bytes:         bytes,
-        items:         items,
-        resource:      resource,
-        status:        status,
-        end_of_stream: end_of_stream,
-    };
-    backend.ready = backend.ready + 1;
-    ret true;
-}
-
-# releasing a ready operation can make another one ready, and it joins the
-# same list, so one pass settles every control the completions have room for
-fun emit_control_locked(backend: *Backend) {
-    for (backend.core.ready_head != iocp.NONE && backend.ready < backend.completions.capacity) {
-        backend.core.steps = backend.core.steps + 1;
-        val operation: *Operation = operation_at(backend, backend.core.ready_head::usize);
-        push_completion_locked(backend, operation.context, operation.link.kind, 0, 0, operation.resource, operation.link.result, false);
-        release_locked(backend, operation);
-    }
-}
-
-# initial is the size the backend starts at: the operation, completion,
-# preserved and socket tables grow on demand
+# initial is the size the backend starts at: every table grows on demand
 pub fun make(backend: *Backend, queue: *shared.IoQueue, initial: usize, source_id: u16) i64 {
-    if (backend == nil || queue == nil || queue.handle == 0 || initial == 0 || source_id == 0) { ret invalid(); }
-    var native_bytes: usize = 0;
-    if (!memory.range_scaled(NATIVE_BATCH, $size_of(windows.IoCompletion), ?native_bytes)) { ret windows.ENOMEM; }
-
-    val allocated: err[allocator.Error] = page.make(?backend.allocator);
-    if (sel allocated.err)                                                                  { ret windows.ENOMEM; }
-    if (!table.make(?backend.operations, ?backend.allocator, $size_of(Operation), initial)) { ret windows.ENOMEM; }
-    if (!table.make(?backend.completions, ?backend.allocator, $size_of(types.NativeCompletion), initial) ||
-        !table.make(?backend.preserved, ?backend.allocator, $size_of(windows.IoCompletion), initial)) {
-        table.destroy(?backend.preserved);
-        table.destroy(?backend.completions);
-        table.destroy(?backend.operations);
-        ret windows.ENOMEM;
-    }
-    if (!iocp.make(?backend.core, ?backend.allocator, $offset_of(Operation, link), initial)) {
-        table.destroy(?backend.preserved);
-        table.destroy(?backend.completions);
-        table.destroy(?backend.operations);
-        ret windows.ENOMEM;
-    }
-    backend.native = windows.allocate(native_bytes)::*windows.IoCompletion;
-    if (backend.native == nil) {
-        iocp.destroy(?backend.core);
-        table.destroy(?backend.preserved);
-        table.destroy(?backend.completions);
-        table.destroy(?backend.operations);
-        ret windows.ENOMEM;
-    }
-    backend.queue           = queue;
-    backend.source_id       = source_id;
-    backend.operation_slots = 0;
-    backend.free_operation  = iocp.NONE;
-    backend.active          = 0;
-    backend.ready           = 0;
-    backend.lock            = mutex.make();
-    backend.io_lock         = mutex.make();
-    ret 0;
-}
-
-# the socket record a submit joins, associated with the completion port once
-# when associate is set. associating a socket that is still associated fails,
-# so a handle wrapped twice from one live socket is refused rather than taken over
-fun socket_acquire_locked(backend: *Backend, resource: usize, associate: bool, sock: *u32) i64 {
-    val acquired: u8 = iocp.acquire(?backend.core, ?backend.operations, resource, OPENING, sock);
-    if (acquired != iocp.ACQUIRED && acquired != iocp.CREATED) { ret windows.ENOMEM; }
-    val record: *iocp.Socket = socket_record(backend, @sock);
-    if (!associate || record.associated) { ret 0; }
-    val result: i64 = windows.io_queue_attach(backend.queue, resource, backend.source_id);
-    if (result < 0) {
-        if (acquired == iocp.CREATED) { iocp.unmap(?backend.core, @sock); }
-        ret result;
-    }
-    record.associated = true;
-    ret 0;
-}
-
-# a socket with a shutdown or close submitted takes no further requests
-fun controlled_locked(backend: *Backend, sock: u32) bool {
-    ret socket_record(backend, sock).control != iocp.NONE;
-}
-
-fun submit_buffer(backend: *Backend, resource: usize, buffer: *u8, length: usize, context: usize, kind: runtime.Kind, token: *types.Token) i64 {
-    if (backend == nil || token == nil || resource == INVALID_SOCKET || (buffer == nil && length != 0) || length > 0xffffffff) { ret invalid(); }
-    mutex.lock(?backend.lock);
-    var sock:     u32 = iocp.NONE;
-    val acquired: i64 = socket_acquire_locked(backend, resource, true, ?sock);
-    if (acquired < 0) {
-        mutex.unlock(?backend.lock);
-        ret acquired;
-    }
-    if (controlled_locked(backend, sock)) {
-        mutex.unlock(?backend.lock);
-        ret windows.ENOTCONN;
-    }
-    var state: u8 = iocp.ACTIVE;
-    if (iocp.must_defer(?backend.core, sock, kind)) { state = iocp.DEFERRED; }
-    val operation: *Operation = claim_locked(backend, sock, kind, resource, context, state, token);
-    if (operation == nil) {
-        mutex.unlock(?backend.lock);
-        ret windows.ENOMEM;
-    }
-    operation.buffer = NativeBuffer{length: length::u32, data: buffer};
-    var result: i64 = 0;
-    if (state == iocp.ACTIVE && read_lane(kind)) {
-        result = post_receive_locked(operation);
-    }
-    or (state == iocp.ACTIVE) {
-        result = windows.sock_async_send(resource, (?operation.buffer)::ptr, 1, 0, (?operation.overlapped)::ptr);
-    }
-    if (result < 0) { release_locked(backend, operation); }
-    mutex.unlock(?backend.lock);
-    ret result;
+    ret port.make(backend, queue, initial, source_id, $size_of(Operation), port.Hooks{
+        clear:    clear_operation,
+        accepted: finish_accept,
+        finish:   nil,
+        stale:    false,
+    });
 }
 
 pub fun submit_read(backend: *Backend, resource: usize, buffer: *u8, length: usize, context: usize, token: *types.Token) i64 {
-    ret submit_buffer(backend, resource, buffer, length, context, runtime.READ, token);
+    ret port.submit_buffer(backend, resource, OPENING, buffer, length, context, runtime.READ, token);
 }
 
 # wait for the stream to be readable without a buffer: an overlapped zero-byte
 # receive, settled on completion by the queued byte count
 pub fun submit_readable(backend: *Backend, resource: usize, context: usize, token: *types.Token) i64 {
-    ret submit_buffer(backend, resource, nil, 0, context, runtime.READABLE, token);
+    ret port.submit_buffer(backend, resource, OPENING, nil, 0, context, runtime.READABLE, token);
 }
 
 pub fun submit_write(backend: *Backend, resource: usize, buffer: *u8, length: usize, context: usize, token: *types.Token) i64 {
-    ret submit_buffer(backend, resource, buffer, length, context, runtime.WRITE, token);
+    ret port.submit_buffer(backend, resource, OPENING, buffer, length, context, runtime.WRITE, token);
 }
 
 pub fun create_connect(value: endpoint.Endpoint, resource: *usize) i64 {
@@ -405,50 +94,37 @@ pub fun rename_listener(listener: *local_types.Listener, replacement: endpoint.E
 }
 
 pub fun close_resource(backend: *Backend, resource: usize) i64 {
-    if (backend == nil || resource == INVALID_SOCKET) { ret invalid(); }
-    mutex.lock(?backend.lock);
-    val closed: i64 = windows.sock_close(resource);
-    # the socket's requests drain on the unmapped record, so a reused value attaches fresh
-    val sock: u32 = iocp.lookup(?backend.core, resource);
-    if (sock != iocp.NONE) { iocp.unmap(?backend.core, sock); }
-    mutex.unlock(?backend.lock);
-    ret closed;
+    ret port.close_socket(backend, resource, OPENING);
 }
 
 pub fun submit_accept(backend: *Backend, listener: usize, context: usize, token: *types.Token) i64 {
-    if (backend == nil || token == nil || listener == INVALID_SOCKET) { ret invalid(); }
+    if (backend == nil || token == nil || listener == INVALID_SOCKET) { ret port.invalid(); }
     var sock: u32 = iocp.NONE;
     mutex.lock(?backend.lock);
-    val attached: i64 = socket_acquire_locked(backend, listener, true, ?sock);
+    val attached: i64 = port.acquire_locked(backend, listener, OPENING, true, ?sock);
     mutex.unlock(?backend.lock);
     if (attached < 0) { ret attached; }
     var accepted: usize = INVALID_SOCKET;
     val created:  i64   = windows.sock_create_flags(1, windows.SOCK_STREAM, 0, true, true, ?accepted);
     if (created < 0) { ret created; }
-    mutex.lock(?backend.lock);
     # the record is found again, since a close may have run while unlocked
-    val reacquired: i64 = socket_acquire_locked(backend, listener, true, ?sock);
-    if (reacquired < 0) {
-        mutex.unlock(?backend.lock);
+    val admitted: i64 = port.admit(backend, listener, OPENING, ?sock);
+    if (admitted < 0) {
         windows.sock_close(accepted);
-        ret reacquired;
+        ret admitted;
     }
-    if (controlled_locked(backend, sock)) {
-        mutex.unlock(?backend.lock);
-        windows.sock_close(accepted);
-        ret windows.ENOTCONN;
-    }
-    val operation: *Operation = claim_locked(backend, sock, runtime.ACCEPT, listener, context, iocp.ACTIVE, token);
-    if (operation == nil) {
+    val header: *port.Header = port.claim_locked(backend, sock, runtime.ACCEPT, listener, context, iocp.ACTIVE, token);
+    if (header == nil) {
         mutex.unlock(?backend.lock);
         windows.sock_close(accepted);
         ret windows.ENOMEM;
     }
-    operation.auxiliary = accepted;
-    val result: i64 = windows.sock_async_accept(listener, accepted, ?operation.address[0], 288, ?operation.transferred, (?operation.overlapped)::ptr);
+    header.auxiliary = accepted;
+    val result: i64 = windows.sock_async_accept(listener, accepted, ?header.address[0], 288, ?header.transferred, (?header.overlapped)::ptr);
     if (result < 0) {
         windows.sock_close(accepted);
-        release_locked(backend, operation);
+        header.auxiliary = INVALID_SOCKET;
+        port.release_locked(backend, header);
     }
     mutex.unlock(?backend.lock);
     ret result;
@@ -469,359 +145,38 @@ fun bind_for_connect(resource: usize) i64 {
 }
 
 pub fun submit_connect(backend: *Backend, resource: usize, peer: endpoint.Endpoint, context: usize, token: *types.Token) i64 {
-    if (backend == nil || token == nil || resource == INVALID_SOCKET) { ret invalid(); }
+    if (backend == nil || token == nil || resource == INVALID_SOCKET) { ret port.invalid(); }
     val bound: i64 = bind_for_connect(resource);
     if (bound < 0) { ret bound; }
-    mutex.lock(?backend.lock);
     var sock:     u32 = iocp.NONE;
-    val acquired: i64 = socket_acquire_locked(backend, resource, true, ?sock);
-    if (acquired < 0) {
-        mutex.unlock(?backend.lock);
-        ret acquired;
-    }
-    if (controlled_locked(backend, sock)) {
-        mutex.unlock(?backend.lock);
-        ret windows.ENOTCONN;
-    }
-    val operation: *Operation = claim_locked(backend, sock, runtime.CONNECT, resource, context, iocp.ACTIVE, token);
-    if (operation == nil) {
+    val admitted: i64 = port.admit(backend, resource, OPENING, ?sock);
+    if (admitted < 0) { ret admitted; }
+    val header: *port.Header = port.claim_locked(backend, sock, runtime.CONNECT, resource, context, iocp.ACTIVE, token);
+    if (header == nil) {
         mutex.unlock(?backend.lock);
         ret windows.ENOMEM;
     }
     var length:  usize = 0;
-    val encoded: i64   = encode(peer, ?operation.address[0], ?length);
+    val encoded: i64   = encode(peer, ?header.address[0], ?length);
     if (encoded < 0) {
-        release_locked(backend, operation);
+        port.release_locked(backend, header);
         mutex.unlock(?backend.lock);
         ret encoded;
     }
-    val result: i64 = windows.sock_async_connect(resource, ?operation.address[0], length, ?operation.transferred, (?operation.overlapped)::ptr);
-    if (result < 0) { release_locked(backend, operation); }
+    val result: i64 = windows.sock_async_connect(resource, ?header.address[0], length, ?header.transferred, (?header.overlapped)::ptr);
+    if (result < 0) { port.release_locked(backend, header); }
     mutex.unlock(?backend.lock);
     ret result;
 }
 
 # a shutdown waits for the socket's writes, and runs once none is left
 pub fun submit_shutdown_write(backend: *Backend, resource: usize, context: usize, token: *types.Token) i64 {
-    if (backend == nil || token == nil || resource == INVALID_SOCKET) { ret invalid(); }
-    mutex.lock(?backend.lock);
-    var sock:     u32 = iocp.NONE;
-    val acquired: i64 = socket_acquire_locked(backend, resource, false, ?sock);
-    if (acquired < 0) {
-        mutex.unlock(?backend.lock);
-        ret acquired;
-    }
-    if (controlled_locked(backend, sock)) {
-        mutex.unlock(?backend.lock);
-        ret windows.EBUSY;
-    }
-    val operation: *Operation = claim_locked(backend, sock, runtime.SHUTDOWN, resource, context, iocp.CONTROL_PENDING, token);
-    if (operation == nil) {
-        mutex.unlock(?backend.lock);
-        ret windows.ENOMEM;
-    }
-    settle_socket_locked(backend, sock);
-    mutex.unlock(?backend.lock);
-    windows.io_queue_wake(backend.queue);
-    ret 0;
+    ret port.submit_shutdown_write(backend, resource, OPENING, context, token);
 }
 
-# a close aborts the socket's requests and completes once they have all left.
-# the record is unmapped at once, so a reused socket value attaches fresh
+# a close aborts the socket's requests and completes once they have all left
 pub fun submit_close(backend: *Backend, resource: usize, context: usize, token: *types.Token) i64 {
-    if (backend == nil || token == nil || resource == INVALID_SOCKET) { ret invalid(); }
-    mutex.lock(?backend.lock);
-    var sock:     u32 = iocp.NONE;
-    val acquired: i64 = socket_acquire_locked(backend, resource, false, ?sock);
-    if (acquired < 0) {
-        mutex.unlock(?backend.lock);
-        ret acquired;
-    }
-    if (controlled_locked(backend, sock)) {
-        mutex.unlock(?backend.lock);
-        ret windows.EBUSY;
-    }
-    val operation: *Operation = claim_locked(backend, sock, runtime.CLOSE, resource, context, iocp.CONTROL_PENDING, token);
-    if (operation == nil) {
-        mutex.unlock(?backend.lock);
-        ret windows.ENOMEM;
-    }
-    var current: u32 = socket_record(backend, sock).ops_head;
-    for (current != iocp.NONE) {
-        val pending: *Operation = operation_at(backend, current::usize);
-        if (iocp.abort(?backend.core, ?backend.operations, current, false, windows.ECANCELED)) {
-            windows.io_queue_cancel(resource, (?pending.overlapped)::ptr);
-        }
-        current = pending.link.sock_next;
-    }
-    operation.link.result = windows.sock_close(resource);
-    iocp.unmap(?backend.core, sock);
-    settle_socket_locked(backend, sock);
-    mutex.unlock(?backend.lock);
-    windows.io_queue_wake(backend.queue);
-    ret 0;
-}
-
-fun restore_preserved(backend: *Backend, count: usize, wake: bool) i64 {
-    var result: i64   = 0;
-    var i:      usize = 0;
-    for (i < count) {
-        val restored: i64 = windows.io_queue_restore(backend.queue, @preserved_at(backend, i));
-        if (result >= 0 && restored < 0) { result = restored; }
-        i = i + 1;
-    }
-    if (wake) {
-        val restored_wake: i64 = windows.io_queue_wake(backend.queue);
-        if (result >= 0 && restored_wake < 0) { result = restored_wake; }
-    }
-    ret result;
-}
-
-# successful cancellation synchronously ends all native access to borrowed data
-pub fun cancel(backend: *Backend, token: types.Token) i64 {
-    if (backend == nil) { ret invalid(); }
-    mutex.lock(?backend.lock);
-    val operation: *Operation = operation_for(backend, token);
-    if (operation == nil) {
-        mutex.unlock(?backend.lock);
-        ret windows.EBADF;
-    }
-    if (operation.link.state == iocp.CONTROL_PENDING || operation.link.state == iocp.CONTROL_READY || operation.link.state == iocp.DEFERRED) {
-        release_locked(backend, operation);
-        mutex.unlock(?backend.lock);
-        windows.io_queue_wake(backend.queue);
-        ret 0;
-    }
-    if (operation.link.state != iocp.ACTIVE && operation.link.state != iocp.CANCEL_READY) {
-        mutex.unlock(?backend.lock);
-        ret windows.EBADF;
-    }
-    if (operation.link.state == iocp.ACTIVE) {
-        val cancelled: i64 = windows.io_queue_cancel(operation.resource, (?operation.overlapped)::ptr);
-        if (cancelled < 0) {
-            mutex.unlock(?backend.lock);
-            ret cancelled;
-        }
-    }
-    iocp.transition(?backend.core, ?backend.operations, operation.index, iocp.CANCELLED, operation.link.result);
-    val context: usize = (?operation.overlapped)::usize;
-    mutex.unlock(?backend.lock);
-
-    mutex.lock(?backend.io_lock);
-    mutex.lock(?backend.lock);
-    val pending: *Operation = operation_for(backend, token);
-    if (pending == nil) {
-        mutex.unlock(?backend.lock);
-        mutex.unlock(?backend.io_lock);
-        ret 0;
-    }
-    if (pending.link.state != iocp.CANCELLED) {
-        mutex.unlock(?backend.lock);
-        mutex.unlock(?backend.io_lock);
-        ret windows.EBADF;
-    }
-    mutex.unlock(?backend.lock);
-
-    var found:           bool  = false;
-    var preserved_count: usize = 0;
-    var preserved_wake:  bool  = false;
-    var result:          i64   = 0;
-    for (!found && result >= 0) {
-        var native: windows.IoCompletion;
-        val count:  i64 = windows.io_queue_poll(backend.queue, ?native, 1, -1);
-        if (count < 0)  { result = count; }
-        or (count == 0) { result = windows.EIO; }
-        or (native.context == context) {
-            found = true;
-        }
-        or ((native.events & windows.IO_EVENT_WAKE) != 0) {
-            preserved_wake = true;
-        }
-        or (preserved_count == backend.preserved.capacity) {
-            result = windows.ENOMEM;
-        }
-        or {
-            @preserved_at(backend, preserved_count) = native;
-            preserved_count                         = preserved_count + 1;
-        }
-    }
-    if (found) {
-        mutex.lock(?backend.lock);
-        val completed: *Operation = operation_for(backend, token);
-        if (completed != nil && completed.link.state == iocp.CANCELLED) {
-            if (completed.link.kind == runtime.ACCEPT && completed.auxiliary != INVALID_SOCKET) {
-                windows.sock_close(completed.auxiliary);
-                completed.auxiliary = INVALID_SOCKET;
-            }
-            release_locked(backend, completed);
-        }
-        mutex.unlock(?backend.lock);
-    }
-    val restored: i64 = restore_preserved(backend, preserved_count, preserved_wake);
-    mutex.unlock(?backend.io_lock);
-    if (result < 0) { ret result; }
-    ret restored;
-}
-
-fun emit_operation_locked(backend: *Backend, operation: *Operation, status: i64, bytes: usize) {
-    var result:             i64   = status;
-    var completed_bytes:    usize = 0;
-    var completed_resource: usize = operation.resource;
-    var end_of_stream:      bool  = false;
-    if (status >= 0 && operation.link.kind == runtime.ACCEPT) {
-        result = windows.sock_accept_context(operation.auxiliary, operation.resource);
-        if (result >= 0) {
-            completed_resource  = operation.auxiliary;
-            operation.auxiliary = INVALID_SOCKET;
-        }
-        or {
-            windows.sock_close(operation.auxiliary);
-            operation.auxiliary = INVALID_SOCKET;
-            completed_resource  = INVALID_SOCKET;
-        }
-    }
-    or (status >= 0 && operation.link.kind == runtime.CONNECT) {
-        result = windows.sock_connect_context(operation.resource);
-    }
-    or (status >= 0 && operation.link.kind == runtime.READABLE) {
-        # a zero-byte receive completes on data, orderly close or error, and
-        # cannot tell data from close: the queued byte count settles it
-        var queued: usize = 0;
-        result = windows.sock_pending_bytes(operation.resource, ?queued);
-        if (result >= 0) {
-            result        = 0;
-            end_of_stream = queued == 0;
-        }
-    }
-    or (status >= 0 && (operation.link.kind == runtime.READ || operation.link.kind == runtime.WRITE)) {
-        result          = 0;
-        completed_bytes = bytes;
-        end_of_stream   = operation.link.kind == runtime.READ && bytes == 0 && operation.buffer.length != 0;
-    }
-    if (status < 0 && operation.link.kind == runtime.ACCEPT && operation.auxiliary != INVALID_SOCKET) {
-        windows.sock_close(operation.auxiliary);
-        operation.auxiliary = INVALID_SOCKET;
-    }
-    push_completion_locked(backend, operation.context, operation.link.kind, completed_bytes, 0, completed_resource, result, end_of_stream);
-    release_locked(backend, operation);
-}
-
-fun consume_native_locked(backend: *Backend, native: windows.IoCompletion) {
-    if ((native.events & windows.IO_EVENT_WAKE) != 0) { ret; }
-    val operation: *Operation = operation_from_context(backend, native.context);
-    if (operation == nil) { ret; }
-    if (operation.link.state == iocp.CANCELLED) {
-        release_locked(backend, operation);
-        ret;
-    }
-    if (operation.link.state == iocp.CANCEL_READY) {
-        emit_operation_locked(backend, operation, operation.link.result, 0);
-        ret;
-    }
-    if (operation.link.state != iocp.ACTIVE) { ret; }
-    var bytes:  u32 = native.flags::u32;
-    var flags:  u32 = operation.native_flags;
-    val status: i64 = windows.sock_async_result(operation.resource, (?operation.overlapped)::ptr, ?bytes, ?flags, false);
-    emit_operation_locked(backend, operation, status, bytes::usize);
-}
-
-pub fun flush(backend: *Backend) i64 {
-    if (backend == nil) { ret invalid(); }
-    mutex.lock(?backend.lock);
-    backend.ready = 0;
-    emit_control_locked(backend);
-    val ready: usize = backend.ready;
-    mutex.unlock(?backend.lock);
-    ret ready::i64;
-}
-
-pub fun dispatch(
-    backend: *Backend,
-    context: usize,
-    events: u32,
-    status: i64,
-    flags: u64,
-    claimed: *bool,
-) i64 {
-    if (backend == nil || claimed == nil) { ret invalid(); }
-    @claimed = false;
-    mutex.lock(?backend.lock);
-    val operation: *Operation = operation_from_context(backend, context);
-    if (operation == nil) {
-        mutex.unlock(?backend.lock);
-        ret 0;
-    }
-    @claimed      = true;
-    backend.ready = 0;
-    consume_native_locked(backend, windows.IoCompletion{
-        context: context,
-        events:  events,
-        status:  status,
-        flags:   flags,
-        source:  backend.source_id,
-    });
-    emit_control_locked(backend);
-    val ready: usize = backend.ready;
-    mutex.unlock(?backend.lock);
-    ret ready::i64;
-}
-
-# one thread owns poll and completion storage
-pub fun poll(backend: *Backend, timeout_ms: i32) i64 {
-    if (backend == nil || timeout_ms < -1) { ret invalid(); }
-    mutex.lock(?backend.lock);
-    backend.ready = 0;
-    emit_control_locked(backend);
-    val immediately_ready: usize = backend.ready;
-    mutex.unlock(?backend.lock);
-    if (immediately_ready != 0) { ret immediately_ready::i64; }
-
-    mutex.lock(?backend.io_lock);
-    val count: i64 = windows.io_queue_poll(backend.queue, backend.native, NATIVE_BATCH, timeout_ms);
-    if (count <= 0) {
-        mutex.unlock(?backend.io_lock);
-        ret count;
-    }
-    mutex.lock(?backend.lock);
-    var i: usize = 0;
-    for (i < count::usize && backend.ready < backend.completions.capacity) {
-        consume_native_locked(backend, backend.native[i]);
-        i = i + 1;
-    }
-    emit_control_locked(backend);
-    val ready: usize = backend.ready;
-    mutex.unlock(?backend.lock);
-    mutex.unlock(?backend.io_lock);
-    ret ready::i64;
-}
-
-pub fun completion(backend: *Backend, index: usize, out: *types.NativeCompletion) i64 {
-    if (backend == nil || out == nil || index >= backend.ready) { ret invalid(); }
-    @out = @completion_at(backend, index);
-    ret 0;
-}
-
-pub fun destroy(backend: *Backend) i64 {
-    if (backend == nil) { ret invalid(); }
-    mutex.lock(?backend.lock);
-    if (backend.active != 0) {
-        mutex.unlock(?backend.lock);
-        ret windows.EBUSY;
-    }
-    windows.deallocate(backend.native::ptr, $size_of(windows.IoCompletion) * NATIVE_BATCH);
-    iocp.destroy(?backend.core);
-    table.destroy(?backend.preserved);
-    table.destroy(?backend.completions);
-    table.destroy(?backend.operations);
-    backend.native          = nil;
-    backend.operation_slots = 0;
-    backend.free_operation  = iocp.NONE;
-    backend.active          = 0;
-    backend.ready           = 0;
-    backend.queue           = nil;
-    backend.source_id       = 0;
-    mutex.unlock(?backend.lock);
-    ret 0;
+    ret port.submit_close(backend, resource, OPENING, context, token);
 }
 
 fun test_listener_name(output: *u8) usize {
