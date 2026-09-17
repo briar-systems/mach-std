@@ -118,8 +118,9 @@ val SLOT_CANCELLING: u8 = 3;
 val SLOT_RELEASING:  u8 = 4;
 
 # a slot index sentinel for the free list and the completion queue
-val NO_SLOT:  usize = ~(0::usize);
-val NO_TIMER: usize = ~(0::usize);
+val NO_SLOT:   usize = ~(0::usize);
+val NO_TIMER:  usize = ~(0::usize);
+val NO_RECORD: usize = ~(0::usize);
 
 # a source is a registered backend, so the table starts far below the slots
 val SOURCE_INITIAL: usize = 4;
@@ -153,7 +154,7 @@ rec Slot {
     next:                   usize;
     completion:             Completion;
     operation_timer_index:  usize;
-    deadline_timer_index:   usize;
+    deadline_record:        usize;
     cancellation_active:    bool;
     cancellation_pending:   bool;
     lifecycle_cancellation: bool;
@@ -167,11 +168,22 @@ rec Slot {
 val TIMER_OPERATION:      u8 = 0;
 val TIMER_SCOPE_DEADLINE: u8 = 1;
 
+# token names an operation entry's slot and record a scope entry's record
 rec TimerEntry {
     deadline: time.Instant;
     token:    Token;
     purpose:  u8;
-    scope:    *cancel.Scope;
+    record:   usize;
+}
+
+# every operation waiting on one owner's deadline shares one record and so one
+# heap entry, however many operations the scope holds
+rec DeadlineRecord {
+    owner:       *cancel.Scope;
+    at:          time.Instant;
+    refs:        usize;
+    timer_index: usize;
+    next:        usize;
 }
 
 pub val OPEN:      u8 = lifecycle.OPEN;
@@ -183,10 +195,16 @@ pub val DESTROYED: u8 = 3;
 pub rec Runtime {
     queue: os.IoQueue;
     # where every table's chunks come from
-    allocator:       allocator.Allocator;
-    slots:           table.Table;
-    timers:          table.Table;
-    sources:         table.Table;
+    allocator: allocator.Allocator;
+    slots:     table.Table;
+    timers:    table.Table;
+    sources:   table.Table;
+    deadlines: table.Table;
+    # open addressed on (owner, at), a power of two at least twice the slots
+    deadline_index:  table.Table;
+    deadline_used:   usize;
+    deadline_free:   usize;
+    deadline_live:   usize;
     native_events:   *NativeEvent;
     initial:         usize;
     slot_count:      usize;
@@ -236,6 +254,8 @@ pub fun aliases(runtime: *Runtime, data: *u8, len: usize) bool {
     ret table.aliases(?runtime.slots, data, len) ||
         table.aliases(?runtime.timers, data, len) ||
         table.aliases(?runtime.sources, data, len) ||
+        table.aliases(?runtime.deadlines, data, len) ||
+        table.aliases(?runtime.deadline_index, data, len) ||
         memory.ranges_overlap(runtime.native_events::*u8, native_event_bytes,
         data, len);
 }
@@ -250,6 +270,14 @@ fun source_at(runtime: *Runtime, index: usize) *Source {
 
 fun timer_at(runtime: *Runtime, index: usize) *TimerEntry {
     ret table.at(?runtime.timers, index)::*TimerEntry;
+}
+
+fun deadline_at(runtime: *Runtime, index: usize) *DeadlineRecord {
+    ret table.at(?runtime.deadlines, index)::*DeadlineRecord;
+}
+
+fun bucket_at(runtime: *Runtime, index: usize) *usize {
+    ret table.at(?runtime.deadline_index, index)::*usize;
 }
 
 # the slot table is the runtime's current size, not a limit it was given
@@ -274,7 +302,7 @@ fun init_slot(runtime: *Runtime, index: usize) {
     slot.runtime                = runtime;
     slot.next                   = NO_SLOT;
     slot.operation_timer_index  = NO_TIMER;
-    slot.deadline_timer_index   = NO_TIMER;
+    slot.deadline_record        = NO_RECORD;
     slot.cancellation_active    = false;
     slot.cancellation_pending   = false;
     slot.lifecycle_cancellation = false;
@@ -321,16 +349,90 @@ fun free_pop(runtime: *Runtime) usize {
 }
 
 fun release_tables(runtime: *Runtime) {
+    table.destroy(?runtime.deadline_index);
+    table.destroy(?runtime.deadlines);
     table.destroy(?runtime.sources);
     table.destroy(?runtime.timers);
     table.destroy(?runtime.slots);
 }
 
-# every slot carries at most an operation timer and a scope deadline, so a
-# reserve of twice the slot table is a push that cannot fail
+fun deadline_hash(owner: *cancel.Scope, at: time.Instant) usize {
+    var h: u64 = owner::u64;
+    h = (h ^ at.sec::u64) * 0x9e3779b97f4a7c15;
+    h = (h ^ at.nsec::u64) * 0xbf58476d1ce4e5b9;
+    ret (h ^ (h >> 31))::usize;
+}
+
+fun deadline_home(runtime: *Runtime, index: usize) usize {
+    val record: *DeadlineRecord = deadline_at(runtime, index);
+    ret deadline_hash(record.owner, record.at) & (runtime.deadline_index.capacity - 1);
+}
+
+# the index is at most half full, so a probe always reaches an empty bucket
+fun deadline_index_insert(runtime: *Runtime, index: usize) {
+    val mask:   usize = runtime.deadline_index.capacity - 1;
+    var bucket: usize = deadline_home(runtime, index);
+    for (@bucket_at(runtime, bucket) != 0) { bucket = (bucket + 1) & mask; }
+    @bucket_at(runtime, bucket) = index + 1;
+}
+
+fun deadline_find(runtime: *Runtime, owner: *cancel.Scope, at: time.Instant) usize {
+    val mask:   usize = runtime.deadline_index.capacity - 1;
+    var bucket: usize = deadline_hash(owner, at) & mask;
+    for (@bucket_at(runtime, bucket) != 0) {
+        val index:  usize           = @bucket_at(runtime, bucket) - 1;
+        val record: *DeadlineRecord = deadline_at(runtime, index);
+        if (record.owner == owner && time.instant_equal(record.at, at)) { ret index; }
+        bucket = (bucket + 1) & mask;
+    }
+    ret NO_RECORD;
+}
+
+# backward shift keeps every probe chain unbroken without tombstones
+fun deadline_index_remove(runtime: *Runtime, index: usize) {
+    val mask: usize = runtime.deadline_index.capacity - 1;
+    var hole: usize = deadline_home(runtime, index);
+    for (@bucket_at(runtime, hole) != index + 1) { hole = (hole + 1) & mask; }
+    var next: usize = (hole + 1) & mask;
+    for (@bucket_at(runtime, next) != 0) {
+        val home: usize = deadline_home(runtime, @bucket_at(runtime, next) - 1);
+        if (((next - home) & mask) >= ((next - hole) & mask)) {
+            @bucket_at(runtime, hole) = @bucket_at(runtime, next);
+            hole                      = next;
+        }
+        next = (next + 1) & mask;
+    }
+    @bucket_at(runtime, hole) = 0;
+}
+
+fun deadline_rebuild(runtime: *Runtime, buckets: usize) bool {
+    var fresh: table.Table;
+    if (!table.make(?fresh, ?runtime.allocator, $size_of(usize), buckets)) { ret false; }
+    var stale: table.Table = runtime.deadline_index;
+    runtime.deadline_index = fresh;
+    memory.raw_zero(runtime.deadline_index.chunks[0], runtime.deadline_index.capacity * $size_of(usize));
+    var index: usize = 0;
+    for (index < runtime.deadline_used) {
+        if (deadline_at(runtime, index).refs > 0) { deadline_index_insert(runtime, index); }
+        index = index + 1;
+    }
+    table.destroy(?stale);
+    ret true;
+}
+
+# a live record holds at least one live slot, so records never outnumber slots
+# and the index stays at most half full
+fun reserve_deadlines(runtime: *Runtime) bool {
+    if (!table.reserve(?runtime.deadlines, runtime.slots.capacity))    { ret false; }
+    if (runtime.deadline_index.capacity >= runtime.slots.capacity * 2) { ret true; }
+    ret deadline_rebuild(runtime, runtime.slots.capacity * 2);
+}
+
+# every slot carries at most an operation timer and holds at most one deadline
+# record, so a reserve of twice the slot table is a push that cannot fail
 fun reserve_timers(runtime: *Runtime) bool {
-    if (runtime.slots.capacity > ~(0::usize) / 2) { ret false; }
-    ret table.reserve(?runtime.timers, runtime.slots.capacity * 2);
+    if (runtime.slots.capacity > ~(0::usize) / 4) { ret false; }
+    ret table.reserve(?runtime.timers, runtime.slots.capacity * 2) && reserve_deadlines(runtime);
 }
 
 # initial is the size the runtime starts at, not a ceiling: the slot, timer and
@@ -349,8 +451,13 @@ pub fun make(runtime: *Runtime, initial: usize) err[io_error.Error] {
     if (!table.make(?runtime.slots, ?runtime.allocator, $size_of(Slot), initial)) {
         ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
     }
+    runtime.deadline_used = 0;
+    runtime.deadline_free = NO_RECORD;
+    runtime.deadline_live = 0;
     if (!table.make(?runtime.timers, ?runtime.allocator, $size_of(TimerEntry), initial) ||
         !table.make(?runtime.sources, ?runtime.allocator, $size_of(Source), SOURCE_INITIAL) ||
+        !table.make(?runtime.deadlines, ?runtime.allocator, $size_of(DeadlineRecord), initial) ||
+        !deadline_rebuild(runtime, initial * 2) ||
         !reserve_timers(runtime)) {
         release_tables(runtime);
         ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
@@ -539,7 +646,7 @@ fun claim_locked(runtime: *Runtime, operation: Operation, source_index: u32, tok
     slot.generation             = generation;
     slot.operation              = operation;
     slot.operation_timer_index  = NO_TIMER;
-    slot.deadline_timer_index   = NO_TIMER;
+    slot.deadline_record        = NO_RECORD;
     slot.cancellation_active    = false;
     slot.cancellation_pending   = false;
     slot.lifecycle_cancellation = false;
@@ -600,18 +707,18 @@ fun timer_less(a: TimerEntry, b: TimerEntry) bool {
     if (time.instant_before(a.deadline, b.deadline)) { ret true; }
     if (time.instant_after(a.deadline, b.deadline))  { ret false; }
     if (a.purpose != b.purpose)                      { ret a.purpose == TIMER_SCOPE_DEADLINE; }
+    if (a.purpose == TIMER_SCOPE_DEADLINE)           { ret a.record < b.record; }
     if (a.token.index < b.token.index)               { ret true; }
     if (a.token.index > b.token.index)               { ret false; }
     ret a.token.generation < b.token.generation;
 }
 
 fun timer_set_index(runtime: *Runtime, entry: TimerEntry, index: usize) {
-    val slot: *Slot = slot_at(runtime, entry.token.index::usize);
     if (entry.purpose == TIMER_OPERATION) {
-        slot.operation_timer_index = index;
+        slot_at(runtime, entry.token.index::usize).operation_timer_index = index;
     }
     or {
-        slot.deadline_timer_index = index;
+        deadline_at(runtime, entry.record).timer_index = index;
     }
 }
 
@@ -675,14 +782,68 @@ fun timer_remove_at(runtime: *Runtime, index: usize) TimerEntry {
     ret removed;
 }
 
-fun timer_remove_token(runtime: *Runtime, token: Token, purpose: u8) bool {
+fun timer_remove_operation(runtime: *Runtime, token: Token) bool {
     val slot: *Slot = slot_for(runtime, token);
     if (slot == nil) { ret false; }
-    var index: usize = slot.operation_timer_index;
-    if (purpose == TIMER_SCOPE_DEADLINE)                                                                                                    { index = slot.deadline_timer_index; }
-    if (index >= runtime.timer_count || timer_at(runtime, index).purpose != purpose || !token_equal(timer_at(runtime, index).token, token)) { ret false; }
+    val index: usize = slot.operation_timer_index;
+    if (index >= runtime.timer_count || timer_at(runtime, index).purpose != TIMER_OPERATION || !token_equal(timer_at(runtime, index).token, token)) { ret false; }
     timer_remove_at(runtime, index);
     ret true;
+}
+
+fun deadline_push(runtime: *Runtime, index: usize) {
+    timer_push(runtime, TimerEntry{
+        deadline: deadline_at(runtime, index).at,
+        token:    Token{index: 0, generation: 0},
+        purpose:  TIMER_SCOPE_DEADLINE,
+        record:   index,
+    });
+}
+
+# a record whose entry already fired is armed again, so a late joiner still
+# reaches expiry
+fun deadline_acquire(runtime: *Runtime, owner: *cancel.Scope, at: time.Instant) usize {
+    val found: usize = deadline_find(runtime, owner, at);
+    if (found != NO_RECORD) {
+        val shared: *DeadlineRecord = deadline_at(runtime, found);
+        shared.refs = shared.refs + 1;
+        if (shared.timer_index == NO_TIMER) { deadline_push(runtime, found); }
+        ret found;
+    }
+    var index: usize = runtime.deadline_free;
+    if (index != NO_RECORD) {
+        runtime.deadline_free = deadline_at(runtime, index).next;
+    }
+    or {
+        index                 = runtime.deadline_used;
+        runtime.deadline_used = runtime.deadline_used + 1;
+    }
+    @deadline_at(runtime, index) = DeadlineRecord{
+        owner:       owner,
+        at:          at,
+        refs:        1,
+        timer_index: NO_TIMER,
+        next:        NO_RECORD,
+    };
+    runtime.deadline_live = runtime.deadline_live + 1;
+    deadline_index_insert(runtime, index);
+    deadline_push(runtime, index);
+    ret index;
+}
+
+fun deadline_release(runtime: *Runtime, slot: *Slot) {
+    val index: usize = slot.deadline_record;
+    if (index == NO_RECORD) { ret; }
+    slot.deadline_record = NO_RECORD;
+    val record: *DeadlineRecord = deadline_at(runtime, index);
+    record.refs = record.refs - 1;
+    if (record.refs > 0)                { ret; }
+    if (record.timer_index != NO_TIMER) { timer_remove_at(runtime, record.timer_index); }
+    deadline_index_remove(runtime, index);
+    record.owner          = nil;
+    record.next           = runtime.deadline_free;
+    runtime.deadline_free = index;
+    runtime.deadline_live = runtime.deadline_live - 1;
 }
 
 # a completion lives in its own slot and the queue links slots, so there is no
@@ -728,8 +889,9 @@ fun close_error(cause: lifecycle.Cause) io_error.Error {
 }
 
 fun remove_slot_timers(runtime: *Runtime, token: Token) {
-    timer_remove_token(runtime, token, TIMER_OPERATION);
-    timer_remove_token(runtime, token, TIMER_SCOPE_DEADLINE);
+    timer_remove_operation(runtime, token);
+    val slot: *Slot = slot_for(runtime, token);
+    if (slot != nil) { deadline_release(runtime, slot); }
 }
 
 fun scope_cancel_callback(context: ptr, reason: cancel.Reason) {
@@ -823,12 +985,7 @@ fun attach_scope_locked(runtime: *Runtime, token: Token, scope: *cancel.Scope) c
     val query: cancel.DeadlineQuery = cancel.get_deadline(scope);
     if (sel query.ok) {
         if (sel query.ok.some) {
-            timer_push(runtime, TimerEntry{
-                deadline: query.ok.some.at,
-                token:    token,
-                purpose:  TIMER_SCOPE_DEADLINE,
-                scope:    query.ok.some.owner,
-            });
+            slot.deadline_record = deadline_acquire(runtime, query.ok.some.owner, query.ok.some.at);
         }
     }
     ret cancel.Reason.active{};
@@ -998,7 +1155,7 @@ pub fun submit_timer(runtime: *Runtime, deadline: time.Instant, context: usize) 
             deadline: deadline,
             token:    token,
             purpose:  TIMER_OPERATION,
-            scope:    nil,
+            record:   NO_RECORD,
         });
     }
     mutex.unlock(?runtime.lock);
@@ -1037,7 +1194,7 @@ pub fun submit_timer_scoped(runtime: *Runtime, scope: *cancel.Scope, deadline: t
         deadline: deadline,
         token:    token,
         purpose:  TIMER_OPERATION,
-        scope:    nil,
+        record:   NO_RECORD,
     });
     mutex.unlock(?runtime.lock);
     ret res[Token, io_error.Error].ok{token};
@@ -1048,7 +1205,7 @@ pub fun cancel_timer(runtime: *Runtime, token: Token) err[io_error.Error] {
     if (runtime == nil) { ret err[io_error.Error].err{invalid(io_error.OP_SUBMIT)}; }
     mutex.lock(?runtime.lock);
     val slot: *Slot = slot_for(runtime, token);
-    if (slot == nil || slot.operation.kind != TIMER || !timer_remove_token(runtime, token, TIMER_OPERATION)) {
+    if (slot == nil || slot.operation.kind != TIMER || !timer_remove_operation(runtime, token)) {
         mutex.unlock(?runtime.lock);
         ret err[io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_SUBMIT)};
     }
@@ -1057,7 +1214,7 @@ pub fun cancel_timer(runtime: *Runtime, token: Token) err[io_error.Error] {
         ret err[io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_SUBMIT)};
     }
     slot.cancellation_active = false;
-    timer_remove_token(runtime, token, TIMER_SCOPE_DEADLINE);
+    deadline_release(runtime, slot);
     enqueue(runtime, token, slot, 0, 0, 0, 0, true, io_error.make(io_error.CANCELLED, io_error.OP_WAIT), false);
     val wake_result: i64 = os.io_queue_wake(?runtime.queue);
     mutex.unlock(?runtime.lock);
@@ -1065,16 +1222,17 @@ pub fun cancel_timer(runtime: *Runtime, token: Token) err[io_error.Error] {
     ret err[io_error.Error].ok{};
 }
 
+# a fired scope entry leaves its record to the registrations that still hold it
 fun timers_expire(runtime: *Runtime, now: time.Instant) *cancel.Scope {
     # all due timers enter the completion queue in deadline and token order
     for (runtime.timer_count > 0 && !time.instant_before(now, timer_at(runtime, 0).deadline)) {
         val entry: TimerEntry = timer_remove_at(runtime, 0);
-        val slot:  *Slot      = slot_for(runtime, entry.token);
-        if (slot != nil && entry.purpose == TIMER_SCOPE_DEADLINE) { ret entry.scope; }
+        if (entry.purpose == TIMER_SCOPE_DEADLINE) { ret deadline_at(runtime, entry.record).owner; }
+        val slot: *Slot = slot_for(runtime, entry.token);
         if (slot != nil) {
             if (!slot.cancellation_active || transitioned(cancel.unregister(?slot.cancellation))) {
                 slot.cancellation_active = false;
-                timer_remove_token(runtime, entry.token, TIMER_SCOPE_DEADLINE);
+                deadline_release(runtime, slot);
                 enqueue(runtime, entry.token, slot, 0, 0, 0, 0, false, io_error.make(io_error.OTHER, io_error.OP_UNKNOWN), false);
             }
         }
@@ -1552,6 +1710,8 @@ fun destroy_with_native_ownership(runtime: *Runtime) err[io_error.Error] {
     val queue_result:  i64                  = os.io_queue_close(?runtime.queue);
     val source_result: err[allocator.Error] = table.destroy(?runtime.sources);
     val timer_result:  err[allocator.Error] = table.destroy(?runtime.timers);
+    val index_result:  err[allocator.Error] = table.destroy(?runtime.deadline_index);
+    val record_result: err[allocator.Error] = table.destroy(?runtime.deadlines);
     val slot_result:   err[allocator.Error] = table.destroy(?runtime.slots);
     val native_result: i64                  = os.deallocate(native_events::ptr, $size_of(NativeEvent) * NATIVE_BATCH);
     runtime.native_events = nil;
@@ -1561,8 +1721,8 @@ fun destroy_with_native_ownership(runtime: *Runtime) err[io_error.Error] {
     runtime.free_tail     = NO_SLOT;
     runtime.head          = NO_SLOT;
     runtime.tail          = NO_SLOT;
-    if (queue_result < 0)                                                                          { ret err[io_error.Error].err{os.error(queue_result, io_error.OP_CLOSE)}; }
-    if (sel timer_result.err || sel source_result.err || native_result < 0 || sel slot_result.err) { ret err[io_error.Error].err{io_error.make(io_error.IO, io_error.OP_CLOSE)}; }
+    if (queue_result < 0)                                                                                                                           { ret err[io_error.Error].err{os.error(queue_result, io_error.OP_CLOSE)}; }
+    if (sel timer_result.err || sel index_result.err || sel record_result.err || sel source_result.err || native_result < 0 || sel slot_result.err) { ret err[io_error.Error].err{io_error.make(io_error.IO, io_error.OP_CLOSE)}; }
     ret err[io_error.Error].ok{};
 }
 
@@ -2178,6 +2338,102 @@ test "runtime timer: large heaps expire in deadline order" {
     mutex.unlock(?runtime.lock);
     if (closed_count != 511)        { ret 1; }
     if (!ok_err(destroy(?runtime))) { ret 1; }
+    ret 0;
+}
+
+# n operations under one deadline scope hold one heap entry, and expiry still
+# ends every one still registered
+fun scope_deadline_scale(n: usize) i32 {
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, 64))) { ret 1; }
+    val clock: time.InstantClock = time.instant();
+    if (sel clock.err) { ret 1; }
+    var scope: cancel.Scope;
+    val at:    time.Instant = time.instant_add(clock.ok, 3600000000000);
+    if (!succeeded(cancel.make_root(?scope, opt[time.Instant].some{at}))) { ret 2; }
+    var first: Token;
+    var i:     usize = 0;
+    for (i < n) {
+        val submitted: res[Token, io_error.Error] = submit_scoped(?runtime, ?scope, test_operation(READ, i));
+        if (sel submitted.err)                                      { ret 3; }
+        if (i == 0)                                                 { first = submitted.ok; }
+        if (runtime.timer_count != 1 || runtime.deadline_live != 1) { ret 4; }
+        # completing every other operation releases its share and nothing else
+        if (i % 2 == 1 && !ok_err(complete(?runtime, submitted.ok, 0, 0, false))) { ret 5; }
+        i = i + 1;
+    }
+    if (runtime.timer_count != 1 || deadline_at(?runtime, 0).refs != n - n / 2) { ret 6; }
+    if (timers_expire(?runtime, time.instant_add(at, -1)) != nil)               { ret 7; }
+    if (timers_expire(?runtime, at) != ?scope)                                  { ret 8; }
+    cancel.timeout(?scope);
+    if (runtime.timer_count != 0 || runtime.deadline_live != 0) { ret 9; }
+    var output:   [64]Completion;
+    var drained:  usize = 0;
+    var timeouts: usize = 0;
+    for (drained < n) {
+        val taken: res[usize, io_error.Error] = poll(?runtime, ?output[0], 64);
+        if (sel taken.err) { ret 10; }
+        if (taken.ok == 0) { ret 10; }
+        var j: usize = 0;
+        for (j < taken.ok) {
+            if (output[j].has_error && output[j].error.kind == io_error.TIMEOUT) { timeouts = timeouts + 1; }
+            j = j + 1;
+        }
+        drained = drained + taken.ok;
+    }
+    if (timeouts != n - n / 2)                                                                         { ret 11; }
+    if (!succeeded(cancel.destroy(?scope)) || !ok_bool(close(?runtime)) || !ok_err(destroy(?runtime))) { ret 12; }
+    ret 0;
+}
+
+test "runtime scope: one deadline entry serves 1k, 10k and 100k operations" {
+    val sizes: [3]usize = [3]usize{1000, 10000, 100000};
+    var i:     usize    = 0;
+    for (i < 3) {
+        val scaled: i32 = scope_deadline_scale(sizes[i]);
+        if (scaled != 0) { ret 10 * (i::i32 + 1) + scaled; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# owners sharing one index bucket chain stay findable as records come and go
+test "runtime scope: deadline records recycle across distinct scopes" {
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, 4))) { ret 1; }
+    val clock: time.InstantClock = time.instant();
+    if (sel clock.err) { ret 1; }
+    var scopes: [8]cancel.Scope;
+    var tokens: [8]Token;
+    var i:      usize = 0;
+    for (i < 8) {
+        val at: time.Instant = time.instant_add(clock.ok, (3600 + i % 3)::i64 * 1000000000);
+        if (!succeeded(cancel.make_root(?scopes[i], opt[time.Instant].some{at}))) { ret 2; }
+        val submitted: res[Token, io_error.Error] = submit_scoped(?runtime, ?scopes[i], test_operation(READ, i));
+        if (sel submitted.err) { ret 3; }
+        tokens[i] = submitted.ok;
+        i         = i + 1;
+    }
+    if (runtime.timer_count != 8 || runtime.deadline_live != 8) { ret 4; }
+    i = 0;
+    for (i < 8) {
+        if (i % 2 == 0 && !ok_err(complete(?runtime, tokens[i], 0, 0, false))) { ret 5; }
+        i = i + 1;
+    }
+    if (runtime.timer_count != 4 || runtime.deadline_live != 4) { ret 6; }
+    i = 1;
+    for (i < 8) {
+        if (deadline_find(?runtime, ?scopes[i], time.instant_add(clock.ok, (3600 + i % 3)::i64 * 1000000000)) == NO_RECORD) { ret 7; }
+        i = i + 2;
+    }
+    val again: res[Token, io_error.Error] = submit_scoped(?runtime, ?scopes[0], test_operation(READ, 9));
+    if (sel again.err)                                          { ret 8; }
+    if (runtime.timer_count != 5 || runtime.deadline_live != 5) { ret 9; }
+    close(?runtime);
+    var output: [16]Completion;
+    val waited: res[usize, io_error.Error] = wait(?runtime, ?output[0], 16, 0);
+    if (!ok_usize(waited) || runtime.timer_count != 0 || runtime.deadline_live != 0) { ret 10; }
+    if (!ok_err(destroy(?runtime)))                                                  { ret 11; }
     ret 0;
 }
 
