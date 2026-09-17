@@ -17,11 +17,11 @@ $if (capability.HAS_FILES) {
 
 Every group is present on linux, darwin and windows. None is present on any other target, freestanding included. `HOSTED` is the core group, which every other group implies.
 
-A target that claims a group exports every member listed here. `src/system/capability/conformance.mach` names every member of every group that the per-OS module supplies, so a missing member fails the build on any target that claims the group. Members `std.system.os` defines itself (the `secret_*` wrappers, `temp_dir`, `unlink_force`, `realtime`, `monotonic` and `message`) exist wherever the module compiles, so the test doesn't name them. The test also keeps the positioned secret transfers inside the files lane, which `test/secret/verify.sh` enforces.
+A target that claims a group exports every member listed here. `src/system/capability/conformance.mach` names every member of every group that the per-OS module supplies, so a missing member fails the build on any target that claims the group. Members `std.system.os` defines itself (the `secret_*` wrappers, `temp_dir`, `unlink_force`, `realtime`, `monotonic`, `error`, `error_message` and `message`) exist wherever the module compiles, so the test doesn't name them. The test also keeps the positioned secret transfers inside the files lane, which `test/secret/verify.sh` enforces.
 
 | flag | group | purpose |
 | --- | --- | --- |
-| `HOSTED` | core | required by every hosted std module: the error constants and their native text, and process termination |
+| `HOSTED` | core | required by every hosted std module: the error constants, the translation of a native code into an `io.error.Error` (`error`, `error_kind`, `error_message`, `message`), and process termination |
 | `HAS_PAGES` | pages | page allocation, protection, locking and advice, and secret-welded storage |
 | `HAS_CLOCK` | clock | the realtime and monotonic clocks, and sleep |
 | `HAS_ENTROPY` | entropy | cryptographic random fill, public and secret |
@@ -35,7 +35,7 @@ A target that claims a group exports every member listed here. `src/system/capab
 
 ### core (`HOSTED`)
 
-`E2BIG`, `EACCES`, `EADDRINUSE`, `EAGAIN`, `EBADF`, `EBUSY`, `ECANCELED`, `ECHILD`, `ECONNABORTED`, `ECONNREFUSED`, `ECONNRESET`, `EEXIST`, `EFAULT`, `EHOSTUNREACH`, `EINTR`, `EINVAL`, `EIO`, `EISDIR`, `EMFILE`, `ENAMETOOLONG`, `ENETUNREACH`, `ENFILE`, `ENODEV`, `ENOENT`, `ENOMEM`, `ENOSPC`, `ENOTCONN`, `ENOTDIR`, `ENOTEMPTY`, `ENOTSUP`, `ENXIO`, `EPERM`, `EPIPE`, `ERANGE`, `EROFS`, `ESRCH`, `ETIMEDOUT`, `ETXTBSY`, `NOT_FOUND`, `abort`, `message`, `terminate`
+`E2BIG`, `EACCES`, `EADDRINUSE`, `EAGAIN`, `EBADF`, `EBUSY`, `ECANCELED`, `ECHILD`, `ECONNABORTED`, `ECONNREFUSED`, `ECONNRESET`, `EEXIST`, `EFAULT`, `EHOSTUNREACH`, `EINTR`, `EINVAL`, `EIO`, `EISDIR`, `EMFILE`, `ENAMETOOLONG`, `ENETUNREACH`, `ENFILE`, `ENODEV`, `ENOENT`, `ENOMEM`, `ENOSPC`, `ENOTCONN`, `ENOTDIR`, `ENOTEMPTY`, `ENOTSUP`, `ENXIO`, `EPERM`, `EPIPE`, `ERANGE`, `EROFS`, `ESRCH`, `ETIMEDOUT`, `ETXTBSY`, `NOT_FOUND`, `abort`, `error`, `error_kind`, `error_message`, `message`, `terminate`
 
 ### pages (`HAS_PAGES`)
 
