@@ -96,7 +96,20 @@ while read -r module; do
     fi
 done < "$work/actual.txt"
 
+# a module that does not build refuses with exactly one diagnostic naming what
+# it needs, so a freestanding user learns the missing capability from one line
+while read -r module; do
+    grep -qxF "$module" "$work/actual.txt" && continue
+    log="$work/logs/$module.log"
+    count="$(grep -cE '^error:' "$log" || true)"
+    if [ "$count" != 1 ] || ! grep -qE '^error: .* needs ' "$log"; then
+        echo "FAIL: $module refuses freestanding with $count diagnostics, not one naming what it needs:" >&2
+        grep -m 5 -E '^error:' "$log" | sed 's/^/    /' >&2 || true
+        status=1
+    fi
+done < "$work/modules.txt"
+
 built="$(wc -l < "$work/actual.txt")"
 total="$(wc -l < "$work/modules.txt")"
 [ "$status" -eq 0 ] || exit "$status"
-echo "OK: $built of $total std modules build freestanding-x86_64, matching $(basename "$expected")"
+echo "OK: $built of $total std modules build freestanding-x86_64, matching $(basename "$expected"), and every other module refuses with one diagnostic"
