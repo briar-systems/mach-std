@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A cancelled or timed-out completion dropped the bytes that had already
+  landed in, or left, the caller's storage, on every backend (#793). On Linux
+  and Darwin a read that finished while its cancel was underway lost its
+  bytes: the runtime refused the completion that raced the cancel, and a cancel
+  that found a read already finished but not yet published withdrew it. A
+  `complete_copy` that raced a cancel lost its copy the same way. Windows hit
+  this far more often, since every read or datagram receive whose data arrived
+  before its cancel was discarded. The 5.2.0 note that Linux and Darwin never
+  lose bytes on cancel was wrong.
+
+### Added
+- `io.runtime.complete_cancellation_transfer(runtime, token, bytes, items,
+  end_of_stream)` publishes an asynchronous cancellation together with the
+  transfer its request finished first. `complete_cancellation` is now the
+  zero-transfer form of it (#793).
+
+### Changed
+- A cancelled, timed-out or closed completion still has `has_error` set and
+  its reason in `error`, and now also reports in `bytes`, `items` and
+  `end_of_stream` the transfer that finished before the cancellation took
+  effect. A caller that cancels a read must consume `bytes` from the cancelled
+  completion, since the stream will not return them again. A cancelled write
+  reports the bytes it sent, and a cancelled datagram batch the datagrams it
+  filled (#793).
+- A `complete`, `complete_batch` or `complete_copy` that loses to a
+  cancellation already underway now succeeds, and its transfer rides on the
+  cancelled completion. `complete_opened` and `fail` are still refused with
+  `CLOSED`, so a source keeps and closes a socket it could not hand over (#793).
+- The `net.async` backend `cancel` functions take a third argument, through
+  which a backend hands back an operation that had already finished, so the
+  driver reports its transfer with the cancellation (#793).
+
+### Deprecated
+- `net.async.discarded_reads` and `net.async.local.discarded_reads` always
+  return 0 and set `*bytes` to 0, since a cancelled read no longer discards
+  anything. They will be removed in 6.0 (#793).
+
 ## [5.2.0] - 2026-09-17
 
 Rebuild everything that links std before running it on 5.2.0. The layout of

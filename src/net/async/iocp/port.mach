@@ -23,6 +23,7 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.size.usize;
 
 pub rec NativeOverlapped {
@@ -76,12 +77,9 @@ pub rec Hooks {
 
 # a bounded completion port backend
 # ---
-# operations:      operation records, each starting with a Header
-# core:            the socket records, their map and the control lists
-# awaiting:        cancelled operations whose packet has not arrived
-# discarded_reads: cancelled stream reads and datagram receives whose packet
-#                  reported bytes anyway
-# discarded_bytes: the bytes those receives took from the socket
+# operations: operation records, each starting with a Header
+# core:       the socket records, their map and the control lists
+# awaiting:   cancelled operations whose packet has not arrived
 pub rec Backend {
     queue:     *shared.IoQueue;
     source_id: u16;
@@ -97,8 +95,6 @@ pub rec Backend {
     active:          usize;
     ready:           usize;
     awaiting:        usize;
-    discarded_reads: u64;
-    discarded_bytes: u64;
     lock:            mutex.Mutex;
 }
 
@@ -243,6 +239,7 @@ fun settle_socket_locked(backend: *Backend, sock: u32) {
 
 # the operation leaves its own socket record, never one found by socket value
 pub fun release_locked(backend: *Backend, operation: *Header) {
+    if (operation.link.state == iocp.CANCELLED) { backend.awaiting = backend.awaiting - 1; }
     val sock: u32 = iocp.release(?backend.core, ?backend.operations, operation.index);
     clear_borrowed(backend, operation);
     operation.resource     = INVALID_SOCKET;
@@ -324,8 +321,6 @@ pub fun make(backend: *Backend, queue: *shared.IoQueue, initial: usize, source_i
     backend.active          = 0;
     backend.ready           = 0;
     backend.awaiting        = 0;
-    backend.discarded_reads = 0;
-    backend.discarded_bytes = 0;
     backend.lock            = mutex.make();
     ret 0;
 }
@@ -459,13 +454,14 @@ pub fun close_socket(backend: *Backend, resource: usize, opening: u64) i64 {
 # cancellation is asynchronous for a request the kernel holds. the request is
 # aborted and cancel returns io.runtime.CANCELLATION_PENDING. its packet still
 # arrives, and dispatch then reports it with types.STATUS_CANCELLED, so its
-# borrowed storage stays with the kernel until that completion is published. a
-# packet that raced the abort and succeeded is reported cancelled too: a
-# stream read's bytes are then discarded although the peer considers them
-# delivered, and a write's bytes may have been sent. a request the kernel never
-# held is released at once and cancel returns 0
-pub fun cancel(backend: *Backend, token: types.Token) i64 {
-    if (backend == nil) { ret invalid(); }
+# borrowed storage stays with the kernel until that completion is published.
+# that completion carries whatever the request finished before the abort
+# landed: a read's bytes, a write's sent bytes, a batch's datagrams. a request
+# the kernel never held is released at once and cancel returns 0. no finished
+# completion is ever held back here, so finished is always none
+pub fun cancel(backend: *Backend, token: types.Token, finished: *opt[types.NativeCompletion]) i64 {
+    if (finished != nil) { @finished = opt[types.NativeCompletion].none{}; }
+    if (backend == nil)  { ret invalid(); }
     mutex.lock(?backend.lock);
     val operation: *Header = operation_for(backend, token);
     if (operation == nil) {
@@ -498,16 +494,35 @@ pub fun cancel(backend: *Backend, token: types.Token) i64 {
     ret runtime.CANCELLATION_PENDING;
 }
 
-# an active request settled with status: an accept's socket is finished or
-# closed, a readiness wait reads the queued byte count, and the rest report
-# their bytes
+# whether the driver cancelled the operation while its request was outstanding
+pub fun cancelled(operation: *Header) bool {
+    ret operation.link.state == iocp.CANCELLED;
+}
+
+# publish the operation's result and release it. a cancelled operation reports
+# STATUS_CANCELLED with the transfer that finished before the cancellation, and
+# hands over no socket
+pub fun settle_locked(backend: *Backend, operation: *Header, bytes: usize, items: usize, resource: usize, status: i64, end_of_stream: bool) {
+    var reported_status:   i64   = status;
+    var reported_resource: usize = resource;
+    if (cancelled(operation)) {
+        reported_status   = types.STATUS_CANCELLED;
+        reported_resource = INVALID_SOCKET;
+    }
+    push_completion_locked(backend, operation.context, operation.link.kind, bytes, items, reported_resource, reported_status, end_of_stream);
+    release_locked(backend, operation);
+}
+
+# a request settled with status: an accept's socket is finished or closed, a
+# readiness wait reads the queued byte count, and the rest report their bytes.
+# a cancelled accept closes the socket it would have handed over
 pub fun finish_locked(backend: *Backend, operation: *Header, status: i64, bytes: usize) {
     var result:             i64   = status;
     var completed_bytes:    usize = 0;
     var completed_resource: usize = operation.resource;
     var end_of_stream:      bool  = false;
     val kind:               u8    = operation.link.kind;
-    if (status >= 0 && kind == runtime.ACCEPT) {
+    if (status >= 0 && kind == runtime.ACCEPT && !cancelled(operation)) {
         result = windows.sock_accept_context(operation.auxiliary, operation.resource);
         if (result >= 0) { result = backend.hooks.accepted(operation); }
         if (result >= 0) {
@@ -539,54 +554,31 @@ pub fun finish_locked(backend: *Backend, operation: *Header, status: i64, bytes:
         completed_bytes = bytes;
         end_of_stream   = kind == runtime.READ && bytes == 0 && operation.buffer.length != 0;
     }
-    if (status < 0 && kind == runtime.ACCEPT && operation.auxiliary != INVALID_SOCKET) {
+    if ((status < 0 || cancelled(operation)) && kind == runtime.ACCEPT && operation.auxiliary != INVALID_SOCKET) {
         windows.sock_close(operation.auxiliary);
         operation.auxiliary = INVALID_SOCKET;
     }
-    push_completion_locked(backend, operation.context, kind, completed_bytes, 0, completed_resource, result, end_of_stream);
-    release_locked(backend, operation);
-}
-
-# a cancelled request's packet ends the kernel's hold on its storage, so it is
-# reported only now, and only as cancelled
-fun finish_cancelled_locked(backend: *Backend, operation: *Header, packet_bytes: u32) {
-    var bytes:    u32  = packet_bytes;
-    var flags:    u32  = operation.native_flags;
-    val observed: i64  = windows.sock_async_result(operation.resource, (?operation.overlapped)::ptr, ?bytes, ?flags, false);
-    val receives: bool = operation.link.kind == runtime.READ || operation.link.kind == runtime.RECEIVE_FROM;
-    if (observed >= 0 && receives && bytes != 0) {
-        backend.discarded_reads = backend.discarded_reads + 1;
-        backend.discarded_bytes = backend.discarded_bytes + bytes::u64;
-    }
-    if (operation.auxiliary != INVALID_SOCKET) {
-        windows.sock_close(operation.auxiliary);
-        operation.auxiliary = INVALID_SOCKET;
-    }
-    backend.awaiting = backend.awaiting - 1;
-    push_completion_locked(backend, operation.context, operation.link.kind, 0, 0, INVALID_SOCKET, types.STATUS_CANCELLED, false);
-    release_locked(backend, operation);
+    settle_locked(backend, operation, completed_bytes, 0, completed_resource, result, end_of_stream);
 }
 
 fun consume_native_locked(backend: *Backend, native: windows.IoCompletion) {
     if ((native.events & windows.IO_EVENT_WAKE) != 0) { ret; }
     val operation: *Header = operation_from_context(backend, native.context);
     if (operation == nil) { ret; }
-    if (operation.link.state == iocp.CANCELLED) {
-        finish_cancelled_locked(backend, operation, native.flags::u32);
-        ret;
-    }
     if (operation.link.state == iocp.CANCEL_READY) {
         finish_locked(backend, operation, operation.link.result, 0);
         ret;
     }
-    if (operation.link.state != iocp.ACTIVE) { ret; }
+    # a cancelled request's packet ends the kernel's hold on its storage, and
+    # settles like any other so the transfer it finished is reported
+    if (operation.link.state != iocp.ACTIVE && !cancelled(operation)) { ret; }
     var bytes:    u32 = native.flags::u32;
     var flags:    u32 = operation.native_flags;
     val observed: i64 = windows.sock_async_result(operation.resource, (?operation.overlapped)::ptr, ?bytes, ?flags, false);
     var status:   i64 = observed;
     # the driver's own cancels leave the active state first, so an aborted
     # request that is still active was aborted by a close outside the driver
-    if (backend.hooks.stale && (observed == windows.ECANCELED || observed == windows.ENOTSOCK)) { status = types.STATUS_STALE; }
+    if (backend.hooks.stale && !cancelled(operation) && (observed == windows.ECANCELED || observed == windows.ENOTSOCK)) { status = types.STATUS_STALE; }
     val kind: u8 = operation.link.kind;
     if (backend.hooks.finish != nil && kind != runtime.ACCEPT && kind != runtime.CONNECT && kind != runtime.READ && kind != runtime.READABLE && kind != runtime.WRITE) {
         backend.hooks.finish(backend::ptr, operation, status, bytes::usize, flags);
@@ -695,16 +687,6 @@ pub fun awaiting_cancellations(backend: *Backend) usize {
     if (backend == nil) { ret 0; }
     mutex.lock(?backend.lock);
     val count: usize = backend.awaiting;
-    mutex.unlock(?backend.lock);
-    ret count;
-}
-
-# cancelled stream reads that took bytes anyway, and the bytes they discarded
-pub fun discarded_reads(backend: *Backend, bytes: *u64) u64 {
-    if (backend == nil) { ret 0; }
-    mutex.lock(?backend.lock);
-    val count: u64 = backend.discarded_reads;
-    if (bytes != nil) { @bytes = backend.discarded_bytes; }
     mutex.unlock(?backend.lock);
     ret count;
 }
