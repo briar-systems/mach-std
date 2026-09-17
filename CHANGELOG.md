@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `buffers.source_lanes`, `buffers.secret_source_lanes` and `buffers.lanes`
+  report how many per-lane budgets a source reads at account open, 0 when it
+  declares none. `Source` and `SecretSource` gain an `fn_lanes` member, set by
+  `buffers.source` and `buffers.secret_source`. A caller with a fixed-size
+  budget array should check the count and refuse a source whose count differs:
+  opening an account reads exactly that many budgets from the pointer it is
+  given, so a shorter array is read past its end and the stray words become
+  budgets. A hand-written `Source` or `SecretSource` that leaves `fn_lanes` out
+  still compiles and reports 0, and a wrapper should forward the member of the
+  source it wraps (#804).
+
 ### Changed
 - A std module that needs an OS capability the target lacks now refuses a
   freestanding build with exactly one diagnostic naming what it needs, for
