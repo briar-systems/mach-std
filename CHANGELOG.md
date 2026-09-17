@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.3.0] - 2026-09-17
+
+Rebuild everything that links std before running it on 5.3.0. The runtime's
+operation records changed layout, and a build made against 5.2.x still links
+with no compile error.
+
+Correction to 5.2.0: its "Known divergence" note said Linux and Darwin never
+lose bytes when a read is cancelled. That was wrong. Losing the bytes of a
+cancelled read was a contract defect on every backend, which Windows hit far
+more often. 5.3.0 fixes it everywhere: a cancelled completion now carries the
+transfer that finished before the cancellation, and a caller that cancels a
+read must consume `bytes` from the cancelled completion. Code that treats
+every error completion as empty loses exactly what it lost before.
+
+### Fixed
+- A cancelled or timed-out completion dropped the bytes that had already
+  landed in, or left, the caller's storage, on every backend (#793). On Linux
+  and Darwin a read that finished while its cancel was underway lost its
+  bytes: the runtime refused the completion that raced the cancel, and a cancel
+  that found a read already finished but not yet published withdrew it. A
+  `complete_copy` that raced a cancel lost its copy the same way. Windows hit
+  this far more often, since every read or datagram receive whose data arrived
+  before its cancel was discarded. The 5.2.0 note that Linux and Darwin never
+  lose bytes on cancel was wrong.
+
+### Added
+- `io.runtime.complete_cancellation_transfer(runtime, token, bytes, items,
+  end_of_stream)` publishes an asynchronous cancellation together with the
+  transfer its request finished first. `complete_cancellation` is now the
+  zero-transfer form of it (#793).
+
+### Changed
+- A cancelled, timed-out or closed completion still has `has_error` set and
+  its reason in `error`, and now also reports in `bytes`, `items` and
+  `end_of_stream` the transfer that finished before the cancellation took
+  effect. A caller that cancels a read must consume `bytes` from the cancelled
+  completion, since the stream will not return them again. A cancelled write
+  reports the bytes it sent, and a cancelled datagram batch the datagrams it
+  filled (#793).
+- A `complete`, `complete_batch` or `complete_copy` that loses to a
+  cancellation already underway now succeeds, and its transfer rides on the
+  cancelled completion. `complete_opened` and `fail` are still refused with
+  `CLOSED`, so a source keeps and closes a socket it could not hand over (#793).
+- Backend signature change: `cancel` in `net.async.linux`, `net.async.darwin`,
+  `net.async.local.unix` and `net.async.iocp.port` takes a third argument,
+  `finished: *opt[types.NativeCompletion]`, through which the backend hands
+  back an operation that had already finished, so the driver reports its
+  transfer with the cancellation. These are backend modules driven by
+  `net.async` and `net.async.local`, not the supported entry point. Code that
+  uses the drivers needs no change. Code that calls a backend's `cancel`
+  directly must pass the new argument, or `nil` to keep the old behavior (#793).
+
+### Deprecated
+- `net.async.discarded_reads` and `net.async.local.discarded_reads` always
+  return 0 and set `*bytes` to 0, since a cancelled read no longer discards
+  anything. They will be removed in 6.0 (#793).
+
 ## [5.2.0] - 2026-09-17
 
 Rebuild everything that links std before running it on 5.2.0. The layout of
