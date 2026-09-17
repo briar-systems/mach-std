@@ -1,3 +1,12 @@
+# std 4.x to 5.0.0
+
+## `buffers.Source` gained members (#767)
+
+`std.memory.buffers.Source` now covers the whole buffer lifecycle. It gained `fn_open_account`, `fn_close_account`, `fn_data`, `fn_retain`, `fn_settle`, `fn_in_flight` and `fn_ready`. Each takes `ctx` first and otherwise matches the `Pool` function of the same name.
+
+- A custom source must fill all seven new members. A `Source` built with `source(pool)` needs no change.
+- Consumers call the `source_*` functions (`source_open_account`, `source_acquire`, `source_data`, `source_ready`, ...) with a `*Source` instead of calling `s.fn_*(s.ctx, ...)` by hand.
+
 # std 3.x to 4.0.0
 
 std 4.0.0 finishes the OS layering in #697. `std.system.os` is now a small contract of primitives with one implementation per OS. Error translation lives in that layer, the logic built on top of it moved out, and descriptors cross it as pointer-width handles. This section lists every breaking change, with the code to write instead. The full detail is in the 4.0.0 changelog, and the contract itself is in `OS-CONTRACT.md`.

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - The license copyright is held by Briar Systems LLC. The MIT terms are unchanged (#765).
+- **Breaking:** `std.memory.buffers.Source` gained `fn_open_account`,
+  `fn_close_account`, `fn_data`, `fn_retain`, `fn_settle`, `fn_in_flight` and
+  `fn_ready`, so a consumer can drive a whole buffer lifecycle through the
+  interface alone. `source(pool)` fills every member, and new `source_*` free
+  functions call through a `*Source` without touching the function pointers (#767).
 
 ## [4.2.0] - 2026-09-17
 
