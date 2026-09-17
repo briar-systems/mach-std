@@ -62,7 +62,7 @@ code=$?
 set -e
 # death by signal surfaces as exit 128+signo both natively and under qemu-user.
 [ "$code" -ge 128 ] || fail "fault path exit $code, expected death by signal (>=128)"
-echo "$err" | grep -q "start not aligned to the runtime page" \
+grep -q "start not aligned to the runtime page" <<< "$err" \
     || fail "fault path missing the invariant panic message; got: $err"
 echo "  OK: died by signal (exit $code), panic named the invariant"
 
