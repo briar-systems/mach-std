@@ -70,6 +70,12 @@ pub rec Operation {
     context:  usize;
 }
 
+# a terminal result. an error completion reports has_error and error, and a
+# cancelled, timed-out or closed one still reports in bytes, items and
+# end_of_stream the transfer that finished before the cancellation took
+# effect: bytes a read placed in its buffer, bytes a write sent, datagrams a
+# batch filled. those bytes belong to the stream, so a caller that cancels a
+# read consumes them like any other read's
 pub rec Completion {
     token:         Token;
     kind:          Kind;
@@ -178,6 +184,11 @@ rec Slot {
     attachment:             lifecycle.Attachment;
     source_index:           u32;
     operation:              Operation;
+    # the transfer a completion reported after the cancellation claimed the
+    # slot, published with the cancellation
+    settled_bytes: usize;
+    settled_items: usize;
+    settled_eof:   bool;
 }
 
 val TIMER_OPERATION:      u8 = 0;
@@ -334,11 +345,12 @@ fun init_slot(runtime: *Runtime, index: usize) {
     slot.cancellation_pending   = false;
     slot.lifecycle_cancellation = false;
     slot.terminal_error         = io_error.make(io_error.OTHER, io_error.OP_UNKNOWN);
-    slot.attachment.owner       = nil;
-    slot.attachment.generation  = 0;
-    slot.attachment.sequence    = 0;
-    slot.attachment.active      = false;
-    slot.source_index           = NO_SOURCE;
+    settle_clear(slot);
+    slot.attachment.owner      = nil;
+    slot.attachment.generation = 0;
+    slot.attachment.sequence   = 0;
+    slot.attachment.active     = false;
+    slot.source_index          = NO_SOURCE;
     cancel.init_registration(?slot.cancellation);
 }
 
@@ -753,6 +765,7 @@ fun claim_locked(runtime: *Runtime, operation: Operation, source_index: u32, tok
     slot.lifecycle_cancellation = false;
     slot.terminal_error         = io_error.make(io_error.OTHER, io_error.OP_UNKNOWN);
     slot.source_index           = source_index;
+    settle_clear(slot);
     cancel.init_registration(?slot.cancellation);
     val attached: err[lifecycle.StateError] = lifecycle.attach(?runtime.lifecycle, ?slot.attachment);
     if (sel attached.err) {
@@ -791,6 +804,25 @@ pub fun submit_owned(runtime: *Runtime, source_token: SourceToken, operation: Op
     mutex.unlock(?runtime.lock);
     if (sel claimed.err) { ret res[Token, io_error.Error].err{io_error.make(claimed.err, io_error.OP_SUBMIT)}; }
     ret res[Token, io_error.Error].ok{token};
+}
+
+fun settle_clear(slot: *Slot) {
+    slot.settled_bytes = 0;
+    slot.settled_items = 0;
+    slot.settled_eof   = false;
+}
+
+# two reports of one operation's transfer describe the same native request, so
+# the larger is kept: a sum could claim more than the buffer holds
+fun settle_merge(slot: *Slot, bytes: usize, items: usize, eof: bool) {
+    if (bytes > slot.settled_bytes) { slot.settled_bytes = bytes; }
+    if (items > slot.settled_items) { slot.settled_items = items; }
+    slot.settled_eof = slot.settled_eof || eof;
+}
+
+# a cancellation publishes whatever transfer settled before it
+fun enqueue_cancellation(runtime: *Runtime, token: Token, slot: *Slot, failure: io_error.Error) {
+    enqueue(runtime, token, slot, slot.settled_bytes, slot.settled_items, 0, 0, true, failure, slot.settled_eof);
 }
 
 fun slot_for(runtime: *Runtime, token: Token) *Slot {
@@ -1042,7 +1074,7 @@ fun scope_cancel_complete(context: ptr, reason: cancel.Reason) {
     val token:     Token = Token{index: slot.index, generation: slot.generation};
     var published: bool  = false;
     if (slot.state == SLOT_CANCELLING && !slot.cancellation_pending) {
-        enqueue(runtime, token, slot, 0, 0, 0, 0, true, slot.terminal_error, false);
+        enqueue_cancellation(runtime, token, slot, slot.terminal_error);
         published = true;
     }
     slot.cancellation_active = false;
@@ -1066,6 +1098,7 @@ fun release_claim_locked(runtime: *Runtime, token: Token) {
     slot.cancellation_pending   = false;
     slot.lifecycle_cancellation = false;
     slot.source_index           = NO_SOURCE;
+    settle_clear(slot);
     cancel.init_registration(?slot.cancellation);
     free_push(runtime, token.index::usize);
     runtime.live = runtime.live - 1;
@@ -1151,10 +1184,24 @@ pub fun submit_scoped_owned(
     ret submit_scoped_with_source(runtime, source_token, true, scope, operation);
 }
 
-fun resolve_with_copy(runtime: *Runtime, token: Token, source: *u8, copy: bool, bytes: usize, items: usize, resource: usize, opening: u64, has_error: bool, failure: io_error.Error, eof: bool) err[io_error.Error] {
+# the slot a completion for token may still settle: one not yet published,
+# whether active or already cancelling
+fun slot_unsettled(runtime: *Runtime, token: Token) *Slot {
+    if (token.index::usize >= runtime.slot_count) { ret nil; }
+    val slot: *Slot = slot_at(runtime, token.index::usize);
+    if (slot.generation != token.generation)                        { ret nil; }
+    if (slot.state != SLOT_ACTIVE && slot.state != SLOT_CANCELLING) { ret nil; }
+    ret slot;
+}
+
+# a completion that loses to a cancellation already underway is not published
+# itself. when transfer is set its bytes, items and end of stream (and a copy)
+# are recorded for the cancellation to carry, and it succeeds. otherwise it is
+# refused with CLOSED, so its caller still owns anything it would have handed over
+fun resolve_with_copy(runtime: *Runtime, token: Token, source: *u8, copy: bool, transfer: bool, bytes: usize, items: usize, resource: usize, opening: u64, has_error: bool, failure: io_error.Error, eof: bool) err[io_error.Error] {
     if (runtime == nil) { ret err[io_error.Error].err{invalid(io_error.OP_SUBMIT)}; }
     mutex.lock(?runtime.lock);
-    val slot: *Slot = slot_for(runtime, token);
+    val slot: *Slot = slot_unsettled(runtime, token);
     if (slot == nil) {
         mutex.unlock(?runtime.lock);
         ret err[io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_SUBMIT)};
@@ -1163,9 +1210,20 @@ fun resolve_with_copy(runtime: *Runtime, token: Token, source: *u8, copy: bool, 
         mutex.unlock(?runtime.lock);
         ret err[io_error.Error].err{invalid(io_error.OP_READ)};
     }
-    if (slot.cancellation_active && !transitioned(cancel.unregister(?slot.cancellation))) {
+    # a claimed registration means the cancel callback is about to run, and a
+    # cancelling slot publishes its cancellation later: either way it has lost
+    var lost: bool = slot.state == SLOT_CANCELLING;
+    if (!lost && slot.cancellation_active && !transitioned(cancel.unregister(?slot.cancellation))) { lost = true; }
+    if (lost) {
+        if (!transfer) {
+            mutex.unlock(?runtime.lock);
+            ret err[io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_SUBMIT)};
+        }
+        # the buffer stays borrowed until the cancellation is published
+        if (copy && bytes > 0) { memory.raw_copy(slot.operation.buffer::ptr, source::ptr, bytes); }
+        settle_merge(slot, bytes, items, eof);
         mutex.unlock(?runtime.lock);
-        ret err[io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_SUBMIT)};
+        ret err[io_error.Error].ok{};
     }
     slot.cancellation_active = false;
     remove_slot_timers(runtime, token);
@@ -1179,39 +1237,59 @@ fun resolve_with_copy(runtime: *Runtime, token: Token, source: *u8, copy: bool, 
     ret err[io_error.Error].ok{};
 }
 
-fun resolve(runtime: *Runtime, token: Token, bytes: usize, items: usize, resource: usize, has_error: bool, failure: io_error.Error, eof: bool) err[io_error.Error] {
-    ret resolve_with_copy(runtime, token, nil, false, bytes, items, resource, 0, has_error, failure, eof);
+fun resolve(runtime: *Runtime, token: Token, transfer: bool, bytes: usize, items: usize, resource: usize, has_error: bool, failure: io_error.Error, eof: bool) err[io_error.Error] {
+    ret resolve_with_copy(runtime, token, nil, false, transfer, bytes, items, resource, 0, has_error, failure, eof);
 }
 
+# a byte completion. one that finishes after a cancellation claimed the
+# operation is carried by the cancelled completion instead, and still succeeds
 pub fun complete(runtime: *Runtime, token: Token, bytes: usize, resource: usize, end_of_stream: bool) err[io_error.Error] {
-    ret resolve(runtime, token, bytes, 0, resource, false, io_error.make(io_error.OTHER, io_error.OP_UNKNOWN), end_of_stream);
+    ret resolve(runtime, token, true, bytes, 0, resource, false, io_error.make(io_error.OTHER, io_error.OP_UNKNOWN), end_of_stream);
 }
 
-# copy is atomic with terminal publication and loses cleanly to close or cancellation
+# copy is atomic with terminal publication. after a cancellation claimed the
+# operation the copy still lands and the cancelled completion reports it
 pub fun complete_copy(runtime: *Runtime, token: Token, source: *u8, bytes: usize, resource: usize, end_of_stream: bool) err[io_error.Error] {
-    ret resolve_with_copy(runtime, token, source, true, bytes, 0, resource, 0, false, io_error.make(io_error.OTHER, io_error.OP_UNKNOWN), end_of_stream);
+    ret resolve_with_copy(runtime, token, source, true, true, bytes, 0, resource, 0, false, io_error.make(io_error.OTHER, io_error.OP_UNKNOWN), end_of_stream);
 }
 
 # a completion that hands the caller a socket it did not open itself, such as
-# an accepted or a connected one, also carries that socket's opening
+# an accepted or a connected one, also carries that socket's opening. a
+# cancellation cannot carry a socket, so after one claimed the operation this
+# is refused with CLOSED and the caller keeps, and closes, the socket
 # ---
 # resource: the native socket
 # opening:  the opening its handle was stamped with (std.io.handle)
 pub fun complete_opened(runtime: *Runtime, token: Token, resource: usize, opening: u64) err[io_error.Error] {
-    ret resolve_with_copy(runtime, token, nil, false, 0, 0, resource, opening, false, io_error.make(io_error.OTHER, io_error.OP_UNKNOWN), false);
+    ret resolve_with_copy(runtime, token, nil, false, false, 0, 0, resource, opening, false, io_error.make(io_error.OTHER, io_error.OP_UNKNOWN), false);
 }
 
-# batch completions report byte progress and completed item count separately
+# batch completions report byte progress and completed item count separately,
+# and after a cancellation claimed the operation both ride on its completion
 pub fun complete_batch(runtime: *Runtime, token: Token, bytes: usize, items: usize, resource: usize) err[io_error.Error] {
-    ret resolve(runtime, token, bytes, items, resource, false, io_error.make(io_error.OTHER, io_error.OP_UNKNOWN), false);
+    ret resolve(runtime, token, true, bytes, items, resource, false, io_error.make(io_error.OTHER, io_error.OP_UNKNOWN), false);
 }
 
+# a failure after a cancellation claimed the operation is refused with CLOSED:
+# the cancellation is reported in its place, with whatever transfer settled
 pub fun fail(runtime: *Runtime, token: Token, failure: io_error.Error) err[io_error.Error] {
-    ret resolve(runtime, token, 0, 0, 0, true, failure, false);
+    ret resolve(runtime, token, false, 0, 0, 0, true, failure, false);
 }
 
 # asynchronous sources publish only after target ownership has quiesced
 pub fun complete_cancellation(runtime: *Runtime, token: Token) err[io_error.Error] {
+    ret complete_cancellation_transfer(runtime, token, 0, 0, false);
+}
+
+# publish an asynchronous cancellation together with the transfer its native
+# request finished before the cancellation took effect. a transfer a
+# completion already recorded for the operation describes the same request,
+# so the larger of the two is published, never their sum
+# ---
+# bytes:         bytes the request moved
+# items:         datagrams a batch filled
+# end_of_stream: whether a read reached the end of its stream
+pub fun complete_cancellation_transfer(runtime: *Runtime, token: Token, bytes: usize, items: usize, end_of_stream: bool) err[io_error.Error] {
     if (runtime == nil) { ret err[io_error.Error].err{invalid(io_error.OP_SUBMIT)}; }
     mutex.lock(?runtime.lock);
     if (token.index::usize >= runtime.slot_count) {
@@ -1224,11 +1302,13 @@ pub fun complete_cancellation(runtime: *Runtime, token: Token) err[io_error.Erro
         ret err[io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_SUBMIT)};
     }
     slot.cancellation_pending = false;
+    settle_merge(slot, bytes, items, end_of_stream);
+    # the scope's completion hook has yet to run and publishes the transfer
     if (slot.cancellation_active) {
         mutex.unlock(?runtime.lock);
         ret err[io_error.Error].ok{};
     }
-    enqueue(runtime, token, slot, 0, 0, 0, 0, true, slot.terminal_error, false);
+    enqueue_cancellation(runtime, token, slot, slot.terminal_error);
     val wake_result: i64 = os.io_queue_wake(?runtime.queue);
     mutex.unlock(?runtime.lock);
     if (wake_result < 0) { ret err[io_error.Error].err{os.error(wake_result, io_error.OP_WAKE)}; }
@@ -1788,7 +1868,7 @@ pub fun begin_close(runtime: *Runtime, mode: lifecycle.Mode, cause: lifecycle.Ca
                     }
                     if (slot.state == SLOT_CANCELLING && cancel_code != CANCELLATION_PENDING) {
                         slot.cancellation_pending = false;
-                        enqueue(runtime, token, slot, 0, 0, 0, 0, true, closed_error, false);
+                        enqueue_cancellation(runtime, token, slot, closed_error);
                     }
                     or (slot.state != SLOT_CANCELLING && slot.state != SLOT_QUEUED) {
                         mutex.unlock(?runtime.lock);
@@ -3053,7 +3133,7 @@ fun completion_race_worker(arg: *u8) {
     }
 }
 
-test "runtime scope: completion and cancellation races have one winner" {
+test "runtime scope: completion and cancellation races report one transfer" {
     var runtime: Runtime;
     if (!ok_err(make(?runtime, 1))) { ret 1; }
     var round: usize = 0;
@@ -3075,11 +3155,15 @@ test "runtime scope: completion and cancellation races have one winner" {
         thread.join(?worker);
         var output: [1]Completion;
         val result: res[usize, io_error.Error] = wait(?runtime, ?output[0], 1, 0);
-        if (sel result.err)                                                                                       { ret 1; }
-        if (result.ok != 1)                                                                                       { ret 1; }
-        if (output[0].context != round)                                                                           { ret 1; }
-        if (atomic.load(?completed) == 1 && output[0].has_error)                                                  { ret 1; }
+        if (sel result.err)             { ret 1; }
+        if (result.ok != 1)             { ret 1; }
+        if (output[0].context != round) { ret 1; }
+        # an accepted completion is published itself or rides on the cancellation,
+        # and a refused one left the cancellation with nothing to carry (#793)
+        if (atomic.load(?completed) == 1 && output[0].bytes != 1)                                                 { ret 1; }
+        if (atomic.load(?completed) == 1 && output[0].has_error && output[0].error.kind != io_error.CANCELLED)    { ret 1; }
         if (atomic.load(?completed) == 0 && (!output[0].has_error || output[0].error.kind != io_error.CANCELLED)) { ret 1; }
+        if (atomic.load(?completed) == 0 && output[0].bytes != 0)                                                 { ret 1; }
         if (!succeeded(cancel.destroy(?scope)) || pending(?runtime) != 0)                                         { ret 1; }
         round = round + 1;
     }
