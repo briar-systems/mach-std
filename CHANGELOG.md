@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused as `UNSUPPORTED` before any socket is created (#738).
 
 ### Changed
+- `chrono.time` and `sync.cancel` document that deadlines are monotonic and must
+  be built from `time.monotonic()`. `time.now`, `since` and `until` are documented
+  as wall-clock only, and `make_root`/`make_child` warn that a wall-clock deadline
+  never fires. This is documentation only, with no behaviour change (#750).
 - Releases run through the family's shared release workflow (briar-systems/.github
   `mach-release.yml`): it verifies the tag, version and changelog section, runs
   the full CI, then publishes. The release-archive check that no test-only fault
