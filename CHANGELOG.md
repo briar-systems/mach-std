@@ -23,6 +23,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of offering it to every source in turn. Per-event dispatch is one
   offer at 1, 10 and 100 sources, where it was 1, 10 and 100. Wakes still reach
   every source (#739).
+- `io.runtime` recycles source ids, so a runtime has no lifetime limit on
+  registrations. The limit was 65,535. A released id waits until every native
+  collection that began before its release has ended, so an event harvested
+  for the old source can never reach the new one. The wire id stays 16 bits,
+  so at most 65,535 sources can be registered at once. The two invariants this
+  rests on are enforced and tested: a source with a live operation cannot be
+  released, and a backend's `destroy` removes every native registration it
+  holds (a leftover one panics) and refuses while the kernel still owns an
+  operation (#740).
+
+### Fixed
+- A registration that loses a race with runtime close no longer leaves a
+  source slot stuck, which made `destroy` report busy forever. This defect is
+  separate from id recycling, and was found while doing it.
 
 ## [5.0.1] - 2026-09-17
 

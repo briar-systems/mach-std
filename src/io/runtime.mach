@@ -137,6 +137,17 @@ val SOURCE_REGISTERED: u8  = 1;
 val SOURCE_RETIRED:    u8  = 2;
 val NO_SOURCE:         u32 = 0xffffffff;
 
+# where a source id leads
+# ---
+# index:    the source slot holding the id while it is registered
+# next:     the next released id, 0 at the tail
+# released: collections begun when the id was released
+rec Route {
+    index:    u32;
+    next:     u32;
+    released: u64;
+}
+
 rec Source {
     state:      u8;
     generation: u32;
@@ -203,7 +214,7 @@ pub rec Runtime {
     slots:     table.Table;
     timers:    table.Table;
     sources:   table.Table;
-    # source index by source id, one u32 per id ever issued
+    # a Route per source id ever issued, indexed by id
     source_routes: table.Table;
     deadlines:     table.Table;
     # open addressed on (owner, at), a power of two at least twice the slots
@@ -224,6 +235,13 @@ pub rec Runtime {
     source_count:    usize;
     source_slots:    usize;
     next_source_tag: u32;
+    # released ids, oldest first, reused once no collection can still hold
+    # an event harvested for them
+    route_free_head: u32;
+    route_free_tail: u32;
+    # native collections begun and ended, each a harvest and its dispatch
+    collections_begun: u64;
+    collections_ended: u64;
     # native events whose source id matched no registered source
     unrouted:        u64;
     native_controls: usize;
@@ -466,7 +484,7 @@ pub fun make(runtime: *Runtime, initial: usize) err[io_error.Error] {
     runtime.deadline_live = 0;
     if (!table.make(?runtime.timers, ?runtime.allocator, $size_of(TimerEntry), initial) ||
         !table.make(?runtime.sources, ?runtime.allocator, $size_of(Source), SOURCE_INITIAL) ||
-        !table.make(?runtime.source_routes, ?runtime.allocator, $size_of(u32), SOURCE_INITIAL) ||
+        !table.make(?runtime.source_routes, ?runtime.allocator, $size_of(Route), SOURCE_INITIAL) ||
         !table.make(?runtime.deadlines, ?runtime.allocator, $size_of(DeadlineRecord), initial) ||
         !deadline_rebuild(runtime, initial * 2) ||
         !reserve_timers(runtime)) {
@@ -479,20 +497,24 @@ pub fun make(runtime: *Runtime, initial: usize) err[io_error.Error] {
         ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
     }
 
-    runtime.initial         = initial;
-    runtime.slot_count      = 0;
-    runtime.free_head       = NO_SLOT;
-    runtime.free_tail       = NO_SLOT;
-    runtime.head            = NO_SLOT;
-    runtime.tail            = NO_SLOT;
-    runtime.count           = 0;
-    runtime.live            = 0;
-    runtime.timer_count     = 0;
-    runtime.source_count    = 0;
-    runtime.source_slots    = 0;
-    runtime.next_source_tag = 1;
-    runtime.unrouted        = 0;
-    runtime.native_controls = 0;
+    runtime.initial           = initial;
+    runtime.slot_count        = 0;
+    runtime.free_head         = NO_SLOT;
+    runtime.free_tail         = NO_SLOT;
+    runtime.head              = NO_SLOT;
+    runtime.tail              = NO_SLOT;
+    runtime.count             = 0;
+    runtime.live              = 0;
+    runtime.timer_count       = 0;
+    runtime.source_count      = 0;
+    runtime.source_slots      = 0;
+    runtime.next_source_tag   = 1;
+    runtime.route_free_head   = 0;
+    runtime.route_free_tail   = 0;
+    runtime.collections_begun = 0;
+    runtime.collections_ended = 0;
+    runtime.unrouted          = 0;
+    runtime.native_controls   = 0;
     lifecycle.make(?runtime.lifecycle);
     runtime.destroyed    = false;
     runtime.woken        = false;
@@ -508,6 +530,55 @@ pub fun make(runtime: *Runtime, initial: usize) err[io_error.Error] {
         ret err[io_error.Error].err{os.error(code, io_error.OP_CREATE)};
     }
     ret err[io_error.Error].ok{};
+}
+
+fun route_at(runtime: *Runtime, id: u16) *Route {
+    ret table.at(?runtime.source_routes, id::usize)::*Route;
+}
+
+# the id a registration will take, 0 when every id is live or still held by a
+# collection that began before its release. nothing changes until commit
+fun take_source_id(runtime: *Runtime) u16 {
+    val head: u32 = runtime.route_free_head;
+    if (head != 0 && route_at(runtime, head::u16).released <= runtime.collections_ended)                                { ret head::u16; }
+    if (runtime.next_source_tag > 0xffff || !table.reserve(?runtime.source_routes, runtime.next_source_tag::usize + 1)) { ret 0; }
+    ret runtime.next_source_tag::u16;
+}
+
+fun commit_source_id(runtime: *Runtime, id: u16, index: u32) {
+    val route: *Route = route_at(runtime, id);
+    if (id::u32 == runtime.next_source_tag) {
+        runtime.next_source_tag = runtime.next_source_tag + 1;
+    }
+    or {
+        runtime.route_free_head = route.next;
+        if (runtime.route_free_head == 0) { runtime.route_free_tail = 0; }
+    }
+    route.index = index;
+    route.next  = 0;
+}
+
+# an event harvested before this point may still name the id, so it waits for
+# every collection already begun to end
+fun release_source_id(runtime: *Runtime, id: u16) {
+    val route: *Route = route_at(runtime, id);
+    route.next     = 0;
+    route.released = runtime.collections_begun;
+    if (runtime.route_free_tail == 0) { runtime.route_free_head = id::u32; }
+    or                                { route_at(runtime, runtime.route_free_tail::u16).next = id::u32; }
+    runtime.route_free_tail = id::u32;
+}
+
+fun collection_begin(runtime: *Runtime) {
+    mutex.lock(?runtime.lock);
+    runtime.collections_begun = runtime.collections_begun + 1;
+    mutex.unlock(?runtime.lock);
+}
+
+fun collection_end(runtime: *Runtime) {
+    mutex.lock(?runtime.lock);
+    runtime.collections_ended = runtime.collections_ended + 1;
+    mutex.unlock(?runtime.lock);
 }
 
 fun source_for(runtime: *Runtime, token: SourceToken) *Source {
@@ -543,15 +614,12 @@ pub fun register_source(
         mutex.unlock(?runtime.lock);
         ret res[SourceToken, io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_CREATE)};
     }
-    if (runtime.next_source_tag > 0xffff) {
+    val tag: u16 = take_source_id(runtime);
+    if (tag == 0) {
         mutex.unlock(?runtime.lock);
         ret res[SourceToken, io_error.Error].err{exhausted(io_error.OP_CREATE)};
     }
     var index: usize = 0;
-    if (!table.reserve(?runtime.source_routes, runtime.next_source_tag::usize + 1)) {
-        mutex.unlock(?runtime.lock);
-        ret res[SourceToken, io_error.Error].err{exhausted(io_error.OP_CREATE)};
-    }
     for (index < runtime.source_slots && source_at(runtime, index).state != SOURCE_UNUSED) { index = index + 1; }
     if (index == runtime.source_slots) {
         if (index == runtime.sources.capacity && !table.grow(?runtime.sources)) {
@@ -564,7 +632,6 @@ pub fun register_source(
     val source:     *Source = source_at(runtime, index);
     var generation: u32     = source.generation + 1;
     if (generation == 0) { generation = 1; }
-    val tag: u16 = runtime.next_source_tag::u16;
     source.state      = SOURCE_REGISTERED;
     source.generation = generation;
     source.tag        = tag;
@@ -576,14 +643,15 @@ pub fun register_source(
     source.busy       = 0;
     val attached: err[lifecycle.StateError] = lifecycle.attach(?runtime.lifecycle, ?source.attachment);
     if (sel attached.err) {
-        source.state   = SOURCE_RETIRED;
+        # no token leaves, so the slot and the id go straight back
+        source.state   = SOURCE_UNUSED;
+        source.tag     = 0;
         source.context = nil;
         mutex.unlock(?runtime.lock);
         ret res[SourceToken, io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_CREATE)};
     }
-    @(table.at(?runtime.source_routes, tag::usize)::*u32) = index::u32;
-    runtime.source_count    = runtime.source_count + 1;
-    runtime.next_source_tag = runtime.next_source_tag + 1;
+    commit_source_id(runtime, tag, index::u32);
+    runtime.source_count = runtime.source_count + 1;
     mutex.unlock(?runtime.lock);
     ret res[SourceToken, io_error.Error].ok{SourceToken{index: index::u32, generation: generation, tag: tag}};
 }
@@ -617,7 +685,9 @@ pub fun release_source(runtime: *Runtime, token: SourceToken) err[io_error.Error
         mutex.unlock(?runtime.lock);
         ret err[io_error.Error].err{invalid(io_error.OP_CLOSE)};
     }
+    release_source_id(runtime, source.tag);
     source.state         = SOURCE_UNUSED;
+    source.tag           = 0;
     source.context       = nil;
     runtime.source_count = runtime.source_count - 1;
     val settled:     res[bool, lifecycle.StateError] = lifecycle.settle(?source.attachment);
@@ -1509,8 +1579,7 @@ fun dispatch_sources(runtime: *Runtime, event: NativeEvent) {
     }
     var source: *Source = nil;
     if (event.source != 0 && event.source::u32 < runtime.next_source_tag) {
-        val route: *u32  = table.at(?runtime.source_routes, event.source::usize)::*u32;
-        val index: usize = (@route)::usize;
+        val index: usize = route_at(runtime, event.source).index::usize;
         if (index < runtime.source_slots) {
             val candidate: *Source = source_at(runtime, index);
             if (candidate.state == SOURCE_REGISTERED && candidate.tag == event.source) { source = candidate; }
@@ -1540,6 +1609,8 @@ fun flush_sources(runtime: *Runtime) {
 fun collect_native(runtime: *Runtime, timeout_ms: i32, controlled: *bool) res[usize, io_error.Error] {
     var total:   usize = 0;
     var timeout: i32   = timeout_ms;
+    collection_begin(runtime);
+    fin { collection_end(runtime); }
     for (true) {
         val polled: res[usize, io_error.Error] = native_poll(runtime, timeout, controlled);
         if (sel polled.err) { ret polled; }
@@ -3170,6 +3241,8 @@ test "runtime: an event for a released source is counted, never offered" {
     val first:   res[SourceToken, io_error.Error] = register_source(?runtime, (?gone)::ptr, routed_source_dispatch, test_source_cancel, test_source_release);
     if (sel first.err) { ret 2; }
     gone.id = source_id(first.ok);
+    # released while a collection holds a harvested batch, so its id is held
+    collection_begin(?runtime);
     if (!ok_err(unregister_source(?runtime, first.ok))) { ret 3; }
     # the released index is reused under a new id
     var live:   RoutedSource                     = RoutedSource{id: 0, offers: ?offered, claimed: 0};
@@ -3182,6 +3255,8 @@ test "runtime: an event for a released source is counted, never offered" {
     dispatch_sources(?runtime, NativeEvent{context: 1, events: native_os.IO_EVENT_READ, status: 0, flags: 0, source: 0});
     dispatch_sources(?runtime, NativeEvent{context: 1, events: native_os.IO_EVENT_READ, status: 0, flags: 0, source: 0xffff});
     if (unrouted_events(?runtime) != 3 || offered != 0) { ret 6; }
+    collection_end(?runtime);
+    if (live.id == gone.id) { ret 10; }
     dispatch_sources(?runtime, NativeEvent{context: os_shared.io_source_context(live.id, 1), events: native_os.IO_EVENT_READ, status: 0, flags: 0, source: live.id});
     if (unrouted_events(?runtime) != 3 || offered != 1 || live.claimed != 1) { ret 7; }
     if (!ok_err(unregister_source(?runtime, second.ok)))                     { ret 8; }
@@ -3197,6 +3272,72 @@ test "runtime: a native event is laid out as the platform completion" {
         $offset_of(NativeEvent, status) != $offset_of(native_os.IoCompletion, status) ||
         $offset_of(NativeEvent, flags) != $offset_of(native_os.IoCompletion, flags) ||
         $offset_of(NativeEvent, source) != $offset_of(native_os.IoCompletion, source)) { ret 1; }
+    ret 0;
+}
+
+# a batch harvested while a source was live is dispatched after the source is
+# released and another registered, as a collection racing a release does
+fun racing_cycle(runtime: *Runtime, old: *RoutedSource, fresh: *RoutedSource) i32 {
+    val first: res[SourceToken, io_error.Error] = register_source(runtime, old::ptr, routed_source_dispatch, test_source_cancel, test_source_release);
+    if (sel first.err) { ret 1; }
+    old.id = source_id(first.ok);
+    collection_begin(runtime);
+    if (!ok_err(unregister_source(runtime, first.ok))) { ret 2; }
+    val second: res[SourceToken, io_error.Error] = register_source(runtime, fresh::ptr, routed_source_dispatch, test_source_cancel, test_source_release);
+    if (sel second.err) { ret 3; }
+    fresh.id = source_id(second.ok);
+    if (fresh.id == old.id) { ret 4; }
+    dispatch_sources(runtime, NativeEvent{context: os_shared.io_source_context(old.id, 1), events: native_os.IO_EVENT_READ, status: 0, flags: 0, source: old.id});
+    collection_end(runtime);
+    if (!ok_err(unregister_source(runtime, second.ok))) { ret 5; }
+    ret 0;
+}
+
+test "runtime: 70,000 source registrations on one runtime never reach a stale source" {
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    var offered: usize        = 0;
+    var old:     RoutedSource = RoutedSource{id: 0, offers: ?offered, claimed: 0};
+    var fresh:   RoutedSource = RoutedSource{id: 0, offers: ?offered, claimed: 0};
+    var highest: u16          = 0;
+    var cycle:   usize        = 0;
+    for (cycle < 70000) {
+        val raced: i32 = racing_cycle(?runtime, ?old, ?fresh);
+        if (raced != 0)         { ret 10 + raced; }
+        if (old.id > highest)   { highest = old.id; }
+        if (fresh.id > highest) { highest = fresh.id; }
+        cycle = cycle + 1;
+    }
+    # 140,000 registrations reuse a handful of ids, and no stale event landed
+    if (offered != 0 || fresh.claimed != 0) { ret 2; }
+    if (highest > 4)                        { ret 3; }
+    if (unrouted_events(?runtime) != 70000) { ret 4; }
+    close(?runtime);
+    if (!ok_err(destroy(?runtime))) { ret 5; }
+    ret 0;
+}
+
+# a source keeps its id while it owns an operation, so the runtime never reuses
+# an id a pending native completion could still carry (#740)
+test "runtime: a source with a live operation cannot be released" {
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    var context:    TestSource                       = TestSource{released: 0, cancellation_pending: false, cancelled: Token{index: 0, generation: 0}};
+    val registered: res[SourceToken, io_error.Error] = register_source(?runtime, (?context)::ptr, test_source_dispatch, test_source_cancel, test_source_release);
+    if (sel registered.err) { ret 2; }
+    val source:    SourceToken                = registered.ok;
+    val submitted: res[Token, io_error.Error] = submit_owned(?runtime, source, test_operation(READ, 93));
+    if (sel submitted.err) { ret 3; }
+    val retired: res[bool, io_error.Error] = retire_source(?runtime, source);
+    if (sel retired.ok)                                         { ret 4; }
+    if (retired.err.kind != io_error.BUSY)                      { ret 4; }
+    if (ok_err(release_source(?runtime, source)))               { ret 5; }
+    if (!ok_err(complete(?runtime, submitted.ok, 1, 0, false))) { ret 6; }
+    var output: Completion;
+    if (!ok_usize(poll(?runtime, ?output, 1)))        { ret 7; }
+    if (!ok_err(unregister_source(?runtime, source))) { ret 8; }
+    close(?runtime);
+    if (!ok_err(destroy(?runtime))) { ret 9; }
     ret 0;
 }
 
