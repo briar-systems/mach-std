@@ -45,6 +45,15 @@ MIGRATION.md covers the breaking changes.
   `fn_ready`, so a consumer can drive a whole buffer lifecycle through the
   interface alone. `source(pool)` fills every member, and new `source_*` free
   functions call through a `*Source` without touching the function pointers (#767).
+- **Breaking:** secret chunks moved from `buffers.Source` to a new
+  `buffers.SecretSource`. `Source` no longer has `fn_secret`, and
+  `source_secret` is gone. A plain `Source` holds nothing welded, so a record
+  holding a `Source` or a `*Source` passes through `ptr` (io.runtime
+  completions, thread args, cancel callbacks). `SecretSource` has open and
+  close account, acquire, release and `fn_view`, and only its holder is welded.
+  `secret_source(pool)` builds one, and the `secret_source_*` functions call
+  through it. A `Source` refuses a secret request as misuse, and a
+  `SecretSource` refuses a plain one (#771).
 
 ### Removed
 - **Breaking:** `time.monotonic`. Use `time.instant` (#752).
