@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.0] - 2026-09-17
+
+Rebuild everything that links std before running it on 5.2.0. The layout of
+the Windows `net.async` and `net.async.local` backend records changed, and so
+did their `Driver`. A build made against 5.1.x still links and runs without any
+compile error, but it reads those records the old way, which is not safe. No
+source change is needed. std now declares `mach = "^5.3"`, so it builds with
+mach 5.3.0 or later within 5.x.
+
+### Behavior changes
+- On Windows, cancelling a `net.async` operation the kernel already holds no
+  longer blocks. The cancel returns at once, and the operation completes as
+  cancelled once the aborted request reports back. `destroy` refuses with
+  `EBUSY` until it does, and `awaiting_cancellations(driver)` shows how many
+  are outstanding (#744).
+- On Windows, a write that finished before its cancel may have reached the
+  peer although it completes as cancelled (#744).
+
+### Known divergence, being changed
+On Windows, a read or datagram receive whose data arrived before its cancel
+completes as cancelled and its bytes are discarded, although the peer
+considers them delivered. Linux and Darwin read only after readiness is
+dispatched, so a cancel there never loses bytes. This is not settled
+behavior: #793 changes it so that a cancelled completion carries the bytes it
+received, planned for 5.3.0. Do not build on the discard. Until then, a caller
+that cancels a read it still wants bytes from can lose them on Windows, even
+where a higher layer promises to keep what the transport gave it, so use a
+deadline and keep reading until the stream drains instead. 5.1.x lost the same
+bytes without counting them. `discarded_reads(driver, bytes)` now counts the
+reads and the bytes (#744, #793).
+
+### Added
+- `net.async.discarded_reads` and `net.async.awaiting_cancellations`, with the
+  same pair on `net.async.local`. Both read 0 on Linux and Darwin (#744).
+- `net.async.types.STATUS_CANCELLED`, the backend status of an operation whose
+  asynchronous cancel has settled (#744).
+
+### Changed
+- The Windows `net.async` backends keep a record per socket, found through a
+  hash of the socket value, with a ready list for controls and a queue of held
+  reads per socket. A flush, a completion, a write and a shutdown cost 0, 2, 2
+  and 1 steps at 1k, 10k and 100k live operations, where they cost 2, 7, 1 and
+  2 steps per live operation. Both backends share one core
+  (`net.async.iocp`), which makes the decisions and does no native I/O, and one
+  Windows layer (`net.async.iocp.port`), which holds cancel and dispatch
+  (#744).
+- `os.io_queue_restore` is no longer used by `net.async`. It stays available
+  (#744).
+- A Windows `net.async` or `net.async.local` cancel no longer wakes the
+  runtime's native waiter and waits for it to leave the native wait. The cancel
+  only requests the abort, and the packet settles it through dispatch. Each
+  backend declares `CANCEL_NEEDS_NATIVE_CONTROL`, which stays true on Linux and
+  Darwin, where cancel ends native access synchronously (#787).
+- The layout of the Windows `net.async` and `net.async.local` backend records,
+  and so of their `Driver`, changed. Rebuild everything that links std (#744).
+
 ## [5.1.0] - 2026-09-17
 
 Rebuild everything that links std before running it on 5.1.0. The layout of
@@ -47,7 +103,7 @@ into one that fails:
 ### Changed
 - `io.runtime` sends each native event straight to the source its id names,
   instead of offering it to every source in turn. Per-event dispatch is one
-  offer at 1, 10 and 100 sources, where it was 1, 10 and 100. Wakes still reach
+  offer at 1, 10 and 100 sources, where it was 1, 10 and 100 offers. Wakes still reach
   every source (#739).
 - `sync.cancel` locks per scope instead of per tree. attach and unregister
   take only their scope's lock, so threads registering on separate child

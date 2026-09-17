@@ -8,6 +8,13 @@
 # that now holds the native value keeps its own state. the driver tells the
 # two apart by the handle's opening (std.io.handle.socket), so wrap a native
 # socket once and pass that handle around
+#
+# cancellation: an operation cancelled through its scope completes CANCELLED
+# once the platform gives up its buffers. on windows that happens when the
+# aborted request reports back, so the completion can arrive after the cancel
+# returns and destroy stays busy until it does (awaiting_cancellations). a read
+# whose data raced the cancel still completes cancelled and its bytes are lost
+# (submit_read, discarded_reads)
 
 use std.allocator;
 use std.allocator.page;
@@ -22,6 +29,7 @@ use std.net.ip;
 use socket_api: std.net.socket;
 use std.net.tcp;
 use std.net.udp;
+use std.sync.atomic;
 use std.sync.cancel;
 use std.sync.mutex;
 use std.sync.thread;
@@ -220,20 +228,22 @@ fun source_dispatch(context: ptr, native_context: usize, events: u32, status: i6
 }
 
 fun source_cancel(context: ptr, token: io_runtime.Token, reason: io_error.Error) i64 {
-    val driver:     *Driver             = context::*Driver;
-    val controlled: err[io_error.Error] = io_runtime.begin_native_control(driver.runtime);
-    if (sel controlled.err) {
-        ret controlled.err.code;
+    val driver:     *Driver = context::*Driver;
+    val controlled: bool    = impl.CANCEL_NEEDS_NATIVE_CONTROL;
+    if (controlled) {
+        val entered: err[io_error.Error] = io_runtime.begin_native_control(driver.runtime);
+        if (sel entered.err) { ret entered.err.code; }
     }
     mutex.lock(?driver.lock);
     val slot: *Slot = slot_for(driver, token);
     var code: i64   = 0;
     if (slot != nil && slot.native_active) {
         code = impl.cancel(?driver.backend, slot.native);
-        if (code >= 0) { slot.native_active = false; }
+        # a pending cancellation keeps the kernel's hold until its packet is published
+        if (code >= 0 && code != io_runtime.CANCELLATION_PENDING) { slot.native_active = false; }
     }
     mutex.unlock(?driver.lock);
-    io_runtime.end_native_control(driver.runtime);
+    if (controlled) { io_runtime.end_native_control(driver.runtime); }
     ret code;
 }
 
@@ -483,6 +493,14 @@ fun submit_buffer(
 }
 
 # the socket is closed through this driver once submitted (module header)
+#
+# cancelling a read is not free on every platform. on windows a read the kernel
+# already holds is aborted asynchronously, and if data arrived first the read
+# still completes as cancelled: its bytes are discarded although the peer
+# considers them delivered, and the stream has silently lost them. a caller that
+# needs every byte must not cancel a pending read to stop waiting. use a
+# deadline, then keep reading until the stream drains. discarded_reads counts
+# the reads this happened to
 pub fun submit_read(driver: *Driver, scope: *cancel.Scope, stream: *tcp.Stream, buffer: *u8, length: usize, context: usize) res[io_runtime.Token, io_error.Error] {
     if (stream == nil || !io_handle.socket_is_valid(stream.handle)) {
         ret res[io_runtime.Token, io_error.Error].err{invalid(io_error.OP_READ)};
@@ -513,6 +531,10 @@ pub fun submit_readable(driver: *Driver, scope: *cancel.Scope, stream: *tcp.Stre
     ret submit_buffer(driver, scope, io_runtime.READABLE, stream.handle, nil, 0, context);
 }
 
+# cancelling a write does not unsend it. on windows a write the kernel already
+# holds is aborted asynchronously, and if it finished first it still completes
+# as cancelled although its bytes may have reached the peer. treat a cancelled
+# write's stream as being in an unknown position
 # the socket is closed through this driver once submitted (module header)
 pub fun submit_write(driver: *Driver, scope: *cancel.Scope, stream: *tcp.Stream, buffer: *u8, length: usize, context: usize) res[io_runtime.Token, io_error.Error] {
     if (stream == nil || !io_handle.socket_is_valid(stream.handle)) {
@@ -741,6 +763,13 @@ fun resolve_native_locked(driver: *Driver, native: types.NativeCompletion) {
         ret;
     }
     slot.native_active = false;
+    if (native.status == types.STATUS_CANCELLED) {
+        val cancelled: err[io_error.Error] = io_runtime.complete_cancellation(driver.runtime, token);
+        if (sel cancelled.err) {
+            panic.panic("std.net.async: asynchronous cancellation lost operation ownership\n");
+        }
+        ret;
+    }
     var resolved: err[io_error.Error];
     if (native.status == types.STATUS_STALE) {
         resolved = io_runtime.fail(driver.runtime, token, io_error.make(io_error.CLOSED, operation_for_kind(native.kind)));
@@ -763,6 +792,40 @@ fun resolve_native_locked(driver: *Driver, native: types.NativeCompletion) {
     }
     if (sel resolved.err && native.kind == io_runtime.ACCEPT && native.status >= 0 && native.resource != io_handle.INVALID_VALUE) {
         os.sock_close(native.resource);
+    }
+}
+
+# reads cancelled on this driver whose data had already arrived, so their bytes
+# were discarded (see submit_read). a nonzero count means the peer sent bytes
+# this program never saw: a protocol that cannot lose bytes must stop cancelling
+# pending reads. always 0 on linux and darwin, which never discard a read
+# ---
+# driver: the driver to query
+# bytes:  receives the total bytes discarded, when not nil
+# ret:    the number of discarded reads since make
+pub fun discarded_reads(driver: *Driver, bytes: *u64) u64 {
+    if (bytes != nil)                           { @bytes = 0; }
+    if (driver == nil || driver.runtime == nil) { ret 0; }
+    $if ($mach.build.os == $mach.os.windows) {
+        ret impl.discarded_reads(?driver.backend, bytes);
+    }
+    $or {
+        ret 0;
+    }
+}
+
+# operations cancelled on this driver whose native request has not yet
+# reported back. each one keeps the driver busy, so a destroy that keeps
+# refusing with a nonzero count is waiting for the kernel, which a caller
+# settles by continuing to wait. always 0 on linux and darwin, which cancel
+# synchronously
+pub fun awaiting_cancellations(driver: *Driver) usize {
+    if (driver == nil || driver.runtime == nil) { ret 0; }
+    $if ($mach.build.os == $mach.os.windows) {
+        ret impl.awaiting_cancellations(?driver.backend);
+    }
+    $or {
+        ret 0;
     }
 }
 
@@ -865,9 +928,9 @@ test "async network: ownership query includes driver backend and runtime" {
             !aliases(?driver, driver.backend.ready.chunks[0]::*u8, 1)) { ret 5; }
     }
     $or {
-        if (!aliases(?driver, driver.backend.attached.chunks[0]::*u8, 1) ||
+        if (!aliases(?driver, driver.backend.core.sockets.chunks[0]::*u8, 1) ||
+            !aliases(?driver, driver.backend.core.socket_map::*u8, 1) ||
             !aliases(?driver, driver.backend.native::*u8, 1) ||
-            !aliases(?driver, driver.backend.preserved.chunks[0]::*u8, 1) ||
             !aliases(?driver, driver.backend.completions.chunks[0]::*u8, 1)) { ret 5; }
     }
     if (refused(destroy(?driver)) ||
@@ -2439,6 +2502,48 @@ test "async network: a readiness wait reports end of stream, reset and cancellat
     ret 0;
 }
 
+# a read cancelled through its scope completes with the scope's reason once the
+# platform gives its buffer back, the driver is left with nothing awaiting, and
+# the stream still reads what the peer sends afterwards
+test "async network: a cancelled read completes cancelled and leaves the stream usable" {
+    var runtime:  io_runtime.Runtime;
+    var driver:   Driver;
+    var scope:    cancel.Scope;
+    var listener: tcp.Listener;
+    if (readable_setup(?runtime, ?driver, ?scope, ?listener) != 0) { ret 1; }
+    var server: tcp.Stream;
+    var client: tcp.Stream;
+    if (readable_pair(?driver, ?scope, ?listener, ?server, ?client) != 0) { ret 2; }
+    var child: cancel.Scope;
+    if (!scope_ok(cancel.make_child(?child, ?scope, opt[time.Instant].none{}))) { ret 3; }
+    var input: [8]u8;
+    if (!ok_token(submit_read(?driver, ?child, ?server, ?input[0], 8, 40))) { ret 4; }
+    if (!scope_changed(cancel.cancel(?child)))                              { ret 5; }
+    var output: io_runtime.Completion;
+    if (!waited_one(wait(?driver, ?output, 1, 1000))
+        || output.context != 40 || output.kind != io_runtime.READ
+        || !output.has_error || output.error.kind != io_error.CANCELLED) {
+        ret 6;
+    }
+    if (!scope_ok(cancel.destroy(?child)))    { ret 7; }
+    if (awaiting_cancellations(?driver) != 0) { ret 8; }
+    var discarded: u64 = 9;
+    if (discarded_reads(?driver, ?discarded) != 0 || discarded != 0)        { ret 9; }
+    if (!ok_token(submit_read(?driver, ?scope, ?server, ?input[0], 8, 41))) { ret 10; }
+    var payload: [2]u8                      = [2]u8{'o', 'k'};
+    val written: res[usize, io_error.Error] = tcp.stream_write(?client, ?payload[0], 2);
+    if (!(sel written.ok && written.ok == 2)) { ret 11; }
+    if (!waited_one(wait(?driver, ?output, 1, 1000))
+        || output.context != 41 || output.has_error || output.bytes != 2 || input[0] != 'o') {
+        ret 12;
+    }
+    if (refused(tcp.stream_close(?client)))                                               { ret 13; }
+    if (!ok_token(submit_stream_close(?driver, ?scope, ?server, lifecycle.ABORTIVE, 42))) { ret 14; }
+    if (!waited_one(wait(?driver, ?output, 1, 1000)) || output.kind != io_runtime.CLOSE)  { ret 15; }
+    if (!readable_teardown(?runtime, ?driver, ?scope, ?listener))                         { ret 16; }
+    ret 0;
+}
+
 val READABLE_IDLE: usize = 64;
 
 # idle connections holding readiness waits hold no caller buffer: each pending
@@ -2512,5 +2617,68 @@ test "async network: idle connections hold readiness waits without buffers" {
         || !ok_err(io_runtime.destroy(?runtime))) {
         ret 17;
     }
+    ret 0;
+}
+
+rec NativeControlCancel {
+    scope: *cancel.Scope;
+    done:  i64;
+}
+
+fun native_control_cancel_worker(arg: *u8) {
+    val context: *NativeControlCancel = arg::*NativeControlCancel;
+    cancel.cancel(context.scope);
+    atomic.store(?context.done, 1);
+}
+
+fun elapsed_below(start: time.Instant, limit_ms: i64) bool {
+    val now: time.InstantClock = time.instant();
+    if (!sel now.ok) { ret false; }
+    val spent: time.Instant = time.Instant{sec: now.ok.sec - start.sec, nsec: now.ok.nsec - start.nsec};
+    ret spent.sec * 1000 + spent.nsec / 1000000 < limit_ms;
+}
+
+# a cancel that never drains the native queue must not wait for the thread
+# blocked in the native wait (#787)
+test "async network: a cancel that settles through dispatch does not wait for the native waiter" {
+    if (impl.CANCEL_NEEDS_NATIVE_CONTROL) { ret 0; }
+    var runtime: io_runtime.Runtime;
+    if (!ok_err(io_runtime.make(?runtime, 1))) { ret 1; }
+    var driver: Driver;
+    val made:   err[io_error.Error] = make(?driver, ?runtime);
+    if (sel made.err) { ret 2; }
+    val listening: res[tcp.Listener, io_error.Error] = listen(ip.endpoint(127, 0, 0, 1, 0), 2);
+    if (sel listening.err) { ret 3; }
+    var listener: tcp.Listener = listening.ok;
+    var peer:     ip.Endpoint;
+    var scope:    cancel.Scope;
+    if (!scope_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 4; }
+    val submitted: res[io_runtime.Token, io_error.Error] = submit_accept(?driver, ?scope, ?listener, ?peer, 81);
+    if (sel submitted.err) { ret 5; }
+    var context: NativeControlCancel = NativeControlCancel{scope: ?scope, done: 0};
+    val started: time.InstantClock   = time.instant();
+    if (!sel started.ok) { ret 6; }
+    mutex.lock(?runtime.native_lock);
+    var worker: thread.Thread;
+    thread.spawn_with(native_control_cancel_worker, (?context)::*u8, ?worker);
+    if (worker.tid < 0) {
+        mutex.unlock(?runtime.native_lock);
+        ret 7;
+    }
+    for (atomic.load(?context.done) == 0 && elapsed_below(started.ok, 1000)) { atomic.spin_hint(); }
+    val finished: bool = atomic.load(?context.done) == 1;
+    mutex.unlock(?runtime.native_lock);
+    thread.join(?worker);
+    if (!finished) { ret 8; }
+    var output: [1]io_runtime.Completion;
+    val waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 1, 1000);
+    if (!waited_one(waited) || !output[0].has_error || output[0].error.kind != io_error.CANCELLED || output[0].context != 81) { ret 9; }
+    if (!scope_ok(cancel.destroy(?scope)))                                                                                    { ret 10; }
+    val closed: err[io_error.Error] = tcp.listener_close(?listener);
+    if (sel closed.err) { ret 11; }
+    val destroyed: err[io_error.Error] = destroy(?driver);
+    if (sel destroyed.err)                     { ret 12; }
+    if (!ok_bool(io_runtime.close(?runtime)))  { ret 13; }
+    if (!ok_err(io_runtime.destroy(?runtime))) { ret 14; }
     ret 0;
 }
