@@ -146,8 +146,7 @@ val LANE_READ:       u8  = 1;
 val LANE_WRITE:      u8  = 2;
 val NONE:            u32 = 0xffffffff;
 # readiness is harvested in fixed batches, so the batch is not a capacity
-val NATIVE_BATCH:  usize = 256;
-val MAP_TOMBSTONE: u32   = 0xffffffff;
+val NATIVE_BATCH: usize = 256;
 
 $if ($mach.build.os == $mach.os.linux) {
     val IN_PROGRESS: i64 = -115;
@@ -219,10 +218,8 @@ fun resource_lookup(backend: *Backend, resource: usize) *Resource {
     for (scanned < backend.map_capacity) {
         val entry: u32 = backend.resource_map[slot];
         if (entry == 0) { ret nil; }
-        if (entry != MAP_TOMBSTONE) {
-            val candidate: *Resource = resource_at(backend, (entry - 1)::usize);
-            if (candidate.state == RESOURCE_ACTIVE && candidate.resource == resource) { ret candidate; }
-        }
+        val candidate: *Resource = resource_at(backend, (entry - 1)::usize);
+        if (candidate.resource == resource) { ret candidate; }
         slot    = (slot + 1) & (backend.map_capacity - 1);
         scanned = scanned + 1;
     }
@@ -230,41 +227,44 @@ fun resource_lookup(backend: *Backend, resource: usize) *Resource {
 }
 
 fun resource_map_insert(backend: *Backend, index: u32) bool {
-    val resource:  usize = resource_at(backend, index::usize).resource;
-    var slot:      usize = resource_hash(resource) & (backend.map_capacity - 1);
-    var tombstone: usize = backend.map_capacity;
-    var scanned:   usize = 0;
-    for (scanned < backend.map_capacity) {
-        val entry: u32 = backend.resource_map[slot];
-        if (entry == 0) {
-            if (tombstone != backend.map_capacity) { slot = tombstone; }
-            backend.resource_map[slot] = index + 1;
-            ret true;
-        }
-        if (entry == MAP_TOMBSTONE && tombstone == backend.map_capacity) { tombstone = slot; }
-        slot    = (slot + 1) & (backend.map_capacity - 1);
-        scanned = scanned + 1;
-    }
-    if (tombstone != backend.map_capacity) {
-        backend.resource_map[tombstone] = index + 1;
-        ret true;
-    }
-    ret false;
-}
-
-fun resource_map_remove(backend: *Backend, index: u32) {
     val resource: usize = resource_at(backend, index::usize).resource;
     var slot:     usize = resource_hash(resource) & (backend.map_capacity - 1);
     var scanned:  usize = 0;
     for (scanned < backend.map_capacity) {
-        val entry: u32 = backend.resource_map[slot];
-        if (entry == 0) { ret; }
-        if (entry == index + 1) {
-            backend.resource_map[slot] = MAP_TOMBSTONE;
-            ret;
+        if (backend.resource_map[slot] == 0) {
+            backend.resource_map[slot] = index + 1;
+            ret true;
         }
         slot    = (slot + 1) & (backend.map_capacity - 1);
         scanned = scanned + 1;
+    }
+    ret false;
+}
+
+# linear probing deletes by shifting the rest of the probe run back, so no
+# tombstone is ever left and a lookup ends at the first empty slot
+fun resource_map_remove(backend: *Backend, index: u32) {
+    val mask:     usize = backend.map_capacity - 1;
+    val resource: usize = resource_at(backend, index::usize).resource;
+    var hole:     usize = resource_hash(resource) & mask;
+    var scanned:  usize = 0;
+    for (backend.resource_map[hole] != index + 1) {
+        if (backend.resource_map[hole] == 0 || scanned == backend.map_capacity) { ret; }
+        hole    = (hole + 1) & mask;
+        scanned = scanned + 1;
+    }
+    backend.resource_map[hole] = 0;
+    var next: usize = (hole + 1) & mask;
+    for (backend.resource_map[next] != 0) {
+        val entry: u32   = backend.resource_map[next];
+        val home:  usize = resource_hash(resource_at(backend, (entry - 1)::usize).resource) & mask;
+        # an entry may fill the hole only if its home is not after the hole
+        if (((next - home) & mask) >= ((next - hole) & mask)) {
+            backend.resource_map[hole] = entry;
+            backend.resource_map[next] = 0;
+            hole                       = next;
+        }
+        next = (next + 1) & mask;
     }
 }
 
@@ -570,15 +570,18 @@ fun arm_resource(backend: *Backend, resource: *Resource) {
     var events: u32 = 0;
     if (resource.read_head != NONE)  { events = events | native.IO_EVENT_READ; }
     if (resource.write_head != NONE) { events = events | native.IO_EVENT_WRITE; }
+    # an idle socket keeps its resource and its registration, which a oneshot
+    # event has already disarmed, so the next operation only rearms it. only a
+    # close through the driver gives them up
     if (events == 0) {
-        unwatch_owned(backend, resource);
         if (resource.close_index != NONE) {
+            unwatch_owned(backend, resource);
             val close_operation: *Operation = operation_at(backend, resource.close_index::usize);
             resource.close_index = NONE;
             val closed: i64 = socket_close(resource.resource);
             finish(backend, resource, close_operation, closed, 0, 0, resource.resource, false);
+            resource_release_unwatched(backend, resource);
         }
-        resource_release_unwatched(backend, resource);
         ret;
     }
     val token:  types.Token = types.Token{index: resource.index, generation: resource.generation};
@@ -958,9 +961,16 @@ pub fun completion(backend: *Backend, index: usize, out: *types.NativeCompletion
 pub fun destroy(backend: *Backend) i64 {
     if (backend == nil) { ret invalid(); }
     mutex.lock(?backend.lock);
-    if (backend.live != 0 || backend.resource_count != 0 || backend.queued_count != 0) {
+    if (backend.live != 0 || backend.queued_count != 0) {
         mutex.unlock(?backend.lock);
         ret native.EBUSY;
+    }
+    # sockets idle at destruction still hold their resource and registration
+    var slot: usize = 0;
+    for (slot < backend.resource_slots) {
+        val resource: *Resource = resource_at(backend, slot);
+        if (resource.state == RESOURCE_ACTIVE) { resource_release(backend, resource); }
+        slot = slot + 1;
     }
     val map_bytes:    usize = $size_of(u32) * backend.map_capacity;
     val native_bytes: usize = $size_of(native.IoCompletion) * NATIVE_BATCH;

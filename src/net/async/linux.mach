@@ -65,6 +65,7 @@ rec Resource {
     closing:      bool;
     write_closed: bool;
     opening:      u64;
+    configured:   bool;
     next_free:    u32;
 }
 
@@ -143,7 +144,6 @@ val LANE_WRITE:      u8  = 2;
 val NONE:            u32 = 0xffffffff;
 # readiness is harvested in fixed batches, so the batch is not a capacity
 val NATIVE_BATCH:     usize = 256;
-val MAP_TOMBSTONE:    u32   = 0xffffffff;
 val IN_PROGRESS:      i64   = -115;
 val MSG_TRUNC:        i32   = 0x20;
 val IP_PKTINFO:       i32   = 8;
@@ -218,10 +218,8 @@ fun resource_lookup(backend: *Backend, resource: usize) *Resource {
     for (scanned < backend.map_capacity) {
         val entry: u32 = backend.resource_map[slot];
         if (entry == 0) { ret nil; }
-        if (entry != MAP_TOMBSTONE) {
-            val candidate: *Resource = resource_at(backend, (entry - 1)::usize);
-            if (candidate.state == RESOURCE_ACTIVE && candidate.resource == resource) { ret candidate; }
-        }
+        val candidate: *Resource = resource_at(backend, (entry - 1)::usize);
+        if (candidate.resource == resource) { ret candidate; }
         slot    = (slot + 1) & (backend.map_capacity - 1);
         scanned = scanned + 1;
     }
@@ -229,41 +227,44 @@ fun resource_lookup(backend: *Backend, resource: usize) *Resource {
 }
 
 fun resource_map_insert(backend: *Backend, index: u32) bool {
-    val resource:  usize = resource_at(backend, index::usize).resource;
-    var slot:      usize = resource_hash(resource) & (backend.map_capacity - 1);
-    var tombstone: usize = backend.map_capacity;
-    var scanned:   usize = 0;
-    for (scanned < backend.map_capacity) {
-        val entry: u32 = backend.resource_map[slot];
-        if (entry == 0) {
-            if (tombstone != backend.map_capacity) { slot = tombstone; }
-            backend.resource_map[slot] = index + 1;
-            ret true;
-        }
-        if (entry == MAP_TOMBSTONE && tombstone == backend.map_capacity) { tombstone = slot; }
-        slot    = (slot + 1) & (backend.map_capacity - 1);
-        scanned = scanned + 1;
-    }
-    if (tombstone != backend.map_capacity) {
-        backend.resource_map[tombstone] = index + 1;
-        ret true;
-    }
-    ret false;
-}
-
-fun resource_map_remove(backend: *Backend, index: u32) {
     val resource: usize = resource_at(backend, index::usize).resource;
     var slot:     usize = resource_hash(resource) & (backend.map_capacity - 1);
     var scanned:  usize = 0;
     for (scanned < backend.map_capacity) {
-        val entry: u32 = backend.resource_map[slot];
-        if (entry == 0) { ret; }
-        if (entry == index + 1) {
-            backend.resource_map[slot] = MAP_TOMBSTONE;
-            ret;
+        if (backend.resource_map[slot] == 0) {
+            backend.resource_map[slot] = index + 1;
+            ret true;
         }
         slot    = (slot + 1) & (backend.map_capacity - 1);
         scanned = scanned + 1;
+    }
+    ret false;
+}
+
+# linear probing deletes by shifting the rest of the probe run back, so no
+# tombstone is ever left and a lookup ends at the first empty slot
+fun resource_map_remove(backend: *Backend, index: u32) {
+    val mask:     usize = backend.map_capacity - 1;
+    val resource: usize = resource_at(backend, index::usize).resource;
+    var hole:     usize = resource_hash(resource) & mask;
+    var scanned:  usize = 0;
+    for (backend.resource_map[hole] != index + 1) {
+        if (backend.resource_map[hole] == 0 || scanned == backend.map_capacity) { ret; }
+        hole    = (hole + 1) & mask;
+        scanned = scanned + 1;
+    }
+    backend.resource_map[hole] = 0;
+    var next: usize = (hole + 1) & mask;
+    for (backend.resource_map[next] != 0) {
+        val entry: u32   = backend.resource_map[next];
+        val home:  usize = resource_hash(resource_at(backend, (entry - 1)::usize).resource) & mask;
+        # an entry may fill the hole only if its home is not after the hole
+        if (((next - home) & mask) >= ((next - hole) & mask)) {
+            backend.resource_map[hole] = entry;
+            backend.resource_map[next] = 0;
+            hole                       = next;
+        }
+        next = (next + 1) & mask;
     }
 }
 
@@ -339,6 +340,7 @@ fun resource_acquire(backend: *Backend, native: usize, opening: u64, created: *b
     resource.generation   = generation;
     resource.resource     = native;
     resource.opening      = opening;
+    resource.configured   = false;
     resource.watched      = false;
     resource.read_head    = NONE;
     resource.read_tail    = NONE;
@@ -620,15 +622,18 @@ fun arm_resource(backend: *Backend, resource: *Resource) {
     var events: u32 = 0;
     if (resource.read_head != NONE)  { events = events | linux.IO_EVENT_READ; }
     if (resource.write_head != NONE) { events = events | linux.IO_EVENT_WRITE; }
+    # an idle socket keeps its resource and its registration, which a oneshot
+    # event has already disarmed, so the next operation only rearms it. only a
+    # close through the driver gives them up
     if (events == 0) {
-        unwatch_owned(backend, resource);
         if (resource.close_index != NONE) {
+            unwatch_owned(backend, resource);
             val close_operation: *Operation = operation_at(backend, resource.close_index::usize);
             resource.close_index = NONE;
             val closed: i64 = socket_close(resource.resource);
             finish(backend, resource, close_operation, closed, 0, 0, resource.resource, false);
+            resource_release_unwatched(backend, resource);
         }
-        resource_release_unwatched(backend, resource);
         ret;
     }
     val token:  types.Token = types.Token{index: resource.index, generation: resource.generation};
@@ -640,6 +645,13 @@ fun arm_resource(backend: *Backend, resource: *Resource) {
     or {
         backend.watches = backend.watches + 1;
         status          = linux.io_queue_watch(backend.queue, resource.resource, token_context(backend, token), events);
+    }
+    # the registration vanishes only when every descriptor for the socket is
+    # closed, so the socket this resource tracked was closed outside the driver
+    if (status == linux.ENOENT && resource.watched) {
+        resource.watched = false;
+        drop_stale(backend, resource);
+        ret;
     }
     if (status < 0) {
         fail_resource(backend, resource, status);
@@ -866,11 +878,14 @@ pub fun submit_write_vector(backend: *Backend, native: usize, opening: u64, vect
 pub fun submit_receive_batch(backend: *Backend, native: usize, opening: u64, packets: *types.Packet, count: usize, context: usize, token: *types.Token) i64 {
     if (backend == nil || token == nil || packets == nil || count == 0) { ret invalid(); }
     mutex.lock(?backend.lock);
-    backend.locates = backend.locates + 1;
-    val configured: i64 = configure_datagram_socket(native);
-    if (configured < 0) {
-        mutex.unlock(?backend.lock);
-        ret configured;
+    val known: *Resource = resource_lookup(backend, native);
+    if (known == nil || known.opening != opening || !known.configured) {
+        backend.locates = backend.locates + 1;
+        val configured: i64 = configure_datagram_socket(native);
+        if (configured < 0) {
+            mutex.unlock(?backend.lock);
+            ret configured;
+        }
     }
     var resource:  *Resource;
     var operation: *Operation;
@@ -879,6 +894,7 @@ pub fun submit_receive_batch(backend: *Backend, native: usize, opening: u64, pac
         mutex.unlock(?backend.lock);
         ret status;
     }
+    resource.configured    = true;
     operation.packets      = packets;
     operation.packet_count = count;
     submission_done(backend, resource);
@@ -1080,9 +1096,16 @@ pub fun completion(backend: *Backend, index: usize, out: *types.NativeCompletion
 pub fun destroy(backend: *Backend) i64 {
     if (backend == nil) { ret invalid(); }
     mutex.lock(?backend.lock);
-    if (backend.live != 0 || backend.resource_count != 0 || backend.queued_count != 0) {
+    if (backend.live != 0 || backend.queued_count != 0) {
         mutex.unlock(?backend.lock);
         ret linux.EBUSY;
+    }
+    # sockets idle at destruction still hold their resource and registration
+    var slot: usize = 0;
+    for (slot < backend.resource_slots) {
+        val resource: *Resource = resource_at(backend, slot);
+        if (resource.state == RESOURCE_ACTIVE) { resource_release(backend, resource); }
+        slot = slot + 1;
     }
     val map_bytes:    usize = $size_of(u32) * backend.map_capacity;
     val native_bytes: usize = $size_of(linux.IoCompletion) * NATIVE_BATCH;
@@ -1451,7 +1474,7 @@ test "async linux: UDP batch preserves boundaries and metadata" {
     val peer_valid:       bool = incoming[0].peer.port == sender_endpoint.port && incoming[1].peer.port == sender_endpoint.port && incoming[2].peer.port == sender_endpoint.port;
     val metadata_valid:   bool = incoming[0].has_local_destination && incoming[0].local_destination.is_v6 == 0 && incoming[0].local_destination.v4.octets[0] == 127 && incoming[0].local_destination.v4.octets[3] == 1 && incoming[0].interface_index != 0;
     val boundaries_valid: bool = incoming[0].length == 3 && !incoming[0].zero_length && !incoming[0].truncated && first_in[0] == 'o' && first_in[2] == 'e' && incoming[1].length == 0 && incoming[1].zero_length && !incoming[1].truncated && incoming[2].length == 4 && !incoming[2].zero_length && incoming[2].truncated && third_in[0] == 1 && third_in[3] == 4;
-    val valid:            bool = receive_submitted == 0 && send_submitted == 0 && saw_receive && saw_send && peer_valid && metadata_valid && boundaries_valid && backend.live == 0 && backend.resource_count == 0;
+    val valid:            bool = receive_submitted == 0 && send_submitted == 0 && saw_receive && saw_send && peer_valid && metadata_valid && boundaries_valid && backend.live == 0 && backend.resource_count == 2;
     linux.sock_close(sender);
     linux.sock_close(receiver);
     val destroyed: i64 = destroy(?backend);
@@ -1533,7 +1556,7 @@ test "async linux: vectored writes and fragmented reads report progress" {
 
     val vector_valid:    bool = vector_submitted == 0 && vector_bytes == 5 && vector_count == 1 && vector_completion.context == 83 && vector_completion.kind == runtime.WRITE && vector_completion.status == 0 && vector_completion.bytes == 5 && vector_completion.items == 0 && vector_input[0] == 'h' && vector_input[1] == 'i' && vector_input[2] == '!' && vector_input[4] == '!';
     val fragments_valid: bool = first_read_submitted == 0 && first_sent == 2 && first_count == 1 && first_completion.context == 84 && first_completion.status == 0 && first_completion.bytes == 2 && first_completion.items == 0 && !first_completion.end_of_stream && second_read_submitted == 0 && second_sent == 2 && second_count == 1 && second_completion.context == 85 && second_completion.status == 0 && second_completion.bytes == 2 && second_completion.items == 0 && assembled[0] == 'a' && assembled[1] == 'b' && assembled[2] == 'c' && assembled[3] == 'd';
-    val valid:           bool = vector_valid && fragments_valid && backend.live == 0 && backend.resource_count == 0;
+    val valid:           bool = vector_valid && fragments_valid && backend.live == 0 && backend.resource_count == 1;
     linux.sock_close(server);
     linux.sock_close(client);
     linux.sock_close(listener);
@@ -1595,7 +1618,7 @@ test "async linux: remote half-close reports EOF and preserves writes" {
 
     val eof_valid:   bool = read_submitted == 0 && half_closed == 0 && read_count == 1 && read_completion.context == 86 && read_completion.kind == runtime.READ && read_completion.status == 0 && read_completion.bytes == 0 && read_completion.items == 0 && read_completion.end_of_stream;
     val write_valid: bool = write_submitted == 0 && response_bytes == 2 && response[0] == 'o' && response[1] == 'k' && write_count == 1 && write_completion.context == 87 && write_completion.status == 0 && write_completion.bytes == 2 && write_completion.items == 0;
-    val valid:       bool = eof_valid && write_valid && backend.live == 0 && backend.resource_count == 0;
+    val valid:       bool = eof_valid && write_valid && backend.live == 0 && backend.resource_count == 1;
     linux.sock_close(server);
     linux.sock_close(client);
     linux.sock_close(listener);
@@ -1665,7 +1688,7 @@ test "async linux: reset completes a pending read once" {
         }
     }
     val after: i64  = poll(?backend, 0);
-    val valid: bool = submitted == 0 && configured == 0 && closed == 0 && saw_reset && completion_count == 1 && after == 0 && backend.live == 0 && backend.resource_count == 0;
+    val valid: bool = submitted == 0 && configured == 0 && closed == 0 && saw_reset && completion_count == 1 && after == 0 && backend.live == 0 && backend.resource_count == 1;
     linux.sock_close(server);
     linux.sock_close(listener);
     val destroyed: i64 = destroy(?backend);
@@ -1768,7 +1791,7 @@ test "async linux: storage grows past the initial size and recycles" {
     var byte:               u8         = 'x';
     val sent:               i64        = linux.sock_send(client, ?byte, 1);
     val after:              i64        = poll(?backend, 0);
-    val valid:              bool       = first == 0 && second == 0 && timed_out == 0 && grown == 0 && grew && stable && cancel_first == 0 && replacement == 0 && generation_changed && cancel_second == 0 && cancel_third == 0 && cancel_replacement == 0 && sent == 1 && after == 0 && storage[0] == 0xa1 && storage[1] == 0xb2 && storage[2] == 0xc3 && backend.live == 0 && backend.resource_count == 0;
+    val valid:              bool       = first == 0 && second == 0 && timed_out == 0 && grown == 0 && grew && stable && cancel_first == 0 && replacement == 0 && generation_changed && cancel_second == 0 && cancel_third == 0 && cancel_replacement == 0 && sent == 1 && after == 0 && storage[0] == 0xa1 && storage[1] == 0xb2 && storage[2] == 0xc3 && backend.live == 0 && backend.resource_count == 1;
     linux.sock_close(server);
     linux.sock_close(client);
     linux.sock_close(listener);
@@ -1902,7 +1925,7 @@ test "async linux: queued cancellation preserves FIFO" {
         completion(?backend, 0, ?a);
         completion(?backend, 1, ?b);
     }
-    val valid: bool = first == 0 && second == 0 && third == 0 && cancelled == 0 && count == 2 && a.context == 11 && b.context == 33 && a.kind == runtime.SEND_TO && b.kind == runtime.SEND_TO && backend.live == 0 && backend.resource_count == 0;
+    val valid: bool = first == 0 && second == 0 && third == 0 && cancelled == 0 && count == 2 && a.context == 11 && b.context == 33 && a.kind == runtime.SEND_TO && b.kind == runtime.SEND_TO && backend.live == 0 && backend.resource_count == 1;
     linux.sock_close(socket);
     val destroyed: i64 = destroy(?backend);
     linux.io_queue_close(?queue);
@@ -1939,7 +1962,7 @@ test "async linux: queued accept cancellation closes handle" {
     if (submitted == 0 && backend.queued_count == 1) { accepted = operation_at(?backend, backend.queued_head::usize).completion.resource; }
     val cancelled: i64  = cancel(?backend, token);
     val closed:    i64  = linux.sock_close(accepted);
-    val valid:     bool = submitted == 0 && cancelled == 0 && accepted != (-1)::usize && closed == linux.EBADF && backend.live == 0 && backend.queued_count == 0 && backend.resource_count == 0;
+    val valid:     bool = submitted == 0 && cancelled == 0 && accepted != (-1)::usize && closed == linux.EBADF && backend.live == 0 && backend.queued_count == 0 && backend.resource_count == 1;
     linux.sock_close(client);
     linux.sock_close(listener);
     val destroyed: i64 = destroy(?backend);
@@ -2015,7 +2038,7 @@ test "async linux: one stream drives concurrent read and write" {
             attempts = attempts + 1;
         }
     }
-    val valid: bool = read_submitted == 0 && write_submitted == 0 && response_bytes == 4 && request_bytes == 4 && saw_read && saw_write && input[0] == 'p' && input[3] == 'g' && response[0] == 'p' && response[3] == 'g' && backend.resource_count == 0;
+    val valid: bool = read_submitted == 0 && write_submitted == 0 && response_bytes == 4 && request_bytes == 4 && saw_read && saw_write && input[0] == 'p' && input[3] == 'g' && response[0] == 'p' && response[3] == 'g' && backend.resource_count == 1;
     linux.sock_close(server);
     linux.sock_close(client);
     linux.sock_close(listener);
@@ -2080,7 +2103,7 @@ test "async linux: listener owns multiple bounded accepts" {
             attempts = attempts + 1;
         }
     }
-    val valid: bool = first == 0 && second == 0 && one_resource && completions == 2 && accepted[0] != (-1)::usize && accepted[1] != (-1)::usize && accepted[0] != accepted[1] && backend.resource_count == 0;
+    val valid: bool = first == 0 && second == 0 && one_resource && completions == 2 && accepted[0] != (-1)::usize && accepted[1] != (-1)::usize && accepted[0] != accepted[1] && backend.resource_count == 1;
     if (accepted[0] != (-1)::usize) { linux.sock_close(accepted[0]); }
     if (accepted[1] != (-1)::usize) { linux.sock_close(accepted[1]); }
     linux.sock_close(clients[0]);
@@ -2373,6 +2396,84 @@ test "async linux: a socket stays registered across blocked operations" {
     if (backend.unwatches != 1) { ret 18; }
     linux.sock_close(sender);
     if (destroy(?backend) < 0) { ret 19; }
+    linux.io_queue_close(?queue);
+    ret 0;
+}
+
+fun test_await(backend: *Backend, context: usize, out: *types.NativeCompletion) bool {
+    var attempts: usize = 0;
+    for (attempts < 8) {
+        val count: i64 = poll(backend, 1000);
+        if (count < 0) { ret false; }
+        var i: usize = 0;
+        for (i < count::usize) {
+            var native: types.NativeCompletion;
+            if (completion(backend, i, ?native) < 0) { ret false; }
+            if (native.context == context) {
+                @out = native;
+                ret true;
+            }
+            i = i + 1;
+        }
+        attempts = attempts + 1;
+    }
+    ret false;
+}
+
+# a registration vanishes only when its socket is closed, so a rearm that no
+# longer finds it means the tracked socket was closed outside the driver: the
+# stale operation completes stale, and the socket now behind that value is
+# registered only when submitted with its own opening (#737)
+test "async linux: a vanished registration marks the resource stale" {
+    var queue: shared.IoQueue;
+    if (linux.io_queue_create(?queue) < 0) { ret 1; }
+    var backend: Backend;
+    if (make(?backend, ?queue, 8, 1) < 0) {
+        linux.io_queue_close(?queue);
+        ret 2;
+    }
+    var tracked:          usize;
+    var tracked_endpoint: ip.Endpoint;
+    var sender:           usize;
+    var sender_endpoint:  ip.Endpoint;
+    var fresh:            usize;
+    var fresh_endpoint:   ip.Endpoint;
+    if (test_datagram(?tracked, ?tracked_endpoint) < 0 || test_datagram(?sender, ?sender_endpoint) < 0 || test_datagram(?fresh, ?fresh_endpoint) < 0) { ret 3; }
+    var inbound:  [8]u8;
+    var outbound: [1]u8;
+    outbound[0] = 'y';
+    var incoming: types.Packet;
+    incoming.buffer   = ?inbound[0];
+    incoming.capacity = 8;
+    var outgoing: types.Packet;
+    outgoing.buffer   = ?outbound[0];
+    outgoing.length   = 1;
+    outgoing.capacity = 1;
+    outgoing.peer     = tracked_endpoint;
+    var token: types.Token;
+    var done:  types.NativeCompletion;
+    if (submit_receive_batch(?backend, tracked, 1, ?incoming, 1, 300, ?token) < 0) { ret 4; }
+    if (datagram_send_batch(sender, ?outgoing, 1) != 1)                            { ret 5; }
+    if (!test_await(?backend, 300, ?done) || done.status != 0)                     { ret 6; }
+
+    # the tracked value now names the fresh socket, whose only other descriptor
+    # is closed, so the old socket and its registration are gone
+    if (linux.duplicate_to(fresh, tracked) < 0) { ret 7; }
+    linux.sock_close(fresh);
+    if (submit_receive_batch(?backend, tracked, 1, ?incoming, 1, 301, ?token) < 0) { ret 8; }
+    if (!test_await(?backend, 301, ?done))                                         { ret 9; }
+    if (done.status != types.STATUS_STALE)                                         { ret 10; }
+
+    if (submit_receive_batch(?backend, tracked, 2, ?incoming, 1, 302, ?token) < 0) { ret 11; }
+    outgoing.peer = fresh_endpoint;
+    if (datagram_send_batch(sender, ?outgoing, 1) != 1)                           { ret 12; }
+    if (!test_await(?backend, 302, ?done) || done.status != 0 || done.items != 1) { ret 13; }
+    if (backend.watches != 2)                                                     { ret 14; }
+
+    if (submit_close(?backend, tracked, 2, 303, ?token) < 0) { ret 15; }
+    if (!test_await(?backend, 303, ?done))                   { ret 16; }
+    linux.sock_close(sender);
+    if (destroy(?backend) < 0) { ret 17; }
     linux.io_queue_close(?queue);
     ret 0;
 }
