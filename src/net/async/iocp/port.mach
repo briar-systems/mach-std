@@ -76,15 +76,17 @@ pub rec Hooks {
 
 # a bounded completion port backend
 # ---
-# operations: operation records, each starting with a Header
-# core:       the socket records, their map and the control lists
+# operations:      operation records, each starting with a Header
+# core:            the socket records, their map and the control lists
+# awaiting:        cancelled operations whose packet has not arrived
+# discarded_reads: cancelled stream reads whose packet reported bytes anyway
+# discarded_bytes: the bytes those reads took from the stream
 pub rec Backend {
     queue:     *shared.IoQueue;
     source_id: u16;
     # where every table's chunks come from
     allocator:       allocator.Allocator;
     operations:      table.Table;
-    preserved:       table.Table;
     completions:     table.Table;
     core:            iocp.Core;
     native:          *windows.IoCompletion;
@@ -93,8 +95,10 @@ pub rec Backend {
     free_operation:  u32;
     active:          usize;
     ready:           usize;
+    awaiting:        usize;
+    discarded_reads: u64;
+    discarded_bytes: u64;
     lock:            mutex.Mutex;
-    io_lock:         mutex.Mutex;
 }
 
 # readiness is harvested in fixed batches, so the batch is not a capacity
@@ -104,10 +108,6 @@ pub val INVALID_SOCKET: usize = (-1)::usize;
 
 pub fun header_at(backend: *Backend, index: usize) *Header {
     ret table.at(?backend.operations, index)::*Header;
-}
-
-fun preserved_at(backend: *Backend, index: usize) *windows.IoCompletion {
-    ret table.at(?backend.preserved, index)::*windows.IoCompletion;
 }
 
 fun completion_at(backend: *Backend, index: usize) *types.NativeCompletion {
@@ -132,7 +132,6 @@ pub fun aliases(backend: *Backend, data: *u8, len: usize) bool {
         memory.ranges_overlap(backend.queue::*u8, $size_of(shared.IoQueue),
         data, len) ||
         table.aliases(?backend.operations, data, len) ||
-        table.aliases(?backend.preserved, data, len) ||
         table.aliases(?backend.completions, data, len) ||
         iocp.aliases(?backend.core, data, len) ||
         memory.ranges_overlap(backend.native::*u8, native_bytes, data, len);
@@ -174,14 +173,13 @@ fun clear_borrowed(backend: *Backend, operation: *Header) {
     backend.hooks.clear(operation);
 }
 
-# the completion and preserved tables track the operation table, so publishing
-# and preserving a completion always have somewhere to land
+# the completion table tracks the operation table, so publishing a completion
+# always has somewhere to land
 fun operation_append(backend: *Backend) bool {
     if (backend.operation_slots >= iocp.NONE::usize) { ret false; }
     if (backend.operation_slots == backend.operations.capacity &&
         !table.grow(?backend.operations)) { ret false; }
-    if (!table.reserve(?backend.completions, backend.operations.capacity) ||
-        !table.reserve(?backend.preserved, backend.operations.capacity)) { ret false; }
+    if (!table.reserve(?backend.completions, backend.operations.capacity)) { ret false; }
     val index: usize   = backend.operation_slots;
     val entry: *Header = header_at(backend, index);
     entry.link.state = iocp.FREE;
@@ -289,8 +287,8 @@ fun emit_control_locked(backend: *Backend) {
     }
 }
 
-# initial is the size the backend starts at: the operation, completion,
-# preserved and socket tables grow on demand
+# initial is the size the backend starts at: the operation, completion and
+# socket tables grow on demand
 # ---
 # operation_size: bytes per operation record, which starts with a Header
 pub fun make(backend: *Backend, queue: *shared.IoQueue, initial: usize, source_id: u16, operation_size: usize, hooks: Hooks) i64 {
@@ -301,15 +299,11 @@ pub fun make(backend: *Backend, queue: *shared.IoQueue, initial: usize, source_i
     val allocated: err[allocator.Error] = page.make(?backend.allocator);
     if (sel allocated.err)                                                             { ret windows.ENOMEM; }
     if (!table.make(?backend.operations, ?backend.allocator, operation_size, initial)) { ret windows.ENOMEM; }
-    if (!table.make(?backend.completions, ?backend.allocator, $size_of(types.NativeCompletion), initial) ||
-        !table.make(?backend.preserved, ?backend.allocator, $size_of(windows.IoCompletion), initial)) {
-        table.destroy(?backend.preserved);
-        table.destroy(?backend.completions);
+    if (!table.make(?backend.completions, ?backend.allocator, $size_of(types.NativeCompletion), initial)) {
         table.destroy(?backend.operations);
         ret windows.ENOMEM;
     }
     if (!iocp.make(?backend.core, ?backend.allocator, $offset_of(Header, link), initial)) {
-        table.destroy(?backend.preserved);
         table.destroy(?backend.completions);
         table.destroy(?backend.operations);
         ret windows.ENOMEM;
@@ -317,7 +311,6 @@ pub fun make(backend: *Backend, queue: *shared.IoQueue, initial: usize, source_i
     backend.native = windows.allocate(native_bytes)::*windows.IoCompletion;
     if (backend.native == nil) {
         iocp.destroy(?backend.core);
-        table.destroy(?backend.preserved);
         table.destroy(?backend.completions);
         table.destroy(?backend.operations);
         ret windows.ENOMEM;
@@ -329,8 +322,10 @@ pub fun make(backend: *Backend, queue: *shared.IoQueue, initial: usize, source_i
     backend.free_operation  = iocp.NONE;
     backend.active          = 0;
     backend.ready           = 0;
+    backend.awaiting        = 0;
+    backend.discarded_reads = 0;
+    backend.discarded_bytes = 0;
     backend.lock            = mutex.make();
-    backend.io_lock         = mutex.make();
     ret 0;
 }
 
@@ -460,22 +455,14 @@ pub fun close_socket(backend: *Backend, resource: usize, opening: u64) i64 {
     ret closed;
 }
 
-fun restore_preserved(backend: *Backend, count: usize, wake: bool) i64 {
-    var result: i64   = 0;
-    var i:      usize = 0;
-    for (i < count) {
-        val restored: i64 = windows.io_queue_restore(backend.queue, @preserved_at(backend, i));
-        if (result >= 0 && restored < 0) { result = restored; }
-        i = i + 1;
-    }
-    if (wake) {
-        val restored_wake: i64 = windows.io_queue_wake(backend.queue);
-        if (result >= 0 && restored_wake < 0) { result = restored_wake; }
-    }
-    ret result;
-}
-
-# successful cancellation synchronously ends all native access to borrowed data
+# cancellation is asynchronous for a request the kernel holds. the request is
+# aborted and cancel returns io.runtime.CANCELLATION_PENDING. its packet still
+# arrives, and dispatch then reports it with types.STATUS_CANCELLED, so its
+# borrowed storage stays with the kernel until that completion is published. a
+# packet that raced the abort and succeeded is reported cancelled too: a
+# stream read's bytes are then discarded although the peer considers them
+# delivered, and a write's bytes may have been sent. a request the kernel never
+# held is released at once and cancel returns 0
 pub fun cancel(backend: *Backend, token: types.Token) i64 {
     if (backend == nil) { ret invalid(); }
     mutex.lock(?backend.lock);
@@ -484,83 +471,33 @@ pub fun cancel(backend: *Backend, token: types.Token) i64 {
         mutex.unlock(?backend.lock);
         ret windows.EBADF;
     }
-    if (operation.link.state == iocp.CONTROL_PENDING || operation.link.state == iocp.CONTROL_READY || operation.link.state == iocp.DEFERRED) {
+    val state: u8 = operation.link.state;
+    if (state == iocp.CONTROL_PENDING || state == iocp.CONTROL_READY || state == iocp.DEFERRED) {
         release_locked(backend, operation);
         mutex.unlock(?backend.lock);
         windows.io_queue_wake(backend.queue);
         ret 0;
     }
-    if (operation.link.state != iocp.ACTIVE && operation.link.state != iocp.CANCEL_READY) {
+    if (state == iocp.CANCELLED) {
+        mutex.unlock(?backend.lock);
+        ret runtime.CANCELLATION_PENDING;
+    }
+    if (state != iocp.ACTIVE && state != iocp.CANCEL_READY) {
         mutex.unlock(?backend.lock);
         ret windows.EBADF;
     }
-    # a close already asked the kernel to abort a cancel-ready operation, and
-    # its packet is still owed, so both states wait for that packet below
-    if (operation.link.state == iocp.ACTIVE) {
-        val cancelled: i64 = windows.io_queue_cancel(operation.resource, (?operation.overlapped)::ptr);
-        if (cancelled < 0) {
+    # a close already aborted a cancel-ready request, so only its packet is owed
+    if (state == iocp.ACTIVE) {
+        val aborted: i64 = windows.io_queue_cancel(operation.resource, (?operation.overlapped)::ptr);
+        if (aborted < 0) {
             mutex.unlock(?backend.lock);
-            ret cancelled;
+            ret aborted;
         }
     }
-    iocp.transition(?backend.core, ?backend.operations, operation.index, iocp.CANCELLED, operation.link.result);
-    val context: usize = (?operation.overlapped)::usize;
+    iocp.transition(?backend.core, ?backend.operations, operation.index, iocp.CANCELLED, 0);
+    backend.awaiting = backend.awaiting + 1;
     mutex.unlock(?backend.lock);
-
-    mutex.lock(?backend.io_lock);
-    mutex.lock(?backend.lock);
-    val pending: *Header = operation_for(backend, token);
-    if (pending == nil) {
-        mutex.unlock(?backend.lock);
-        mutex.unlock(?backend.io_lock);
-        ret 0;
-    }
-    if (pending.link.state != iocp.CANCELLED) {
-        mutex.unlock(?backend.lock);
-        mutex.unlock(?backend.io_lock);
-        ret windows.EBADF;
-    }
-    mutex.unlock(?backend.lock);
-
-    var found:           bool  = false;
-    var preserved_count: usize = 0;
-    var preserved_wake:  bool  = false;
-    var result:          i64   = 0;
-    for (!found && result >= 0) {
-        var native: windows.IoCompletion;
-        val count:  i64 = windows.io_queue_poll(backend.queue, ?native, 1, -1);
-        if (count < 0)  { result = count; }
-        or (count == 0) { result = windows.EIO; }
-        or (native.context == context) {
-            found = true;
-        }
-        or ((native.events & windows.IO_EVENT_WAKE) != 0) {
-            preserved_wake = true;
-        }
-        or (preserved_count == backend.preserved.capacity) {
-            result = windows.ENOMEM;
-        }
-        or {
-            @preserved_at(backend, preserved_count) = native;
-            preserved_count                         = preserved_count + 1;
-        }
-    }
-    if (found) {
-        mutex.lock(?backend.lock);
-        val completed: *Header = operation_for(backend, token);
-        if (completed != nil && completed.link.state == iocp.CANCELLED) {
-            if (completed.auxiliary != INVALID_SOCKET) {
-                windows.sock_close(completed.auxiliary);
-                completed.auxiliary = INVALID_SOCKET;
-            }
-            release_locked(backend, completed);
-        }
-        mutex.unlock(?backend.lock);
-    }
-    val restored: i64 = restore_preserved(backend, preserved_count, preserved_wake);
-    mutex.unlock(?backend.io_lock);
-    if (result < 0) { ret result; }
-    ret restored;
+    ret runtime.CANCELLATION_PENDING;
 }
 
 # an active request settled with status: an accept's socket is finished or
@@ -612,12 +549,31 @@ pub fun finish_locked(backend: *Backend, operation: *Header, status: i64, bytes:
     release_locked(backend, operation);
 }
 
+# a cancelled request's packet ends the kernel's hold on its storage, so it is
+# reported only now, and only as cancelled
+fun finish_cancelled_locked(backend: *Backend, operation: *Header, packet_bytes: u32) {
+    var bytes:    u32 = packet_bytes;
+    var flags:    u32 = operation.native_flags;
+    val observed: i64 = windows.sock_async_result(operation.resource, (?operation.overlapped)::ptr, ?bytes, ?flags, false);
+    if (observed >= 0 && operation.link.kind == runtime.READ && bytes != 0) {
+        backend.discarded_reads = backend.discarded_reads + 1;
+        backend.discarded_bytes = backend.discarded_bytes + bytes::u64;
+    }
+    if (operation.auxiliary != INVALID_SOCKET) {
+        windows.sock_close(operation.auxiliary);
+        operation.auxiliary = INVALID_SOCKET;
+    }
+    backend.awaiting = backend.awaiting - 1;
+    push_completion_locked(backend, operation.context, operation.link.kind, 0, 0, INVALID_SOCKET, types.STATUS_CANCELLED, false);
+    release_locked(backend, operation);
+}
+
 fun consume_native_locked(backend: *Backend, native: windows.IoCompletion) {
     if ((native.events & windows.IO_EVENT_WAKE) != 0) { ret; }
     val operation: *Header = operation_from_context(backend, native.context);
     if (operation == nil) { ret; }
     if (operation.link.state == iocp.CANCELLED) {
-        release_locked(backend, operation);
+        finish_cancelled_locked(backend, operation, native.flags::u32);
         ret;
     }
     if (operation.link.state == iocp.CANCEL_READY) {
@@ -692,12 +648,8 @@ pub fun poll(backend: *Backend, timeout_ms: i32) i64 {
     mutex.unlock(?backend.lock);
     if (immediately_ready != 0) { ret immediately_ready::i64; }
 
-    mutex.lock(?backend.io_lock);
     val count: i64 = windows.io_queue_poll(backend.queue, backend.native, NATIVE_BATCH, timeout_ms);
-    if (count <= 0) {
-        mutex.unlock(?backend.io_lock);
-        ret count;
-    }
+    if (count <= 0) { ret count; }
     mutex.lock(?backend.lock);
     var i: usize = 0;
     for (i < count::usize && backend.ready < backend.completions.capacity) {
@@ -707,7 +659,6 @@ pub fun poll(backend: *Backend, timeout_ms: i32) i64 {
     emit_control_locked(backend);
     val ready: usize = backend.ready;
     mutex.unlock(?backend.lock);
-    mutex.unlock(?backend.io_lock);
     ret ready::i64;
 }
 
@@ -717,6 +668,7 @@ pub fun completion(backend: *Backend, index: usize, out: *types.NativeCompletion
     ret 0;
 }
 
+# a cancelled operation keeps the backend busy until its packet is consumed
 pub fun destroy(backend: *Backend) i64 {
     if (backend == nil) { ret invalid(); }
     mutex.lock(?backend.lock);
@@ -726,7 +678,6 @@ pub fun destroy(backend: *Backend) i64 {
     }
     windows.deallocate(backend.native::ptr, $size_of(windows.IoCompletion) * NATIVE_BATCH);
     iocp.destroy(?backend.core);
-    table.destroy(?backend.preserved);
     table.destroy(?backend.completions);
     table.destroy(?backend.operations);
     backend.native          = nil;
@@ -738,4 +689,23 @@ pub fun destroy(backend: *Backend) i64 {
     backend.source_id       = 0;
     mutex.unlock(?backend.lock);
     ret 0;
+}
+
+# cancelled operations whose packet has not arrived yet
+pub fun awaiting_cancellations(backend: *Backend) usize {
+    if (backend == nil) { ret 0; }
+    mutex.lock(?backend.lock);
+    val count: usize = backend.awaiting;
+    mutex.unlock(?backend.lock);
+    ret count;
+}
+
+# cancelled stream reads that took bytes anyway, and the bytes they discarded
+pub fun discarded_reads(backend: *Backend, bytes: *u64) u64 {
+    if (backend == nil) { ret 0; }
+    mutex.lock(?backend.lock);
+    val count: u64 = backend.discarded_reads;
+    if (bytes != nil) { @bytes = backend.discarded_bytes; }
+    mutex.unlock(?backend.lock);
+    ret count;
 }

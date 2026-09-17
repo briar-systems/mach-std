@@ -38,6 +38,8 @@ fwd port.dispatch;
 fwd port.poll;
 fwd port.completion;
 fwd port.destroy;
+fwd port.awaiting_cancellations;
+fwd port.discarded_reads;
 
 rec NativeMessage {
     address:        *u8;
@@ -787,30 +789,33 @@ test "async windows: cancellation quiesces borrowed accept storage" {
     if (submit_accept(?backend, listener, 1, ?first_peer, 20, ?first) < 0 || submit_accept(?backend, listener, 1, ?second_peer, 21, ?second) < 0) { ret 1; }
     # the table was made at two, so the third accept grows it
     if (submit_accept(?backend, listener, 1, ?third_peer, 22, ?third) < 0 || backend.operations.capacity < 3) { ret 1; }
-    if (cancel(?backend, first) < 0 || cancel(?backend, second) < 0 || cancel(?backend, third) < 0)           { ret 1; }
-    if (operation_at(?backend, first.index::usize).header.auxiliary != INVALID_SOCKET
-        || operation_at(?backend, second.index::usize).header.auxiliary != INVALID_SOCKET
-        || operation_at(?backend, third.index::usize).header.auxiliary != INVALID_SOCKET) {
-        ret 1;
-    }
+    val pending: i64 = runtime.CANCELLATION_PENDING;
+    if (cancel(?backend, first) != pending || cancel(?backend, second) != pending || cancel(?backend, third) != pending) { ret 2; }
+    # a repeated cancel of a request still awaiting its packet stays pending
+    if (cancel(?backend, first) != pending || awaiting_cancellations(?backend) != 3) { ret 3; }
     first_peer.port  = 0xffff;
     second_peer.port = 0xffff;
     third_peer.port  = 0xffff;
-    var attempts: usize = 0;
+    var cancelled: usize = 0;
+    var attempts:  usize = 0;
     for (attempts < 16 && backend.active != 0) {
         val count: i64 = poll(?backend, 1000);
-        if (count < 0) { ret 1; }
+        if (count < 0) { ret 4; }
         var i: usize = 0;
         for (i < count::usize) {
             var done: types.NativeCompletion;
             completion(?backend, i, ?done);
-            if (done.context >= 20 && done.context <= 22) { ret 1; }
-            i = i + 1;
+            if (done.context < 20 || done.context > 22)                                   { ret 5; }
+            if (done.status != types.STATUS_CANCELLED || done.resource != INVALID_SOCKET) { ret 6; }
+            cancelled = cancelled + 1;
+            i         = i + 1;
         }
         attempts = attempts + 1;
     }
-    if (backend.active != 0 || first_peer.port != 0xffff || second_peer.port != 0xffff || third_peer.port != 0xffff) { ret 1; }
-    if (poll(?backend, 1) != 0)                                                                                      { ret 1; }
+    # the accepted sockets were closed with their packets, and no peer was written
+    if (cancelled != 3 || backend.active != 0 || awaiting_cancellations(?backend) != 0)       { ret 7; }
+    if (first_peer.port != 0xffff || second_peer.port != 0xffff || third_peer.port != 0xffff) { ret 8; }
+    if (poll(?backend, 1) != 0)                                                               { ret 1; }
     windows.sock_close(listener);
     if (destroy(?backend) < 0 || windows.io_queue_close(?queue) < 0) { ret 1; }
     ret 0;
@@ -1097,13 +1102,14 @@ test "async windows: read cancellation quiesces borrowed storage" {
             for (i < count::usize) {
                 var done: types.NativeCompletion;
                 completion(?backend, i, ?done);
-                if (done.context == 42) { completion_count = completion_count + 1; }
+                if (done.context == 42 && done.status == types.STATUS_CANCELLED && done.bytes == 0) { completion_count = completion_count + 1; }
                 i = i + 1;
             }
             attempts = attempts + 1;
         }
     }
-    val valid: bool = submitted == 0 && canceled == 0 && sent == 1 && input == 0xa5 && completion_count == 0 && backend.active == 0;
+    # the buffer stayed untouched, and the read reported only its cancellation
+    val valid: bool = submitted == 0 && canceled == runtime.CANCELLATION_PENDING && sent == 1 && input == 0xa5 && completion_count == 1 && backend.active == 0;
     windows.sock_close(server);
     windows.sock_close(client);
     windows.sock_close(listener);
@@ -1113,65 +1119,163 @@ test "async windows: read cancellation quiesces borrowed storage" {
     ret 0;
 }
 
-test "async windows: cancellation preserves earlier IOCP packets" {
+# the native request of an active operation has finished once its OVERLAPPED
+# status is no longer STATUS_PENDING, so its packet is on the queue
+fun test_request_done(backend: *Backend, token: types.Token) bool {
+    var waited: usize = 0;
+    for (waited < 500) {
+        if (operation_at(backend, token.index::usize).header.overlapped.internal != 0x103) { ret true; }
+        windows.sleep(10000000);
+        waited = waited + 1;
+    }
+    ret false;
+}
+
+# a completion queued before a cancel is delivered before the cancellation
+test "async windows: cancellation keeps earlier IOCP packets in order" {
     var first_listener:  usize;
     var first_client:    usize;
     var first_server:    usize;
     var second_listener: usize;
     var second_client:   usize;
     var second_server:   usize;
-    if (test_stream_pair(?first_listener, ?first_client, ?first_server) < 0 || test_stream_pair(?second_listener, ?second_client, ?second_server) < 0) { ret 1; }
+    if (test_stream_pair(?first_listener, ?first_client, ?first_server) < 0) { ret 1; }
+    fin {
+        windows.sock_close(first_server);
+        windows.sock_close(first_client);
+        windows.sock_close(first_listener);
+    }
+    if (test_stream_pair(?second_listener, ?second_client, ?second_server) < 0) { ret 2; }
+    fin {
+        windows.sock_close(second_server);
+        windows.sock_close(second_client);
+        windows.sock_close(second_listener);
+    }
+    var queue: shared.IoQueue;
+    if (windows.io_queue_create(?queue) < 0) { ret 3; }
+    fin { windows.io_queue_close(?queue); }
+    var backend: Backend;
+    if (make(?backend, ?queue, 2, 1) < 0) { ret 4; }
+    var first_input:    u8 = 0;
+    var canceled_input: u8 = 0xa5;
+    var first_token:    types.Token;
+    var canceled_token: types.Token;
+    if (submit_read(?backend, first_server, 1, ?first_input, 1, 43, ?first_token) != 0)        { ret 5; }
+    if (submit_read(?backend, second_server, 1, ?canceled_input, 1, 44, ?canceled_token) != 0) { ret 6; }
+    var output: u8 = 0x5a;
+    if (windows.sock_send(first_client, ?output, 1) != 1)                 { ret 7; }
+    if (!test_request_done(?backend, first_token))                        { ret 8; }
+    if (cancel(?backend, canceled_token) != runtime.CANCELLATION_PENDING) { ret 9; }
+    var seen:     usize = 0;
+    var attempts: usize = 0;
+    for (attempts < 16 && seen < 2) {
+        val count: i64 = poll(?backend, 1000);
+        if (count < 0) { ret 10; }
+        var i: usize = 0;
+        for (i < count::usize) {
+            var done: types.NativeCompletion;
+            completion(?backend, i, ?done);
+            if (seen == 0 && (done.context != 43 || done.kind != runtime.READ || done.status != 0 || done.bytes != 1)) { ret 11; }
+            if (seen == 1 && (done.context != 44 || done.status != types.STATUS_CANCELLED))                            { ret 12; }
+            seen = seen + 1;
+            i    = i + 1;
+        }
+        attempts = attempts + 1;
+    }
+    if (seen != 2 || first_input != 0x5a || canceled_input != 0xa5 || backend.active != 0) { ret 13; }
+    if (destroy(?backend) < 0)                                                             { ret 14; }
+    ret 0;
+}
+
+# a cancel returns at once, and the operation keeps the backend busy until
+# dispatch consumes its packet and reports the cancellation
+test "async windows: cancel stays pending until dispatch consumes the packet" {
     var queue: shared.IoQueue;
     if (windows.io_queue_create(?queue) < 0) { ret 1; }
+    fin { windows.io_queue_close(?queue); }
     var backend: Backend;
-    if (make(?backend, ?queue, 2, 1) < 0) {
-        windows.io_queue_close(?queue);
-        ret 1;
+    if (make(?backend, ?queue, 4, 1) < 0) { ret 2; }
+    var listener: usize;
+    var client:   usize;
+    var server:   usize;
+    if (test_stream_pair(?listener, ?client, ?server) < 0) { ret 3; }
+    fin {
+        windows.sock_close(server);
+        windows.sock_close(client);
+        windows.sock_close(listener);
     }
-    var first_input:          u8    = 0;
-    var canceled_input:       u8    = 0xa5;
-    var first_token:          types.Token;
-    var canceled_token:       types.Token;
-    val first_submitted:      i64   = submit_read(?backend, first_server, 1, ?first_input, 1, 43, ?first_token);
-    val canceled_submitted:   i64   = submit_read(?backend, second_server, 1, ?canceled_input, 1, 44, ?canceled_token);
-    var output:               u8    = 0x5a;
-    val sent:                 i64   = windows.sock_send(first_client, ?output, 1);
-    var earlier:              windows.IoCompletion;
-    val earlier_count:        i64   = windows.io_queue_poll(?queue, ?earlier, 1, 1000);
-    val first_native_context: usize = (?operation_at(?backend, first_token.index::usize).header.overlapped)::usize;
-    var earlier_restored:     i64   = windows.EIO;
-    if (earlier_count == 1 && earlier.context == first_native_context) {
-        earlier_restored = windows.io_queue_restore(?queue, earlier);
-    }
-    val canceled:     i64   = cancel(?backend, canceled_token);
-    var saw_first:    bool  = false;
-    var saw_canceled: bool  = false;
-    var attempts:     usize = 0;
-    for (attempts < 16 && !saw_first) {
-        val count: i64 = poll(?backend, 1000);
-        if (count < 0) { attempts = 16; }
-        or {
-            var i: usize = 0;
-            for (i < count::usize) {
-                var done: types.NativeCompletion;
-                completion(?backend, i, ?done);
-                if (done.context == 43 && done.kind == runtime.READ && done.status == 0 && done.bytes == 1 && done.items == 0) { saw_first = true; }
-                if (done.context == 44)                                                                                        { saw_canceled = true; }
-                i = i + 1;
-            }
-            attempts = attempts + 1;
+    var input: u8 = 0;
+    var token: types.Token;
+    if (submit_read(?backend, server, 1, ?input, 1, 50, ?token) != 0) { ret 4; }
+    if (cancel(?backend, token) != runtime.CANCELLATION_PENDING)      { ret 5; }
+    if (awaiting_cancellations(?backend) != 1 || backend.active != 1) { ret 6; }
+    if (destroy(?backend) != windows.EBUSY)                           { ret 7; }
+    var cancelled: bool  = false;
+    var attempts:  usize = 0;
+    for (attempts < 16 && !cancelled) {
+        var native: windows.IoCompletion;
+        val count:  i64 = windows.io_queue_poll(?queue, ?native, 1, 1000);
+        if (count < 0) { ret 8; }
+        if (count == 1 && (native.events & windows.IO_EVENT_WAKE) == 0) {
+            var claimed: bool = false;
+            val ready:   i64  = dispatch(?backend, native.context, native.events, native.status, native.flags, ?claimed);
+            if (!claimed || ready != 1) { ret 9; }
+            var done: types.NativeCompletion;
+            if (completion(?backend, 0, ?done) < 0 || done.context != 50 || done.kind != runtime.READ || done.status != types.STATUS_CANCELLED) { ret 10; }
+            cancelled = true;
         }
+        attempts = attempts + 1;
     }
-    val valid: bool = first_submitted == 0 && canceled_submitted == 0 && sent == 1 && earlier_count == 1 && earlier.context == first_native_context && earlier_restored == 0 && canceled == 0 && saw_first && !saw_canceled && first_input == 0x5a && canceled_input == 0xa5 && backend.active == 0;
-    windows.sock_close(first_server);
-    windows.sock_close(first_client);
-    windows.sock_close(first_listener);
-    windows.sock_close(second_server);
-    windows.sock_close(second_client);
-    windows.sock_close(second_listener);
-    val destroyed: i64 = destroy(?backend);
-    windows.io_queue_close(?queue);
-    if (!valid || destroyed < 0) { ret 1; }
+    if (!cancelled || awaiting_cancellations(?backend) != 0 || backend.active != 0) { ret 11; }
+    var discarded: u64 = 7;
+    if (discarded_reads(?backend, ?discarded) != 0 || discarded != 0) { ret 12; }
+    if (destroy(?backend) < 0)                                        { ret 13; }
+    ret 0;
+}
+
+# a read whose data arrived before its cancel still reports cancelled, and the
+# bytes it took are counted as discarded
+test "async windows: a read that raced its cancel is reported cancelled" {
+    var queue: shared.IoQueue;
+    if (windows.io_queue_create(?queue) < 0) { ret 1; }
+    fin { windows.io_queue_close(?queue); }
+    var backend: Backend;
+    if (make(?backend, ?queue, 4, 1) < 0) { ret 2; }
+    var listener: usize;
+    var client:   usize;
+    var server:   usize;
+    if (test_stream_pair(?listener, ?client, ?server) < 0) { ret 3; }
+    fin {
+        windows.sock_close(server);
+        windows.sock_close(client);
+        windows.sock_close(listener);
+    }
+    var input: [4]u8;
+    var token: types.Token;
+    if (submit_read(?backend, server, 1, ?input[0], 4, 51, ?token) != 0) { ret 4; }
+    var payload: [3]u8 = [3]u8{'a', 'b', 'c'};
+    if (windows.sock_send(client, ?payload[0], 3) != 3)          { ret 5; }
+    if (!test_request_done(?backend, token))                     { ret 6; }
+    if (cancel(?backend, token) != runtime.CANCELLATION_PENDING) { ret 7; }
+    var reports:  usize = 0;
+    var attempts: usize = 0;
+    for (attempts < 16 && backend.active != 0) {
+        val count: i64 = poll(?backend, 1000);
+        if (count < 0) { ret 8; }
+        var i: usize = 0;
+        for (i < count::usize) {
+            var done: types.NativeCompletion;
+            completion(?backend, i, ?done);
+            if (done.context != 51 || done.status != types.STATUS_CANCELLED || done.bytes != 0) { ret 9; }
+            reports = reports + 1;
+            i       = i + 1;
+        }
+        attempts = attempts + 1;
+    }
+    var discarded: u64 = 0;
+    if (reports != 1 || backend.active != 0)                          { ret 10; }
+    if (discarded_reads(?backend, ?discarded) != 1 || discarded != 3) { ret 11; }
+    if (destroy(?backend) < 0)                                        { ret 12; }
     ret 0;
 }
 
@@ -1297,7 +1401,7 @@ test "async windows: canceling a read after its socket closed settles it" {
     var close_token: types.Token;
     if (submit_read(?backend, server, 1, ?input, 1, 40, ?read_token) != 0) { ret 4; }
     if (submit_close(?backend, server, 1, 41, ?close_token) != 0)          { ret 5; }
-    if (cancel(?backend, read_token) != 0)                                 { ret 6; }
+    if (cancel(?backend, read_token) != runtime.CANCELLATION_PENDING)      { ret 6; }
     var reads:    usize = 0;
     var closes:   usize = 0;
     var attempts: usize = 0;
@@ -1308,14 +1412,14 @@ test "async windows: canceling a read after its socket closed settles it" {
         for (i < count::usize) {
             var done: types.NativeCompletion;
             completion(?backend, i, ?done);
-            if (done.context == 40) { reads = reads + 1; }
-            if (done.context == 41) { closes = closes + 1; }
+            if (done.context == 40 && done.kind == runtime.READ && done.status == types.STATUS_CANCELLED) { reads = reads + 1; }
+            if (done.context == 41)                                                                       { closes = closes + 1; }
             i = i + 1;
         }
         attempts = attempts + 1;
     }
-    # the cancel consumed the read's packet, so only the close completes
-    if (reads != 0 || closes != 1 || backend.active != 0) { ret 8; }
+    # the read's aborted packet reports the cancellation, and the close completes
+    if (reads != 1 || closes != 1 || backend.active != 0) { ret 8; }
     # a pending wake may remain, and draining it must yield no completion
     if (poll(?backend, 0) != 0) { ret 9; }
     if (destroy(?backend) < 0)  { ret 10; }
