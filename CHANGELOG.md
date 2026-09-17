@@ -7,6 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.1.0] - 2026-09-17
+
+Requires mach 5.2.0 or later. Tested with mach 5.2.1, the family CI seed.
+
+### Added
+- `std.process.limits`: read and set the open-file limit. `open_files()` returns
+  a `FileLimit` with the soft limit in force, the hard limit, and the highest
+  soft limit this process may set (`ceiling`); `set_open_files(limit)` sets the
+  soft and hard limits; `raise_open_files()` raises the soft limit to the
+  ceiling. A soft limit above the hard one is `INVALID`, raising the hard limit
+  without privilege is `PERMISSION`, and windows, which has no such limit,
+  reports `UNSUPPORTED`. The OS contract's process group gains
+  `open_file_limit` and `set_open_file_limit` (#746).
+
+
+- `std.system.os.thread_affinity(words, capacity, out_count)` and
+  `set_thread_affinity(words, count)` read and pin the calling thread's CPU
+  affinity, in the threads capability group. The mask is caller-sized words with
+  no fixed CPU limit, and a short buffer reports `RANGE` with the words needed.
+  windows numbers CPUs across processor groups and refuses a set spanning groups
+  as `UNSUPPORTED`; darwin has no hard affinity and returns `UNSUPPORTED`.
+  `std.sync.thread` adds `CpuSet` over caller words (`cpu_set`, `cpu_set_add`,
+  `cpu_set_contains`, `cpu_set_size`, `cpu_set_nth`, `cpu_set_clear`),
+  `current_affinity`, `affinity_words`, `set_current_affinity`,
+  `pin_current_to` and `allowed_cpus`, which lists the CPUs the thread may run on
+  in ascending order so worker i can pin to the i-th (#755).
+- Listeners and datagram sockets take options applied before bind, so a
+  multi-core server can bind one `SO_REUSEPORT` socket per thread:
+  `net.socket.BindOptions { reuse_address, reuse_port }` and
+  `net.socket.bind_options()`; `net.tcp.ListenOptions { bind, backlog }`,
+  `net.tcp.listen_options(backlog)`, `net.tcp.listen_with` and
+  `net.tcp.listen_with_options`; `net.udp.bind_with` and
+  `net.udp.bind_with_options`; `net.async.listen_with` and
+  `net.async.bind_datagram_with`. The defaults match `listen` and `bind`
+  exactly. `reuse_port` where the target has no `SO_REUSEPORT` (windows) is
+  refused as `UNSUPPORTED` before any socket is created (#738).
+
+### Changed
+- The README is trimmed to what std is, how to add it, supported compilers and
+  targets, and links. The versioning policy moved to CONTRIBUTING.md, and the
+  API contract sections moved into their modules' doc comments (#756).
+- `chrono.time` and `sync.cancel` document that deadlines are monotonic and must
+  be built from `time.monotonic()`. `time.now`, `since` and `until` are documented
+  as wall-clock only, and `make_root`/`make_child` warn that a wall-clock deadline
+  never fires. This is documentation only, with no behaviour change (#750).
+- Releases run through the family's shared release workflow (briar-systems/.github
+  `mach-release.yml`): it verifies the tag, version and changelog section, runs
+  the full CI, then publishes. The release-archive check that no test-only fault
+  module ships now runs in CI on every x86_64-linux run (#735).
+
+### Fixed
+- On linux, darwin and local unix sockets, `net.async` keeps a socket registered
+  from its first operation until it is closed through the driver. It used to
+  unregister and forget the socket whenever its queue emptied, so every blocked
+  operation paid an address lookup, a registration and an unregistration. Now
+  only the first operation looks the socket up and registers it, and every
+  later one rearms the existing registration. A datagram socket is configured
+  once instead of on every receive. An idle socket costs one resource record
+  until it is closed through the driver, and destroying a driver releases any
+  idle ones (#737).
+- The backends' socket map deletes by shifting the probe run back instead of
+  leaving tombstones, so lookups no longer grow longer as a server opens and
+  closes sockets. After heavy churn a miss used to scan the whole map, for
+  example 262,145 probes at 100,000 sockets. It now stops at the first empty
+  slot (#737).
+- On linux, when a rearm finds that a socket's registration has vanished, the
+  socket was closed outside the driver. The pending operation completes as
+  closed, and the socket now behind that value is registered only when it is
+  submitted with its own handle (#737).
+
 ## [4.0.1] - 2026-09-16
 
 Requires mach 5.2.0 or later. Tested with mach 5.2.1, the family CI seed.

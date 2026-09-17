@@ -46,31 +46,31 @@ inspect_macho() {
     headers="$(llvm-objdump --macho --private-headers "$exe")"
     [ "$(echo "$headers" | grep -c 'cmd LC_LOAD_DYLIB$')" = 1 ] \
         || fail "$target $profile: expected one LC_LOAD_DYLIB command"
-    echo "$headers" | grep -q 'cmd LC_LOAD_DYLINKER$' \
+    grep -q 'cmd LC_LOAD_DYLINKER$' <<< "$headers" \
         || fail "$target $profile: no LC_LOAD_DYLINKER"
-    echo "$headers" | grep -q 'name /usr/lib/dyld' \
+    grep -q 'name /usr/lib/dyld' <<< "$headers" \
         || fail "$target $profile: the dynamic linker is not /usr/lib/dyld"
     local fileheader
     fileheader="$(llvm-readobj --file-header "$exe")"
-    echo "$fileheader" | grep -q 'FileType: Executable' \
+    grep -q 'FileType: Executable' <<< "$fileheader" \
         || fail "$target $profile: not an MH_EXECUTE image"
-    echo "$fileheader" | grep -q 'MH_DYLDLINK' \
+    grep -q 'MH_DYLDLINK' <<< "$fileheader" \
         || fail "$target $profile: not a dyld-linked image"
-    echo "$fileheader" | grep -q 'MH_TWOLEVEL' \
+    grep -q 'MH_TWOLEVEL' <<< "$fileheader" \
         || fail "$target $profile: not a two-level-namespace image"
     case "$target" in
         darwin-aarch64)
             # the arm64 runtime reads argc/argv/envp from x0/x1/x2: LC_MAIN
-            echo "$fileheader" | grep -q 'MH_PIE' \
+            grep -q 'MH_PIE' <<< "$fileheader" \
                 || fail "$target $profile: arm64 image is not MH_PIE"
-            echo "$headers" | grep -q 'cmd LC_MAIN$' \
+            grep -q 'cmd LC_MAIN$' <<< "$headers" \
                 || fail "$target $profile: arm64 image has no LC_MAIN entry"
-            echo "$headers" | grep -q 'cmd LC_BUILD_VERSION$' \
+            grep -q 'cmd LC_BUILD_VERSION$' <<< "$headers" \
                 || fail "$target $profile: arm64 image has no LC_BUILD_VERSION"
             ;;
         darwin-x86_64)
             # the x86_64 runtime reads argc/argv off the stack: LC_UNIXTHREAD
-            echo "$headers" | grep -q 'cmd LC_UNIXTHREAD$' \
+            grep -q 'cmd LC_UNIXTHREAD$' <<< "$headers" \
                 || fail "$target $profile: x86_64 image has no LC_UNIXTHREAD entry"
             ;;
     esac
@@ -78,7 +78,7 @@ inspect_macho() {
     local segments seg
     segments="$(llvm-readobj --macho-segment "$exe")"
     for seg in __PAGEZERO __TEXT __DATA __STUBS __GOT __LINKEDIT; do
-        echo "$segments" | grep -q "Name: $seg\$" \
+        grep -q "Name: $seg\$" <<< "$segments" \
             || fail "$target $profile: segment $seg is missing"
     done
 
@@ -102,7 +102,7 @@ inspect_macho() {
         darwin-aarch64) required+=(_fdopendir _readdir _fstat) ;;
     esac
     for sym in "${required[@]}"; do
-        echo "$imports" | grep -Fxq "$sym" \
+        grep -Fxq "$sym" <<< "$imports" \
             || fail "$target $profile: libSystem import $sym is missing or misspelled"
     done
     # `_exit` here is C `exit(3)`, which must not be bound: the runtime and the
@@ -112,10 +112,10 @@ inspect_macho() {
         ___ulock_wait ___ulock_wake ___open ___fcntl
     )
     for sym in "${refused[@]}"; do
-        ! echo "$imports" | grep -Fxq "$sym" \
+        ! grep -Fxq "$sym" <<< "$imports" \
             || fail "$target $profile: refused symbol $sym is bound"
     done
-    if echo "$imports" | grep -Eq '^[^_]'; then
+    if grep -Eq '^[^_]' <<< "$imports"; then
         fail "$target $profile: an import without the Mach-O underscore prefix remains"
     fi
 
@@ -149,11 +149,11 @@ for target in "${targets[@]}"; do
         [ -n "$exe" ] || fail "$target $profile: no backends binary produced"
 
         # confirm the backend's shared module was actually compiled
-        echo "$log" | grep -q "skipped .* target-gated modules" \
+        grep -q "skipped .* target-gated modules" <<< "$log" \
             && fail "$target $profile: target-gated modules were skipped"
-        echo "$log" | grep -q "std.system.os.${target%%-*}.shared" \
+        grep -q "std.system.os.${target%%-*}.shared" <<< "$log" \
             || fail "$target $profile: os backend was never compiled"
-        echo "$log" | grep -q "std.net.async.${target%%-*}" \
+        grep -q "std.net.async.${target%%-*}" <<< "$log" \
             || fail "$target $profile: network backend was never compiled"
 
         secret_ir="out/$target/$profile/ir/std/system/os/secret.ir"
@@ -188,13 +188,13 @@ for target in "${targets[@]}"; do
                 grep -q '_free' "$secret_asm" \
                     || fail "$target $profile: secret release omitted libSystem free"
                 undefined="$(llvm-nm -u "$exe")"
-                echo "$undefined" | grep -Eq '(^|[[:space:]])_calloc$' \
+                grep -Eq '(^|[[:space:]])_calloc$' <<< "$undefined" \
                     || fail "$target $profile: Mach-O calloc import is misspelled"
-                echo "$undefined" | grep -Eq '(^|[[:space:]])_getentropy$' \
+                grep -Eq '(^|[[:space:]])_getentropy$' <<< "$undefined" \
                     || fail "$target $profile: Mach-O getentropy import is misspelled"
-                echo "$undefined" | grep -Eq '(^|[[:space:]])_free$' \
+                grep -Eq '(^|[[:space:]])_free$' <<< "$undefined" \
                     || fail "$target $profile: Mach-O free import is misspelled"
-                if echo "$undefined" | grep -Eq '(^|[[:space:]])(calloc|getentropy|free)$'; then
+                if grep -Eq '(^|[[:space:]])(calloc|getentropy|free)$' <<< "$undefined"; then
                     fail "$target $profile: unprefixed Mach-O secret import remains"
                 fi
                 grep -Eq '(jmp|b) _calloc' "$main_asm" \

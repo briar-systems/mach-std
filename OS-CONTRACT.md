@@ -25,11 +25,11 @@ A target that claims a group exports every member listed here. `src/system/capab
 | `HAS_PAGES` | pages | page allocation, protection, locking and advice, and secret-welded storage |
 | `HAS_CLOCK` | clock | the realtime and monotonic clocks, and sleep |
 | `HAS_ENTROPY` | entropy | cryptographic random fill, public and secret |
-| `HAS_THREADS` | threads | thread spawn and join, futex-shaped wait and wake, and the cpu count |
+| `HAS_THREADS` | threads | thread spawn and join, futex-shaped wait and wake, the cpu count, and the calling thread's CPU affinity |
 | `HAS_FILES` | files | descriptors, positioned and secret I/O, stat, directories, identity, publication, pipes and the working directory |
 | `HAS_IO_QUEUE` | io queue | the native completion or readiness queue |
 | `HAS_SOCKETS` | sockets | stream, datagram and local sockets, their options and address codecs |
-| `HAS_PROCESS` | process | spawn, wait, status decoding, the environment and signal disposition |
+| `HAS_PROCESS` | process | spawn, wait, status decoding, the environment, signal disposition, and the open-file limit |
 
 ## Members
 
@@ -51,7 +51,9 @@ A target that claims a group exports every member listed here. `src/system/capab
 
 ### threads (`HAS_THREADS`)
 
-`cpu_count`, `thread_current_id`, `thread_current_name`, `thread_detach`, `thread_join`, `thread_spawn`, `thread_wait`, `thread_wait_until`, `thread_wake`
+`cpu_count`, `set_thread_affinity`, `thread_affinity`, `thread_current_id`, `thread_current_name`, `thread_detach`, `thread_join`, `thread_spawn`, `thread_wait`, `thread_wait_until`, `thread_wake`
+
+`thread_affinity(words: *u64, capacity: usize, out_count: *usize) i64` and `set_thread_affinity(words: *u64, count: usize) i64` act on the calling thread. CPU `i` is bit `i % 64` of `words[i / 64]`, and no set size is fixed: a read whose `capacity` is too small returns a code `error_kind` classifies as `RANGE`, with the words needed in `out_count`. linux reads and sets the kernel's cpumask at whatever size the kernel uses. windows numbers CPUs globally, a processor's index being the active counts of every lower processor group plus its bit within its own group; a thread's affinity is one group's mask, so a set spanning groups is `UNSUPPORTED` rather than truncated. darwin has no hard affinity and returns `UNSUPPORTED` from both. A user-supplied implementation may return `UNSUPPORTED` or its own numbering.
 
 ### files (`HAS_FILES`)
 
@@ -67,7 +69,7 @@ A target that claims a group exports every member listed here. `src/system/capab
 
 ### process (`HAS_PROCESS`)
 
-`PROCESS_CONTINUED`, `PROCESS_EXITED`, `PROCESS_OP_CLOSE`, `PROCESS_OP_PIPE`, `PROCESS_OP_READ`, `PROCESS_OP_SPAWN`, `PROCESS_OP_STATUS`, `PROCESS_OP_TERMINATE`, `PROCESS_OP_WAIT`, `PROCESS_SIGNALED`, `PROCESS_STOPPED`, `ProcessStatus`, `ProcessWaitError`, `WNOHANG`, `WaitResult`, `environ`, `getenv`, `getpid`, `ignore_sigpipe`, `spawn`, `spawn_in`, `spawn_redirected`, `spawn_redirected_in`, `terminate_child`, `wait`, `wait_pid`
+`FileLimit`, `LIMIT_UNLIMITED`, `PROCESS_CONTINUED`, `PROCESS_EXITED`, `PROCESS_OP_CLOSE`, `PROCESS_OP_PIPE`, `PROCESS_OP_READ`, `PROCESS_OP_SPAWN`, `PROCESS_OP_STATUS`, `PROCESS_OP_TERMINATE`, `PROCESS_OP_WAIT`, `PROCESS_SIGNALED`, `PROCESS_STOPPED`, `ProcessStatus`, `ProcessWaitError`, `WNOHANG`, `WaitResult`, `environ`, `getenv`, `getpid`, `ignore_sigpipe`, `open_file_limit`, `set_open_file_limit`, `spawn`, `spawn_in`, `spawn_redirected`, `spawn_redirected_in`, `terminate_child`, `wait`, `wait_pid`
 
 ## Assumptions
 

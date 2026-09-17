@@ -1,6 +1,6 @@
 # Darwin ordinary entropy boundary probe
 
-The native verifier uses the checksum-verified published Mach 4.30.0 compiler on both Darwin architectures in debug and release. SDK C signature, minimum-platform annotation and actual import spelling are checked before Mach execution. Native C errors establish the exact producer values required from the ordinary wrapper. Oversized native failure must leave its owned buffer unchanged.
+The native verifier uses the checksum-verified mach release pinned for the family in briar-systems/.github on both Darwin architectures in debug and release. SDK C signature, minimum-platform annotation and actual import spelling are checked before Mach execution. Native C errors establish the exact producer values required from the ordinary wrapper. Oversized native failure must leave its owned buffer unchanged.
 
 Baseline smoke probes cover zero length and spans of 1,255,256,257,512 and1025 bytes with exact surrounding guards. They check actual native completion without treating random output as a deterministic oracle or asserting statistical quality. Existing crypto/rand tests run separately.
 

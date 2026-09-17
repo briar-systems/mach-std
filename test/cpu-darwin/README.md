@@ -1,6 +1,6 @@
 # Darwin active CPU query probe
 
-The native verifier uses checksum-verified published Mach4.30.0 on both Darwin architectures in debug and release. SDK C checks the exact sysctlbyname signature and LP64 widths. Native object imports and Mach's single libSystem dependency are retained.
+The native verifier uses checksum-verified mach release pinned for the family in briar-systems/.github on both Darwin architectures in debug and release. SDK C checks the exact sysctlbyname signature and LP64 widths. Native object imports and Mach's single libSystem dependency are retained.
 
 Native C and Mach observe hw.activecpu around the ordinary wrapper and also record hw.ncpu. Those samples are observations, not an equality or mathematical bound on changes between calls. Each direct query must return a complete positive int. An invalid-name native C call establishes the actual failure value required from the direct Mach binding.
 
