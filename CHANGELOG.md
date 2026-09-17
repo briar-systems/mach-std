@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused as `UNSUPPORTED` before any socket is created (#738).
 
 ### Changed
+- The README is trimmed to what std is, how to add it, supported compilers and
+  targets, and links. The versioning policy moved to CONTRIBUTING.md, and the
+  API contract sections moved into their modules' doc comments (#756).
 - `chrono.time` and `sync.cancel` document that deadlines are monotonic and must
   be built from `time.monotonic()`. `time.now`, `since` and `until` are documented
   as wall-clock only, and `make_root`/`make_child` warn that a wall-clock deadline
