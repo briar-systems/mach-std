@@ -15,6 +15,7 @@ use std.net.ip;
 use std.sync.mutex;
 use std.system.os.darwin;
 use std.system.os.shared;
+use std.system.panic;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -95,8 +96,10 @@ pub rec Backend {
     watches:   u64;
     rearms:    u64;
     unwatches: u64;
-    locates:   u64;
-    lock:      mutex.Mutex;
+    # registrations held, zero once destroy returns
+    registered: usize;
+    locates:    u64;
+    lock:       mutex.Mutex;
 }
 
 fun operation_at(backend: *Backend, index: usize) *Operation {
@@ -157,12 +160,12 @@ fun invalid() i64 {
 }
 
 fun token_context(backend: *Backend, token: types.Token) usize {
-    ret ((backend.source_id::u64 << 48) | (token.index::u64 << 16) | token.generation::u64)::usize;
+    ret shared.io_source_context(backend.source_id, (token.index::u64 << 16) | token.generation::u64);
 }
 
 fun context_token(backend: *Backend, context: usize, token: *types.Token) bool {
     val raw: u64 = context::u64;
-    if ((raw >> 48)::u16 != backend.source_id || token == nil) { ret false; }
+    if (shared.io_context_source(context) != backend.source_id || token == nil) { ret false; }
     token.index      = ((raw >> 16) & 0xffffffff)::u32;
     token.generation = (raw & 0xffff)::u32;
     ret token.generation != 0;
@@ -360,13 +363,21 @@ fun resource_acquire(backend: *Backend, native: usize, opening: u64, created: *b
 
 fun resource_release_unwatched(backend: *Backend, resource: *Resource) {
     val index: u32 = resource.index;
-    resource.watched = false;
+    set_watched(backend, resource, false);
     resource_map_remove(backend, index);
     resource.state         = RESOURCE_FREE;
     resource.armed         = false;
     resource.next_free     = backend.free_resource;
     backend.free_resource  = index;
     backend.resource_count = backend.resource_count - 1;
+}
+
+# every registration change goes through here, so destroy can prove it gave up
+# each one before the runtime recycles the source id they carry
+fun set_watched(backend: *Backend, resource: *Resource, watched: bool) {
+    if (watched && !resource.watched) { backend.registered = backend.registered + 1; }
+    if (!watched && resource.watched) { backend.registered = backend.registered - 1; }
+    resource.watched = watched;
 }
 
 fun resource_release(backend: *Backend, resource: *Resource) {
@@ -380,8 +391,8 @@ fun unwatch_owned(backend: *Backend, resource: *Resource) {
         backend.unwatches = backend.unwatches + 1;
         darwin.io_queue_unwatch(backend.queue, resource.resource);
     }
-    resource.watched = false;
-    resource.armed   = false;
+    set_watched(backend, resource, false);
+    resource.armed = false;
 }
 
 # the socket this resource tracked was closed outside the driver and its
@@ -652,7 +663,7 @@ fun arm_resource(backend: *Backend, resource: *Resource) {
     # the registration vanishes only when every descriptor for the socket is
     # closed, so the socket this resource tracked was closed outside the driver
     if (status == darwin.ENOENT && resource.watched) {
-        resource.watched = false;
+        set_watched(backend, resource, false);
         drop_stale(backend, resource);
         ret;
     }
@@ -668,8 +679,8 @@ fun arm_resource(backend: *Backend, resource: *Resource) {
         resource_release_unwatched(backend, resource);
         ret;
     }
-    resource.watched = true;
-    resource.armed   = true;
+    set_watched(backend, resource, true);
+    resource.armed = true;
 }
 
 fun drive_resource(backend: *Backend, resource: *Resource, events: u32) {
@@ -790,6 +801,7 @@ pub fun make(backend: *Backend, queue: *shared.IoQueue, initial: usize, source_i
     backend.watches         = 0;
     backend.rearms          = 0;
     backend.unwatches       = 0;
+    backend.registered      = 0;
     backend.locates         = 0;
     backend.lock            = mutex.make();
     var i: usize = 0;
@@ -1133,6 +1145,8 @@ pub fun destroy(backend: *Backend) i64 {
         if (resource.state == RESOURCE_ACTIVE) { resource_release(backend, resource); }
         slot = slot + 1;
     }
+    # a registration left behind could name this source id after it is reused
+    if (backend.registered != 0) { panic.panic("std.net.async: destroy left a native registration behind\n"); }
     val map_bytes:    usize = $size_of(u32) * backend.map_capacity;
     val native_bytes: usize = $size_of(darwin.IoCompletion) * NATIVE_BATCH;
     darwin.deallocate(backend.native::ptr, native_bytes);
@@ -2611,5 +2625,34 @@ test "async darwin: a socket stays registered across blocked operations" {
     darwin.sock_close(sender);
     if (destroy(?backend) < 0) { ret 19; }
     darwin.io_queue_close(?queue);
+    ret 0;
+}
+
+# destroy gives up every registration it holds, so no event can name its source
+# id once the runtime reuses it (#740)
+test "async darwin: destroy removes every registration it holds" {
+    var queue: shared.IoQueue;
+    if (darwin.io_queue_create(?queue) < 0) { ret 1; }
+    fin { darwin.io_queue_close(?queue); }
+    var pipe: [2]i32;
+    if (darwin.pipe(?pipe[0]) < 0) { ret 2; }
+    fin {
+        darwin.close(pipe[0]);
+        darwin.close(pipe[1]);
+    }
+    var backend: Backend;
+    if (make(?backend, ?queue, 8, 1) < 0) { ret 3; }
+    var created:  bool      = false;
+    val resource: *Resource = resource_acquire(?backend, pipe[0]::usize, 0, ?created);
+    if (resource == nil) { ret 4; }
+    val context: usize = token_context(?backend, types.Token{index: resource.index, generation: resource.generation});
+    if (darwin.io_queue_watch(?queue, pipe[0]::usize, context, darwin.IO_EVENT_READ) < 0) { ret 5; }
+    set_watched(?backend, resource, true);
+    if (backend.registered != 1)                          { ret 6; }
+    if (destroy(?backend) < 0 || backend.registered != 0) { ret 7; }
+    var byte: u8 = 1;
+    if (darwin.write(pipe[1], ?byte, 1) != 1) { ret 8; }
+    var events: [4]darwin.IoCompletion;
+    if (darwin.io_queue_poll(?queue, ?events[0], 4, 0) != 0) { ret 9; }
     ret 0;
 }

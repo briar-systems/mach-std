@@ -96,6 +96,7 @@ pub rec Backend {
     # submission order of read-lane requests
     next_sequence: u64;
     queue:         *shared.IoQueue;
+    source_id:     u16;
     # where every table's chunks come from
     allocator:       allocator.Allocator;
     operations:      table.Table;
@@ -459,6 +460,7 @@ pub fun make(backend: *Backend, queue: *shared.IoQueue, initial: usize, source_i
         ret windows.ENOMEM;
     }
     backend.queue           = queue;
+    backend.source_id       = source_id;
     backend.operation_slots = 0;
     backend.attached_slots  = 0;
     backend.free_operation  = NONE;
@@ -528,7 +530,7 @@ fun socket_attach(backend: *Backend, resource: usize, opening: u64) i64 {
         @attached_at(backend, free) = Attachment{socket: INVALID_SOCKET, opening: 0};
         backend.attached_slots      = free + 1;
     }
-    val result: i64 = windows.io_queue_attach(backend.queue, resource);
+    val result: i64 = windows.io_queue_attach(backend.queue, resource, backend.source_id);
     if (result >= 0) {
         @attached_at(backend, free) = Attachment{socket: resource, opening: opening};
         backend.attached_count      = backend.attached_count + 1;
@@ -1003,14 +1005,18 @@ pub fun cancel(backend: *Backend, token: types.Token) i64 {
         windows.io_queue_wake(backend.queue);
         ret 0;
     }
-    if (operation.state != SLOT_ACTIVE) {
+    if (operation.state != SLOT_ACTIVE && operation.state != SLOT_CANCEL_READY) {
         mutex.unlock(?backend.lock);
         ret windows.EBADF;
     }
-    val cancelled: i64 = windows.io_queue_cancel(operation.resource, (?operation.overlapped)::ptr);
-    if (cancelled < 0) {
-        mutex.unlock(?backend.lock);
-        ret cancelled;
+    # a close already asked the kernel to abort a cancel-ready operation, and
+    # its packet is still owed, so both states wait for that packet below
+    if (operation.state == SLOT_ACTIVE) {
+        val cancelled: i64 = windows.io_queue_cancel(operation.resource, (?operation.overlapped)::ptr);
+        if (cancelled < 0) {
+            mutex.unlock(?backend.lock);
+            ret cancelled;
+        }
     }
     operation.state = SLOT_CANCELLED;
     val context: usize = (?operation.overlapped)::usize;
@@ -1250,6 +1256,7 @@ pub fun dispatch(
         events:  events,
         status:  status,
         flags:   flags,
+        source:  backend.source_id,
     });
     settle_controls_locked(backend);
     val ready: usize = backend.ready;
@@ -1312,6 +1319,7 @@ pub fun destroy(backend: *Backend) i64 {
     backend.ready           = 0;
     backend.attached_count  = 0;
     backend.queue           = nil;
+    backend.source_id       = 0;
     mutex.unlock(?backend.lock);
     ret 0;
 }
@@ -2062,5 +2070,85 @@ test "async windows: canceling close returns native resources to baseline" {
     if (destroy(?backend) < 0 || windows.io_queue_close(?queue) < 0) { ret 1; }
     var after: u32 = 0;
     if (!test_handle_count(?after) || after != before) { ret 1; }
+    ret 0;
+}
+
+# an operation the kernel still owns keeps the backend alive, so no completion
+# can outlive the source id once the runtime reuses it (#740)
+test "async windows: destroy waits for every kernel-owned operation" {
+    var queue: shared.IoQueue;
+    if (windows.io_queue_create(?queue) < 0) { ret 1; }
+    fin { windows.io_queue_close(?queue); }
+    var backend: Backend;
+    if (make(?backend, ?queue, 2, 1) < 0) { ret 2; }
+    var listener: usize = INVALID_SOCKET;
+    if (windows.sock_create_flags(windows.AF_INET, windows.SOCK_STREAM, windows.IPPROTO_TCP, false, true, ?listener) < 0) { ret 3; }
+    fin { windows.sock_close(listener); }
+    var address: [128]u8;
+    ip.to_sockaddr(ip.endpoint(127, 0, 0, 1, 0), ?address[0]);
+    if (windows.sock_bind(listener, ?address[0], windows.SOCKADDR_IN_SIZE) < 0 || windows.sock_listen(listener, 4) < 0) { ret 4; }
+    var peer:  ip.Endpoint;
+    var token: types.Token;
+    if (submit_accept(?backend, listener, 1, ?peer, 30, ?token) < 0) { ret 5; }
+    if (destroy(?backend) != windows.EBUSY)                          { ret 6; }
+    if (cancel(?backend, token) < 0)                                 { ret 7; }
+    var attempts: usize = 0;
+    for (attempts < 16 && backend.active != 0) {
+        if (destroy(?backend) != windows.EBUSY) { ret 8; }
+        if (poll(?backend, 1000) < 0)           { ret 9; }
+        attempts = attempts + 1;
+    }
+    if (backend.active != 0)   { ret 10; }
+    if (destroy(?backend) < 0) { ret 11; }
+    var left: windows.IoCompletion;
+    if (windows.io_queue_poll(?queue, ?left, 1, 0) != 0) { ret 12; }
+    ret 0;
+}
+
+# a close marks its socket's reads for cancellation, and a scope cancel that
+# lands afterwards still owns the read (#786)
+test "async windows: canceling a read after its socket closed settles it" {
+    var queue: shared.IoQueue;
+    if (windows.io_queue_create(?queue) < 0) { ret 1; }
+    fin { windows.io_queue_close(?queue); }
+    var backend: Backend;
+    if (make(?backend, ?queue, 8, 1) < 0) { ret 2; }
+    var listener: usize;
+    var client:   usize;
+    var server:   usize;
+    if (test_stream_pair(?listener, ?client, ?server) < 0) { ret 3; }
+    fin {
+        windows.sock_close(client);
+        windows.sock_close(listener);
+    }
+    var input:       u8 = 0;
+    var read_token:  types.Token;
+    var close_token: types.Token;
+    if (submit_read(?backend, server, 1, ?input, 1, 40, ?read_token) != 0) { ret 4; }
+    if (submit_close(?backend, server, 1, 41, ?close_token) != 0)          { ret 5; }
+    if (cancel(?backend, read_token) != 0)                                 { ret 6; }
+    var reads:    usize = 0;
+    var closes:   usize = 0;
+    var attempts: usize = 0;
+    for (attempts < 16 && backend.active != 0) {
+        val count: i64 = poll(?backend, 1000);
+        if (count < 0) { ret 7; }
+        var i: usize = 0;
+        for (i < count::usize) {
+            var done: types.NativeCompletion;
+            completion(?backend, i, ?done);
+            if (done.context == 40) { reads = reads + 1; }
+            if (done.context == 41) { closes = closes + 1; }
+            i = i + 1;
+        }
+        attempts = attempts + 1;
+    }
+    # the cancel consumed the read's packet, so only the close completes
+    if (reads != 0 || closes != 1 || backend.active != 0) { ret 8; }
+    # a pending wake may remain, and draining it must yield no completion
+    if (poll(?backend, 0) != 0) { ret 9; }
+    if (destroy(?backend) < 0)  { ret 10; }
+    var left: windows.IoCompletion;
+    if (windows.io_queue_poll(?queue, ?left, 1, 0) != 0) { ret 11; }
     ret 0;
 }
