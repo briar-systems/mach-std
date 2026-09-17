@@ -46,6 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolver slot. Each costs one step at 1k, 10k and 100k slots, where each
   cost R steps before. `Resolver` gains a `steps` counter used by the scaling
   test (#742).
+- `net.async.local` claims stream and listener entries from free lists instead
+  of scanning up to the high-water mark on every accept, connect and bind. A
+  claim after churn costs one step at 1k, 10k and 100k streams, where it cost n
+  steps before (#743).
 
 ### Fixed
 - A registration that loses a race with runtime close no longer leaves a
