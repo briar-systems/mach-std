@@ -1,6 +1,6 @@
 # Darwin VM boundary probe
 
-The native verifier builds this fixture with the checksum-verified published Mach 4.30.0 compiler on both Darwin architectures in debug and release. A local dep/std snapshot supplies the exact candidate source.
+The native verifier builds this fixture with the checksum-verified mach release pinned for the family in briar-systems/.github on both Darwin architectures in debug and release. A local dep/std snapshot supplies the exact candidate source.
 
 Before Mach execution, native.c checks SDK signatures, LP64 widths, constants and actual public import spellings. Its real error results and valid lock/advice results must match Mach exactly. Lock error probes use an owned mapping and SIZE_MAX minus one page as the length. The requested end overflows and remains below the start after page rounding. A separate native map/protect/unmap/protect sequence validates the release oracle before Mach execution. The Mach reallocation test checks that protection of each released range fails, rather than interpreting residency as mapping ownership. Its write to a read-only mapping establishes the host fault signal used by the Mach protection probe. Both children must first print the readiness marker. No timeout counts as a protection fault.
 

@@ -874,6 +874,8 @@ pub fun terminate_group(pgid: i64) i64 {
 
 # canonical process observations
 fwd os_shared.ProcessStatus;
+fwd os_shared.FileLimit;
+fwd os_shared.LIMIT_UNLIMITED;
 fwd os_shared.ProcessWaitError;
 fwd os_shared.WaitResult;
 fwd os_shared.PROCESS_OP_WAIT;
@@ -1124,6 +1126,53 @@ pub fun getpid() i64 {
     ret ls.getpid()::i64;
 }
 
+# darwin's RLIM_INFINITY is 2^63 - 1, not all ones
+val RLIM_INFINITY: u64 = 0x7fffffffffffffff;
+
+fun limit_from_native(value: u64) u64 {
+    if (value >= RLIM_INFINITY) { ret os_shared.LIMIT_UNLIMITED; }
+    ret value;
+}
+
+fun limit_to_native(value: u64) u64 {
+    if (value >= RLIM_INFINITY) { ret RLIM_INFINITY; }
+    ret value;
+}
+
+# read this process's open-file limit.
+#
+# darwin refuses a soft limit above kern.maxfilesperproc even when the hard
+# limit is RLIM_INFINITY (setrlimit(2) COMPATIBILITY), so the ceiling is the
+# smaller of the two. this is the rule Go's runtime applies before raising the
+# limit (os/rlimit_darwin.go)
+# ---
+# out: filled with the limit in force
+# ret: 0, or a negative native code
+pub fun open_file_limit(out: *os_shared.FileLimit) i64 {
+    var native: ls.ResourceLimit;
+    if (ls.getrlimit(ls.RLIMIT_NOFILE, ?native) != 0) { ret ls.fail_errno(); }
+    var per_process: i32   = 0;
+    var length:      usize = $size_of(i32);
+    if (ls.sysctlbyname("kern.maxfilesperproc", ?per_process, ?length, nil, 0) != 0) { ret ls.fail_errno(); }
+    if (length != $size_of(i32) || per_process < 1)                                  { ret EINVAL; }
+    out.soft    = limit_from_native(native.current);
+    out.hard    = limit_from_native(native.maximum);
+    out.ceiling = out.hard;
+    if (per_process::u64 < out.ceiling) { out.ceiling = per_process::u64; }
+    ret 0;
+}
+
+# set this process's open-file limit. ceiling is ignored, and darwin's own
+# refusal of a soft limit above its per-process maximum passes through
+# ---
+# limit: the soft and hard limits to set
+# ret:   0, or a negative native code
+pub fun set_open_file_limit(limit: os_shared.FileLimit) i64 {
+    var native: ls.ResourceLimit = ls.ResourceLimit{current: limit_to_native(limit.soft), maximum: limit_to_native(limit.hard)};
+    if (ls.setrlimit(ls.RLIMIT_NOFILE, ?native) != 0) { ret ls.fail_errno(); }
+    ret 0;
+}
+
 # ignore SIGPIPE for this process
 #
 # signal(3) installs the disposition through public libSystem. it is
@@ -1176,6 +1225,22 @@ pub fun cpu_count() i64 {
     val result: i32   = ls.sysctlbyname("hw.activecpu", ?ncpu, ?len, nil, 0);
     if (result == -1 || len != $size_of(i32) || ncpu < 1) { ret 1; }
     ret ncpu::i64;
+}
+
+# darwin has no hard CPU affinity: THREAD_AFFINITY_POLICY is a scheduling hint
+# over tags, not a CPU set, so neither affinity primitive is offered
+# ---
+# ret: ENOTSUP
+pub fun thread_affinity(words: *u64, capacity: usize, out_count: *usize) i64 {
+    if (out_count != nil) { @out_count = 0; }
+    ret ENOTSUP;
+}
+
+# darwin has no hard CPU affinity, so a thread cannot be pinned
+# ---
+# ret: ENOTSUP
+pub fun set_thread_affinity(words: *u64, count: usize) i64 {
+    ret ENOTSUP;
 }
 
 # get the current working directory
@@ -2011,9 +2076,12 @@ pub val IO_EVENT_HANGUP: u32 = 0x08;
 pub val IO_EVENT_WAKE:   u32 = 0x10;
 
 # context is opaque to the OS and zero is reserved for the runtime wake source
+# source: the id of the source that registered the context, 0 for a wake. it
+#         sits in the padding after events, so the record stays 32 bytes
 pub rec IoCompletion {
     context: usize;
     events:  u32;
+    source:  u16;
     status:  i64;
     flags:   u64;
 }
@@ -2043,8 +2111,10 @@ fun user_kevent(event: *ls.Kevent, flags: u16, fflags: u32) {
 
 pub fun io_queue_create(queue: *os_shared.IoQueue) i64 {
     if (queue == nil) { ret EINVAL; }
-    queue.handle = (-1)::isize::usize;
-    queue.wake   = 0;
+    queue.handle       = (-1)::isize::usize;
+    queue.wake         = 0;
+    queue.wake_pending = 0;
+    queue.wakes_posted = 0;
     val kqueue: i32 = ls.kqueue();
     if (kqueue == -1) { ret ls.fail_errno(); }
     val current: i64 = fd_flags(kqueue::i32);
@@ -2151,6 +2221,8 @@ pub fun io_queue_poll(queue: *os_shared.IoQueue, completions: *IoCompletion, cap
         var status:       i64       = data;
         if (filter == EVFILT_USER && ident == 1) {
             events = IO_EVENT_WAKE;
+            # the trigger clears on delivery, and a later request posts again
+            os_shared.io_wake_harvested(queue);
         }
         or {
             if (filter == EVFILT_READ)        { events = events | IO_EVENT_READ; }
@@ -2165,6 +2237,8 @@ pub fun io_queue_poll(queue: *os_shared.IoQueue, completions: *IoCompletion, cap
         completions[remaining].events  = events;
         completions[remaining].status  = status;
         completions[remaining].flags   = native_flags::u64 | (fflags::u64 << 16);
+        completions[remaining].source  = 0;
+        if (events != IO_EVENT_WAKE) { completions[remaining].source = os_shared.io_context_source(context); }
     }
     ret result::i64;
 }
@@ -2175,11 +2249,17 @@ pub fun io_queue_wait(queue: *os_shared.IoQueue, timeout_ms: i32) i64 {
 }
 
 pub fun io_queue_wake(queue: *os_shared.IoQueue) i64 {
-    if (queue == nil) { ret EINVAL; }
+    if (queue == nil)                       { ret EINVAL; }
+    if (queue.handle == (-1)::isize::usize) { ret EBADF; }
+    if (!os_shared.io_wake_claim(queue))    { ret 0; }
     var event: ls.Kevent;
     user_kevent(?event, 0, NOTE_TRIGGER);
     val result: i32 = ls.kevent(queue.handle::i32, ?event, 1, nil, 0, nil);
-    if (result == -1) { ret ls.fail_errno(); }
+    if (result == -1) {
+        os_shared.io_wake_harvested(queue);
+        ret ls.fail_errno();
+    }
+    os_shared.io_wake_posted(queue);
     ret 0;
 }
 
@@ -2591,6 +2671,18 @@ pub fun sock_connect(fd: usize, addr: *u8, addrlen: usize) i64 {
 pub fun sock_sendto(fd: usize, buf: *u8, len: usize, flags: i32, addr: *u8, addrlen: usize) i64 {
     if (addrlen > 0xffffffff) { ret EINVAL; }
     val result: i64 = ls.sendto(fd::i32, buf, len, flags, addr, addrlen::u32);
+    if (result == -1) { ret ls.fail_errno(); }
+    ret result;
+}
+
+# peek at a stream socket without consuming or blocking
+# ---
+# fd:  socket fd
+# ret: 1 when a byte is readable, 0 at orderly end of stream, EAGAIN when
+#      nothing is ready yet, or the socket's negative errno
+pub fun sock_peek_readable(fd: usize) i64 {
+    var byte:   u8  = 0;
+    val result: i64 = ls.recvfrom(fd::i32, ?byte, 1, ls.MSG_PEEK | ls.MSG_DONTWAIT, nil, nil);
     if (result == -1) { ret ls.fail_errno(); }
     ret result;
 }

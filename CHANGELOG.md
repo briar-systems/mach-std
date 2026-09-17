@@ -7,6 +7,399 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.3.0] - 2026-09-17
+
+Rebuild everything that links std before running it on 5.3.0. The runtime's
+operation records changed layout, and a build made against 5.2.x still links
+with no compile error.
+
+Correction to 5.2.0: its "Known divergence" note said Linux and Darwin never
+lose bytes when a read is cancelled. That was wrong. Losing the bytes of a
+cancelled read was a contract defect on every backend, which Windows hit far
+more often. 5.3.0 fixes it everywhere: a cancelled completion now carries the
+transfer that finished before the cancellation, and a caller that cancels a
+read must consume `bytes` from the cancelled completion. Code that treats
+every error completion as empty loses exactly what it lost before.
+
+### Fixed
+- A cancelled or timed-out completion dropped the bytes that had already
+  landed in, or left, the caller's storage, on every backend (#793). On Linux
+  and Darwin a read that finished while its cancel was underway lost its
+  bytes: the runtime refused the completion that raced the cancel, and a cancel
+  that found a read already finished but not yet published withdrew it. A
+  `complete_copy` that raced a cancel lost its copy the same way. Windows hit
+  this far more often, since every read or datagram receive whose data arrived
+  before its cancel was discarded. The 5.2.0 note that Linux and Darwin never
+  lose bytes on cancel was wrong.
+
+### Added
+- `io.runtime.complete_cancellation_transfer(runtime, token, bytes, items,
+  end_of_stream)` publishes an asynchronous cancellation together with the
+  transfer its request finished first. `complete_cancellation` is now the
+  zero-transfer form of it (#793).
+
+### Changed
+- A cancelled, timed-out or closed completion still has `has_error` set and
+  its reason in `error`, and now also reports in `bytes`, `items` and
+  `end_of_stream` the transfer that finished before the cancellation took
+  effect. A caller that cancels a read must consume `bytes` from the cancelled
+  completion, since the stream will not return them again. A cancelled write
+  reports the bytes it sent, and a cancelled datagram batch the datagrams it
+  filled (#793).
+- A `complete`, `complete_batch` or `complete_copy` that loses to a
+  cancellation already underway now succeeds, and its transfer rides on the
+  cancelled completion. `complete_opened` and `fail` are still refused with
+  `CLOSED`, so a source keeps and closes a socket it could not hand over (#793).
+- Backend signature change: `cancel` in `net.async.linux`, `net.async.darwin`,
+  `net.async.local.unix` and `net.async.iocp.port` takes a third argument,
+  `finished: *opt[types.NativeCompletion]`, through which the backend hands
+  back an operation that had already finished, so the driver reports its
+  transfer with the cancellation. These are backend modules driven by
+  `net.async` and `net.async.local`, not the supported entry point. Code that
+  uses the drivers needs no change. Code that calls a backend's `cancel`
+  directly must pass the new argument, or `nil` to keep the old behavior (#793).
+
+### Deprecated
+- `net.async.discarded_reads` and `net.async.local.discarded_reads` always
+  return 0 and set `*bytes` to 0, since a cancelled read no longer discards
+  anything. They will be removed in 6.0 (#793).
+
+## [5.2.0] - 2026-09-17
+
+Rebuild everything that links std before running it on 5.2.0. The layout of
+the Windows `net.async` and `net.async.local` backend records changed, and so
+did their `Driver`. A build made against 5.1.x still links and runs without any
+compile error, but it reads those records the old way, which is not safe. No
+source change is needed. std now declares `mach = "^5.3"`, so it builds with
+mach 5.3.0 or later within 5.x.
+
+### Behavior changes
+- On Windows, cancelling a `net.async` operation the kernel already holds no
+  longer blocks. The cancel returns at once, and the operation completes as
+  cancelled once the aborted request reports back. `destroy` refuses with
+  `EBUSY` until it does, and `awaiting_cancellations(driver)` shows how many
+  are outstanding (#744).
+- On Windows, a write that finished before its cancel may have reached the
+  peer although it completes as cancelled (#744).
+
+### Known divergence, being changed
+On Windows, a read or datagram receive whose data arrived before its cancel
+completes as cancelled and its bytes are discarded, although the peer
+considers them delivered. Linux and Darwin read only after readiness is
+dispatched, so a cancel there never loses bytes. This is not settled
+behavior: #793 changes it so that a cancelled completion carries the bytes it
+received, planned for 5.3.0. Do not build on the discard. Until then, a caller
+that cancels a read it still wants bytes from can lose them on Windows, even
+where a higher layer promises to keep what the transport gave it, so use a
+deadline and keep reading until the stream drains instead. 5.1.x lost the same
+bytes without counting them. `discarded_reads(driver, bytes)` now counts the
+reads and the bytes (#744, #793).
+
+### Added
+- `net.async.discarded_reads` and `net.async.awaiting_cancellations`, with the
+  same pair on `net.async.local`. Both read 0 on Linux and Darwin (#744).
+- `net.async.types.STATUS_CANCELLED`, the backend status of an operation whose
+  asynchronous cancel has settled (#744).
+
+### Changed
+- The Windows `net.async` backends keep a record per socket, found through a
+  hash of the socket value, with a ready list for controls and a queue of held
+  reads per socket. A flush, a completion, a write and a shutdown cost 0, 2, 2
+  and 1 steps at 1k, 10k and 100k live operations, where they cost 2, 7, 1 and
+  2 steps per live operation. Both backends share one core
+  (`net.async.iocp`), which makes the decisions and does no native I/O, and one
+  Windows layer (`net.async.iocp.port`), which holds cancel and dispatch
+  (#744).
+- `os.io_queue_restore` is no longer used by `net.async`. It stays available
+  (#744).
+- A Windows `net.async` or `net.async.local` cancel no longer wakes the
+  runtime's native waiter and waits for it to leave the native wait. The cancel
+  only requests the abort, and the packet settles it through dispatch. Each
+  backend declares `CANCEL_NEEDS_NATIVE_CONTROL`, which stays true on Linux and
+  Darwin, where cancel ends native access synchronously (#787).
+- The layout of the Windows `net.async` and `net.async.local` backend records,
+  and so of their `Driver`, changed. Rebuild everything that links std (#744).
+
+## [5.1.0] - 2026-09-17
+
+Rebuild everything that links std before running it on 5.1.0. The layout of
+`sync.cancel.Scope` changed: `callback_count` is now an atomic `i64` where it
+was a `usize`. The size of the record is unchanged, so code built against 5.0.x
+still links and runs without any compile error, but it reads and writes that
+field the old way, which is not safe. `os.shared.IoQueue`,
+`memory.buffers.Snapshot` and every platform's `IoCompletion` also gained
+fields. No source change is needed in code that does not build those records
+by hand.
+
+### Behavior changes
+Both of these are correct, and both can turn a program that worked on 5.0.x
+into one that fails:
+- A `net.async` backend's `destroy` panics if a native registration would
+  outlive it, where 5.0.x left the registration behind silently. `destroy`
+  still releases idle sockets itself, so the panic points to a defect in std's
+  registration accounting, not to caller misuse. Report it with the backend
+  and platform (#740).
+- On Windows, a `net.async` backend's `destroy` refuses with `EBUSY` while the
+  kernel still owns one of its operations. Poll until the backend is idle, then
+  destroy it again (#740).
+
+### Added
+- `io.runtime.NativeEvent.source` (and `source` on every platform's
+  `IoCompletion`): the id of the source a native event belongs to, 0 for a
+  wake. epoll and kqueue read it from the top 16 bits of the registered
+  context (`os.shared.IO_SOURCE_SHIFT`, `io_source_context`,
+  `io_context_source`). IOCP reads it from the completion key, which
+  `io_queue_attach` now takes (#739).
+- `io.runtime.unrouted_events(runtime)` counts native events whose source id
+  matched no registered source. A nonzero count is expected when a source is
+  released between a batch harvest and its dispatch (#739).
+- `memory.buffers.Snapshot.release_failures` counts backing releases the
+  allocator or the secret store refused. The pool cannot recover that memory,
+  so the count is the only signal it leaked (#779).
+
+### Changed
+- `io.runtime` sends each native event straight to the source its id names,
+  instead of offering it to every source in turn. Per-event dispatch is one
+  offer at 1, 10 and 100 sources, where it was 1, 10 and 100 offers. Wakes still reach
+  every source (#739).
+- `sync.cancel` locks per scope instead of per tree. attach and unregister
+  take only their scope's lock, so threads registering on separate child
+  scopes no longer contend. At 8 threads on per-thread children, attach plus
+  unregister totals 78M/s, where it was 5.8M/s. Single-threaded use is
+  slower: about 6% on attach and unregister, and about 12% on the full
+  make_child, attach, unregister and destroy lifecycle, because destroy now
+  takes the parent's lock and then the scope's. A scope shared by threads still
+  serializes, and the module now documents per-worker roots and per-connection
+  child scopes as the intended shape. `Scope.callback_count` is now an atomic
+  `i64`, which leaves the size of `Scope` unchanged (#754).
+- `io.runtime` recycles source ids, so a runtime has no lifetime limit on
+  registrations. The limit was 65,535. A released id waits until every native
+  collection that began before its release has ended, so an event harvested
+  for the old source can never reach the new one. The wire id stays 16 bits,
+  so at most 65,535 sources can be registered at once. The two invariants this
+  rests on are enforced and tested: a source with a live operation cannot be
+  released, and a backend's `destroy` removes every native registration and
+  waits for the kernel (see Behavior changes) (#740).
+- Native wakes are coalesced. `os.shared.IoQueue` gains `wake_pending`, so only
+  the first wake request since the last poll posts a native wake (an eventfd
+  write, a `NOTE_TRIGGER` kevent or an IOCP packet), and later requests post
+  nothing until a poll takes it. The poll clears the flag after draining the
+  wake and before the caller looks for work, so no request is lost. N
+  operations completed between two waits now post 1 wake at 1k, 10k and 100k,
+  where they posted N. `IoQueue.wakes_posted` counts posted wakes (#753).
+- `net.resolve` keeps runtime-owned lookups waiting to publish on an intrusive
+  list, finds an operation from its runtime token through a hash of the token
+  index, remembers each queued completion's ring position, and claims slots
+  from a free list. Runtime dispatch, cancel and release no longer scan every
+  resolver slot. Each costs one step at 1k, 10k and 100k slots, where each
+  cost R steps before. `Resolver` gains a `steps` counter used by the scaling
+  test (#742).
+- `net.async.local` claims stream and listener entries from free lists instead
+  of scanning up to the high-water mark on every accept, connect and bind. A
+  claim after churn costs one step at 1k, 10k and 100k streams, where it cost n
+  steps before (#743).
+
+### Fixed
+- A registration that loses a race with runtime close no longer leaves a
+  source slot stuck, which made `destroy` report busy forever. This defect is
+  separate from id recycling, and was found while doing it.
+- The `memory.buffers` `source_*` and `secret_source_*` wrappers refuse a nil
+  source or a nil member as misuse, instead of calling through nil. Found in
+  the #775 sweep (#778).
+- `memory.buffers` no longer ignores a refused backing release. Plain and
+  secret releases, and the cleanup after a failed secret borrow, count the
+  failure in `release_failures`. Found in the #775 sweep (#779).
+- On Windows, canceling a stream operation after its socket's close no longer
+  panics the runtime with "source cancellation lost operation ownership". The
+  close had already asked the kernel to abort the operation, and the cancel
+  refused it with EBADF. It now waits for the aborted packet, as it does for an
+  operation it aborts itself. The local-socket backend already did (#786).
+
+## [5.0.1] - 2026-09-17
+
+Requires mach 5.2.0 or later. Tested with mach 5.2.1, the family CI seed.
+
+### Fixed
+- `memory.buffers` no longer crashes when a fresh chunk is acquired after
+  released chunks were retained. Retained chunks keep their slots, but the slot
+  table's demand left them out, so the table could be full with no room for the
+  new chunk, and the missing slot was written through nil. The demand now counts
+  held, retained and reserved slots. A pool that still finds no slot refuses
+  with `Reason.memory` and returns the backing it just allocated (#775).
+
+## [5.0.0] - 2026-09-17
+
+Requires mach 5.2.0 or later. Tested with mach 5.2.1, the family CI seed.
+MIGRATION.md covers the breaking changes.
+
+### Added
+- `time.Instant`, a monotonic instant that is distinct from the wall-clock
+  `time.Time` and never converts to or from it. Read it with `time.instant()`,
+  which needs the clock capability. The arithmetic is `instant_add`,
+  `instant_sub`, `instant_before`, `instant_after` and `instant_equal`, and it
+  builds freestanding. `time.elapsed(start)` and `time.remaining(deadline)`
+  measure against the monotonic clock (#752).
+
+### Changed
+- **Breaking:** every deadline is an `Instant`.
+  - `cancel.make_root(scope, deadline: opt[Instant])` and
+    `cancel.make_child(scope, parent, deadline: opt[Instant])` replace the
+    `has_deadline` flag and its placeholder `Time`.
+  - `cancel.expire` takes the current `Instant`, and `cancel.Deadline.at` is an
+    `Instant`.
+  - These now take an `Instant` deadline: `io.runtime.submit_timer`,
+    `io.runtime.submit_timer_scoped`, `sync.condition.wait_until`,
+    `sync.channel.send_until`, `sync.channel.receive_until`,
+    `sync.worker_pool.submit_until` and `net.resolve.wait_until`.
+  - A wall-clock `Time` passed as a deadline no longer compiles
+    (`test/deadline`). MIGRATION.md has the before and after (#752).
+- **Breaking:** `time.Time` is wall-clock only. `time.now`, `time.since` and
+  `time.until` read the calendar clock, which can jump (#752).
+- `io.runtime` keeps one refcounted deadline entry per (scope, deadline), not
+  one per operation. N operations under one scope hold a single heap entry, and
+  submission and completion cost stays flat from 1k to 100k operations. Expiry
+  still ends every operation still registered in the scope (#741).
+- The license copyright is held by Briar Systems LLC. The MIT terms are unchanged (#765).
+- **Breaking:** `std.memory.buffers.Source` gained `fn_open_account`,
+  `fn_close_account`, `fn_data`, `fn_retain`, `fn_settle`, `fn_in_flight` and
+  `fn_ready`, so a consumer can drive a whole buffer lifecycle through the
+  interface alone. `source(pool)` fills every member, and new `source_*` free
+  functions call through a `*Source` without touching the function pointers (#767).
+- **Breaking:** secret chunks moved from `buffers.Source` to a new
+  `buffers.SecretSource`. `Source` no longer has `fn_secret`, and
+  `source_secret` is gone. A plain `Source` holds nothing welded, so a record
+  holding a `Source` or a `*Source` passes through `ptr` (io.runtime
+  completions, thread args, cancel callbacks). `SecretSource` has open and
+  close account, acquire, release and `fn_view`, and only its holder is welded.
+  `secret_source(pool)` builds one, and the `secret_source_*` functions call
+  through it. A `Source` refuses a secret request as misuse, and a
+  `SecretSource` refuses a plain one (#771).
+
+### Removed
+- **Breaking:** `time.monotonic`. Use `time.instant` (#752).
+
+## [4.2.0] - 2026-09-17
+
+Requires mach 5.2.0 or later. Tested with mach 5.2.1, the family CI seed.
+
+### Added
+- `std.memory.buffers`: one shared on-demand buffer source (`Source`) and std's
+  implementation (`Pool`).
+  - Classes are caller-declared, and a request larger than every class takes an
+    oversize path that is budgeted and returned to the backing at once.
+  - Budgets are in bytes, per account lane plus a global budget. An account may
+    reserve bytes, and its slot metadata is reserved at open.
+  - A refusal is typed (budget, exhausted, memory, misuse). Exhausted and
+    memory refusals register the account for a FIFO wake-up, drained with
+    `ready` or reported through an optional `notify`.
+  - `acquire_n` is all-or-nothing.
+  - Secret classes hold welded `std.memory.secret` storage that is wiped in full
+    on release. They need the pages capability.
+  - `retain`, `settle` and `in_flight` track in-flight users.
+  - Chunks are address-stable.
+  - Use is serialized, enforced by an entrant check rather than a thread check.
+  - `snapshot` reports counters, including `backing_allocations` per class and
+    in total, so `high_water` can be sized for a steady state that never touches
+    the backing. `arena_bytes` sizes an `allocator.fixed` arena.
+  - Acquire, release and wake cost stays flat from 1k to 100k chunks. The module
+    builds freestanding (#760).
+- `std.memory.secret.borrow_data` returns the welded storage of a live borrow
+  (#760).
+- `net.async.submit_readable` and `net.async.local.submit_readable` wait until a
+  stream is readable, at orderly end of stream, or failed, without holding a
+  buffer, so an idle connection needs no read buffer. The completion has the new
+  kind `io.runtime.READABLE` and zero bytes, with `end_of_stream` set at EOF.
+  Nothing is read, and the wait queues in order with reads on the same stream.
+  Linux and darwin settle readiness with a non-consuming peek, and windows posts
+  a zero-byte overlapped receive and settles it with the queued byte count
+  (#759).
+
+## [4.1.0] - 2026-09-17
+
+Requires mach 5.2.0 or later. Tested with mach 5.2.1, the family CI seed.
+
+### Added
+- `std.process.limits`: read and set the open-file limit. `open_files()` returns
+  a `FileLimit` with the soft limit in force, the hard limit, and the highest
+  soft limit this process may set (`ceiling`); `set_open_files(limit)` sets the
+  soft and hard limits; `raise_open_files()` raises the soft limit to the
+  ceiling. A soft limit above the hard one is `INVALID`, raising the hard limit
+  without privilege is `PERMISSION`, and windows, which has no such limit,
+  reports `UNSUPPORTED`. The OS contract's process group gains
+  `open_file_limit` and `set_open_file_limit` (#746).
+
+
+- `std.system.os.thread_affinity(words, capacity, out_count)` and
+  `set_thread_affinity(words, count)` read and pin the calling thread's CPU
+  affinity, in the threads capability group. The mask is caller-sized words with
+  no fixed CPU limit, and a short buffer reports `RANGE` with the words needed.
+  windows numbers CPUs across processor groups and refuses a set spanning groups
+  as `UNSUPPORTED`; darwin has no hard affinity and returns `UNSUPPORTED`.
+  `std.sync.thread` adds `CpuSet` over caller words (`cpu_set`, `cpu_set_add`,
+  `cpu_set_contains`, `cpu_set_size`, `cpu_set_nth`, `cpu_set_clear`),
+  `current_affinity`, `affinity_words`, `set_current_affinity`,
+  `pin_current_to` and `allowed_cpus`, which lists the CPUs the thread may run on
+  in ascending order so worker i can pin to the i-th (#755).
+- Listeners and datagram sockets take options applied before bind, so a
+  multi-core server can bind one `SO_REUSEPORT` socket per thread:
+  `net.socket.BindOptions { reuse_address, reuse_port }` and
+  `net.socket.bind_options()`; `net.tcp.ListenOptions { bind, backlog }`,
+  `net.tcp.listen_options(backlog)`, `net.tcp.listen_with` and
+  `net.tcp.listen_with_options`; `net.udp.bind_with` and
+  `net.udp.bind_with_options`; `net.async.listen_with` and
+  `net.async.bind_datagram_with`. The defaults match `listen` and `bind`
+  exactly. `reuse_port` where the target has no `SO_REUSEPORT` (windows) is
+  refused as `UNSUPPORTED` before any socket is created (#738).
+
+### Changed
+- The README is trimmed to what std is, how to add it, supported compilers and
+  targets, and links. The versioning policy moved to CONTRIBUTING.md, and the
+  API contract sections moved into their modules' doc comments (#756).
+- `chrono.time` and `sync.cancel` document that deadlines are monotonic and must
+  be built from `time.monotonic()`. `time.now`, `since` and `until` are documented
+  as wall-clock only, and `make_root`/`make_child` warn that a wall-clock deadline
+  never fires. This is documentation only, with no behaviour change (#750).
+- Releases run through the family's shared release workflow (briar-systems/.github
+  `mach-release.yml`): it verifies the tag, version and changelog section, runs
+  the full CI, then publishes. The release-archive check that no test-only fault
+  module ships now runs in CI on every x86_64-linux run (#735).
+
+### Fixed
+- On linux, darwin and local unix sockets, `net.async` keeps a socket registered
+  from its first operation until it is closed through the driver. It used to
+  unregister and forget the socket whenever its queue emptied, so every blocked
+  operation paid an address lookup, a registration and an unregistration. Now
+  only the first operation looks the socket up and registers it, and every
+  later one rearms the existing registration. A datagram socket is configured
+  once instead of on every receive. An idle socket costs one resource record
+  until it is closed through the driver, and destroying a driver releases any
+  idle ones (#737).
+- The backends' socket map deletes by shifting the probe run back instead of
+  leaving tombstones, so lookups no longer grow longer as a server opens and
+  closes sockets. After heavy churn a miss used to scan the whole map, for
+  example 262,145 probes at 100,000 sockets. It now stops at the first empty
+  slot (#737).
+- On linux, when a rearm finds that a socket's registration has vanished, the
+  socket was closed outside the driver. The pending operation completes as
+  closed, and the socket now behind that value is registered only when it is
+  submitted with its own handle (#737).
+
+## [4.0.1] - 2026-09-16
+
+Requires mach 5.2.0 or later. Tested with mach 5.2.1, the family CI seed.
+
+### Fixed
+- On linux and darwin, a `net.async` datagram send batch with a packet whose
+  `length` exceeds its `capacity`, whose buffer is missing, or whose peer family
+  is unsupported is refused as a whole before any native call, as on windows:
+  the send completes with an `INVALID` (or `UNSUPPORTED`) error and nothing
+  from the batch is sent. They used to send the packets up to the bad one
+  (#720).
+
+## [4.0.0] - 2026-09-16
+
+The OS layering from #697 is complete: `std.system.os` is a small contract of primitives, error translation lives in the OS layer, logic built on top of it moved out, and descriptors cross it as pointer-width handles. Every breaking change and its replacement is in MIGRATION.md. Requires mach 5.2.0 or later. Tested with mach 5.2.1, the family CI seed.
+
 ### Added
 - `std.system.os.error(code, operation)` builds the `io.error.Error` for a
   native code a primitive returned, and `std.system.os.error_kind(code)` is the

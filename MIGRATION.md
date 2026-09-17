@@ -1,3 +1,465 @@
+# std 4.x to 5.0.0
+
+std 5.0.0 separates the two clocks (#752). `time.Time` is wall-clock (calendar) time only. It can jump when the system clock is set. Monotonic readings get their own type, `time.Instant`. The two types don't convert into each other, so the compiler now rejects a wall-clock `Time` passed as a deadline. Every deadline and timer in std takes an `Instant`. In the same release, a deadline scope costs the runtime one timer entry no matter how many operations it holds (#741). That change is internal and needs no caller changes.
+
+std 5.0.0 requires mach 5.2.0 or later.
+
+## Reading the clock
+
+`time.monotonic()` is gone, with no forwarder. Use `time.instant()`, which returns `time.InstantClock` (`res[Instant, io.error.Error]`). The arithmetic has its own names:
+
+| 4.x on a monotonic `Time` | 5.0.0 on an `Instant` |
+| --- | --- |
+| `time.monotonic()` | `time.instant()` |
+| `time.Clock` (monotonic reading) | `time.InstantClock` |
+| `time.time_add(t, d)` | `time.instant_add(i, d)` |
+| `time.time_sub(a, b)` | `time.instant_sub(a, b)` |
+| `time.time_before(a, b)` / `time_after` / `time_equal` | `time.instant_before` / `instant_after` / `instant_equal` |
+
+```mach
+# before
+val started: time.Clock = time.monotonic();
+val deadline: time.Time = time.time_add(started.ok, 5 * duration.SECOND);
+
+# after
+val started: time.InstantClock = time.instant();
+val deadline: time.Instant = time.instant_add(started.ok, 5 * duration.SECOND);
+```
+
+`time.now()`, `time.since(t)` and `time.until(t)` stay, and they are wall-clock only. `since` and `until` measure against the calendar clock, so a clock change moves them. To measure elapsed time or the time left before a deadline, use the new monotonic forms:
+
+```mach
+# before: wall clock, wrong across a clock change
+val start: time.Time = time.now().ok;
+val took: time.Elapsed = time.since(start);
+
+# after
+val start: time.Instant = time.instant().ok;
+val took: time.Elapsed = time.elapsed(start);
+val left: time.Elapsed = time.remaining(deadline);
+```
+
+Keep a `Time` only for timestamps that people read, such as log records, certificate validity or HTTP dates. Anything that bounds a wait is an `Instant`.
+
+## Cancellation scopes
+
+`cancel.make_root` and `cancel.make_child` take the deadline as `opt[time.Instant]`. The `has_deadline` flag is gone, along with the dummy `Time{sec: 0, nsec: 0}` that went with it. `cancel.expire` takes the current `Instant`. `cancel.Deadline.at` is an `Instant`.
+
+```mach
+# before
+cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+cancel.make_root(?scope, true, deadline);
+cancel.make_child(?child, ?parent, false, none);
+cancel.expire(?scope, time.monotonic().ok);
+
+# after
+cancel.make_root(?scope, opt[time.Instant].none{});
+cancel.make_root(?scope, opt[time.Instant].some{deadline});
+cancel.make_child(?child, ?parent, opt[time.Instant].none{});
+cancel.expire(?scope, time.instant().ok);
+```
+
+A child still inherits the earlier of its own deadline and its parent's.
+
+## Timers and timed waits
+
+Every absolute deadline parameter is now an `Instant`:
+
+- `io.runtime.submit_timer(runtime, deadline: time.Instant, context)`
+- `io.runtime.submit_timer_scoped(runtime, scope, deadline: time.Instant, context)`
+- `sync.condition.wait_until(c, m, deadline: time.Instant)`
+- `sync.channel.send_until[T](channel, value, deadline: time.Instant)`
+- `sync.channel.receive_until[T](channel, deadline: time.Instant)`
+- `sync.worker_pool.submit_until(pool, task, deadline: time.Instant)`
+- `net.resolve.wait_until(resolver, output, capacity, deadline: time.Instant)`
+
+Relative timeouts (`timeout_ms` and similar) are unchanged. `test/deadline/verify.sh` checks that a wall-clock `Time` doesn't compile on any of these surfaces.
+
+## Downstream sites
+
+These are the known call sites to change in the family:
+
+- hedge: 9 deadline sites and the variables that feed them.
+  - `src/connection.mach:705`, `:1063`
+  - `src/acme/origination.mach:379`
+  - `src/protocol/secure.mach:420`
+  - `src/protocol/h2.mach:701`
+  - `src/protocol/h3/session.mach:1016`, `:2199`
+  - Also audit its 14 `time.now` calls. Any that measures a duration or builds a deadline becomes `time.instant`.
+- laurel: `src/context.mach:341` and `src/testing.mach:419`.
+- mach-http: `src/core/exchange.mach:539`. The caller-supplied `now` it threads through becomes an `Instant`.
+- mach-tls: `src/test/transport.mach:289`.
+- bramble-hub: review its 2 `time.now` calls.
+
+## `buffers.Source` gained members (#767)
+
+`std.memory.buffers.Source` now covers the whole buffer lifecycle. It gained `fn_open_account`, `fn_close_account`, `fn_data`, `fn_retain`, `fn_settle`, `fn_in_flight` and `fn_ready`. Each takes `ctx` first and otherwise matches the `Pool` function of the same name.
+
+- A custom source must fill all seven new members. A `Source` built with `source(pool)` needs no change.
+- Consumers call the `source_*` functions (`source_open_account`, `source_acquire`, `source_data`, `source_ready`, ...) with a `*Source` instead of calling `s.fn_*(s.ctx, ...)` by hand.
+
+## Secret chunks moved to `buffers.SecretSource` (#771)
+
+`Source.fn_secret` returned `*^u8`, which welded `Source` and every record holding one, so those records could not pass through `ptr`. Secret chunks now have their own interface.
+
+- `Source` lost `fn_secret`, and `source_secret` is gone. A custom `Source` drops that member.
+- A `Source` serves plain chunks only. A request with `secret: true` is refused as `misuse`.
+- Secret consumers take a `SecretSource`, built with `secret_source(pool)`, and call `secret_source_open_account`, `secret_source_close_account`, `secret_source_acquire` (with `secret: true`), `secret_source_release` and `secret_source_view`. A record holding a `SecretSource` is welded.
+
+```mach
+# before
+val view: *^u8 = buffers.source_secret(?src, chunk);
+
+# after
+var secrets: buffers.SecretSource = buffers.secret_source(?pool);
+val view:    *^u8                 = buffers.secret_source_view(?secrets, chunk);
+```
+
+
+# std 3.x to 4.0.0
+
+std 4.0.0 finishes the OS layering in #697. `std.system.os` is now a small contract of primitives with one implementation per OS. Error translation lives in that layer, the logic built on top of it moved out, and descriptors cross it as pointer-width handles. This section lists every breaking change, with the code to write instead. The full detail is in the 4.0.0 changelog, and the contract itself is in `OS-CONTRACT.md`.
+
+std 4.0.0 requires mach 5.2.0 or later.
+
+## Errors (#688, #693)
+
+### Building an error
+
+`io.error.from_code` and `io.error.message` are gone, with no forwarder. `std.io.error` no longer depends on the OS layer.
+
+- For a native code that a primitive returned, use `std.system.os.error(code, op)`.
+- For an error with no native call behind it, use `io.error.make(kind, op)`, which sets `code` to 0. State the kind explicitly. Don't borrow an errno to get one.
+
+```mach
+# before
+ret err[io_error.Error].err{io_error.from_code(n, io_error.OP_READ)};
+ret err[io_error.Error].err{io_error.from_code(os.EINVAL, io_error.OP_SEND)};
+
+# after
+ret err[io_error.Error].err{os.error(n, io_error.OP_READ)};
+ret err[io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_SEND)};
+```
+
+An adapter that reports a fault of its own, such as a transport adapter refusing work, builds the error with `io.error.make` and names the kind it means (`INVALID`, `CLOSED`, `IO`, ...). Callers match on that kind.
+
+### Messages
+
+- `io.error.message(e)` is now `std.system.os.message(e)`. It gives the native text when a native code is behind the error, and `io.error.kind_name(kind)` otherwise.
+- `std.system.os.message(code)` is now `std.system.os.error_message(code)`.
+
+### `code` is opaque, compare `kind`
+
+`Error.code` is an implementation-defined native code, and 0 when std raised the error itself. Nothing outside the OS layer should compare it with an errno.
+
+- Before, std borrowed errnos for its own refusals, such as `EBADF` for a closed handle or `EINVAL` for invalid use. Those refusals now have `code == 0` and a specific kind.
+- Comparing two codes from the same error source is still fine, for example checking that two completions carry the same failure.
+
+### Reclassification
+
+Native codes now classify with the full kind set. A code that used to be `OTHER` has its own kind:
+
+| native code | kind in 3.x | kind in 4.0.0 |
+| --- | --- | --- |
+| `EIO` (and every unmapped windows error) | `OTHER` | `IO` |
+| `ENOENT` | `OTHER` | `NOT_FOUND` |
+| `EEXIST` | `OTHER` | `EXISTS` |
+| `ENOTDIR` | `OTHER` | `NOT_DIRECTORY` |
+| `EISDIR` | `OTHER` | `IS_DIRECTORY` |
+| `ENOTEMPTY` | `OTHER` | `NOT_EMPTY` |
+| `ENAMETOOLONG` | `OTHER` | `NAME_TOO_LONG` |
+| `EBUSY` | `OTHER` | `BUSY` |
+| `ERANGE` | `OTHER` | `RANGE` |
+| `ECHILD` | `OTHER` | `NO_CHILD` |
+| `ELOOP` | `OTHER` | `LOOP` |
+
+A test that pins one of these codes to `OTHER` must expect the new kind.
+
+### No errno constants on the portable surface (#693)
+
+The 38 `E*` constants are gone from `std.system.os`. The per-OS modules (`std.system.os.linux`, `.darwin`, `.windows`) keep theirs for code that is already OS-specific. To read a raw primitive return, ask the contract:
+
+```mach
+# before
+val n: i64 = os.read(fd, buf, len);
+if (n == os.EINTR) { continue; }
+
+# after
+val n: i64 = os.read(fd, buf, len);
+if (n < 0 && os.error_kind(n) == io_error.INTERRUPTED) { continue; }
+```
+
+Other public results that changed:
+- `std.filesystem.removal.Error` and `std.process.exec.Failure` gain a `kind`, and their `code` is 0 for their own refusals.
+- `std.filesystem.transaction.ownership` functions return `err[removal.Error]` instead of an `i64`.
+- `std.net.local.endpoint.to_sockaddr` and `from_sockaddr` return `err[io_error.Kind]`.
+- `std.net.resolve` failures carry the resolver's kind (`NO_NAME` is `NOT_FOUND`, `TEMPORARY` is `WOULD_BLOCK`).
+- `std.system.os.getenv` reports an unset variable as a code that `os.error_kind` reads as `NOT_FOUND`, not as `-1`.
+
+### Terminal errors (E17)
+
+`std.terminal.error.control_failure` and `read_failure` are now `std.terminal.control_failure` and `std.terminal.read_failure`. `std.terminal.error` holds only the outcome tags and `code`.
+
+## Logic that left `std.system.os` (#692)
+
+There are no forwarders. Change the call site:
+
+| removed | use instead |
+| --- | --- |
+| `os.secret_allocate` | `std.memory.secret.allocate` |
+| `os.secret_deallocate` | `std.memory.secret.deallocate` |
+| `os.secret_allocate_typed` | `std.memory.secret.allocate_typed` |
+| `os.secret_deallocate_typed` | `std.memory.secret.deallocate_typed` |
+| `os.secret_random_fill` | `std.memory.secret.random_fill` |
+| `os.SecretBorrow` | `std.memory.secret.Borrow` |
+| `os.secret_borrow_*` | `std.memory.secret.borrow_*` |
+| `os.sock_addr_init`, `sock_addr6_init` | `std.net.ip.to_sockaddr` |
+| `os.sock_addr_read`, `sock_addr6_read` | `std.net.ip.from_sockaddr` |
+| `os.sock_addr_family` | `std.net.ip.sockaddr_family` |
+| `os.has_exited` | `std.process.exec.exited` |
+| `os.exit_code` | `std.process.exec.code` |
+| `os.was_signaled` | `std.process.exec.signaled` |
+| `os.term_signal` | `std.process.exec.signal` |
+| `os.was_stopped` | `std.process.exec.stopped` |
+| `os.stop_signal` | `std.process.exec.stop_signal` |
+| `os.was_continued` | `std.process.exec.continued` |
+| `os.stat_mode` | `std.filesystem.native.stat_mode` |
+| `os.unlink_force` | `std.filesystem.native.unlink_force` |
+| `os.temp_dir` | `std.filesystem.native.temp_dir` |
+| `os.NOT_FOUND` | `os.error_kind(n) == io_error.NOT_FOUND` |
+| `os.spawn_shell(command, envp, cwd) i64` | `std.process.exec.spawn_shell(command, cwd, envp) res[Child, Error]` |
+| `os.separator` | `std.types.path.separator()` |
+
+`std.memory.secret` reports failures as `io.error` values, where the old functions returned a negative errno:
+
+```mach
+# before
+if (os.secret_random_fill(key, 32) != 0) { ret fail(); }
+
+# after
+val filled: err[io_error.Error] = secret.random_fill(key, 32);
+if (sel filled.err) { ret fail(); }
+```
+
+The contract keeps only the one-call secret primitives: `allocate_secret`, `release_secret`, `allocate_secret_typed`, `release_secret_typed`, `random_fill_secret`, `read_at_secret` and `write_at_secret`. They don't wipe or retry, which is `std.memory.secret`'s job.
+
+`std.system.os.windows.spawn_command_line` spawns from a verbatim native command line. It is a Windows-only escape hatch outside the contract: the contract's argv spawns quote arguments the CRT way, and cmd.exe doesn't parse that quoting. `std.process.exec` uses it only to start the shell. Ordinary argv spawns never go through it.
+
+## Pointer-width handles (#694)
+
+Every descriptor that crosses the `std.system.os` contract is a `usize` handle. The per-OS modules keep their native `i32` shape, for code that genuinely needs a raw descriptor, such as passing it through `SCM_RIGHTS`.
+
+- A primitive that creates a handle writes it through an out parameter and returns only an `i64` status:
+  - `open(dir, path, flags, mode, out: *usize)`
+  - `retain_identity_at(..., handle: *usize)`
+  - `pipe(read_end: *usize, write_end: *usize)`
+- "No handle" is `os.INVALID_HANDLE`. A `usize` compared with `< 0` is always false, so replace every `-1` check.
+- `STDIN_FD`, `STDOUT_FD`, `STDERR_FD` and `AT_FDCWD` are gone. Use the functions `os.stdin()`, `os.stdout()`, `os.stderr()` and `os.working_dir()`.
+- `os.terminate(code)` is gone. Use `os.exit(status: u32)`. The panic sink is `os.panic_sink(msg, len)`, formerly the per-OS `panic_os`.
+- The descriptors std's own APIs hold are handles too:
+  - `transaction.root_fd`/`root_home_fd`
+  - the `transaction.ownership` roots, locks and borrows
+  - `removal.tree`/`private_tree`
+  - `filesystem.native.unlink_force`
+  - the `process.exec.spawn_redirected*` family, where `os.INVALID_HANDLE` inherits the parent's stream
+  - `memory.secret.borrow_read_at`/`borrow_write_at`
+  - `net.resolve.lines.Reader.fd`
+
+### Worked example: a transport over raw descriptors
+
+This is the shape of mach-lsp's stdio transport and supervisor.
+
+```mach
+# before
+fun read_some(fd: i32, buf: *u8, len: usize) i64 {
+    var n: i64 = os.read(fd, buf, len);
+    for (n == os.EINTR) { n = os.read(fd, buf, len); }
+    ret n;
+}
+
+var pipes: [2]i32;
+if (os.pipe(?pipes[0]) < 0) { ret fail(); }
+val log: i64 = os.open(os.AT_FDCWD, path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644);
+val pid: i64 = os.spawn_redirected(program, argv, envp, pipes[0], os.STDOUT_FD, log::i32);
+os.write(os.STDOUT_FD, reply, reply_len);
+
+# after
+fun read_some(handle: usize, buf: *u8, len: usize) i64 {
+    var n: i64 = os.read(handle, buf, len);
+    for (n < 0 && os.error_kind(n) == io_error.INTERRUPTED) { n = os.read(handle, buf, len); }
+    ret n;
+}
+
+var to_child:   usize = os.INVALID_HANDLE;
+var from_child: usize = os.INVALID_HANDLE;
+if (os.pipe(?to_child, ?from_child) < 0) { ret fail(); }
+var log:    usize = os.INVALID_HANDLE;
+val opened: i64   = os.open(os.working_dir(), path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644, ?log);
+if (opened < 0) { ret fail(); }
+val pid: i64 = os.spawn_redirected(program, argv, envp, to_child, os.stdout(), log);
+os.write(os.stdout(), reply, reply_len);
+```
+
+A global that held a descriptor as `i64` and was cast with `::i32` at each use becomes a `usize` initialised to `os.INVALID_HANDLE`.
+
+### Worked example: a directory listing in a test
+
+This is the shape of hedge's runtime test.
+
+```mach
+# before
+val raw: i64 = os.open(os.AT_FDCWD, path, os.O_RDONLY | os.O_DIRECTORY, 0);
+if (raw < 0) { ret 1; }
+var cursor: os.DirectoryCursor;
+val init:   os.DirectoryInitResult = os.directory_init(?cursor, raw::i32);
+if (init.code < 0) {
+    os.close(raw::i32);
+    ret 2;
+}
+# ... os.directory_next(?cursor, ...) ...
+os.close(raw::i32);
+
+# after
+var dir:    usize = os.INVALID_HANDLE;
+val opened: i64   = os.open(os.working_dir(), path, os.O_RDONLY | os.O_DIRECTORY, 0, ?dir);
+if (opened < 0) { ret 1; }
+var cursor: os.DirectoryCursor;
+val init:   os.DirectoryInitResult = os.directory_init(?cursor, dir);
+if (init.code < 0) {
+    os.close(dir);
+    ret 2;
+}
+# ... os.directory_next(?cursor, ...) ...
+os.close(dir);
+```
+
+## `memory.table` takes an allocator (#689)
+
+- `memory.table.make(table, a: *allocator.Allocator, element_size, initial)` takes the allocator that every chunk comes from and goes back to.
+- `destroy` returns `err[allocator.Error]` instead of an `i64`. A refused release is reported as `release` with the backend's code, and the table is still emptied.
+- `Table` holds a copy of the allocator in its new `allocator` field, so the allocator's context must outlive the table.
+- Chunks are requested at `memory.table.ELEMENT_ALIGN` (16).
+
+```mach
+# before
+if (!table.make(?t, $size_of(Entry), 64)) { ret fail(); }
+if (table.destroy(?t) < 0) { ret fail(); }
+
+# after
+var pages: allocator.Allocator;
+if (sel page.make(?pages).err) { ret fail(); }
+if (!table.make(?t, ?pages, $size_of(Entry), 64)) { ret fail(); }
+if (sel table.destroy(?t).err) { ret fail(); }
+```
+
+## Tracked sockets close through their driver (#716)
+
+`io.handle.SocketHandle` carries an opening, a process-wide number stamped when the socket is created or accepted. The `net.async` backends key their state by native value and opening together.
+
+Ownership rule: once a `net.async` driver has seen a socket, close it through the driver. Use `submit_stream_close`, `submit_datagram_close` or `submit_listener_close`, never `tcp.stream_close`, `udp.socket_close` or `tcp.listener_close` directly.
+
+A socket closed some other way is detected on its next use:
+- its pending work completes `CLOSED` with code 0
+- a submission through the old handle is refused the same way
+- whatever socket later reuses the native value keeps its own state and registration
+
+Handle construction:
+- Build accepted and connected streams with `net.async.stream(completion)`.
+- Wrap any other native socket exactly once with `io.handle.socket(value)`, and pass that handle around. Two handles wrapped from one live socket look like two sockets, and the driver treats the older one as closed.
+
+```mach
+# before (hedge listener.close_connection)
+tcp.stream_close(?connection.stream);
+
+# after
+val closing: res[io_runtime.Token, io_error.Error] =
+    net_async.submit_stream_close(?driver, ?scope, ?connection.stream, lifecycle.ABORTIVE, context);
+if (sel closing.err) { ret fail(closing.err); }
+# wait for the close completion (context) before releasing the connection
+```
+
+`std.system.os.linux.io_queue_watch` now only registers. A descriptor that is already registered is refused with `EEXIST`, and the owner re-arms its registration with `io_queue_rearm`.
+
+## Downstream checklist
+
+These are the answers the dependent repositories gave to the std.system.os usage query in #697:
+
+| repository | what to change |
+| --- | --- |
+| hedge | `from_code(os.E*)` and raw negative literals become `io_error.make(kind, op)`. `os.secret_random_fill` becomes `memory.secret.random_fill`. The runtime test's `os.open`/`close(raw::i32)`/directory cursor become handles. `os.ignore_sigpipe` is unchanged. Close tracked TCP streams and the QUIC socket through the driver, and the TCP listener with `submit_listener_close`. |
+| mach-http | `from_code(os.EINVAL/EBUSY/EBADF/EIO/ETIMEDOUT/ECANCELED)` becomes `io_error.make(kind, op)`. `adapter_failure` (built from `from_code(os.EIO)`, and pinned by a test to `OTHER`) becomes `io_error.make` with the kind the adapter means. `EIO` now classifies as `IO`. |
+| mach-quic | three `from_code(os.EBUSY/EINVAL/EBADF)` sites become `io_error.make`. `os.thread_current_id`, `os.allocate` and `os.deallocate` are unchanged. |
+| mach-tls | `from_code(os.EINVAL)` and the test's `from_code(os.EIO)` become `io_error.make`. `os.SHUT_WR` and the thread primitives are unchanged. The `Error.code` equality between two completions still holds. |
+| mach-acme | nothing: it uses only `thread_current_id`, `thread_wait`, `thread_wake` and `sleep`. |
+| mach-crypto | `os.secret_*` becomes `std.memory.secret.*`. Results are `err[io.error.Error]` instead of `i64`, so the `!= 0` checks become `sel ... .err`. |
+| mach-lsp | `== os.EINTR` becomes `os.error_kind(n) == io_error.INTERRUPTED`. `i32` descriptors become `usize` handles across transport, mirror, supervisor and trace (see the worked example). `STDIN_FD`, `STDOUT_FD` and `AT_FDCWD` become functions. |
+
+
+### Removed `os.E*` constants and `os.separator`, by repository
+
+A grep of the local checkouts of every family repository found these direct `std.system.os` errno uses. The mach compiler and ludus weren't part of the earlier query, so they appear here for the first time.
+
+| repository | sites | constants |
+| --- | --- | --- |
+| **mach** (compiler, dev 4a2227c1e) | 30, in `src/cli/cmd/{build,doc,init,fmt,clean,help,dep}.mach` and `src/lang/{embed,output/remove,me/ir/printer,build/cache/store,driver/cache,driver/deps}.mach` | `ENOENT`, `EIO`, `EINVAL`, `ENOTDIR`, `ENAMETOOLONG`, `ENOMEM`, `EEXIST` |
+| **ludus** (dev a4d9464) | 2: `src/engine/platform/settings/store.mach:72`, `src/game/world/telemetry/store.mach:66` | `ENOENT` |
+| hedge | 16: `src/acme/origination.mach` (4), `src/connection.mach:457`, `src/protocol/secure.mach` | `EINVAL`, `EPIPE`, `EAGAIN`, `EIO`, `ETIMEDOUT`, `ECANCELED`, `EBADF`, `EBUSY` |
+| mach-http | 8: `src/core/transport.mach:164-182`, `:1144` | `EINVAL`, `EBUSY`, `EBADF`, `EIO`, `ETIMEDOUT`, `ECANCELED`, `EAGAIN` |
+| mach-lsp | 5: `src/transport.mach:224-234`, `:357` | `EINTR`, compared with raw returns |
+| mach-quic | 3: `src/transport.mach:1248-1259` | `EBUSY`, `EINVAL`, `EBADF` |
+| mach-tls | 2: `src/transport.mach:41`, `src/test/transport.mach:144` | `EINVAL`, `EIO` |
+
+No family repository uses `os.separator`.
+
+How each pattern changes:
+
+```mach
+# an error built from an errno constant, with no native call behind it
+# before
+ret err[io_error.Error].err{io_error.from_code(os.EINVAL, op)};
+# after: name the kind
+ret err[io_error.Error].err{io_error.make(io_error.INVALID, op)};
+
+# an error built from a code a primitive returned
+# before
+ret err[io_error.Error].err{io_error.from_code(n, op)};
+# after
+ret err[io_error.Error].err{os.error(n, op)};
+
+# a raw return compared with a constant
+# before
+if (n == os.EINTR) { ... }
+# after
+if (n < 0 && os.error_kind(n) == io_error.INTERRUPTED) { ... }
+
+# "missing" detected by comparing with ENOENT
+# before
+if (code == os.ENOENT) { ret none; }
+# after, with a raw code
+if (os.error_kind(code) == io_error.NOT_FOUND) { ret none; }
+# after, with an io.error.Error
+if (failure.kind == io_error.NOT_FOUND) { ret none; }
+```
+
+The constants map to kinds as follows:
+- `EINVAL` → `INVALID`
+- `EIO` → `IO`
+- `ENOENT` → `NOT_FOUND`
+- `EEXIST` → `EXISTS`
+- `ENOTDIR` → `NOT_DIRECTORY`
+- `ENAMETOOLONG` → `NAME_TOO_LONG`
+- `ENOMEM` → `RESOURCE_EXHAUSTED`
+- `EBUSY` → `BUSY`
+- `EBADF` and `EPIPE` → `CLOSED`
+- `EAGAIN` → `WOULD_BLOCK`
+- `ETIMEDOUT` → `TIMEOUT`
+- `ECANCELED` → `CANCELLED`
+- `EINTR` → `INTERRUPTED`
+
+Code that is genuinely OS-specific can keep the constants by importing the per-OS module (`std.system.os.linux` and so on).
+
+---
+
 # std 2.0.0 migration inventory: v5 `res`, `opt` and `err`
 
 This is the retained-surface inventory for mach-std #617 (representation) and

@@ -13,6 +13,9 @@ case "$MACH_CI_LEG" in
         bash test/fault/verify.sh "$mach" linux-x86_64
         bash test/thread-resources/verify.sh "$mach" linux-x86_64
         bash test/thread-resources/verify-release.sh "$mach" linux-x86_64
+        # the release archive carries no test-only fault module
+        "$mach" build .
+        bash test/fault/verify-release.sh out/linux-x86_64/debug/lib/std
         format_evidence linux-x86_64
         bash test/relro/verify.sh "$mach"
         bash test/symlink/verify.sh "$mach"
@@ -23,6 +26,7 @@ case "$MACH_CI_LEG" in
         # classification is target-independent, so one leg is the whole signal
         bash test/derive/verify.sh
         bash test/secret/verify.sh
+        bash test/deadline/verify.sh
         ;;
     aarch64-linux)
         bash test/native/verify.sh "$mach" linux-arm64

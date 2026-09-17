@@ -4,6 +4,7 @@ use io_error:  std.io.error;
 use io_handle: std.io.handle;
 use std.system.capability;
 use std.types.bool.bool;
+use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
 use std.types.result.res;
@@ -58,6 +59,30 @@ pub fun bind(ep: ip.Endpoint) res[Socket, io_error.Error] {
 }
 
 pub fun bind_with_flags(ep: ip.Endpoint, flags: socket_api.Flags) res[Socket, io_error.Error] {
+    ret bind_with_options(ep, socket_api.bind_options(), flags);
+}
+
+# create a blocking UDP socket bound with explicit options
+# ---
+# ep:      endpoint to bind to
+# options: options applied between creation and bind
+# ret:     the bound Socket, or the refusal. reuse_port where the target has
+#          no SO_REUSEPORT is UNSUPPORTED, and no socket is created
+pub fun bind_with(ep: ip.Endpoint, options: socket_api.BindOptions) res[Socket, io_error.Error] {
+    ret bind_with_options(ep, options, socket_api.blocking_flags());
+}
+
+# create a UDP socket bound with explicit options and creation flags
+# ---
+# ep:      endpoint to bind to
+# options: options applied between creation and bind
+# flags:   socket creation flags
+# ret:     the bound Socket, or the refusal
+pub fun bind_with_options(ep: ip.Endpoint, options: socket_api.BindOptions, flags: socket_api.Flags) res[Socket, io_error.Error] {
+    val checked: err[io_error.Error] = socket_api.check_bind_options(options, io_error.OP_OPTION);
+    if (sel checked.err) {
+        ret res[Socket, io_error.Error].err{checked.err};
+    }
     val family:  i32                                         = ip.endpoint_family(ep);
     val created: res[io_handle.SocketHandle, io_error.Error] = socket_api.create(family, os.SOCK_DGRAM, 0, flags);
     if (sel created.err) {
@@ -66,23 +91,22 @@ pub fun bind_with_flags(ep: ip.Endpoint, flags: socket_api.Flags) res[Socket, io
     val handle: io_handle.SocketHandle = created.ok;
     val raw:    usize                  = handle.value;
 
-    var opt:  i32 = 1;
-    var code: i64 = os.sock_setopt(raw, os.SOL_SOCKET, os.SO_REUSEADDR, (?opt)::*u8, 4);
-    if (code < 0) {
+    val applied: err[io_error.Error] = socket_api.apply_bind_options(handle, options);
+    if (sel applied.err) {
         os.sock_close(raw);
-        ret res[Socket, io_error.Error].err{os.error(code, io_error.OP_OPTION)};
+        ret res[Socket, io_error.Error].err{applied.err};
     }
 
     var sa:     [128]u8;
     val sa_len: usize = ip.to_sockaddr(ep, ?sa[0]);
 
-    code = os.sock_bind(raw, ?sa[0], sa_len);
+    val code: i64 = os.sock_bind(raw, ?sa[0], sa_len);
     if (code < 0) {
         os.sock_close(raw);
         ret res[Socket, io_error.Error].err{os.error(code, io_error.OP_BIND)};
     }
 
-    ret res[Socket, io_error.Error].ok{Socket{handle: io_handle.socket(raw), family: family}};
+    ret res[Socket, io_error.Error].ok{Socket{handle: handle, family: family}};
 }
 
 pub fun local_endpoint(s: *Socket) res[ip.Endpoint, io_error.Error] {
@@ -202,4 +226,106 @@ test "udp: IPv6 loopback bind" {
     }
     socket_close(?s);
     ret 0;
+}
+
+test "udp: bind options default to what bind does" {
+    val options: socket_api.BindOptions = socket_api.bind_options();
+    if (!options.reuse_address || options.reuse_port) { ret 1; }
+    val br: res[Socket, io_error.Error] = bind_with(ip.endpoint(127, 0, 0, 1, 0), options);
+    if (sel br.err) { ret 2; }
+    var s: Socket = br.ok;
+    socket_close(?s);
+    ret 0;
+}
+
+# several datagram sockets with SO_REUSEPORT bind one port, and every datagram
+# sent to it arrives on one of them. windows refuses before creating a socket
+test "udp: sockets with reuse_port share one port" {
+    val shared:   socket_api.BindOptions = socket_api.BindOptions{reuse_address: true, reuse_port: true};
+    val any_port: ip.Endpoint            = ip.endpoint(127, 0, 0, 1, 0);
+    $if ($mach.build.os == $mach.os.windows) {
+        val refused: res[Socket, io_error.Error] = bind_with(any_port, shared);
+        if (sel refused.ok) {
+            var unexpected: Socket = refused.ok;
+            socket_close(?unexpected);
+            ret 1;
+        }
+        if (refused.err.kind != io_error.UNSUPPORTED) { ret 2; }
+        ret 0;
+    }
+    $or {
+        var sockets: [3]Socket;
+        val first:   res[Socket, io_error.Error] = bind_with_options(any_port, shared, socket_api.async_flags());
+        if (sel first.err) { ret 3; }
+        sockets[0] = first.ok;
+        val bound: res[ip.Endpoint, io_error.Error] = local_endpoint(?sockets[0]);
+        if (sel bound.err) {
+            socket_close(?sockets[0]);
+            ret 4;
+        }
+        val port:  ip.Endpoint = bound.ok;
+        var count: usize       = 1;
+        var bad:   i32         = 0;
+        for (count < 3) {
+            val next: res[Socket, io_error.Error] = bind_with_options(port, shared, socket_api.async_flags());
+            if (sel next.err) {
+                bad = 5;
+                brk;
+            }
+            sockets[count] = next.ok;
+            count          = count + 1;
+        }
+        var sender: Socket;
+        var opened: bool = false;
+        if (bad == 0) {
+            val sr: res[Socket, io_error.Error] = create();
+            if (sel sr.ok) {
+                sender = sr.ok;
+                opened = true;
+            }
+            or { bad = 6; }
+        }
+        var payload: [4]u8 = [4]u8{'m', 'a', 'r', 'k'};
+        var sent:    usize = 0;
+        for (bad == 0 && sent < 16) {
+            val wr: res[usize, io_error.Error] = send_to(?sender, ?payload[0], 4, port);
+            if (!(sel wr.ok && wr.ok == 4)) {
+                bad = 7;
+                brk;
+            }
+            sent = sent + 1;
+        }
+        var received: usize = 0;
+        var rounds:   usize = 0;
+        for (bad == 0 && received < sent && rounds < 2000) {
+            var progressed: bool  = false;
+            var which:      usize = 0;
+            for (which < count) {
+                var buffer: [8]u8;
+                var from:   ip.Endpoint;
+                val rr:     res[usize, io_error.Error] = recv_from(?sockets[which], ?buffer[0], 8, ?from);
+                if (sel rr.ok) {
+                    if (rr.ok != 4 || buffer[0] != 'm') { bad = 8; }
+                    received   = received + 1;
+                    progressed = true;
+                }
+                or (sel rr.err && (rr.err.kind != io_error.WOULD_BLOCK && rr.err.kind != io_error.INTERRUPTED)) {
+                    bad = 9;
+                }
+                which = which + 1;
+            }
+            if (!progressed) {
+                os.sleep(1000000);
+                rounds = rounds + 1;
+            }
+        }
+        if (bad == 0 && received != sent) { bad = 10; }
+        if (opened)                       { socket_close(?sender); }
+        var i: usize = 0;
+        for (i < count) {
+            socket_close(?sockets[i]);
+            i = i + 1;
+        }
+        ret bad;
+    }
 }

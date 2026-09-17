@@ -5,12 +5,15 @@
 # a joinable thread leaves the record for join. detach transfers it to the
 # exiting thread, which releases it after the user context has been destroyed.
 
+use io_error: std.io.error;
 use std.sync.atomic;
 use std.system.capability;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
@@ -311,6 +314,200 @@ pub fun diagnostic_id(t: *Thread) i64 {
     ret t.tid;
 }
 
+# a set of CPUs over words the caller owns
+#
+# CPU i is bit i % 64 of words[i / 64]. count is how many leading words are
+# meaningful, capacity how many the caller provided. nothing is allocated.
+# ---
+# words:    the mask words
+# capacity: words available at words
+# count:    words in use, never more than capacity
+pub rec CpuSet {
+    words:    *u64;
+    capacity: usize;
+    count:    usize;
+}
+
+# an empty CPU set over caller-provided words
+# ---
+# words:    storage for the mask words
+# capacity: number of words at words
+# ret:      the set, with every word cleared
+pub fun cpu_set(words: *u64, capacity: usize) CpuSet {
+    var set: CpuSet = CpuSet{words: words, capacity: capacity, count: 0};
+    cpu_set_clear(?set);
+    ret set;
+}
+
+# remove every CPU from the set
+pub fun cpu_set_clear(set: *CpuSet) {
+    var i: usize = 0;
+    for (i < set.capacity) {
+        set.words[i] = 0;
+        i            = i + 1;
+    }
+    set.count = 0;
+}
+
+# add a CPU to the set
+# ---
+# ret: false when the CPU does not fit the set's words
+pub fun cpu_set_add(set: *CpuSet, cpu: usize) bool {
+    val word: usize = cpu / 64;
+    if (word >= set.capacity) { ret false; }
+    var i: usize = set.count;
+    for (i <= word) {
+        set.words[i] = 0;
+        i            = i + 1;
+    }
+    if (word >= set.count) { set.count = word + 1; }
+    set.words[word] = set.words[word] | (1::u64 << (cpu % 64)::u64);
+    ret true;
+}
+
+# whether a CPU is in the set
+pub fun cpu_set_contains(set: *CpuSet, cpu: usize) bool {
+    val word: usize = cpu / 64;
+    if (word >= set.count) { ret false; }
+    ret ((set.words[word] >> (cpu % 64)::u64) & 1) != 0;
+}
+
+# the number of CPUs in the set
+pub fun cpu_set_size(set: *CpuSet) usize {
+    var total: usize = 0;
+    var i:     usize = 0;
+    for (i < set.count) {
+        var w: u64 = set.words[i];
+        for (w != 0) {
+            w     = w & (w - 1);
+            total = total + 1;
+        }
+        i = i + 1;
+    }
+    ret total;
+}
+
+# the n-th CPU in the set, counting from zero in ascending index order
+# ---
+# ret: the CPU index, or none when the set holds n CPUs or fewer
+pub fun cpu_set_nth(set: *CpuSet, n: usize) opt[usize] {
+    var seen: usize = 0;
+    var i:    usize = 0;
+    for (i < set.count) {
+        val w:   u64   = set.words[i];
+        var bit: usize = 0;
+        for (w != 0 && bit < 64) {
+            if (((w >> bit::u64) & 1) != 0) {
+                if (seen == n) { ret opt[usize].some{i * 64 + bit}; }
+                seen = seen + 1;
+            }
+            bit = bit + 1;
+        }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# read the calling thread's CPU affinity into set
+#
+# a set too small for the platform's mask is refused with RANGE; size it with
+# affinity_words first. darwin has no CPU affinity and refuses with UNSUPPORTED.
+# ---
+# ret: ok with set.count updated, or the refusal
+pub fun current_affinity(set: *CpuSet) err[io_error.Error] {
+    var used: usize = 0;
+    val code: i64   = os.thread_affinity(set.words, set.capacity, ?used);
+    if (code < 0) { ret err[io_error.Error].err{os.error(code, io_error.OP_READ)}; }
+    set.count = used;
+    ret err[io_error.Error].ok{};
+}
+
+# the number of words a CPU set needs to hold the calling thread's affinity
+# ---
+# ret: the word count, or the refusal
+pub fun affinity_words() res[usize, io_error.Error] {
+    var needed: usize = 0;
+    val code:   i64   = os.thread_affinity(nil, 0, ?needed);
+    if (code < 0 && os.error_kind(code) != io_error.RANGE) {
+        ret res[usize, io_error.Error].err{os.error(code, io_error.OP_READ)};
+    }
+    ret res[usize, io_error.Error].ok{needed};
+}
+
+# pin the calling thread to the CPUs in set
+# ---
+# ret: ok, INVALID for an empty set or CPUs the process may not use,
+#      UNSUPPORTED where the platform cannot express the set, or the refusal
+pub fun set_current_affinity(set: *CpuSet) err[io_error.Error] {
+    if (set.count == 0) { ret err[io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_OPTION)}; }
+    val code: i64 = os.set_thread_affinity(set.words, set.count);
+    if (code < 0) { ret err[io_error.Error].err{os.error(code, io_error.OP_OPTION)}; }
+    ret err[io_error.Error].ok{};
+}
+
+# pin the calling thread to one CPU
+# ---
+# cpu: global CPU index, as allowed_cpus reports it
+# ret: ok, INVALID for a CPU the process may not use, or the refusal
+pub fun pin_current_to(cpu: usize) err[io_error.Error] {
+    val words: usize = cpu / 64 + 1;
+    val bytes: usize = words * 8;
+    val store: ptr   = os.allocate(bytes);
+    if (store == nil) { ret err[io_error.Error].err{io_error.make(io_error.RESOURCE_EXHAUSTED, io_error.OP_OPTION)}; }
+    var set: CpuSet = cpu_set(store::*u64, words);
+    cpu_set_add(?set, cpu);
+    val applied: err[io_error.Error] = set_current_affinity(?set);
+    os.deallocate(store, bytes);
+    ret applied;
+}
+
+# list the CPUs the calling thread may run on, in ascending index order
+#
+# a consumer that runs one worker per CPU pins worker i to out[i].
+# ---
+# out:       destination for global CPU indices
+# capacity:  entries available at out
+# out_count: CPUs listed, or CPUs available when capacity is too small
+# ret:       ok, RANGE when capacity is too small, or the refusal
+pub fun allowed_cpus(out: *usize, capacity: usize, out_count: *usize) err[io_error.Error] {
+    @out_count = 0;
+    val sized: res[usize, io_error.Error] = affinity_words();
+    if (sel sized.err) { ret err[io_error.Error].err{sized.err}; }
+    val words: usize = sized.ok;
+    if (words == 0) { ret err[io_error.Error].ok{}; }
+    val bytes: usize = words * 8;
+    val store: ptr   = os.allocate(bytes);
+    if (store == nil) { ret err[io_error.Error].err{io_error.make(io_error.RESOURCE_EXHAUSTED, io_error.OP_READ)}; }
+    var set:  CpuSet              = cpu_set(store::*u64, words);
+    val read: err[io_error.Error] = current_affinity(?set);
+    if (sel read.err) {
+        os.deallocate(store, bytes);
+        ret read;
+    }
+    val total: usize = cpu_set_size(?set);
+    @out_count = total;
+    if (total > capacity) {
+        os.deallocate(store, bytes);
+        ret err[io_error.Error].err{io_error.make(io_error.RANGE, io_error.OP_READ)};
+    }
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < set.count) {
+        val w:   u64   = set.words[i];
+        var bit: usize = 0;
+        for (w != 0 && bit < 64) {
+            if (((w >> bit::u64) & 1) != 0) {
+                out[n] = i * 64 + bit;
+                n      = n + 1;
+            }
+            bit = bit + 1;
+        }
+        i = i + 1;
+    }
+    os.deallocate(store, bytes);
+    ret err[io_error.Error].ok{};
+}
+
 var test_flag:      i64 = 0;
 var test_destroyed: i64 = 0;
 
@@ -543,4 +740,117 @@ test "thread: repeated detach completes owned contexts" {
         i = i + 1;
     }
     ret 0;
+}
+
+test "thread: a CPU set adds, finds and counts CPUs in index order" {
+    var words: [4]u64;
+    var set:   CpuSet = cpu_set(?words[0], 4);
+    if (cpu_set_size(?set) != 0 || cpu_set_contains(?set, 3))                       { ret 1; }
+    if (!cpu_set_add(?set, 130) || !cpu_set_add(?set, 3) || !cpu_set_add(?set, 64)) { ret 2; }
+    if (cpu_set_add(?set, 256))                                                     { ret 3; }
+    if (set.count != 3 || cpu_set_size(?set) != 3)                                  { ret 4; }
+    if (!cpu_set_contains(?set, 64) || cpu_set_contains(?set, 65))                  { ret 5; }
+    val first:  opt[usize] = cpu_set_nth(?set, 0);
+    val second: opt[usize] = cpu_set_nth(?set, 1);
+    val third:  opt[usize] = cpu_set_nth(?set, 2);
+    val fourth: opt[usize] = cpu_set_nth(?set, 3);
+    if (!(sel first.some && first.some == 3))    { ret 6; }
+    if (!(sel second.some && second.some == 64)) { ret 7; }
+    if (!(sel third.some && third.some == 130))  { ret 8; }
+    if (!(sel fourth.none))                      { ret 9; }
+    ret 0;
+}
+
+$if ($mach.build.os == $mach.os.darwin) {
+    test "thread: darwin has no CPU affinity" {
+        var words: [4]u64;
+        var set:   CpuSet              = cpu_set(?words[0], 4);
+        val read:  err[io_error.Error] = current_affinity(?set);
+        if (!(sel read.err && read.err.kind == io_error.UNSUPPORTED)) { ret 1; }
+        val pinned: err[io_error.Error] = pin_current_to(0);
+        if (!(sel pinned.err && pinned.err.kind == io_error.UNSUPPORTED)) { ret 2; }
+        var cpus:   [8]usize;
+        var count:  usize               = 0;
+        val listed: err[io_error.Error] = allowed_cpus(?cpus[0], 8, ?count);
+        if (!(sel listed.err && listed.err.kind == io_error.UNSUPPORTED)) { ret 3; }
+        ret 0;
+    }
+}
+$or {
+    # read the calling thread's affinity into caller storage sized for it
+    fun affinity_snapshot(set: *CpuSet, store: *u64, capacity: usize) bool {
+        @set = cpu_set(store, capacity);
+        val read: err[io_error.Error] = current_affinity(set);
+        ret sel read.ok;
+    }
+
+    test "thread: allowed CPUs match the affinity mask and each can be pinned" {
+        val sized: res[usize, io_error.Error] = affinity_words();
+        if (sel sized.err) { ret 1; }
+        val words: usize = sized.ok;
+        if (words == 0 || words > 256) { ret 1; }
+        var store:    [256]u64;
+        var original: CpuSet;
+        if (!affinity_snapshot(?original, ?store[0], words)) { ret 2; }
+
+        var cpus:   [1024]usize;
+        var count:  usize               = 0;
+        val listed: err[io_error.Error] = allowed_cpus(?cpus[0], 1024, ?count);
+        if (sel listed.err || count == 0 || count != cpu_set_size(?original)) { ret 3; }
+        var i: usize = 0;
+        for (i < count) {
+            if (!cpu_set_contains(?original, cpus[i])) { ret 4; }
+            if (i > 0 && cpus[i] <= cpus[i - 1])       { ret 5; }
+            val nth: opt[usize] = cpu_set_nth(?original, i);
+            if (!(sel nth.some && nth.some == cpus[i])) { ret 6; }
+            i = i + 1;
+        }
+
+        var pinned: bool = true;
+        i = 0;
+        for (i < count && i < 4) {
+            val pin: err[io_error.Error] = pin_current_to(cpus[i]);
+            if (sel pin.err) { pinned = false; }
+            var now_store: [256]u64;
+            var now:       CpuSet;
+            if (!affinity_snapshot(?now, ?now_store[0], words))              { pinned = false; }
+            if (cpu_set_size(?now) != 1 || !cpu_set_contains(?now, cpus[i])) { pinned = false; }
+            i = i + 1;
+        }
+        val restored: err[io_error.Error] = set_current_affinity(?original);
+        if (!pinned)          { ret 7; }
+        if (sel restored.err) { ret 8; }
+        ret 0;
+    }
+
+    test "thread: a short affinity buffer reports RANGE with the size it needs" {
+        var one:    [1]u64;
+        var needed: usize = 0;
+        val code:   i64   = os.thread_affinity(?one[0], 0, ?needed);
+        if (os.error_kind(code) != io_error.RANGE || needed == 0) { ret 1; }
+        var cpus:   [1]usize;
+        var count:  usize               = 0;
+        val listed: err[io_error.Error] = allowed_cpus(?cpus[0], 0, ?count);
+        if (!(sel listed.err && listed.err.kind == io_error.RANGE) || count == 0) { ret 2; }
+        ret 0;
+    }
+
+    test "thread: pinning to a CPU the process cannot use is INVALID" {
+        val sized: res[usize, io_error.Error] = affinity_words();
+        if (sel sized.err) { ret 1; }
+        val words: usize = sized.ok;
+        if (words > 256) { ret 1; }
+        var store:    [256]u64;
+        var original: CpuSet;
+        if (!affinity_snapshot(?original, ?store[0], words)) { ret 2; }
+        val pin:      err[io_error.Error] = pin_current_to(16000);
+        val restored: err[io_error.Error] = set_current_affinity(?original);
+        if (!(sel pin.err && pin.err.kind == io_error.INVALID)) { ret 3; }
+        if (sel restored.err)                                   { ret 4; }
+        var empty_words: [1]u64;
+        var empty:       CpuSet              = cpu_set(?empty_words[0], 1);
+        val none:        err[io_error.Error] = set_current_affinity(?empty);
+        if (!(sel none.err && none.err.kind == io_error.INVALID)) { ret 5; }
+        ret 0;
+    }
 }
