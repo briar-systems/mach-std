@@ -73,6 +73,7 @@ rec Slot {
 rec ListenerEntry {
     state:        u8;
     generation:   u32;
+    next_free:    u32;
     bind_token:   io_runtime.Token;
     listen_token: io_runtime.Token;
     value:        types.Listener;
@@ -88,6 +89,7 @@ pub rec Listener {
 rec StreamEntry {
     state:            u8;
     generation:       u32;
+    next_free:        u32;
     completion_token: io_runtime.Token;
     value:            types.Stream;
 }
@@ -103,17 +105,22 @@ pub rec Driver {
     source:  io_runtime.SourceToken;
     backend: impl.Backend;
     # where every table's chunks come from
-    allocator:         allocator.Allocator;
-    slots:             table.Table;
-    listeners:         table.Table;
-    streams:           table.Table;
-    slot_count:        usize;
-    listener_count:    usize;
-    stream_count:      usize;
+    allocator:      allocator.Allocator;
+    slots:          table.Table;
+    listeners:      table.Table;
+    streams:        table.Table;
+    slot_count:     usize;
+    listener_count: usize;
+    stream_count:   usize;
+    # free entries, most recently freed first
+    free_listener:     u32;
+    free_stream:       u32;
     backend_destroyed: bool;
     cleanup_code:      i64;
     instance:          u64;
-    lock:              mutex.Mutex;
+    # entries examined by stream and listener claims, for the scaling tests
+    claim_steps: u64;
+    lock:        mutex.Mutex;
 }
 
 # whether a byte range overlaps the driver, its platform backend or its
@@ -225,20 +232,40 @@ fun listener_index(driver: *Driver, listener: *ListenerEntry) u32 {
     ret table.index_of(?driver.listeners, listener::usize)::u32;
 }
 
+# the next free listener, which stays free until listener_take commits it
 fun listener_claim(driver: *Driver) *ListenerEntry {
-    var i: usize = 0;
-    for (i < driver.listener_count) {
-        val listener: *ListenerEntry = listener_at(driver, i);
-        if (listener.state == LISTENER_FREE) { ret listener; }
-        i = i + 1;
-    }
-    if (i > 0xffffffff)                           { ret nil; }
+    driver.claim_steps = driver.claim_steps + 1;
+    if (driver.free_listener != NONE) { ret listener_at(driver, driver.free_listener::usize); }
+    val i: usize = driver.listener_count;
+    if (i >= 0xffffffff)                          { ret nil; }
     if (!table.reserve(?driver.listeners, i + 1)) { ret nil; }
     val listener: *ListenerEntry = listener_at(driver, i);
     listener.state        = LISTENER_FREE;
     listener.generation   = 0;
+    listener.next_free    = NONE;
     driver.listener_count = i + 1;
+    driver.free_listener  = i::u32;
     ret listener;
+}
+
+# every change out of the free state goes through here, for the entry
+# listener_claim returned
+fun listener_take(driver: *Driver, listener: *ListenerEntry, state: u8) {
+    val index: u32 = listener_index(driver, listener);
+    if (listener.state != LISTENER_FREE || driver.free_listener != index) {
+        panic.panic("std.net.async.local: a listener was taken that was not claimed\n");
+    }
+    driver.free_listener = listener.next_free;
+    listener.next_free   = NONE;
+    listener.state       = state;
+}
+
+# every change into the free state goes through here
+fun listener_free(driver: *Driver, listener: *ListenerEntry) {
+    if (listener.state == LISTENER_FREE) { ret; }
+    listener.state       = LISTENER_FREE;
+    listener.next_free   = driver.free_listener;
+    driver.free_listener = listener_index(driver, listener);
 }
 
 fun stream_for(driver: *Driver, token: Stream) *StreamEntry {
@@ -252,20 +279,40 @@ fun stream_index(driver: *Driver, stream: *StreamEntry) u32 {
     ret table.index_of(?driver.streams, stream::usize)::u32;
 }
 
+# the next free stream, which stays free until stream_take commits it
 fun stream_claim(driver: *Driver) *StreamEntry {
-    var i: usize = 0;
-    for (i < driver.stream_count) {
-        val stream: *StreamEntry = stream_at(driver, i);
-        if (stream.state == STREAM_FREE) { ret stream; }
-        i = i + 1;
-    }
-    if (i > 0xffffffff)                         { ret nil; }
+    driver.claim_steps = driver.claim_steps + 1;
+    if (driver.free_stream != NONE) { ret stream_at(driver, driver.free_stream::usize); }
+    val i: usize = driver.stream_count;
+    if (i >= 0xffffffff)                        { ret nil; }
     if (!table.reserve(?driver.streams, i + 1)) { ret nil; }
     val stream: *StreamEntry = stream_at(driver, i);
     stream.state        = STREAM_FREE;
     stream.generation   = 0;
+    stream.next_free    = NONE;
     driver.stream_count = i + 1;
+    driver.free_stream  = i::u32;
     ret stream;
+}
+
+# every change out of the free state goes through here, for the entry
+# stream_claim returned
+fun stream_take(driver: *Driver, stream: *StreamEntry, state: u8) {
+    val index: u32 = stream_index(driver, stream);
+    if (stream.state != STREAM_FREE || driver.free_stream != index) {
+        panic.panic("std.net.async.local: a stream was taken that was not claimed\n");
+    }
+    driver.free_stream = stream.next_free;
+    stream.next_free   = NONE;
+    stream.state       = state;
+}
+
+# every change into the free state goes through here
+fun stream_free(driver: *Driver, stream: *StreamEntry) {
+    if (stream.state == STREAM_FREE) { ret; }
+    stream.state       = STREAM_FREE;
+    stream.next_free   = driver.free_stream;
+    driver.free_stream = stream_index(driver, stream);
 }
 
 fun stream_resource(stream: *StreamEntry) usize {
@@ -286,7 +333,7 @@ fun close_all_streams_locked(driver: *Driver) {
             val code: i64 = impl.close_resource(?driver.backend, stream.value.handle);
             if (driver.cleanup_code >= 0 && code < 0) { driver.cleanup_code = code; }
             stream.value.handle = io_handle.INVALID_VALUE;
-            stream.state        = STREAM_FREE;
+            stream_free(driver, stream);
         }
         i = i + 1;
     }
@@ -495,7 +542,7 @@ fun close_listener_entry_locked(driver: *Driver, listener: *ListenerEntry) {
     if (driver.cleanup_code >= 0 && closed < 0)  { driver.cleanup_code = closed; }
     if (driver.cleanup_code >= 0 && removed < 0) { driver.cleanup_code = removed; }
     listener.value.handle = io_handle.INVALID_VALUE;
-    listener.state        = LISTENER_FREE;
+    listener_free(driver, listener);
 }
 
 fun close_all_listeners_locked(driver: *Driver) {
@@ -593,6 +640,9 @@ pub fun make(driver: *Driver, runtime: *io_runtime.Runtime) err[io_error.Error] 
     driver.slot_count        = 0;
     driver.listener_count    = 0;
     driver.stream_count      = 0;
+    driver.free_listener     = NONE;
+    driver.free_stream       = NONE;
+    driver.claim_steps       = 0;
     driver.backend_destroyed = false;
     driver.cleanup_code      = 0;
     driver.lock              = mutex.make();
@@ -718,7 +768,7 @@ pub fun submit_bind(
             var generation: u32 = listener.generation + 1;
             if (generation == 0) { generation = 1; }
             listener.generation = generation;
-            listener.state      = LISTENER_BIND_PENDING;
+            listener_take(driver, listener, LISTENER_BIND_PENDING);
             val slot: *Slot = slot_for(driver, token);
             slot.resource       = listener.value.handle;
             slot.listener_index = listener_index(driver, listener);
@@ -876,8 +926,8 @@ pub fun submit_accept(
     if (claimed.ok) {
         var generation: u32 = stream.generation + 1;
         if (generation == 0) { generation = 1; }
-        stream.generation        = generation;
-        stream.state             = STREAM_PENDING;
+        stream.generation = generation;
+        stream_take(driver, stream, STREAM_PENDING);
         stream.value.handle      = io_handle.INVALID_VALUE;
         stream.value.server_side = true;
         stream.completion_token  = token;
@@ -923,8 +973,8 @@ pub fun submit_connect(
         val slot:       *Slot = slot_for(driver, token);
         var generation: u32   = stream.generation + 1;
         if (generation == 0) { generation = 1; }
-        stream.generation        = generation;
-        stream.state             = STREAM_PENDING;
+        stream.generation = generation;
+        stream_take(driver, stream, STREAM_PENDING);
         stream.value.handle      = resource;
         stream.value.server_side = false;
         stream.completion_token  = token;
@@ -1110,7 +1160,7 @@ fun cleanup_locked(driver: *Driver, completion: *io_runtime.Completion) {
         if (completion.has_error) {
             if (stream.value.handle != io_handle.INVALID_VALUE) { impl.close_resource(?driver.backend, stream.value.handle); }
             stream.value.handle = io_handle.INVALID_VALUE;
-            stream.state        = STREAM_FREE;
+            stream_free(driver, stream);
         }
         or {
             stream.value.handle = completion.resource;
@@ -1124,7 +1174,7 @@ fun cleanup_locked(driver: *Driver, completion: *io_runtime.Completion) {
             impl.close_resource(?driver.backend, listener.value.handle);
             impl.cleanup_listener(?listener.value);
             listener.value.handle = io_handle.INVALID_VALUE;
-            listener.state        = LISTENER_FREE;
+            listener_free(driver, listener);
         }
         or {
             listener.state = LISTENER_BOUND;
@@ -1153,12 +1203,12 @@ fun cleanup_locked(driver: *Driver, completion: *io_runtime.Completion) {
             completion.error     = os.error(removed, io_error.OP_CLOSE);
         }
         listener.value.handle = io_handle.INVALID_VALUE;
-        listener.state        = LISTENER_FREE;
+        listener_free(driver, listener);
     }
     if (slot.kind == io_runtime.CLOSE && slot.stream_index != NONE) {
         val stream: *StreamEntry = stream_at(driver, slot.stream_index::usize);
         stream.value.handle = io_handle.INVALID_VALUE;
-        stream.state        = STREAM_FREE;
+        stream_free(driver, stream);
     }
     slot.state          = SLOT_FREE;
     slot.listener_index = NONE;
@@ -1290,6 +1340,8 @@ pub fun destroy(driver: *Driver) err[io_error.Error] {
     driver.slot_count     = 0;
     driver.listener_count = 0;
     driver.stream_count   = 0;
+    driver.free_listener  = NONE;
+    driver.free_stream    = NONE;
     val cleanup_code: i64 = driver.cleanup_code;
     mutex.unlock(?driver.lock);
     driver.runtime = nil;
@@ -1351,6 +1403,65 @@ test "async local: ownership query includes driver backend and runtime" {
         !aliases(?driver, ?external[0], 1) ||
         !ok_bool(io_runtime.close(?runtime)) ||
         !ok_err(io_runtime.destroy(?runtime))) { ret 6; }
+    ret 0;
+}
+
+# claim cost at n streams: with every entry held but a freed last one, then
+# with every entry held, after the last entry has churned
+fun claim_after_churn(n: usize, freed_cost: *u64, full_cost: *u64) i32 {
+    var runtime: io_runtime.Runtime;
+    if (refused(io_runtime.make(?runtime, 4))) { ret 1; }
+    var driver: Driver;
+    if (refused(make(?driver, ?runtime))) { ret 2; }
+    var i: usize = 0;
+    for (i < n) {
+        val stream: *StreamEntry = stream_claim(?driver);
+        if (stream == nil) { ret 3; }
+        stream_take(?driver, stream, STREAM_OPEN);
+        i = i + 1;
+    }
+    var round: usize = 0;
+    for (round < 3) {
+        stream_free(?driver, stream_at(?driver, n - 1));
+        val again: *StreamEntry = stream_claim(?driver);
+        if (again != stream_at(?driver, n - 1)) { ret 4; }
+        stream_take(?driver, again, STREAM_OPEN);
+        round = round + 1;
+    }
+    stream_free(?driver, stream_at(?driver, n - 1));
+    var before: u64          = driver.claim_steps;
+    val freed:  *StreamEntry = stream_claim(?driver);
+    @freed_cost = driver.claim_steps - before;
+    if (freed != stream_at(?driver, n - 1)) { ret 5; }
+    stream_take(?driver, freed, STREAM_OPEN);
+    before = driver.claim_steps;
+    val fresh: *StreamEntry = stream_claim(?driver);
+    @full_cost = driver.claim_steps - before;
+    if (fresh == nil) { ret 6; }
+    stream_take(?driver, fresh, STREAM_OPEN);
+    i = 0;
+    for (i <= n) {
+        stream_free(?driver, stream_at(?driver, i));
+        i = i + 1;
+    }
+    if (refused(destroy(?driver))) { ret 7; }
+    io_runtime.close(?runtime);
+    if (refused(io_runtime.destroy(?runtime))) { ret 8; }
+    ret 0;
+}
+
+test "async local: stream claim cost stays flat after churn at 1k, 10k and 100k" {
+    val sizes: [3]usize = [3]usize{1000, 10000, 100000};
+    var freed: [3]u64;
+    var full:  [3]u64;
+    var i:     usize    = 0;
+    for (i < 3) {
+        val churned: i32 = claim_after_churn(sizes[i], ?freed[i], ?full[i]);
+        if (churned != 0) { ret 10 * (i::i32 + 1) + churned; }
+        i = i + 1;
+    }
+    if (freed[0] != freed[1] || freed[1] != freed[2] || full[0] != full[1] || full[1] != full[2]) { ret 40; }
+    if (freed[0] > 1 || full[0] > 1)                                                              { ret 41; }
     ret 0;
 }
 
