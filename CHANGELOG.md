@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `io.runtime.unrouted_events(runtime)` counts native events whose source id
   matched no registered source. A nonzero count is expected when a source is
   released between a batch harvest and its dispatch (#739).
+- `memory.buffers.Snapshot.release_failures` counts backing releases the
+  allocator or the secret store refused. The pool cannot recover that memory,
+  so the count is the only signal it leaked (#779).
 
 ### Changed
 - `io.runtime` sends each native event straight to the source its id names,
@@ -65,6 +68,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A registration that loses a race with runtime close no longer leaves a
   source slot stuck, which made `destroy` report busy forever. This defect is
   separate from id recycling, and was found while doing it.
+- The `memory.buffers` `source_*` and `secret_source_*` wrappers refuse a nil
+  source or a nil member as misuse, instead of calling through nil. Found in
+  the #775 sweep (#778).
+- `memory.buffers` no longer ignores a refused backing release. Plain and
+  secret releases, and the cleanup after a failed secret borrow, count the
+  failure in `release_failures`. Found in the #775 sweep (#779).
 
 ## [5.0.1] - 2026-09-17
 
