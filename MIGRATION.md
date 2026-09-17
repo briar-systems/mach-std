@@ -1,3 +1,121 @@
+# std 4.x to 5.0.0
+
+std 5.0.0 separates the two clocks (#752). `time.Time` is wall-clock (calendar) time only. It can jump when the system clock is set. Monotonic readings get their own type, `time.Instant`. The two types don't convert into each other, so the compiler now rejects a wall-clock `Time` passed as a deadline. Every deadline and timer in std takes an `Instant`. In the same release, a deadline scope costs the runtime one timer entry no matter how many operations it holds (#741). That change is internal and needs no caller changes.
+
+std 5.0.0 requires mach 5.2.0 or later.
+
+## Reading the clock
+
+`time.monotonic()` is gone, with no forwarder. Use `time.instant()`, which returns `time.InstantClock` (`res[Instant, io.error.Error]`). The arithmetic has its own names:
+
+| 4.x on a monotonic `Time` | 5.0.0 on an `Instant` |
+| --- | --- |
+| `time.monotonic()` | `time.instant()` |
+| `time.Clock` (monotonic reading) | `time.InstantClock` |
+| `time.time_add(t, d)` | `time.instant_add(i, d)` |
+| `time.time_sub(a, b)` | `time.instant_sub(a, b)` |
+| `time.time_before(a, b)` / `time_after` / `time_equal` | `time.instant_before` / `instant_after` / `instant_equal` |
+
+```mach
+# before
+val started: time.Clock = time.monotonic();
+val deadline: time.Time = time.time_add(started.ok, 5 * duration.SECOND);
+
+# after
+val started: time.InstantClock = time.instant();
+val deadline: time.Instant = time.instant_add(started.ok, 5 * duration.SECOND);
+```
+
+`time.now()`, `time.since(t)` and `time.until(t)` stay, and they are wall-clock only. `since` and `until` measure against the calendar clock, so a clock change moves them. To measure elapsed time or the time left before a deadline, use the new monotonic forms:
+
+```mach
+# before: wall clock, wrong across a clock change
+val start: time.Time = time.now().ok;
+val took: time.Elapsed = time.since(start);
+
+# after
+val start: time.Instant = time.instant().ok;
+val took: time.Elapsed = time.elapsed(start);
+val left: time.Elapsed = time.remaining(deadline);
+```
+
+Keep a `Time` only for timestamps that people read, such as log records, certificate validity or HTTP dates. Anything that bounds a wait is an `Instant`.
+
+## Cancellation scopes
+
+`cancel.make_root` and `cancel.make_child` take the deadline as `opt[time.Instant]`. The `has_deadline` flag is gone, along with the dummy `Time{sec: 0, nsec: 0}` that went with it. `cancel.expire` takes the current `Instant`. `cancel.Deadline.at` is an `Instant`.
+
+```mach
+# before
+cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0});
+cancel.make_root(?scope, true, deadline);
+cancel.make_child(?child, ?parent, false, none);
+cancel.expire(?scope, time.monotonic().ok);
+
+# after
+cancel.make_root(?scope, opt[time.Instant].none{});
+cancel.make_root(?scope, opt[time.Instant].some{deadline});
+cancel.make_child(?child, ?parent, opt[time.Instant].none{});
+cancel.expire(?scope, time.instant().ok);
+```
+
+A child still inherits the earlier of its own deadline and its parent's.
+
+## Timers and timed waits
+
+Every absolute deadline parameter is now an `Instant`:
+
+- `io.runtime.submit_timer(runtime, deadline: time.Instant, context)`
+- `io.runtime.submit_timer_scoped(runtime, scope, deadline: time.Instant, context)`
+- `sync.condition.wait_until(c, m, deadline: time.Instant)`
+- `sync.channel.send_until[T](channel, value, deadline: time.Instant)`
+- `sync.channel.receive_until[T](channel, deadline: time.Instant)`
+- `sync.worker_pool.submit_until(pool, task, deadline: time.Instant)`
+- `net.resolve.wait_until(resolver, output, capacity, deadline: time.Instant)`
+
+Relative timeouts (`timeout_ms` and similar) are unchanged. `test/deadline/verify.sh` checks that a wall-clock `Time` doesn't compile on any of these surfaces.
+
+## Downstream sites
+
+These are the known call sites to change in the family:
+
+- hedge: 9 deadline sites and the variables that feed them.
+  - `src/connection.mach:705`, `:1063`
+  - `src/acme/origination.mach:379`
+  - `src/protocol/secure.mach:420`
+  - `src/protocol/h2.mach:701`
+  - `src/protocol/h3/session.mach:1016`, `:2199`
+  - Also audit its 14 `time.now` calls. Any that measures a duration or builds a deadline becomes `time.instant`.
+- laurel: `src/context.mach:341` and `src/testing.mach:419`.
+- mach-http: `src/core/exchange.mach:539`. The caller-supplied `now` it threads through becomes an `Instant`.
+- mach-tls: `src/test/transport.mach:289`.
+- bramble-hub: review its 2 `time.now` calls.
+
+## `buffers.Source` gained members (#767)
+
+`std.memory.buffers.Source` now covers the whole buffer lifecycle. It gained `fn_open_account`, `fn_close_account`, `fn_data`, `fn_retain`, `fn_settle`, `fn_in_flight` and `fn_ready`. Each takes `ctx` first and otherwise matches the `Pool` function of the same name.
+
+- A custom source must fill all seven new members. A `Source` built with `source(pool)` needs no change.
+- Consumers call the `source_*` functions (`source_open_account`, `source_acquire`, `source_data`, `source_ready`, ...) with a `*Source` instead of calling `s.fn_*(s.ctx, ...)` by hand.
+
+## Secret chunks moved to `buffers.SecretSource` (#771)
+
+`Source.fn_secret` returned `*^u8`, which welded `Source` and every record holding one, so those records could not pass through `ptr`. Secret chunks now have their own interface.
+
+- `Source` lost `fn_secret`, and `source_secret` is gone. A custom `Source` drops that member.
+- A `Source` serves plain chunks only. A request with `secret: true` is refused as `misuse`.
+- Secret consumers take a `SecretSource`, built with `secret_source(pool)`, and call `secret_source_open_account`, `secret_source_close_account`, `secret_source_acquire` (with `secret: true`), `secret_source_release` and `secret_source_view`. A record holding a `SecretSource` is welded.
+
+```mach
+# before
+val view: *^u8 = buffers.source_secret(?src, chunk);
+
+# after
+var secrets: buffers.SecretSource = buffers.secret_source(?pool);
+val view:    *^u8                 = buffers.secret_source_view(?secrets, chunk);
+```
+
+
 # std 3.x to 4.0.0
 
 std 4.0.0 finishes the OS layering in #697. `std.system.os` is now a small contract of primitives with one implementation per OS. Error translation lives in that layer, the logic built on top of it moved out, and descriptors cross it as pointer-width handles. This section lists every breaking change, with the code to write instead. The full detail is in the 4.0.0 changelog, and the contract itself is in `OS-CONTRACT.md`.
