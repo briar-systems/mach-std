@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `io.runtime.NativeEvent.source` (and `source` on every platform's
+  `IoCompletion`): the id of the source a native event belongs to, 0 for a
+  wake. epoll and kqueue read it from the top 16 bits of the registered
+  context (`os.shared.IO_SOURCE_SHIFT`, `io_source_context`,
+  `io_context_source`). IOCP reads it from the completion key, which
+  `io_queue_attach` now takes (#739).
+- `io.runtime.unrouted_events(runtime)` counts native events whose source id
+  matched no registered source. A nonzero count is expected when a source is
+  released between a batch harvest and its dispatch (#739).
+
+### Changed
+- `io.runtime` sends each native event straight to the source its id names,
+  instead of offering it to every source in turn. Per-event dispatch is one
+  offer at 1, 10 and 100 sources, where it was 1, 10 and 100. Wakes still reach
+  every source (#739).
+
 ## [5.0.0] - 2026-09-17
 
 Requires mach 5.2.0 or later. Tested with mach 5.2.1, the family CI seed.
