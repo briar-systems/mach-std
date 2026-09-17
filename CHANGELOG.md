@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Behavior changes
+- On Windows, cancelling a `net.async` operation the kernel already holds no
+  longer blocks. The cancel returns at once, and the operation completes as
+  cancelled once the aborted request reports back. `destroy` refuses with
+  `EBUSY` until it does, and `awaiting_cancellations(driver)` shows how many
+  are outstanding (#744).
+- On Windows, a read whose data arrived before its cancel still completes as
+  cancelled, and its bytes are discarded although the peer considers them
+  delivered. A caller that needs every byte must not cancel a pending read to
+  stop waiting, and should use a deadline and keep reading until the stream
+  drains instead. `discarded_reads(driver, bytes)` counts these reads and the
+  bytes they lost, and also counts datagram receives lost the same way. A write
+  that finished before its cancel may have reached the peer although it
+  completes as cancelled (#744).
+
+### Added
+- `net.async.discarded_reads` and `net.async.awaiting_cancellations`, with the
+  same pair on `net.async.local`. Both read 0 on Linux and Darwin (#744).
+- `net.async.types.STATUS_CANCELLED`, the backend status of an operation whose
+  asynchronous cancel has settled (#744).
+
+### Changed
+- The Windows `net.async` backends keep a record per socket, found through a
+  hash of the socket value, with a ready list for controls and a queue of held
+  reads per socket. A flush, a completion, a write and a shutdown cost 0, 2, 2
+  and 1 steps at 1k, 10k and 100k live operations, where they cost 2, 7, 1 and
+  2 steps per live operation. Both backends share one core
+  (`net.async.iocp`), which makes the decisions and does no native I/O, and one
+  Windows layer (`net.async.iocp.port`), which holds cancel and dispatch
+  (#744).
+- `os.io_queue_restore` is no longer used by `net.async`. It stays available
+  (#744).
+
 ## [5.1.0] - 2026-09-17
 
 Rebuild everything that links std before running it on 5.1.0. The layout of
@@ -47,7 +80,7 @@ into one that fails:
 ### Changed
 - `io.runtime` sends each native event straight to the source its id names,
   instead of offering it to every source in turn. Per-event dispatch is one
-  offer at 1, 10 and 100 sources, where it was 1, 10 and 100. Wakes still reach
+  offer at 1, 10 and 100 sources, where it was 1, 10 and 100 offers. Wakes still reach
   every source (#739).
 - `sync.cancel` locks per scope instead of per tree. attach and unregister
   take only their scope's lock, so threads registering on separate child
