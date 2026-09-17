@@ -7,7 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A spawned child whose redirected stream is the descriptor it already is, such
+  as `stdout_fd = 1` or `stderr_fd = 2`, now runs. On linux aarch64 and riscv64
+  the redirect used `dup3`, which refuses a descriptor onto itself, so the child
+  exited 126 before exec. On every linux arch and on darwin, such a stream now
+  also survives exec when it was close-on-exec: the redirect clears the flag
+  instead of duplicating, where `dup2` onto itself used to leave it set. Windows
+  hands handles to the child without duplicating them and was not affected
+  (#722).
+
 ### Added
+- `net.async.submit_listener_close(driver, scope, listener, context)` closes a
+  TCP listener the driver knows about, so the backend unregisters it. Every
+  accept still pending on it completes cancelled, and the listener's handle is
+  invalidated. A listener that has had an accept submitted is closed this way,
+  not with `tcp.listener_close`, the same as streams and datagram sockets
+  close through `submit_stream_close` and `submit_datagram_close` (#724).
 - `std.system.capability`: comptime flags for the OS capability groups a
   target provides, `HOSTED`, `HAS_PAGES`, `HAS_CLOCK`, `HAS_ENTROPY`,
   `HAS_THREADS`, `HAS_FILES`, `HAS_IO_QUEUE`, `HAS_SOCKETS` and `HAS_PROCESS`.
