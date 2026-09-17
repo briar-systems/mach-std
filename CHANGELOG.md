@@ -202,6 +202,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   | `os.temp_dir` | `std.filesystem.native.temp_dir` |
   | `os.NOT_FOUND` | `os.error_kind(n) == io.error.NOT_FOUND` |
   | `os.spawn_shell(command, envp, cwd) i64` | `std.process.exec.spawn_shell(command, cwd, envp) res[Child, Error]` |
+  | `os.separator` | `std.types.path.separator()` |
 
   The sockaddr and status helpers, and `spawn_shell`, are also gone from the
   per-OS modules.
@@ -217,6 +218,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AT_FDCWD`. Use `os.stdin()`, `os.stdout()`, `os.stderr()` and
   `os.working_dir()`. The per-OS modules keep the native constants (#694).
 - **Breaking.** `std.system.os.terminate`. Use `os.exit(status: u32)` (#694).
+
+## [3.3.0] - 2026-09-16
+
+Requires mach 5.2.0 or later: the capability gates need the compiler fix in briar-systems/mach#3469. Tested with mach 5.2.1, the family CI seed.
+
+### Added
+- `net.async.submit_listener_close(driver, scope, listener, context)` closes a
+  TCP listener the driver knows about, so the backend unregisters it. Every
+  accept still pending on it completes cancelled, and the listener's handle is
+  invalidated. A listener that has had an accept submitted is closed this way,
+  not with `tcp.listener_close`, the same as streams and datagram sockets
+  close through `submit_stream_close` and `submit_datagram_close` (#724).
+- `std.system.capability`: comptime flags for the OS capability groups a
+  target provides, `HOSTED`, `HAS_PAGES`, `HAS_CLOCK`, `HAS_ENTROPY`,
+  `HAS_THREADS`, `HAS_FILES`, `HAS_IO_QUEUE`, `HAS_SOCKETS` and `HAS_PROCESS`.
+  A module gates on them with `$if`, which discards an OS-bound branch before
+  resolution. The module imports nothing OS-bound and builds freestanding. Every
+  flag is set on linux, darwin and windows, and none is set on any other target
+  (#685).
+
+### Changed
+- Core modules keep their test-only code, and the test-only imports of
+  `std.allocator.page`, `std.allocator.testing` and `std.system.os`, behind
+  `std.system.capability.HOSTED`, so importing them no longer pulls in the OS
+  layer. `io.error.from_code` and `io.error.message`, and
+  `std.terminal.error`'s `control_failure` and `read_failure`, exist only where
+  the OS layer does. Nothing changes on linux, darwin or windows. 57 modules
+  now build for a freestanding target, up from 37: the collections, compress,
+  `data.json`, `data.toml`, `derive`, `encoding.binary`, `format`, `io.error`,
+  `io.reader`, `io.writer`, `terminal.error`, `types.semver` and
+  `allocator.arena` (#686).
+- `std.chrono.time`'s `Time` and its arithmetic no longer need the OS
+  layer. `now`, `monotonic`, `since` and `until` exist only where the clock
+  group does (`std.system.capability.HAS_CLOCK`). `std.types.path.separator`
+  is a target constant rather than a read of `std.system.os`. In
+  `std.log.record`, `system_clock` also requires the clock group, a record with
+  a caller-supplied timestamp or clock works on every target, and an error
+  field includes its native message only where the OS layer can translate the
+  code. Nothing changes on linux, darwin or windows. `chrono.time`,
+  `chrono.date`, `chrono.format`, `types.path` and `log.record` now build
+  freestanding, 62 modules in all (#690).
+- `OS-CONTRACT.md` documents the `std.system.os` contract: its
+  capability groups, the members of each group as of 3.x, and the assumptions
+  a user-supplied implementation can rely on. `std.system.capability.conformance`
+  names every member of every group a target claims, so a missing member fails
+  the build (#691).
+
+### Fixed
+- A spawned child whose redirected stream is the descriptor it already is, such
+  as `stdout_fd = 1` or `stderr_fd = 2`, now runs. On linux aarch64 and riscv64
+  the redirect used `dup3`, which refuses a descriptor onto itself, so the child
+  exited 126 before exec. On every linux arch and on darwin, such a stream now
+  also survives exec when it was close-on-exec: the redirect clears the flag
+  instead of duplicating, where `dup2` onto itself used to leave it set. Windows
+  hands handles to the child without duplicating them and was not affected
+  (#722).
+
+## [3.2.1] - 2026-09-16
+
+Tested with mach 5.2.1, the family CI seed.
+
+### Fixed
+- A `net.resolve` resolver on an `io.runtime` no longer claims native events
+  that belong to other sources. Its dispatch returned "claimed" whenever it
+  published a result, and the runtime stops offering an event at the first
+  claim, so a resolver registered before a `net.async` driver could swallow a
+  socket's oneshot readiness. The socket was then never re-armed and its
+  pending operation never completed. The resolver owns no native context and
+  now never claims one, and `io.runtime.DispatchFun` documents the rule
+  (#715).
+- On windows, a pending `net.async` datagram receive batch completes as soon as
+  a datagram is available and carries every datagram already queued, up to its
+  count, as on linux and darwin. It used to wait until the whole batch had
+  arrived, so a server that kept `receive_batch(16)` pending waited for sixteen
+  datagrams under light traffic. After the first datagram the windows backend
+  now takes only datagrams that are already queued, with a synchronous
+  receive, and never posts a receive that could wait. The batch contract is
+  documented on `submit_receive_batch` (#718).
+- The `net.async` packet record documents `capacity` and `length`. A send
+  refuses a length above the packet's capacity, which the windows backend
+  already enforced (#711).
+- `net.async` has regression coverage for a pending datagram receive under
+  load: a flood past the receive buffer with one thread and with a submitting
+  thread, and scoped batch-of-one sends with cancelled child scopes and table
+  growth. The #711 stall report traced to the caller, not std, so no library
+  behaviour changed for it (#711).
 
 ## [3.2.0] - 2026-09-16
 
