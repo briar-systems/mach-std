@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.0] - 2026-09-17
+
+Rebuild everything that links std before running it on 5.1.0. The layout of
+`sync.cancel.Scope` changed: `callback_count` is now an atomic `i64` where it
+was a `usize`. The size of the record is unchanged, so code built against 5.0.x
+still links and runs without any compile error, but it reads and writes that
+field the old way, which is not safe. `os.shared.IoQueue`,
+`memory.buffers.Snapshot` and every platform's `IoCompletion` also gained
+fields. No source change is needed in code that does not build those records
+by hand.
+
+### Behavior changes
+Both of these are correct, and both can turn a program that worked on 5.0.x
+into one that fails:
+- A `net.async` backend's `destroy` panics if a native registration would
+  outlive it, where 5.0.x left the registration behind silently. `destroy`
+  still releases idle sockets itself, so the panic points to a defect in std's
+  registration accounting, not to caller misuse. Report it with the backend
+  and platform (#740).
+- On Windows, a `net.async` backend's `destroy` refuses with `EBUSY` while the
+  kernel still owns one of its operations. Poll until the backend is idle, then
+  destroy it again (#740).
+
 ### Added
 - `io.runtime.NativeEvent.source` (and `source` on every platform's
   `IoCompletion`): the id of the source a native event belongs to, 0 for a
@@ -42,9 +65,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for the old source can never reach the new one. The wire id stays 16 bits,
   so at most 65,535 sources can be registered at once. The two invariants this
   rests on are enforced and tested: a source with a live operation cannot be
-  released, and a backend's `destroy` removes every native registration it
-  holds (a leftover one panics) and refuses while the kernel still owns an
-  operation (#740).
+  released, and a backend's `destroy` removes every native registration and
+  waits for the kernel (see Behavior changes) (#740).
 - Native wakes are coalesced. `os.shared.IoQueue` gains `wake_pending`, so only
   the first wake request since the last poll posts a native wake (an eventfd
   write, a `NOTE_TRIGGER` kevent or an IOCP packet), and later requests post
