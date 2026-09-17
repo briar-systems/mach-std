@@ -29,7 +29,7 @@ A target that claims a group exports every member listed here. `src/system/capab
 | `HAS_FILES` | files | descriptors, positioned and secret I/O, stat, directories, identity, publication, pipes and the working directory |
 | `HAS_IO_QUEUE` | io queue | the native completion or readiness queue |
 | `HAS_SOCKETS` | sockets | stream, datagram and local sockets, their options and address codecs |
-| `HAS_PROCESS` | process | spawn, wait, status decoding, the environment and signal disposition |
+| `HAS_PROCESS` | process | spawn, wait, status decoding, the environment, signal disposition, and the open-file limit |
 
 ## Members
 
@@ -67,7 +67,7 @@ A target that claims a group exports every member listed here. `src/system/capab
 
 ### process (`HAS_PROCESS`)
 
-`PROCESS_CONTINUED`, `PROCESS_EXITED`, `PROCESS_OP_CLOSE`, `PROCESS_OP_PIPE`, `PROCESS_OP_READ`, `PROCESS_OP_SPAWN`, `PROCESS_OP_STATUS`, `PROCESS_OP_TERMINATE`, `PROCESS_OP_WAIT`, `PROCESS_SIGNALED`, `PROCESS_STOPPED`, `ProcessStatus`, `ProcessWaitError`, `WNOHANG`, `WaitResult`, `environ`, `getenv`, `getpid`, `ignore_sigpipe`, `spawn`, `spawn_in`, `spawn_redirected`, `spawn_redirected_in`, `terminate_child`, `wait`, `wait_pid`
+`FileLimit`, `LIMIT_UNLIMITED`, `PROCESS_CONTINUED`, `PROCESS_EXITED`, `PROCESS_OP_CLOSE`, `PROCESS_OP_PIPE`, `PROCESS_OP_READ`, `PROCESS_OP_SPAWN`, `PROCESS_OP_STATUS`, `PROCESS_OP_TERMINATE`, `PROCESS_OP_WAIT`, `PROCESS_SIGNALED`, `PROCESS_STOPPED`, `ProcessStatus`, `ProcessWaitError`, `WNOHANG`, `WaitResult`, `environ`, `getenv`, `getpid`, `ignore_sigpipe`, `open_file_limit`, `set_open_file_limit`, `spawn`, `spawn_in`, `spawn_redirected`, `spawn_redirected_in`, `terminate_child`, `wait`, `wait_pid`
 
 ## Assumptions
 

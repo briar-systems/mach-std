@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `std.process.limits`: read and set the open-file limit. `open_files()` returns
+  a `FileLimit` with the soft limit in force, the hard limit, and the highest
+  soft limit this process may set (`ceiling`); `set_open_files(limit)` sets the
+  soft and hard limits; `raise_open_files()` raises the soft limit to the
+  ceiling. A soft limit above the hard one is `INVALID`, raising the hard limit
+  without privilege is `PERMISSION`, and windows, which has no such limit,
+  reports `UNSUPPORTED`. The OS contract's process group gains
+  `open_file_limit` and `set_open_file_limit` (#746).
+
 ### Changed
 - Releases run through the family's shared release workflow (briar-systems/.github
   `mach-release.yml`): it verifies the tag, version and changelog section, runs
