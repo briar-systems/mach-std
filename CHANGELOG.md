@@ -24,6 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   offer at 1, 10 and 100 sources, where it was 1, 10 and 100. Wakes still reach
   every source (#739).
 
+## [5.0.1] - 2026-09-17
+
+Requires mach 5.2.0 or later. Tested with mach 5.2.1, the family CI seed.
+
+### Fixed
+- `memory.buffers` no longer crashes when a fresh chunk is acquired after
+  released chunks were retained. Retained chunks keep their slots, but the slot
+  table's demand left them out, so the table could be full with no room for the
+  new chunk, and the missing slot was written through nil. The demand now counts
+  held, retained and reserved slots. A pool that still finds no slot refuses
+  with `Reason.memory` and returns the backing it just allocated (#775).
+
 ## [5.0.0] - 2026-09-17
 
 Requires mach 5.2.0 or later. Tested with mach 5.2.1, the family CI seed.
