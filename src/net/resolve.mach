@@ -23,9 +23,12 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str_len;
 
+use net_async:   std.net.async;
+use async_types: std.net.async.types;
 use std.net.ip;
 use std.net.resolve.shared;
 use std.net.resolve.types;
+use std.net.udp;
 
 $if ($mach.build.os == $mach.os.windows) {
     use std.system.os.windows;
@@ -550,9 +553,12 @@ fun runtime_release(context: ptr, completion: *io_runtime.Completion) {
     mutex.unlock(?resolver.lock);
 }
 
+# publishes every queued result on each dispatch, whatever the event. the
+# resolver owns no native context, so it never claims one: a claimed event is
+# withheld from the sources after this one, and a oneshot readiness event that
+# its owner never sees is never re-armed
 fun runtime_dispatch(context: ptr, native_context: usize, events: u32, status: i64, flags: u64) bool {
-    val resolver:  *Resolver = context::*Resolver;
-    var published: bool      = false;
+    val resolver: *Resolver = context::*Resolver;
     mutex.lock(?resolver.lock);
     var i: usize = 0;
     for (i < resolver.capacity) {
@@ -569,15 +575,12 @@ fun runtime_dispatch(context: ptr, native_context: usize, events: u32, status: i
             or {
                 completed = io_runtime.complete(resolver.runtime, operation.runtime_token, 0, 0, false);
             }
-            if (sel completed.ok) {
-                operation.runtime_published = true;
-                published                   = true;
-            }
+            if (sel completed.ok) { operation.runtime_published = true; }
         }
         i = i + 1;
     }
     mutex.unlock(?resolver.lock);
-    ret published;
+    ret false;
 }
 
 fun cancel_callback(context: ptr, reason: cancellation.Reason) {
@@ -1855,5 +1858,118 @@ test "resolver: runtime cancellation and deadline preserve the first reason" {
     if (!closed(?resolver) || !destroyed(?resolver)
         || !ok_err(io_runtime.destroy(?runtime))
         || !test_pool_destroy(?pool)) { ret 14; }
+    ret 0;
+}
+
+# a resolver that publishes while the runtime dispatches another source's
+# readiness must not claim that event: the event is oneshot, so a source that
+# never sees it never re-arms (#715)
+test "resolver: runtime publication leaves other sources' readiness to them" {
+    if (!resolver_threads_supported()) { ret 0; }
+    var owner: allocator.Allocator;
+    page.make(?owner);
+    var runtime: io_runtime.Runtime;
+    if (!ok_err(io_runtime.make(?runtime, 4))) { ret 1; }
+    var pool: TestPool;
+    if (!test_pool_make(?pool, 1)) { ret 2; }
+    var gate: Gate;
+    # registered before the driver, so every native event reaches it first
+    var resolver: Resolver;
+    if (!made(make_runtime_with_adapter(?resolver, ?runtime, ?pool.pool, ?owner, 1,
+        test_limits(), (?gate)::ptr, gated_adapter))) { ret 3; }
+    var driver: net_async.Driver;
+    if (!ok_err(net_async.make(?driver, ?runtime))) { ret 4; }
+    val bound: res[udp.Socket, io_error.Error] = net_async.bind_datagram(ip.endpoint(127, 0, 0, 1, 0));
+    if (sel bound.err) { ret 5; }
+    var receiver:   udp.Socket                      = bound.ok;
+    val peer_bound: res[udp.Socket, io_error.Error] = net_async.bind_datagram(ip.endpoint(127, 0, 0, 1, 0));
+    if (sel peer_bound.err) { ret 6; }
+    var peer:   udp.Socket                       = peer_bound.ok;
+    val target: res[ip.Endpoint, io_error.Error] = udp.local_endpoint(?receiver);
+    if (sel target.err) { ret 7; }
+    var scope: cancellation.Scope;
+    if (!scope_ok(cancellation.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 8; }
+
+    var storage: [256]u8;
+    var packet:  async_types.Packet;
+    packet.buffer   = ?storage[0];
+    packet.capacity = 256;
+    # nothing is readable yet, so the receive stays pending and armed
+    val receiving: res[io_runtime.Token, io_error.Error] = net_async.submit_receive_batch(
+        ?driver, ?scope, ?receiver, ?packet, 1, 81);
+    if (sel receiving.err) { ret 9; }
+
+    var query:     types.Query                        = test_query("runtime-shared", nil, 0);
+    val resolving: res[io_runtime.Token, types.Error] = submit_runtime(?resolver, ?scope, ?query, 82);
+    if (sel resolving.err) { ret 10; }
+    gate_wait_entered(?gate);
+    # collect the submission wakes now, so the receiver's readiness is the
+    # first event of the next collect. the wake descriptor is level
+    # triggered: the first collect drains it and requeues it, the second one
+    # finds it idle and drops it from the ready list
+    var output: [4]io_runtime.Completion;
+    var settle: usize = 0;
+    for (settle < 2) {
+        val settled: res[usize, io_error.Error] = io_runtime.wait(?runtime, ?output[0], 4, 0);
+        if (!(sel settled.ok && settled.ok == 0)) { ret 25; }
+        settle = settle + 1;
+    }
+
+    # the receiver becomes readable before the resolver has anything queued
+    var payload: [4]u8                      = [4]u8{1, 2, 3, 4};
+    val sent:    res[usize, io_error.Error] = udp.send_to(?peer, ?payload[0], 4, target.ok);
+    if (!(sel sent.ok && sent.ok == 4)) { ret 11; }
+
+    # queue the resolution, so the resolver publishes during the collect that
+    # also carries the receiver's readiness
+    gate_release(?gate);
+    var queued: bool = false;
+    for (!queued) {
+        mutex.lock(?resolver.lock);
+        queued = resolver.operations[0].state == SLOT_QUEUED;
+        mutex.unlock(?resolver.lock);
+        if (!queued) { os.sleep(1000000); }
+    }
+
+    var resolved: bool  = false;
+    var received: bool  = false;
+    var rounds:   usize = 0;
+    for ((!resolved || !received) && rounds < 6) {
+        val waited: res[usize, io_error.Error] = io_runtime.wait(?runtime, ?output[0], 4, 250);
+        if (sel waited.err) { ret 12; }
+        var i: usize = 0;
+        for (i < waited.ok) {
+            if (output[i].has_error) { ret 13; }
+            if (output[i].context == 81) {
+                received = true;
+            }
+            or (output[i].context == 82) { resolved = true; }
+            or                           { ret 14; }
+            i = i + 1;
+        }
+        rounds = rounds + 1;
+    }
+    if (!resolved) { ret 15; }
+    if (!received) { ret 16; }
+
+    var resolver_completion: types.Completion;
+    if (poll(?resolver, ?resolver_completion, 1) != 1) { ret 17; }
+    if (!released(?resolver_completion.resolution))    { ret 18; }
+    udp.socket_close(?peer);
+    val closing: res[io_runtime.Token, io_error.Error] = net_async.submit_datagram_close(?driver, ?scope, ?receiver, 83);
+    if (sel closing.err) { ret 19; }
+    var guard: usize = 0;
+    for (io_runtime.pending(?runtime) > 0 && guard < 16) {
+        val drained: res[usize, io_error.Error] = io_runtime.wait(?runtime, ?output[0], 4, 1000);
+        if (sel drained.err) { ret 20; }
+        guard = guard + 1;
+    }
+    if (io_runtime.pending(?runtime) != 0)       { ret 21; }
+    if (!ok_err(net_async.destroy(?driver)))     { ret 22; }
+    if (!scope_ok(cancellation.destroy(?scope))) { ret 23; }
+    if (!closed(?resolver) || !destroyed(?resolver)
+        || !ok_bool(io_runtime.close(?runtime))
+        || !ok_err(io_runtime.destroy(?runtime))
+        || !test_pool_destroy(?pool)) { ret 24; }
     ret 0;
 }
