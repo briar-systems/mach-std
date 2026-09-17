@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.0.0] - 2026-09-17
+
+Requires mach 5.2.0 or later. Tested with mach 5.2.1, the family CI seed.
+MIGRATION.md covers the breaking changes.
+
 ### Added
 - `time.Instant`, a monotonic instant that is distinct from the wall-clock
   `time.Time` and never converts to or from it. Read it with `time.instant()`,
