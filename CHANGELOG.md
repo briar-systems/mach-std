@@ -32,6 +32,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the full CI, then publishes. The release-archive check that no test-only fault
   module ships now runs in CI on every x86_64-linux run (#735).
 
+### Fixed
+- On linux, darwin and local unix sockets, `net.async` keeps a socket registered
+  from its first operation until it is closed through the driver. It used to
+  unregister and forget the socket whenever its queue emptied, so every blocked
+  operation paid an address lookup, a registration and an unregistration. Now
+  only the first operation looks the socket up and registers it, and every
+  later one rearms the existing registration. A datagram socket is configured
+  once instead of on every receive. An idle socket costs one resource record
+  until it is closed through the driver, and destroying a driver releases any
+  idle ones (#737).
+- The backends' socket map deletes by shifting the probe run back instead of
+  leaving tombstones, so lookups no longer grow longer as a server opens and
+  closes sockets. After heavy churn a miss used to scan the whole map, for
+  example 262,145 probes at 100,000 sockets. It now stops at the first empty
+  slot (#737).
+- On linux, when a rearm finds that a socket's registration has vanished, the
+  socket was closed outside the driver. The pending operation completes as
+  closed, and the socket now behind that value is registered only when it is
+  submitted with its own handle (#737).
+
 ## [4.0.1] - 2026-09-16
 
 Requires mach 5.2.0 or later. Tested with mach 5.2.1, the family CI seed.
