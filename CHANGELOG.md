@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of offering it to every source in turn. Per-event dispatch is one
   offer at 1, 10 and 100 sources, where it was 1, 10 and 100. Wakes still reach
   every source (#739).
+- `sync.cancel` locks per scope instead of per tree. attach and unregister
+  take only their scope's lock, so threads registering on separate child
+  scopes no longer contend. At 8 threads on per-thread children, attach plus
+  unregister totals 78M/s, where it was 5.8M/s. A scope shared by threads still
+  serializes, and the module now documents per-worker roots and per-connection
+  child scopes as the intended shape. `Scope.callback_count` is now an atomic
+  `i64`, which leaves the size of `Scope` unchanged (#754).
 - `io.runtime` recycles source ids, so a runtime has no lifetime limit on
   registrations. The limit was 65,535. A released id waits until every native
   collection that began before its release has ended, so an event harvested
