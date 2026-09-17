@@ -16,6 +16,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Linux and darwin settle readiness with a non-consuming peek, and windows posts
   a zero-byte overlapped receive and settles it with the queued byte count
   (#759).
+- `std.system.os.thread_affinity(words, capacity, out_count)` and
+  `set_thread_affinity(words, count)` read and pin the calling thread's CPU
+  affinity, in the threads capability group. The mask is caller-sized words with
+  no fixed CPU limit, and a short buffer reports `RANGE` with the words needed.
+  windows numbers CPUs across processor groups and refuses a set spanning groups
+  as `UNSUPPORTED`; darwin has no hard affinity and returns `UNSUPPORTED`.
+  `std.sync.thread` adds `CpuSet` over caller words (`cpu_set`, `cpu_set_add`,
+  `cpu_set_contains`, `cpu_set_size`, `cpu_set_nth`, `cpu_set_clear`),
+  `current_affinity`, `affinity_words`, `set_current_affinity`,
+  `pin_current_to` and `allowed_cpus`, which lists the CPUs the thread may run on
+  in ascending order so worker i can pin to the i-th (#755).
 - Listeners and datagram sockets take options applied before bind, so a
   multi-core server can bind one `SO_REUSEPORT` socket per thread:
   `net.socket.BindOptions { reuse_address, reuse_port }` and
