@@ -25,7 +25,8 @@
 # a secret class is backed by welded storage from std.memory.secret, held as a
 # borrow so the pool itself carries no welded pointer: its chunks carry no plain
 # data pointer, `secret` gives the welded view, and release wipes the whole
-# chunk. welded storage needs the pages capability (HAS_PAGES), so a secret class
+# chunk. secret chunks are served through `SecretSource`, never through
+# `Source`, so only a holder of a `SecretSource` is welded. welded storage needs the pages capability (HAS_PAGES), so a secret class
 # or request is refused on a target without it (WELDED is false). a
 # bring-your-own-OS implementation gets secret classes by providing the os
 # contract's secret primitives.
@@ -151,10 +152,12 @@ pub rec Account {
     next:           *Account;
 }
 
-# the interface every buffer source implements
+# the interface every plain buffer source implements
 #
 # a consumer drives a source only through these members, through the `source_*`
-# functions below, so a host may supply its own source in place of `Pool`
+# functions below, so a host may supply its own source in place of `Pool`. a
+# source serves plain chunks only and refuses a secret request as misuse. its
+# type holds nothing welded, so a record holding a source passes through `ptr`
 # ---
 # ctx:              opaque context passed to every callback
 # fn_open_account:  open (account, handle, budgets per lane, reserve)
@@ -162,7 +165,6 @@ pub rec Account {
 # fn_acquire:       one chunk for (account, request, register on refusal)
 # fn_acquire_n:     a set of chunks, all or nothing, written to the output array
 # fn_release:       give a chunk back, `none` on success
-# fn_secret:        the welded view of a secret chunk, nil otherwise
 # fn_data:          the address of a held plain chunk, nil when stale
 # fn_retain:        count one more in-flight user of a held chunk
 # fn_settle:        count one in-flight user finished
@@ -175,12 +177,32 @@ pub rec Source {
     fn_acquire:       fun(ptr, *Account, Request, bool) Acquired;
     fn_acquire_n:     fun(ptr, *Account, *Request, usize, *Chunk, bool) Acquired;
     fn_release:       fun(ptr, *Account, Chunk) Reason;
-    fn_secret:        fun(ptr, Chunk) *^u8;
     fn_data:          fun(ptr, Ref) *u8;
     fn_retain:        fun(ptr, Ref) Reason;
     fn_settle:        fun(ptr, Ref) Reason;
     fn_in_flight:     fun(ptr, Ref) bool;
     fn_ready:         fun(ptr, *u64, usize) usize;
+}
+
+# the interface for secret-welded chunks
+#
+# a secret consumer drives it through the `secret_source_*` functions below. it
+# serves secret chunks only and refuses a plain request as misuse. `fn_view`
+# returns a welded pointer, so a record holding a secret source is welded
+# ---
+# ctx:              opaque context passed to every callback
+# fn_open_account:  open (account, handle, budgets per lane, reserve)
+# fn_close_account: close an account, giving up its registration
+# fn_acquire:       one secret chunk for (account, request, register on refusal)
+# fn_release:       give a secret chunk back, wiped in full, `none` on success
+# fn_view:          the welded view of a held secret chunk, nil when stale
+pub rec SecretSource {
+    ctx:              ptr;
+    fn_open_account:  fun(ptr, *Account, u64, *usize, usize) Reason;
+    fn_close_account: fun(ptr, *Account) Reason;
+    fn_acquire:       fun(ptr, *Account, Request, bool) Acquired;
+    fn_release:       fun(ptr, *Account, Chunk) Reason;
+    fn_view:          fun(ptr, Chunk) *^u8;
 }
 
 # one declared size class
@@ -1043,11 +1065,26 @@ fun pool_close_account(context: ptr, account: *Account) Reason {
     ret close_account(context::*Pool, account);
 }
 
+# a request on the wrong surface: counted as misuse with no other effect
+fun wrong_surface(pool: *Pool) Acquired {
+    if (pool == nil || !pool.made) { ret refusal(Status.error{}, Reason.misuse{}); }
+    if (!enter(pool))              { ret refusal(Status.error{}, Reason.misuse{}); }
+    val r: Reason = misused(pool);
+    leave(pool);
+    ret refusal(Status.error{}, r);
+}
+
 fun pool_acquire(context: ptr, account: *Account, request: Request, register: bool) Acquired {
+    if (request.secret) { ret wrong_surface(context::*Pool); }
     ret acquire(context::*Pool, account, request, register);
 }
 
 fun pool_acquire_n(context: ptr, account: *Account, requests: *Request, count: usize, out: *Chunk, register: bool) Acquired {
+    var i: usize = 0;
+    for (requests != nil && i < count) {
+        if (requests[i].secret) { ret wrong_surface(context::*Pool); }
+        i = i + 1;
+    }
     ret acquire_n(context::*Pool, account, requests, count, out, register);
 }
 
@@ -1055,7 +1092,17 @@ fun pool_release(context: ptr, account: *Account, chunk: Chunk) Reason {
     ret release(context::*Pool, account, chunk);
 }
 
-fun pool_secret(context: ptr, chunk: Chunk) *^u8 {
+fun pool_secret_acquire(context: ptr, account: *Account, request: Request, register: bool) Acquired {
+    if (!request.secret) { ret wrong_surface(context::*Pool); }
+    ret acquire(context::*Pool, account, request, register);
+}
+
+fun pool_secret_release(context: ptr, account: *Account, chunk: Chunk) Reason {
+    if (chunk.data != nil) { ret wrong_surface(context::*Pool).reason; }
+    ret release(context::*Pool, account, chunk);
+}
+
+fun pool_secret_view(context: ptr, chunk: Chunk) *^u8 {
     ret secret(context::*Pool, chunk);
 }
 
@@ -1088,12 +1135,23 @@ pub fun source(pool: *Pool) Source {
         fn_acquire:       pool_acquire,
         fn_acquire_n:     pool_acquire_n,
         fn_release:       pool_release,
-        fn_secret:        pool_secret,
         fn_data:          pool_data,
         fn_retain:        pool_retain,
         fn_settle:        pool_settle,
         fn_in_flight:     pool_in_flight,
         fn_ready:         pool_ready,
+    };
+}
+
+# the pool as a SecretSource, borrowing the pool
+pub fun secret_source(pool: *Pool) SecretSource {
+    ret SecretSource{
+        ctx:              pool::ptr,
+        fn_open_account:  pool_open_account,
+        fn_close_account: pool_close_account,
+        fn_acquire:       pool_secret_acquire,
+        fn_release:       pool_secret_release,
+        fn_view:          pool_secret_view,
     };
 }
 
@@ -1131,11 +1189,6 @@ pub fun source_release(s: *Source, account: *Account, chunk: Chunk) Reason {
     ret s.fn_release(s.ctx, account, chunk);
 }
 
-# the welded view of a secret chunk, nil for a plain one
-pub fun source_secret(s: *Source, chunk: Chunk) *^u8 {
-    ret s.fn_secret(s.ctx, chunk);
-}
-
 # the address of a held plain chunk, nil when the ref is stale
 pub fun source_data(s: *Source, ref: Ref) *u8 {
     ret s.fn_data(s.ctx, ref);
@@ -1161,6 +1214,33 @@ pub fun source_in_flight(s: *Source, ref: Ref) bool {
 # ret: how many handles were written, at most capacity
 pub fun source_ready(s: *Source, output: *u64, capacity: usize) usize {
     ret s.fn_ready(s.ctx, output, capacity);
+}
+
+# open an account on a secret source, as `source_open_account`
+pub fun secret_source_open_account(s: *SecretSource, account: *Account, handle: u64, budgets: *usize, reserve: usize) Reason {
+    ret s.fn_open_account(s.ctx, account, handle, budgets, reserve);
+}
+
+# close an account on a secret source
+pub fun secret_source_close_account(s: *SecretSource, account: *Account) Reason {
+    ret s.fn_close_account(s.ctx, account);
+}
+
+# acquire one secret chunk, `request.secret` must be set
+# ---
+# register: whether an exhausted or memory refusal registers the account
+pub fun secret_source_acquire(s: *SecretSource, account: *Account, request: Request, register: bool) Acquired {
+    ret s.fn_acquire(s.ctx, account, request, register);
+}
+
+# release a secret chunk, wiping it in full
+pub fun secret_source_release(s: *SecretSource, account: *Account, chunk: Chunk) Reason {
+    ret s.fn_release(s.ctx, account, chunk);
+}
+
+# the welded view of a held secret chunk, nil when stale
+pub fun secret_source_view(s: *SecretSource, chunk: Chunk) *^u8 {
+    ret s.fn_view(s.ctx, chunk);
 }
 
 # bytes an allocator.fixed arena needs to hold a pool's slot metadata and the
@@ -1927,10 +2007,6 @@ $if (capability.HOSTED) {
         ret Reason.none{};
     }
 
-    fun stub_secret(context: ptr, chunk: Chunk) *^u8 {
-        ret nil;
-    }
-
     fun stub_data(context: ptr, ref: Ref) *u8 {
         val stub: *Stub = context::*Stub;
         if (!stub_live(stub, ref)) { ret nil; }
@@ -1978,6 +2054,19 @@ $if (capability.HOSTED) {
         var over_pool: Source = source(?pool);
         val pooled:    i32    = consume(?over_pool);
         if (pooled != 0) { ret 10 + pooled; }
+        # a plain source refuses a secret request as misuse
+        var b:       [2]usize;
+        var account: Account;
+        if (!is_none(source_open_account(?over_pool, ?account, 1, budgets_of(64, ?b[0]), 0))) { ret 30; }
+        var hidden: Request = ask(16);
+        hidden.secret = true;
+        val misuse_before: i64      = pool.misuse;
+        val refused:       Acquired = source_acquire(?over_pool, ?account, hidden, false);
+        if (!sel refused.reason.misuse || pool.misuse != misuse_before + 1) { ret 31; }
+        var spare: Chunk;
+        val set:   Acquired = source_acquire_n(?over_pool, ?account, ?hidden, 1, ?spare, false);
+        if (!sel set.reason.misuse)                                                    { ret 32; }
+        if (account.held != 0 || !is_none(source_close_account(?over_pool, ?account))) { ret 33; }
         var stub: Stub;
         var own:  Source = Source{
             ctx: (?stub)::ptr,
@@ -1986,7 +2075,6 @@ $if (capability.HOSTED) {
             fn_acquire:       stub_acquire,
             fn_acquire_n:     stub_acquire_n,
             fn_release:       stub_release,
-            fn_secret:        stub_secret,
             fn_data:          stub_data,
             fn_retain:        stub_retain,
             fn_settle:        stub_settle,
@@ -1995,6 +2083,103 @@ $if (capability.HOSTED) {
         };
         val stubbed: i32 = consume(?own);
         if (stubbed != 0) { ret 40 + stubbed; }
+        ret 0;
+    }
+
+    # records carrying a plain source, by value and by pointer, as a completion,
+    # thread argument or cancel callback context would
+    rec Driver {
+        s:     Source;
+        count: u32;
+    }
+
+    rec Connection {
+        s:     *Source;
+        owner: *Driver;
+    }
+
+    test "buffers: a record holding a Source passes through ptr" {
+        var stub:   Stub;
+        var driver: Driver;
+        driver.s = Source{
+            ctx: (?stub)::ptr,
+            fn_open_account:  stub_open,
+            fn_close_account: stub_close,
+            fn_acquire:       stub_acquire,
+            fn_acquire_n:     stub_acquire_n,
+            fn_release:       stub_release,
+            fn_data:          stub_data,
+            fn_retain:        stub_retain,
+            fn_settle:        stub_settle,
+            fn_in_flight:     stub_in_flight,
+            fn_ready:         stub_ready,
+        };
+        driver.count = 3;
+        val carried: ptr     = (?driver)::ptr;
+        val back:    *Driver = carried::*Driver;
+        if (back != ?driver || back.count != 3) { ret 1; }
+        var connection: Connection  = Connection{s: ?back.s, owner: back};
+        val passed:     ptr         = (?connection)::ptr;
+        val again:      *Connection = passed::*Connection;
+        if (again.owner != ?driver || again.s.ctx != (?stub)::ptr) { ret 2; }
+        val result: i32 = consume(again.s);
+        if (result != 0) { ret 10 + result; }
+        ret 0;
+    }
+
+    # a secret consumer written only against SecretSource
+    fun consume_secret(s: *SecretSource) i32 {
+        var b:       [2]usize;
+        var account: Account;
+        if (!is_none(secret_source_open_account(s, ?account, 5, budgets_of(4096, ?b[0]), 0))) { ret 1; }
+        fin { secret_source_close_account(s, ?account); }
+        var request: Request  = ask(64);
+        val plain:   Acquired = secret_source_acquire(s, ?account, request, false);
+        if (!sel plain.reason.misuse) { ret 2; }
+        request.secret = true;
+        val got: Acquired = secret_source_acquire(s, ?account, request, false);
+        if (!sel got.status.ok || got.chunk.data != nil) { ret 3; }
+        val view: *^u8 = secret_source_view(s, got.chunk);
+        if (view == nil) { ret 4; }
+        var i: usize = 0;
+        for (i < 64) {
+            view[i] = 0x5a;
+            i       = i + 1;
+        }
+        if (!is_none(secret_source_release(s, ?account, got.chunk))) { ret 5; }
+        if (secret_source_view(s, got.chunk) != nil)                 { ret 6; }
+        i = 0;
+        for (i < 64) {
+            if (view[i]:>u8 != 0) { ret 7; }
+            i = i + 1;
+        }
+        ret 0;
+    }
+
+    test "buffers: a secret consumer runs through SecretSource alone" {
+        var arena: Arena;
+        if (!arena_make(?arena, 1 << 20)) { ret 1; }
+        fin { arena_free(?arena); }
+        var classes: [2]ClassConfig = [2]ClassConfig{
+            ClassConfig{size: 64, align: 0, secret: false, high_water: 1},
+            ClassConfig{size: 64, align: 0, secret: true, high_water: 1},
+        };
+        var pool: Pool;
+        if (!make(?pool, test_config(?classes[0], 2, 1 << 16), ?arena.counted)) { ret 2; }
+        fin { destroy(?pool); }
+        var secrets: SecretSource = secret_source(?pool);
+        val result:  i32          = consume_secret(?secrets);
+        if (result != 0) { ret 10 + result; }
+        # a plain chunk is not released through the secret surface
+        var plain:   Source = source(?pool);
+        var b:       [2]usize;
+        var account: Account;
+        if (!is_none(source_open_account(?plain, ?account, 1, budgets_of(4096, ?b[0]), 0))) { ret 3; }
+        val held: Acquired = source_acquire(?plain, ?account, ask(16), false);
+        if (!sel held.status.ok)                                               { ret 4; }
+        if (!is_misuse(secret_source_release(?secrets, ?account, held.chunk))) { ret 5; }
+        if (!is_none(source_release(?plain, ?account, held.chunk)))            { ret 6; }
+        if (!is_none(source_close_account(?plain, ?account)))                  { ret 7; }
         ret 0;
     }
 

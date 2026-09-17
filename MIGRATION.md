@@ -98,6 +98,23 @@ These are the known call sites to change in the family:
 - A custom source must fill all seven new members. A `Source` built with `source(pool)` needs no change.
 - Consumers call the `source_*` functions (`source_open_account`, `source_acquire`, `source_data`, `source_ready`, ...) with a `*Source` instead of calling `s.fn_*(s.ctx, ...)` by hand.
 
+## Secret chunks moved to `buffers.SecretSource` (#771)
+
+`Source.fn_secret` returned `*^u8`, which welded `Source` and every record holding one, so those records could not pass through `ptr`. Secret chunks now have their own interface.
+
+- `Source` lost `fn_secret`, and `source_secret` is gone. A custom `Source` drops that member.
+- A `Source` serves plain chunks only. A request with `secret: true` is refused as `misuse`.
+- Secret consumers take a `SecretSource`, built with `secret_source(pool)`, and call `secret_source_open_account`, `secret_source_close_account`, `secret_source_acquire` (with `secret: true`), `secret_source_release` and `secret_source_view`. A record holding a `SecretSource` is welded.
+
+```mach
+# before
+val view: *^u8 = buffers.source_secret(?src, chunk);
+
+# after
+var secrets: buffers.SecretSource = buffers.secret_source(?pool);
+val view:    *^u8                 = buffers.secret_source_view(?secrets, chunk);
+```
+
 
 # std 3.x to 4.0.0
 
