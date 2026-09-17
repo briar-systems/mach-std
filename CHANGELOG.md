@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `std.system.os.error(code, operation)` builds the `io.error.Error` for a
+  native code a primitive returned, and `std.system.os.error_kind(code)` is the
+  portable reading of such a code. A caller that checks a raw primitive return
+  compares `os.error_kind(n)` with a kind, never the code with an errno.
+  `std.system.os.error_message(code)` gives the native text (#688).
+- `io.error.kind_name(kind)` names a kind, for an error with no native code
+  behind it (#688).
+- `ELOOP` on linux and windows, where windows maps
+  `ERROR_CANT_RESOLVE_FILENAME` to it (#688).
+
 ### Changed
 - **Breaking.** `memory.table.make(table, a, element_size, initial)` takes the
   `allocator.Allocator` every chunk is taken from and returned to, and
@@ -22,6 +33,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `net.async` backend hold the allocator their tables use in an `allocator`
   field, which `make` sets to a page allocator (#689).
 - The freestanding ratchet includes `std.memory.table` (#689).
+- **Breaking.** Native codes classify with the full kind set. A code that used
+  to be `OTHER` now gets its own kind: `EIO` is `IO`, `ENOENT` is `NOT_FOUND`,
+  `EEXIST` is `EXISTS`, `ENOTDIR` is `NOT_DIRECTORY`, `EISDIR` is
+  `IS_DIRECTORY`, `ENOTEMPTY` is `NOT_EMPTY`, `ENAMETOOLONG` is
+  `NAME_TOO_LONG`, `EBUSY` is `BUSY`, `ERANGE` is `RANGE`, `ECHILD` is
+  `NO_CHILD` and `ELOOP` is `LOOP`. On windows every unmapped native error was
+  already `EIO`, so it now reads as `IO` (#688).
+- **Breaking.** `std.system.os.message` takes an `io.error.Error`, not a code.
+  It gives the native text when a native code is behind the error and the
+  kind's name otherwise. The code form is `std.system.os.error_message` (#688).
+- **Breaking.** An error std raises itself, with no native call behind it,
+  now has `code` 0 and states its kind. Before, it borrowed an errno such as
+  `EBADF` for a closed handle or `EINVAL` for invalid use, so a caller that
+  compared `code` with those errnos must compare `kind` instead (#688).
+- **Breaking.** `std.terminal.control_failure` and `read_failure` are defined
+  in `std.terminal`. `std.terminal.error` holds only the outcome tags and
+  `code` (#688).
+
+### Removed
+- **Breaking.** `io.error.from_code` and `io.error.message`. Use
+  `std.system.os.error` and `std.system.os.message`, or `io.error.make` for an
+  error with no native code. `std.io.error` no longer depends on the OS layer
+  and builds freestanding, and so does `std.terminal.error` (#688).
 
 ## [3.3.0] - 2026-09-16
 
