@@ -74,6 +74,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `memory.buffers` no longer ignores a refused backing release. Plain and
   secret releases, and the cleanup after a failed secret borrow, count the
   failure in `release_failures`. Found in the #775 sweep (#779).
+- On Windows, canceling a stream operation after its socket's close no longer
+  panics the runtime with "source cancellation lost operation ownership". The
+  close had already asked the kernel to abort the operation, and the cancel
+  refused it with EBADF. It now waits for the aborted packet, as it does for an
+  operation it aborts itself. The local-socket backend already did (#786).
 
 ## [5.0.1] - 2026-09-17
 
