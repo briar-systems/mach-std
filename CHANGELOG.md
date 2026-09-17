@@ -7,13 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `time.Instant`, a monotonic instant that is distinct from the wall-clock
+  `time.Time` and never converts to or from it. Read it with `time.instant()`,
+  which needs the clock capability. The arithmetic is `instant_add`,
+  `instant_sub`, `instant_before`, `instant_after` and `instant_equal`, and it
+  builds freestanding. `time.elapsed(start)` and `time.remaining(deadline)`
+  measure against the monotonic clock (#752).
+
 ### Changed
+- **Breaking:** every deadline is an `Instant`.
+  - `cancel.make_root(scope, deadline: opt[Instant])` and
+    `cancel.make_child(scope, parent, deadline: opt[Instant])` replace the
+    `has_deadline` flag and its placeholder `Time`.
+  - `cancel.expire` takes the current `Instant`, and `cancel.Deadline.at` is an
+    `Instant`.
+  - These now take an `Instant` deadline: `io.runtime.submit_timer`,
+    `io.runtime.submit_timer_scoped`, `sync.condition.wait_until`,
+    `sync.channel.send_until`, `sync.channel.receive_until`,
+    `sync.worker_pool.submit_until` and `net.resolve.wait_until`.
+  - A wall-clock `Time` passed as a deadline no longer compiles
+    (`test/deadline`). MIGRATION.md has the before and after (#752).
+- **Breaking:** `time.Time` is wall-clock only. `time.now`, `time.since` and
+  `time.until` read the calendar clock, which can jump (#752).
+- `io.runtime` keeps one refcounted deadline entry per (scope, deadline), not
+  one per operation. N operations under one scope hold a single heap entry, and
+  submission and completion cost stays flat from 1k to 100k operations. Expiry
+  still ends every operation still registered in the scope (#741).
 - The license copyright is held by Briar Systems LLC. The MIT terms are unchanged (#765).
 - **Breaking:** `std.memory.buffers.Source` gained `fn_open_account`,
   `fn_close_account`, `fn_data`, `fn_retain`, `fn_settle`, `fn_in_flight` and
   `fn_ready`, so a consumer can drive a whole buffer lifecycle through the
   interface alone. `source(pool)` fills every member, and new `source_*` free
   functions call through a `*Source` without touching the function pointers (#767).
+
+### Removed
+- **Breaking:** `time.monotonic`. Use `time.instant` (#752).
 
 ## [4.2.0] - 2026-09-17
 

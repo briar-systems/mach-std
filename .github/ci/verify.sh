@@ -26,6 +26,7 @@ case "$MACH_CI_LEG" in
         # classification is target-independent, so one leg is the whole signal
         bash test/derive/verify.sh
         bash test/secret/verify.sh
+        bash test/deadline/verify.sh
         ;;
     aarch64-linux)
         bash test/native/verify.sh "$mach" linux-arm64

@@ -17,6 +17,7 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 
@@ -117,8 +118,9 @@ val SLOT_CANCELLING: u8 = 3;
 val SLOT_RELEASING:  u8 = 4;
 
 # a slot index sentinel for the free list and the completion queue
-val NO_SLOT:  usize = ~(0::usize);
-val NO_TIMER: usize = ~(0::usize);
+val NO_SLOT:   usize = ~(0::usize);
+val NO_TIMER:  usize = ~(0::usize);
+val NO_RECORD: usize = ~(0::usize);
 
 # a source is a registered backend, so the table starts far below the slots
 val SOURCE_INITIAL: usize = 4;
@@ -152,7 +154,7 @@ rec Slot {
     next:                   usize;
     completion:             Completion;
     operation_timer_index:  usize;
-    deadline_timer_index:   usize;
+    deadline_record:        usize;
     cancellation_active:    bool;
     cancellation_pending:   bool;
     lifecycle_cancellation: bool;
@@ -166,11 +168,22 @@ rec Slot {
 val TIMER_OPERATION:      u8 = 0;
 val TIMER_SCOPE_DEADLINE: u8 = 1;
 
+# token names an operation entry's slot and record a scope entry's record
 rec TimerEntry {
-    deadline: time.Time;
+    deadline: time.Instant;
     token:    Token;
     purpose:  u8;
-    scope:    *cancel.Scope;
+    record:   usize;
+}
+
+# every operation waiting on one owner's deadline shares one record and so one
+# heap entry, however many operations the scope holds
+rec DeadlineRecord {
+    owner:       *cancel.Scope;
+    at:          time.Instant;
+    refs:        usize;
+    timer_index: usize;
+    next:        usize;
 }
 
 pub val OPEN:      u8 = lifecycle.OPEN;
@@ -182,10 +195,16 @@ pub val DESTROYED: u8 = 3;
 pub rec Runtime {
     queue: os.IoQueue;
     # where every table's chunks come from
-    allocator:       allocator.Allocator;
-    slots:           table.Table;
-    timers:          table.Table;
-    sources:         table.Table;
+    allocator: allocator.Allocator;
+    slots:     table.Table;
+    timers:    table.Table;
+    sources:   table.Table;
+    deadlines: table.Table;
+    # open addressed on (owner, at), a power of two at least twice the slots
+    deadline_index:  table.Table;
+    deadline_used:   usize;
+    deadline_free:   usize;
+    deadline_live:   usize;
     native_events:   *NativeEvent;
     initial:         usize;
     slot_count:      usize;
@@ -235,6 +254,8 @@ pub fun aliases(runtime: *Runtime, data: *u8, len: usize) bool {
     ret table.aliases(?runtime.slots, data, len) ||
         table.aliases(?runtime.timers, data, len) ||
         table.aliases(?runtime.sources, data, len) ||
+        table.aliases(?runtime.deadlines, data, len) ||
+        table.aliases(?runtime.deadline_index, data, len) ||
         memory.ranges_overlap(runtime.native_events::*u8, native_event_bytes,
         data, len);
 }
@@ -249,6 +270,14 @@ fun source_at(runtime: *Runtime, index: usize) *Source {
 
 fun timer_at(runtime: *Runtime, index: usize) *TimerEntry {
     ret table.at(?runtime.timers, index)::*TimerEntry;
+}
+
+fun deadline_at(runtime: *Runtime, index: usize) *DeadlineRecord {
+    ret table.at(?runtime.deadlines, index)::*DeadlineRecord;
+}
+
+fun bucket_at(runtime: *Runtime, index: usize) *usize {
+    ret table.at(?runtime.deadline_index, index)::*usize;
 }
 
 # the slot table is the runtime's current size, not a limit it was given
@@ -273,7 +302,7 @@ fun init_slot(runtime: *Runtime, index: usize) {
     slot.runtime                = runtime;
     slot.next                   = NO_SLOT;
     slot.operation_timer_index  = NO_TIMER;
-    slot.deadline_timer_index   = NO_TIMER;
+    slot.deadline_record        = NO_RECORD;
     slot.cancellation_active    = false;
     slot.cancellation_pending   = false;
     slot.lifecycle_cancellation = false;
@@ -320,16 +349,90 @@ fun free_pop(runtime: *Runtime) usize {
 }
 
 fun release_tables(runtime: *Runtime) {
+    table.destroy(?runtime.deadline_index);
+    table.destroy(?runtime.deadlines);
     table.destroy(?runtime.sources);
     table.destroy(?runtime.timers);
     table.destroy(?runtime.slots);
 }
 
-# every slot carries at most an operation timer and a scope deadline, so a
-# reserve of twice the slot table is a push that cannot fail
+fun deadline_hash(owner: *cancel.Scope, at: time.Instant) usize {
+    var h: u64 = owner::u64;
+    h = (h ^ at.sec::u64) * 0x9e3779b97f4a7c15;
+    h = (h ^ at.nsec::u64) * 0xbf58476d1ce4e5b9;
+    ret (h ^ (h >> 31))::usize;
+}
+
+fun deadline_home(runtime: *Runtime, index: usize) usize {
+    val record: *DeadlineRecord = deadline_at(runtime, index);
+    ret deadline_hash(record.owner, record.at) & (runtime.deadline_index.capacity - 1);
+}
+
+# the index is at most half full, so a probe always reaches an empty bucket
+fun deadline_index_insert(runtime: *Runtime, index: usize) {
+    val mask:   usize = runtime.deadline_index.capacity - 1;
+    var bucket: usize = deadline_home(runtime, index);
+    for (@bucket_at(runtime, bucket) != 0) { bucket = (bucket + 1) & mask; }
+    @bucket_at(runtime, bucket) = index + 1;
+}
+
+fun deadline_find(runtime: *Runtime, owner: *cancel.Scope, at: time.Instant) usize {
+    val mask:   usize = runtime.deadline_index.capacity - 1;
+    var bucket: usize = deadline_hash(owner, at) & mask;
+    for (@bucket_at(runtime, bucket) != 0) {
+        val index:  usize           = @bucket_at(runtime, bucket) - 1;
+        val record: *DeadlineRecord = deadline_at(runtime, index);
+        if (record.owner == owner && time.instant_equal(record.at, at)) { ret index; }
+        bucket = (bucket + 1) & mask;
+    }
+    ret NO_RECORD;
+}
+
+# backward shift keeps every probe chain unbroken without tombstones
+fun deadline_index_remove(runtime: *Runtime, index: usize) {
+    val mask: usize = runtime.deadline_index.capacity - 1;
+    var hole: usize = deadline_home(runtime, index);
+    for (@bucket_at(runtime, hole) != index + 1) { hole = (hole + 1) & mask; }
+    var next: usize = (hole + 1) & mask;
+    for (@bucket_at(runtime, next) != 0) {
+        val home: usize = deadline_home(runtime, @bucket_at(runtime, next) - 1);
+        if (((next - home) & mask) >= ((next - hole) & mask)) {
+            @bucket_at(runtime, hole) = @bucket_at(runtime, next);
+            hole                      = next;
+        }
+        next = (next + 1) & mask;
+    }
+    @bucket_at(runtime, hole) = 0;
+}
+
+fun deadline_rebuild(runtime: *Runtime, buckets: usize) bool {
+    var fresh: table.Table;
+    if (!table.make(?fresh, ?runtime.allocator, $size_of(usize), buckets)) { ret false; }
+    var stale: table.Table = runtime.deadline_index;
+    runtime.deadline_index = fresh;
+    memory.raw_zero(runtime.deadline_index.chunks[0], runtime.deadline_index.capacity * $size_of(usize));
+    var index: usize = 0;
+    for (index < runtime.deadline_used) {
+        if (deadline_at(runtime, index).refs > 0) { deadline_index_insert(runtime, index); }
+        index = index + 1;
+    }
+    table.destroy(?stale);
+    ret true;
+}
+
+# a live record holds at least one live slot, so records never outnumber slots
+# and the index stays at most half full
+fun reserve_deadlines(runtime: *Runtime) bool {
+    if (!table.reserve(?runtime.deadlines, runtime.slots.capacity))    { ret false; }
+    if (runtime.deadline_index.capacity >= runtime.slots.capacity * 2) { ret true; }
+    ret deadline_rebuild(runtime, runtime.slots.capacity * 2);
+}
+
+# every slot carries at most an operation timer and holds at most one deadline
+# record, so a reserve of twice the slot table is a push that cannot fail
 fun reserve_timers(runtime: *Runtime) bool {
-    if (runtime.slots.capacity > ~(0::usize) / 2) { ret false; }
-    ret table.reserve(?runtime.timers, runtime.slots.capacity * 2);
+    if (runtime.slots.capacity > ~(0::usize) / 4) { ret false; }
+    ret table.reserve(?runtime.timers, runtime.slots.capacity * 2) && reserve_deadlines(runtime);
 }
 
 # initial is the size the runtime starts at, not a ceiling: the slot, timer and
@@ -348,8 +451,13 @@ pub fun make(runtime: *Runtime, initial: usize) err[io_error.Error] {
     if (!table.make(?runtime.slots, ?runtime.allocator, $size_of(Slot), initial)) {
         ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
     }
+    runtime.deadline_used = 0;
+    runtime.deadline_free = NO_RECORD;
+    runtime.deadline_live = 0;
     if (!table.make(?runtime.timers, ?runtime.allocator, $size_of(TimerEntry), initial) ||
         !table.make(?runtime.sources, ?runtime.allocator, $size_of(Source), SOURCE_INITIAL) ||
+        !table.make(?runtime.deadlines, ?runtime.allocator, $size_of(DeadlineRecord), initial) ||
+        !deadline_rebuild(runtime, initial * 2) ||
         !reserve_timers(runtime)) {
         release_tables(runtime);
         ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
@@ -538,7 +646,7 @@ fun claim_locked(runtime: *Runtime, operation: Operation, source_index: u32, tok
     slot.generation             = generation;
     slot.operation              = operation;
     slot.operation_timer_index  = NO_TIMER;
-    slot.deadline_timer_index   = NO_TIMER;
+    slot.deadline_record        = NO_RECORD;
     slot.cancellation_active    = false;
     slot.cancellation_pending   = false;
     slot.lifecycle_cancellation = false;
@@ -596,21 +704,21 @@ fun token_equal(a: Token, b: Token) bool {
 }
 
 fun timer_less(a: TimerEntry, b: TimerEntry) bool {
-    if (time.time_before(a.deadline, b.deadline)) { ret true; }
-    if (time.time_after(a.deadline, b.deadline))  { ret false; }
-    if (a.purpose != b.purpose)                   { ret a.purpose == TIMER_SCOPE_DEADLINE; }
-    if (a.token.index < b.token.index)            { ret true; }
-    if (a.token.index > b.token.index)            { ret false; }
+    if (time.instant_before(a.deadline, b.deadline)) { ret true; }
+    if (time.instant_after(a.deadline, b.deadline))  { ret false; }
+    if (a.purpose != b.purpose)                      { ret a.purpose == TIMER_SCOPE_DEADLINE; }
+    if (a.purpose == TIMER_SCOPE_DEADLINE)           { ret a.record < b.record; }
+    if (a.token.index < b.token.index)               { ret true; }
+    if (a.token.index > b.token.index)               { ret false; }
     ret a.token.generation < b.token.generation;
 }
 
 fun timer_set_index(runtime: *Runtime, entry: TimerEntry, index: usize) {
-    val slot: *Slot = slot_at(runtime, entry.token.index::usize);
     if (entry.purpose == TIMER_OPERATION) {
-        slot.operation_timer_index = index;
+        slot_at(runtime, entry.token.index::usize).operation_timer_index = index;
     }
     or {
-        slot.deadline_timer_index = index;
+        deadline_at(runtime, entry.record).timer_index = index;
     }
 }
 
@@ -674,14 +782,68 @@ fun timer_remove_at(runtime: *Runtime, index: usize) TimerEntry {
     ret removed;
 }
 
-fun timer_remove_token(runtime: *Runtime, token: Token, purpose: u8) bool {
+fun timer_remove_operation(runtime: *Runtime, token: Token) bool {
     val slot: *Slot = slot_for(runtime, token);
     if (slot == nil) { ret false; }
-    var index: usize = slot.operation_timer_index;
-    if (purpose == TIMER_SCOPE_DEADLINE)                                                                                                    { index = slot.deadline_timer_index; }
-    if (index >= runtime.timer_count || timer_at(runtime, index).purpose != purpose || !token_equal(timer_at(runtime, index).token, token)) { ret false; }
+    val index: usize = slot.operation_timer_index;
+    if (index >= runtime.timer_count || timer_at(runtime, index).purpose != TIMER_OPERATION || !token_equal(timer_at(runtime, index).token, token)) { ret false; }
     timer_remove_at(runtime, index);
     ret true;
+}
+
+fun deadline_push(runtime: *Runtime, index: usize) {
+    timer_push(runtime, TimerEntry{
+        deadline: deadline_at(runtime, index).at,
+        token:    Token{index: 0, generation: 0},
+        purpose:  TIMER_SCOPE_DEADLINE,
+        record:   index,
+    });
+}
+
+# a record whose entry already fired is armed again, so a late joiner still
+# reaches expiry
+fun deadline_acquire(runtime: *Runtime, owner: *cancel.Scope, at: time.Instant) usize {
+    val found: usize = deadline_find(runtime, owner, at);
+    if (found != NO_RECORD) {
+        val shared: *DeadlineRecord = deadline_at(runtime, found);
+        shared.refs = shared.refs + 1;
+        if (shared.timer_index == NO_TIMER) { deadline_push(runtime, found); }
+        ret found;
+    }
+    var index: usize = runtime.deadline_free;
+    if (index != NO_RECORD) {
+        runtime.deadline_free = deadline_at(runtime, index).next;
+    }
+    or {
+        index                 = runtime.deadline_used;
+        runtime.deadline_used = runtime.deadline_used + 1;
+    }
+    @deadline_at(runtime, index) = DeadlineRecord{
+        owner:       owner,
+        at:          at,
+        refs:        1,
+        timer_index: NO_TIMER,
+        next:        NO_RECORD,
+    };
+    runtime.deadline_live = runtime.deadline_live + 1;
+    deadline_index_insert(runtime, index);
+    deadline_push(runtime, index);
+    ret index;
+}
+
+fun deadline_release(runtime: *Runtime, slot: *Slot) {
+    val index: usize = slot.deadline_record;
+    if (index == NO_RECORD) { ret; }
+    slot.deadline_record = NO_RECORD;
+    val record: *DeadlineRecord = deadline_at(runtime, index);
+    record.refs = record.refs - 1;
+    if (record.refs > 0)                { ret; }
+    if (record.timer_index != NO_TIMER) { timer_remove_at(runtime, record.timer_index); }
+    deadline_index_remove(runtime, index);
+    record.owner          = nil;
+    record.next           = runtime.deadline_free;
+    runtime.deadline_free = index;
+    runtime.deadline_live = runtime.deadline_live - 1;
 }
 
 # a completion lives in its own slot and the queue links slots, so there is no
@@ -727,8 +889,9 @@ fun close_error(cause: lifecycle.Cause) io_error.Error {
 }
 
 fun remove_slot_timers(runtime: *Runtime, token: Token) {
-    timer_remove_token(runtime, token, TIMER_OPERATION);
-    timer_remove_token(runtime, token, TIMER_SCOPE_DEADLINE);
+    timer_remove_operation(runtime, token);
+    val slot: *Slot = slot_for(runtime, token);
+    if (slot != nil) { deadline_release(runtime, slot); }
 }
 
 fun scope_cancel_callback(context: ptr, reason: cancel.Reason) {
@@ -822,12 +985,7 @@ fun attach_scope_locked(runtime: *Runtime, token: Token, scope: *cancel.Scope) c
     val query: cancel.DeadlineQuery = cancel.get_deadline(scope);
     if (sel query.ok) {
         if (sel query.ok.some) {
-            timer_push(runtime, TimerEntry{
-                deadline: query.ok.some.at,
-                token:    token,
-                purpose:  TIMER_SCOPE_DEADLINE,
-                scope:    query.ok.some.owner,
-            });
+            slot.deadline_record = deadline_acquire(runtime, query.ok.some.owner, query.ok.some.at);
         }
     }
     ret cancel.Reason.active{};
@@ -841,7 +999,7 @@ fun submit_scoped_with_source(
     operation: Operation,
 ) res[Token, io_error.Error] {
     if (runtime == nil || scope == nil) { ret res[Token, io_error.Error].err{invalid(io_error.OP_SUBMIT)}; }
-    val now: time.Clock = time.monotonic();
+    val now: time.InstantClock = time.instant();
     if (sel now.err) { ret res[Token, io_error.Error].err{now.err}; }
     cancel.expire(scope, now.ok);
     val query:      cancel.DeadlineQuery = cancel.get_deadline(scope);
@@ -978,7 +1136,7 @@ pub fun complete_cancellation(runtime: *Runtime, token: Token) err[io_error.Erro
 
 # deadlines are absolute monotonic instants and never expire early
 # late delivery is limited only by native scheduling and runtime dequeue latency
-pub fun submit_timer(runtime: *Runtime, deadline: time.Time, context: usize) res[Token, io_error.Error] {
+pub fun submit_timer(runtime: *Runtime, deadline: time.Instant, context: usize) res[Token, io_error.Error] {
     if (runtime == nil || deadline.sec < 0 || deadline.nsec < 0 || deadline.nsec >= 1000000000) {
         ret res[Token, io_error.Error].err{invalid(io_error.OP_SUBMIT)};
     }
@@ -997,7 +1155,7 @@ pub fun submit_timer(runtime: *Runtime, deadline: time.Time, context: usize) res
             deadline: deadline,
             token:    token,
             purpose:  TIMER_OPERATION,
-            scope:    nil,
+            record:   NO_RECORD,
         });
     }
     mutex.unlock(?runtime.lock);
@@ -1005,11 +1163,11 @@ pub fun submit_timer(runtime: *Runtime, deadline: time.Time, context: usize) res
     ret res[Token, io_error.Error].ok{token};
 }
 
-pub fun submit_timer_scoped(runtime: *Runtime, scope: *cancel.Scope, deadline: time.Time, context: usize) res[Token, io_error.Error] {
+pub fun submit_timer_scoped(runtime: *Runtime, scope: *cancel.Scope, deadline: time.Instant, context: usize) res[Token, io_error.Error] {
     if (runtime == nil || scope == nil || deadline.sec < 0 || deadline.nsec < 0 || deadline.nsec >= 1000000000) {
         ret res[Token, io_error.Error].err{invalid(io_error.OP_SUBMIT)};
     }
-    val now: time.Clock = time.monotonic();
+    val now: time.InstantClock = time.instant();
     if (sel now.err) { ret res[Token, io_error.Error].err{now.err}; }
     cancel.expire(scope, now.ok);
     val operation: Operation = Operation{kind: TIMER, resource: 0, buffer: nil, length: 0, offset: 0, context: context};
@@ -1036,7 +1194,7 @@ pub fun submit_timer_scoped(runtime: *Runtime, scope: *cancel.Scope, deadline: t
         deadline: deadline,
         token:    token,
         purpose:  TIMER_OPERATION,
-        scope:    nil,
+        record:   NO_RECORD,
     });
     mutex.unlock(?runtime.lock);
     ret res[Token, io_error.Error].ok{token};
@@ -1047,7 +1205,7 @@ pub fun cancel_timer(runtime: *Runtime, token: Token) err[io_error.Error] {
     if (runtime == nil) { ret err[io_error.Error].err{invalid(io_error.OP_SUBMIT)}; }
     mutex.lock(?runtime.lock);
     val slot: *Slot = slot_for(runtime, token);
-    if (slot == nil || slot.operation.kind != TIMER || !timer_remove_token(runtime, token, TIMER_OPERATION)) {
+    if (slot == nil || slot.operation.kind != TIMER || !timer_remove_operation(runtime, token)) {
         mutex.unlock(?runtime.lock);
         ret err[io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_SUBMIT)};
     }
@@ -1056,7 +1214,7 @@ pub fun cancel_timer(runtime: *Runtime, token: Token) err[io_error.Error] {
         ret err[io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_SUBMIT)};
     }
     slot.cancellation_active = false;
-    timer_remove_token(runtime, token, TIMER_SCOPE_DEADLINE);
+    deadline_release(runtime, slot);
     enqueue(runtime, token, slot, 0, 0, 0, 0, true, io_error.make(io_error.CANCELLED, io_error.OP_WAIT), false);
     val wake_result: i64 = os.io_queue_wake(?runtime.queue);
     mutex.unlock(?runtime.lock);
@@ -1064,16 +1222,17 @@ pub fun cancel_timer(runtime: *Runtime, token: Token) err[io_error.Error] {
     ret err[io_error.Error].ok{};
 }
 
-fun timers_expire(runtime: *Runtime, now: time.Time) *cancel.Scope {
+# a fired scope entry leaves its record to the registrations that still hold it
+fun timers_expire(runtime: *Runtime, now: time.Instant) *cancel.Scope {
     # all due timers enter the completion queue in deadline and token order
-    for (runtime.timer_count > 0 && !time.time_before(now, timer_at(runtime, 0).deadline)) {
+    for (runtime.timer_count > 0 && !time.instant_before(now, timer_at(runtime, 0).deadline)) {
         val entry: TimerEntry = timer_remove_at(runtime, 0);
-        val slot:  *Slot      = slot_for(runtime, entry.token);
-        if (slot != nil && entry.purpose == TIMER_SCOPE_DEADLINE) { ret entry.scope; }
+        if (entry.purpose == TIMER_SCOPE_DEADLINE) { ret deadline_at(runtime, entry.record).owner; }
+        val slot: *Slot = slot_for(runtime, entry.token);
         if (slot != nil) {
             if (!slot.cancellation_active || transitioned(cancel.unregister(?slot.cancellation))) {
                 slot.cancellation_active = false;
-                timer_remove_token(runtime, entry.token, TIMER_SCOPE_DEADLINE);
+                deadline_release(runtime, slot);
                 enqueue(runtime, entry.token, slot, 0, 0, 0, 0, false, io_error.make(io_error.OTHER, io_error.OP_UNKNOWN), false);
             }
         }
@@ -1081,10 +1240,10 @@ fun timers_expire(runtime: *Runtime, now: time.Time) *cancel.Scope {
     ret nil;
 }
 
-fun timer_timeout(runtime: *Runtime, requested_ms: i32, now: time.Time) i32 {
+fun timer_timeout(runtime: *Runtime, requested_ms: i32, now: time.Instant) i32 {
     if (runtime.timer_count == 0) { ret requested_ms; }
-    val deadline: time.Time = timer_at(runtime, 0).deadline;
-    if (!time.time_before(now, deadline)) { ret 0; }
+    val deadline: time.Instant = timer_at(runtime, 0).deadline;
+    if (!time.instant_before(now, deadline)) { ret 0; }
     var sec:  i64 = deadline.sec - now.sec;
     var nsec: i64 = deadline.nsec - now.nsec;
     if (nsec < 0) {
@@ -1142,15 +1301,15 @@ fun drain(runtime: *Runtime, output: *Completion, output_capacity: usize) usize 
 
 # a failed clock stops expiry and is handed back, the last good read is the
 # caller's now
-fun settle_expired_locked(runtime: *Runtime) time.Clock {
-    var now:           time.Clock    = time.monotonic();
-    var expired_scope: *cancel.Scope = nil;
+fun settle_expired_locked(runtime: *Runtime) time.InstantClock {
+    var now:           time.InstantClock = time.instant();
+    var expired_scope: *cancel.Scope     = nil;
     if (sel now.ok) { expired_scope = timers_expire(runtime, now.ok); }
     for (expired_scope != nil) {
         mutex.unlock(?runtime.lock);
         cancel.timeout(expired_scope);
         mutex.lock(?runtime.lock);
-        now           = time.monotonic();
+        now           = time.instant();
         expired_scope = nil;
         if (sel now.ok) { expired_scope = timers_expire(runtime, now.ok); }
     }
@@ -1166,7 +1325,7 @@ fun take(runtime: *Runtime, output: *Completion, output_capacity: usize, answer_
         mutex.unlock(?runtime.lock);
         ret res[usize, io_error.Error].err{invalid(io_error.OP_WAIT)};
     }
-    val settled: time.Clock = settle_expired_locked(runtime);
+    val settled: time.InstantClock = settle_expired_locked(runtime);
     if (sel settled.err) {
         mutex.unlock(?runtime.lock);
         ret res[usize, io_error.Error].err{settled.err};
@@ -1209,7 +1368,7 @@ pub fun prepare_wait(runtime: *Runtime, timeout_ms: i32) res[WaitPlan, io_error.
         mutex.unlock(?runtime.lock);
         ret res[WaitPlan, io_error.Error].err{invalid(io_error.OP_WAIT)};
     }
-    val settled: time.Clock = settle_expired_locked(runtime);
+    val settled: time.InstantClock = settle_expired_locked(runtime);
     if (sel settled.err) {
         mutex.unlock(?runtime.lock);
         ret res[WaitPlan, io_error.Error].err{settled.err};
@@ -1347,10 +1506,10 @@ fun collect_native(runtime: *Runtime, timeout_ms: i32, controlled: *bool) res[us
 }
 
 # the relative time left before deadline, rounded up so a wait never ends short
-fun remaining_ms(timeout_ms: i32, deadline: time.Time, now: time.Time) i32 {
-    if (timeout_ms <= 0)                  { ret timeout_ms; }
-    if (!time.time_before(now, deadline)) { ret 0; }
-    val left: i64 = time.time_sub(deadline, now);
+fun remaining_ms(timeout_ms: i32, deadline: time.Instant, now: time.Instant) i32 {
+    if (timeout_ms <= 0)                     { ret timeout_ms; }
+    if (!time.instant_before(now, deadline)) { ret 0; }
+    val left: i64 = time.instant_sub(deadline, now);
     ret ((left + 999999) / 1000000)::i32;
 }
 
@@ -1372,11 +1531,11 @@ pub fun wait(runtime: *Runtime, output: *Completion, output_capacity: usize, tim
     if (runtime == nil || output == nil || output_capacity == 0 || timeout_ms < -1) {
         ret res[usize, io_error.Error].err{invalid(io_error.OP_WAIT)};
     }
-    var deadline: time.Time;
+    var deadline: time.Instant;
     if (timeout_ms > 0) {
-        val start: time.Clock = time.monotonic();
+        val start: time.InstantClock = time.instant();
         if (sel start.err) { ret res[usize, io_error.Error].err{start.err}; }
-        deadline = time.time_add(start.ok, timeout_ms::i64 * 1000000);
+        deadline = time.instant_add(start.ok, timeout_ms::i64 * 1000000);
     }
     # readiness is collected without blocking before completions are returned,
     # so a resource that completes at submission cannot keep the native queue
@@ -1408,7 +1567,7 @@ pub fun wait(runtime: *Runtime, output: *Completion, output_capacity: usize, tim
         if (drained.ok > 0 || woken) { ret drained; }
         var remaining: i32 = timeout_ms;
         if (timeout_ms > 0) {
-            val now: time.Clock = time.monotonic();
+            val now: time.InstantClock = time.instant();
             if (sel now.err) { ret res[usize, io_error.Error].err{now.err}; }
             remaining = remaining_ms(timeout_ms, deadline, now.ok);
         }
@@ -1551,6 +1710,8 @@ fun destroy_with_native_ownership(runtime: *Runtime) err[io_error.Error] {
     val queue_result:  i64                  = os.io_queue_close(?runtime.queue);
     val source_result: err[allocator.Error] = table.destroy(?runtime.sources);
     val timer_result:  err[allocator.Error] = table.destroy(?runtime.timers);
+    val index_result:  err[allocator.Error] = table.destroy(?runtime.deadline_index);
+    val record_result: err[allocator.Error] = table.destroy(?runtime.deadlines);
     val slot_result:   err[allocator.Error] = table.destroy(?runtime.slots);
     val native_result: i64                  = os.deallocate(native_events::ptr, $size_of(NativeEvent) * NATIVE_BATCH);
     runtime.native_events = nil;
@@ -1560,8 +1721,8 @@ fun destroy_with_native_ownership(runtime: *Runtime) err[io_error.Error] {
     runtime.free_tail     = NO_SLOT;
     runtime.head          = NO_SLOT;
     runtime.tail          = NO_SLOT;
-    if (queue_result < 0)                                                                          { ret err[io_error.Error].err{os.error(queue_result, io_error.OP_CLOSE)}; }
-    if (sel timer_result.err || sel source_result.err || native_result < 0 || sel slot_result.err) { ret err[io_error.Error].err{io_error.make(io_error.IO, io_error.OP_CLOSE)}; }
+    if (queue_result < 0)                                                                                                                           { ret err[io_error.Error].err{os.error(queue_result, io_error.OP_CLOSE)}; }
+    if (sel timer_result.err || sel index_result.err || sel record_result.err || sel source_result.err || native_result < 0 || sel slot_result.err) { ret err[io_error.Error].err{io_error.make(io_error.IO, io_error.OP_CLOSE)}; }
     ret err[io_error.Error].ok{};
 }
 
@@ -1865,7 +2026,7 @@ test "runtime: close wins copy completion without touching caller bytes" {
 test "runtime: cancellation wins copy completion without touching caller bytes" {
     var runtime: Runtime;
     var scope:   cancel.Scope;
-    if (!ok_err(make(?runtime, 1)) || !succeeded(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 1; }
+    if (!ok_err(make(?runtime, 1)) || !succeeded(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 1; }
     var destination: [2]u8;
     destination[0] = 8;
     destination[1] = 8;
@@ -1978,20 +2139,20 @@ test "runtime: wake is retained until the next wait" {
     ret 0;
 }
 
-fun elapsed_ms(start: time.Time) i64 {
-    val now: time.Clock = time.monotonic();
+fun elapsed_ms(start: time.Instant) i64 {
+    val now: time.InstantClock = time.instant();
     if (sel now.err) { ret -1; }
-    ret time.time_sub(now.ok, start) / 1000000;
+    ret time.instant_sub(now.ok, start) / 1000000;
 }
 
 # a submission wake is the runtime's own and must not end a wait (#676)
 test "runtime: a submission wake does not end a wait early" {
     var runtime: Runtime;
     if (!ok_err(make(?runtime, 1))) { ret 1; }
-    val start: time.Clock = time.monotonic();
+    val start: time.InstantClock = time.instant();
     if (sel start.err) { ret 2; }
     var scope: cancel.Scope;
-    if (!succeeded(cancel.make_root(?scope, true, time.time_add(start.ok, 60000000000)))) { ret 3; }
+    if (!succeeded(cancel.make_root(?scope, opt[time.Instant].some{time.instant_add(start.ok, 60000000000)}))) { ret 3; }
     # a deadline scope makes the submission post a wake on the native queue
     val submitted: res[Token, io_error.Error] = submit_scoped(?runtime, ?scope, test_operation(READ, 91));
     if (sel submitted.err) { ret 4; }
@@ -2037,7 +2198,7 @@ test "runtime: an internal wake keeps the wait's deadline" {
     var worker:  thread.Thread;
     thread.spawn_with(notify_worker, (?context)::*u8, ?worker);
     if (worker.tid < 0) { ret 2; }
-    val start: time.Clock = time.monotonic();
+    val start: time.InstantClock = time.instant();
     if (sel start.err) { ret 3; }
     atomic.store(?started, 1);
     var output: [1]Completion;
@@ -2062,7 +2223,7 @@ test "runtime: a caller wake ends a wait that an internal wake did not" {
     var worker:  thread.Thread;
     thread.spawn_with(notify_worker, (?context)::*u8, ?worker);
     if (worker.tid < 0) { ret 2; }
-    val start: time.Clock = time.monotonic();
+    val start: time.InstantClock = time.instant();
     if (sel start.err) { ret 3; }
     atomic.store(?started, 1);
     var output: [1]Completion;
@@ -2089,7 +2250,7 @@ test "runtime: a return with completions answers a pending wake" {
     val first:  res[usize, io_error.Error] = wait(?runtime, ?output[0], 1, -1);
     if (!(sel first.ok && first.ok == 1)) { ret 5; }
     # the wake's native event is still queued, but it was already answered
-    val start: time.Clock = time.monotonic();
+    val start: time.InstantClock = time.instant();
     if (sel start.err) { ret 6; }
     val second: res[usize, io_error.Error] = wait(?runtime, ?output[0], 1, 100);
     val took:   i64                        = elapsed_ms(start.ok);
@@ -2152,15 +2313,15 @@ test "runtime: sustained mixed completions remain bounded and fair" {
 test "runtime timer: large heaps expire in deadline order" {
     var runtime: Runtime;
     if (!ok_err(make(?runtime, 1024))) { ret 1; }
-    val base: time.Time = time.Time{sec: 10, nsec: 0};
-    var i:    usize     = 0;
+    val base: time.Instant = time.Instant{sec: 10, nsec: 0};
+    var i:    usize        = 0;
     for (i < 1024) {
-        val deadline: time.Time = time.time_add(base, ((1024 - i) * 1000000)::i64);
+        val deadline: time.Instant = time.instant_add(base, ((1024 - i) * 1000000)::i64);
         if (!ok_token(submit_timer(?runtime, deadline, i))) { ret 1; }
         i = i + 1;
     }
     mutex.lock(?runtime.lock);
-    timers_expire(?runtime, time.time_add(base, 513000000));
+    timers_expire(?runtime, time.instant_add(base, 513000000));
     var output: [1024]Completion;
     val count:  usize = drain(?runtime, ?output[0], 1024);
     mutex.unlock(?runtime.lock);
@@ -2180,24 +2341,120 @@ test "runtime timer: large heaps expire in deadline order" {
     ret 0;
 }
 
+# n operations under one deadline scope hold one heap entry, and expiry still
+# ends every one still registered
+fun scope_deadline_scale(n: usize) i32 {
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, 64))) { ret 1; }
+    val clock: time.InstantClock = time.instant();
+    if (sel clock.err) { ret 1; }
+    var scope: cancel.Scope;
+    val at:    time.Instant = time.instant_add(clock.ok, 3600000000000);
+    if (!succeeded(cancel.make_root(?scope, opt[time.Instant].some{at}))) { ret 2; }
+    var first: Token;
+    var i:     usize = 0;
+    for (i < n) {
+        val submitted: res[Token, io_error.Error] = submit_scoped(?runtime, ?scope, test_operation(READ, i));
+        if (sel submitted.err)                                      { ret 3; }
+        if (i == 0)                                                 { first = submitted.ok; }
+        if (runtime.timer_count != 1 || runtime.deadline_live != 1) { ret 4; }
+        # completing every other operation releases its share and nothing else
+        if (i % 2 == 1 && !ok_err(complete(?runtime, submitted.ok, 0, 0, false))) { ret 5; }
+        i = i + 1;
+    }
+    if (runtime.timer_count != 1 || deadline_at(?runtime, 0).refs != n - n / 2) { ret 6; }
+    if (timers_expire(?runtime, time.instant_add(at, -1)) != nil)               { ret 7; }
+    if (timers_expire(?runtime, at) != ?scope)                                  { ret 8; }
+    cancel.timeout(?scope);
+    if (runtime.timer_count != 0 || runtime.deadline_live != 0) { ret 9; }
+    var output:   [64]Completion;
+    var drained:  usize = 0;
+    var timeouts: usize = 0;
+    for (drained < n) {
+        val taken: res[usize, io_error.Error] = poll(?runtime, ?output[0], 64);
+        if (sel taken.err) { ret 10; }
+        if (taken.ok == 0) { ret 10; }
+        var j: usize = 0;
+        for (j < taken.ok) {
+            if (output[j].has_error && output[j].error.kind == io_error.TIMEOUT) { timeouts = timeouts + 1; }
+            j = j + 1;
+        }
+        drained = drained + taken.ok;
+    }
+    if (timeouts != n - n / 2)                                                                         { ret 11; }
+    if (!succeeded(cancel.destroy(?scope)) || !ok_bool(close(?runtime)) || !ok_err(destroy(?runtime))) { ret 12; }
+    ret 0;
+}
+
+test "runtime scope: one deadline entry serves 1k, 10k and 100k operations" {
+    val sizes: [3]usize = [3]usize{1000, 10000, 100000};
+    var i:     usize    = 0;
+    for (i < 3) {
+        val scaled: i32 = scope_deadline_scale(sizes[i]);
+        if (scaled != 0) { ret 10 * (i::i32 + 1) + scaled; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# owners sharing one index bucket chain stay findable as records come and go
+test "runtime scope: deadline records recycle across distinct scopes" {
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, 4))) { ret 1; }
+    val clock: time.InstantClock = time.instant();
+    if (sel clock.err) { ret 1; }
+    var scopes: [8]cancel.Scope;
+    var tokens: [8]Token;
+    var i:      usize = 0;
+    for (i < 8) {
+        val at: time.Instant = time.instant_add(clock.ok, (3600 + i % 3)::i64 * 1000000000);
+        if (!succeeded(cancel.make_root(?scopes[i], opt[time.Instant].some{at}))) { ret 2; }
+        val submitted: res[Token, io_error.Error] = submit_scoped(?runtime, ?scopes[i], test_operation(READ, i));
+        if (sel submitted.err) { ret 3; }
+        tokens[i] = submitted.ok;
+        i         = i + 1;
+    }
+    if (runtime.timer_count != 8 || runtime.deadline_live != 8) { ret 4; }
+    i = 0;
+    for (i < 8) {
+        if (i % 2 == 0 && !ok_err(complete(?runtime, tokens[i], 0, 0, false))) { ret 5; }
+        i = i + 1;
+    }
+    if (runtime.timer_count != 4 || runtime.deadline_live != 4) { ret 6; }
+    i = 1;
+    for (i < 8) {
+        if (deadline_find(?runtime, ?scopes[i], time.instant_add(clock.ok, (3600 + i % 3)::i64 * 1000000000)) == NO_RECORD) { ret 7; }
+        i = i + 2;
+    }
+    val again: res[Token, io_error.Error] = submit_scoped(?runtime, ?scopes[0], test_operation(READ, 9));
+    if (sel again.err)                                          { ret 8; }
+    if (runtime.timer_count != 5 || runtime.deadline_live != 5) { ret 9; }
+    close(?runtime);
+    var output: [16]Completion;
+    val waited: res[usize, io_error.Error] = wait(?runtime, ?output[0], 16, 0);
+    if (!ok_usize(waited) || runtime.timer_count != 0 || runtime.deadline_live != 0) { ret 10; }
+    if (!ok_err(destroy(?runtime)))                                                  { ret 11; }
+    ret 0;
+}
+
 test "runtime timer: cancellation and expiry each publish once" {
     var runtime: Runtime;
     if (!ok_err(make(?runtime, 2))) { ret 1; }
-    val base:             time.Time                  = time.Time{sec: 10, nsec: 0};
-    val cancelled_result: res[Token, io_error.Error] = submit_timer(?runtime, time.time_add(base, 1000000), 1);
+    val base:             time.Instant               = time.Instant{sec: 10, nsec: 0};
+    val cancelled_result: res[Token, io_error.Error] = submit_timer(?runtime, time.instant_add(base, 1000000), 1);
     if (sel cancelled_result.err) { ret 1; }
     val cancelled: Token = cancelled_result.ok;
     if (!ok_err(cancel_timer(?runtime, cancelled))) { ret 1; }
     if (ok_err(cancel_timer(?runtime, cancelled)))  { ret 1; }
     mutex.lock(?runtime.lock);
-    timers_expire(?runtime, time.time_add(base, 2000000));
+    timers_expire(?runtime, time.instant_add(base, 2000000));
     mutex.unlock(?runtime.lock);
 
-    val expired_result: res[Token, io_error.Error] = submit_timer(?runtime, time.time_add(base, 3000000), 2);
+    val expired_result: res[Token, io_error.Error] = submit_timer(?runtime, time.instant_add(base, 3000000), 2);
     if (sel expired_result.err) { ret 1; }
     val expired: Token = expired_result.ok;
     mutex.lock(?runtime.lock);
-    timers_expire(?runtime, time.time_add(base, 4000000));
+    timers_expire(?runtime, time.instant_add(base, 4000000));
     mutex.unlock(?runtime.lock);
     if (ok_err(cancel_timer(?runtime, expired))) { ret 1; }
 
@@ -2215,20 +2472,20 @@ test "runtime timer: cancellation and expiry each publish once" {
 test "runtime timer: wall clock adjustments cannot change ordering" {
     var runtime: Runtime;
     if (!ok_err(make(?runtime, 1))) { ret 1; }
-    val monotonic_base: time.Time                  = time.Time{sec: 50, nsec: 0};
-    val submitted:      res[Token, io_error.Error] = submit_timer(?runtime, time.time_add(monotonic_base, 20000000), 7);
+    val monotonic_base: time.Instant               = time.Instant{sec: 50, nsec: 0};
+    val submitted:      res[Token, io_error.Error] = submit_timer(?runtime, time.instant_add(monotonic_base, 20000000), 7);
     if (sel submitted.err) { ret 1; }
     var wall_clock: time.Time = time.Time{sec: 2000000000, nsec: 0};
     wall_clock = time.Time{sec: 1000000000, nsec: 0};
     if (wall_clock.sec != 1000000000) { ret 1; }
     mutex.lock(?runtime.lock);
-    timers_expire(?runtime, time.time_add(monotonic_base, 19000000));
+    timers_expire(?runtime, time.instant_add(monotonic_base, 19000000));
     if (runtime.count != 0 || runtime.timer_count != 1) {
         mutex.unlock(?runtime.lock);
         ret 1;
     }
     wall_clock = time.Time{sec: 3000000000, nsec: 0};
-    timers_expire(?runtime, time.time_add(monotonic_base, 20000000));
+    timers_expire(?runtime, time.instant_add(monotonic_base, 20000000));
     if (wall_clock.sec != 3000000000 || runtime.count != 1 || runtime.timer_count != 0) {
         mutex.unlock(?runtime.lock);
         ret 1;
@@ -2267,7 +2524,7 @@ test "runtime timer: concurrent cancellation and expiry have one winner" {
     if (!ok_err(make(?runtime, 1))) { ret 1; }
     var round: usize = 0;
     for (round < 32) {
-        val now: time.Clock = time.monotonic();
+        val now: time.InstantClock = time.instant();
         if (sel now.err) { ret 1; }
         val submitted: res[Token, io_error.Error] = submit_timer(?runtime, now.ok, round);
         if (sel submitted.err) { ret 1; }
@@ -2430,10 +2687,10 @@ test "runtime wait and destroy serialize both native ownership interleavings" {
 test "runtime timer: native wait uses monotonic deadlines" {
     var runtime: Runtime;
     if (!ok_err(make(?runtime, 1))) { ret 1; }
-    val now: time.Clock = time.monotonic();
+    val now: time.InstantClock = time.instant();
     if (sel now.err) { ret 1; }
-    val start:     time.Time                  = now.ok;
-    val deadline:  time.Time                  = time.time_add(start, 20000000);
+    val start:     time.Instant               = now.ok;
+    val deadline:  time.Instant               = time.instant_add(start, 20000000);
     val submitted: res[Token, io_error.Error] = submit_timer(?runtime, deadline, 91);
     if (sel submitted.err) { ret 1; }
     var output:   [1]Completion;
@@ -2445,10 +2702,10 @@ test "runtime timer: native wait uses monotonic deadlines" {
         count    = result.ok;
         attempts = attempts + 1;
     }
-    val finished: time.Clock = time.monotonic();
-    if (sel finished.err)                                                                             { ret 1; }
-    if (count != 1 || output[0].context != 91 || output[0].has_error)                                 { ret 1; }
-    if (time.time_before(finished.ok, deadline) || time.time_sub(finished.ok, deadline) > 5000000000) { ret 1; }
+    val finished: time.InstantClock = time.instant();
+    if (sel finished.err)                                                                                   { ret 1; }
+    if (count != 1 || output[0].context != 91 || output[0].has_error)                                       { ret 1; }
+    if (time.instant_before(finished.ok, deadline) || time.instant_sub(finished.ok, deadline) > 5000000000) { ret 1; }
     close(?runtime);
     if (!ok_err(destroy(?runtime))) { ret 1; }
     ret 0;
@@ -2457,8 +2714,8 @@ test "runtime timer: native wait uses monotonic deadlines" {
 test "runtime scope: prior cancellation rejects submission" {
     var runtime: Runtime;
     var scope:   cancel.Scope;
-    if (!ok_err(make(?runtime, 1)))                                                                                      { ret 1; }
-    if (!succeeded(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) || !transitioned(cancel.cancel(?scope))) { ret 1; }
+    if (!ok_err(make(?runtime, 1)))                                                                             { ret 1; }
+    if (!succeeded(cancel.make_root(?scope, opt[time.Instant].none{})) || !transitioned(cancel.cancel(?scope))) { ret 1; }
     val submitted: res[Token, io_error.Error] = submit_scoped(?runtime, ?scope, test_operation(READ, 1));
     if (!sel submitted.err)                                           { ret 1; }
     if (submitted.err.kind != io_error.CANCELLED)                     { ret 1; }
@@ -2472,15 +2729,14 @@ test "runtime scope: parent cancellation settles descendant work once" {
     var runtime: Runtime;
     var root:    cancel.Scope;
     var child:   cancel.Scope;
-    val none:    time.Time = time.Time{sec: 0, nsec: 0};
-    if (!ok_err(make(?runtime, 3)))                                                                                    { ret 1; }
-    if (!succeeded(cancel.make_root(?root, false, none)) || !succeeded(cancel.make_child(?child, ?root, false, none))) { ret 1; }
+    if (!ok_err(make(?runtime, 3)))                                                                                                              { ret 1; }
+    if (!succeeded(cancel.make_root(?root, opt[time.Instant].none{})) || !succeeded(cancel.make_child(?child, ?root, opt[time.Instant].none{}))) { ret 1; }
     var tokens: [3]Token;
     val first:  res[Token, io_error.Error] = submit_scoped(?runtime, ?root, test_operation(READ, 10));
     val second: res[Token, io_error.Error] = submit_scoped(?runtime, ?child, test_operation(WRITE, 11));
-    val now:    time.Clock                 = time.monotonic();
+    val now:    time.InstantClock          = time.instant();
     if (sel now.err) { ret 1; }
-    val third: res[Token, io_error.Error] = submit_timer_scoped(?runtime, ?child, time.time_add(now.ok, 1000000000), 12);
+    val third: res[Token, io_error.Error] = submit_timer_scoped(?runtime, ?child, time.instant_add(now.ok, 1000000000), 12);
     if (sel first.err)  { ret 1; }
     if (sel second.err) { ret 1; }
     if (sel third.err)  { ret 1; }
@@ -2507,8 +2763,8 @@ test "runtime scope: parent cancellation settles descendant work once" {
 test "runtime scope: completion before cancellation remains successful" {
     var runtime: Runtime;
     var scope:   cancel.Scope;
-    if (!ok_err(make(?runtime, 1)))                                              { ret 1; }
-    if (!succeeded(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 1; }
+    if (!ok_err(make(?runtime, 1)))                                     { ret 1; }
+    if (!succeeded(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 1; }
     val submitted: res[Token, io_error.Error] = submit_scoped(?runtime, ?scope, test_operation(READ, 15));
     if (sel submitted.err) { ret 1; }
     val token: Token = submitted.ok;
@@ -2529,10 +2785,10 @@ test "runtime scope: equal operation and scope deadlines prefer timeout" {
     var runtime: Runtime;
     var scope:   cancel.Scope;
     if (!ok_err(make(?runtime, 1))) { ret 1; }
-    val now: time.Clock = time.monotonic();
+    val now: time.InstantClock = time.instant();
     if (sel now.err) { ret 1; }
-    val deadline: time.Time = time.time_add(now.ok, 20000000);
-    if (!succeeded(cancel.make_root(?scope, true, deadline))) { ret 1; }
+    val deadline: time.Instant = time.instant_add(now.ok, 20000000);
+    if (!succeeded(cancel.make_root(?scope, opt[time.Instant].some{deadline}))) { ret 1; }
     val submitted: res[Token, io_error.Error] = submit_timer_scoped(?runtime, ?scope, deadline, 21);
     if (sel submitted.err) { ret 1; }
     var output:   [1]Completion;
@@ -2575,7 +2831,7 @@ test "runtime scope: completion and cancellation races have one winner" {
     var round: usize = 0;
     for (round < 32) {
         var scope: cancel.Scope;
-        if (!succeeded(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 1; }
+        if (!succeeded(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 1; }
         val submitted: res[Token, io_error.Error] = submit_scoped(?runtime, ?scope, test_operation(READ, round));
         if (sel submitted.err) { ret 1; }
         var completed: i64                   = -1;
@@ -2629,7 +2885,7 @@ test "runtime scope: submission and cancellation races preserve ownership" {
     var round: usize = 0;
     for (round < 32) {
         var scope: cancel.Scope;
-        if (!succeeded(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 1; }
+        if (!succeeded(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 1; }
         var token:     Token;
         var submitted: i64                   = -1;
         var context:   SubmissionRaceContext = SubmissionRaceContext{
@@ -2677,8 +2933,8 @@ test "runtime scope: deadline and cancellation races preserve the first reason" 
     var round: usize = 0;
     for (round < 32) {
         var scope: cancel.Scope;
-        if (!succeeded(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 1; }
-        if (!ok_token(submit_scoped(?runtime, ?scope, test_operation(READ, 51))))    { ret 1; }
+        if (!succeeded(cancel.make_root(?scope, opt[time.Instant].none{})))       { ret 1; }
+        if (!ok_token(submit_scoped(?runtime, ?scope, test_operation(READ, 51)))) { ret 1; }
         var context: ScopeTransitionContext = ScopeTransitionContext{scope: ?scope};
         var worker:  thread.Thread;
         thread.spawn_with(timeout_race_worker, (?context)::*u8, ?worker);
@@ -2704,11 +2960,11 @@ test "runtime scope: deadline and cancellation races preserve the first reason" 
 test "runtime scope: close remains distinct from cancellation" {
     var runtime: Runtime;
     var scope:   cancel.Scope;
-    if (!ok_err(make(?runtime, 1)))                                              { ret 1; }
-    if (!succeeded(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 1; }
-    if (!ok_token(submit_scoped(?runtime, ?scope, test_operation(READ, 31))))    { ret 1; }
-    if (succeeded(cancel.destroy(?scope)) || !ok_bool(close(?runtime)))          { ret 1; }
-    if (!transitioned(cancel.cancel(?scope)))                                    { ret 1; }
+    if (!ok_err(make(?runtime, 1)))                                           { ret 1; }
+    if (!succeeded(cancel.make_root(?scope, opt[time.Instant].none{})))       { ret 1; }
+    if (!ok_token(submit_scoped(?runtime, ?scope, test_operation(READ, 31)))) { ret 1; }
+    if (succeeded(cancel.destroy(?scope)) || !ok_bool(close(?runtime)))       { ret 1; }
+    if (!transitioned(cancel.cancel(?scope)))                                 { ret 1; }
     val scope_reason: cancel.Reason = cancel.reason(?scope);
     if (!sel scope_reason.cancelled)        { ret 1; }
     if (!succeeded(cancel.destroy(?scope))) { ret 1; }
@@ -2725,15 +2981,15 @@ test "runtime scope: failed submission wake rolls ownership back" {
     var runtime: Runtime;
     if (!ok_err(make(?runtime, 1)))            { ret 1; }
     if (os.io_queue_close(?runtime.queue) < 0) { ret 1; }
-    val now: time.Clock = time.monotonic();
+    val now: time.InstantClock = time.instant();
     if (sel now.err) { ret 1; }
-    val timer_result: res[Token, io_error.Error] = submit_timer(?runtime, time.time_add(now.ok, 1000000000), 61);
+    val timer_result: res[Token, io_error.Error] = submit_timer(?runtime, time.instant_add(now.ok, 1000000000), 61);
     if (!sel timer_result.err)    { ret 1; }
     if (pending(?runtime) != 0)   { ret 1; }
     if (runtime.timer_count != 0) { ret 1; }
 
     var scope: cancel.Scope;
-    if (!succeeded(cancel.make_root(?scope, true, time.time_add(now.ok, 1000000000)))) { ret 1; }
+    if (!succeeded(cancel.make_root(?scope, opt[time.Instant].some{time.instant_add(now.ok, 1000000000)}))) { ret 1; }
     val scoped_result: res[Token, io_error.Error] = submit_scoped(?runtime, ?scope, test_operation(READ, 62));
     if (!sel scoped_result.err)             { ret 1; }
     if (pending(?runtime) != 0)             { ret 1; }
@@ -2872,7 +3128,7 @@ test "runtime: asynchronous source cancellation publishes after quiescence" {
     if (sel source_result.err) { ret 2; }
     val source: SourceToken = source_result.ok;
     var scope:  cancel.Scope;
-    if (!succeeded(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 3; }
+    if (!succeeded(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 3; }
     val submitted: res[Token, io_error.Error] = submit_scoped_owned(?runtime, source, ?scope, test_operation(FILE_READ, 93));
     if (sel submitted.err) { ret 4; }
     val token: Token = submitted.ok;
