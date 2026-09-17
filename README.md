@@ -26,9 +26,9 @@ std follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See the 
 
 ## API surface
 
-The semantic versioning promise covers std's public API: the driver and library modules that callers are expected to use, such as `std.net.async` and `std.net.async.local`. Code that uses those modules keeps building across minor and patch releases.
+The semantic versioning promise covers the driver and library modules, such as `std.net.async` and `std.net.async.local`. Code that uses only those keeps building across minor and patch releases.
 
-The `net.async` backend modules are implementation, not API:
+std is designed so that callers can reach past a driver when it does not give them what they need, and doing so is expected. The only thing to know is what the version number covers. The `net.async` backend modules are outside the promise:
 
 - `std.net.async.linux` (`src/net/async/linux.mach`)
 - `std.net.async.darwin` (`src/net/async/darwin.mach`)
@@ -38,9 +38,9 @@ The `net.async` backend modules are implementation, not API:
 - `std.net.async.local.unix` (`src/net/async/local/unix.mach`)
 - `std.net.async.local.windows` (`src/net/async/local/windows.mach`)
 
-They are `pub` only because a driver has to reach them and Mach has no narrower visibility, not because they are a supported entry point. Their signatures may change in a minor release. Code that calls a backend directly is not covered by the promise.
+Their signatures may change in a minor release. If you call one directly, check the CHANGELOG when you upgrade.
 
-The reason is structural. Each backend is compiled for its own target only, so exactly one backend exists in any build, and the driver above it owns the portable contract that callers rely on. A backend's signature is the driver's private arrangement with that one target. To decide whether a module not listed here falls under the same rule, ask whether it exists only to serve a driver that owns a portable contract, and whether only one variant of it is ever built for a target. This list is exactly what was ruled on. Other modules are not covered by it until they are ruled on.
+The reason: each backend is compiled for its own target only, so exactly one backend exists in any build, and the driver above it owns the portable contract. This list is exactly what was ruled on and says nothing about other modules.
 
 std 5.3.0 is the release that raised the question: #793 changed the backend `cancel` signatures and shipped as a minor release, with the change named in its own CHANGELOG entry. The owner then approved this rule.
 
