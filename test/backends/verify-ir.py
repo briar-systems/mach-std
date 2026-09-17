@@ -1,11 +1,12 @@
-# secret IR contract: the wipe precedes the native release, no integer pointer
-# alias is materialized, and no test-only inspection enters production IR.
+# secret IR contract: the native secret primitives exist, std.memory.secret
+# wipes before it calls the native release, no integer pointer alias is
+# materialized, and no test-only inspection enters production IR.
 # under the v5 inlining policy (mach N6, PR #3270) an #[oblivious] callee is
 # inlined only into an oblivious caller, so the oblivious `wipe` stays a call
-# in the public `release_all` in both profiles rather than becoming the inlined
-# zero-byte store, and the ordering is asserted on that call. `wipe_typed` is
-# not oblivious, so release inlines it into `release_typed` as its asm
-# byte-store loop; release accepts either the call or that inlined `asm`.
+# in `release_all` in both profiles rather than becoming the inlined zero-byte
+# store, and the ordering is asserted on that call. `wipe_typed` is not
+# oblivious, so release inlines it into `release_typed` as its asm byte-store
+# loop, and release accepts either the call or that inlined `asm`.
 from pathlib import Path
 import re
 import sys
@@ -43,46 +44,51 @@ def first(lines, predicate, label):
     raise ValueError('missing ' + label)
 
 
-def verify(secret_text, main_text, profile):
-    secret, main = IR(secret_text), IR(main_text)
-    for name in ('allocate', 'deallocate', 'random_fill'):
-        secret.function('std.system.os.secret.' + name)
-    for name in ('std.system.os.secret_allocate_typed', 'std.system.os.secret_deallocate_typed',
-                 'std.system.os.secret.wipe_typed'):
-        if name + '$backends.main.SecretRecord' not in main.text:
+PORTABLE = 'std.memory.secret.'
+TYPED = '$backends.main.SecretRecord'
+
+
+def verify(native_text, portable_text, main_text, profile):
+    native, portable, main = IR(native_text), IR(portable_text), IR(main_text)
+    for name in ('allocate', 'release', 'random_fill', 'read_at', 'write_at'):
+        native.function('std.system.os.secret.' + name)
+    for name in (PORTABLE + 'allocate_typed', PORTABLE + 'deallocate_typed', PORTABLE + 'wipe_typed',
+                 'std.system.os.allocate_secret_typed', 'std.system.os.release_secret_typed'):
+        if name + TYPED not in main.text:
             raise ValueError('missing typed boundary ' + name)
-    if re.search(r'\b(ptrtoint|inttoptr)\b', secret.text + main.text):
+    if re.search(r'\b(ptrtoint|inttoptr)\b', native.text + portable.text + main.text):
         raise ValueError('secret boundary materialized an integer pointer alias')
-    if re.search(r'std[.]system[.]os[.]secret[.](scripted_fill|all_zero|reset_probe_fill|interrupted_fill|probe_release|probe_typed_release)', secret.text):
+    fixtures = r'(scripted_fill|all_zero|reset_probe_fill|interrupted_fill|probe_release|probe_typed_release|is_ok|refused_as|failed_natively|count_is|count_refused|count_failed)'
+    if re.search(re.escape(PORTABLE) + fixtures, portable.text):
         raise ValueError('test-only secret inspection entered production IR')
-    body = secret.function('std.system.os.secret.release_all').splitlines()
-    wipe = first(body, lambda line: secret.call(line, 'void', '@"std.system.os.secret.wipe"'), 'release wipe')
-    release = first(body, lambda line: secret.call(line, 'i64', '%p3'), 'native release call')
+    body = portable.function(PORTABLE + 'release_all').splitlines()
+    wipe = first(body, lambda line: portable.call(line, 'void', '@"' + PORTABLE + 'wipe"'), 'release wipe')
+    release = first(body, lambda line: portable.call(line, 'i64', '%p3'), 'native release call')
     if wipe >= release:
         raise ValueError('native release precedes secret wipe')
-    typed = main.function('std.system.os.secret.release_typed$backends.main.SecretRecord').splitlines()
+    typed = main.function(PORTABLE + 'release_typed' + TYPED).splitlines()
     typed_release = first(typed, lambda line: main.call(line, 'i64', '%p3'), 'typed native release call')
-    typed_wipe = first(typed, lambda line: main.call(line, 'void', '@"std.system.os.secret.wipe_typed$backends.main.SecretRecord"')
+    typed_wipe = first(typed, lambda line: main.call(line, 'void', '@"' + PORTABLE + 'wipe_typed' + TYPED + '"')
                        or (profile == 'release' and re.match(r'\s+asm\b', line) is not None), 'typed release wipe')
     if typed_wipe >= typed_release:
         raise ValueError('native typed release precedes full-layout wipe')
-    return secret, body, wipe, release
+    return portable, body, wipe, release
 
 
-def controls(secret_text, main_text, profile):
-    secret, body, wipe, release = verify(secret_text, main_text, profile)
-    original = secret.raw_function('std.system.os.secret.release_all')
+def controls(native_text, portable_text, main_text, profile):
+    portable, body, wipe, release = verify(native_text, portable_text, main_text, profile)
+    original = portable.raw_function(PORTABLE + 'release_all')
     deleted = body[:wipe] + body[wipe + 1:]
     reordered = list(body)
     reordered[wipe], reordered[release] = reordered[release], reordered[wipe]
     variants = {
-        'deleted wipe': (secret_text.replace(original, '\n'.join(deleted)), main_text),
-        'release before wipe': (secret_text.replace(original, '\n'.join(reordered)), main_text),
-        'integer pointer alias': (secret_text.replace(original, original.replace('\n', '\n      %999999 = ptrtoint !0 %p1\n', 1)), main_text),
+        'deleted wipe': portable_text.replace(original, '\n'.join(deleted)),
+        'release before wipe': portable_text.replace(original, '\n'.join(reordered)),
+        'integer pointer alias': portable_text.replace(original, original.replace('\n', '\n      %999999 = ptrtoint !0 %p1\n', 1)),
     }
-    for name, (changed_secret, changed_main) in variants.items():
+    for name, changed in variants.items():
         try:
-            verify(changed_secret, changed_main, profile)
+            verify(native_text, changed, main_text, profile)
         except ValueError:
             continue
         raise ValueError('IR oracle accepted control: ' + name)
@@ -90,10 +96,10 @@ def controls(secret_text, main_text, profile):
 
 
 if __name__ == '__main__':
-    secret_text, main_text = (Path(name).read_text() for name in sys.argv[1:3])
-    profile = sys.argv[3]
+    native_text, portable_text, main_text = (Path(name).read_text() for name in sys.argv[1:4])
+    profile = sys.argv[4]
     try:
-        verify(secret_text, main_text, profile)
-        controls(secret_text, main_text, profile)
+        verify(native_text, portable_text, main_text, profile)
+        controls(native_text, portable_text, main_text, profile)
     except ValueError as error:
         raise SystemExit('FAIL: ' + str(error))

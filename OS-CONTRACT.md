@@ -17,7 +17,7 @@ $if (capability.HAS_FILES) {
 
 Every group is present on linux, darwin and windows. None is present on any other target, freestanding included. `HOSTED` is the core group, which every other group implies.
 
-A target that claims a group exports every member listed here. `src/system/capability/conformance.mach` names every member of every group that the per-OS module supplies, so a missing member fails the build on any target that claims the group. Members `std.system.os` defines itself (the `secret_*` wrappers, `temp_dir`, `unlink_force`, `realtime`, `monotonic`, `error`, `error_message` and `message`) exist wherever the module compiles, so the test doesn't name them. The test also keeps the positioned secret transfers inside the files lane, which `test/secret/verify.sh` enforces.
+A target that claims a group exports every member listed here. `src/system/capability/conformance.mach` names every member of every group that the per-OS module supplies, so a missing member fails the build on any target that claims the group. Members `std.system.os` defines itself (the secret primitives `allocate_secret`, `allocate_secret_typed`, `release_secret`, `release_secret_typed`, `random_fill_secret`, `read_at_secret` and `write_at_secret`, and `realtime`, `monotonic`, `error`, `error_message` and `message`) exist wherever the module compiles, so the test doesn't name them. The test also keeps the positioned secret transfers inside the files lane, which `test/secret/verify.sh` enforces.
 
 | flag | group | purpose |
 | --- | --- | --- |
@@ -35,11 +35,11 @@ A target that claims a group exports every member listed here. `src/system/capab
 
 ### core (`HOSTED`)
 
-`NOT_FOUND`, `abort`, `error`, `error_kind`, `error_message`, `message`, `terminate`
+`abort`, `error`, `error_kind`, `error_message`, `message`, `terminate`
 
 ### pages (`HAS_PAGES`)
 
-`ADVISE_DONT_NEED`, `ADVISE_NORMAL`, `ADVISE_RANDOM`, `ADVISE_SEQUENTIAL`, `ADVISE_WILL_NEED`, `PROT_EXEC`, `PROT_NONE`, `PROT_READ`, `PROT_WRITE`, `SecretBorrow`, `advise`, `allocate`, `deallocate`, `heap_region_base`, `heap_region_extend`, `lock`, `page_size`, `protect`, `reallocate`, `secret_allocate`, `secret_allocate_typed`, `secret_borrow_close`, `secret_borrow_copy`, `secret_borrow_drain`, `secret_borrow_fill`, `secret_borrow_open`, `secret_borrow_size`, `secret_borrow_wipe`, `secret_deallocate`, `secret_deallocate_typed`, `unlock`
+`ADVISE_DONT_NEED`, `ADVISE_NORMAL`, `ADVISE_RANDOM`, `ADVISE_SEQUENTIAL`, `ADVISE_WILL_NEED`, `PROT_EXEC`, `PROT_NONE`, `PROT_READ`, `PROT_WRITE`, `advise`, `allocate`, `allocate_secret`, `allocate_secret_typed`, `deallocate`, `heap_region_base`, `heap_region_extend`, `lock`, `page_size`, `protect`, `reallocate`, `release_secret`, `release_secret_typed`, `unlock`
 
 ### clock (`HAS_CLOCK`)
 
@@ -47,7 +47,7 @@ A target that claims a group exports every member listed here. `src/system/capab
 
 ### entropy (`HAS_ENTROPY`)
 
-`random_fill`, `secret_random_fill`
+`RANDOM_FILL_SECRET_MAX`, `random_fill`, `random_fill_secret`
 
 ### threads (`HAS_THREADS`)
 
@@ -55,7 +55,7 @@ A target that claims a group exports every member listed here. `src/system/capab
 
 ### files (`HAS_FILES`)
 
-`AT_FDCWD`, `AT_REMOVEDIR`, `AT_SYMLINK_NOFOLLOW`, `DirectoryCursor`, `DirectoryEntry`, `DirectoryInitResult`, `LOCK_EX`, `LOCK_NB`, `LOCK_SH`, `LOCK_UN`, `O_APPEND`, `O_CREAT`, `O_DIRECTORY`, `O_EXCL`, `O_RDONLY`, `O_RDWR`, `O_TRUNC`, `O_WRONLY`, `PUBLICATION_CLAIMS`, `PUBLICATION_READ_RETAIN_REPLACE`, `PUBLICATION_RETAIN_REPLACE`, `SEEK_CUR`, `SEEK_END`, `SEEK_SET`, `STDERR_FD`, `STDIN_FD`, `STDOUT_FD`, `S_IFDIR`, `S_IFLNK`, `S_IFMT`, `S_IFREG`, `access`, `close`, `directory_close`, `directory_init`, `directory_next`, `file_identity`, `getcwd`, `identity_at`, `lock_fd`, `make_dir`, `map_file`, `open`, `pipe`, `publication_capabilities`, `read`, `rename`, `retain_identity_at`, `secret_borrow_read_at`, `secret_borrow_write_at`, `seek`, `separator`, `set_mode`, `set_mode_at`, `stat`, `stat_mode`, `stat_path`, `stat_t`, `symlink`, `sync_fd`, `sync_file`, `temp_dir`, `unlink`, `unlink_force`, `write`
+`AT_FDCWD`, `AT_REMOVEDIR`, `AT_SYMLINK_NOFOLLOW`, `DirectoryCursor`, `DirectoryEntry`, `DirectoryInitResult`, `LOCK_EX`, `LOCK_NB`, `LOCK_SH`, `LOCK_UN`, `O_APPEND`, `O_CREAT`, `O_DIRECTORY`, `O_EXCL`, `O_RDONLY`, `O_RDWR`, `O_TRUNC`, `O_WRONLY`, `PUBLICATION_CLAIMS`, `PUBLICATION_READ_RETAIN_REPLACE`, `PUBLICATION_RETAIN_REPLACE`, `SEEK_CUR`, `SEEK_END`, `SEEK_SET`, `STDERR_FD`, `STDIN_FD`, `STDOUT_FD`, `S_IFDIR`, `S_IFLNK`, `S_IFMT`, `S_IFREG`, `access`, `close`, `directory_close`, `directory_init`, `directory_next`, `file_identity`, `getcwd`, `identity_at`, `lock_fd`, `make_dir`, `map_file`, `open`, `pipe`, `publication_capabilities`, `read`, `read_at_secret`, `rename`, `retain_identity_at`, `seek`, `set_mode`, `set_mode_at`, `stat`, `stat_path`, `stat_t`, `symlink`, `sync_fd`, `sync_file`, `unlink`, `write`, `write_at_secret`
 
 ### io queue (`HAS_IO_QUEUE`)
 
@@ -63,11 +63,11 @@ A target that claims a group exports every member listed here. `src/system/capab
 
 ### sockets (`HAS_SOCKETS`)
 
-`AF_INET`, `AF_INET6`, `DNS_HOSTS_PATH`, `IPPROTO_IP`, `IPPROTO_IPV6`, `IPPROTO_TCP`, `IPV6_TCLASS`, `IPV6_V6ONLY`, `IP_TOS`, `SHUT_RD`, `SHUT_RDWR`, `SHUT_WR`, `SOCKADDR_IN6_SIZE`, `SOCKADDR_IN_SIZE`, `SOCKADDR_STORAGE_SIZE`, `SOCK_DGRAM`, `SOCK_STREAM`, `SOL_SOCKET`, `SO_EXCLUSIVEADDRUSE`, `SO_KEEPALIVE`, `SO_LINGER`, `SO_RCVBUF`, `SO_RCVTIMEO`, `SO_REUSEADDR`, `SO_REUSEPORT`, `SO_SNDBUF`, `SO_UNSUPPORTED`, `TCP_FASTOPEN`, `TCP_KEEPCNT`, `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_NODELAY`, `sock_accept`, `sock_accept_flags`, `sock_addr6_init`, `sock_addr6_read`, `sock_addr_family`, `sock_addr_init`, `sock_addr_read`, `sock_bind`, `sock_close`, `sock_connect`, `sock_create`, `sock_create_flags`, `sock_getopt`, `sock_inheritable`, `sock_listen`, `sock_local_addr`, `sock_recv`, `sock_recvfrom`, `sock_remote_addr`, `sock_send`, `sock_sendto`, `sock_set_rcvtimeo`, `sock_setopt`, `sock_shutdown`
+`AF_INET`, `AF_INET6`, `DNS_HOSTS_PATH`, `IPPROTO_IP`, `IPPROTO_IPV6`, `IPPROTO_TCP`, `IPV6_TCLASS`, `IPV6_V6ONLY`, `IP_TOS`, `SHUT_RD`, `SHUT_RDWR`, `SHUT_WR`, `SOCKADDR_IN6_SIZE`, `SOCKADDR_IN_SIZE`, `SOCKADDR_STORAGE_SIZE`, `SOCK_DGRAM`, `SOCK_STREAM`, `SOL_SOCKET`, `SO_EXCLUSIVEADDRUSE`, `SO_KEEPALIVE`, `SO_LINGER`, `SO_RCVBUF`, `SO_RCVTIMEO`, `SO_REUSEADDR`, `SO_REUSEPORT`, `SO_SNDBUF`, `SO_UNSUPPORTED`, `TCP_FASTOPEN`, `TCP_KEEPCNT`, `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_NODELAY`, `sock_accept`, `sock_accept_flags`, `sock_bind`, `sock_close`, `sock_connect`, `sock_create`, `sock_create_flags`, `sock_getopt`, `sock_inheritable`, `sock_listen`, `sock_local_addr`, `sock_recv`, `sock_recvfrom`, `sock_remote_addr`, `sock_send`, `sock_sendto`, `sock_set_rcvtimeo`, `sock_setopt`, `sock_shutdown`
 
 ### process (`HAS_PROCESS`)
 
-`PROCESS_CONTINUED`, `PROCESS_EXITED`, `PROCESS_OP_CLOSE`, `PROCESS_OP_PIPE`, `PROCESS_OP_READ`, `PROCESS_OP_SPAWN`, `PROCESS_OP_STATUS`, `PROCESS_OP_TERMINATE`, `PROCESS_OP_WAIT`, `PROCESS_SIGNALED`, `PROCESS_STOPPED`, `ProcessStatus`, `ProcessWaitError`, `WNOHANG`, `WaitResult`, `environ`, `exit_code`, `getenv`, `getpid`, `has_exited`, `ignore_sigpipe`, `spawn`, `spawn_in`, `spawn_redirected`, `spawn_redirected_in`, `spawn_shell`, `stop_signal`, `term_signal`, `terminate_child`, `wait`, `wait_pid`, `was_continued`, `was_signaled`, `was_stopped`
+`PROCESS_CONTINUED`, `PROCESS_EXITED`, `PROCESS_OP_CLOSE`, `PROCESS_OP_PIPE`, `PROCESS_OP_READ`, `PROCESS_OP_SPAWN`, `PROCESS_OP_STATUS`, `PROCESS_OP_TERMINATE`, `PROCESS_OP_WAIT`, `PROCESS_SIGNALED`, `PROCESS_STOPPED`, `ProcessStatus`, `ProcessWaitError`, `WNOHANG`, `WaitResult`, `environ`, `getenv`, `getpid`, `ignore_sigpipe`, `spawn`, `spawn_in`, `spawn_redirected`, `spawn_redirected_in`, `terminate_child`, `wait`, `wait_pid`
 
 ## Assumptions
 

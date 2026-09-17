@@ -22,6 +22,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   depth removal refuses (#693).
 - `std.process.exec.Failure` has a `kind`, the portable classification of the
   failure (#693).
+- `std.memory.secret`: secret-welded storage built on the os contract's secret
+  primitives. `allocate`, `deallocate`, `allocate_typed`, `deallocate_typed`,
+  `random_fill`, `Borrow` and `borrow_open`, `borrow_close`, `borrow_size`,
+  `borrow_wipe`, `borrow_fill`, `borrow_drain`, `borrow_copy`,
+  `borrow_read_at` and `borrow_write_at`. Fallible calls return
+  `err[io.error.Error]` (the positioned transfers return
+  `res[usize, io.error.Error]`) instead of a negative errno (#692).
+- The os contract's secret primitives, each one native call that keeps the
+  welded pointer shape: `std.system.os.allocate_secret`, `release_secret`,
+  `allocate_secret_typed`, `release_secret_typed`, `random_fill_secret`
+  (at most `RANDOM_FILL_SECRET_MAX` bytes per call), `read_at_secret` and
+  `write_at_secret`. They do not wipe or retry (#692).
+- `std.net.ip.sockaddr_family(sa)` reads the family a sockaddr buffer carries
+  (#692).
+- `std.process.exec.stopped`, `stop_signal` and `continued` read stop and
+  continuation observations (#692).
+- `std.filesystem.native` holds `stat_mode`, `unlink_force` and `temp_dir`
+  (#692).
+- `std.process.exec.spawn_shell(command, cwd, envp)` starts a command through
+  the host interpreter without waiting. `run_shell` is built on it. The
+  interpreter choice is a per-OS table in `std.process.exec`: `/bin/sh -c`
+  on posix, and on windows `%ComSpec%` (falling back to the System32
+  `cmd.exe`) with the verbatim `"<shell>" /s /c "<command>"` line (#692).
+- `std.system.os.windows.spawn_command_line(application, command_line, envp,
+  cwd)` spawns from a verbatim native command line. It is a per-OS escape
+  hatch outside the contract: the contract's argv spawns encode arguments with
+  the CRT convention, which cmd.exe does not parse (#692).
 
 ### Changed
 - **Breaking.** Native codes classify with the full kind set. A code that used
@@ -66,6 +93,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     resolver's native code when there is one.
   - `std.process.events` reports a failed windows console handler install or
     restore with its native error instead of `EINVAL`.
+- **Breaking.** `std.system.os.getenv` reports an unset variable as a native
+  code that `os.error_kind` reads as `NOT_FOUND` (`ENOENT`), not the `-1`
+  sentinel, which shared the native code space with `EPERM` (#692).
+- **Breaking.** The sockaddr layout is written once in `std.net.ip`.
+  `to_sockaddr` and `from_sockaddr` no longer go through the OS layer (#692).
 
 ### Removed
 - **Breaking.** `io.error.from_code` and `io.error.message`. Use
@@ -77,6 +109,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kind. The per-OS modules (`std.system.os.linux`, `.darwin`, `.windows`) keep
   their constants for code that is already OS-specific. `std.io.writer` no
   longer depends on the OS layer and builds freestanding (#693).
+- **Breaking.** Logic built on the os primitives leaves `std.system.os`, with
+  no forwarder (#692):
+
+  | removed | use instead |
+  | --- | --- |
+  | `os.secret_allocate` | `std.memory.secret.allocate` |
+  | `os.secret_deallocate` | `std.memory.secret.deallocate` |
+  | `os.secret_allocate_typed` | `std.memory.secret.allocate_typed` |
+  | `os.secret_deallocate_typed` | `std.memory.secret.deallocate_typed` |
+  | `os.secret_random_fill` | `std.memory.secret.random_fill` |
+  | `os.SecretBorrow` | `std.memory.secret.Borrow` |
+  | `os.secret_borrow_*` | `std.memory.secret.borrow_*` |
+  | `os.sock_addr_init`, `sock_addr6_init` | `std.net.ip.to_sockaddr` |
+  | `os.sock_addr_read`, `sock_addr6_read` | `std.net.ip.from_sockaddr` |
+  | `os.sock_addr_family` | `std.net.ip.sockaddr_family` |
+  | `os.has_exited` | `std.process.exec.exited` |
+  | `os.exit_code` | `std.process.exec.code` |
+  | `os.was_signaled` | `std.process.exec.signaled` |
+  | `os.term_signal` | `std.process.exec.signal` |
+  | `os.was_stopped` | `std.process.exec.stopped` |
+  | `os.stop_signal` | `std.process.exec.stop_signal` |
+  | `os.was_continued` | `std.process.exec.continued` |
+  | `os.stat_mode` | `std.filesystem.native.stat_mode` |
+  | `os.unlink_force` | `std.filesystem.native.unlink_force` |
+  | `os.temp_dir` | `std.filesystem.native.temp_dir` |
+  | `os.NOT_FOUND` | `os.error_kind(n) == io.error.NOT_FOUND` |
+  | `os.spawn_shell(command, envp, cwd) i64` | `std.process.exec.spawn_shell(command, cwd, envp) res[Child, Error]` |
+  | `os.separator` | `std.types.path.separator()` |
+
+  The sockaddr and status helpers, and `spawn_shell`, are also gone from the
+  per-OS modules.
+
+  What stays in the contract, on purpose: `ProcessStatus` with its
+  `PROCESS_*` kind and stage values, since the native wait and spawn
+  primitives produce them. `getenv` reports an unset variable as `ENOENT`
+  rather than moving a sentinel to its caller. `stat_mode`, `unlink_force`
+  and `temp_dir` sit in the leaf module `std.filesystem.native` because
+  `std.filesystem`, its removal and transaction modules, and `std.net.local`
+  all use them.
 
 ## [3.3.0] - 2026-09-16
 
