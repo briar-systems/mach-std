@@ -23,8 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `retain`, `settle` and `in_flight` track in-flight users.
   - Chunks are address-stable.
   - Use is serialized, enforced by an entrant check rather than a thread check.
-  - `snapshot` reports counters, and `arena_bytes` sizes an `allocator.fixed`
-    arena.
+  - `snapshot` reports counters, including `backing_allocations` per class and
+    in total, so `high_water` can be sized for a steady state that never touches
+    the backing. `arena_bytes` sizes an `allocator.fixed` arena.
   - Acquire, release and wake cost stays flat from 1k to 100k chunks. The module
     builds freestanding (#760).
 - `std.memory.secret.borrow_data` returns the welded storage of a live borrow
