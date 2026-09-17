@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- A std module that needs an OS capability the target lacks now refuses a
+  freestanding build with exactly one diagnostic naming what it needs, for
+  example `std.filesystem needs the files capability
+  (std.system.capability.HAS_FILES)`, instead of hundreds of resolution errors.
+  Each OS-bound module gates its OS-bound imports on the capability flags it
+  uses directly. `std.system.os`, `std.system.panic` and `std.runtime` say they
+  need a linux, darwin or windows target, and the per-OS runtime and terminal
+  modules name their own target. `std.system.os.secret` no longer repeats
+  `std.system.os`'s refusal. `test/freestanding/verify.sh` enforces the single
+  diagnostic for every module that does not build (#695).
+
 ## [5.3.0] - 2026-09-17
 
 Rebuild everything that links std before running it on 5.3.0. The runtime's
