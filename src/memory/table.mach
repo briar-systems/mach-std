@@ -1,18 +1,26 @@
 # chunked element storage whose live elements never move
 
+use std.allocator;
 use std.memory;
-use std.system.os;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
 use std.types.size.usize;
 
 # the directory is inline and fixed, so growth never moves it either
 val DIRECTORY: usize = 40;
 
+# every chunk is requested at this alignment, so an element type may need at
+# most this much
+pub val ELEMENT_ALIGN: usize = 16;
+
 # chunk 0 holds `1 << shift` elements and chunk k holds `1 << (shift + k - 1)`,
 # so capacity doubles per chunk and an element address is fixed once handed out
+# allocator: where every chunk comes from and goes back to
 pub rec Table {
+    allocator:    allocator.Allocator;
     chunks:       [DIRECTORY]ptr;
     element_size: usize;
     shift:        usize;
@@ -57,14 +65,31 @@ fun chunk_bytes(table: *Table, chunk: usize, output: *usize) bool {
         output);
 }
 
-# initial is rounded up to a power of two and is the size of the first chunk
-pub fun make(table: *Table, element_size: usize, initial: usize) bool {
-    if (table == nil || element_size == 0 || initial == 0) { ret false; }
+fun take_chunk(table: *Table, bytes: usize) ptr {
+    val got: res[ptr, allocator.Error] = allocator.allocate_raw(?table.allocator, bytes, ELEMENT_ALIGN);
+    if (sel got.err) { ret nil; }
+    ret got.ok;
+}
+
+# a table whose chunks come from a
+#
+# the table keeps a copy of a, so the allocator's context must outlive the
+# table. the only failure is a refused or unrepresentable allocation, so the
+# result carries no cause
+# ---
+# table:        the table to initialize
+# a:            the allocator every chunk is taken from and returned to
+# element_size: bytes per element, whose alignment is at most ELEMENT_ALIGN
+# initial:      the first chunk's element count, rounded up to a power of two
+# ret:          whether the table was made
+pub fun make(table: *Table, a: *allocator.Allocator, element_size: usize, initial: usize) bool {
+    if (table == nil || a == nil || element_size == 0 || initial == 0) { ret false; }
     var shift: usize = 0;
     for ((1::usize << shift) < initial) {
         shift = shift + 1;
         if (shift >= DIRECTORY) { ret false; }
     }
+    table.allocator    = @a;
     table.element_size = element_size;
     table.shift        = shift;
     table.chunk_count  = 0;
@@ -76,7 +101,7 @@ pub fun make(table: *Table, element_size: usize, initial: usize) bool {
     }
     var bytes: usize = 0;
     if (!chunk_bytes(table, 0, ?bytes)) { ret false; }
-    val chunk: ptr = os.allocate(bytes);
+    val chunk: ptr = take_chunk(table, bytes);
     if (chunk == nil) { ret false; }
     table.chunks[0]   = chunk;
     table.chunk_count = 1;
@@ -91,7 +116,7 @@ pub fun grow(table: *Table) bool {
     if (table.capacity > ~(0::usize) / 2) { ret false; }
     var bytes: usize = 0;
     if (!chunk_bytes(table, table.chunk_count, ?bytes)) { ret false; }
-    val chunk: ptr = os.allocate(bytes);
+    val chunk: ptr = take_chunk(table, bytes);
     if (chunk == nil) { ret false; }
     table.chunks[table.chunk_count] = chunk;
     table.capacity                  = table.capacity +
@@ -143,15 +168,22 @@ pub fun index_of(table: *Table, address: usize) usize {
     ret NO_INDEX;
 }
 
-pub fun destroy(table: *Table) i64 {
-    if (table == nil) { ret 0; }
-    var result: i64   = 0;
-    var chunk:  usize = 0;
+# return every chunk to the table's allocator
+#
+# every chunk is released even after one release fails, and the table is empty
+# afterwards either way. destroying an empty or never-made table succeeds
+# ---
+# table: the table to destroy
+# ret:   ok, or the first refusal the allocator reported
+pub fun destroy(table: *Table) err[allocator.Error] {
+    if (table == nil) { ret err[allocator.Error].ok{}; }
+    var result: err[allocator.Error] = err[allocator.Error].ok{};
+    var chunk:  usize                = 0;
     for (chunk < table.chunk_count) {
         var bytes: usize = 0;
         if (chunk_bytes(table, chunk, ?bytes)) {
-            val code: i64 = os.deallocate(table.chunks[chunk], bytes);
-            if (code < 0) { result = code; }
+            val released: err[allocator.Error] = allocator.deallocate_raw(?table.allocator, table.chunks[chunk], bytes, ELEMENT_ALIGN);
+            if (sel released.err && sel result.ok) { result = released; }
         }
         table.chunks[chunk] = nil;
         chunk               = chunk + 1;
@@ -176,10 +208,46 @@ pub fun aliases(table: *Table, data: *u8, len: usize) bool {
     ret false;
 }
 
+use std.allocator.fixed;
+use std.types.option.opt;
+
+val TEST_BYTES: usize = 32768;
+
+rec TestArena {
+    state:  fixed.FixedState;
+    buffer: [TEST_BYTES]u8;
+}
+
+fun test_allocator(a: *allocator.Allocator, arena: *TestArena) bool {
+    val made: err[allocator.Error] = fixed.make(a, ?arena.state, ?arena.buffer[0], TEST_BYTES);
+    ret sel made.ok;
+}
+
+fun destroyed(table: *Table) bool {
+    val released: err[allocator.Error] = destroy(table);
+    ret sel released.ok;
+}
+
+fun refusing_allocate(ctx: ptr, size: usize, align: usize) opt[ptr] {
+    ret opt[ptr].none{};
+}
+
+fun refusing_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) opt[ptr] {
+    ret opt[ptr].none{};
+}
+
+# hands out the arena's storage but refuses every release with -5
+fun failing_deallocate(ctx: ptr, p: ptr, size: usize, align: usize) i64 {
+    ret -5;
+}
+
 test "table: growth leaves every live element where it was" {
+    var a:     allocator.Allocator;
+    var arena: TestArena;
     var table: Table;
-    if (!make(?table, $size_of(usize), 4)) { ret 1; }
-    if (table.capacity != 4)               { ret 2; }
+    if (!test_allocator(?a, ?arena))           { ret 1; }
+    if (!make(?table, ?a, $size_of(usize), 4)) { ret 1; }
+    if (table.capacity != 4)                   { ret 2; }
     var taken: [4]*usize;
     var i:     usize = 0;
     for (i < 4) {
@@ -199,14 +267,18 @@ test "table: growth leaves every live element where it was" {
         if (@taken[i] != i + 1)                { ret 6; }
         i = i + 1;
     }
+    if (!destroyed(?table)) { ret 7; }
     ret 0;
 }
 
 test "table: every index maps to one distinct element" {
+    var a:     allocator.Allocator;
+    var arena: TestArena;
     var table: Table;
-    if (!make(?table, $size_of(usize), 1)) { ret 1; }
-    if (!reserve(?table, 600))             { ret 2; }
-    if (table.capacity != 1024)            { ret 3; }
+    if (!test_allocator(?a, ?arena))           { ret 1; }
+    if (!make(?table, ?a, $size_of(usize), 1)) { ret 1; }
+    if (!reserve(?table, 600))                 { ret 2; }
+    if (table.capacity != 1024)                { ret 3; }
     var i: usize = 0;
     for (i < table.capacity) {
         val cell: *usize = at(?table, i)::*usize;
@@ -220,15 +292,18 @@ test "table: every index maps to one distinct element" {
         i = i + 1;
     }
     if (at(?table, table.capacity) != nil)           { ret 6; }
-    if (destroy(?table) < 0)                         { ret 7; }
+    if (!destroyed(?table))                          { ret 7; }
     if (table.capacity != 0 || at(?table, 0) != nil) { ret 8; }
     ret 0;
 }
 
 test "table: an element address recovers its own index" {
+    var a:     allocator.Allocator;
+    var arena: TestArena;
     var table: Table;
-    if (!make(?table, $size_of(usize), 2)) { ret 1; }
-    if (!reserve(?table, 40))              { ret 2; }
+    if (!test_allocator(?a, ?arena))           { ret 1; }
+    if (!make(?table, ?a, $size_of(usize), 2)) { ret 1; }
+    if (!reserve(?table, 40))                  { ret 2; }
     var i: usize = 0;
     for (i < table.capacity) {
         val address: usize = at(?table, i)::usize;
@@ -237,15 +312,18 @@ test "table: an element address recovers its own index" {
         i = i + 1;
     }
     if (index_of(?table, 0) != NO_INDEX) { ret 5; }
-    if (destroy(?table) < 0)             { ret 6; }
+    if (!destroyed(?table))              { ret 6; }
     ret 0;
 }
 
 test "table: ownership query covers every chunk" {
+    var a:        allocator.Allocator;
+    var arena:    TestArena;
     var table:    Table;
     var external: [8]u8;
-    if (!make(?table, $size_of(usize), 2)) { ret 1; }
-    if (!grow(?table))                     { ret 2; }
+    if (!test_allocator(?a, ?arena))           { ret 1; }
+    if (!make(?table, ?a, $size_of(usize), 2)) { ret 1; }
+    if (!grow(?table))                         { ret 2; }
     var chunk: usize = 0;
     for (chunk < table.chunk_count) {
         if (!aliases(?table, table.chunks[chunk]::*u8, 1)) { ret 3; }
@@ -253,18 +331,62 @@ test "table: ownership query covers every chunk" {
     }
     if (aliases(?table, ?external[0], 8)) { ret 4; }
     if (!aliases(?table, nil, 1))         { ret 5; }
-    if (destroy(?table) < 0)              { ret 6; }
+    if (!destroyed(?table))               { ret 6; }
     if (aliases(?table, ?external[0], 8)) { ret 7; }
     ret 0;
 }
 
 test "table: a refused shape allocates nothing" {
+    var a:     allocator.Allocator;
+    var arena: TestArena;
     var table: Table;
-    if (make(?table, 0, 4))                         { ret 1; }
-    if (make(?table, $size_of(usize), 0))           { ret 2; }
-    if (make(nil, $size_of(usize), 4))              { ret 3; }
-    if (!make(?table, $size_of(usize), 2))          { ret 4; }
-    if (!reserve(?table, 2) || table.capacity != 2) { ret 5; }
-    if (destroy(?table) < 0)                        { ret 6; }
+    if (!test_allocator(?a, ?arena))                 { ret 1; }
+    if (make(?table, ?a, 0, 4))                      { ret 1; }
+    if (make(?table, ?a, $size_of(usize), 0))        { ret 2; }
+    if (make(nil, ?a, $size_of(usize), 4))           { ret 3; }
+    if (make(?table, nil, $size_of(usize), 4))       { ret 4; }
+    if (fixed.remaining(?arena.state) != TEST_BYTES) { ret 5; }
+    if (!make(?table, ?a, $size_of(usize), 2))       { ret 6; }
+    if (!reserve(?table, 2) || table.capacity != 2)  { ret 7; }
+    if (!destroyed(?table))                          { ret 8; }
+    ret 0;
+}
+
+test "table: chunks come from the given allocator and a refusal fails the table" {
+    var refusing: allocator.Allocator = allocator.Allocator{
+        ctx:           nil,
+        fn_allocate:   refusing_allocate,
+        fn_reallocate: refusing_reallocate,
+        fn_deallocate: failing_deallocate,
+    };
+    var table: Table;
+    if (make(?table, ?refusing, $size_of(usize), 4)) { ret 1; }
+
+    var a:     allocator.Allocator;
+    var arena: TestArena;
+    if (!test_allocator(?a, ?arena))           { ret 2; }
+    if (!make(?table, ?a, $size_of(usize), 4)) { ret 3; }
+    val before: usize = fixed.remaining(?arena.state);
+    if (!grow(?table))                           { ret 4; }
+    if (fixed.remaining(?arena.state) >= before) { ret 5; }
+    table.allocator.fn_allocate = refusing_allocate;
+    if (grow(?table))           { ret 6; }
+    if (table.chunk_count != 2) { ret 7; }
+    ret 0;
+}
+
+test "table: destroy reports a refused release and still empties the table" {
+    var a:     allocator.Allocator;
+    var arena: TestArena;
+    var table: Table;
+    if (!test_allocator(?a, ?arena))           { ret 1; }
+    if (!make(?table, ?a, $size_of(usize), 4)) { ret 2; }
+    if (!grow(?table))                         { ret 3; }
+    table.allocator.fn_deallocate = failing_deallocate;
+    val released: err[allocator.Error] = destroy(?table);
+    if (!sel released.err)                                         { ret 4; }
+    if (!(sel released.err.release && released.err.release == -5)) { ret 4; }
+    if (table.chunk_count != 0 || table.capacity != 0)             { ret 5; }
+    if (table.chunks[0] != nil || table.chunks[1] != nil)          { ret 6; }
     ret 0;
 }

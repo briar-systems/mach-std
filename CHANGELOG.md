@@ -70,6 +70,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same modules replaces a descriptor number in one step (#716).
 
 ### Changed
+- **Breaking.** `memory.table.make(table, a, element_size, initial)` takes the
+  `allocator.Allocator` every chunk is taken from and returned to, and
+  `memory.table.destroy` returns `err[allocator.Error]` instead of an `i64`. A
+  refused release is reported as `release` with the backend's native code, and
+  the table is still emptied. Chunks are requested at `memory.table.ELEMENT_ALIGN`
+  (16), the largest alignment an element type may need. memory.table no longer
+  depends on the OS layer and now builds freestanding (#689).
+- **Breaking.** `memory.table.Table` has an `allocator` field holding a copy of
+  the allocator passed to `make`, so the allocator's context must outlive the
+  table (#689).
+- `io.runtime.Runtime`, `net.async.Driver`, `net.async.local.Driver` and every
+  `net.async` backend hold the allocator their tables use in an `allocator`
+  field, which `make` sets to a page allocator (#689).
+- The freestanding ratchet includes `std.memory.table` (#689).
 - **Breaking.** Native codes classify with the full kind set. A code that used
   to be `OTHER` now gets its own kind: `EIO` is `IO`, `ENOENT` is `NOT_FOUND`,
   `EEXIST` is `EXISTS`, `ENOTDIR` is `NOT_DIRECTORY`, `EISDIR` is
