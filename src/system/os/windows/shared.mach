@@ -303,6 +303,12 @@ ext fun HeapReAlloc(p0: isize, p1: u32, p2: ptr, p3: usize) ptr;
 ext fun GetSystemInfo(p0: *u8);
 #[library("kernel32.dll")]
 ext fun GetActiveProcessorCount(p0: u16) u32;
+#[library("kernel32.dll")]
+ext fun GetActiveProcessorGroupCount() u16;
+#[library("kernel32.dll")]
+ext fun GetThreadGroupAffinity(p0: isize, p1: *GROUP_AFFINITY) i32;
+#[library("kernel32.dll")]
+ext fun SetThreadGroupAffinity(p0: isize, p1: *GROUP_AFFINITY, p2: *GROUP_AFFINITY) i32;
 
 #[library("kernel32.dll")]
 ext fun CreateFileW(p0: *u16, p1: u32, p2: u32, p3: ptr, p4: u32, p5: u32, p6: isize) isize;
@@ -530,6 +536,15 @@ ext fun FreeEnvironmentStringsW(p0: *u16) i32;
 ext fun CompareStringOrdinal(p0: *u16, p1: i32, p2: *u16, p3: i32, p4: i32) i32;
 
 # Win32 structures
+
+# KAFFINITY mask, group number, three reserved words
+rec GROUP_AFFINITY {
+    mask:      usize;
+    group:     u16;
+    reserved0: u16;
+    reserved1: u16;
+    reserved2: u16;
+}
 
 rec FILETIME {
     dwLowDateTime:  u32;
@@ -4014,6 +4029,151 @@ pub fun cpu_count() i64 {
     val n: u32 = GetActiveProcessorCount(0xffff);
     if (n < 1) { ret 1; }
     ret n::i64;
+}
+
+# windows splits logical processors into groups of at most 64. the portable
+# CPU index is global: a processor's index is the sum of the active counts of
+# every lower-numbered group plus its bit within its own group. a thread's
+# affinity always lies within one group.
+val AFFINITY_ALL_GROUPS: u16 = 0xffff;
+
+# the global index of the first processor in group
+fun affinity_group_base(group: u16) usize {
+    var base: usize = 0;
+    var g:    u16   = 0;
+    for (g < group) {
+        base = base + GetActiveProcessorCount(g)::usize;
+        g    = g + 1;
+    }
+    ret base;
+}
+
+# map a global CPU index to its group and bit, given each group's active count
+# ---
+# counts: active processor count per group
+# groups: number of groups
+# cpu:    global CPU index
+# group:  the group the CPU lies in
+# bit:    the CPU's bit within that group
+# ret:    false when cpu is past the last active processor
+fun affinity_locate(counts: *u32, groups: u16, cpu: usize, group: *u16, bit: *u32) bool {
+    var base: usize = 0;
+    var g:    u16   = 0;
+    for (g < groups) {
+        val count: usize = counts[g::usize]::usize;
+        if (cpu < base + count) {
+            @group = g;
+            @bit   = (cpu - base)::u32;
+            ret true;
+        }
+        base = base + count;
+        g    = g + 1;
+    }
+    ret false;
+}
+
+# read the calling thread's CPU affinity, as global CPU indices
+#
+# CPU i is bit i % 64 of words[i / 64]. out_count covers every active
+# processor across all groups, and only the thread's own group has bits set.
+# ---
+# words:     destination for the mask words
+# capacity:  number of words the destination holds
+# out_count: words written, or words needed when capacity is too small
+# ret:       0, ERANGE when capacity is too small, or the native refusal
+pub fun thread_affinity(words: *u64, capacity: usize, out_count: *usize) i64 {
+    if (out_count == nil || (words == nil && capacity != 0)) { ret EINVAL; }
+    val total: usize = GetActiveProcessorCount(AFFINITY_ALL_GROUPS)::usize;
+    val used:  usize = (total + 63) / 64;
+    @out_count = used;
+    if (used > capacity) { ret ERANGE; }
+    var affinity: GROUP_AFFINITY;
+    if (GetThreadGroupAffinity(GetCurrentThread(), ?affinity) == 0) { ret last_error(); }
+    var i: usize = 0;
+    for (i < used) {
+        words[i] = 0;
+        i        = i + 1;
+    }
+    val base: usize = affinity_group_base(affinity.group);
+    val mask: u64   = affinity.mask::u64;
+    var bit:  usize = 0;
+    for (bit < 64) {
+        if (((mask >> bit::u64) & 1) != 0) {
+            val cpu: usize = base + bit;
+            if (cpu < total) { words[cpu / 64] = words[cpu / 64] | (1::u64 << (cpu % 64)::u64); }
+        }
+        bit = bit + 1;
+    }
+    ret 0;
+}
+
+# pin the calling thread to the CPUs set in words
+#
+# every set CPU must lie in one processor group, since a thread's affinity is a
+# single group's mask. a set spanning groups is refused rather than truncated.
+# ---
+# words: mask words, CPU i is bit i % 64 of words[i / 64]
+# count: number of mask words
+# ret:   0, EINVAL for an empty set or an inactive CPU, ENOTSUP for a set
+#        spanning groups, or the native refusal
+pub fun set_thread_affinity(words: *u64, count: usize) i64 {
+    if (words == nil || count == 0) { ret EINVAL; }
+    val groups: u16 = GetActiveProcessorGroupCount();
+    var counts: [256]u32;
+    if (groups == 0 || groups::usize > 256) { ret ENOTSUP; }
+    var g: u16 = 0;
+    for (g < groups) {
+        counts[g::usize] = GetActiveProcessorCount(g);
+        g                = g + 1;
+    }
+    var chosen: u16   = 0;
+    var mask:   u64   = 0;
+    var any:    bool  = false;
+    var cpu:    usize = 0;
+    for (cpu < count * 64) {
+        if (((words[cpu / 64] >> (cpu % 64)::u64) & 1) != 0) {
+            var group: u16 = 0;
+            var bit:   u32 = 0;
+            if (!affinity_locate(?counts[0], groups, cpu, ?group, ?bit)) { ret EINVAL; }
+            if (any && group != chosen)                                  { ret ENOTSUP; }
+            chosen = group;
+            any    = true;
+            mask   = mask | (1::u64 << bit::u64);
+        }
+        cpu = cpu + 1;
+    }
+    if (!any) { ret EINVAL; }
+    var affinity: GROUP_AFFINITY;
+    affinity.mask  = mask::usize;
+    affinity.group = chosen;
+    var previous: GROUP_AFFINITY;
+    if (SetThreadGroupAffinity(GetCurrentThread(), ?affinity, ?previous) == 0) { ret last_error(); }
+    ret 0;
+}
+
+test "std.system.os.windows.affinity: a set spanning processor groups is UNSUPPORTED" {
+    val groups: u16 = GetActiveProcessorGroupCount();
+    if (groups < 2) { ret 0; }
+    val second: usize = affinity_group_base(1);
+    var words:  [256]u64;
+    if (second / 64 >= 256) { ret 0; }
+    words[0]           = 1;
+    words[second / 64] = words[second / 64] | (1::u64 << (second % 64)::u64);
+    if (set_thread_affinity(?words[0], second / 64 + 1) != ENOTSUP) { ret 1; }
+    ret 0;
+}
+
+test "std.system.os.windows.affinity: global indices map to their group" {
+    var counts: [3]u32 = [3]u32{64, 20, 8};
+    var group:  u16    = 0;
+    var bit:    u32    = 0;
+    if (!affinity_locate(?counts[0], 3, 0, ?group, ?bit) || group != 0 || bit != 0)   { ret 1; }
+    if (!affinity_locate(?counts[0], 3, 63, ?group, ?bit) || group != 0 || bit != 63) { ret 2; }
+    if (!affinity_locate(?counts[0], 3, 64, ?group, ?bit) || group != 1 || bit != 0)  { ret 3; }
+    if (!affinity_locate(?counts[0], 3, 83, ?group, ?bit) || group != 1 || bit != 19) { ret 4; }
+    if (!affinity_locate(?counts[0], 3, 84, ?group, ?bit) || group != 2 || bit != 0)  { ret 5; }
+    if (affinity_locate(?counts[0], 3, 92, ?group, ?bit))                             { ret 6; }
+    ret 0;
 }
 
 # get the current working directory

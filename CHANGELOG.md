@@ -17,6 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports `UNSUPPORTED`. The OS contract's process group gains
   `open_file_limit` and `set_open_file_limit` (#746).
 
+
+- `std.system.os.thread_affinity(words, capacity, out_count)` and
+  `set_thread_affinity(words, count)` read and pin the calling thread's CPU
+  affinity, in the threads capability group. The mask is caller-sized words with
+  no fixed CPU limit, and a short buffer reports `RANGE` with the words needed.
+  windows numbers CPUs across processor groups and refuses a set spanning groups
+  as `UNSUPPORTED`; darwin has no hard affinity and returns `UNSUPPORTED`.
+  `std.sync.thread` adds `CpuSet` over caller words (`cpu_set`, `cpu_set_add`,
+  `cpu_set_contains`, `cpu_set_size`, `cpu_set_nth`, `cpu_set_clear`),
+  `current_affinity`, `affinity_words`, `set_current_affinity`,
+  `pin_current_to` and `allowed_cpus`, which lists the CPUs the thread may run on
+  in ascending order so worker i can pin to the i-th (#755).
 - Listeners and datagram sockets take options applied before bind, so a
   multi-core server can bind one `SO_REUSEPORT` socket per thread:
   `net.socket.BindOptions { reuse_address, reuse_port }` and
@@ -29,6 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused as `UNSUPPORTED` before any socket is created (#738).
 
 ### Changed
+- The README is trimmed to what std is, how to add it, supported compilers and
+  targets, and links. The versioning policy moved to CONTRIBUTING.md, and the
+  API contract sections moved into their modules' doc comments (#756).
 - `chrono.time` and `sync.cancel` document that deadlines are monotonic and must
   be built from `time.monotonic()`. `time.now`, `since` and `until` are documented
   as wall-clock only, and `make_root`/`make_child` warn that a wall-clock deadline
