@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.0.0] - 2026-09-16
+
+The OS layering from #697 is complete: `std.system.os` is a small contract of primitives, error translation lives in the OS layer, logic built on top of it moved out, and descriptors cross it as pointer-width handles. Every breaking change and its replacement is in MIGRATION.md. Requires mach 5.2.0 or later. Tested with mach 5.2.1, the family CI seed.
+
 ### Added
 - `std.system.os.error(code, operation)` builds the `io.error.Error` for a
   native code a primitive returned, and `std.system.os.error_kind(code)` is the
