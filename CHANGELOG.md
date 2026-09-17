@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#744).
 - `os.io_queue_restore` is no longer used by `net.async`. It stays available
   (#744).
+- The layout of the Windows `net.async` and `net.async.local` backend records,
+  and so of their `Driver`, changed. Rebuild everything that links std (#744).
 
 ## [5.1.0] - 2026-09-17
 
