@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Listeners and datagram sockets take options applied before bind, so a
+  multi-core server can bind one `SO_REUSEPORT` socket per thread:
+  `net.socket.BindOptions { reuse_address, reuse_port }` and
+  `net.socket.bind_options()`; `net.tcp.ListenOptions { bind, backlog }`,
+  `net.tcp.listen_options(backlog)`, `net.tcp.listen_with` and
+  `net.tcp.listen_with_options`; `net.udp.bind_with` and
+  `net.udp.bind_with_options`; `net.async.listen_with` and
+  `net.async.bind_datagram_with`. The defaults match `listen` and `bind`
+  exactly. `reuse_port` where the target has no `SO_REUSEPORT` (windows) is
+  refused as `UNSUPPORTED` before any socket is created (#738).
+
 ### Changed
 - Releases run through the family's shared release workflow (briar-systems/.github
   `mach-release.yml`): it verifies the tag, version and changelog section, runs

@@ -40,6 +40,47 @@ pub fun listen(ep: ip.Endpoint, backlog: i32) res[Listener, io_error.Error] {
 }
 
 pub fun listen_with_flags(ep: ip.Endpoint, backlog: i32, flags: socket_api.Flags) res[Listener, io_error.Error] {
+    ret listen_with_options(ep, listen_options(backlog), flags);
+}
+
+# how a listener is set up before it listens
+# ---
+# bind:    options applied between creation and bind
+# backlog: maximum pending connection queue length
+pub rec ListenOptions {
+    bind:    socket_api.BindOptions;
+    backlog: i32;
+}
+
+# the options listen uses: SO_REUSEADDR, no SO_REUSEPORT
+# ---
+# backlog: maximum pending connection queue length
+# ret:     the options
+pub fun listen_options(backlog: i32) ListenOptions {
+    ret ListenOptions{bind: socket_api.bind_options(), backlog: backlog};
+}
+
+# create a blocking TCP listener with explicit options
+# ---
+# ep:      endpoint to bind to
+# options: bind options and backlog
+# ret:     the Listener, or the refusal. reuse_port where the target has no
+#          SO_REUSEPORT is UNSUPPORTED, and no socket is created
+pub fun listen_with(ep: ip.Endpoint, options: ListenOptions) res[Listener, io_error.Error] {
+    ret listen_with_options(ep, options, socket_api.blocking_flags());
+}
+
+# create a TCP listener with explicit options and creation flags
+# ---
+# ep:      endpoint to bind to
+# options: bind options and backlog
+# flags:   socket creation flags
+# ret:     the Listener, or the refusal
+pub fun listen_with_options(ep: ip.Endpoint, options: ListenOptions, flags: socket_api.Flags) res[Listener, io_error.Error] {
+    val checked: err[io_error.Error] = socket_api.check_bind_options(options.bind, io_error.OP_OPTION);
+    if (sel checked.err) {
+        ret res[Listener, io_error.Error].err{checked.err};
+    }
     val created: res[io_handle.SocketHandle, io_error.Error] = socket_api.create(ip.endpoint_family(ep), os.SOCK_STREAM, 0, flags);
     if (sel created.err) {
         ret res[Listener, io_error.Error].err{created.err};
@@ -47,29 +88,28 @@ pub fun listen_with_flags(ep: ip.Endpoint, backlog: i32, flags: socket_api.Flags
     val handle: io_handle.SocketHandle = created.ok;
     val raw:    usize                  = handle.value;
 
-    var opt:  i32 = 1;
-    var code: i64 = os.sock_setopt(raw, os.SOL_SOCKET, os.SO_REUSEADDR, (?opt)::*u8, 4);
-    if (code < 0) {
+    val applied: err[io_error.Error] = socket_api.apply_bind_options(handle, options.bind);
+    if (sel applied.err) {
         os.sock_close(raw);
-        ret res[Listener, io_error.Error].err{os.error(code, io_error.OP_OPTION)};
+        ret res[Listener, io_error.Error].err{applied.err};
     }
 
     var sa:     [128]u8;
     val sa_len: usize = ip.to_sockaddr(ep, ?sa[0]);
 
-    code = os.sock_bind(raw, ?sa[0], sa_len);
+    var code: i64 = os.sock_bind(raw, ?sa[0], sa_len);
     if (code < 0) {
         os.sock_close(raw);
         ret res[Listener, io_error.Error].err{os.error(code, io_error.OP_BIND)};
     }
 
-    code = os.sock_listen(raw, backlog);
+    code = os.sock_listen(raw, options.backlog);
     if (code < 0) {
         os.sock_close(raw);
         ret res[Listener, io_error.Error].err{os.error(code, io_error.OP_LISTEN)};
     }
 
-    ret res[Listener, io_error.Error].ok{Listener{handle: io_handle.socket(raw)}};
+    ret res[Listener, io_error.Error].ok{Listener{handle: handle}};
 }
 
 # accept a new connection on a listener
@@ -493,4 +533,107 @@ test "tcp: read timeout bounds a blocking read" {
     stream_close(?client);
     listener_close(?ln);
     ret rc;
+}
+
+test "tcp: listen options default to what listen does" {
+    val options: ListenOptions = listen_options(7);
+    if (!options.bind.reuse_address || options.bind.reuse_port || options.backlog != 7) { ret 1; }
+    val lr: res[Listener, io_error.Error] = listen_with(ip.endpoint(127, 0, 0, 1, 0), options);
+    if (sel lr.err) { ret 2; }
+    var listener: Listener = lr.ok;
+    listener_close(?listener);
+    ret 0;
+}
+
+# several listeners with SO_REUSEPORT bind one port, and every connection is
+# accepted on one of them. windows has no SO_REUSEPORT and refuses before
+# creating a socket
+test "tcp: listeners with reuse_port share one port" {
+    val shared:   ListenOptions = ListenOptions{bind: socket_api.BindOptions{reuse_address: true, reuse_port: true}, backlog: 16};
+    val any_port: ip.Endpoint   = ip.endpoint(127, 0, 0, 1, 0);
+    $if ($mach.build.os == $mach.os.windows) {
+        val refused: res[Listener, io_error.Error] = listen_with(any_port, shared);
+        if (sel refused.ok) {
+            var unexpected: Listener = refused.ok;
+            listener_close(?unexpected);
+            ret 1;
+        }
+        if (refused.err.kind != io_error.UNSUPPORTED) { ret 2; }
+        ret 0;
+    }
+    $or {
+        val first_result: res[Listener, io_error.Error] = listen_with_options(any_port, shared, socket_api.async_flags());
+        if (sel first_result.err) { ret 3; }
+        var first:        Listener                         = first_result.ok;
+        val bound_result: res[ip.Endpoint, io_error.Error] = listener_local_endpoint(?first);
+        if (sel bound_result.err) {
+            listener_close(?first);
+            ret 4;
+        }
+        val port:          ip.Endpoint                   = bound_result.ok;
+        val second_result: res[Listener, io_error.Error] = listen_with_options(port, shared, socket_api.async_flags());
+        if (sel second_result.err) {
+            listener_close(?first);
+            ret 5;
+        }
+        var second: Listener = second_result.ok;
+        var bad:    i32      = 0;
+        $if ($mach.build.os == $mach.os.linux) {
+            # linux needs SO_REUSEPORT on every socket bound to the port
+            val plain: res[Listener, io_error.Error] = listen(port, 1);
+            if (sel plain.ok) {
+                var unexpected: Listener = plain.ok;
+                listener_close(?unexpected);
+                bad = 6;
+            }
+            or (sel plain.err && plain.err.kind != io_error.ADDRESS_IN_USE) {
+                bad = 7;
+            }
+        }
+        var clients:   [8]Stream;
+        var connected: usize = 0;
+        for (bad == 0 && connected < 8) {
+            val cr: res[Stream, io_error.Error] = connect(port);
+            if (sel cr.err) {
+                bad = 8;
+                brk;
+            }
+            clients[connected] = cr.ok;
+            connected          = connected + 1;
+        }
+        var accepted: usize = 0;
+        var rounds:   usize = 0;
+        for (bad == 0 && accepted < connected && rounds < 2000) {
+            var progressed: bool  = false;
+            var which:      usize = 0;
+            for (which < 2) {
+                var ln: *Listener = ?first;
+                if (which == 1) { ln = ?second; }
+                val ar: res[Stream, io_error.Error] = accept_with_flags(ln, socket_api.async_flags());
+                if (sel ar.ok) {
+                    var server: Stream = ar.ok;
+                    stream_close(?server);
+                    accepted   = accepted + 1;
+                    progressed = true;
+                }
+                or (sel ar.err && (ar.err.kind != io_error.WOULD_BLOCK && ar.err.kind != io_error.INTERRUPTED)) {
+                    bad = 9;
+                }
+                which = which + 1;
+            }
+            if (!progressed) {
+                os.sleep(1000000);
+                rounds = rounds + 1;
+            }
+        }
+        if (bad == 0 && accepted != connected) { bad = 10; }
+        var i: usize = 0;
+        for (i < connected) {
+            stream_close(?clients[i]);
+            i = i + 1;
+        }
+        listener_close(?second);
+        listener_close(?first);
+        ret bad;
+    }
 }
