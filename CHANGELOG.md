@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `net.async.submit_readable` and `net.async.local.submit_readable` wait until a
+  stream is readable, at orderly end of stream, or failed, without holding a
+  buffer, so an idle connection needs no read buffer. The completion has the new
+  kind `io.runtime.READABLE` and zero bytes, with `end_of_stream` set at EOF.
+  Nothing is read, and the wait queues in order with reads on the same stream.
+  Linux and darwin settle readiness with a non-consuming peek, and windows posts
+  a zero-byte overlapped receive and settles it with the queued byte count
+  (#759).
+
 ## [4.1.0] - 2026-09-17
 
 Requires mach 5.2.0 or later. Tested with mach 5.2.1, the family CI seed.
