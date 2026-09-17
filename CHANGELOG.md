@@ -32,6 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   released, and a backend's `destroy` removes every native registration it
   holds (a leftover one panics) and refuses while the kernel still owns an
   operation (#740).
+- Native wakes are coalesced. `os.shared.IoQueue` gains `wake_pending`, so only
+  the first wake request since the last poll posts a native wake (an eventfd
+  write, a `NOTE_TRIGGER` kevent or an IOCP packet), and later requests post
+  nothing until a poll takes it. The poll clears the flag after draining the
+  wake and before the caller looks for work, so no request is lost. N
+  operations completed between two waits now post 1 wake at 1k, 10k and 100k,
+  where they posted N. `IoQueue.wakes_posted` counts posted wakes (#753).
 - `net.resolve` keeps runtime-owned lookups waiting to publish on an intrusive
   list, finds an operation from its runtime token through a hash of the token
   index, remembers each queued completion's ring position, and claims slots
