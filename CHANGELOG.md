@@ -17,6 +17,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behind it (#688).
 - `ELOOP` on linux and windows, where windows maps
   `ERROR_CANT_RESOLVE_FILENAME` to it (#688).
+- `std.filesystem.removal.Error` has a `kind`. `removal.from_native(code)`
+  builds one for a native failure and `removal.contained()` for a component or
+  depth removal refuses (#693).
+- `std.process.exec.Failure` has a `kind`, the portable classification of the
+  failure (#693).
+- `std.memory.secret`: secret-welded storage built on the os contract's secret
+  primitives. `allocate`, `deallocate`, `allocate_typed`, `deallocate_typed`,
+  `random_fill`, `Borrow` and `borrow_open`, `borrow_close`, `borrow_size`,
+  `borrow_wipe`, `borrow_fill`, `borrow_drain`, `borrow_copy`,
+  `borrow_read_at` and `borrow_write_at`. Fallible calls return
+  `err[io.error.Error]` (the positioned transfers return
+  `res[usize, io.error.Error]`) instead of a negative errno (#692).
+- The os contract's secret primitives, each one native call that keeps the
+  welded pointer shape: `std.system.os.allocate_secret`, `release_secret`,
+  `allocate_secret_typed`, `release_secret_typed`, `random_fill_secret`
+  (at most `RANDOM_FILL_SECRET_MAX` bytes per call), `read_at_secret` and
+  `write_at_secret`. They do not wipe or retry (#692).
+- `std.net.ip.sockaddr_family(sa)` reads the family a sockaddr buffer carries
+  (#692).
+- `std.process.exec.stopped`, `stop_signal` and `continued` read stop and
+  continuation observations (#692).
+- `std.filesystem.native` holds `stat_mode`, `unlink_force` and `temp_dir`
+  (#692).
+- `std.process.exec.spawn_shell(command, cwd, envp)` starts a command through
+  the host interpreter without waiting. `run_shell` is built on it. The
+  interpreter choice is a per-OS table in `std.process.exec`: `/bin/sh -c`
+  on posix, and on windows `%ComSpec%` (falling back to the System32
+  `cmd.exe`) with the verbatim `"<shell>" /s /c "<command>"` line (#692).
+- `std.system.os.windows.spawn_command_line(application, command_line, envp,
+  cwd)` spawns from a verbatim native command line. It is a per-OS escape
+  hatch outside the contract: the contract's argv spawns encode arguments with
+  the CRT convention, which cmd.exe does not parse (#692).
+- `std.system.os.INVALID_HANDLE`, the handle no resource has, and
+  `os.stdin()`, `os.stdout()`, `os.stderr()` and `os.working_dir()`, the
+  process's standard handles and the directory handle that resolves a path
+  against the working directory. They are functions because a future
+  implementation may only learn them at run time (#694).
+- `std.system.os.exit(status: u32)` ends the process, and
+  `std.system.os.panic_sink(msg, len)` writes to the error stream and ends the
+  process. The per-OS panic arms in `std.system.panic` are these sinks (#694).
+
+- `std.io.handle.socket(value)` wraps a native socket the process has just
+  opened or accepted, stamping the handle with a process-wide opening. Every
+  std socket constructor uses it (#716).
+- `std.net.async.stream(completion)` turns a successful accept or connect
+  completion into the stream the driver knows, opening included (#716).
+- `io.runtime.Completion.opening` and `io.runtime.complete_opened`: a completion
+  that hands over a socket carries its opening (#716).
+- `std.system.os.linux.io_queue_rearm` and `std.system.os.darwin.io_queue_rearm`
+  re-arm a registration the caller made, and `duplicate_to(from, to)` in the
+  same modules replaces a descriptor number in one step (#716).
 
 ### Changed
 - **Breaking.** `memory.table.make(table, a, element_size, initial)` takes the
@@ -50,12 +101,174 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking.** `std.terminal.control_failure` and `read_failure` are defined
   in `std.terminal`. `std.terminal.error` holds only the outcome tags and
   `code` (#688).
+- **Breaking.** Modules outside the OS layer compare kinds, never errno.
+  A refusal std makes on its own carries a kind and code 0, a native failure
+  keeps its code, and a raw primitive return is read with `os.error_kind`
+  (#693). This changes what several public results hold:
+  - `std.filesystem.removal.Error.code` is 0 for a refusal, and an entry name
+    a native listing returns that is not a single component is a containment
+    refusal, not `EIO`.
+  - `std.filesystem.transaction.ownership` functions return
+    `err[removal.Error]` instead of an `i64` code.
+  - `std.filesystem.transaction` maps an ownership refusal to its own kinds:
+    invalid use is `INVALID`, a held root lock is `LOCK_HELD`, an unsupported
+    backend is `UNSUPPORTED`, and a claim that already exists or a claims
+    entry that is not a directory is `CONFLICT`. A native `EINVAL` elsewhere
+    in a publication is `IO` with its code.
+  - `std.process.exec.Failure.code` is 0 when the refusal is the module's own,
+    such as waiting on a child that was never spawned.
+  - `std.io.file`, `std.io.file.adapter`, `std.filesystem`, `std.process.events`
+    and `std.net.local` report their own refusals with `io.error.make`.
+  - `std.net.local.endpoint.to_sockaddr` and `from_sockaddr` return
+    `err[io_error.Kind]` instead of an `i64` code.
+  - `std.net.resolve` completions that fail carry the resolver's kind directly
+    (`NO_NAME` is `NOT_FOUND`, `TEMPORARY` is `WOULD_BLOCK`) and keep the
+    resolver's native code when there is one.
+  - `std.process.events` reports a failed windows console handler install or
+    restore with its native error instead of `EINVAL`.
+- **Breaking.** `std.system.os.getenv` reports an unset variable as a native
+  code that `os.error_kind` reads as `NOT_FOUND` (`ENOENT`), not the `-1`
+  sentinel, which shared the native code space with `EPERM` (#692).
+- **Breaking.** The sockaddr layout is written once in `std.net.ip`.
+  `to_sockaddr` and `from_sockaddr` no longer go through the OS layer (#692).
+- **Breaking.** Every descriptor that crosses the `std.system.os` contract is
+  a pointer-width handle (`usize`), not an `i32` (#694). A primitive that makes
+  a handle writes it through an out parameter and returns only a status, so a
+  handle value can never be read as a negative native code:
+  - `read`, `write`, `close`, `sync_fd`, `stat`, `set_mode`, `file_identity`,
+    `publication_capabilities`, `seek`, `lock_fd`, `map_file`,
+    `directory_init`, `read_at_secret` and `write_at_secret` take
+    `handle: usize`.
+  - `set_mode_at`, `identity_at`, `stat_path`, `unlink`, `make_dir`, `access`
+    and `rename` take `dir: usize` directory handles.
+  - `open(dir, path, flags, mode, out: *usize) i64` returns 0 and writes the
+    handle, where it used to return the descriptor.
+  - `retain_identity_at(dir, path, access, out, handle: *usize) i64` does the
+    same.
+  - `pipe(read_end: *usize, write_end: *usize) i64` replaces `pipe(fds: *i32)`.
+  - `spawn_redirected` and `spawn_redirected_in` take `usize` standard
+    handles, and `INVALID_HANDLE` keeps the parent's, where `-1` did.
+  - A missing handle is `INVALID_HANDLE`, never a negative value: a `usize`
+    compared with `< 0` is always false.
+
+  Worked example:
+
+  ```mach
+  # before
+  val fd: i64 = os.open(os.AT_FDCWD, path, os.O_RDONLY, 0);
+  if (fd < 0) { ret fail(fd); }
+  val n: i64 = os.read(fd::i32, buf, len);
+  os.close(fd::i32);
+
+  # after
+  var fd:     usize = os.INVALID_HANDLE;
+  val opened: i64   = os.open(os.working_dir(), path, os.O_RDONLY, 0, ?fd);
+  if (opened < 0) { ret fail(opened); }
+  val n: i64 = os.read(fd, buf, len);
+  os.close(fd);
+  ```
+
+  A pipe: `var r: usize; var w: usize; os.pipe(?r, ?w);` replaces
+  `var fds: [2]i32; os.pipe(?fds[0]);`. Code that needs a raw native
+  descriptor, for example to pass it through `SCM_RIGHTS`, uses the per-OS
+  module (`std.system.os.linux` and friends), which keeps its native `i32`
+  shape.
+- **Breaking.** The descriptors std's own APIs hold or accept are handles too
+  (#694):
+  - `std.filesystem.transaction.root_fd` and `root_home_fd` return `usize`,
+    and `INVALID_HANDLE` for an invalid root.
+  - `std.filesystem.transaction.ownership`: `control_fd`, `root_init`,
+    `root_init_with_home` and `root_set_home` use `usize`, and so do the `Root`,
+    `Lock` and `Borrow` descriptor fields.
+  - `std.filesystem.removal.tree` and `private_tree` take a `usize` directory
+    handle.
+  - `std.filesystem.native.unlink_force` takes `dir: usize`.
+  - `std.process.exec.spawn_redirected`, `spawn_redirected_grouped`,
+    `spawn_redirected_in` and `spawn_redirected_in_grouped` take `usize`
+    handles, and `os.INVALID_HANDLE` inherits the parent's stream.
+  - `std.memory.secret.borrow_read_at` and `borrow_write_at` take
+    `file: usize`.
+  - `std.net.resolve.lines.Reader.fd` is a `usize`.
+
+- **Breaking.** A socket a `net.async` driver has seen is closed through the
+  driver (`submit_stream_close`, `submit_datagram_close`). `io.handle.SocketHandle`
+  gains an `opening`, and the linux, darwin and windows backends key their state
+  by native value and opening together. A socket closed outside its driver is
+  detected on the next submission through either handle:
+  - its pending work completes `CLOSED` with code 0
+  - a submission through the old handle is refused the same way
+  - the socket that now holds the native value keeps its own state and
+    registration
+
+  Before, the backends keyed state by the native value alone, so a reused value
+  inherited the old socket's pending operations, and a later cancel could
+  unregister the new owner (#716).
+- **Breaking.** `std.system.os.linux.io_queue_watch` only registers: a
+  descriptor that is already registered is refused with `EEXIST` instead of
+  being taken over, and a caller re-arms its own registration with
+  `io_queue_rearm`. A backend resource unregisters only a registration it made
+  (#716).
+- **Migration.** Close a socket a driver knows through that driver. hedge's
+  `listener.close_connection` (`tcp.stream_close` on a driver-tracked stream) is
+  the known case. Build accepted and connected streams with
+  `net.async.stream(completion)`, and wrap any other native socket once with
+  `io.handle.socket` and pass that handle around: two handles wrapped from one
+  live socket look like two sockets, and the driver treats the older one as
+  closed (#716).
 
 ### Removed
 - **Breaking.** `io.error.from_code` and `io.error.message`. Use
   `std.system.os.error` and `std.system.os.message`, or `io.error.make` for an
   error with no native code. `std.io.error` no longer depends on the OS layer
   and builds freestanding, and so does `std.terminal.error` (#688).
+- **Breaking.** The 38 `E*` constants on `std.system.os` (`EPERM` through
+  `ECANCELED`). Compare `std.system.os.error_kind(code)` with an `io.error`
+  kind. The per-OS modules (`std.system.os.linux`, `.darwin`, `.windows`) keep
+  their constants for code that is already OS-specific. `std.io.writer` no
+  longer depends on the OS layer and builds freestanding (#693).
+- **Breaking.** Logic built on the os primitives leaves `std.system.os`, with
+  no forwarder (#692):
+
+  | removed | use instead |
+  | --- | --- |
+  | `os.secret_allocate` | `std.memory.secret.allocate` |
+  | `os.secret_deallocate` | `std.memory.secret.deallocate` |
+  | `os.secret_allocate_typed` | `std.memory.secret.allocate_typed` |
+  | `os.secret_deallocate_typed` | `std.memory.secret.deallocate_typed` |
+  | `os.secret_random_fill` | `std.memory.secret.random_fill` |
+  | `os.SecretBorrow` | `std.memory.secret.Borrow` |
+  | `os.secret_borrow_*` | `std.memory.secret.borrow_*` |
+  | `os.sock_addr_init`, `sock_addr6_init` | `std.net.ip.to_sockaddr` |
+  | `os.sock_addr_read`, `sock_addr6_read` | `std.net.ip.from_sockaddr` |
+  | `os.sock_addr_family` | `std.net.ip.sockaddr_family` |
+  | `os.has_exited` | `std.process.exec.exited` |
+  | `os.exit_code` | `std.process.exec.code` |
+  | `os.was_signaled` | `std.process.exec.signaled` |
+  | `os.term_signal` | `std.process.exec.signal` |
+  | `os.was_stopped` | `std.process.exec.stopped` |
+  | `os.stop_signal` | `std.process.exec.stop_signal` |
+  | `os.was_continued` | `std.process.exec.continued` |
+  | `os.stat_mode` | `std.filesystem.native.stat_mode` |
+  | `os.unlink_force` | `std.filesystem.native.unlink_force` |
+  | `os.temp_dir` | `std.filesystem.native.temp_dir` |
+  | `os.NOT_FOUND` | `os.error_kind(n) == io.error.NOT_FOUND` |
+  | `os.spawn_shell(command, envp, cwd) i64` | `std.process.exec.spawn_shell(command, cwd, envp) res[Child, Error]` |
+  | `os.separator` | `std.types.path.separator()` |
+
+  The sockaddr and status helpers, and `spawn_shell`, are also gone from the
+  per-OS modules.
+
+  What stays in the contract, on purpose: `ProcessStatus` with its
+  `PROCESS_*` kind and stage values, since the native wait and spawn
+  primitives produce them. `getenv` reports an unset variable as `ENOENT`
+  rather than moving a sentinel to its caller. `stat_mode`, `unlink_force`
+  and `temp_dir` sit in the leaf module `std.filesystem.native` because
+  `std.filesystem`, its removal and transaction modules, and `std.net.local`
+  all use them.
+- **Breaking.** `std.system.os.STDIN_FD`, `STDOUT_FD`, `STDERR_FD` and
+  `AT_FDCWD`. Use `os.stdin()`, `os.stdout()`, `os.stderr()` and
+  `os.working_dir()`. The per-OS modules keep the native constants (#694).
+- **Breaking.** `std.system.os.terminate`. Use `os.exit(status: u32)` (#694).
 
 ## [3.3.0] - 2026-09-16
 
