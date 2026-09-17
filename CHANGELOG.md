@@ -7,6 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.0] - 2026-09-17
+
+Rebuild everything that links std before running it on 5.1.0. The layout of
+`sync.cancel.Scope` changed: `callback_count` is now an atomic `i64` where it
+was a `usize`. The size of the record is unchanged, so code built against 5.0.x
+still links and runs without any compile error, but it reads and writes that
+field the old way, which is not safe. `os.shared.IoQueue`,
+`memory.buffers.Snapshot` and every platform's `IoCompletion` also gained
+fields. No source change is needed in code that does not build those records
+by hand.
+
+### Behavior changes
+Both of these are correct, and both can turn a program that worked on 5.0.x
+into one that fails:
+- A `net.async` backend's `destroy` panics if a native registration would
+  outlive it, where 5.0.x left the registration behind silently. `destroy`
+  still releases idle sockets itself, so the panic points to a defect in std's
+  registration accounting, not to caller misuse. Report it with the backend
+  and platform (#740).
+- On Windows, a `net.async` backend's `destroy` refuses with `EBUSY` while the
+  kernel still owns one of its operations. Poll until the backend is idle, then
+  destroy it again (#740).
+
+### Added
+- `io.runtime.NativeEvent.source` (and `source` on every platform's
+  `IoCompletion`): the id of the source a native event belongs to, 0 for a
+  wake. epoll and kqueue read it from the top 16 bits of the registered
+  context (`os.shared.IO_SOURCE_SHIFT`, `io_source_context`,
+  `io_context_source`). IOCP reads it from the completion key, which
+  `io_queue_attach` now takes (#739).
+- `io.runtime.unrouted_events(runtime)` counts native events whose source id
+  matched no registered source. A nonzero count is expected when a source is
+  released between a batch harvest and its dispatch (#739).
+- `memory.buffers.Snapshot.release_failures` counts backing releases the
+  allocator or the secret store refused. The pool cannot recover that memory,
+  so the count is the only signal it leaked (#779).
+
+### Changed
+- `io.runtime` sends each native event straight to the source its id names,
+  instead of offering it to every source in turn. Per-event dispatch is one
+  offer at 1, 10 and 100 sources, where it was 1, 10 and 100. Wakes still reach
+  every source (#739).
+- `sync.cancel` locks per scope instead of per tree. attach and unregister
+  take only their scope's lock, so threads registering on separate child
+  scopes no longer contend. At 8 threads on per-thread children, attach plus
+  unregister totals 78M/s, where it was 5.8M/s. Single-threaded use is
+  slower: about 6% on attach and unregister, and about 12% on the full
+  make_child, attach, unregister and destroy lifecycle, because destroy now
+  takes the parent's lock and then the scope's. A scope shared by threads still
+  serializes, and the module now documents per-worker roots and per-connection
+  child scopes as the intended shape. `Scope.callback_count` is now an atomic
+  `i64`, which leaves the size of `Scope` unchanged (#754).
+- `io.runtime` recycles source ids, so a runtime has no lifetime limit on
+  registrations. The limit was 65,535. A released id waits until every native
+  collection that began before its release has ended, so an event harvested
+  for the old source can never reach the new one. The wire id stays 16 bits,
+  so at most 65,535 sources can be registered at once. The two invariants this
+  rests on are enforced and tested: a source with a live operation cannot be
+  released, and a backend's `destroy` removes every native registration and
+  waits for the kernel (see Behavior changes) (#740).
+- Native wakes are coalesced. `os.shared.IoQueue` gains `wake_pending`, so only
+  the first wake request since the last poll posts a native wake (an eventfd
+  write, a `NOTE_TRIGGER` kevent or an IOCP packet), and later requests post
+  nothing until a poll takes it. The poll clears the flag after draining the
+  wake and before the caller looks for work, so no request is lost. N
+  operations completed between two waits now post 1 wake at 1k, 10k and 100k,
+  where they posted N. `IoQueue.wakes_posted` counts posted wakes (#753).
+- `net.resolve` keeps runtime-owned lookups waiting to publish on an intrusive
+  list, finds an operation from its runtime token through a hash of the token
+  index, remembers each queued completion's ring position, and claims slots
+  from a free list. Runtime dispatch, cancel and release no longer scan every
+  resolver slot. Each costs one step at 1k, 10k and 100k slots, where each
+  cost R steps before. `Resolver` gains a `steps` counter used by the scaling
+  test (#742).
+- `net.async.local` claims stream and listener entries from free lists instead
+  of scanning up to the high-water mark on every accept, connect and bind. A
+  claim after churn costs one step at 1k, 10k and 100k streams, where it cost n
+  steps before (#743).
+
+### Fixed
+- A registration that loses a race with runtime close no longer leaves a
+  source slot stuck, which made `destroy` report busy forever. This defect is
+  separate from id recycling, and was found while doing it.
+- The `memory.buffers` `source_*` and `secret_source_*` wrappers refuse a nil
+  source or a nil member as misuse, instead of calling through nil. Found in
+  the #775 sweep (#778).
+- `memory.buffers` no longer ignores a refused backing release. Plain and
+  secret releases, and the cleanup after a failed secret borrow, count the
+  failure in `release_failures`. Found in the #775 sweep (#779).
+- On Windows, canceling a stream operation after its socket's close no longer
+  panics the runtime with "source cancellation lost operation ownership". The
+  close had already asked the kernel to abort the operation, and the cancel
+  refused it with EBADF. It now waits for the aborted packet, as it does for an
+  operation it aborts itself. The local-socket backend already did (#786).
+
 ## [5.0.1] - 2026-09-17
 
 Requires mach 5.2.0 or later. Tested with mach 5.2.1, the family CI seed.

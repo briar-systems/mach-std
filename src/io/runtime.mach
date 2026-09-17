@@ -12,6 +12,7 @@ use std.sync.cancel;
 use std.sync.mutex;
 use std.sync.thread;
 use std.system.os;
+use os_shared: std.system.os.shared;
 use std.system.panic;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -82,9 +83,13 @@ pub rec Completion {
     end_of_stream: bool;
 }
 
+# one native completion, laid out as the platform's IoCompletion
+# ---
+# source: the id of the source the event belongs to, 0 for a wake
 pub rec NativeEvent {
     context: usize;
     events:  u32;
+    source:  u16;
     status:  i64;
     flags:   u64;
 }
@@ -95,9 +100,8 @@ pub rec SourceToken {
     tag:        u16;
 }
 
-# offered every native event in registration order. returns true only for a
-# native context the source itself registered, which ends the offer. a wake
-# (context 0) is offered to every source regardless
+# offered each native event carrying the source's id, and every wake (context
+# 0). returns true when the source consumed the event
 pub def DispatchFun: fun(ptr, usize, u32, i64, u64) bool;
 pub def CancelFun:   fun(ptr, Token, io_error.Error) i64;
 pub def ReleaseFun:  fun(ptr, *Completion);
@@ -132,6 +136,17 @@ val SOURCE_UNUSED:     u8  = 0;
 val SOURCE_REGISTERED: u8  = 1;
 val SOURCE_RETIRED:    u8  = 2;
 val NO_SOURCE:         u32 = 0xffffffff;
+
+# where a source id leads
+# ---
+# index:    the source slot holding the id while it is registered
+# next:     the next released id, 0 at the tail
+# released: collections begun when the id was released
+rec Route {
+    index:    u32;
+    next:     u32;
+    released: u64;
+}
 
 rec Source {
     state:      u8;
@@ -199,7 +214,9 @@ pub rec Runtime {
     slots:     table.Table;
     timers:    table.Table;
     sources:   table.Table;
-    deadlines: table.Table;
+    # a Route per source id ever issued, indexed by id
+    source_routes: table.Table;
+    deadlines:     table.Table;
     # open addressed on (owner, at), a power of two at least twice the slots
     deadline_index:  table.Table;
     deadline_used:   usize;
@@ -218,6 +235,15 @@ pub rec Runtime {
     source_count:    usize;
     source_slots:    usize;
     next_source_tag: u32;
+    # released ids, oldest first, reused once no collection can still hold
+    # an event harvested for them
+    route_free_head: u32;
+    route_free_tail: u32;
+    # native collections begun and ended, each a harvest and its dispatch
+    collections_begun: u64;
+    collections_ended: u64;
+    # native events whose source id matched no registered source
+    unrouted:        u64;
     native_controls: usize;
     lifecycle:       lifecycle.Lifecycle;
     destroyed:       bool;
@@ -254,6 +280,7 @@ pub fun aliases(runtime: *Runtime, data: *u8, len: usize) bool {
     ret table.aliases(?runtime.slots, data, len) ||
         table.aliases(?runtime.timers, data, len) ||
         table.aliases(?runtime.sources, data, len) ||
+        table.aliases(?runtime.source_routes, data, len) ||
         table.aliases(?runtime.deadlines, data, len) ||
         table.aliases(?runtime.deadline_index, data, len) ||
         memory.ranges_overlap(runtime.native_events::*u8, native_event_bytes,
@@ -351,6 +378,7 @@ fun free_pop(runtime: *Runtime) usize {
 fun release_tables(runtime: *Runtime) {
     table.destroy(?runtime.deadline_index);
     table.destroy(?runtime.deadlines);
+    table.destroy(?runtime.source_routes);
     table.destroy(?runtime.sources);
     table.destroy(?runtime.timers);
     table.destroy(?runtime.slots);
@@ -456,6 +484,7 @@ pub fun make(runtime: *Runtime, initial: usize) err[io_error.Error] {
     runtime.deadline_live = 0;
     if (!table.make(?runtime.timers, ?runtime.allocator, $size_of(TimerEntry), initial) ||
         !table.make(?runtime.sources, ?runtime.allocator, $size_of(Source), SOURCE_INITIAL) ||
+        !table.make(?runtime.source_routes, ?runtime.allocator, $size_of(Route), SOURCE_INITIAL) ||
         !table.make(?runtime.deadlines, ?runtime.allocator, $size_of(DeadlineRecord), initial) ||
         !deadline_rebuild(runtime, initial * 2) ||
         !reserve_timers(runtime)) {
@@ -468,19 +497,24 @@ pub fun make(runtime: *Runtime, initial: usize) err[io_error.Error] {
         ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
     }
 
-    runtime.initial         = initial;
-    runtime.slot_count      = 0;
-    runtime.free_head       = NO_SLOT;
-    runtime.free_tail       = NO_SLOT;
-    runtime.head            = NO_SLOT;
-    runtime.tail            = NO_SLOT;
-    runtime.count           = 0;
-    runtime.live            = 0;
-    runtime.timer_count     = 0;
-    runtime.source_count    = 0;
-    runtime.source_slots    = 0;
-    runtime.next_source_tag = 1;
-    runtime.native_controls = 0;
+    runtime.initial           = initial;
+    runtime.slot_count        = 0;
+    runtime.free_head         = NO_SLOT;
+    runtime.free_tail         = NO_SLOT;
+    runtime.head              = NO_SLOT;
+    runtime.tail              = NO_SLOT;
+    runtime.count             = 0;
+    runtime.live              = 0;
+    runtime.timer_count       = 0;
+    runtime.source_count      = 0;
+    runtime.source_slots      = 0;
+    runtime.next_source_tag   = 1;
+    runtime.route_free_head   = 0;
+    runtime.route_free_tail   = 0;
+    runtime.collections_begun = 0;
+    runtime.collections_ended = 0;
+    runtime.unrouted          = 0;
+    runtime.native_controls   = 0;
     lifecycle.make(?runtime.lifecycle);
     runtime.destroyed    = false;
     runtime.woken        = false;
@@ -496,6 +530,55 @@ pub fun make(runtime: *Runtime, initial: usize) err[io_error.Error] {
         ret err[io_error.Error].err{os.error(code, io_error.OP_CREATE)};
     }
     ret err[io_error.Error].ok{};
+}
+
+fun route_at(runtime: *Runtime, id: u16) *Route {
+    ret table.at(?runtime.source_routes, id::usize)::*Route;
+}
+
+# the id a registration will take, 0 when every id is live or still held by a
+# collection that began before its release. nothing changes until commit
+fun take_source_id(runtime: *Runtime) u16 {
+    val head: u32 = runtime.route_free_head;
+    if (head != 0 && route_at(runtime, head::u16).released <= runtime.collections_ended)                                { ret head::u16; }
+    if (runtime.next_source_tag > 0xffff || !table.reserve(?runtime.source_routes, runtime.next_source_tag::usize + 1)) { ret 0; }
+    ret runtime.next_source_tag::u16;
+}
+
+fun commit_source_id(runtime: *Runtime, id: u16, index: u32) {
+    val route: *Route = route_at(runtime, id);
+    if (id::u32 == runtime.next_source_tag) {
+        runtime.next_source_tag = runtime.next_source_tag + 1;
+    }
+    or {
+        runtime.route_free_head = route.next;
+        if (runtime.route_free_head == 0) { runtime.route_free_tail = 0; }
+    }
+    route.index = index;
+    route.next  = 0;
+}
+
+# an event harvested before this point may still name the id, so it waits for
+# every collection already begun to end
+fun release_source_id(runtime: *Runtime, id: u16) {
+    val route: *Route = route_at(runtime, id);
+    route.next     = 0;
+    route.released = runtime.collections_begun;
+    if (runtime.route_free_tail == 0) { runtime.route_free_head = id::u32; }
+    or                                { route_at(runtime, runtime.route_free_tail::u16).next = id::u32; }
+    runtime.route_free_tail = id::u32;
+}
+
+fun collection_begin(runtime: *Runtime) {
+    mutex.lock(?runtime.lock);
+    runtime.collections_begun = runtime.collections_begun + 1;
+    mutex.unlock(?runtime.lock);
+}
+
+fun collection_end(runtime: *Runtime) {
+    mutex.lock(?runtime.lock);
+    runtime.collections_ended = runtime.collections_ended + 1;
+    mutex.unlock(?runtime.lock);
 }
 
 fun source_for(runtime: *Runtime, token: SourceToken) *Source {
@@ -531,7 +614,8 @@ pub fun register_source(
         mutex.unlock(?runtime.lock);
         ret res[SourceToken, io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_CREATE)};
     }
-    if (runtime.next_source_tag > 0xffff) {
+    val tag: u16 = take_source_id(runtime);
+    if (tag == 0) {
         mutex.unlock(?runtime.lock);
         ret res[SourceToken, io_error.Error].err{exhausted(io_error.OP_CREATE)};
     }
@@ -548,7 +632,6 @@ pub fun register_source(
     val source:     *Source = source_at(runtime, index);
     var generation: u32     = source.generation + 1;
     if (generation == 0) { generation = 1; }
-    val tag: u16 = runtime.next_source_tag::u16;
     source.state      = SOURCE_REGISTERED;
     source.generation = generation;
     source.tag        = tag;
@@ -560,13 +643,15 @@ pub fun register_source(
     source.busy       = 0;
     val attached: err[lifecycle.StateError] = lifecycle.attach(?runtime.lifecycle, ?source.attachment);
     if (sel attached.err) {
-        source.state   = SOURCE_RETIRED;
+        # no token leaves, so the slot and the id go straight back
+        source.state   = SOURCE_UNUSED;
+        source.tag     = 0;
         source.context = nil;
         mutex.unlock(?runtime.lock);
         ret res[SourceToken, io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_CREATE)};
     }
-    runtime.source_count    = runtime.source_count + 1;
-    runtime.next_source_tag = runtime.next_source_tag + 1;
+    commit_source_id(runtime, tag, index::u32);
+    runtime.source_count = runtime.source_count + 1;
     mutex.unlock(?runtime.lock);
     ret res[SourceToken, io_error.Error].ok{SourceToken{index: index::u32, generation: generation, tag: tag}};
 }
@@ -600,7 +685,9 @@ pub fun release_source(runtime: *Runtime, token: SourceToken) err[io_error.Error
         mutex.unlock(?runtime.lock);
         ret err[io_error.Error].err{invalid(io_error.OP_CLOSE)};
     }
+    release_source_id(runtime, source.tag);
     source.state         = SOURCE_UNUSED;
+    source.tag           = 0;
     source.context       = nil;
     runtime.source_count = runtime.source_count - 1;
     val settled:     res[bool, lifecycle.StateError] = lifecycle.settle(?source.attachment);
@@ -621,6 +708,20 @@ pub fun unregister_source(runtime: *Runtime, token: SourceToken) err[io_error.Er
 
 pub fun source_id(token: SourceToken) u16 {
     ret token.tag;
+}
+
+# native events whose source id matched no registered source since make
+#
+# a nonzero count is not by itself an error. a correct program raises it when a
+# source is released between the harvest of a native batch and the dispatch of
+# that source's event. a count that keeps rising with no releases points at a
+# backend reporting a wrong id
+pub fun unrouted_events(runtime: *Runtime) u64 {
+    if (runtime == nil) { ret 0; }
+    mutex.lock(?runtime.lock);
+    val count: u64 = runtime.unrouted;
+    mutex.unlock(?runtime.lock);
+    ret count;
 }
 
 # a fresh index is appended and an index is never recycled while it is live,
@@ -1439,17 +1540,8 @@ fun native_poll(runtime: *Runtime, timeout_ms: i32, controlled: *bool) res[usize
     ret res[usize, io_error.Error].ok{polled::usize};
 }
 
-fun dispatch_source(runtime: *Runtime, index: usize, event: NativeEvent) bool {
-    mutex.lock(?runtime.lock);
-    if (runtime.destroyed || index >= runtime.source_slots) {
-        mutex.unlock(?runtime.lock);
-        ret false;
-    }
-    val source: *Source = source_at(runtime, index);
-    if (source.state != SOURCE_REGISTERED) {
-        mutex.unlock(?runtime.lock);
-        ret false;
-    }
+# the caller holds the lock, which is released on return
+fun offer_locked(runtime: *Runtime, source: *Source, event: NativeEvent) bool {
     source.busy = source.busy + 1;
     val context:  ptr         = source.context;
     val dispatch: DispatchFun = source.dispatch;
@@ -1461,14 +1553,44 @@ fun dispatch_source(runtime: *Runtime, index: usize, event: NativeEvent) bool {
     ret claimed;
 }
 
-fun dispatch_sources(runtime: *Runtime, event: NativeEvent) {
-    val wake: bool  = (event.events & native_os.IO_EVENT_WAKE) != 0;
-    var i:    usize = 0;
-    for (i < runtime.source_slots) {
-        val claimed: bool = dispatch_source(runtime, i, event);
-        if (claimed && !wake) { ret; }
-        i = i + 1;
+fun wake_source(runtime: *Runtime, index: usize, event: NativeEvent) {
+    mutex.lock(?runtime.lock);
+    if (runtime.destroyed || index >= runtime.source_slots || source_at(runtime, index).state != SOURCE_REGISTERED) {
+        mutex.unlock(?runtime.lock);
+        ret;
     }
+    offer_locked(runtime, source_at(runtime, index), event);
+}
+
+# a wake reaches every source, any other event only the source its id names
+fun dispatch_sources(runtime: *Runtime, event: NativeEvent) {
+    if ((event.events & native_os.IO_EVENT_WAKE) != 0) {
+        var i: usize = 0;
+        for (i < runtime.source_slots) {
+            wake_source(runtime, i, event);
+            i = i + 1;
+        }
+        ret;
+    }
+    mutex.lock(?runtime.lock);
+    if (runtime.destroyed) {
+        mutex.unlock(?runtime.lock);
+        ret;
+    }
+    var source: *Source = nil;
+    if (event.source != 0 && event.source::u32 < runtime.next_source_tag) {
+        val index: usize = route_at(runtime, event.source).index::usize;
+        if (index < runtime.source_slots) {
+            val candidate: *Source = source_at(runtime, index);
+            if (candidate.state == SOURCE_REGISTERED && candidate.tag == event.source) { source = candidate; }
+        }
+    }
+    if (source == nil) {
+        runtime.unrouted = runtime.unrouted + 1;
+        mutex.unlock(?runtime.lock);
+        ret;
+    }
+    offer_locked(runtime, source, event);
 }
 
 fun flush_sources(runtime: *Runtime) {
@@ -1477,6 +1599,7 @@ fun flush_sources(runtime: *Runtime) {
         events:  native_os.IO_EVENT_WAKE,
         status:  0,
         flags:   0,
+        source:  0,
     });
 }
 
@@ -1486,6 +1609,8 @@ fun flush_sources(runtime: *Runtime) {
 fun collect_native(runtime: *Runtime, timeout_ms: i32, controlled: *bool) res[usize, io_error.Error] {
     var total:   usize = 0;
     var timeout: i32   = timeout_ms;
+    collection_begin(runtime);
+    fin { collection_end(runtime); }
     for (true) {
         val polled: res[usize, io_error.Error] = native_poll(runtime, timeout, controlled);
         if (sel polled.err) { ret polled; }
@@ -1709,6 +1834,7 @@ fun destroy_with_native_ownership(runtime: *Runtime) err[io_error.Error] {
     mutex.unlock(?runtime.lock);
     val queue_result:  i64                  = os.io_queue_close(?runtime.queue);
     val source_result: err[allocator.Error] = table.destroy(?runtime.sources);
+    val route_result:  err[allocator.Error] = table.destroy(?runtime.source_routes);
     val timer_result:  err[allocator.Error] = table.destroy(?runtime.timers);
     val index_result:  err[allocator.Error] = table.destroy(?runtime.deadline_index);
     val record_result: err[allocator.Error] = table.destroy(?runtime.deadlines);
@@ -1721,8 +1847,8 @@ fun destroy_with_native_ownership(runtime: *Runtime) err[io_error.Error] {
     runtime.free_tail     = NO_SLOT;
     runtime.head          = NO_SLOT;
     runtime.tail          = NO_SLOT;
-    if (queue_result < 0)                                                                                                                           { ret err[io_error.Error].err{os.error(queue_result, io_error.OP_CLOSE)}; }
-    if (sel timer_result.err || sel index_result.err || sel record_result.err || sel source_result.err || native_result < 0 || sel slot_result.err) { ret err[io_error.Error].err{io_error.make(io_error.IO, io_error.OP_CLOSE)}; }
+    if (queue_result < 0)                                                                                                                                                   { ret err[io_error.Error].err{os.error(queue_result, io_error.OP_CLOSE)}; }
+    if (sel timer_result.err || sel index_result.err || sel record_result.err || sel source_result.err || sel route_result.err || native_result < 0 || sel slot_result.err) { ret err[io_error.Error].err{io_error.make(io_error.IO, io_error.OP_CLOSE)}; }
     ret err[io_error.Error].ok{};
 }
 
@@ -2168,6 +2294,108 @@ test "runtime: a submission wake does not end a wait early" {
     if (!succeeded(cancel.destroy(?scope)))   { ret 10; }
     close(?runtime);
     if (!ok_err(destroy(?runtime))) { ret 11; }
+    ret 0;
+}
+
+# native wakes posted while count operations are submitted and completed
+# between two waits, then drained
+fun wakes_between_waits(count: usize, posted: *i64) i32 {
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, count))) { ret 1; }
+    var output: [64]Completion;
+    val before: i64   = runtime.queue.wakes_posted;
+    var i:      usize = 0;
+    for (i < count) {
+        val submitted: res[Token, io_error.Error] = submit(?runtime, test_operation(READ, i));
+        if (sel submitted.err)                                      { ret 2; }
+        if (!ok_err(complete(?runtime, submitted.ok, 1, 0, false))) { ret 3; }
+        i = i + 1;
+    }
+    @posted = runtime.queue.wakes_posted - before;
+    var drained: usize = 0;
+    for (drained < count) {
+        val waited: res[usize, io_error.Error] = wait(?runtime, ?output[0], 64, 1000);
+        if (sel waited.err) { ret 4; }
+        if (waited.ok == 0) { ret 5; }
+        drained = drained + waited.ok;
+    }
+    close(?runtime);
+    if (!ok_err(destroy(?runtime))) { ret 6; }
+    ret 0;
+}
+
+test "runtime: native wakes stay one per wait from 1k to 100k operations" {
+    val sizes:  [3]usize = [3]usize{1000, 10000, 100000};
+    var posted: [3]i64;
+    var i:      usize    = 0;
+    for (i < 3) {
+        val counted: i32 = wakes_between_waits(sizes[i], ?posted[i]);
+        if (counted != 0)   { ret 10 * (i::i32 + 1) + counted; }
+        if (posted[i] != 1) { ret 40 + i::i32; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+rec RacingCompleter {
+    runtime: *Runtime;
+    started: *i64;
+    count:   usize;
+    failed:  i64;
+}
+
+fun racing_completer(arg: *u8) {
+    val context: *RacingCompleter = arg::*RacingCompleter;
+    for (atomic.load(context.started) == 0) { atomic.spin_hint(); }
+    var i: usize = 0;
+    for (i < context.count) {
+        val submitted: res[Token, io_error.Error] = submit(context.runtime, test_operation(READ, i));
+        if (sel submitted.err) {
+            atomic.store(?context.failed, 1);
+            ret;
+        }
+        if (!ok_err(complete(context.runtime, submitted.ok, 1, 0, false))) {
+            atomic.store(?context.failed, 1);
+            ret;
+        }
+        os.sleep(50000);
+        i = i + 1;
+    }
+}
+
+# every completion made while another thread waits reaches it promptly: a
+# coalesced wake is never lost between a harvest and the next request
+test "runtime: coalesced wakes lose no completion against a racing waiter" {
+    val total:   usize = 5000;
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, 64))) { ret 1; }
+    var started: i64             = 0;
+    var context: RacingCompleter = RacingCompleter{runtime: ?runtime, started: ?started, count: total, failed: 0};
+    var worker:  thread.Thread;
+    thread.spawn_with(racing_completer, (?context)::*u8, ?worker);
+    if (worker.tid < 0) { ret 2; }
+    atomic.store(?started, 1);
+    var output:   [16]Completion;
+    var received: usize = 0;
+    var result:   i32   = 0;
+    for (received < total && result == 0) {
+        val began: time.InstantClock = time.instant();
+        if (sel began.err) { result = 8; }
+        val waited: res[usize, io_error.Error] = wait(?runtime, ?output[0], 16, 5000);
+        # a lost wake shows as a wait that sits out its timeout
+        if (sel began.ok && elapsed_ms(began.ok) >= 1000) { result = 9; }
+        if (sel waited.err)                               { result = 3; }
+        if (sel waited.ok) {
+            if (waited.ok == 0) { result = 4; }
+            received = received + waited.ok;
+        }
+        if (result == 0 && atomic.load(?context.failed) != 0) { result = 5; }
+    }
+    thread.join(?worker);
+    if (result != 0)       { ret result; }
+    if (received != total) { ret 6; }
+    close(?runtime);
+    if (!ok_err(destroy(?runtime))) { ret 7; }
     ret 0;
 }
 
@@ -3040,6 +3268,179 @@ fun test_source_cancel(context: ptr, token: Token, reason: io_error.Error) i64 {
 fun test_source_release(context: ptr, completion: *Completion) {
     val source: *TestSource = context::*TestSource;
     source.released = source.released + 1;
+}
+
+# a source that claims only contexts carrying its own id, counting every offer
+rec RoutedSource {
+    id:      u16;
+    offers:  *usize;
+    claimed: usize;
+}
+
+fun routed_source_dispatch(context: ptr, native_context: usize, events: u32, status: i64, flags: u64) bool {
+    val source: *RoutedSource = context::*RoutedSource;
+    if ((events & native_os.IO_EVENT_WAKE) != 0) { ret false; }
+    @source.offers = @source.offers + 1;
+    if (os_shared.io_context_source(native_context) != source.id) { ret false; }
+    source.claimed = source.claimed + 1;
+    ret true;
+}
+
+# offers made to deliver one event to the last of count sources
+fun routed_offers(count: usize, offers: *usize) i32 {
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    var sources: [100]RoutedSource;
+    var tokens:  [100]SourceToken;
+    var offered: usize = 0;
+    var i:       usize = 0;
+    for (i < count) {
+        sources[i] = RoutedSource{id: 0, offers: ?offered, claimed: 0};
+        val registered: res[SourceToken, io_error.Error] = register_source(?runtime, (?sources[i])::ptr, routed_source_dispatch, test_source_cancel, test_source_release);
+        if (sel registered.err) { ret 2; }
+        tokens[i]     = registered.ok;
+        sources[i].id = source_id(registered.ok);
+        i             = i + 1;
+    }
+    val last: usize = count - 1;
+    dispatch_sources(?runtime, NativeEvent{
+        context: os_shared.io_source_context(sources[last].id, 1),
+        events:  native_os.IO_EVENT_READ,
+        status:  0,
+        flags:   0,
+        source:  sources[last].id,
+    });
+    if (sources[last].claimed != 1) { ret 3; }
+    @offers = offered;
+    i       = 0;
+    for (i < count) {
+        if (!ok_err(unregister_source(?runtime, tokens[i]))) { ret 4; }
+        i = i + 1;
+    }
+    close(?runtime);
+    if (!ok_err(destroy(?runtime))) { ret 5; }
+    ret 0;
+}
+
+test "runtime: native event dispatch cost stays flat from 1 to 100 sources" {
+    val counts: [3]usize = [3]usize{1, 10, 100};
+    var offers: [3]usize;
+    var i:      usize    = 0;
+    for (i < 3) {
+        val routed: i32 = routed_offers(counts[i], ?offers[i]);
+        if (routed != 0) { ret 10 * (i::i32 + 1) + routed; }
+        i = i + 1;
+    }
+    if (offers[0] != 1 || offers[1] != 1 || offers[2] != 1) { ret 40; }
+    ret 0;
+}
+
+test "runtime: an event for a released source is counted, never offered" {
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    var offered: usize                            = 0;
+    var gone:    RoutedSource                     = RoutedSource{id: 0, offers: ?offered, claimed: 0};
+    val first:   res[SourceToken, io_error.Error] = register_source(?runtime, (?gone)::ptr, routed_source_dispatch, test_source_cancel, test_source_release);
+    if (sel first.err) { ret 2; }
+    gone.id = source_id(first.ok);
+    # released while a collection holds a harvested batch, so its id is held
+    collection_begin(?runtime);
+    if (!ok_err(unregister_source(?runtime, first.ok))) { ret 3; }
+    # the released index is reused under a new id
+    var live:   RoutedSource                     = RoutedSource{id: 0, offers: ?offered, claimed: 0};
+    val second: res[SourceToken, io_error.Error] = register_source(?runtime, (?live)::ptr, routed_source_dispatch, test_source_cancel, test_source_release);
+    if (sel second.err)                    { ret 4; }
+    if (second.ok.index != first.ok.index) { ret 4; }
+    live.id = source_id(second.ok);
+    if (unrouted_events(?runtime) != 0) { ret 5; }
+    dispatch_sources(?runtime, NativeEvent{context: os_shared.io_source_context(gone.id, 1), events: native_os.IO_EVENT_READ, status: 0, flags: 0, source: gone.id});
+    dispatch_sources(?runtime, NativeEvent{context: 1, events: native_os.IO_EVENT_READ, status: 0, flags: 0, source: 0});
+    dispatch_sources(?runtime, NativeEvent{context: 1, events: native_os.IO_EVENT_READ, status: 0, flags: 0, source: 0xffff});
+    if (unrouted_events(?runtime) != 3 || offered != 0) { ret 6; }
+    collection_end(?runtime);
+    if (live.id == gone.id) { ret 10; }
+    dispatch_sources(?runtime, NativeEvent{context: os_shared.io_source_context(live.id, 1), events: native_os.IO_EVENT_READ, status: 0, flags: 0, source: live.id});
+    if (unrouted_events(?runtime) != 3 || offered != 1 || live.claimed != 1) { ret 7; }
+    if (!ok_err(unregister_source(?runtime, second.ok)))                     { ret 8; }
+    close(?runtime);
+    if (!ok_err(destroy(?runtime))) { ret 9; }
+    ret 0;
+}
+
+test "runtime: a native event is laid out as the platform completion" {
+    if ($size_of(NativeEvent) != $size_of(native_os.IoCompletion) ||
+        $offset_of(NativeEvent, context) != $offset_of(native_os.IoCompletion, context) ||
+        $offset_of(NativeEvent, events) != $offset_of(native_os.IoCompletion, events) ||
+        $offset_of(NativeEvent, status) != $offset_of(native_os.IoCompletion, status) ||
+        $offset_of(NativeEvent, flags) != $offset_of(native_os.IoCompletion, flags) ||
+        $offset_of(NativeEvent, source) != $offset_of(native_os.IoCompletion, source)) { ret 1; }
+    ret 0;
+}
+
+# a batch harvested while a source was live is dispatched after the source is
+# released and another registered, as a collection racing a release does
+fun racing_cycle(runtime: *Runtime, old: *RoutedSource, fresh: *RoutedSource) i32 {
+    val first: res[SourceToken, io_error.Error] = register_source(runtime, old::ptr, routed_source_dispatch, test_source_cancel, test_source_release);
+    if (sel first.err) { ret 1; }
+    old.id = source_id(first.ok);
+    collection_begin(runtime);
+    if (!ok_err(unregister_source(runtime, first.ok))) { ret 2; }
+    val second: res[SourceToken, io_error.Error] = register_source(runtime, fresh::ptr, routed_source_dispatch, test_source_cancel, test_source_release);
+    if (sel second.err) { ret 3; }
+    fresh.id = source_id(second.ok);
+    if (fresh.id == old.id) { ret 4; }
+    dispatch_sources(runtime, NativeEvent{context: os_shared.io_source_context(old.id, 1), events: native_os.IO_EVENT_READ, status: 0, flags: 0, source: old.id});
+    collection_end(runtime);
+    if (!ok_err(unregister_source(runtime, second.ok))) { ret 5; }
+    ret 0;
+}
+
+test "runtime: 70,000 source registrations on one runtime never reach a stale source" {
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    var offered: usize        = 0;
+    var old:     RoutedSource = RoutedSource{id: 0, offers: ?offered, claimed: 0};
+    var fresh:   RoutedSource = RoutedSource{id: 0, offers: ?offered, claimed: 0};
+    var highest: u16          = 0;
+    var cycle:   usize        = 0;
+    for (cycle < 70000) {
+        val raced: i32 = racing_cycle(?runtime, ?old, ?fresh);
+        if (raced != 0)         { ret 10 + raced; }
+        if (old.id > highest)   { highest = old.id; }
+        if (fresh.id > highest) { highest = fresh.id; }
+        cycle = cycle + 1;
+    }
+    # 140,000 registrations reuse a handful of ids, and no stale event landed
+    if (offered != 0 || fresh.claimed != 0) { ret 2; }
+    if (highest > 4)                        { ret 3; }
+    if (unrouted_events(?runtime) != 70000) { ret 4; }
+    close(?runtime);
+    if (!ok_err(destroy(?runtime))) { ret 5; }
+    ret 0;
+}
+
+# a source keeps its id while it owns an operation, so the runtime never reuses
+# an id a pending native completion could still carry (#740)
+test "runtime: a source with a live operation cannot be released" {
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    var context:    TestSource                       = TestSource{released: 0, cancellation_pending: false, cancelled: Token{index: 0, generation: 0}};
+    val registered: res[SourceToken, io_error.Error] = register_source(?runtime, (?context)::ptr, test_source_dispatch, test_source_cancel, test_source_release);
+    if (sel registered.err) { ret 2; }
+    val source:    SourceToken                = registered.ok;
+    val submitted: res[Token, io_error.Error] = submit_owned(?runtime, source, test_operation(READ, 93));
+    if (sel submitted.err) { ret 3; }
+    val retired: res[bool, io_error.Error] = retire_source(?runtime, source);
+    if (sel retired.ok)                                         { ret 4; }
+    if (retired.err.kind != io_error.BUSY)                      { ret 4; }
+    if (ok_err(release_source(?runtime, source)))               { ret 5; }
+    if (!ok_err(complete(?runtime, submitted.ok, 1, 0, false))) { ret 6; }
+    var output: Completion;
+    if (!ok_usize(poll(?runtime, ?output, 1)))        { ret 7; }
+    if (!ok_err(unregister_source(?runtime, source))) { ret 8; }
+    close(?runtime);
+    if (!ok_err(destroy(?runtime))) { ret 9; }
+    ret 0;
 }
 
 test "runtime: retired source slots reject stale tokens and remain reusable" {
