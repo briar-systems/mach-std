@@ -34,10 +34,8 @@ decode() {
     esac
 }
 
-# vendor this checkout's std by copying rather than by the `dep/std -> repo root`
-# symlink the other probes use. a probe for symlinks must not need a working
-# symlink to set itself up, and on a windows host `ln -s` under msys silently
-# produces a copy anyway.
+# vendor this checkout's std as a physical copy: mach refuses a symlinked dep
+# root, and a probe for symlinks must not need a working symlink to set itself up.
 rm -rf dep
 mkdir -p dep/std
 cp ../../mach.toml dep/std/mach.toml
