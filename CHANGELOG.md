@@ -30,6 +30,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     builds freestanding (#760).
 - `std.memory.secret.borrow_data` returns the welded storage of a live borrow
   (#760).
+
+- `std.process.limits`: read and set the open-file limit. `open_files()` returns
+  a `FileLimit` with the soft limit in force, the hard limit, and the highest
+  soft limit this process may set (`ceiling`); `set_open_files(limit)` sets the
+  soft and hard limits; `raise_open_files()` raises the soft limit to the
+  ceiling. A soft limit above the hard one is `INVALID`, raising the hard limit
+  without privilege is `PERMISSION`, and windows, which has no such limit,
+  reports `UNSUPPORTED`. The OS contract's process group gains
+  `open_file_limit` and `set_open_file_limit` (#746).
+
+
 - `std.system.os.thread_affinity(words, capacity, out_count)` and
   `set_thread_affinity(words, count)` read and pin the calling thread's CPU
   affinity, in the threads capability group. The mask is caller-sized words with
