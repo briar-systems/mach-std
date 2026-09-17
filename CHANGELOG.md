@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.0.1] - 2026-09-16
+
+Requires mach 5.2.0 or later. Tested with mach 5.2.1, the family CI seed.
+
 ### Fixed
 - On linux and darwin, a `net.async` datagram send batch with a packet whose
   `length` exceeds its `capacity`, whose buffer is missing, or whose peer family
