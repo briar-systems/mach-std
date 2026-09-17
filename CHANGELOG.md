@@ -39,6 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#744).
 - `os.io_queue_restore` is no longer used by `net.async`. It stays available
   (#744).
+- A Windows `net.async` or `net.async.local` cancel no longer wakes the
+  runtime's native waiter and waits for it to leave the native wait. The cancel
+  only requests the abort, and the packet settles it through dispatch. Each
+  backend declares `CANCEL_NEEDS_NATIVE_CONTROL`, which stays true on Linux and
+  Darwin, where cancel ends native access synchronously (#787).
 - The layout of the Windows `net.async` and `net.async.local` backend records,
   and so of their `Driver`, changed. Rebuild everything that links std (#744).
 
