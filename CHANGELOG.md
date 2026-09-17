@@ -136,6 +136,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   | `os.temp_dir` | `std.filesystem.native.temp_dir` |
   | `os.NOT_FOUND` | `os.error_kind(n) == io.error.NOT_FOUND` |
   | `os.spawn_shell(command, envp, cwd) i64` | `std.process.exec.spawn_shell(command, cwd, envp) res[Child, Error]` |
+  | `os.separator` | `std.types.path.separator()` |
 
   The sockaddr and status helpers, and `spawn_shell`, are also gone from the
   per-OS modules.
