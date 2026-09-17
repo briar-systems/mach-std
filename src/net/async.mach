@@ -22,6 +22,7 @@ use std.net.tcp;
 use std.net.udp;
 use std.sync.cancel;
 use std.sync.mutex;
+use std.sync.thread;
 use std.system.os;
 use std.system.panic;
 use std.types.bool.bool;
@@ -529,6 +530,21 @@ fun submit_packets(
     ret res[io_runtime.Token, io_error.Error].ok{token};
 }
 
+# receive up to count datagrams into packets
+#
+# the completion arrives as soon as at least one datagram is available and
+# carries every datagram already queued, up to count. it never waits for the
+# batch to fill, so its items are between 1 and count
+# ---
+# driver:  the driver the socket belongs to
+# scope:   the cancellation scope the operation is registered on
+# socket:  the datagram socket
+# packets: count packets whose buffer and capacity describe the storage. the
+#          storage is borrowed until the operation completes
+# count:   the most datagrams one completion carries
+# context: returned with the completion
+# ret:     the operation's token, or the refusal
+#
 # the socket is closed through this driver once submitted (module header)
 pub fun submit_receive_batch(driver: *Driver, scope: *cancel.Scope, socket: *udp.Socket, packets: *types.Packet, count: usize, context: usize) res[io_runtime.Token, io_error.Error] {
     ret submit_packets(driver, scope, io_runtime.RECEIVE_FROM, socket, packets, count, context);
@@ -580,8 +596,12 @@ pub fun submit_shutdown_write(driver: *Driver, scope: *cancel.Scope, stream: *tc
     ret submit_control(driver, scope, io_runtime.SHUTDOWN, stream.handle, context, ?accepted);
 }
 
-# closes a stream this driver knows. the only way to close such a stream: a
-# direct close is detected on next use and never hands the stream's state to
+# close a stream the driver knows about
+#
+# a tracked stream is closed here or with submit_shutdown_write, not with
+# tcp.stream_close, so the backend unregisters it. a graceful close shuts the
+# write side down, and an abortive close cancels pending reads and closes it
+# a direct close is detected on next use and never hands the stream's state to
 # the socket that reuses its value (module header)
 pub fun submit_stream_close(
     driver: *Driver,
@@ -605,9 +625,12 @@ pub fun submit_stream_close(
     ret submitted;
 }
 
-# closes a datagram socket this driver knows. the only way to close such a
-# socket: a direct close is detected on next use and never hands the socket's
-# state to the socket that reuses its value (module header)
+# close a datagram socket the driver knows about
+#
+# a tracked socket is closed here, not with udp.socket_close, so the backend
+# unregisters it. every receive still pending on it completes cancelled
+# a direct close is detected on next use and never hands the socket's state to
+# the socket that reuses its value (module header)
 pub fun submit_datagram_close(driver: *Driver, scope: *cancel.Scope, socket: *udp.Socket, context: usize) res[io_runtime.Token, io_error.Error] {
     if (driver == nil || scope == nil || socket == nil || !io_handle.socket_is_valid(socket.handle)) {
         ret res[io_runtime.Token, io_error.Error].err{invalid(io_error.OP_CLOSE)};
@@ -615,6 +638,29 @@ pub fun submit_datagram_close(driver: *Driver, scope: *cancel.Scope, socket: *ud
     var accepted:  bool                                  = false;
     val submitted: res[io_runtime.Token, io_error.Error] = submit_control(driver, scope, io_runtime.CLOSE, socket.handle, context, ?accepted);
     if (accepted) { socket.handle = io_handle.invalid_socket(); }
+    ret submitted;
+}
+
+# close a listener the driver knows about
+#
+# a listener that has had an accept submitted is tracked by the driver and is
+# closed here, not with tcp.listener_close, so the backend unregisters it.
+# every accept still pending on it completes cancelled. on success the
+# listener's handle is invalidated, and the close completes as its own
+# operation
+# ---
+# driver:   the driver the listener belongs to
+# scope:    the cancellation scope the close is registered on
+# listener: the listener to close
+# context:  returned with the close's completion
+# ret:      the close's token, or the refusal
+pub fun submit_listener_close(driver: *Driver, scope: *cancel.Scope, listener: *tcp.Listener, context: usize) res[io_runtime.Token, io_error.Error] {
+    if (driver == nil || scope == nil || listener == nil || !io_handle.socket_is_valid(listener.handle)) {
+        ret res[io_runtime.Token, io_error.Error].err{invalid(io_error.OP_CLOSE)};
+    }
+    var accepted:  bool                                  = false;
+    val submitted: res[io_runtime.Token, io_error.Error] = submit_control(driver, scope, io_runtime.CLOSE, listener.handle, context, ?accepted);
+    if (accepted) { listener.handle = io_handle.invalid_socket(); }
     ret submitted;
 }
 
@@ -1306,6 +1352,642 @@ test "async network: one wait returns a queued completion and a collected one to
     if (!ok_bool(io_runtime.close(?runtime)))   { ret 23; }
     if (!ok_err(io_runtime.destroy(?runtime)))  { ret 24; }
     ret 0;
+}
+
+val FLOOD_ROUNDS:   usize = 400;
+val FLOOD_BURST:    usize = 64;
+val FLOOD_PAYLOAD:  usize = 512;
+val FLOOD_PACKETS:  usize = 4;
+val FLOOD_RCVBUF:   i32   = 4096;
+val FLOOD_IDLE_MAX: usize = 3;
+
+# bytes queued on a datagram socket, 0 when the count cannot be read. the flood
+# tests treat a round as idle only while datagrams sit queued behind a pending
+# receive: a loopback that drops a whole burst leaves nothing to receive, and
+# darwin does that under receive-buffer overflow
+$if ($mach.build.os == $mach.os.linux) {
+    use linux_os: std.system.os.linux;
+
+    $if ($mach.build.arch == $mach.arch.x86_64) {
+        val FLOOD_SYS_IOCTL: usize = 16;
+    }
+    $or {
+        val FLOOD_SYS_IOCTL: usize = 29;
+    }
+
+    fun flood_queued(fd: usize) usize {
+        var count:  i32 = 0;
+        val status: i64 = linux_os.syscall3(FLOOD_SYS_IOCTL, fd, 0x541b, (?count)::usize);
+        if (status < 0 || count < 0) { ret 0; }
+        ret count::usize;
+    }
+}
+$or ($mach.build.os == $mach.os.darwin) {
+    val FLOOD_SO_NREAD: i32 = 0x1020;
+
+    fun flood_queued(fd: usize) usize {
+        var count:  i32 = 0;
+        var length: u32 = 4;
+        val status: i64 = os.sock_getopt(fd, os.SOL_SOCKET, FLOOD_SO_NREAD, (?count)::*u8, ?length);
+        if (status < 0 || count < 0) { ret 0; }
+        ret count::usize;
+    }
+}
+$or ($mach.build.os == $mach.os.windows) {
+    use windows_os: std.system.os.windows;
+
+    fun flood_queued(fd: usize) usize {
+        var count: usize = 0;
+        if (windows_os.sock_pending_bytes(fd, ?count) < 0) { ret 0; }
+        ret count;
+    }
+}
+
+# one pending receive and steady sends share a udp socket whose receive buffer
+# a peer keeps overflowing. a wait that returns no receive while datagrams stay
+# queued behind the pending receive has lost its readiness (#711)
+test "async network: a pending datagram receive survives receive-buffer overflow under concurrent sends" {
+    var runtime: io_runtime.Runtime;
+    if (!ok_err(io_runtime.make(?runtime, 16))) { ret 1; }
+    var driver: Driver;
+    if (!ok_err(make(?driver, ?runtime))) { ret 2; }
+    val receiver_result: res[udp.Socket, io_error.Error] = bind_datagram(ip.endpoint(127, 0, 0, 1, 0));
+    if (sel receiver_result.err) { ret 3; }
+    var receiver:       udp.Socket                      = receiver_result.ok;
+    val flooder_result: res[udp.Socket, io_error.Error] = bind_datagram(ip.endpoint(127, 0, 0, 1, 0));
+    if (sel flooder_result.err) { ret 4; }
+    var flooder: udp.Socket = flooder_result.ok;
+    var rcvbuf:  i32        = FLOOD_RCVBUF;
+    if (os.sock_setopt(receiver.handle.value, os.SOL_SOCKET, os.SO_RCVBUF, (?rcvbuf)::*u8, 4) < 0) { ret 5; }
+    val receiver_endpoint: res[ip.Endpoint, io_error.Error] = udp.local_endpoint(?receiver);
+    if (sel receiver_endpoint.err) { ret 6; }
+    val flooder_endpoint: res[ip.Endpoint, io_error.Error] = udp.local_endpoint(?flooder);
+    if (sel flooder_endpoint.err) { ret 7; }
+    var scope: cancel.Scope;
+    if (!scope_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 8; }
+
+    var inbound_storage:  [2048]u8;
+    var outbound_storage: [2048]u8;
+    var inbound:          [4]types.Packet;
+    var outbound:         [4]types.Packet;
+    var i:                usize = 0;
+    for (i < FLOOD_PACKETS) {
+        inbound[i].buffer    = ?inbound_storage[i * FLOOD_PAYLOAD];
+        inbound[i].capacity  = FLOOD_PAYLOAD;
+        outbound[i].buffer   = ?outbound_storage[i * FLOOD_PAYLOAD];
+        outbound[i].capacity = FLOOD_PAYLOAD;
+        outbound[i].length   = 16;
+        outbound[i].peer     = flooder_endpoint.ok;
+        i                    = i + 1;
+    }
+    val first_receive: res[io_runtime.Token, io_error.Error] = submit_receive_batch(?driver, ?scope, ?receiver, ?inbound[0], FLOOD_PACKETS, 900);
+    if (sel first_receive.err) { ret 9; }
+    val first_send: res[io_runtime.Token, io_error.Error] = submit_send_batch(?driver, ?scope, ?receiver, ?outbound[0], FLOOD_PACKETS, 901);
+    if (sel first_send.err) { ret 10; }
+
+    var datagram: [512]u8;
+    var sink:     [512]u8;
+    var output:   [16]io_runtime.Completion;
+    var received: usize = 0;
+    var idle:     usize = 0;
+    var round:    usize = 0;
+    for (round < FLOOD_ROUNDS) {
+        var burst: usize = 0;
+        for (burst < FLOOD_BURST) {
+            val sent: res[usize, io_error.Error] = udp.send_to(?flooder, ?datagram[0], FLOOD_PAYLOAD, receiver_endpoint.ok);
+            if (sel sent.err) { ret 20; }
+            burst = burst + 1;
+        }
+        var drained: bool = true;
+        for (drained) {
+            var from:   ip.Endpoint;
+            val pulled: res[usize, io_error.Error] = udp.recv_from(?flooder, ?sink[0], 512, ?from);
+            drained = sel pulled.ok;
+        }
+        val queued: bool                       = flood_queued(receiver.handle.value) != 0;
+        val waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 16, 200);
+        if (sel waited.err) { ret 11; }
+        var got: bool  = false;
+        var j:   usize = 0;
+        for (j < waited.ok) {
+            if (output[j].has_error) { ret 12; }
+            if (output[j].kind == io_runtime.RECEIVE_FROM) {
+                got      = true;
+                received = received + output[j].items;
+                val next: res[io_runtime.Token, io_error.Error] = submit_receive_batch(?driver, ?scope, ?receiver, ?inbound[0], FLOOD_PACKETS, 900);
+                if (sel next.err) { ret 13; }
+            }
+            or (output[j].kind == io_runtime.SEND_TO) {
+                val again: res[io_runtime.Token, io_error.Error] = submit_send_batch(?driver, ?scope, ?receiver, ?outbound[0], FLOOD_PACKETS, 901);
+                if (sel again.err) { ret 14; }
+            }
+            or { ret 15; }
+            j = j + 1;
+        }
+        if (got || !queued || flood_queued(receiver.handle.value) == 0) { idle = 0; }
+        or {
+            idle = idle + 1;
+            if (idle > FLOOD_IDLE_MAX) { ret 16; }
+        }
+        round = round + 1;
+    }
+    if (received == 0) { ret 17; }
+
+    udp.socket_close(?flooder);
+    val closed: res[io_runtime.Token, io_error.Error] = submit_datagram_close(?driver, ?scope, ?receiver, 902);
+    if (sel closed.err) { ret 18; }
+    var guard: usize = 0;
+    for (io_runtime.pending(?runtime) > 0 && guard < 64) {
+        val drained_wait: res[usize, io_error.Error] = wait(?driver, ?output[0], 16, 1000);
+        if (sel drained_wait.err) { ret 19; }
+        guard = guard + 1;
+    }
+    if (io_runtime.pending(?runtime) != 0)     { ret 20; }
+    if (!scope_ok(cancel.destroy(?scope)))     { ret 21; }
+    if (refused(destroy(?driver)))             { ret 22; }
+    if (!ok_bool(io_runtime.close(?runtime)))  { ret 23; }
+    if (!ok_err(io_runtime.destroy(?runtime))) { ret 24; }
+    ret 0;
+}
+
+val FLOOD_SENDS_MAX: i64   = 4;
+val FLOOD_WAITS:     usize = 400;
+
+rec FloodContext {
+    driver:   *Driver;
+    scope:    *cancel.Scope;
+    receiver: *udp.Socket;
+    flooder:  *udp.Socket;
+    target:   ip.Endpoint;
+    outbound: *types.Packet;
+    lock:     mutex.Mutex;
+    sends:    i64;
+    stop:     bool;
+    failed:   i64;
+}
+
+fun flood_worker(arg: *u8) {
+    val context:  *FloodContext = arg::*FloodContext;
+    var datagram: [512]u8;
+    var sink:     [512]u8;
+    for {
+        mutex.lock(?context.lock);
+        val stop:   bool = context.stop;
+        var submit: bool = context.sends < FLOOD_SENDS_MAX;
+        if (submit) { context.sends = context.sends + 1; }
+        mutex.unlock(?context.lock);
+        if (stop) { ret; }
+        if (submit) {
+            val sent: res[io_runtime.Token, io_error.Error] = submit_send_batch(context.driver, context.scope, context.receiver, context.outbound, FLOOD_PACKETS, 901);
+            if (sel sent.err) {
+                mutex.lock(?context.lock);
+                context.failed = 1;
+                mutex.unlock(?context.lock);
+                ret;
+            }
+        }
+        var burst: usize = 0;
+        for (burst < FLOOD_BURST) {
+            val flooded: res[usize, io_error.Error] = udp.send_to(context.flooder, ?datagram[0], FLOOD_PAYLOAD, context.target);
+            if (sel flooded.err) {
+                mutex.lock(?context.lock);
+                context.failed = 1;
+                mutex.unlock(?context.lock);
+                ret;
+            }
+            burst = burst + 1;
+        }
+        var drained: bool = true;
+        for (drained) {
+            var from:   ip.Endpoint;
+            val pulled: res[usize, io_error.Error] = udp.recv_from(context.flooder, ?sink[0], 512, ?from);
+            drained = sel pulled.ok;
+        }
+        os.sleep(200000);
+    }
+}
+
+# the same shape with the sends and the flood on a second thread, so
+# submissions race the waiting thread's native collect (#711)
+test "async network: a pending datagram receive survives overflow while another thread submits sends" {
+    var runtime: io_runtime.Runtime;
+    if (!ok_err(io_runtime.make(?runtime, 16))) { ret 1; }
+    var driver: Driver;
+    if (!ok_err(make(?driver, ?runtime))) { ret 2; }
+    val receiver_result: res[udp.Socket, io_error.Error] = bind_datagram(ip.endpoint(127, 0, 0, 1, 0));
+    if (sel receiver_result.err) { ret 3; }
+    var receiver:       udp.Socket                      = receiver_result.ok;
+    val flooder_result: res[udp.Socket, io_error.Error] = bind_datagram(ip.endpoint(127, 0, 0, 1, 0));
+    if (sel flooder_result.err) { ret 4; }
+    var flooder: udp.Socket = flooder_result.ok;
+    var rcvbuf:  i32        = FLOOD_RCVBUF;
+    if (os.sock_setopt(receiver.handle.value, os.SOL_SOCKET, os.SO_RCVBUF, (?rcvbuf)::*u8, 4) < 0) { ret 5; }
+    val receiver_endpoint: res[ip.Endpoint, io_error.Error] = udp.local_endpoint(?receiver);
+    if (sel receiver_endpoint.err) { ret 6; }
+    val flooder_endpoint: res[ip.Endpoint, io_error.Error] = udp.local_endpoint(?flooder);
+    if (sel flooder_endpoint.err) { ret 7; }
+    var scope: cancel.Scope;
+    if (!scope_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 8; }
+
+    var inbound_storage:  [2048]u8;
+    var outbound_storage: [2048]u8;
+    var inbound:          [4]types.Packet;
+    var outbound:         [4]types.Packet;
+    var i:                usize = 0;
+    for (i < FLOOD_PACKETS) {
+        inbound[i].buffer    = ?inbound_storage[i * FLOOD_PAYLOAD];
+        inbound[i].capacity  = FLOOD_PAYLOAD;
+        outbound[i].buffer   = ?outbound_storage[i * FLOOD_PAYLOAD];
+        outbound[i].capacity = FLOOD_PAYLOAD;
+        outbound[i].length   = 16;
+        outbound[i].peer     = flooder_endpoint.ok;
+        i                    = i + 1;
+    }
+    val first_receive: res[io_runtime.Token, io_error.Error] = submit_receive_batch(?driver, ?scope, ?receiver, ?inbound[0], FLOOD_PACKETS, 900);
+    if (sel first_receive.err) { ret 9; }
+
+    var context: FloodContext = FloodContext{
+        driver:   ?driver,
+        scope:    ?scope,
+        receiver: ?receiver,
+        flooder:  ?flooder,
+        target:   receiver_endpoint.ok,
+        outbound: ?outbound[0],
+        lock:     mutex.make(),
+        sends:    0,
+        stop:     false,
+        failed:   0,
+    };
+    var worker: thread.Thread;
+    thread.spawn_with(flood_worker, (?context)::*u8, ?worker);
+    if (worker.tid < 0) { ret 10; }
+
+    var output:   [16]io_runtime.Completion;
+    var received: usize = 0;
+    var idle:     usize = 0;
+    var code:     i64   = 0;
+    var waits:    usize = 0;
+    for (waits < FLOOD_WAITS && code == 0) {
+        val queued: bool                       = flood_queued(receiver.handle.value) != 0;
+        val waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 16, 200);
+        if (sel waited.err) {
+            code = 11;
+            brk;
+        }
+        var got: bool  = false;
+        var j:   usize = 0;
+        for (j < waited.ok) {
+            if (output[j].has_error) {
+                code = 12;
+                brk;
+            }
+            if (output[j].kind == io_runtime.RECEIVE_FROM) {
+                got      = true;
+                received = received + output[j].items;
+                val next: res[io_runtime.Token, io_error.Error] = submit_receive_batch(?driver, ?scope, ?receiver, ?inbound[0], FLOOD_PACKETS, 900);
+                if (sel next.err) {
+                    code = 13;
+                    brk;
+                }
+            }
+            or (output[j].kind == io_runtime.SEND_TO) {
+                mutex.lock(?context.lock);
+                context.sends = context.sends - 1;
+                mutex.unlock(?context.lock);
+            }
+            j = j + 1;
+        }
+        if (got || !queued || flood_queued(receiver.handle.value) == 0) { idle = 0; }
+        or {
+            idle = idle + 1;
+            if (idle > FLOOD_IDLE_MAX) { code = 16; }
+        }
+        waits = waits + 1;
+    }
+    mutex.lock(?context.lock);
+    context.stop = true;
+    mutex.unlock(?context.lock);
+    thread.join(?worker);
+    if (code != 0)           { ret code::i32; }
+    if (context.failed != 0) { ret 17; }
+    if (received == 0)       { ret 18; }
+
+    udp.socket_close(?flooder);
+    val closed: res[io_runtime.Token, io_error.Error] = submit_datagram_close(?driver, ?scope, ?receiver, 902);
+    if (sel closed.err) { ret 19; }
+    var guard: usize = 0;
+    for (io_runtime.pending(?runtime) > 0 && guard < 64) {
+        val drained_wait: res[usize, io_error.Error] = wait(?driver, ?output[0], 16, 1000);
+        if (sel drained_wait.err) { ret 20; }
+        guard = guard + 1;
+    }
+    if (io_runtime.pending(?runtime) != 0)     { ret 21; }
+    if (!scope_ok(cancel.destroy(?scope)))     { ret 22; }
+    if (refused(destroy(?driver)))             { ret 23; }
+    if (!ok_bool(io_runtime.close(?runtime)))  { ret 24; }
+    if (!ok_err(io_runtime.destroy(?runtime))) { ret 25; }
+    ret 0;
+}
+
+val CHURN_CHILDREN: usize = 8;
+val CHURN_SENDS:    usize = 4;
+val CHURN_ROUNDS:   usize = 600;
+val CHURN_PAYLOAD:  usize = 1400;
+
+# hedge's shape on one thread: a scoped receive of sixteen, batch-of-one sends
+# under child scopes that are cancelled mid-flight, a flood past the receive
+# buffer, and enough operations to grow every table past its initial size (#711)
+test "async network: a pending datagram receive survives cancelled sibling sends and table growth" {
+    var runtime: io_runtime.Runtime;
+    if (!ok_err(io_runtime.make(?runtime, 4))) { ret 1; }
+    var driver: Driver;
+    if (!ok_err(make(?driver, ?runtime))) { ret 2; }
+    val receiver_result: res[udp.Socket, io_error.Error] = bind_datagram(ip.endpoint(127, 0, 0, 1, 0));
+    if (sel receiver_result.err) { ret 3; }
+    var receiver:       udp.Socket                      = receiver_result.ok;
+    val flooder_result: res[udp.Socket, io_error.Error] = bind_datagram(ip.endpoint(127, 0, 0, 1, 0));
+    if (sel flooder_result.err) { ret 4; }
+    var flooder: udp.Socket = flooder_result.ok;
+    var rcvbuf:  i32        = FLOOD_RCVBUF;
+    if (os.sock_setopt(receiver.handle.value, os.SOL_SOCKET, os.SO_RCVBUF, (?rcvbuf)::*u8, 4) < 0) { ret 5; }
+    var sndbuf: i32 = FLOOD_RCVBUF;
+    if (os.sock_setopt(receiver.handle.value, os.SOL_SOCKET, os.SO_SNDBUF, (?sndbuf)::*u8, 4) < 0) { ret 5; }
+    val receiver_endpoint: res[ip.Endpoint, io_error.Error] = udp.local_endpoint(?receiver);
+    if (sel receiver_endpoint.err) { ret 6; }
+    val flooder_endpoint: res[ip.Endpoint, io_error.Error] = udp.local_endpoint(?flooder);
+    if (sel flooder_endpoint.err) { ret 7; }
+    var pump: cancel.Scope;
+    if (!scope_ok(cancel.make_root(?pump, false, time.Time{sec: 0, nsec: 0}))) { ret 8; }
+
+    var inbound_storage: [24000]u8;
+    var inbound:         [16]types.Packet;
+    var i:               usize = 0;
+    for (i < 16) {
+        inbound[i].buffer   = ?inbound_storage[i * 1500];
+        inbound[i].capacity = 1500;
+        i                   = i + 1;
+    }
+    var payload:  [1400]u8;
+    var outbound: [32]types.Packet;
+    i = 0;
+    for (i < CHURN_CHILDREN * CHURN_SENDS) {
+        outbound[i].buffer   = ?payload[0];
+        outbound[i].capacity = CHURN_PAYLOAD;
+        outbound[i].length   = CHURN_PAYLOAD;
+        outbound[i].peer     = flooder_endpoint.ok;
+        i                    = i + 1;
+    }
+    val first_receive: res[io_runtime.Token, io_error.Error] = submit_receive_batch(?driver, ?pump, ?receiver, ?inbound[0], 16, 900);
+    if (sel first_receive.err) { ret 9; }
+
+    var children:  [8]cancel.Scope;
+    var live:      [8]bool;
+    var pending:   [8]usize;
+    var datagram:  [512]u8;
+    var sink:      [1500]u8;
+    var output:    [64]io_runtime.Completion;
+    var received:  usize = 0;
+    var idle:      usize = 0;
+    var receiving: bool  = true;
+    var round:     usize = 0;
+    for (round < CHURN_ROUNDS) {
+        var c: usize = 0;
+        for (c < CHURN_CHILDREN) {
+            if (!live[c]) {
+                if (!scope_ok(cancel.make_child(?children[c], ?pump, false, time.Time{sec: 0, nsec: 0}))) { ret 10; }
+                live[c] = true;
+                var s: usize = 0;
+                for (s < CHURN_SENDS) {
+                    val sent: res[io_runtime.Token, io_error.Error] = submit_send_batch(?driver, ?children[c], ?receiver, ?outbound[c * CHURN_SENDS + s], 1, 1000 + c);
+                    if (sel sent.err) { ret 11; }
+                    pending[c] = pending[c] + 1;
+                    s          = s + 1;
+                }
+            }
+            c = c + 1;
+        }
+        # cancel a rotating half of the connections while their sends are in flight
+        c = round % 2;
+        for (c < CHURN_CHILDREN) {
+            cancel.cancel(?children[c]);
+            c = c + 2;
+        }
+        var burst: usize = 0;
+        for (burst < FLOOD_BURST) {
+            val sent: res[usize, io_error.Error] = udp.send_to(?flooder, ?datagram[0], FLOOD_PAYLOAD, receiver_endpoint.ok);
+            if (sel sent.err) { ret 21; }
+            burst = burst + 1;
+        }
+        var drained: bool = true;
+        for (drained) {
+            var from:   ip.Endpoint;
+            val pulled: res[usize, io_error.Error] = udp.recv_from(?flooder, ?sink[0], 1500, ?from);
+            drained = sel pulled.ok;
+        }
+        val queued: bool                       = receiving && flood_queued(receiver.handle.value) != 0;
+        val waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 64, 50);
+        if (sel waited.err) { ret 12; }
+        var got: bool  = false;
+        var j:   usize = 0;
+        for (j < waited.ok) {
+            if (output[j].kind == io_runtime.RECEIVE_FROM) {
+                if (output[j].has_error) { ret 13; }
+                got       = true;
+                receiving = false;
+                received  = received + output[j].items;
+            }
+            or (output[j].kind == io_runtime.SEND_TO) {
+                val owner: usize = output[j].context - 1000;
+                if (owner >= CHURN_CHILDREN || pending[owner] == 0) { ret 14; }
+                pending[owner] = pending[owner] - 1;
+            }
+            or { ret 15; }
+            j = j + 1;
+        }
+        # the receive is resubmitted after the batch is handled, as hedge does
+        if (!receiving) {
+            val next: res[io_runtime.Token, io_error.Error] = submit_receive_batch(?driver, ?pump, ?receiver, ?inbound[0], 16, 900);
+            if (sel next.err) { ret 16; }
+            receiving = true;
+        }
+        c = 0;
+        for (c < CHURN_CHILDREN) {
+            if (live[c] && pending[c] == 0) {
+                if (!scope_ok(cancel.destroy(?children[c]))) { ret 17; }
+                live[c] = false;
+            }
+            c = c + 1;
+        }
+        if (got || !queued || flood_queued(receiver.handle.value) == 0) { idle = 0; }
+        or {
+            idle = idle + 1;
+            if (idle > FLOOD_IDLE_MAX * 4) { ret 18; }
+        }
+        round = round + 1;
+    }
+    if (received == 0) { ret 19; }
+
+    udp.socket_close(?flooder);
+    val closed: res[io_runtime.Token, io_error.Error] = submit_datagram_close(?driver, ?pump, ?receiver, 902);
+    if (sel closed.err) { ret 20; }
+    var guard: usize = 0;
+    for (io_runtime.pending(?runtime) > 0 && guard < 256) {
+        val drained_wait: res[usize, io_error.Error] = wait(?driver, ?output[0], 64, 1000);
+        if (sel drained_wait.err) { ret 21; }
+        var j: usize = 0;
+        for (j < drained_wait.ok) {
+            if (output[j].kind == io_runtime.SEND_TO) {
+                val owner: usize = output[j].context - 1000;
+                pending[owner] = pending[owner] - 1;
+            }
+            j = j + 1;
+        }
+        guard = guard + 1;
+    }
+    if (io_runtime.pending(?runtime) != 0) { ret 22; }
+    var c: usize = 0;
+    for (c < CHURN_CHILDREN) {
+        if (live[c] && !scope_ok(cancel.destroy(?children[c]))) { ret 23; }
+        c = c + 1;
+    }
+    if (!scope_ok(cancel.destroy(?pump)))      { ret 24; }
+    if (refused(destroy(?driver)))             { ret 25; }
+    if (!ok_bool(io_runtime.close(?runtime)))  { ret 26; }
+    if (!ok_err(io_runtime.destroy(?runtime))) { ret 27; }
+    ret 0;
+}
+
+# a receive batch completes with what is available: one datagram completes a
+# pending batch of four with one item, on every backend (#718)
+test "async network: a datagram receive batch completes with the packets available" {
+    var runtime: io_runtime.Runtime;
+    if (!ok_err(io_runtime.make(?runtime, 4))) { ret 1; }
+    var driver: Driver;
+    if (!ok_err(make(?driver, ?runtime))) { ret 2; }
+    val receiver_result: res[udp.Socket, io_error.Error] = bind_datagram(ip.endpoint(127, 0, 0, 1, 0));
+    if (sel receiver_result.err) { ret 3; }
+    var receiver:      udp.Socket                      = receiver_result.ok;
+    val sender_result: res[udp.Socket, io_error.Error] = bind_datagram(ip.endpoint(127, 0, 0, 1, 0));
+    if (sel sender_result.err) { ret 4; }
+    var sender: udp.Socket                       = sender_result.ok;
+    val target: res[ip.Endpoint, io_error.Error] = udp.local_endpoint(?receiver);
+    if (sel target.err) { ret 5; }
+    var scope: cancel.Scope;
+    if (!scope_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 6; }
+
+    var storage: [256]u8;
+    var packets: [4]types.Packet;
+    var i:       usize = 0;
+    for (i < 4) {
+        packets[i].buffer   = ?storage[i * 64];
+        packets[i].capacity = 64;
+        i                   = i + 1;
+    }
+    val receiving: res[io_runtime.Token, io_error.Error] = submit_receive_batch(?driver, ?scope, ?receiver, ?packets[0], 4, 71);
+    if (sel receiving.err) { ret 7; }
+    var payload: [3]u8                      = [3]u8{7, 8, 9};
+    val sent:    res[usize, io_error.Error] = udp.send_to(?sender, ?payload[0], 3, target.ok);
+    if (!(sel sent.ok && sent.ok == 3)) { ret 8; }
+
+    var output: [4]io_runtime.Completion;
+    var items:  usize = 0;
+    var done:   bool  = false;
+    var rounds: usize = 0;
+    for (!done && rounds < 8) {
+        val waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 4, 250);
+        if (sel waited.err) { ret 9; }
+        var j: usize = 0;
+        for (j < waited.ok) {
+            if (output[j].context != 71 || output[j].has_error) { ret 10; }
+            done  = true;
+            items = output[j].items;
+            j     = j + 1;
+        }
+        rounds = rounds + 1;
+    }
+    if (!done)                                                        { ret 11; }
+    if (items != 1)                                                   { ret 12; }
+    if (packets[0].length != 3 || storage[0] != 7 || storage[2] != 9) { ret 13; }
+
+    udp.socket_close(?sender);
+    val closing: res[io_runtime.Token, io_error.Error] = submit_datagram_close(?driver, ?scope, ?receiver, 72);
+    if (sel closing.err) { ret 14; }
+    var guard: usize = 0;
+    for (io_runtime.pending(?runtime) > 0 && guard < 16) {
+        val drained: res[usize, io_error.Error] = wait(?driver, ?output[0], 4, 1000);
+        if (sel drained.err) { ret 15; }
+        guard = guard + 1;
+    }
+    if (io_runtime.pending(?runtime) != 0)     { ret 16; }
+    if (!scope_ok(cancel.destroy(?scope)))     { ret 17; }
+    if (refused(destroy(?driver)))             { ret 18; }
+    if (!ok_bool(io_runtime.close(?runtime)))  { ret 19; }
+    if (!ok_err(io_runtime.destroy(?runtime))) { ret 20; }
+    ret 0;
+}
+
+fun listener_close_settles(pending_accept: bool) i32 {
+    var runtime: io_runtime.Runtime;
+    if (!ok_err(io_runtime.make(?runtime, 4))) { ret 1; }
+    var driver: Driver;
+    if (!ok_err(make(?driver, ?runtime))) { ret 2; }
+    val listener_result: res[tcp.Listener, io_error.Error] = listen(ip.endpoint(127, 0, 0, 1, 0), 2);
+    if (sel listener_result.err) { ret 3; }
+    var listener: tcp.Listener = listener_result.ok;
+    var scope:    cancel.Scope;
+    if (!scope_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 4; }
+    val before: usize = io_runtime.pending(?runtime);
+    var peer:   ip.Endpoint;
+    if (pending_accept) {
+        val accepting: res[io_runtime.Token, io_error.Error] = submit_accept(?driver, ?scope, ?listener, ?peer, 501);
+        if (sel accepting.err) { ret 5; }
+    }
+    val closing: res[io_runtime.Token, io_error.Error] = submit_listener_close(?driver, ?scope, ?listener, 502);
+    if (sel closing.err)                            { ret 6; }
+    if (io_handle.socket_is_valid(listener.handle)) { ret 7; }
+    var output:     [4]io_runtime.Completion;
+    var saw_accept: bool  = false;
+    var saw_close:  bool  = false;
+    var rounds:     usize = 0;
+    for ((!saw_close || (pending_accept && !saw_accept)) && rounds < 16) {
+        val waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 4, 1000);
+        if (sel waited.err) { ret 8; }
+        var i: usize = 0;
+        for (i < waited.ok) {
+            if (output[i].context == 501) {
+                if (!output[i].has_error)                                                                  { ret 9; }
+                if (output[i].error.kind != io_error.CANCELLED && output[i].error.kind != io_error.CLOSED) { ret 10; }
+                saw_accept = true;
+            }
+            or (output[i].context == 502) {
+                if (output[i].has_error || output[i].kind != io_runtime.CLOSE) { ret 11; }
+                saw_close = true;
+            }
+            or { ret 12; }
+            i = i + 1;
+        }
+        rounds = rounds + 1;
+    }
+    if (!saw_close)                             { ret 13; }
+    if (pending_accept && !saw_accept)          { ret 14; }
+    if (io_runtime.pending(?runtime) != before) { ret 15; }
+    val repeated: res[io_runtime.Token, io_error.Error] = submit_listener_close(?driver, ?scope, ?listener, 503);
+    if (!sel repeated.err)                     { ret 16; }
+    if (!scope_ok(cancel.destroy(?scope)))     { ret 17; }
+    if (refused(destroy(?driver)))             { ret 18; }
+    if (!ok_bool(io_runtime.close(?runtime)))  { ret 19; }
+    if (!ok_err(io_runtime.destroy(?runtime))) { ret 20; }
+    ret 0;
+}
+
+# a tracked listener closes through its driver, and a pending accept on it
+# completes cancelled (#724)
+test "async network: a listener with a pending accept closes through its driver" {
+    ret listener_close_settles(true);
+}
+
+test "async network: a listener with nothing pending closes through its driver" {
+    ret listener_close_settles(false);
 }
 
 $if ($mach.build.os == $mach.os.linux) {
