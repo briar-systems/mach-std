@@ -52,14 +52,17 @@ pub rec Operation {
     address:      [288]u8;
     transferred:  u32;
     native_flags: u32;
+    sequence:     u64;
     result:       i64;
     index:        u32;
     next_free:    u32;
 }
 
 pub rec Backend {
-    queue:     *shared.IoQueue;
-    source_id: u16;
+    # submission order of read-lane requests
+    next_sequence: u64;
+    queue:         *shared.IoQueue;
+    source_id:     u16;
     # where every table's chunks come from
     allocator:       allocator.Allocator;
     operations:      table.Table;
@@ -117,13 +120,15 @@ pub fun aliases(backend: *Backend, data: *u8, len: usize) bool {
         memory.ranges_overlap(backend.native::*u8, native_bytes, data, len);
 }
 
-val SLOT_FREE:            u8    = 0;
-val SLOT_ACTIVE:          u8    = 1;
-val SLOT_CANCELLED:       u8    = 2;
-val SLOT_CANCEL_READY:    u8    = 3;
-val SLOT_CONTROL_PENDING: u8    = 4;
-val SLOT_CONTROL_READY:   u8    = 5;
-val INVALID_SOCKET:       usize = (-1)::usize;
+val SLOT_FREE:            u8 = 0;
+val SLOT_ACTIVE:          u8 = 1;
+val SLOT_CANCELLED:       u8 = 2;
+val SLOT_CANCEL_READY:    u8 = 3;
+val SLOT_CONTROL_PENDING: u8 = 4;
+val SLOT_CONTROL_READY:   u8 = 5;
+# a read-lane request held back so it posts in submission order
+val SLOT_DEFERRED:  u8    = 6;
+val INVALID_SOCKET: usize = (-1)::usize;
 
 fun invalid() i64 {
     ret windows.EINVAL;
@@ -208,12 +213,70 @@ fun claim_locked(backend: *Backend, kind: runtime.Kind, resource: usize, context
     operation.transferred  = 0;
     operation.native_flags = 0;
     operation.result       = 0;
+    operation.sequence     = backend.next_sequence;
+    backend.next_sequence  = backend.next_sequence + 1;
     backend.active         = backend.active + 1;
     @token                 = types.Token{index: index::u32, generation: generation};
     ret operation;
 }
 
+fun read_lane(kind: runtime.Kind) bool {
+    ret kind == runtime.READ || kind == runtime.READABLE;
+}
+
 fun release_locked(backend: *Backend, operation: *Operation) {
+    val kind:     runtime.Kind = operation.kind;
+    val resource: usize        = operation.resource;
+    release_raw_locked(backend, operation);
+    if (read_lane(kind)) { start_deferred_locked(backend, resource); }
+}
+
+# a readiness wait and the reads around it on one socket settle in submission
+# order: a zero-byte receive posted beside a read could find the read's bytes
+# already taken and report a false end of stream. other reads post at once
+fun deferred_behind_locked(backend: *Backend, operation: *Operation) bool {
+    var i: usize = 0;
+    for (i < backend.operation_slots) {
+        val o: *Operation = operation_at(backend, i);
+        if (o != operation && o.state != SLOT_FREE && o.state != SLOT_CONTROL_PENDING && o.state != SLOT_CONTROL_READY
+            && o.resource == operation.resource && read_lane(o.kind) && o.sequence < operation.sequence
+            && (o.state == SLOT_DEFERRED || o.kind == runtime.READABLE || operation.kind == runtime.READABLE)) {
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun post_receive_locked(operation: *Operation) i64 {
+    ret windows.sock_async_receive(operation.resource, (?operation.buffer)::ptr, 1, ?operation.native_flags, (?operation.overlapped)::ptr);
+}
+
+# post the socket's held read-lane requests, oldest first, while nothing older
+# is still in flight
+fun start_deferred_locked(backend: *Backend, resource: usize) {
+    for (true) {
+        var next: *Operation = nil;
+        var i:    usize      = 0;
+        for (i < backend.operation_slots) {
+            val operation: *Operation = operation_at(backend, i);
+            if (operation.state == SLOT_DEFERRED && operation.resource == resource
+                && (next == nil || operation.sequence < next.sequence)) {
+                next = operation;
+            }
+            i = i + 1;
+        }
+        if (next == nil || deferred_behind_locked(backend, next)) { ret; }
+        next.state = SLOT_ACTIVE;
+        val posted: i64 = post_receive_locked(next);
+        if (posted < 0) {
+            next.state  = SLOT_CONTROL_READY;
+            next.result = posted;
+        }
+    }
+}
+
+fun release_raw_locked(backend: *Backend, operation: *Operation) {
     clear_borrowed(operation);
     operation.state        = SLOT_FREE;
     operation.resource     = INVALID_SOCKET;
@@ -292,15 +355,26 @@ fun push_completion_locked(
     ret true;
 }
 
-fun emit_control_locked(backend: *Backend) {
-    var i: usize = 0;
+fun emit_control_locked(backend: *Backend) usize {
+    var emitted: usize = 0;
+    var i:       usize = 0;
     for (i < backend.operation_slots && backend.ready < backend.completions.capacity) {
         val operation: *Operation = operation_at(backend, i);
         if (operation.state == SLOT_CONTROL_READY) {
             push_completion_locked(backend, operation.context, operation.kind, 0, 0, operation.resource, operation.result, false);
             release_locked(backend, operation);
+            emitted = emitted + 1;
         }
         i = i + 1;
+    }
+    ret emitted;
+}
+
+# a control or a held request that completes can let another control progress
+fun settle_controls_locked(backend: *Backend) {
+    progress_controls_locked(backend);
+    for (emit_control_locked(backend) > 0 && backend.ready < backend.completions.capacity) {
+        progress_controls_locked(backend);
     }
 }
 
@@ -402,19 +476,28 @@ fun submit_buffer(backend: *Backend, resource: usize, buffer: *u8, length: usize
     }
     operation.buffer = NativeBuffer{length: length::u32, data: buffer};
     var result: i64 = 0;
-    if (kind == runtime.READ) {
-        result = windows.sock_async_receive(resource, (?operation.buffer)::ptr, 1, ?operation.native_flags, (?operation.overlapped)::ptr);
+    if (read_lane(kind) && deferred_behind_locked(backend, operation)) {
+        operation.state = SLOT_DEFERRED;
+    }
+    or (read_lane(kind)) {
+        result = post_receive_locked(operation);
     }
     or {
         result = windows.sock_async_send(resource, (?operation.buffer)::ptr, 1, 0, (?operation.overlapped)::ptr);
     }
-    if (result < 0) { release_locked(backend, operation); }
+    if (result < 0) { release_raw_locked(backend, operation); }
     mutex.unlock(?backend.lock);
     ret result;
 }
 
 pub fun submit_read(backend: *Backend, resource: usize, buffer: *u8, length: usize, context: usize, token: *types.Token) i64 {
     ret submit_buffer(backend, resource, buffer, length, context, runtime.READ, token);
+}
+
+# wait for the stream to be readable without a buffer: an overlapped zero-byte
+# receive, settled on completion by the queued byte count
+pub fun submit_readable(backend: *Backend, resource: usize, context: usize, token: *types.Token) i64 {
+    ret submit_buffer(backend, resource, nil, 0, context, runtime.READABLE, token);
 }
 
 pub fun submit_write(backend: *Backend, resource: usize, buffer: *u8, length: usize, context: usize, token: *types.Token) i64 {
@@ -554,6 +637,10 @@ pub fun submit_close(backend: *Backend, resource: usize, context: usize, token: 
             pending.state  = SLOT_CANCEL_READY;
             pending.result = windows.ECANCELED;
         }
+        or (pending.state == SLOT_DEFERRED && pending.resource == resource) {
+            pending.state  = SLOT_CONTROL_READY;
+            pending.result = windows.ECANCELED;
+        }
         i = i + 1;
     }
     operation.result = windows.sock_close(resource);
@@ -588,7 +675,7 @@ pub fun cancel(backend: *Backend, token: types.Token) i64 {
         mutex.unlock(?backend.lock);
         ret windows.EBADF;
     }
-    if (operation.state == SLOT_CONTROL_PENDING || operation.state == SLOT_CONTROL_READY) {
+    if (operation.state == SLOT_CONTROL_PENDING || operation.state == SLOT_CONTROL_READY || operation.state == SLOT_DEFERRED) {
         release_locked(backend, operation);
         mutex.unlock(?backend.lock);
         windows.io_queue_wake(backend.queue);
@@ -685,6 +772,16 @@ fun emit_operation_locked(backend: *Backend, operation: *Operation, status: i64,
     or (status >= 0 && operation.kind == runtime.CONNECT) {
         result = windows.sock_connect_context(operation.resource);
     }
+    or (status >= 0 && operation.kind == runtime.READABLE) {
+        # a zero-byte receive completes on data, orderly close or error, and
+        # cannot tell data from close: the queued byte count settles it
+        var queued: usize = 0;
+        result = windows.sock_pending_bytes(operation.resource, ?queued);
+        if (result >= 0) {
+            result        = 0;
+            end_of_stream = queued == 0;
+        }
+    }
     or (status >= 0 && (operation.kind == runtime.READ || operation.kind == runtime.WRITE)) {
         result          = 0;
         completed_bytes = bytes;
@@ -721,8 +818,7 @@ pub fun flush(backend: *Backend) i64 {
     if (backend == nil) { ret invalid(); }
     mutex.lock(?backend.lock);
     backend.ready = 0;
-    progress_controls_locked(backend);
-    emit_control_locked(backend);
+    settle_controls_locked(backend);
     val ready: usize = backend.ready;
     mutex.unlock(?backend.lock);
     ret ready::i64;
@@ -752,8 +848,7 @@ pub fun dispatch(
         status:  status,
         flags:   flags,
     });
-    progress_controls_locked(backend);
-    emit_control_locked(backend);
+    settle_controls_locked(backend);
     val ready: usize = backend.ready;
     mutex.unlock(?backend.lock);
     ret ready::i64;
@@ -764,8 +859,7 @@ pub fun poll(backend: *Backend, timeout_ms: i32) i64 {
     if (backend == nil || timeout_ms < -1) { ret invalid(); }
     mutex.lock(?backend.lock);
     backend.ready = 0;
-    progress_controls_locked(backend);
-    emit_control_locked(backend);
+    settle_controls_locked(backend);
     val immediately_ready: usize = backend.ready;
     mutex.unlock(?backend.lock);
     if (immediately_ready != 0) { ret immediately_ready::i64; }
@@ -782,8 +876,7 @@ pub fun poll(backend: *Backend, timeout_ms: i32) i64 {
         consume_native_locked(backend, backend.native[i]);
         i = i + 1;
     }
-    progress_controls_locked(backend);
-    emit_control_locked(backend);
+    settle_controls_locked(backend);
     val ready: usize = backend.ready;
     mutex.unlock(?backend.lock);
     mutex.unlock(?backend.io_lock);

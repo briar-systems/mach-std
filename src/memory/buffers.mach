@@ -1,0 +1,1722 @@
+# on-demand buffers with caller-declared size classes, byte budgets and wake-ups
+#
+# a `Source` hands out address-stable chunks to accounts. `Pool` is std's source:
+# the caller declares up to MAX_CLASSES size classes, a request is served from
+# the smallest class that fits its bytes, alignment and secrecy, and a request
+# larger than every class takes the oversize path, one contiguous block from the
+# backing that is returned to it at release.
+#
+# budgets are bytes. every account has a budget per lane (the pool declares how
+# many lanes there are) and may reserve bytes at open; growth past a reservation
+# competes for the global budget less every reservation. a refusal is a result,
+# never a crash:
+#   budget     the account's own lane limit. never registered, since the
+#              account's own releases end it
+#   exhausted  the shared remainder is gone
+#   memory     a backing refused
+#   misuse     a stale ref, a foreign chunk, a held or in-flight violation, or
+#              a concurrent entry
+# an account refused as exhausted or memory is registered, when it asks, at most
+# once and in FIFO order. each release wakes the oldest waiter: it moves to the
+# ready list, `ready` drains ready handles oldest first, and the optional notify
+# callback runs once per account woken. without notify a release makes no
+# callbacks and never allocates.
+#
+# a secret class is backed by welded storage from std.memory.secret, held as a
+# borrow so the pool itself carries no welded pointer: its chunks carry no plain
+# data pointer, `secret` gives the welded view, and release wipes the whole
+# chunk. welded storage needs the pages capability (HAS_PAGES), so a secret class
+# or request is refused on a target without it (WELDED is false). a
+# bring-your-own-OS implementation gets secret classes by providing the os
+# contract's secret primitives.
+#
+# acquire is O(1) when a class serves it from a retained chunk; otherwise it costs
+# one backing allocation. `backing_allocations` in the snapshot counts them, so a
+# host can size each class's high_water for a steady state that never touches the
+# backing.
+#
+# chunks never move while held. payloads are separate backing allocations and a
+# class keeps up to its high_water released chunks for reuse; only the slot
+# metadata lives in a growable table, and nothing hands its addresses out.
+# opening an account reserves slot metadata for its reservation, so an acquire
+# inside the reservation never fails on metadata.
+#
+# a pool is serialized-use: it is never entered concurrently. it is not tied to
+# a thread, so work may hand a pool between threads as long as the hand-off is
+# serialized. every call claims an entrant flag and a concurrent call is refused
+# as misuse with no effect, a refused release leaving the chunk owned by its
+# caller. one pool per worker is the intended deployment. callbacks (notify,
+# trap, backings) must not call back into the pool.
+
+use A: std.allocator;
+use std.memory;
+use std.memory.table;
+use std.sync.atomic;
+use std.system.capability;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+$if (capability.HOSTED) {
+    use std.allocator.fixed;
+    use std.allocator.page;
+}
+
+$if (capability.HAS_PAGES) {
+    use io_error: std.io.error;
+}
+
+pub val MAX_CLASSES: usize = 32;
+pub val MAX_LANES:   usize = 8;
+pub val OVERSIZE:    u16   = 0xffff;
+
+val NONE:          u32   = 0xffffffff;
+val SLOT_EMPTY:    u8    = 0;
+val SLOT_HELD:     u8    = 1;
+val SLOT_RETAINED: u8    = 2;
+val DEFAULT_ALIGN: usize = 16;
+
+# what a caller asks for
+# ---
+# bytes:  the bytes needed, served rounded up to a class or exactly by oversize
+# align:  the alignment needed, 0 for the default of 16
+# lane:   the budget lane the bytes are charged to
+# secret: whether the chunk must be secret-welded
+pub rec Request {
+    bytes:  usize;
+    align:  usize;
+    lane:   u8;
+    secret: bool;
+}
+
+# a chunk's identity: an index and a generation, stale once released
+pub rec Ref {
+    index:      u32;
+    generation: u32;
+}
+
+# a held chunk
+# ---
+# ref:   identity for release, data, retain and settle
+# class: the class index, or OVERSIZE
+# bytes: usable bytes, at least what was requested
+# data:  the address, nil for a secret chunk (see `secret`)
+pub rec Chunk {
+    ref:   Ref;
+    class: u16;
+    bytes: usize;
+    data:  *u8;
+}
+
+pub tag Status: u8 {
+    ok;
+    blocked;
+    error;
+}
+
+pub tag Reason: u8 {
+    none;
+    budget;
+    exhausted;
+    memory;
+    misuse;
+}
+
+pub rec Acquired {
+    status: Status;
+    reason: Reason;
+    chunk:  Chunk;
+}
+
+# an owner of chunks and budgets, embedded by the caller
+#
+# the fields belong to the source that opened it. it must not move while open.
+pub rec Account {
+    pool:           *Pool;
+    handle:         u64;
+    budgets:        [8]usize;
+    used:           [8]usize;
+    reserve:        usize;
+    reserved_slots: usize;
+    held:           usize;
+    chunks:         usize;
+    open:           bool;
+    waiting:        bool;
+    is_ready:       bool;
+    prev:           *Account;
+    next:           *Account;
+}
+
+# the interface every buffer source implements
+# ---
+# ctx:          opaque context passed to every callback
+# fn_acquire:   one chunk for (account, request, register on refusal)
+# fn_acquire_n: a set of chunks, all or nothing, written to the output array
+# fn_release:   give a chunk back, `none` on success
+# fn_secret:    the welded view of a secret chunk, nil otherwise
+pub rec Source {
+    ctx:          ptr;
+    fn_acquire:   fun(ptr, *Account, Request, bool) Acquired;
+    fn_acquire_n: fun(ptr, *Account, *Request, usize, *Chunk, bool) Acquired;
+    fn_release:   fun(ptr, *Account, Chunk) Reason;
+    fn_secret:    fun(ptr, Chunk) *^u8;
+}
+
+# one declared size class
+# ---
+# size:       usable bytes per chunk
+# align:      chunk alignment, 0 for the default of 16
+# secret:     whether chunks are secret-welded
+# high_water: released chunks kept for reuse, the rest go back to the backing
+pub rec ClassConfig {
+    size:       usize;
+    align:      usize;
+    secret:     bool;
+    high_water: usize;
+}
+
+# pool configuration
+# ---
+# classes:        the class declarations, copied at make
+# class_count:    how many, at most MAX_CLASSES
+# lanes:          budget lanes per account, 1 to MAX_LANES
+# global_budget:  total bytes the pool may hand out
+# initial_slots:  slot metadata to create up front, 0 for a small default
+# notify:         optional, called once per account woken with its handle
+# notify_context: first argument to notify
+# trap:           optional, called on every misuse refusal
+# trap_context:   first argument to trap
+pub rec Config {
+    classes:        *ClassConfig;
+    class_count:    usize;
+    lanes:          u8;
+    global_budget:  usize;
+    initial_slots:  usize;
+    notify:         fun(ptr, u64);
+    notify_context: ptr;
+    trap:           fun(ptr);
+    trap_context:   ptr;
+}
+
+rec ClassState {
+    size:          usize;
+    align:         usize;
+    secret:        bool;
+    high_water:    usize;
+    retained_head: u32;
+    retained:      usize;
+    live:          usize;
+    peak:          usize;
+    acquisitions:  u64;
+    releases:      u64;
+    refusals:      u64;
+    backing:       u64;
+}
+
+rec Slot {
+    generation: u32;
+    next:       u32;
+    inflight:   u32;
+    class:      u16;
+    lane:       u8;
+    state:      u8;
+    secret:     bool;
+    align:      usize;
+    bytes:      usize;
+    address:    usize;
+    welded:     u32;
+    welded_gen: u32;
+    account:    *Account;
+}
+
+pub rec ClassCounters {
+    size:                usize;
+    live:                usize;
+    peak:                usize;
+    retained:            usize;
+    held_bytes:          usize;
+    acquisitions:        u64;
+    releases:            u64;
+    refusals:            u64;
+    backing_allocations: u64;
+}
+
+# a point-in-time view of a pool
+pub rec Snapshot {
+    classes:             [32]ClassCounters;
+    class_count:         usize;
+    bytes_live:          usize;
+    bytes_peak:          usize;
+    reserved:            usize;
+    overflow:            usize;
+    accounts:            usize;
+    waiters:             usize;
+    ready:               usize;
+    misuse:              u64;
+    oversize_live:       usize;
+    oversize_bytes:      usize;
+    acquisitions:        u64;
+    oversize_acquired:   u64;
+    oversize_returned:   u64;
+    refusals:            u64;
+    budget_refusals:     u64;
+    backing_allocations: u64;
+    steps:               u64;
+}
+
+# std's buffer source
+pub rec Pool {
+    entrant:             i64;
+    misuse:              i64;
+    made:                bool;
+    classes:             [32]ClassState;
+    class_count:         usize;
+    lanes:               usize;
+    global_budget:       usize;
+    reserved_total:      usize;
+    overflow_used:       usize;
+    bytes_live:          usize;
+    bytes_peak:          usize;
+    slots:               table.Table;
+    slot_top:            u32;
+    empty_head:          u32;
+    slots_in_use:        usize;
+    slots_reserved:      usize;
+    plain:               A.Allocator;
+    notify:              fun(ptr, u64);
+    notify_context:      ptr;
+    trap:                fun(ptr);
+    trap_context:        ptr;
+    wait_head:           *Account;
+    wait_tail:           *Account;
+    ready_head:          *Account;
+    ready_tail:          *Account;
+    accounts:            usize;
+    waiters:             usize;
+    ready_count:         usize;
+    oversize_live:       usize;
+    oversize_bytes:      usize;
+    acquisitions:        u64;
+    oversize_acquired:   u64;
+    oversize_returned:   u64;
+    refusals:            u64;
+    budget_refusals:     u64;
+    backing_allocations: u64;
+    steps:               u64;
+}
+
+fun enter(pool: *Pool) bool {
+    var expected: i64 = 0;
+    if (atomic.cas(?pool.entrant, ?expected, 1)) { ret true; }
+    atomic.fetch_add(?pool.misuse, 1);
+    if (pool.trap != nil) { pool.trap(pool.trap_context); }
+    ret false;
+}
+
+fun leave(pool: *Pool) {
+    atomic.store(?pool.entrant, 0);
+}
+
+fun misused(pool: *Pool) Reason {
+    atomic.fetch_add(?pool.misuse, 1);
+    if (pool.trap != nil) { pool.trap(pool.trap_context); }
+    ret Reason.misuse{};
+}
+
+fun refusal(status: Status, reason: Reason) Acquired {
+    var out: Acquired;
+    out.status = status;
+    out.reason = reason;
+    ret out;
+}
+
+fun power_of_two(value: usize) bool {
+    ret value != 0 && (value & (value - 1)) == 0;
+}
+
+fun effective_align(align: usize) usize {
+    if (align == 0) { ret DEFAULT_ALIGN; }
+    ret align;
+}
+
+fun round_up(value: usize, align: usize, output: *usize) bool {
+    val mask: usize = align - 1;
+    if (value > ~(0::usize) - mask) { ret false; }
+    @output = (value + mask) & ~mask;
+    ret true;
+}
+
+fun slot_at(pool: *Pool, index: u32) *Slot {
+    ret table.at(?pool.slots, index::usize)::*Slot;
+}
+
+# slots demanded by in-use slots plus every unused reservation, kept backed
+fun ensure_slots(pool: *Pool, demand: usize) bool {
+    if (demand > 0xfffffffe) { ret false; }
+    ret table.reserve(?pool.slots, demand);
+}
+
+fun take_slot(pool: *Pool) u32 {
+    if (pool.empty_head != NONE) {
+        val index: u32   = pool.empty_head;
+        val slot:  *Slot = slot_at(pool, index);
+        pool.empty_head = slot.next;
+        ret index;
+    }
+    if (pool.slot_top::usize >= pool.slots.capacity) { ret NONE; }
+    val index: u32   = pool.slot_top;
+    val slot:  *Slot = slot_at(pool, index);
+    slot.generation = 0;
+    slot.state      = SLOT_EMPTY;
+    pool.slot_top   = pool.slot_top + 1;
+    ret index;
+}
+
+fun put_slot(pool: *Pool, index: u32) {
+    val slot: *Slot = slot_at(pool, index);
+    slot.state      = SLOT_EMPTY;
+    slot.account    = nil;
+    slot.address    = 0;
+    slot.welded     = 0;
+    slot.welded_gen = 0;
+    slot.inflight   = 0;
+    slot.next       = pool.empty_head;
+    pool.empty_head = index;
+}
+
+fun plain_allocate(pool: *Pool, bytes: usize, align: usize) usize {
+    val got: res[ptr, A.Error] = A.allocate_raw(?pool.plain, bytes, align);
+    if (sel got.err) { ret 0; }
+    ret got.ok::usize;
+}
+
+fun slot_release(pool: *Pool, slot: *Slot, bytes: usize, align: usize) {
+    if (slot.secret) {
+        welded_release(slot.welded, slot.welded_gen, bytes);
+        slot.welded     = 0;
+        slot.welded_gen = 0;
+        ret;
+    }
+    A.deallocate_raw(?pool.plain, slot.address::ptr, bytes, align);
+    slot.address = 0;
+}
+
+# the smallest class serving the request, OVERSIZE when none does
+fun select_class(pool: *Pool, request: Request) u16 {
+    val align: usize = effective_align(request.align);
+    var best:  u16   = OVERSIZE;
+    var i:     usize = 0;
+    for (i < pool.class_count) {
+        pool.steps = pool.steps + 1;
+        val cls: *ClassState = ?pool.classes[i];
+        if (cls.secret == request.secret && cls.size >= request.bytes && cls.align >= align) {
+            if (best == OVERSIZE || cls.size < pool.classes[best::usize].size) { best = i::u16; }
+        }
+        i = i + 1;
+    }
+    ret best;
+}
+
+fun account_over(account: *Account, held: usize) usize {
+    if (held > account.reserve) { ret held - account.reserve; }
+    ret 0;
+}
+
+fun unlink_wait(pool: *Pool, account: *Account) {
+    if (account.prev != nil) { account.prev.next = account.next; }
+    or                       { pool.wait_head = account.next; }
+    if (account.next != nil) { account.next.prev = account.prev; }
+    or                       { pool.wait_tail = account.prev; }
+    account.prev    = nil;
+    account.next    = nil;
+    account.waiting = false;
+    pool.waiters    = pool.waiters - 1;
+}
+
+fun unlink_ready(pool: *Pool, account: *Account) {
+    if (account.prev != nil) { account.prev.next = account.next; }
+    or                       { pool.ready_head = account.next; }
+    if (account.next != nil) { account.next.prev = account.prev; }
+    or                       { pool.ready_tail = account.prev; }
+    account.prev     = nil;
+    account.next     = nil;
+    account.is_ready = false;
+    pool.ready_count = pool.ready_count - 1;
+}
+
+fun register_waiter(pool: *Pool, account: *Account) {
+    if (account.waiting || account.is_ready) { ret; }
+    account.prev = pool.wait_tail;
+    account.next = nil;
+    if (pool.wait_tail != nil) { pool.wait_tail.next = account; }
+    or                         { pool.wait_head = account; }
+    pool.wait_tail  = account;
+    account.waiting = true;
+    pool.waiters    = pool.waiters + 1;
+}
+
+fun wake_one(pool: *Pool) {
+    val account: *Account = pool.wait_head;
+    if (account == nil) { ret; }
+    unlink_wait(pool, account);
+    account.prev = pool.ready_tail;
+    account.next = nil;
+    if (pool.ready_tail != nil) { pool.ready_tail.next = account; }
+    or                          { pool.ready_head = account; }
+    pool.ready_tail  = account;
+    account.is_ready = true;
+    pool.ready_count = pool.ready_count + 1;
+    if (pool.notify != nil) { pool.notify(pool.notify_context, account.handle); }
+}
+
+fun charge_fits(pool: *Pool, account: *Account, lane: usize, bytes: usize, reason: *Reason) bool {
+    if (account.used[lane] > account.budgets[lane] || bytes > account.budgets[lane] - account.used[lane]) {
+        @reason = Reason.budget{};
+        ret false;
+    }
+    if (bytes > ~(0::usize) - account.held) {
+        @reason = Reason.budget{};
+        ret false;
+    }
+    val delta: usize = account_over(account, account.held + bytes) - account_over(account, account.held);
+    val room:  usize = pool.global_budget - pool.reserved_total;
+    if (pool.overflow_used > room || delta > room - pool.overflow_used) {
+        @reason = Reason.exhausted{};
+        ret false;
+    }
+    ret true;
+}
+
+fun charge(pool: *Pool, account: *Account, lane: usize, bytes: usize) {
+    val delta: usize = account_over(account, account.held + bytes) - account_over(account, account.held);
+    account.used[lane] = account.used[lane] + bytes;
+    account.held       = account.held + bytes;
+    pool.overflow_used = pool.overflow_used + delta;
+    pool.bytes_live    = pool.bytes_live + bytes;
+    if (pool.bytes_live > pool.bytes_peak) { pool.bytes_peak = pool.bytes_live; }
+}
+
+fun uncharge(pool: *Pool, account: *Account, lane: usize, bytes: usize) {
+    val delta: usize = account_over(account, account.held) - account_over(account, account.held - bytes);
+    account.used[lane] = account.used[lane] - bytes;
+    account.held       = account.held - bytes;
+    pool.overflow_used = pool.overflow_used - delta;
+    pool.bytes_live    = pool.bytes_live - bytes;
+}
+
+# acquire with the entrant already claimed
+fun acquire_locked(pool: *Pool, account: *Account, request: Request, register: bool) Acquired {
+    if (account == nil || account.pool != pool || !account.open || request.bytes == 0 ||
+        request.lane::usize >= pool.lanes || !power_of_two(effective_align(request.align)) ||
+        effective_align(request.align) > table.ELEMENT_ALIGN * 4096) {
+        ret refusal(Status.error{}, misused(pool));
+    }
+    val class_index: u16   = select_class(pool, request);
+    val align:       usize = effective_align(request.align);
+    var bytes:       usize = 0;
+    if (class_index == OVERSIZE) {
+        if (request.secret && !WELDED)               { ret refusal(Status.error{}, misused(pool)); }
+        if (!round_up(request.bytes, align, ?bytes)) { ret refusal(Status.blocked{}, Reason.budget{}); }
+    }
+    or {
+        bytes = pool.classes[class_index::usize].size;
+    }
+    val lane:   usize = request.lane::usize;
+    var reason: Reason;
+    if (!charge_fits(pool, account, lane, bytes, ?reason)) {
+        pool.refusals = pool.refusals + 1;
+        if (class_index != OVERSIZE) {
+            pool.classes[class_index::usize].refusals = pool.classes[class_index::usize].refusals + 1;
+        }
+        if (sel reason.budget) { pool.budget_refusals = pool.budget_refusals + 1; }
+        or (register)          { register_waiter(pool, account); }
+        ret refusal(Status.blocked{}, reason);
+    }
+    # a slot inside the reservation is already backed; past it the table may grow
+    val inside: bool = account.chunks < account.reserved_slots;
+    if (!inside && !ensure_slots(pool, pool.slots_in_use + pool.slots_reserved + 1)) {
+        pool.refusals = pool.refusals + 1;
+        if (register) { register_waiter(pool, account); }
+        ret refusal(Status.blocked{}, Reason.memory{});
+    }
+    var secret_chunk: bool  = request.secret;
+    var chunk_align:  usize = align;
+    if (class_index != OVERSIZE) {
+        secret_chunk = pool.classes[class_index::usize].secret;
+        chunk_align  = pool.classes[class_index::usize].align;
+    }
+    var index:   u32   = NONE;
+    var address: usize = 0;
+    var welded:  u32   = 0;
+    var wgen:    u32   = 0;
+    if (class_index != OVERSIZE && pool.classes[class_index::usize].retained_head != NONE) {
+        val cls: *ClassState = ?pool.classes[class_index::usize];
+        index = cls.retained_head;
+        val kept: *Slot = slot_at(pool, index);
+        cls.retained_head = kept.next;
+        cls.retained      = cls.retained - 1;
+        address           = kept.address;
+        welded            = kept.welded;
+        wgen              = kept.welded_gen;
+    }
+    or {
+        var backed: bool = false;
+        if (secret_chunk) {
+            backed = welded_allocate(bytes, ?welded, ?wgen);
+        }
+        or {
+            address = plain_allocate(pool, bytes, chunk_align);
+            backed  = address != 0;
+        }
+        if (!backed) {
+            pool.refusals = pool.refusals + 1;
+            if (class_index != OVERSIZE) {
+                pool.classes[class_index::usize].refusals = pool.classes[class_index::usize].refusals + 1;
+            }
+            if (register) { register_waiter(pool, account); }
+            ret refusal(Status.blocked{}, Reason.memory{});
+        }
+        index                    = take_slot(pool);
+        pool.backing_allocations = pool.backing_allocations + 1;
+        if (class_index != OVERSIZE) {
+            pool.classes[class_index::usize].backing = pool.classes[class_index::usize].backing + 1;
+        }
+    }
+    pool.steps = pool.steps + 1;
+    val slot: *Slot = slot_at(pool, index);
+    slot.generation = slot.generation + 1;
+    if (slot.generation == 0) { slot.generation = 1; }
+    slot.state      = SLOT_HELD;
+    slot.class      = class_index;
+    slot.lane       = request.lane;
+    slot.bytes      = bytes;
+    slot.address    = address;
+    slot.welded     = welded;
+    slot.welded_gen = wgen;
+    slot.align      = chunk_align;
+    slot.account    = account;
+    slot.inflight   = 0;
+    slot.next       = NONE;
+    slot.secret     = secret_chunk;
+    charge(pool, account, lane, bytes);
+    account.chunks = account.chunks + 1;
+    if (!inside) { pool.slots_in_use = pool.slots_in_use + 1; }
+    or {
+        pool.slots_reserved = pool.slots_reserved - 1;
+        pool.slots_in_use   = pool.slots_in_use + 1;
+    }
+    pool.acquisitions = pool.acquisitions + 1;
+    if (class_index == OVERSIZE) {
+        pool.oversize_live     = pool.oversize_live + 1;
+        pool.oversize_bytes    = pool.oversize_bytes + bytes;
+        pool.oversize_acquired = pool.oversize_acquired + 1;
+    }
+    or {
+        val cls: *ClassState = ?pool.classes[class_index::usize];
+        cls.live         = cls.live + 1;
+        cls.acquisitions = cls.acquisitions + 1;
+        if (cls.live > cls.peak) { cls.peak = cls.live; }
+    }
+    var out: Acquired;
+    out.status      = Status.ok{};
+    out.reason      = Reason.none{};
+    out.chunk.ref   = Ref{index: index, generation: slot.generation};
+    out.chunk.class = class_index;
+    out.chunk.bytes = bytes;
+    out.chunk.data  = nil;
+    if (!secret_chunk) { out.chunk.data = address::*u8; }
+    ret out;
+}
+
+fun held_slot(pool: *Pool, ref: Ref) *Slot {
+    if (ref.index >= pool.slot_top) { ret nil; }
+    val slot: *Slot = slot_at(pool, ref.index);
+    if (slot.state != SLOT_HELD || slot.generation != ref.generation) { ret nil; }
+    ret slot;
+}
+
+fun release_locked(pool: *Pool, account: *Account, chunk: Chunk, wake: bool) Reason {
+    if (account == nil || account.pool != pool) { ret misused(pool); }
+    val slot: *Slot = held_slot(pool, chunk.ref);
+    if (slot == nil || slot.account != account || slot.class != chunk.class || slot.inflight != 0) {
+        ret misused(pool);
+    }
+    pool.steps = pool.steps + 1;
+    val bytes: usize = slot.bytes;
+    uncharge(pool, account, slot.lane::usize, bytes);
+    account.chunks    = account.chunks - 1;
+    pool.slots_in_use = pool.slots_in_use - 1;
+    if (account.chunks < account.reserved_slots) { pool.slots_reserved = pool.slots_reserved + 1; }
+    slot.generation = slot.generation + 1;
+    if (slot.generation == 0) { slot.generation = 1; }
+    slot.account = nil;
+    if (slot.class == OVERSIZE) {
+        # oversize blocks go straight back to the backing
+        slot_release(pool, slot, bytes, slot.align);
+        pool.oversize_live     = pool.oversize_live - 1;
+        pool.oversize_bytes    = pool.oversize_bytes - bytes;
+        pool.oversize_returned = pool.oversize_returned + 1;
+        put_slot(pool, chunk.ref.index);
+    }
+    or {
+        val cls: *ClassState = ?pool.classes[slot.class::usize];
+        cls.live     = cls.live - 1;
+        cls.releases = cls.releases + 1;
+        if (cls.secret) { welded_wipe(slot.welded, slot.welded_gen, cls.size); }
+        if (cls.retained < cls.high_water) {
+            slot.state        = SLOT_RETAINED;
+            slot.next         = cls.retained_head;
+            cls.retained_head = chunk.ref.index;
+            cls.retained      = cls.retained + 1;
+        }
+        or {
+            slot_release(pool, slot, cls.size, cls.align);
+            put_slot(pool, chunk.ref.index);
+        }
+    }
+    if (wake) { wake_one(pool); }
+    ret Reason.none{};
+}
+
+# make a pool
+# ---
+# pool:   the pool to initialize
+# config: the classes and budgets, copied
+# plain:  the backing for plain chunks and slot metadata, copied, whose context
+#         must outlive the pool
+# ret:    whether the pool was made, refused when a class is secret on a target
+#         without welded storage
+pub fun make(pool: *Pool, config: Config, plain: *A.Allocator) bool {
+    if (pool == nil || plain == nil || config.class_count > MAX_CLASSES ||
+        (config.class_count != 0 && config.classes == nil) ||
+        config.lanes == 0 || config.lanes::usize > MAX_LANES) { ret false; }
+    var i: usize = 0;
+    for (i < config.class_count) {
+        val c:     ClassConfig = config.classes[i];
+        val align: usize       = effective_align(c.align);
+        if (c.size == 0 || !power_of_two(align) || align > table.ELEMENT_ALIGN * 4096) { ret false; }
+        if (c.secret && !WELDED)                                                       { ret false; }
+        i = i + 1;
+    }
+    var blank: Pool;
+    @pool      = blank;
+    pool.plain = @plain;
+    i          = 0;
+    for (i < config.class_count) {
+        val c:   ClassConfig = config.classes[i];
+        val cls: *ClassState = ?pool.classes[i];
+        cls.size          = c.size;
+        cls.align         = effective_align(c.align);
+        cls.secret        = c.secret;
+        cls.high_water    = c.high_water;
+        cls.retained_head = NONE;
+        i                 = i + 1;
+    }
+    var initial: usize = config.initial_slots;
+    if (initial == 0)                                             { initial = 16; }
+    if (!table.make(?pool.slots, plain, $size_of(Slot), initial)) { ret false; }
+    pool.class_count    = config.class_count;
+    pool.lanes          = config.lanes::usize;
+    pool.global_budget  = config.global_budget;
+    pool.notify         = config.notify;
+    pool.notify_context = config.notify_context;
+    pool.trap           = config.trap;
+    pool.trap_context   = config.trap_context;
+    pool.empty_head     = NONE;
+    pool.made           = true;
+    ret true;
+}
+
+# release every retained chunk and the slot metadata
+#
+# refused while any account is open, so no held chunk is ever leaked or freed
+# under its owner
+pub fun destroy(pool: *Pool) bool {
+    if (pool == nil || !pool.made || !enter(pool)) { ret false; }
+    if (pool.accounts != 0) {
+        misused(pool);
+        leave(pool);
+        ret false;
+    }
+    var c: usize = 0;
+    for (c < pool.class_count) {
+        val cls:   *ClassState = ?pool.classes[c];
+        var index: u32         = cls.retained_head;
+        for (index != NONE) {
+            val slot: *Slot = slot_at(pool, index);
+            slot_release(pool, slot, cls.size, cls.align);
+            index = slot.next;
+        }
+        cls.retained_head = NONE;
+        cls.retained      = 0;
+        c                 = c + 1;
+    }
+    table.destroy(?pool.slots);
+    pool.made = false;
+    leave(pool);
+    ret true;
+}
+
+# open an account
+# ---
+# pool:    the pool
+# account: caller-embedded storage that must not move while open
+# handle:  the caller's identity, reported by ready and notify
+# budgets: one byte budget per lane
+# reserve: bytes reserved out of the global budget for this account
+# ret:     none, exhausted when the reservation cannot be granted, memory when
+#          its metadata cannot be backed, or misuse
+pub fun open_account(pool: *Pool, account: *Account, handle: u64, budgets: *usize, reserve: usize) Reason {
+    if (pool == nil || !pool.made) { ret Reason.misuse{}; }
+    if (!enter(pool))              { ret Reason.misuse{}; }
+    if (account == nil || budgets == nil || (account.open && account.pool == pool)) {
+        val r: Reason = misused(pool);
+        leave(pool);
+        ret r;
+    }
+    if (reserve > pool.global_budget - pool.reserved_total) {
+        leave(pool);
+        ret Reason.exhausted{};
+    }
+    if (pool.global_budget - pool.reserved_total - reserve < pool.overflow_used) {
+        leave(pool);
+        ret Reason.exhausted{};
+    }
+    # the smallest chunk bounds how many chunks the reservation can hold
+    var slots: usize = 0;
+    if (reserve != 0) {
+        var smallest: usize = reserve;
+        var c:        usize = 0;
+        for (c < pool.class_count) {
+            if (pool.classes[c].size < smallest) { smallest = pool.classes[c].size; }
+            c = c + 1;
+        }
+        slots = (reserve + smallest - 1) / smallest;
+    }
+    if (!ensure_slots(pool, pool.slots_in_use + pool.slots_reserved + slots)) {
+        leave(pool);
+        ret Reason.memory{};
+    }
+    var blank: Account;
+    @account               = blank;
+    account.pool           = pool;
+    account.handle         = handle;
+    account.reserve        = reserve;
+    account.reserved_slots = slots;
+    account.open           = true;
+    var lane: usize = 0;
+    for (lane < pool.lanes) {
+        account.budgets[lane] = budgets[lane];
+        lane                  = lane + 1;
+    }
+    pool.reserved_total = pool.reserved_total + reserve;
+    pool.slots_reserved = pool.slots_reserved + slots;
+    pool.accounts       = pool.accounts + 1;
+    leave(pool);
+    ret Reason.none{};
+}
+
+# close an account holding no chunks, unlinking any registration
+pub fun close_account(pool: *Pool, account: *Account) Reason {
+    if (pool == nil || !enter(pool)) { ret Reason.misuse{}; }
+    if (account == nil || account.pool != pool || !account.open || account.chunks != 0) {
+        val r: Reason = misused(pool);
+        leave(pool);
+        ret r;
+    }
+    if (account.waiting)  { unlink_wait(pool, account); }
+    if (account.is_ready) { unlink_ready(pool, account); }
+    pool.reserved_total = pool.reserved_total - account.reserve;
+    pool.slots_reserved = pool.slots_reserved - account.reserved_slots;
+    pool.accounts       = pool.accounts - 1;
+    account.open        = false;
+    account.pool        = nil;
+    leave(pool);
+    ret Reason.none{};
+}
+
+# acquire one chunk
+# ---
+# register: on exhausted or memory, register the account for one wake-up
+pub fun acquire(pool: *Pool, account: *Account, request: Request, register: bool) Acquired {
+    if (pool == nil || !pool.made) { ret refusal(Status.error{}, Reason.misuse{}); }
+    if (!enter(pool))              { ret refusal(Status.error{}, Reason.misuse{}); }
+    val out: Acquired = acquire_locked(pool, account, request, register);
+    leave(pool);
+    ret out;
+}
+
+# acquire every requested chunk or none
+#
+# a partial set is released inside the pool, without waking anyone, before the
+# refusal is reported. `out` holds count chunks on success
+pub fun acquire_n(pool: *Pool, account: *Account, requests: *Request, count: usize, out: *Chunk, register: bool) Acquired {
+    if (pool == nil || !pool.made) { ret refusal(Status.error{}, Reason.misuse{}); }
+    if (!enter(pool))              { ret refusal(Status.error{}, Reason.misuse{}); }
+    if ((count != 0 && (requests == nil || out == nil))) {
+        val r: Reason = misused(pool);
+        leave(pool);
+        ret refusal(Status.error{}, r);
+    }
+    var i: usize = 0;
+    for (i < count) {
+        val got: Acquired = acquire_locked(pool, account, requests[i], false);
+        if (!sel got.status.ok) {
+            var j: usize = 0;
+            for (j < i) {
+                release_locked(pool, account, out[j], false);
+                j = j + 1;
+            }
+            if (register && (sel got.reason.exhausted || sel got.reason.memory)) { register_waiter(pool, account); }
+            leave(pool);
+            ret got;
+        }
+        out[i] = got.chunk;
+        i      = i + 1;
+    }
+    leave(pool);
+    var done: Acquired;
+    done.status = Status.ok{};
+    done.reason = Reason.none{};
+    if (count != 0) { done.chunk = out[0]; }
+    ret done;
+}
+
+# give a chunk back
+#
+# a secret chunk is wiped in full. the oldest waiter, if any, is woken. a
+# refused release leaves the chunk held by its caller
+pub fun release(pool: *Pool, account: *Account, chunk: Chunk) Reason {
+    if (pool == nil || !pool.made) { ret Reason.misuse{}; }
+    if (!enter(pool))              { ret Reason.misuse{}; }
+    val r: Reason = release_locked(pool, account, chunk, true);
+    leave(pool);
+    ret r;
+}
+
+# the welded view of a held secret chunk, nil for a plain or stale one
+pub fun secret(pool: *Pool, chunk: Chunk) *^u8 {
+    if (pool == nil || !pool.made || chunk.data != nil) { ret nil; }
+    if (!enter(pool))                                   { ret nil; }
+    val slot: *Slot = held_slot(pool, chunk.ref);
+    var view: *^u8  = nil;
+    if (slot != nil && slot.secret) { view = welded_view(slot.welded, slot.welded_gen); }
+    leave(pool);
+    ret view;
+}
+
+# the address of a held plain chunk, nil when the ref is stale or secret
+pub fun data(pool: *Pool, ref: Ref) *u8 {
+    if (pool == nil || !pool.made || !enter(pool)) { ret nil; }
+    val slot:    *Slot = held_slot(pool, ref);
+    var address: *u8   = nil;
+    if (slot != nil) {
+        if (!slot.secret) { address = slot.address::*u8; }
+    }
+    leave(pool);
+    ret address;
+}
+
+# count an in-flight user, such as an operation the chunk was handed to
+pub fun retain(pool: *Pool, ref: Ref) Reason {
+    if (pool == nil || !pool.made || !enter(pool)) { ret Reason.misuse{}; }
+    val slot: *Slot = held_slot(pool, ref);
+    if (slot == nil || slot.inflight == 0xffffffff) {
+        val r: Reason = misused(pool);
+        leave(pool);
+        ret r;
+    }
+    slot.inflight = slot.inflight + 1;
+    leave(pool);
+    ret Reason.none{};
+}
+
+# end one in-flight use
+pub fun settle(pool: *Pool, ref: Ref) Reason {
+    if (pool == nil || !pool.made || !enter(pool)) { ret Reason.misuse{}; }
+    val slot: *Slot = held_slot(pool, ref);
+    if (slot == nil || slot.inflight == 0) {
+        val r: Reason = misused(pool);
+        leave(pool);
+        ret r;
+    }
+    slot.inflight = slot.inflight - 1;
+    leave(pool);
+    ret Reason.none{};
+}
+
+# whether a held chunk has in-flight users
+pub fun in_flight(pool: *Pool, ref: Ref) bool {
+    if (pool == nil || !pool.made || !enter(pool)) { ret false; }
+    val slot:   *Slot = held_slot(pool, ref);
+    var flight: bool  = false;
+    if (slot != nil) { flight = slot.inflight != 0; }
+    leave(pool);
+    ret flight;
+}
+
+# drain the handles of woken accounts, oldest first
+# ---
+# ret: handles written, at most capacity
+pub fun ready(pool: *Pool, output: *u64, capacity: usize) usize {
+    if (pool == nil || !pool.made || (capacity != 0 && output == nil) || !enter(pool)) { ret 0; }
+    var written: usize = 0;
+    for (written < capacity && pool.ready_head != nil) {
+        val account: *Account = pool.ready_head;
+        output[written] = account.handle;
+        unlink_ready(pool, account);
+        written = written + 1;
+    }
+    leave(pool);
+    ret written;
+}
+
+# a point-in-time view of the pool's counters
+pub fun snapshot(pool: *Pool, output: *Snapshot) bool {
+    if (pool == nil || output == nil || !pool.made || !enter(pool)) { ret false; }
+    var blank: Snapshot;
+    @output = blank;
+    var c: usize = 0;
+    for (c < pool.class_count) {
+        val cls: *ClassState = ?pool.classes[c];
+        output.classes[c] = ClassCounters{
+            size:                cls.size,
+            live:                cls.live,
+            peak:                cls.peak,
+            retained:            cls.retained,
+            held_bytes:          cls.live * cls.size,
+            acquisitions:        cls.acquisitions,
+            releases:            cls.releases,
+            refusals:            cls.refusals,
+            backing_allocations: cls.backing,
+        };
+        c = c + 1;
+    }
+    output.class_count         = pool.class_count;
+    output.bytes_live          = pool.bytes_live;
+    output.bytes_peak          = pool.bytes_peak;
+    output.reserved            = pool.reserved_total;
+    output.overflow            = pool.overflow_used;
+    output.accounts            = pool.accounts;
+    output.waiters             = pool.waiters;
+    output.ready               = pool.ready_count;
+    output.misuse              = atomic.load(?pool.misuse)::u64;
+    output.oversize_live       = pool.oversize_live;
+    output.oversize_bytes      = pool.oversize_bytes;
+    output.acquisitions        = pool.acquisitions;
+    output.oversize_acquired   = pool.oversize_acquired;
+    output.oversize_returned   = pool.oversize_returned;
+    output.refusals            = pool.refusals;
+    output.budget_refusals     = pool.budget_refusals;
+    output.backing_allocations = pool.backing_allocations;
+    output.steps               = pool.steps;
+    leave(pool);
+    ret true;
+}
+
+fun source_acquire(context: ptr, account: *Account, request: Request, register: bool) Acquired {
+    ret acquire(context::*Pool, account, request, register);
+}
+
+fun source_acquire_n(context: ptr, account: *Account, requests: *Request, count: usize, out: *Chunk, register: bool) Acquired {
+    ret acquire_n(context::*Pool, account, requests, count, out, register);
+}
+
+fun source_release(context: ptr, account: *Account, chunk: Chunk) Reason {
+    ret release(context::*Pool, account, chunk);
+}
+
+fun source_secret(context: ptr, chunk: Chunk) *^u8 {
+    ret secret(context::*Pool, chunk);
+}
+
+# the pool as a Source, borrowing the pool
+pub fun source(pool: *Pool) Source {
+    ret Source{
+        ctx:          pool::ptr,
+        fn_acquire:   source_acquire,
+        fn_acquire_n: source_acquire_n,
+        fn_release:   source_release,
+        fn_secret:    source_secret,
+    };
+}
+
+# bytes an allocator.fixed arena needs to hold a pool's slot metadata and the
+# given number of plain chunks of every class, for embedded use
+# ---
+# config: the pool configuration
+# chunks: chunks per class, one entry per class
+# ret:    the byte count, or the overflow refusal
+pub fun arena_bytes(config: Config, chunks: *usize) res[usize, A.Error] {
+    if ((config.class_count != 0 && (config.classes == nil || chunks == nil)) ||
+        config.class_count > MAX_CLASSES) { ret res[usize, A.Error].err{A.Error.invalid{}}; }
+    var total: usize = 0;
+    var slots: usize = 0;
+    var c:     usize = 0;
+    for (c < config.class_count) {
+        var bytes: usize = 0;
+        var round: usize = 0;
+        if (!round_up(config.classes[c].size, table.ELEMENT_ALIGN, ?round) ||
+            !memory.range_scaled(chunks[c], round + table.ELEMENT_ALIGN, ?bytes) ||
+            bytes > ~(0::usize) - total) { ret res[usize, A.Error].err{A.Error.overflow{}}; }
+        total = total + bytes;
+        if (chunks[c] > ~(0::usize) - slots) { ret res[usize, A.Error].err{A.Error.overflow{}}; }
+        slots = slots + chunks[c];
+        c     = c + 1;
+    }
+    # the slot table doubles, so twice the slots bounds every chunk it grows to
+    var meta: usize = 0;
+    if (!memory.range_scaled(slots * 2 + 32, $size_of(Slot) + table.ELEMENT_ALIGN, ?meta) ||
+        meta > ~(0::usize) - total) { ret res[usize, A.Error].err{A.Error.overflow{}}; }
+    ret res[usize, A.Error].ok{total + meta};
+}
+
+# welded storage goes through std.memory.secret borrows, so no welded pointer is
+# ever held behind the pool's untyped context
+$if (capability.HAS_PAGES) {
+    use secret_memory: std.memory.secret;
+
+    pub val WELDED: bool = true;
+
+    fun welded_allocate(size: usize, index: *u32, generation: *u32) bool {
+        val data: *^u8 = secret_memory.allocate(size);
+        if (data == nil) { ret false; }
+        var borrow: secret_memory.Borrow;
+        val opened: err[io_error.Error] = secret_memory.borrow_open(data, size, ?borrow);
+        if (sel opened.err) {
+            secret_memory.deallocate(data, size);
+            ret false;
+        }
+        @index      = borrow.index;
+        @generation = borrow.generation;
+        ret true;
+    }
+
+    fun welded_view(index: u32, generation: u32) *^u8 {
+        ret secret_memory.borrow_data(secret_memory.Borrow{index: index, generation: generation});
+    }
+
+    fun welded_wipe(index: u32, generation: u32, size: usize) {
+        secret_memory.borrow_wipe(secret_memory.Borrow{index: index, generation: generation}, 0, size);
+    }
+
+    fun welded_release(index: u32, generation: u32, size: usize) {
+        val borrow: secret_memory.Borrow = secret_memory.Borrow{index: index, generation: generation};
+        val data:   *^u8                 = secret_memory.borrow_data(borrow);
+        secret_memory.borrow_close(borrow);
+        if (data != nil) { secret_memory.deallocate(data, size); }
+    }
+}
+$or {
+    pub val WELDED: bool = false;
+
+    fun welded_allocate(size: usize, index: *u32, generation: *u32) bool {
+        ret false;
+    }
+
+    fun welded_view(index: u32, generation: u32) *^u8 {
+        ret nil;
+    }
+
+    fun welded_wipe(index: u32, generation: u32, size: usize) {}
+
+    fun welded_release(index: u32, generation: u32, size: usize) {}
+}
+
+$if (capability.HOSTED) {
+    fun status_ok(a: Acquired) bool {
+        ret sel a.status.ok;
+    }
+    fun status_error(a: Acquired) bool {
+        ret sel a.status.error;
+    }
+    fun status_blocked(a: Acquired) bool {
+        ret sel a.status.blocked;
+    }
+    fun reason_budget(a: Acquired) bool {
+        ret sel a.reason.budget;
+    }
+    fun reason_exhausted(a: Acquired) bool {
+        ret sel a.reason.exhausted;
+    }
+    fun reason_memory(a: Acquired) bool {
+        ret sel a.reason.memory;
+    }
+    fun reason_misuse(a: Acquired) bool {
+        ret sel a.reason.misuse;
+    }
+    fun is_none(r: Reason) bool {
+        ret sel r.none;
+    }
+    fun is_misuse(r: Reason) bool {
+        ret sel r.misuse;
+    }
+    fun failed(r: err[A.Error]) bool {
+        ret sel r.err;
+    }
+
+    rec Counting {
+        inner:        A.Allocator;
+        allocs:       usize;
+        frees:        usize;
+        refuse:       bool;
+        refuse_align: usize;
+    }
+
+    fun counting_allocate(context: ptr, size: usize, align: usize) opt[ptr] {
+        val c: *Counting = context::*Counting;
+        if (c.refuse || (c.refuse_align != 0 && align == c.refuse_align)) { ret opt[ptr].none{}; }
+        c.allocs = c.allocs + 1;
+        ret c.inner.fn_allocate(c.inner.ctx, size, align);
+    }
+
+    fun counting_reallocate(context: ptr, p: ptr, old: usize, size: usize, align: usize) opt[ptr] {
+        ret opt[ptr].none{};
+    }
+
+    fun counting_deallocate(context: ptr, p: ptr, size: usize, align: usize) i64 {
+        val c: *Counting = context::*Counting;
+        c.frees = c.frees + 1;
+        ret c.inner.fn_deallocate(c.inner.ctx, p, size, align);
+    }
+
+    # a counted bump arena over one page region, so a test's memory is bounded
+    rec Arena {
+        page:    A.Allocator;
+        state:   fixed.FixedState;
+        count:   Counting;
+        counted: A.Allocator;
+        base:    ptr;
+        bytes:   usize;
+    }
+
+    fun arena_make(arena: *Arena, bytes: usize) bool {
+        page.make(?arena.page);
+        val got: res[ptr, A.Error] = A.allocate_raw(?arena.page, bytes, 16);
+        if (sel got.err) { ret false; }
+        arena.base  = got.ok;
+        arena.bytes = bytes;
+        if (failed(fixed.make(?arena.count.inner, ?arena.state, got.ok::*u8, bytes))) { ret false; }
+        arena.counted = A.Allocator{
+            ctx: (?arena.count)::ptr,
+            fn_allocate:   counting_allocate,
+            fn_reallocate: counting_reallocate,
+            fn_deallocate: counting_deallocate,
+        };
+        ret true;
+    }
+
+    fun arena_free(arena: *Arena) {
+        A.deallocate_raw(?arena.page, arena.base, arena.bytes, 16);
+    }
+
+    fun no_notify(context: ptr, handle: u64) {}
+
+    fun no_trap(context: ptr) {}
+
+    fun test_config(classes: *ClassConfig, count: usize, global: usize) Config {
+        var config: Config;
+        config.classes       = classes;
+        config.class_count   = count;
+        config.lanes         = 2;
+        config.global_budget = global;
+        config.initial_slots = 4;
+        ret config;
+    }
+
+    fun ask(bytes: usize) Request {
+        ret Request{bytes: bytes, align: 0, lane: 0, secret: false};
+    }
+
+    fun budgets_of(value: usize, out: *usize) *usize {
+        out[0] = value;
+        out[1] = value;
+        ret out;
+    }
+
+    test "buffers: a request takes the smallest fitting class and oversize takes the rest" {
+        var arena: Arena;
+        if (!arena_make(?arena, 16 << 20)) { ret 1; }
+        fin { arena_free(?arena); }
+        var classes: [3]ClassConfig = [3]ClassConfig{
+            ClassConfig{size: 512, align: 0, secret: false, high_water: 4},
+            ClassConfig{size: 4096, align: 0, secret: false, high_water: 4},
+            ClassConfig{size: 16384, align: 0, secret: false, high_water: 0},
+        };
+        var pool: Pool;
+        if (!make(?pool, test_config(?classes[0], 3, 1 << 22), ?arena.counted)) { ret 2; }
+        fin { destroy(?pool); }
+        var b:       [2]usize;
+        var account: Account;
+        if (!is_none(open_account(?pool, ?account, 7, budgets_of(1 << 21, ?b[0]), 0))) { ret 3; }
+        fin { close_account(?pool, ?account); }
+        val small: Acquired = acquire(?pool, ?account, ask(100), false);
+        val mid:   Acquired = acquire(?pool, ?account, ask(600), false);
+        val big:   Acquired = acquire(?pool, ?account, ask(5000), false);
+        if (!sel small.status.ok || small.chunk.class != 0 || small.chunk.bytes != 512) { ret 4; }
+        if (!sel mid.status.ok || mid.chunk.class != 1 || mid.chunk.bytes != 4096)      { ret 5; }
+        if (!sel big.status.ok || big.chunk.class != 2 || big.chunk.bytes != 16384)     { ret 6; }
+        var wide: Request = ask(100);
+        wide.align = 64;
+        val aligned: Acquired = acquire(?pool, ?account, wide, false);
+        if (!sel aligned.status.ok || aligned.chunk.class != OVERSIZE || aligned.chunk.bytes != 128) { ret 7; }
+        if ((aligned.chunk.data::usize & 63) != 0)                                                   { ret 8; }
+        val frees: usize    = arena.count.frees;
+        val large: Acquired = acquire(?pool, ?account, ask(100000), false);
+        var snap:  Snapshot;
+        if (!sel large.status.ok || large.chunk.class != OVERSIZE || large.chunk.bytes != 100000) { ret 9; }
+        snapshot(?pool, ?snap);
+        if (snap.oversize_live != 2 || snap.oversize_bytes != 100128) { ret 10; }
+        if (account.used[0] != 512 + 4096 + 16384 + 128 + 100000)     { ret 11; }
+        if (!is_none(release(?pool, ?account, large.chunk)))          { ret 12; }
+        if (arena.count.frees != frees + 1)                           { ret 13; }
+        snapshot(?pool, ?snap);
+        if (snap.oversize_live != 1 || snap.oversize_returned != 1) { ret 14; }
+        if (!is_none(release(?pool, ?account, aligned.chunk)) || !is_none(release(?pool, ?account, small.chunk)) ||
+            !is_none(release(?pool, ?account, mid.chunk)) || !is_none(release(?pool, ?account, big.chunk))) { ret 15; }
+        if (account.held != 0 || pool.bytes_live != 0) { ret 16; }
+        ret 0;
+    }
+
+    test "buffers: a secret chunk has no plain view and is wiped in full on release" {
+        var arena: Arena;
+        if (!arena_make(?arena, 1 << 20)) { ret 1; }
+        fin { arena_free(?arena); }
+        var classes: [1]ClassConfig = [1]ClassConfig{
+            ClassConfig{size: 512, align: 0, secret: true, high_water: 1},
+        };
+        var pool: Pool;
+        if (!make(?pool, test_config(?classes[0], 1, 1 << 20), ?arena.counted)) { ret 2; }
+        fin { destroy(?pool); }
+        var b:       [2]usize;
+        var account: Account;
+        if (!is_none(open_account(?pool, ?account, 1, budgets_of(1 << 20, ?b[0]), 0))) { ret 3; }
+        fin { close_account(?pool, ?account); }
+        # a plain request finds no plain class and takes the oversize path
+        var request: Request  = ask(512);
+        val plain:   Acquired = acquire(?pool, ?account, request, false);
+        if (!status_ok(plain) || plain.chunk.class != OVERSIZE || plain.chunk.data == nil) { ret 4; }
+        if (!is_none(release(?pool, ?account, plain.chunk)))                               { ret 40; }
+        request.secret = true;
+        val got: Acquired = acquire(?pool, ?account, request, false);
+        if (!sel got.status.ok || got.chunk.data != nil) { ret 5; }
+        if (data(?pool, got.chunk.ref) != nil)           { ret 6; }
+        val view: *^u8 = secret(?pool, got.chunk);
+        if (view == nil) { ret 7; }
+        var i: usize = 0;
+        for (i < 512) {
+            view[i] = 0xa5;
+            i       = i + 1;
+        }
+        if (!is_none(release(?pool, ?account, got.chunk))) { ret 8; }
+        # the retained region is still backed, so it can be read after release
+        i = 0;
+        for (i < 512) {
+            if (view[i]:>u8 != 0) { ret 9; }
+            i = i + 1;
+        }
+        request.bytes = 4000;
+        val large: Acquired = acquire(?pool, ?account, request, false);
+        if (!sel large.status.ok || large.chunk.class != OVERSIZE || large.chunk.data != nil) { ret 10; }
+        if (secret(?pool, large.chunk) == nil)                                                { ret 11; }
+        if (!is_none(release(?pool, ?account, large.chunk)))                                  { ret 12; }
+        ret 0;
+    }
+
+    test "buffers: budget, exhausted and memory refusals are told apart" {
+        var arena: Arena;
+        if (!arena_make(?arena, 1 << 20)) { ret 1; }
+        fin { arena_free(?arena); }
+        var classes: [1]ClassConfig = [1]ClassConfig{
+            ClassConfig{size: 512, align: 0, secret: false, high_water: 0},
+        };
+        var pool: Pool;
+        if (!make(?pool, test_config(?classes[0], 1, 1024), ?arena.counted)) { ret 2; }
+        fin { destroy(?pool); }
+        var b:     [2]usize;
+        var first: Account;
+        var other: Account;
+        if (!is_none(open_account(?pool, ?first, 1, budgets_of(512, ?b[0]), 0)))  { ret 3; }
+        if (!is_none(open_account(?pool, ?other, 2, budgets_of(4096, ?b[0]), 0))) { ret 4; }
+        val one: Acquired = acquire(?pool, ?first, ask(1), true);
+        if (!sel one.status.ok) { ret 5; }
+        val over: Acquired = acquire(?pool, ?first, ask(1), true);
+        if (!sel over.status.blocked || !sel over.reason.budget || pool.waiters != 0) { ret 6; }
+        val two: Acquired = acquire(?pool, ?other, ask(1), true);
+        if (!sel two.status.ok) { ret 7; }
+        val gone: Acquired = acquire(?pool, ?other, ask(1), true);
+        if (!sel gone.status.blocked || !sel gone.reason.exhausted || pool.waiters != 1) { ret 8; }
+        if (!is_none(release(?pool, ?other, two.chunk)))                                 { ret 9; }
+        if (pool.waiters != 0 || pool.ready_count != 1)                                  { ret 10; }
+        arena.count.refuse = true;
+        val refused: Acquired = acquire(?pool, ?other, ask(1), false);
+        if (!sel refused.status.blocked || !sel refused.reason.memory) { ret 11; }
+        arena.count.refuse = false;
+        var handles: [4]u64;
+        if (ready(?pool, ?handles[0], 4) != 1 || handles[0] != 2)                             { ret 12; }
+        if (!is_none(release(?pool, ?first, one.chunk)))                                      { ret 13; }
+        if (!is_none(close_account(?pool, ?first)) || !is_none(close_account(?pool, ?other))) { ret 14; }
+        ret 0;
+    }
+
+    test "buffers: an acquire inside a reservation never fails on metadata" {
+        var arena: Arena;
+        if (!arena_make(?arena, 1 << 20)) { ret 1; }
+        fin { arena_free(?arena); }
+        # payloads align at 32 and slot metadata at 16, so metadata alone can be refused
+        var classes: [1]ClassConfig = [1]ClassConfig{
+            ClassConfig{size: 512, align: 32, secret: false, high_water: 0},
+        };
+        var config: Config = test_config(?classes[0], 1, 1 << 16);
+        config.initial_slots = 1;
+        var pool: Pool;
+        if (!make(?pool, config, ?arena.counted)) { ret 2; }
+        fin { destroy(?pool); }
+        var b:        [2]usize;
+        var reserved: Account;
+        var plain:    Account;
+        if (!is_none(open_account(?pool, ?reserved, 1, budgets_of(1 << 16, ?b[0]), 3 * 512))) { ret 3; }
+        if (!is_none(open_account(?pool, ?plain, 2, budgets_of(1 << 16, ?b[0]), 0)))          { ret 4; }
+        arena.count.refuse_align = 16;
+        var held:  [3]Chunk;
+        var extra: [2]Chunk;
+        var count: usize = 0;
+        for (count < 2) {
+            val got: Acquired = acquire(?pool, ?plain, ask(1), false);
+            if (!sel got.status.ok) { brk; }
+            extra[count] = got.chunk;
+            count        = count + 1;
+        }
+        if (count != 1) { ret 5; }
+        var i: usize = 0;
+        for (i < 3) {
+            val got: Acquired = acquire(?pool, ?reserved, ask(1), false);
+            if (!sel got.status.ok) { ret 10 + i::i32; }
+            held[i] = got.chunk;
+            i       = i + 1;
+        }
+        val refused: Acquired = acquire(?pool, ?plain, ask(1), false);
+        if (!sel refused.reason.memory) { ret 6; }
+        arena.count.refuse_align = 0;
+        i                        = 0;
+        for (i < 3) {
+            release(?pool, ?reserved, held[i]);
+            i = i + 1;
+        }
+        release(?pool, ?plain, extra[0]);
+        close_account(?pool, ?reserved);
+        close_account(?pool, ?plain);
+        ret 0;
+    }
+
+    test "buffers: acquire_n gets every chunk or none" {
+        var arena: Arena;
+        if (!arena_make(?arena, 1 << 20)) { ret 1; }
+        fin { arena_free(?arena); }
+        var classes: [1]ClassConfig = [1]ClassConfig{
+            ClassConfig{size: 512, align: 0, secret: false, high_water: 8},
+        };
+        var pool: Pool;
+        if (!make(?pool, test_config(?classes[0], 1, 1 << 20), ?arena.counted)) { ret 2; }
+        fin { destroy(?pool); }
+        var b:       [2]usize;
+        var account: Account;
+        if (!is_none(open_account(?pool, ?account, 1, budgets_of(1024, ?b[0]), 0))) { ret 3; }
+        fin { close_account(?pool, ?account); }
+        var requests: [3]Request = [3]Request{ask(1), ask(1), ask(1)};
+        var out:      [3]Chunk;
+        val refused:  Acquired   = acquire_n(?pool, ?account, ?requests[0], 3, ?out[0], false);
+        if (!sel refused.reason.budget)                { ret 4; }
+        if (account.chunks != 0 || account.held != 0)  { ret 5; }
+        if (pool.bytes_live != 0 || pool.waiters != 0) { ret 6; }
+        val got: Acquired = acquire_n(?pool, ?account, ?requests[0], 2, ?out[0], false);
+        if (!sel got.status.ok || account.chunks != 2)                              { ret 7; }
+        if (out[0].data == nil || out[1].data == nil || out[0].data == out[1].data) { ret 8; }
+        release(?pool, ?account, out[0]);
+        release(?pool, ?account, out[1]);
+        ret 0;
+    }
+
+    test "buffers: in-flight and stale chunks are refused as misuse and stay put" {
+        var arena: Arena;
+        if (!arena_make(?arena, 1 << 20)) { ret 1; }
+        fin { arena_free(?arena); }
+        var classes: [1]ClassConfig = [1]ClassConfig{
+            ClassConfig{size: 512, align: 0, secret: false, high_water: 0},
+        };
+        var config: Config = test_config(?classes[0], 1, 1 << 20);
+        config.trap = no_trap;
+        var pool: Pool;
+        if (!make(?pool, config, ?arena.counted)) { ret 2; }
+        fin { destroy(?pool); }
+        var b:        [2]usize;
+        var account:  Account;
+        var stranger: Account;
+        if (!is_none(open_account(?pool, ?account, 1, budgets_of(1 << 20, ?b[0]), 0)))  { ret 3; }
+        if (!is_none(open_account(?pool, ?stranger, 2, budgets_of(1 << 20, ?b[0]), 0))) { ret 4; }
+        val got: Acquired = acquire(?pool, ?account, ask(8), false);
+        if (!sel got.status.ok)                                                         { ret 5; }
+        if (!is_none(retain(?pool, got.chunk.ref)) || !in_flight(?pool, got.chunk.ref)) { ret 6; }
+        if (!is_misuse(release(?pool, ?account, got.chunk)))                            { ret 7; }
+        if (data(?pool, got.chunk.ref) != got.chunk.data)                               { ret 8; }
+        if (!is_misuse(release(?pool, ?stranger, got.chunk)))                           { ret 9; }
+        if (!is_none(settle(?pool, got.chunk.ref)) || in_flight(?pool, got.chunk.ref))  { ret 10; }
+        if (!is_misuse(settle(?pool, got.chunk.ref)))                                   { ret 11; }
+        if (!is_none(release(?pool, ?account, got.chunk)))                              { ret 12; }
+        if (data(?pool, got.chunk.ref) != nil)                                          { ret 13; }
+        if (!is_misuse(release(?pool, ?account, got.chunk)))                            { ret 14; }
+        if (!is_misuse(retain(?pool, got.chunk.ref)))                                   { ret 15; }
+        var snap: Snapshot;
+        snapshot(?pool, ?snap);
+        if (snap.misuse != 5) { ret 16; }
+        close_account(?pool, ?account);
+        close_account(?pool, ?stranger);
+        ret 0;
+    }
+
+    test "buffers: held chunks keep their address while the pool grows" {
+        var arena: Arena;
+        if (!arena_make(?arena, 4 << 20)) { ret 1; }
+        fin { arena_free(?arena); }
+        var classes: [1]ClassConfig = [1]ClassConfig{
+            ClassConfig{size: 64, align: 0, secret: false, high_water: 0},
+        };
+        var pool: Pool;
+        if (!make(?pool, test_config(?classes[0], 1, 1 << 22), ?arena.counted)) { ret 2; }
+        fin { destroy(?pool); }
+        var b:       [2]usize;
+        var account: Account;
+        if (!is_none(open_account(?pool, ?account, 1, budgets_of(1 << 22, ?b[0]), 0))) { ret 3; }
+        val first: Acquired = acquire(?pool, ?account, ask(64), false);
+        if (!sel first.status.ok) { ret 4; }
+        first.chunk.data[0] = 0x5a;
+        var i: usize = 0;
+        for (i < 1000) {
+            if (!status_ok(acquire(?pool, ?account, ask(64), false))) { ret 5; }
+            i = i + 1;
+        }
+        if (first.chunk.data[0] != 0x5a || data(?pool, first.chunk.ref) != first.chunk.data) { ret 6; }
+        ret 0;
+    }
+
+    rec Reentry {
+        pool:    *Pool;
+        account: *Account;
+        chunk:   Chunk;
+        result:  Reason;
+        calls:   usize;
+    }
+
+    fun reenter(context: ptr, handle: u64) {
+        val r: *Reentry = context::*Reentry;
+        r.calls  = r.calls + 1;
+        r.result = release(r.pool, r.account, r.chunk);
+    }
+
+    test "buffers: a concurrent entry is refused as misuse with the chunk still held" {
+        var arena: Arena;
+        if (!arena_make(?arena, 1 << 20)) { ret 1; }
+        fin { arena_free(?arena); }
+        var classes: [1]ClassConfig = [1]ClassConfig{
+            ClassConfig{size: 512, align: 0, secret: false, high_water: 0},
+        };
+        var entry:  Reentry;
+        var config: Config = test_config(?classes[0], 1, 1024);
+        config.notify         = reenter;
+        config.notify_context = (?entry)::ptr;
+        var pool: Pool;
+        if (!make(?pool, config, ?arena.counted)) { ret 2; }
+        fin { destroy(?pool); }
+        var b:      [2]usize;
+        var holder: Account;
+        var waiter: Account;
+        if (!is_none(open_account(?pool, ?holder, 1, budgets_of(4096, ?b[0]), 0))) { ret 3; }
+        if (!is_none(open_account(?pool, ?waiter, 2, budgets_of(4096, ?b[0]), 0))) { ret 4; }
+        val one: Acquired = acquire(?pool, ?holder, ask(1), false);
+        val two: Acquired = acquire(?pool, ?holder, ask(1), false);
+        if (!sel one.status.ok || !sel two.status.ok)                 { ret 5; }
+        if (!reason_exhausted(acquire(?pool, ?waiter, ask(1), true))) { ret 6; }
+        entry.pool    = ?pool;
+        entry.account = ?holder;
+        entry.chunk   = two.chunk;
+        # releasing one wakes the waiter, and its notify tries to release two
+        if (!is_none(release(?pool, ?holder, one.chunk))) { ret 7; }
+        if (entry.calls != 1 || !sel entry.result.misuse) { ret 8; }
+        if (data(?pool, two.chunk.ref) != two.chunk.data) { ret 9; }
+        if (holder.chunks != 1 || holder.held != 512)     { ret 10; }
+        var snap: Snapshot;
+        snapshot(?pool, ?snap);
+        if (snap.misuse != 1)                             { ret 11; }
+        if (!is_none(release(?pool, ?holder, two.chunk))) { ret 12; }
+        close_account(?pool, ?holder);
+        close_account(?pool, ?waiter);
+        ret 0;
+    }
+
+    test "buffers: one release wakes exactly the oldest waiter and allocates nothing" {
+        var arena: Arena;
+        if (!arena_make(?arena, 1 << 20)) { ret 1; }
+        fin { arena_free(?arena); }
+        var classes: [1]ClassConfig = [1]ClassConfig{
+            ClassConfig{size: 512, align: 0, secret: false, high_water: 4},
+        };
+        var pool: Pool;
+        if (!make(?pool, test_config(?classes[0], 1, 512), ?arena.counted)) { ret 2; }
+        fin { destroy(?pool); }
+        var b:       [2]usize;
+        var holder:  Account;
+        var waiters: [16]Account;
+        if (!is_none(open_account(?pool, ?holder, 100, budgets_of(4096, ?b[0]), 0))) { ret 3; }
+        val held: Acquired = acquire(?pool, ?holder, ask(1), false);
+        if (!sel held.status.ok) { ret 4; }
+        var i: usize = 0;
+        for (i < 16) {
+            if (!is_none(open_account(?pool, ?waiters[i], i::u64, budgets_of(4096, ?b[0]), 0))) { ret 5; }
+            val refused: Acquired = acquire(?pool, ?waiters[i], ask(1), true);
+            if (!sel refused.reason.exhausted) { ret 6; }
+            # registering twice keeps one place in line
+            acquire(?pool, ?waiters[i], ask(1), true);
+            i = i + 1;
+        }
+        if (pool.waiters != 16) { ret 7; }
+        val allocs: usize = arena.count.allocs;
+        if (!is_none(release(?pool, ?holder, held.chunk))) { ret 8; }
+        if (arena.count.allocs != allocs)                  { ret 9; }
+        if (pool.waiters != 15 || pool.ready_count != 1)   { ret 10; }
+        var handles: [4]u64;
+        if (ready(?pool, ?handles[0], 4) != 1 || handles[0] != 0) { ret 11; }
+        if (ready(?pool, ?handles[0], 4) != 0)                    { ret 12; }
+        i = 0;
+        for (i < 16) {
+            if (!is_none(close_account(?pool, ?waiters[i]))) { ret 13; }
+            i = i + 1;
+        }
+        if (pool.waiters != 0) { ret 14; }
+        close_account(?pool, ?holder);
+        ret 0;
+    }
+
+    test "buffers: steady state under high_water never touches the backing" {
+        var arena: Arena;
+        if (!arena_make(?arena, 1 << 20)) { ret 1; }
+        fin { arena_free(?arena); }
+        var classes: [1]ClassConfig = [1]ClassConfig{
+            ClassConfig{size: 512, align: 0, secret: false, high_water: 4},
+        };
+        var pool: Pool;
+        if (!make(?pool, test_config(?classes[0], 1, 1 << 20), ?arena.counted)) { ret 2; }
+        fin { destroy(?pool); }
+        var b:       [2]usize;
+        var account: Account;
+        if (!is_none(open_account(?pool, ?account, 1, budgets_of(1 << 20, ?b[0]), 0))) { ret 3; }
+        fin { close_account(?pool, ?account); }
+        var held: [4]Chunk;
+        var i:    usize = 0;
+        for (i < 4) {
+            val got: Acquired = acquire(?pool, ?account, ask(64), false);
+            if (!status_ok(got)) { ret 4; }
+            held[i] = got.chunk;
+            i       = i + 1;
+        }
+        i = 0;
+        for (i < 4) {
+            release(?pool, ?account, held[i]);
+            i = i + 1;
+        }
+        var snap: Snapshot;
+        snapshot(?pool, ?snap);
+        val warm:   u64   = snap.backing_allocations;
+        val allocs: usize = arena.count.allocs;
+        if (warm != 4 || snap.classes[0].backing_allocations != 4) { ret 5; }
+        var round: usize = 0;
+        for (round < 1000) {
+            i = 0;
+            for (i < 4) {
+                val got: Acquired = acquire(?pool, ?account, ask(64), false);
+                if (!status_ok(got)) { ret 6; }
+                held[i] = got.chunk;
+                i       = i + 1;
+            }
+            i = 0;
+            for (i < 4) {
+                release(?pool, ?account, held[i]);
+                i = i + 1;
+            }
+            round = round + 1;
+        }
+        snapshot(?pool, ?snap);
+        if (snap.backing_allocations != warm || arena.count.allocs != allocs) { ret 7; }
+        ret 0;
+    }
+
+    rec Cost {
+        acquire: u64;
+        release: u64;
+        wake:    u64;
+    }
+
+    # deterministic steps per operation, independent of how many chunks exist
+    fun measure(n: usize, cost: *Cost) bool {
+        var arena: Arena;
+        if (!arena_make(?arena, n * 256 + (8 << 20))) { ret false; }
+        fin { arena_free(?arena); }
+        var classes: [4]ClassConfig = [4]ClassConfig{
+            ClassConfig{size: 64, align: 0, secret: false, high_water: 0},
+            ClassConfig{size: 128, align: 0, secret: false, high_water: 0},
+            ClassConfig{size: 512, align: 0, secret: false, high_water: 0},
+            ClassConfig{size: 4096, align: 0, secret: false, high_water: 0},
+        };
+        var pool: Pool;
+        if (!make(?pool, test_config(?classes[0], 4, n * 64 + 64), ?arena.counted)) { ret false; }
+        fin { destroy(?pool); }
+        var b:       [2]usize;
+        var account: Account;
+        var waiter:  Account;
+        if (!is_none(open_account(?pool, ?account, 1, budgets_of(~(0::usize), ?b[0]), 0))) { ret false; }
+        if (!is_none(open_account(?pool, ?waiter, 2, budgets_of(~(0::usize), ?b[0]), 0)))  { ret false; }
+        var first: Chunk;
+        var last:  Chunk;
+        var i:     usize = 0;
+        for (i < n) {
+            val got: Acquired = acquire(?pool, ?account, ask(64), false);
+            if (!sel got.status.ok) { ret false; }
+            if (i == 0)             { first = got.chunk; }
+            last = got.chunk;
+            i    = i + 1;
+        }
+        val before_acquire: u64      = pool.steps;
+        val one:            Acquired = acquire(?pool, ?account, ask(64), false);
+        if (!sel one.status.ok) { ret false; }
+        cost.acquire = pool.steps - before_acquire;
+        # the pool is now full, so the waiter registers
+        if (!reason_exhausted(acquire(?pool, ?waiter, ask(64), true))) { ret false; }
+        val before_wake: u64 = pool.steps;
+        release(?pool, ?account, one.chunk);
+        cost.wake = pool.steps - before_wake;
+        var handles: [1]u64;
+        if (ready(?pool, ?handles[0], 1) != 1) { ret false; }
+        val before_release: u64 = pool.steps;
+        release(?pool, ?account, last);
+        cost.release = pool.steps - before_release;
+        release(?pool, ?account, first);
+        ret true;
+    }
+
+    test "buffers: acquire, release and wake cost stays flat from 1k to 100k chunks" {
+        var small: Cost;
+        var mid:   Cost;
+        var large: Cost;
+        if (!measure(1000, ?small))                                       { ret 1; }
+        if (!measure(10000, ?mid))                                        { ret 2; }
+        if (!measure(100000, ?large))                                     { ret 3; }
+        if (small.acquire != mid.acquire || mid.acquire != large.acquire) { ret 4; }
+        if (small.release != mid.release || mid.release != large.release) { ret 5; }
+        if (small.wake != mid.wake || mid.wake != large.wake)             { ret 6; }
+        if (large.acquire > 8 || large.release > 2 || large.wake > 2)     { ret 7; }
+        ret 0;
+    }
+}

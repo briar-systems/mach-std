@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.2.0] - 2026-09-17
+
+Requires mach 5.2.0 or later. Tested with mach 5.2.1, the family CI seed.
+
+### Added
+- `std.memory.buffers`: one shared on-demand buffer source (`Source`) and std's
+  implementation (`Pool`).
+  - Classes are caller-declared, and a request larger than every class takes an
+    oversize path that is budgeted and returned to the backing at once.
+  - Budgets are in bytes, per account lane plus a global budget. An account may
+    reserve bytes, and its slot metadata is reserved at open.
+  - A refusal is typed (budget, exhausted, memory, misuse). Exhausted and
+    memory refusals register the account for a FIFO wake-up, drained with
+    `ready` or reported through an optional `notify`.
+  - `acquire_n` is all-or-nothing.
+  - Secret classes hold welded `std.memory.secret` storage that is wiped in full
+    on release. They need the pages capability.
+  - `retain`, `settle` and `in_flight` track in-flight users.
+  - Chunks are address-stable.
+  - Use is serialized, enforced by an entrant check rather than a thread check.
+  - `snapshot` reports counters, including `backing_allocations` per class and
+    in total, so `high_water` can be sized for a steady state that never touches
+    the backing. `arena_bytes` sizes an `allocator.fixed` arena.
+  - Acquire, release and wake cost stays flat from 1k to 100k chunks. The module
+    builds freestanding (#760).
+- `std.memory.secret.borrow_data` returns the welded storage of a live borrow
+  (#760).
+- `net.async.submit_readable` and `net.async.local.submit_readable` wait until a
+  stream is readable, at orderly end of stream, or failed, without holding a
+  buffer, so an idle connection needs no read buffer. The completion has the new
+  kind `io.runtime.READABLE` and zero bytes, with `end_of_stream` set at EOF.
+  Nothing is read, and the wait queues in order with reads on the same stream.
+  Linux and darwin settle readiness with a non-consuming peek, and windows posts
+  a zero-byte overlapped receive and settles it with the queued byte count
+  (#759).
+
 ## [4.1.0] - 2026-09-17
 
 Requires mach 5.2.0 or later. Tested with mach 5.2.1, the family CI seed.
