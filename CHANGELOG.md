@@ -32,6 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   released, and a backend's `destroy` removes every native registration it
   holds (a leftover one panics) and refuses while the kernel still owns an
   operation (#740).
+- `net.resolve` keeps runtime-owned lookups waiting to publish on an intrusive
+  list, finds an operation from its runtime token through a hash of the token
+  index, remembers each queued completion's ring position, and claims slots
+  from a free list. Runtime dispatch, cancel and release no longer scan every
+  resolver slot. Each costs one step at 1k, 10k and 100k slots, where each
+  cost R steps before. `Resolver` gains a `steps` counter used by the scaling
+  test (#742).
 
 ### Fixed
 - A registration that loses a race with runtime close no longer leaves a
