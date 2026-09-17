@@ -87,6 +87,9 @@ val SLOT_FREE:   u8 = 0;
 val SLOT_ACTIVE: u8 = 1;
 val SLOT_QUEUED: u8 = 2;
 
+# an operation index sentinel for the free and queued lists
+val NO_OPERATION: u32 = 0xffffffff;
+
 pub val OPEN:      u8 = 0;
 pub val CLOSING:   u8 = 1;
 pub val DESTROYED: u8 = 2;
@@ -122,6 +125,14 @@ rec Operation {
     runtime_terminal_failure:     io_error.Error;
     terminal_failure:             types.Error;
     resolution:                   types.Resolution;
+    # free list while free, queued-unpublished list while waiting to publish
+    next:          u32;
+    prev:          u32;
+    queued_linked: bool;
+    # whether runtime_token is in the route table
+    routed: bool;
+    # where the completion sits in the ring while queued
+    completion_slot: usize;
 }
 
 # operation and completion storage is fixed after construction
@@ -139,14 +150,23 @@ pub rec Resolver {
     operations:         *Operation;
     completions:        *types.Completion;
     capacity:           usize;
-    next_slot:          usize;
-    head:               usize;
-    tail:               usize;
-    count:              usize;
-    live:               usize;
-    state:              u8;
-    lock:               mutex.Mutex;
-    ready:              condition.Condition;
+    free_head:          u32;
+    free_tail:          u32;
+    # runtime-owned operations queued and not yet published, oldest first
+    queued_head: u32;
+    queued_tail: u32;
+    # open addressed on the runtime token index, holding operation index + 1
+    routes:         *u32;
+    route_capacity: usize;
+    head:           usize;
+    tail:           usize;
+    count:          usize;
+    live:           usize;
+    # slots examined by lookups and publication, for the scaling tests
+    steps: u64;
+    state: u8;
+    lock:  mutex.Mutex;
+    ready: condition.Condition;
 }
 
 fun system_adapter(context: ptr, query: *types.Query, owner: *allocator.Allocator, limits: types.ResultLimits, output: *types.Resolution) types.Error {
@@ -222,7 +242,7 @@ fun refused(kind: types.ErrorKind, native_code: i64) err[types.Error] {
 pub fun make_with_adapter(resolver: *Resolver, pool: *worker_pool.Pool, owner: *allocator.Allocator,
     capacity: usize, result_limits: types.ResultLimits, adapter_context: ptr, adapter: types.AdapterFun) err[types.Error] {
     if (resolver == nil || pool == nil || owner == nil || capacity == 0
-        || capacity > 0xffffffff || result_limits.max_endpoints == 0
+        || capacity >= 0xffffffff || result_limits.max_endpoints == 0
         || result_limits.max_canonical_name_bytes == 0 || adapter::usize == 0) {
         ret refused(types.INVALID, 0);
     }
@@ -240,6 +260,22 @@ pub fun make_with_adapter(resolver: *Resolver, pool: *worker_pool.Pool, owner: *
         resolver.operations = nil;
         ret refused(types.OUT_OF_MEMORY, 0);
     }
+    var route_capacity: usize = 4;
+    for (route_capacity < capacity * 2) { route_capacity = route_capacity * 2; }
+    val route_allocation: res[*u32, allocator.Error] = allocator.allocate[u32](owner, route_capacity);
+    if (sel route_allocation.err) {
+        allocator.deallocate[types.Completion](owner, completion_allocation.ok, capacity);
+        allocator.deallocate[Operation](owner, resolver.operations, capacity);
+        resolver.operations = nil;
+        ret refused(types.OUT_OF_MEMORY, 0);
+    }
+    resolver.routes         = route_allocation.ok;
+    resolver.route_capacity = route_capacity;
+    var slot: usize = 0;
+    for (slot < route_capacity) {
+        resolver.routes[slot] = 0;
+        slot                  = slot + 1;
+    }
     resolver.completions        = completion_allocation.ok;
     resolver.pool               = pool;
     resolver.allocator          = owner;
@@ -250,11 +286,15 @@ pub fun make_with_adapter(resolver: *Resolver, pool: *worker_pool.Pool, owner: *
     resolver.runtime_source     = io_runtime.SourceToken{index: 0, generation: 0, tag: 0};
     resolver.runtime_registered = false;
     resolver.capacity           = capacity;
-    resolver.next_slot          = 0;
+    resolver.free_head          = 0;
+    resolver.free_tail          = (capacity - 1)::u32;
+    resolver.queued_head        = NO_OPERATION;
+    resolver.queued_tail        = NO_OPERATION;
     resolver.head               = 0;
     resolver.tail               = 0;
     resolver.count              = 0;
     resolver.live               = 0;
+    resolver.steps              = 0;
     resolver.state              = OPEN;
     resolver.lock               = mutex.make();
     resolver.ready              = condition.make();
@@ -278,6 +318,12 @@ pub fun make_with_adapter(resolver: *Resolver, pool: *worker_pool.Pool, owner: *
         operation.runtime_terminal_claimed     = false;
         operation.runtime_terminal_failure     = io_error.make(io_error.OTHER, io_error.OP_UNKNOWN);
         operation.terminal_failure             = shared.error(types.NO_ERROR, 0);
+        operation.next                         = NO_OPERATION;
+        if (i + 1 < capacity) { operation.next = (i + 1)::u32; }
+        operation.prev            = NO_OPERATION;
+        operation.queued_linked   = false;
+        operation.routed          = false;
+        operation.completion_slot = 0;
         cancellation.init_registration(?operation.registration);
         shared.clear(?operation.resolution, owner);
         i = i + 1;
@@ -331,41 +377,95 @@ fun valid_query(query: *types.Query) bool {
 }
 
 fun claim_locked(resolver: *Resolver) *Operation {
-    if (resolver.live == resolver.capacity) { ret nil; }
-    var checked: usize = 0;
-    for (checked < resolver.capacity) {
-        val index: usize = resolver.next_slot;
-        resolver.next_slot = (resolver.next_slot + 1) % resolver.capacity;
-        val operation: *Operation = ?resolver.operations[index];
-        if (operation.state == SLOT_FREE) {
-            operation.state      = SLOT_ACTIVE;
-            operation.generation = operation.generation + 1;
-            if (operation.generation == 0) { operation.generation = 1; }
-            operation.context                      = 0;
-            operation.scope                        = nil;
-            operation.cancellation_reason          = REASON_ACTIVE;
-            operation.scope_use_done               = 1;
-            operation.registration_done            = 1;
-            operation.runtime_token                = io_runtime.Token{index: 0, generation: 0};
-            operation.runtime_owned                = false;
-            operation.runtime_published            = false;
-            operation.runtime_released             = false;
-            operation.internal_dequeued            = false;
-            operation.runtime_cancellation_pending = false;
-            operation.runtime_terminal_claimed     = false;
-            operation.runtime_terminal_failure     = io_error.make(io_error.OTHER, io_error.OP_UNKNOWN);
-            operation.terminal_failure             = shared.error(types.NO_ERROR, 0);
-            cancellation.init_registration(?operation.registration);
-            shared.clear(?operation.resolution, resolver.allocator);
-            resolver.live = resolver.live + 1;
-            ret operation;
+    if (resolver.free_head == NO_OPERATION) { ret nil; }
+    resolver.steps = resolver.steps + 1;
+    val operation: *Operation = ?resolver.operations[resolver.free_head::usize];
+    resolver.free_head = operation.next;
+    if (resolver.free_head == NO_OPERATION) { resolver.free_tail = NO_OPERATION; }
+    operation.next       = NO_OPERATION;
+    operation.state      = SLOT_ACTIVE;
+    operation.generation = operation.generation + 1;
+    if (operation.generation == 0) { operation.generation = 1; }
+    operation.context                      = 0;
+    operation.scope                        = nil;
+    operation.cancellation_reason          = REASON_ACTIVE;
+    operation.scope_use_done               = 1;
+    operation.registration_done            = 1;
+    operation.runtime_token                = io_runtime.Token{index: 0, generation: 0};
+    operation.runtime_owned                = false;
+    operation.runtime_published            = false;
+    operation.runtime_released             = false;
+    operation.internal_dequeued            = false;
+    operation.runtime_cancellation_pending = false;
+    operation.runtime_terminal_claimed     = false;
+    operation.runtime_terminal_failure     = io_error.make(io_error.OTHER, io_error.OP_UNKNOWN);
+    operation.terminal_failure             = shared.error(types.NO_ERROR, 0);
+    cancellation.init_registration(?operation.registration);
+    shared.clear(?operation.resolution, resolver.allocator);
+    resolver.live = resolver.live + 1;
+    ret operation;
+}
+
+fun route_home(resolver: *Resolver, token: io_runtime.Token) usize {
+    ret (token.index::usize * 11400714819323198485) & (resolver.route_capacity - 1);
+}
+
+fun route_insert(resolver: *Resolver, operation: *Operation) {
+    var slot: usize = route_home(resolver, operation.runtime_token);
+    for (resolver.routes[slot] != 0) { slot = (slot + 1) & (resolver.route_capacity - 1); }
+    resolver.routes[slot] = operation.index + 1;
+    operation.routed      = true;
+}
+
+# backward-shift deletion keeps every remaining entry reachable from its home
+fun route_remove(resolver: *Resolver, operation: *Operation) {
+    if (!operation.routed) { ret; }
+    operation.routed = false;
+    val mask: usize = resolver.route_capacity - 1;
+    var hole: usize = route_home(resolver, operation.runtime_token);
+    for (resolver.routes[hole] != operation.index + 1) { hole = (hole + 1) & mask; }
+    var next: usize = (hole + 1) & mask;
+    for (resolver.routes[next] != 0) {
+        val moved: *Operation = ?resolver.operations[(resolver.routes[next] - 1)::usize];
+        val home:  usize      = route_home(resolver, moved.runtime_token);
+        # the entry may fill the hole unless its home lies after the hole and at or before its slot
+        if (((next - home) & mask) >= ((next - hole) & mask)) {
+            resolver.routes[hole] = resolver.routes[next];
+            hole                  = next;
         }
-        checked = checked + 1;
+        next = (next + 1) & mask;
     }
-    ret nil;
+    resolver.routes[hole] = 0;
+}
+
+fun queued_link(resolver: *Resolver, operation: *Operation) {
+    operation.prev = resolver.queued_tail;
+    operation.next = NO_OPERATION;
+    if (resolver.queued_tail == NO_OPERATION) { resolver.queued_head = operation.index; }
+    or                                        { resolver.operations[resolver.queued_tail::usize].next = operation.index; }
+    resolver.queued_tail    = operation.index;
+    operation.queued_linked = true;
+}
+
+fun queued_unlink(resolver: *Resolver, operation: *Operation) {
+    if (!operation.queued_linked)       { ret; }
+    if (operation.prev == NO_OPERATION) { resolver.queued_head = operation.next; }
+    or                                  { resolver.operations[operation.prev::usize].next = operation.next; }
+    if (operation.next == NO_OPERATION) { resolver.queued_tail = operation.prev; }
+    or                                  { resolver.operations[operation.next::usize].prev = operation.prev; }
+    operation.prev          = NO_OPERATION;
+    operation.next          = NO_OPERATION;
+    operation.queued_linked = false;
+}
+
+fun mark_published(resolver: *Resolver, operation: *Operation) {
+    operation.runtime_published = true;
+    queued_unlink(resolver, operation);
 }
 
 fun release_locked(resolver: *Resolver, operation: *Operation) {
+    queued_unlink(resolver, operation);
+    route_remove(resolver, operation);
     operation.state                        = SLOT_FREE;
     operation.scope                        = nil;
     operation.cancellation_reason          = REASON_ACTIVE;
@@ -382,7 +482,11 @@ fun release_locked(resolver: *Resolver, operation: *Operation) {
     operation.terminal_failure             = shared.error(types.NO_ERROR, 0);
     cancellation.init_registration(?operation.registration);
     shared.clear(?operation.resolution, resolver.allocator);
-    resolver.live = resolver.live - 1;
+    resolver.live  = resolver.live - 1;
+    operation.next = NO_OPERATION;
+    if (resolver.free_tail == NO_OPERATION) { resolver.free_head = operation.index; }
+    or                                      { resolver.operations[resolver.free_tail::usize].next = operation.index; }
+    resolver.free_tail = operation.index;
 }
 
 fun copy_string(source: *u8, output: *u8, capacity: usize) *u8 {
@@ -428,6 +532,7 @@ fun parse_service(service: *u8, port: *u16) bool {
 
 fun enqueue_locked(resolver: *Resolver, operation: *Operation, failure: types.Error) {
     val token: types.Token = types.Token{index: operation.index, generation: operation.generation};
+    operation.completion_slot           = resolver.tail;
     resolver.completions[resolver.tail] = types.Completion{
         token:      token,
         context:    operation.context,
@@ -439,6 +544,7 @@ fun enqueue_locked(resolver: *Resolver, operation: *Operation, failure: types.Er
     resolver.count             = resolver.count + 1;
     operation.terminal_failure = failure;
     operation.state            = SLOT_QUEUED;
+    if (operation.runtime_owned && !operation.runtime_published) { queued_link(resolver, operation); }
     if (resolver.runtime == nil) {
         condition.signal(?resolver.ready);
     }
@@ -462,12 +568,13 @@ fun runtime_token_equal(a: io_runtime.Token, b: io_runtime.Token) bool {
 }
 
 fun operation_for_runtime_locked(resolver: *Resolver, token: io_runtime.Token) *Operation {
-    var i: usize = 0;
-    for (i < resolver.capacity) {
-        val operation: *Operation = ?resolver.operations[i];
-        if (operation.state != SLOT_FREE && operation.runtime_owned
-            && runtime_token_equal(operation.runtime_token, token)) { ret operation; }
-        i = i + 1;
+    val mask: usize = resolver.route_capacity - 1;
+    var slot: usize = route_home(resolver, token);
+    for (resolver.routes[slot] != 0) {
+        resolver.steps = resolver.steps + 1;
+        val operation: *Operation = ?resolver.operations[(resolver.routes[slot] - 1)::usize];
+        if (runtime_token_equal(operation.runtime_token, token)) { ret operation; }
+        slot = (slot + 1) & mask;
     }
     ret nil;
 }
@@ -493,16 +600,11 @@ fun resolver_io_error(failure: types.Error) io_error.Error {
 }
 
 fun queued_completion_locked(resolver: *Resolver, operation: *Operation) *types.Completion {
-    var offset: usize = 0;
-    var index:  usize = resolver.head;
-    for (offset < resolver.count) {
-        val completion: *types.Completion = ?resolver.completions[index];
-        if (completion.token.index == operation.index
-            && completion.token.generation == operation.generation) { ret completion; }
-        index  = (index + 1) % resolver.capacity;
-        offset = offset + 1;
-    }
-    ret nil;
+    if (operation.state != SLOT_QUEUED || operation.internal_dequeued) { ret nil; }
+    resolver.steps = resolver.steps + 1;
+    val completion: *types.Completion = ?resolver.completions[operation.completion_slot];
+    if (completion.token.index != operation.index || completion.token.generation != operation.generation) { ret nil; }
+    ret completion;
 }
 
 fun rewrite_queued_runtime_terminal_locked(resolver: *Resolver, operation: *Operation,
@@ -533,7 +635,7 @@ fun runtime_cancel(context: ptr, token: io_runtime.Token, failure: io_error.Erro
             operation.runtime_terminal_failure = failure;
             rewrite_queued_runtime_terminal_locked(resolver, operation, failure);
         }
-        operation.runtime_published = true;
+        mark_published(resolver, operation);
         mutex.unlock(?resolver.lock);
         ret 0;
     }
@@ -564,24 +666,23 @@ fun runtime_release(context: ptr, completion: *io_runtime.Completion) {
 fun runtime_dispatch(context: ptr, native_context: usize, events: u32, status: i64, flags: u64) bool {
     val resolver: *Resolver = context::*Resolver;
     mutex.lock(?resolver.lock);
-    var i: usize = 0;
-    for (i < resolver.capacity) {
-        val operation: *Operation = ?resolver.operations[i];
-        if (operation.state == SLOT_QUEUED && operation.runtime_owned && !operation.runtime_published) {
-            var completed: err[io_error.Error];
-            if (operation.runtime_cancellation_pending) {
-                completed = io_runtime.complete_cancellation(resolver.runtime, operation.runtime_token);
-            }
-            or (operation.terminal_failure.kind != types.NO_ERROR) {
-                completed = io_runtime.fail(resolver.runtime, operation.runtime_token,
-                    resolver_io_error(operation.terminal_failure));
-            }
-            or {
-                completed = io_runtime.complete(resolver.runtime, operation.runtime_token, 0, 0, false);
-            }
-            if (sel completed.ok) { operation.runtime_published = true; }
+    var index: u32 = resolver.queued_head;
+    for (index != NO_OPERATION) {
+        resolver.steps = resolver.steps + 1;
+        val operation: *Operation = ?resolver.operations[index::usize];
+        index = operation.next;
+        var completed: err[io_error.Error];
+        if (operation.runtime_cancellation_pending) {
+            completed = io_runtime.complete_cancellation(resolver.runtime, operation.runtime_token);
         }
-        i = i + 1;
+        or (operation.terminal_failure.kind != types.NO_ERROR) {
+            completed = io_runtime.fail(resolver.runtime, operation.runtime_token,
+                resolver_io_error(operation.terminal_failure));
+        }
+        or {
+            completed = io_runtime.complete(resolver.runtime, operation.runtime_token, 0, 0, false);
+        }
+        if (sel completed.ok) { mark_published(resolver, operation); }
     }
     mutex.unlock(?resolver.lock);
     ret false;
@@ -851,6 +952,7 @@ pub fun submit_runtime(resolver: *Resolver, scope: *cancellation.Scope,
     }
     val token: io_runtime.Token = runtime_submission.ok;
     operation.runtime_token = token;
+    route_insert(resolver, operation);
 
     val numeric_addr:    res[ip.Addr, ip.ParseError] = ip.addr_parse(operation.query.host);
     var port:            u16                         = 0;
@@ -1012,16 +1114,21 @@ pub fun destroy(resolver: *Resolver) err[types.Error] {
     val operations:  *Operation           = resolver.operations;
     val completions: *types.Completion    = resolver.completions;
     val capacity:    usize                = resolver.capacity;
-    resolver.state       = DESTROYED;
-    resolver.operations  = nil;
-    resolver.completions = nil;
-    resolver.capacity    = 0;
-    resolver.pool        = nil;
-    resolver.allocator   = nil;
-    resolver.runtime     = nil;
+    val routes:      *u32                 = resolver.routes;
+    val route_count: usize                = resolver.route_capacity;
+    resolver.state          = DESTROYED;
+    resolver.operations     = nil;
+    resolver.completions    = nil;
+    resolver.routes         = nil;
+    resolver.route_capacity = 0;
+    resolver.capacity       = 0;
+    resolver.pool           = nil;
+    resolver.allocator      = nil;
+    resolver.runtime        = nil;
     mutex.unlock(?resolver.lock);
     val operations_freed:  err[allocator.Error] = allocator.deallocate[Operation](owner, operations, capacity);
     val completions_freed: err[allocator.Error] = allocator.deallocate[types.Completion](owner, completions, capacity);
+    val routes_freed:      err[allocator.Error] = allocator.deallocate[u32](owner, routes, route_count);
     var first:             err[types.Error]     = err[types.Error].ok{};
     var refused_any:       bool                 = false;
     if (runtime_registered) {
@@ -1037,6 +1144,10 @@ pub fun destroy(resolver: *Resolver) err[types.Error] {
     }
     if (sel completions_freed.err) {
         if (!refused_any) { first = release_refused(completions_freed.err); }
+        refused_any = true;
+    }
+    if (sel routes_freed.err) {
+        if (!refused_any) { first = release_refused(routes_freed.err); }
     }
     ret first;
 }
@@ -1651,6 +1762,86 @@ test "resolver: native localhost uses service policy without truncating results"
     }
     if (!released(?completion.resolution) || !scope_ok(cancellation.destroy(?scope))
         || !test_resolver_cleanup(?resolver, ?pool)) { ret 7; }
+    ret 0;
+}
+
+rec ResolveCost {
+    dispatch: u64;
+    cancel:   u64;
+    release:  u64;
+}
+
+# a full resolver: count numeric lookups published but one, then the cost of
+# dispatching, cancelling and releasing that last one
+fun resolve_scale(count: usize, cost: *ResolveCost) i32 {
+    var owner: allocator.Allocator;
+    page.make(?owner);
+    var runtime: io_runtime.Runtime;
+    if (!ok_err(io_runtime.make(?runtime, count))) { ret 1; }
+    var pool: TestPool;
+    if (!test_pool_make(?pool, 1)) { ret 2; }
+    var resolver: Resolver;
+    if (!made(make_runtime_with_adapter(?resolver, ?runtime, ?pool.pool, ?owner, count,
+        test_limits(), nil, fake_adapter))) { ret 3; }
+    var scope: cancellation.Scope;
+    if (!scope_ok(cancellation.make_root(?scope, opt[time.Instant].none{}))) { ret 4; }
+    var query: types.Query = test_query("127.0.0.1", "80", 0);
+    var last:  io_runtime.Token;
+    var i:     usize       = 0;
+    for (i < count) {
+        if (i + 1 == count) { runtime_dispatch((?resolver)::ptr, 0, 0, 0, 0); }
+        val submitted: res[io_runtime.Token, types.Error] = submit_runtime(?resolver, ?scope, ?query, i);
+        if (sel submitted.err) { ret 5; }
+        last = submitted.ok;
+        i    = i + 1;
+    }
+    var before: u64 = resolver.steps;
+    runtime_dispatch((?resolver)::ptr, 0, 0, 0, 0);
+    cost.dispatch = resolver.steps - before;
+    before        = resolver.steps;
+    runtime_cancel((?resolver)::ptr, last, io_error.make(io_error.CANCELLED, io_error.OP_SUBMIT));
+    cost.cancel = resolver.steps - before;
+    var output: io_runtime.Completion;
+    i = 0;
+    for (i < count) {
+        before = resolver.steps;
+        val polled: res[usize, io_error.Error] = io_runtime.poll(?runtime, ?output, 1);
+        if (sel polled.err) { ret 6; }
+        if (polled.ok != 1) { ret 6; }
+        if (i + 1 == count) {
+            if (output.token.index != last.index || output.token.generation != last.generation) { ret 7; }
+            cost.release = resolver.steps - before;
+        }
+        i = i + 1;
+    }
+    var completion: types.Completion;
+    i = 0;
+    for (i < count) {
+        if (poll(?resolver, ?completion, 1) != 1) { ret 8; }
+        if (!released(?completion.resolution))    { ret 8; }
+        i = i + 1;
+    }
+    if (!scope_ok(cancellation.destroy(?scope)) || !closed(?resolver) || !destroyed(?resolver))                     { ret 9; }
+    if (!ok_bool(io_runtime.close(?runtime)) || !ok_err(io_runtime.destroy(?runtime)) || !test_pool_destroy(?pool)) { ret 10; }
+    ret 0;
+}
+
+test "resolver: runtime dispatch, cancel and release cost stays flat from 1k to 100k slots" {
+    if (!resolver_threads_supported()) { ret 0; }
+    val sizes: [3]usize = [3]usize{1000, 10000, 100000};
+    var costs: [3]ResolveCost;
+    var i:     usize    = 0;
+    for (i < 3) {
+        val scaled: i32 = resolve_scale(sizes[i], ?costs[i]);
+        if (scaled != 0) { ret 10 * (i::i32 + 1) + scaled; }
+        i = i + 1;
+    }
+    i = 1;
+    for (i < 3) {
+        if (costs[i].dispatch != costs[0].dispatch || costs[i].cancel != costs[0].cancel || costs[i].release != costs[0].release) { ret 40 + i::i32; }
+        i = i + 1;
+    }
+    if (costs[0].dispatch > 2 || costs[0].cancel > 2 || costs[0].release > 2) { ret 50; }
     ret 0;
 }
 
