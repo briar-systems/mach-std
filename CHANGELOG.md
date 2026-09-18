@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.7.0] - 2026-09-18
+
 Rebuild everything that links std, do not just recompile against the new
 sources. `buffers.Source` and `buffers.SecretSource` each grew by one word
 (`fn_measure`). Source that builds these records still compiles unchanged, but
