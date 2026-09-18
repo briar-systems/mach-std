@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.5.0] - 2026-09-18
+
 std now requires mach 5.5.0 (`mach = "^5.5"`): the hardware SHA-256 paths use
 the instruction-set extension rows that release added.
 
@@ -30,6 +32,11 @@ the instruction-set extension rows that release added.
   (`HAS_CPU_FEATURES`) with one primitive, `cpu_features`, which linux fills
   from the auxv `AT_HWCAP` and darwin from sysctl. `std.system.cpu` builds
   freestanding and is in the ratchet (#730).
+
+### Changed
+- The tag-triggered workflow is `.github/workflows/cd.yml`, the family's name
+  for it, and it serializes runs per tag so a duplicate tag push waits and
+  then finds the release already published (#812, #814).
 
 ## [5.4.0] - 2026-09-17
 
