@@ -27,6 +27,7 @@ case "$MACH_CI_LEG" in
         bash test/derive/verify.sh
         bash test/secret/verify.sh
         bash test/deadline/verify.sh
+        bash test/sha256/verify.sh "$mach" linux-x86_64
         ;;
     aarch64-linux)
         bash test/native/verify.sh "$mach" linux-arm64
@@ -37,6 +38,7 @@ case "$MACH_CI_LEG" in
         bash test/sigpipe/verify.sh "$mach" linux-arm64
         bash test/terminate-child/verify.sh "$mach" linux-arm64
         bash test/process-status/verify.sh "$mach" linux-arm64
+        bash test/sha256/verify.sh "$mach" linux-arm64
         ;;
     x86_64-windows)
         bash test/native/verify.sh "$mach" windows-x86_64
@@ -48,6 +50,7 @@ case "$MACH_CI_LEG" in
         bash test/sigpipe/verify.sh "$mach" windows-x86_64
         bash test/terminate-child/verify.sh "$mach" windows-x86_64
         CC=gcc bash test/process-status/verify.sh "$mach" windows-x86_64
+        bash test/sha256/verify.sh "$mach" windows-x86_64
         ;;
     aarch64-darwin|x86_64-darwin)
         target="darwin-${MACH_CI_LEG%%-*}"
@@ -61,6 +64,7 @@ case "$MACH_CI_LEG" in
         # observable from outside the process (#415)
         bash test/darwin/verify.sh "$mach" "$target"
         format_evidence "$target"
+        bash test/sha256/verify.sh "$mach" "$target"
         ;;
     # the library suite under qemu-user is real coverage for logic and a weak
     # signal for ABI constants. it is what caught #436
@@ -75,6 +79,7 @@ case "$MACH_CI_LEG" in
         bash test/relro/verify.sh "$mach" linux-riscv64 qemu-riscv64
         bash test/sigpipe/verify.sh "$mach" linux-riscv64 qemu-riscv64
         bash test/terminate-child/verify.sh "$mach" linux-riscv64 qemu-riscv64
+        bash test/sha256/verify.sh "$mach" linux-riscv64 qemu-riscv64
         ;;
     cross-backends)
         bash test/backends/verify.sh
