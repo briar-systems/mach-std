@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.6.0] - 2026-09-18
+
 ### Added
 - Secret-typed SHA-256 and SHA-384. `sha256.SecretState` holds `^u32` words
   and a `[64]^u8` block, with `init_secret`, `update_secret(s, *^u8, len)`,
