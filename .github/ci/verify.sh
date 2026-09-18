@@ -28,6 +28,7 @@ case "$MACH_CI_LEG" in
         bash test/secret/verify.sh
         bash test/deadline/verify.sh
         bash test/sha256/verify.sh "$mach" linux-x86_64
+        bash test/sha256/refusals.sh "$mach"
         ;;
     aarch64-linux)
         bash test/native/verify.sh "$mach" linux-arm64
