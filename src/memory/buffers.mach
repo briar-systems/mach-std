@@ -171,6 +171,7 @@ pub rec Account {
 # fn_in_flight:     whether a held chunk has in-flight users
 # fn_ready:         drain woken account handles, oldest first, returning the count
 # fn_lanes:         budget lanes per account, 0 when undeclared
+# fn_measure:       the bytes an acquisition would charge, 0 when refused
 pub rec Source {
     ctx:              ptr;
     fn_open_account:  fun(ptr, *Account, u64, *usize, usize) Reason;
@@ -184,6 +185,7 @@ pub rec Source {
     fn_in_flight:     fun(ptr, Ref) bool;
     fn_ready:         fun(ptr, *u64, usize) usize;
     fn_lanes:         fun(ptr) usize;
+    fn_measure:       fun(ptr, Request) usize;
 }
 
 # the interface for secret-welded chunks
@@ -199,6 +201,7 @@ pub rec Source {
 # fn_release:       give a secret chunk back, wiped in full, `none` on success
 # fn_view:          the welded view of a held secret chunk, nil when stale
 # fn_lanes:         budget lanes per account, 0 when undeclared
+# fn_measure:       the bytes an acquisition would charge, 0 when refused
 pub rec SecretSource {
     ctx:              ptr;
     fn_open_account:  fun(ptr, *Account, u64, *usize, usize) Reason;
@@ -207,6 +210,7 @@ pub rec SecretSource {
     fn_release:       fun(ptr, *Account, Chunk) Reason;
     fn_view:          fun(ptr, Chunk) *^u8;
     fn_lanes:         fun(ptr) usize;
+    fn_measure:       fun(ptr, Request) usize;
 }
 
 # one declared size class
@@ -485,6 +489,22 @@ fun select_class(pool: *Pool, request: Request) u16 {
     ret best;
 }
 
+# whether a request is well formed for this pool, the misuse half of acquire
+fun request_valid(pool: *Pool, request: Request) bool {
+    val align: usize = effective_align(request.align);
+    ret request.bytes != 0 && request.lane::usize < pool.lanes && power_of_two(align) &&
+        align <= table.ELEMENT_ALIGN * 4096 && (!request.secret || WELDED);
+}
+
+# the bytes an acquisition charges: the serving class size, or the request
+# rounded up to its alignment when it is oversize. false when the rounding
+# overflows, the one refusal that is not misuse
+fun charge_of(pool: *Pool, class_index: u16, request: Request, out: *usize) bool {
+    if (class_index == OVERSIZE) { ret round_up(request.bytes, effective_align(request.align), out); }
+    @out = pool.classes[class_index::usize].size;
+    ret true;
+}
+
 fun account_over(account: *Account, held: usize) usize {
     if (held > account.reserve) { ret held - account.reserve; }
     ret 0;
@@ -574,21 +594,13 @@ fun uncharge(pool: *Pool, account: *Account, lane: usize, bytes: usize) {
 
 # acquire with the entrant already claimed
 fun acquire_locked(pool: *Pool, account: *Account, request: Request, register: bool) Acquired {
-    if (account == nil || account.pool != pool || !account.open || request.bytes == 0 ||
-        request.lane::usize >= pool.lanes || !power_of_two(effective_align(request.align)) ||
-        effective_align(request.align) > table.ELEMENT_ALIGN * 4096) {
+    if (account == nil || account.pool != pool || !account.open || !request_valid(pool, request)) {
         ret refusal(Status.error{}, misused(pool));
     }
     val class_index: u16   = select_class(pool, request);
     val align:       usize = effective_align(request.align);
     var bytes:       usize = 0;
-    if (class_index == OVERSIZE) {
-        if (request.secret && !WELDED)               { ret refusal(Status.error{}, misused(pool)); }
-        if (!round_up(request.bytes, align, ?bytes)) { ret refusal(Status.blocked{}, Reason.budget{}); }
-    }
-    or {
-        bytes = pool.classes[class_index::usize].size;
-    }
+    if (!charge_of(pool, class_index, request, ?bytes)) { ret refusal(Status.blocked{}, Reason.budget{}); }
     val lane:   usize = request.lane::usize;
     var reason: Reason;
     if (!charge_fits(pool, account, lane, bytes, ?reason)) {
@@ -1044,6 +1056,21 @@ pub fun lanes(pool: *Pool) usize {
     ret pool.lanes;
 }
 
+# the bytes `acquire` would charge for a request, without acquiring
+#
+# the same class selection and rounding as `acquire`: the smallest fitting
+# class's size, or the request rounded up to its alignment when no class fits
+# ---
+# ret: the charge, 0 for a nil or unmade pool, a request `acquire` would refuse
+#      as misuse, or a rounding that overflows
+pub fun measure(pool: *Pool, request: Request) usize {
+    if (pool == nil || !pool.made || !enter(pool)) { ret 0; }
+    var bytes: usize = 0;
+    if (request_valid(pool, request) && !charge_of(pool, select_class(pool, request), request, ?bytes)) { bytes = 0; }
+    leave(pool);
+    ret bytes;
+}
+
 # drain the handles of woken accounts, oldest first
 # ---
 # ret: handles written, at most capacity
@@ -1177,6 +1204,10 @@ fun pool_lanes(context: ptr) usize {
     ret lanes(context::*Pool);
 }
 
+fun pool_measure(context: ptr, request: Request) usize {
+    ret measure(context::*Pool, request);
+}
+
 # the pool as a Source, borrowing the pool
 pub fun source(pool: *Pool) Source {
     ret Source{
@@ -1192,6 +1223,7 @@ pub fun source(pool: *Pool) Source {
         fn_in_flight:     pool_in_flight,
         fn_ready:         pool_ready,
         fn_lanes:         pool_lanes,
+        fn_measure:       pool_measure,
     };
 }
 
@@ -1205,6 +1237,7 @@ pub fun secret_source(pool: *Pool) SecretSource {
         fn_release:       pool_secret_release,
         fn_view:          pool_secret_view,
         fn_lanes:         pool_lanes,
+        fn_measure:       pool_measure,
     };
 }
 
@@ -1290,10 +1323,27 @@ pub fun source_lanes(s: *Source) usize {
     ret s.fn_lanes(s.ctx);
 }
 
+# the bytes an acquisition of `request` would charge on a source
+#
+# what `source_acquire` charges the account's lane for this request, so a
+# borrower can size a budget before acquiring
+# ---
+# ret: the charge, 0 when the source declines to measure or would refuse
+pub fun source_measure(s: *Source, request: Request) usize {
+    if (s == nil || s.fn_measure == nil) { ret 0; }
+    ret s.fn_measure(s.ctx, request);
+}
+
 # budget lanes per account a secret source declares, as `source_lanes`
 pub fun secret_source_lanes(s: *SecretSource) usize {
     if (s == nil || s.fn_lanes == nil) { ret 0; }
     ret s.fn_lanes(s.ctx);
+}
+
+# the bytes an acquisition would charge on a secret source, as `source_measure`
+pub fun secret_source_measure(s: *SecretSource, request: Request) usize {
+    if (s == nil || s.fn_measure == nil) { ret 0; }
+    ret s.fn_measure(s.ctx, request);
 }
 
 # open an account on a secret source, as `source_open_account`
@@ -1550,6 +1600,59 @@ $if (capability.HOSTED) {
         if (secret_source_lanes(?secrets) != MAX_LANES || source_lanes(nil) != 0) { ret 5; }
         if (!destroy(?pool))                                                      { ret 6; }
         if (lanes(?pool) != 0 || source_lanes(?plain) != 0)                       { ret 7; }
+        ret 0;
+    }
+
+    test "buffers: measure reports exactly what acquire charges" {
+        var arena: Arena;
+        if (!arena_make(?arena, 16 << 20)) { ret 1; }
+        fin { arena_free(?arena); }
+        var classes: [3]ClassConfig = [3]ClassConfig{
+            ClassConfig{size: 512, align: 0, secret: false, high_water: 4},
+            ClassConfig{size: 4096, align: 0, secret: false, high_water: 4},
+            ClassConfig{size: 16384, align: 0, secret: false, high_water: 0},
+        };
+        var pool: Pool;
+        if (measure(nil, ask(100)) != 0 || measure(?pool, ask(100)) != 0)       { ret 2; }
+        if (!make(?pool, test_config(?classes[0], 3, 1 << 22), ?arena.counted)) { ret 3; }
+        fin { destroy(?pool); }
+        var plain:   Source = source(?pool);
+        var b:       [2]usize;
+        var account: Account;
+        if (!is_none(open_account(?pool, ?account, 7, budgets_of(1 << 21, ?b[0]), 0))) { ret 4; }
+        fin { close_account(?pool, ?account); }
+        # every class boundary from both sides, one oversize by alignment and one by size
+        var requests: [8]Request = [8]Request{
+            ask(1), ask(512), ask(513), ask(4096), ask(4097), ask(16384), ask(16385), ask(100),
+        };
+        requests[7].align = 64;
+        var i: usize = 0;
+        for (i < 8) {
+            val before:   usize    = account.held;
+            val expected: usize    = measure(?pool, requests[i]);
+            val got:      Acquired = acquire(?pool, ?account, requests[i], false);
+            if (!sel got.status.ok)                                 { ret 10 + i::i32; }
+            if (expected == 0 || account.held - before != expected) { ret 20 + i::i32; }
+            if (source_measure(?plain, requests[i]) != expected)    { ret 30 + i::i32; }
+            if (!is_none(release(?pool, ?account, got.chunk)))      { ret 40 + i::i32; }
+            i = i + 1;
+        }
+        # what acquire refuses as misuse measures as 0
+        var bad: Request = ask(0);
+        if (measure(?pool, bad) != 0) { ret 50; }
+        bad      = ask(100);
+        bad.lane = MAX_LANES::u8;
+        if (measure(?pool, bad) != 0) { ret 51; }
+        bad       = ask(100);
+        bad.align = 48;
+        if (measure(?pool, bad) != 0) { ret 52; }
+        # a rounding that overflows is refused, not charged
+        bad       = ask(~(0::usize));
+        bad.align = 64;
+        if (measure(?pool, bad) != 0) { ret 53; }
+        val huge: Acquired = acquire(?pool, ?account, bad, false);
+        if (sel huge.status.ok)                 { ret 54; }
+        if (source_measure(nil, ask(100)) != 0) { ret 55; }
         ret 0;
     }
 
@@ -2031,7 +2134,7 @@ $if (capability.HOSTED) {
     }
 
     # deterministic steps per operation, independent of how many chunks exist
-    fun measure(n: usize, cost: *Cost) bool {
+    fun measure_steps(n: usize, cost: *Cost) bool {
         var arena: Arena;
         if (!arena_make(?arena, n * 256 + (8 << 20))) { ret false; }
         fin { arena_free(?arena); }
@@ -2456,9 +2559,9 @@ $if (capability.HOSTED) {
         var small: Cost;
         var mid:   Cost;
         var large: Cost;
-        if (!measure(1000, ?small))                                       { ret 1; }
-        if (!measure(10000, ?mid))                                        { ret 2; }
-        if (!measure(100000, ?large))                                     { ret 3; }
+        if (!measure_steps(1000, ?small))                                 { ret 1; }
+        if (!measure_steps(10000, ?mid))                                  { ret 2; }
+        if (!measure_steps(100000, ?large))                               { ret 3; }
         if (small.acquire != mid.acquire || mid.acquire != large.acquire) { ret 4; }
         if (small.release != mid.release || mid.release != large.release) { ret 5; }
         if (small.wake != mid.wake || mid.wake != large.wake)             { ret 6; }

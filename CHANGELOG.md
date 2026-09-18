@@ -7,9 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Rebuild everything that links std, do not just recompile against the new
+sources. `buffers.Source` and `buffers.SecretSource` each grew by one word
+(`fn_measure`). Source that builds these records still compiles unchanged, but
+an object file built against 5.6.x that stores or passes one uses the old
+layout, still links, and reads a stray word as the measure callback.
+
 ### Added
 
-- `sha512.SecretState512` with `init_secret512`, `update_secret512`, `final_secret512` and `destroy_secret512`: SHA-512 over secret-typed data with the same engine, block layout and welding contract as the SHA-384 entry, a 64-byte digest to `*^u8` (#823).
+- `buffers.measure`, `buffers.source_measure` and `buffers.secret_source_measure`
+  report the bytes `acquire` would charge for a request without acquiring it:
+  the smallest fitting class's size, or the request rounded up to its alignment
+  when no class fits, through the same code path `acquire` charges by. 0 for a
+  request `acquire` would refuse as misuse. `Source` and `SecretSource` gain an
+  `fn_measure` member, set by `buffers.source` and `buffers.secret_source` (#825).
+- `sha512.SecretState512` with `init_secret512`, `update_secret512`,
+  `final_secret512` and `destroy_secret512`: SHA-512 over secret-typed data
+  with the same engine, block layout and welding contract as the SHA-384 entry,
+  a 64-byte digest to `*^u8` (#823).
 
 ## [5.6.0] - 2026-09-18
 
