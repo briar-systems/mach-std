@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.5.0] - 2026-09-18
+
+std now requires mach 5.5.0 (`mach = "^5.5"`): the hardware SHA-256 paths use
+the instruction-set extension rows that release added.
+
+### Added
+- `std.crypto.hash.sha256` compresses with SHA-NI on x86_64 and ARMv8 SHA2 on
+  aarch64 when the processor has them, chosen once at run time and cached.
+  `init`, `update`, `final` and `hash` are unchanged, and `sha256.accelerated()`
+  says which backend is in use. Measured at -O2 over 4 MiB (`test/sha256`):
+  x86_64-linux portable 22.8 ns/byte, SHA-NI 0.66 ns/byte, 34x. The aarch64
+  numbers are in the CI logs of the aarch64-linux and aarch64-darwin legs.
+  The hardware functions are outliers under `#[extensions(...)]`: the
+  dispatcher's run-time check is what puts control in them, and calling one
+  on a processor without the extensions faults (#730).
+- `std.system.cpu.features()` reports the running processor's instruction-set
+  extensions as a per-isa record whose field names are the compiler's own
+  (`sha`, `ssse3`, `sse41` on x86_64, `sha2` on aarch64, the isa letters on
+  riscv). Each field has a `SELECTED_*` value reading
+  `$mach.build.extensions.<name>`, so the record fails to compile the moment
+  the compiler drops or renames a row. x86_64 reads cpuid and needs no OS.
+  aarch64 reads the OS: `std.system.os` gains the `cpu` capability group
+  (`HAS_CPU_FEATURES`) with one primitive, `cpu_features`, which linux fills
+  from the auxv `AT_HWCAP` and darwin from sysctl. `std.system.cpu` builds
+  freestanding and is in the ratchet (#730).
+
+### Changed
+- The tag-triggered workflow is `.github/workflows/cd.yml`, the family's name
+  for it, and it serializes runs per tag so a duplicate tag push waits and
+  then finds the release already published (#812, #814).
+
 ## [5.4.0] - 2026-09-17
 
 Rebuild everything that links std, do not just recompile against the new
