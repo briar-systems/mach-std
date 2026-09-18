@@ -26,8 +26,8 @@ expect() {
     grep -q "$1" <<< "$log" || { echo "$log" >&2; fail "$2"; }
 }
 expect 'expected \*\^u8, found \*u8' "update_secret or final_secret accepted a public pointer"
-[ "$(grep -c 'expected \*\^u8, found \*u8' <<< "$log")" -ge 3 ] \
-    || { echo "$log" >&2; fail "not every public-pointer call was refused (update_secret, final_secret, update_secret384)"; }
+[ "$(grep -c 'expected \*\^u8, found \*u8' <<< "$log")" -ge 4 ] \
+    || { echo "$log" >&2; fail "not every public-pointer call was refused (update_secret, final_secret, update_secret384, update_secret512)"; }
 expect 'cannot add or drop the secret qualifier' "a State was cast to a SecretState"
 expect 'a secret-welded pointer cannot be erased to the untyped `ptr`' "a record holding a SecretState erased to ptr"
 echo "OK: the secret hash contract holds (public bytes, public digest, state aliasing, holder erasure all refused)"

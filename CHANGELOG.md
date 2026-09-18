@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `sha512.SecretState512` with `init_secret512`, `update_secret512`, `final_secret512` and `destroy_secret512`: SHA-512 over secret-typed data with the same engine, block layout and welding contract as the SHA-384 entry, a 64-byte digest to `*^u8` (#823).
+
 ## [5.6.0] - 2026-09-18
 
 ### Added
