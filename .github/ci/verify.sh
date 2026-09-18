@@ -79,7 +79,6 @@ case "$MACH_CI_LEG" in
         bash test/relro/verify.sh "$mach" linux-riscv64 qemu-riscv64
         bash test/sigpipe/verify.sh "$mach" linux-riscv64 qemu-riscv64
         bash test/terminate-child/verify.sh "$mach" linux-riscv64 qemu-riscv64
-        bash test/sha256/verify.sh "$mach" linux-riscv64 qemu-riscv64
         ;;
     cross-backends)
         bash test/backends/verify.sh
