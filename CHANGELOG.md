@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Secret-typed SHA-256 and SHA-384. `sha256.SecretState` holds `^u32` words
+  and a `[64]^u8` block, with `init_secret`, `update_secret(s, *^u8, len)`,
+  `final_secret(s, *^u8)` and `destroy_secret`, which zeroizes the words and
+  the block so a destroyed state is all zero. `sha512.SecretState384` is the
+  same entry for SHA-384 (`init_secret384`, `update_secret384`,
+  `final_secret384`, `destroy_secret384`). The contract is the welding: a
+  record embedding a secret state is welded, `update_secret` takes `*^u8`
+  only so public bytes are lifted at the call site, the digest goes to `*^u8`
+  and declassifying is the caller's decision, and no cast joins a secret
+  state to the public `State`. `test/sha256/refusals` pins each with a build
+  that must fail. The secret SHA-256 path uses the same SHA-NI and ARMv8 SHA2
+  dispatch as the public one through a generic instance of the same asm body,
+  so an HMAC key schedule runs at hardware speed; the portable compressions
+  are `#[oblivious]` at the secret instance. Design by mach-crypto's steward
+  (briar-systems/mach-crypto#122), which lets crypto drop its own SHA-2
+  (#819).
+
 ## [5.5.0] - 2026-09-18
 
 std now requires mach 5.5.0 (`mach = "^5.5"`): the hardware SHA-256 paths use
