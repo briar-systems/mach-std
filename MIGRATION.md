@@ -101,6 +101,32 @@ The width-named `ct.is_zero_*`, `eq_*`, `lt_*` and `gt_*` are gone; the four gen
 
 The lowering is unchanged: each instance emits the same instructions the removed function did, carries `#[oblivious]`, and is validated constant-time on its own.
 
+## Buffers: budgets carry their count (#807)
+
+`buffers.open_account`, `source_open_account` and `secret_source_open_account` take the per-lane budgets as a `buffers.Budgets` value instead of a `*usize` the pool read `lanes` entries from. `Budgets { lanes: usize; bytes: [8]usize; }` carries its own count, and `open_account` refuses as counted misuse (the trap fires) unless `budgets.lanes` equals the pool's lane count. A short array can no longer be read past its end (#804), and a count that disagrees with the pool is a loud refusal at open rather than lanes silently opened with budget 0. `Source.fn_open_account` and `SecretSource.fn_open_account` change to match: `fun(ptr, *Account, u64, Budgets, usize) Reason`.
+
+| 5.x | 6.0.0 |
+| --- | --- |
+| `open_account(?pool, ?account, handle, ?budgets[0], reserve)` with `var budgets: [N]usize` | `open_account(?pool, ?account, handle, b, reserve)` with `var b: buffers.Budgets` whose `lanes` is `N` and `bytes[0..N)` filled |
+| `source_open_account(s, ?account, handle, ?budgets[0], reserve)` | `source_open_account(s, ?account, handle, b, reserve)` with `b.lanes == source_lanes(s)` |
+| a `Source` literal's `fn_open_account: fun(ptr, *Account, u64, *usize, usize) Reason` | `fn_open_account: fun(ptr, *Account, u64, Budgets, usize) Reason` |
+
+```mach
+# before
+var budgets: [3]usize = [3]usize{1 << 20, 1 << 16, 1 << 16};
+val r: buffers.Reason = buffers.source_open_account(s, ?account, handle, ?budgets[0], 0);
+
+# after
+var b: buffers.Budgets;
+b.lanes    = 3;
+b.bytes[0] = 1 << 20;
+b.bytes[1] = 1 << 16;
+b.bytes[2] = 1 << 16;
+val r: buffers.Reason = buffers.source_open_account(s, ?account, handle, b, 0);
+```
+
+A composer that adds lanes of its own supplies their budgets too, and the total must equal `source_lanes`; the exact-match rule is the contract, not a limitation. `source_lanes` / `secret_source_lanes` stay, and are how a caller sizes `Budgets` for a source it did not build.
+
 # std 4.x to 5.0.0
 
 std 5.0.0 separates the two clocks (#752). `time.Time` is wall-clock (calendar) time only. It can jump when the system clock is set. Monotonic readings get their own type, `time.Instant`. The two types don't convert into each other, so the compiler now rejects a wall-clock `Time` passed as a deadline. Every deadline and timer in std takes an `Instant`. In the same release, a deadline scope costs the runtime one timer entry no matter how many operations it holds (#741). That change is internal and needs no caller changes.

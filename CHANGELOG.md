@@ -74,6 +74,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kind in release output. Strings hash eight bytes at a time. Looking up one
   hundred thousand `u64` keys drops from 29 ns to 19 ns per hit and from
   21 ns to 15 ns per miss, one million from 39 ns to 28 ns per hit (#656).
+- **Breaking.** `buffers.open_account`, `source_open_account` and
+  `secret_source_open_account` take the per-lane budgets as a
+  `buffers.Budgets` value (`lanes` plus `[8]usize` bytes) instead of a
+  `*usize` the pool read `lanes` entries from, and `Source.fn_open_account`
+  / `SecretSource.fn_open_account` change to match. A `lanes` that differs
+  from the pool's is refused as counted misuse with the trap fired, so a
+  short budget array can no longer be read past its end (#804) and a count
+  mismatch is a loud refusal at open rather than lanes silently opened with
+  budget 0 (MIGRATION.md) (#807).
 
 ### Removed
 
