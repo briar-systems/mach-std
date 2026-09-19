@@ -21,8 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with no allocation (#655).
 - `sort.sort_by`, `sort.is_sorted_by`, `sort.binary_search_by`: the
   comparator-taking forms of the three, with the comparator called through
-  its pointer per comparison. When briar-systems/mach#3706 and #3707 land, the
-  comparator becomes a comptime parameter with no call-site change (#655).
+  its pointer per comparison (#655).
+- `heap.HeapBy[T]` with `init_by(alloc, cmp)` and the `_by` operations: a
+  heap ordered by a stored comparator, called through its pointer per
+  comparison, the spelling for an order the element type does not carry
+  (#659).
 - `std.crypto.ct.is_zero[T]`, `eq[T]`, `lt[T]` and `gt[T]`: the four
   comparison families as one generic each over `^T`, each `#[oblivious]` and
   `#[inline]`. The twenty width-named functions (`is_zero_u8` through
@@ -47,6 +50,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#655).
 - `sort.binary_search` reports the first of several equal elements as `found`
   (#655).
+- **Breaking.** `heap.Heap[T]` is `heap.Heap[T, D]` with `D` one of
+  `heap.Min` or `heap.Max`, ordered by `natural.less[T]`. The `cmp` field and
+  `init`'s `cmp` argument are gone, and every operation takes `[T, D]`. The
+  sift compares with the operator on `T` directly: `push` and `pop` on a
+  `Heap[i64, Min]` contain no indirect call in release output. A comparator
+  moves to `HeapBy[T]` (MIGRATION.md). Pushing and popping one million
+  random `i64` drops from 223 ms to 171 ms, and one thousand from 49 ns to
+  26 ns per operation (#659).
 
 ## [5.8.0] - 2026-09-19
 
