@@ -63,6 +63,8 @@ use std.system.capability;
 
 $if (capability.HAS_PAGES) {
     use std.allocator.fixed;
+    use std.allocator.page;
+    use std.allocator.testing;
     use std.sync.mutex;
     use std.sync.thread;
     use std.system.os;
@@ -972,7 +974,9 @@ fun native_release(ctx: ptr, span: ptr, size: usize) i64 {
 #
 # spans are requested at SPAN_ALIGN and zeroed on the way out, so any backing
 # allocator that honors alignment can host a heap: a fixed buffer, an arena,
-# or the testing allocator for span-level accounting.
+# the page allocator, or the testing allocator for span-level accounting. a
+# backing that hands back a span off the SPAN_ALIGN grid gets it straight back
+# and the request is refused.
 # ---
 # s:       Source to initialize
 # backing: allocator spans are drawn from (must outlive the heap)
@@ -1006,12 +1010,15 @@ fun backed_release(ctx: ptr, span: ptr, size: usize) i64 {
 # the Source members every behavioural case runs against
 #
 # a member is a row here and a branch in test_bed_open: the host mapper, the
-# allocator adapter over a fixed buffer, and a mapper that hands out the
-# weakest base the contract allows. a new Source member is one more row.
-val TEST_MEMBER_NATIVE: usize = 0;
-val TEST_MEMBER_FIXED:  usize = 1;
-val TEST_MEMBER_WEAK:   usize = 2;
-val TEST_MEMBER_COUNT:  usize = 3;
+# allocator adapter over a fixed buffer, over the page allocator and over the
+# testing allocator, and a mapper that hands out the weakest base the
+# contract allows. a new Source member is one more row.
+val TEST_MEMBER_NATIVE:  usize = 0;
+val TEST_MEMBER_FIXED:   usize = 1;
+val TEST_MEMBER_PAGE:    usize = 2;
+val TEST_MEMBER_TESTING: usize = 3;
+val TEST_MEMBER_WEAK:    usize = 4;
+val TEST_MEMBER_COUNT:   usize = 5;
 
 # the fixed buffer never reclaims, so it holds every span the heaviest case
 # ever obtains: the million-operation case runs through about 170 MiB
@@ -1042,12 +1049,14 @@ rec TestBed {
     src:     Source;
     region:  ptr;
     state:   fixed.FixedState;
+    tracker: *testing.Testing;
     backing: allocator.Allocator;
 }
 
 fun test_bed_open(bed: *TestBed, member: usize) bool {
-    bed.member = member;
-    bed.region = nil;
+    bed.member  = member;
+    bed.region  = nil;
+    bed.tracker = nil;
 
     if (member == TEST_MEMBER_NATIVE) {
         native_source(?bed.src);
@@ -1061,6 +1070,24 @@ fun test_bed_open(bed: *TestBed, member: usize) bool {
         allocator_source(?bed.src, ?bed.backing);
         ret true;
     }
+    if (member == TEST_MEMBER_PAGE) {
+        val mr: err[allocator.Error] = page.make(?bed.backing);
+        if (sel mr.err) { ret false; }
+        allocator_source(?bed.src, ?bed.backing);
+        ret true;
+    }
+    if (member == TEST_MEMBER_TESTING) {
+        # the tracker is too large for the stack, so it lives on the mapper
+        bed.tracker = os.allocate($size_of(testing.Testing))::*testing.Testing;
+        if (bed.tracker == nil) { ret false; }
+        val mr: err[allocator.Error] = testing.make(bed.tracker);
+        if (sel mr.err) {
+            os.deallocate(bed.tracker::ptr, $size_of(testing.Testing));
+            ret false;
+        }
+        allocator_source(?bed.src, testing.allocator_of(bed.tracker));
+        ret true;
+    }
     if (member == TEST_MEMBER_WEAK) {
         bed.src.ctx        = nil;
         bed.src.fn_obtain  = test_weak_obtain;
@@ -1070,9 +1097,19 @@ fun test_bed_open(bed: *TestBed, member: usize) bool {
     ret false;
 }
 
-fun test_bed_close(bed: *TestBed) {
+# false when the member's own accounting says a span was leaked or freed twice
+fun test_bed_close(bed: *TestBed) bool {
+    var clean: bool = true;
     if (bed.region != nil) { os.deallocate(bed.region, TEST_FIXED_BYTES); }
-    bed.region = nil;
+    if (bed.tracker != nil) {
+        if (testing.leaked(bed.tracker))                 { clean = false; }
+        if (testing.double_free_count(bed.tracker) != 0) { clean = false; }
+        testing.dnit(bed.tracker);
+        os.deallocate(bed.tracker::ptr, $size_of(testing.Testing));
+    }
+    bed.region  = nil;
+    bed.tracker = nil;
+    ret clean;
 }
 
 # a heap over one member, wired to an Allocator
@@ -1094,8 +1131,9 @@ fun test_heap_on(bed: *TestBed, member: usize, h: *Heap, a: *allocator.Allocator
 
 # run one behavioural case against every member
 #
-# a failure is reported as member * 100 + the case's own code, and a case
-# that leaves blocks live or spans the source refuses to take back fails too
+# a failure is reported as member * 100 + the case's own code; a case that
+# leaves spans the source refuses to take back, or that the member's own
+# accounting reports as leaked or freed twice, fails too
 fun test_each(body: fun(*Heap, *allocator.Allocator) i32) i32 {
     var member: usize = 0;
     for (member < TEST_MEMBER_COUNT) {
@@ -1104,12 +1142,13 @@ fun test_each(body: fun(*Heap, *allocator.Allocator) i32) i32 {
         var a:   allocator.Allocator;
         if (!test_heap_on(?bed, member, ?h, ?a)) { ret (member * 100 + 1)::i32; }
 
-        val code: i32                  = body(?h, ?a);
-        val dr:   err[allocator.Error] = dnit(?h);
-        test_bed_close(?bed);
+        val code:  i32                  = body(?h, ?a);
+        val dr:    err[allocator.Error] = dnit(?h);
+        val clean: bool                 = test_bed_close(?bed);
 
         if (code != 0)             { ret (member * 100)::i32 + code; }
-        if (sel dr.err)            { ret (member * 100 + 98)::i32; }
+        if (sel dr.err)            { ret (member * 100 + 97)::i32; }
+        if (!clean)                { ret (member * 100 + 98)::i32; }
         if (mapped_bytes(?h) != 0) { ret (member * 100 + 99)::i32; }
         member = member + 1;
     }
