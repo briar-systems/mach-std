@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.7.1] - 2026-09-19
+
 std now requires mach 5.5.2 (`mach = "^5.5.2"`): the hardware SHA-256 bodies
 carry `#[oblivious]`, which needs the constant-time checker's view of welded
 pointers inside inline asm that mach#3640 added.
