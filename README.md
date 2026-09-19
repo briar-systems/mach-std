@@ -9,13 +9,13 @@ Add std as a dependency in your project's `mach.toml`:
 ```toml
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v5.7.1"
+ref = "tag/v5.8.0"
 ```
 
 Or with the dependency manager:
 
 ```bash
-mach dep add . std --git https://github.com/briar-systems/mach-std --ref tag/v5.7.1
+mach dep add . std --git https://github.com/briar-systems/mach-std --ref tag/v5.8.0
 ```
 
 ## Support

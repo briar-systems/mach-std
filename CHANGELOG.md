@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.8.0] - 2026-09-19
+
 std now requires mach 5.8.0 (`mach = "^5.8"`): every aarch64-linux and
 aarch64-darwin link reads `__mach_dit_required`, the cell that release's
 linker defines (briar-systems/mach#3508), and the runtime spells the DIT
