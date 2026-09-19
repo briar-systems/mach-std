@@ -40,6 +40,7 @@ case "$MACH_CI_LEG" in
         bash test/terminate-child/verify.sh "$mach" linux-arm64
         bash test/process-status/verify.sh "$mach" linux-arm64
         bash test/sha256/verify.sh "$mach" linux-arm64
+        bash test/dit/verify.sh "$mach" linux-arm64
         ;;
     x86_64-windows)
         bash test/native/verify.sh "$mach" windows-x86_64
@@ -66,6 +67,8 @@ case "$MACH_CI_LEG" in
         bash test/darwin/verify.sh "$mach" "$target"
         format_evidence "$target"
         bash test/sha256/verify.sh "$mach" "$target"
+        # the data-independent-timing mode exists on aarch64 only
+        if [ "$target" = darwin-aarch64 ]; then bash test/dit/verify.sh "$mach" "$target"; fi
         ;;
     # the library suite under qemu-user is real coverage for logic and a weak
     # signal for ABI constants. it is what caught #436
