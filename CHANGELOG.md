@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `std.crypto.ct.is_zero[T]`, `eq[T]`, `lt[T]` and `gt[T]`: the four
+  comparison families as one generic each over `^T`, each `#[oblivious]` and
+  `#[inline]`. The twenty width-named functions (`is_zero_u8` through
+  `gt_usize`) stay as those generics at one width, so no caller moves. Every
+  instance is validated constant-time on its own, and the release lowering
+  of each width-named function is unchanged instruction for instruction on
+  x86_64 and aarch64 (#660).
+
 ## [5.8.0] - 2026-09-19
 
 std now requires mach 5.8.0 (`mach = "^5.8"`): every aarch64-linux and
