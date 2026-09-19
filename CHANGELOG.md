@@ -27,6 +27,20 @@ enable sequence with the asm mnemonics it adds.
   on whether the mode is available, sharing the reader `cpu_features` uses.
   `test/dit` runs a secret-multiply program and a plain one on the aarch64
   legs, and under `qemu-aarch64 -cpu cortex-a57` shows the refusal (#831).
+## [5.7.1] - 2026-09-19
+
+std now requires mach 5.5.2 (`mach = "^5.5.2"`): the hardware SHA-256 bodies
+carry `#[oblivious]`, which needs the constant-time checker's view of welded
+pointers inside inline asm that mach#3640 added.
+
+### Fixed
+
+- `sha256.sha_ni_block` and `sha256.sha2_block` carry `#[oblivious]`, so the
+  constant-time checker holds the timing argument for the secret SHA-256 path
+  through hardware that 5.6.0 could only state in prose. `test/sha256/oblivious`
+  pins that the checker sees an oblivious asm body over a welded pointer: a
+  branch on a loaded secret word and an address that rides one are both
+  refused (#829).
 
 ## [5.7.0] - 2026-09-18
 
