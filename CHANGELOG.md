@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `map.clone[K, V](m, alloc)` / `clone_by` and `set.clone` / `clone_by`: a
+  copy of a map or set on another allocator without rehashing. The control
+  bytes, keys and values are copied as they are, the copy answers every
+  lookup the original does, the two share no storage afterwards, and a
+  refused acquisition leaves nothing allocated (#847).
+- `map.Iter`, `map.Entry[K, V]`, `map.iter` / `iter_by` and `map.next` /
+  `next_by`, with `set.iter` / `iter_by` / `next` / `next_by` yielding `*K`:
+  a cursor over a map's live entries that hides the slot layout. A step
+  skips empty and deleted slots, so a whole walk costs the capacity; the
+  order is unspecified, the entry just yielded may be removed, and an insert
+  may grow the table and end the walk (#847).
+
 ## [6.0.0] - 2026-09-19
 
 std 6.0.0 keeps `mach = "^5.8"`; nothing in it needs 5.9. Every removed or
