@@ -7,9 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-std now requires the mach release that defines `__mach_dit_required`
-(briar-systems/mach#3508, version to be confirmed against its merged PR): every
-aarch64-linux and aarch64-darwin link references the cell.
+std now requires mach 5.8.0 (`mach = "^5.8"`): every aarch64-linux and
+aarch64-darwin link reads `__mach_dit_required`, the cell that release's
+linker defines (briar-systems/mach#3508), and the runtime spells the DIT
+enable sequence with the asm mnemonics it adds.
 
 ### Added
 
