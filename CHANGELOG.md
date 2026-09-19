@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.0.0] - 2026-09-19
+
+std 6.0.0 keeps `mach = "^5.8"`; nothing in it needs 5.9. Every removed or
+changed signature below is a compile-time refusal at the caller, so a
+program that builds against 6.0.0 has already moved. Three changes can
+newly fail or differ at run time in code that already compiles:
+
+- `buffers.open_account` and the source forms refuse, as counted misuse
+  with the trap fired, a `Budgets` whose `lanes` differs from the pool's.
+- `sort.binary_search` reports the first of several equal elements, where
+  5.x reported whichever the probe met.
+- The hash of a `str`, an integer or a record key is a different value:
+  `natural.hash` is not the 5.x `map.hash_*`, and hashes were never stable
+  across std versions.
+
 ### Added
 
 - `std.collections.natural`: the natural order, equality and hash of a type,

@@ -9,18 +9,18 @@ Add std as a dependency in your project's `mach.toml`:
 ```toml
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v5.8.0"
+ref = "tag/v6.0.0"
 ```
 
 Or with the dependency manager:
 
 ```bash
-mach dep add . std --git https://github.com/briar-systems/mach-std --ref tag/v5.8.0
+mach dep add . std --git https://github.com/briar-systems/mach-std --ref tag/v6.0.0
 ```
 
 ## Support
 
-std 5.x requires mach 5.8.0 or later. It is tested on linux (x86_64, arm64, riscv64), darwin (x86_64, aarch64) and windows (x86_64). Its OS-free core also builds for freestanding targets.
+std 6.x requires mach 5.8.0 or later. It is tested on linux (x86_64, arm64, riscv64), darwin (x86_64, aarch64) and windows (x86_64). Its OS-free core also builds for freestanding targets.
 
 std follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See the [changelog](./CHANGELOG.md).
 
