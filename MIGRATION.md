@@ -1,3 +1,132 @@
+# std 5.x to 6.0.0
+
+std 6.0.0 gives the collections one ordering contract (#655). A collection orders, compares and hashes its elements by the type's natural order, `std.collections.natural`, resolved at compile time, and the comparator-taking spelling of every entry point is its `_by` form. See the contract on #655.
+
+## Sorting (#655)
+
+`sort`, `is_sorted` and `binary_search` no longer take a comparator: they order by `natural.less[T]`. The comparator forms are `sort_by`, `is_sorted_by` and `binary_search_by`, with the comparator in its old position. `sort` is now pattern-defeating quicksort rather than Shell sort, and `sort_stable` / `sort_stable_by` (merge sort over a caller-supplied scratch buffer) are new.
+
+| 5.x | 6.0.0 |
+| --- | --- |
+| `sort.sort[T](data, len, cmp)` | `sort.sort[T](data, len)` for a `T` with a natural order, else `sort.sort_by[T](data, len, cmp)` |
+| `sort.is_sorted[T](data, len, cmp)` | `sort.is_sorted[T](data, len)` or `sort.is_sorted_by[T](data, len, cmp)` |
+| `sort.binary_search[T](data, len, target, cmp)` | `sort.binary_search[T](data, len, target)` or `sort.binary_search_by[T](data, len, target, cmp)` |
+
+A natural order exists for integers, floats, `str` (by content) and records of those (lexicographic in field declaration order, nested records descended). A comparator that only spells `<` on such a type is redundant and its `_by` call is the slower path, so drop it:
+
+```mach
+# before
+fun cmp_i64(a: *i64, b: *i64) i64 { if (@a < @b) { ret -1; } if (@a > @b) { ret 1; } ret 0; }
+sort.sort[i64](data, len, cmp_i64);
+sort.sort[str](names, n, cmp_str);
+
+# after
+sort.sort[i64](data, len);
+sort.sort[str](names, n);
+```
+
+A comparator that expresses an order the type does not carry (a subset of the fields, a different field order, address order, a union) keeps its function and moves to the `_by` name:
+
+```mach
+# before
+sort.sort[Span](spans, n, span_compare);
+
+# after
+sort.sort_by[Span](spans, n, span_compare);
+```
+
+`binary_search` with equal elements present now reports the first of them as `found`.
+
+## Heap (#659)
+
+`Heap[T]` no longer stores a comparator. `Heap[T, D]` orders by the element's natural order with `D` naming the top: `heap.Min` or `heap.Max`. `init` loses its `cmp` argument. A comparator heap is `HeapBy[T]`, created with `init_by(alloc, cmp)`, whose operations carry the `_by` suffix (`push_by`, `pop_by`, `peek_by`, `dnit_by`, `is_empty_by`, `length_by`).
+
+| 5.x | 6.0.0 |
+| --- | --- |
+| `heap.Heap[T]` with a `<` comparator | `heap.Heap[T, heap.Min]` |
+| `heap.Heap[T]` with a `>` comparator | `heap.Heap[T, heap.Max]` |
+| `heap.Heap[T]` with any other comparator | `heap.HeapBy[T]` |
+| `heap.init[T](alloc, cmp)` | `heap.init[T, D](alloc)` or `heap.init_by[T](alloc, cmp)` |
+| `heap.push[T](?h, v)`, `pop`, `peek`, `dnit`, `is_empty`, `length` | `heap.push[T, D](?h, v)` and so on, or the `_by` form on a `HeapBy` |
+
+```mach
+# before
+var h: heap.Heap[i64] = heap.init[i64](?a, cmp_i64);
+heap.push[i64](?h, 3);
+
+# after
+var h: heap.Heap[i64, heap.Min] = heap.init[i64, heap.Min](?a);
+heap.push[i64, heap.Min](?h, 3);
+```
+
+A record element orders by its fields in declaration order, so "by priority, then by id" is `rec Task { prio: u8; id: u32; }` in a `Heap[Task, heap.Min]` with no comparator at all.
+
+## Map and Set (#656)
+
+`Map[K, V]` and `Set[K]` no longer take hash and equality functions: they key by the natural hash and equality of `K` (`natural.hash[K]`, `natural.eq[K]`), so `init` takes only the allocator. The `hash_fn`/`eq_fn` fields and the `ptr`-typed helpers `map.hash_str`, `eq_str`, `hash_i64`, `eq_i64`, `hash_u64`, `eq_u64`, `hash_u32`, `eq_u32` are gone. A key whose hash or equality the type does not carry (a union, a record with a pointer field, a key compared by something other than all its fields) goes in `MapBy[K, V]` / `SetBy[K]`, created with `init_by(alloc, hash_fn, eq_fn)` where the functions are typed (`fun(*K) u64`, `fun(*K, *K) bool`, no `ptr` casts), and whose operations carry the `_by` suffix.
+
+| 5.x | 6.0.0 |
+| --- | --- |
+| `map.init[K, V](alloc, map.hash_u32, map.eq_u32)` (any of the `map.hash_*`/`eq_*` helpers) | `map.init[K, V](alloc)` |
+| `map.init[K, V](alloc, my_hash, my_eq)` with `my_hash(p: ptr) u64`, `my_eq(a: ptr, b: ptr) bool` | `map.init_by[K, V](alloc, my_hash, my_eq)` with `my_hash(k: *K) u64`, `my_eq(a: *K, b: *K) bool` |
+| `map.Map[K, V]` holding custom functions | `map.MapBy[K, V]` |
+| `map.get/insert/contains/remove/clear/dnit/is_empty/length/capacity` on a custom-keyed map | the `_by` form of each |
+| `set.init[K](alloc, hash, eq)` | `set.init[K](alloc)` or `set.init_by[K](alloc, hash, eq)` on a `set.SetBy[K]` |
+
+```mach
+# before
+var seen: map.Map[u64, u32] = map.init[u64, u32](alloc, map.hash_u64, map.eq_u64);
+var dedup: map.Map[Type, TypeId] = map.init[Type, TypeId](alloc, hash_type, eq_type);
+fun hash_type(p: ptr) u64 { val t: *Type = p::*Type; ... }
+
+# after
+var seen: map.Map[u64, u32] = map.init[u64, u32](alloc);
+var dedup: map.MapBy[Type, TypeId] = map.init_by[Type, TypeId](alloc, hash_type, eq_type);
+fun hash_type(t: *Type) u64 { ... }
+val g: opt[*TypeId] = map.get_by[Type, TypeId](?dedup, ?t);
+```
+
+A record key hashes and compares field by field, so a key such as `rec QueryKey { kind: u16; key: u64; }` needs no functions at all. The hash of a value is not stable across std versions.
+
+## Constant-time comparisons (#839)
+
+The width-named `ct.is_zero_*`, `eq_*`, `lt_*` and `gt_*` are gone; the four generics are the surface. Spell the width as the type argument:
+
+| 5.x | 6.0.0 |
+| --- | --- |
+| `ct.is_zero_u8(a)` | `ct.is_zero[u8](a)` |
+| `ct.eq_u32(a, b)` | `ct.eq[u32](a, b)` |
+| `ct.lt_u64(a, b)` / `ct.lt_usize(a, b)` | `ct.lt[u64](a, b)` / `ct.lt[usize](a, b)` |
+| `ct.gt_u16(a, b)` | `ct.gt[u16](a, b)` |
+
+The lowering is unchanged: each instance emits the same instructions the removed function did, carries `#[oblivious]`, and is validated constant-time on its own.
+
+## Buffers: budgets carry their count (#807)
+
+`buffers.open_account`, `source_open_account` and `secret_source_open_account` take the per-lane budgets as a `buffers.Budgets` value instead of a `*usize` the pool read `lanes` entries from. `Budgets { lanes: usize; bytes: [8]usize; }` carries its own count, and `open_account` refuses as counted misuse (the trap fires) unless `budgets.lanes` equals the pool's lane count. A short array can no longer be read past its end (#804), and a count that disagrees with the pool is a loud refusal at open rather than lanes silently opened with budget 0. `Source.fn_open_account` and `SecretSource.fn_open_account` change to match: `fun(ptr, *Account, u64, Budgets, usize) Reason`.
+
+| 5.x | 6.0.0 |
+| --- | --- |
+| `open_account(?pool, ?account, handle, ?budgets[0], reserve)` with `var budgets: [N]usize` | `open_account(?pool, ?account, handle, b, reserve)` with `var b: buffers.Budgets` whose `lanes` is `N` and `bytes[0..N)` filled |
+| `source_open_account(s, ?account, handle, ?budgets[0], reserve)` | `source_open_account(s, ?account, handle, b, reserve)` with `b.lanes == source_lanes(s)` |
+| a `Source` literal's `fn_open_account: fun(ptr, *Account, u64, *usize, usize) Reason` | `fn_open_account: fun(ptr, *Account, u64, Budgets, usize) Reason` |
+
+```mach
+# before
+var budgets: [3]usize = [3]usize{1 << 20, 1 << 16, 1 << 16};
+val r: buffers.Reason = buffers.source_open_account(s, ?account, handle, ?budgets[0], 0);
+
+# after
+var b: buffers.Budgets;
+b.lanes    = 3;
+b.bytes[0] = 1 << 20;
+b.bytes[1] = 1 << 16;
+b.bytes[2] = 1 << 16;
+val r: buffers.Reason = buffers.source_open_account(s, ?account, handle, b, 0);
+```
+
+A composer that adds lanes of its own supplies their budgets too, and the total must equal `source_lanes`; the exact-match rule is the contract, not a limitation. `source_lanes` / `secret_source_lanes` stay, and are how a caller sizes `Budgets` for a source it did not build.
+
 # std 4.x to 5.0.0
 
 std 5.0.0 separates the two clocks (#752). `time.Time` is wall-clock (calendar) time only. It can jump when the system clock is set. Monotonic readings get their own type, `time.Instant`. The two types don't convert into each other, so the compiler now rejects a wall-clock `Time` passed as a deadline. Every deadline and timer in std takes an `Instant`. In the same release, a deadline scope costs the runtime one timer entry no matter how many operations it holds (#741). That change is internal and needs no caller changes.

@@ -1,9 +1,38 @@
 # in-place sorting, searching, and array utilities
+#
+# THE ORDERING CONTRACT. every entry point comes in two spellings. the bare one
+# (`sort`, `is_sorted`, `binary_search`, `sort_stable`) orders by the element's
+# natural order, `std.collections.natural.less[T]`, which is resolved at compile
+# time: the compare in the emitted loop is the operator on `T` itself, and no
+# call is made per comparison. the `_by` one takes a comparator returning
+# negative, zero or positive, the C `qsort` shape, and calls it through its
+# pointer per comparison; that is the path for an order the type does not
+# carry, and it costs an indirect call each time. a comparator that is not a
+# strict weak order (one that contradicts itself) leaves the elements in an
+# unspecified permutation, never out of bounds: every scan is bounded by the
+# range and not by a sentinel.
+#
+# THE ALGORITHM is pattern-defeating quicksort (Peters, 2015): insertion sort
+# below `INSERTION_LIMIT`, a median-of-three pivot (ninther above
+# `NINTHER_LIMIT`), a partition that detects an already-partitioned range and
+# then confirms a nearly sorted one with a bounded insertion pass, an
+# equal-elements partition when the pivot repeats its predecessor so many
+# equal keys cost O(n), a pattern breaker on a badly unbalanced partition, and a
+# heapsort fallback after log2(n) of those, which is what bounds the worst case
+# at O(n log n). `sort` is not stable; `sort_stable` is a merge sort over a
+# caller-supplied scratch buffer, so nothing here allocates.
 
+use std.system.capability;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
 use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use std.collections.natural;
 
 # where a binary search landed
 #
@@ -24,6 +53,7 @@ pub tag SearchPosition: u8 {
 # ---
 # a: pointer to the first element
 # b: pointer to the second element
+#[inline]
 pub fun swap[T](a: *T, b: *T) {
     val tmp: T = @a;
     @a = @b;
@@ -45,47 +75,397 @@ pub fun reverse[T](data: *T, len: usize) {
     }
 }
 
-# in-place shell sort with Ciura gap sequence
+# the ordering policy of the private core: the natural order, or a comparator
+rec Natural {}
+
+rec ByCmp {}
+
+# below this many elements a range is insertion sorted
+val INSERTION_LIMIT: usize = 24;
+
+# above this many elements the pivot is the ninther rather than the median of three
+val NINTHER_LIMIT: usize = 128;
+
+# how many element moves an "already partitioned" range may cost before the
+# insertion pass gives up and the partition recurses after all
+val PARTIAL_INSERTION_LIMIT: usize = 8;
+
+# the one compare every routine here goes through
+#
+# with `Natural` it is the operator on `T`, with `ByCmp` it is the comparator.
+# the marker is a zero-size value, so the selection costs nothing at runtime and
+# the routine bodies exist once each rather than once per policy.
+#[inline]
+fun before[T, P](p: P, cmp: fun(*T, *T) i64, a: *T, b: *T) bool {
+    $if ($type_of(p) == ByCmp) { ret cmp(a, b) < 0; }
+    $or                        { ret natural.less[T](a, b); }
+}
+
+# order two elements in place
+#[inline]
+fun sort2[T, P](p: P, cmp: fun(*T, *T) i64, a: *T, b: *T) {
+    if (before[T, P](p, cmp, b, a)) { swap[T](a, b); }
+}
+
+# order three elements in place
+#[inline]
+fun sort3[T, P](p: P, cmp: fun(*T, *T) i64, a: *T, b: *T, c: *T) {
+    sort2[T, P](p, cmp, a, b);
+    sort2[T, P](p, cmp, b, c);
+    sort2[T, P](p, cmp, a, b);
+}
+
+# insertion sort a short range
+fun insertion_sort[T, P](p: P, cmp: fun(*T, *T) i64, data: *T, len: usize) {
+    var i: usize = 1;
+    for (i < len) {
+        if (before[T, P](p, cmp, ?data[i], ?data[i - 1])) {
+            val held: T     = data[i];
+            var j:    usize = i;
+            for (j > 0 && before[T, P](p, cmp, ?held, ?data[j - 1])) {
+                data[j] = data[j - 1];
+                j       = j - 1;
+            }
+            data[j] = held;
+        }
+        i = i + 1;
+    }
+}
+
+# insertion sort that gives up once it has moved `PARTIAL_INSERTION_LIMIT` elements
+#
+# a range the partition step found already partitioned is very likely sorted
+# or nearly so. this confirms cheaply: it returns true when the range is
+# sorted on exit, and false, with the range still a permutation of its input,
+# once the pass has cost more than a nearly sorted range would.
+# ---
+# ret: true when the range is now sorted
+fun partial_insertion_sort[T, P](p: P, cmp: fun(*T, *T) i64, data: *T, len: usize) bool {
+    var moves: usize = 0;
+    var i:     usize = 1;
+    for (i < len) {
+        if (before[T, P](p, cmp, ?data[i], ?data[i - 1])) {
+            val held: T     = data[i];
+            var j:    usize = i;
+            for (j > 0 && before[T, P](p, cmp, ?held, ?data[j - 1])) {
+                data[j] = data[j - 1];
+                j       = j - 1;
+            }
+            data[j] = held;
+            moves   = moves + (i - j);
+            if (moves > PARTIAL_INSERTION_LIMIT) { ret false; }
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# restore the max-heap property below `root` within the first `len` elements
+fun sift_down[T, P](p: P, cmp: fun(*T, *T) i64, data: *T, len: usize, root: usize) {
+    var i: usize = root;
+    for {
+        val left: usize = 2 * i + 1;
+        if (left >= len) { ret; }
+        var child: usize = left;
+        if (left + 1 < len && before[T, P](p, cmp, ?data[left], ?data[left + 1])) {
+            child = left + 1;
+        }
+        if (!before[T, P](p, cmp, ?data[i], ?data[child])) { ret; }
+        swap[T](?data[i], ?data[child]);
+        i = child;
+    }
+}
+
+# heapsort, the O(n log n) fallback once the partitions have gone bad too often
+fun heapsort[T, P](p: P, cmp: fun(*T, *T) i64, data: *T, len: usize) {
+    if (len < 2) { ret; }
+    var i: usize = len / 2;
+    for (i > 0) {
+        i = i - 1;
+        sift_down[T, P](p, cmp, data, len, i);
+    }
+    var end: usize = len;
+    for (end > 1) {
+        end = end - 1;
+        swap[T](?data[0], ?data[end]);
+        sift_down[T, P](p, cmp, data, end, 0);
+    }
+}
+
+# where a partition put its pivot, and whether it found the range already partitioned
+rec Partition {
+    pivot: usize;
+    done:  bool;
+}
+
+# partition the range around the pivot at `data[0]`
+#
+# on return the pivot is at index `pivot`, every element before it is less
+# than it, and every element after it is not less than it. `done` reports that
+# no element had to move, which is the signal that the range may already be
+# sorted. `len` is at least three, since the caller has already placed a
+# median of three.
+fun partition_right[T, P](p: P, cmp: fun(*T, *T) i64, data: *T, len: usize) Partition {
+    val pivot: T     = data[0];
+    var first: usize = 1;
+    var last:  usize = len;
+
+    for (first < last && before[T, P](p, cmp, ?data[first], ?pivot)) { first = first + 1; }
+    for (first < last && !before[T, P](p, cmp, ?data[last - 1], ?pivot)) { last = last - 1; }
+
+    val done: bool = first >= last;
+
+    for (first < last) {
+        swap[T](?data[first], ?data[last - 1]);
+        first = first + 1;
+        for (first < last && before[T, P](p, cmp, ?data[first], ?pivot)) { first = first + 1; }
+        last = last - 1;
+        for (first < last && !before[T, P](p, cmp, ?data[last - 1], ?pivot)) { last = last - 1; }
+    }
+
+    val pos: usize = first - 1;
+    data[0]   = data[pos];
+    data[pos] = pivot;
+    ret Partition{pivot: pos, done: done};
+}
+
+# partition the range so that every element equal to the pivot lands on the left
+#
+# used when the pivot equals the element before the range, which means every
+# element less than it has already been placed: the elements equal to the pivot
+# are the left side, and only the strictly greater ones remain to sort. on
+# return the pivot is at index `pivot`, every element before it is not greater
+# than it, and every element after it is greater.
+fun partition_left[T, P](p: P, cmp: fun(*T, *T) i64, data: *T, len: usize) usize {
+    val pivot: T     = data[0];
+    var last:  usize = len - 1;
+    var first: usize = 1;
+
+    for (last > 0 && before[T, P](p, cmp, ?pivot, ?data[last])) { last = last - 1; }
+    for (first < last && !before[T, P](p, cmp, ?pivot, ?data[first])) { first = first + 1; }
+
+    for (first < last) {
+        swap[T](?data[first], ?data[last]);
+        last = last - 1;
+        for (last > first && before[T, P](p, cmp, ?pivot, ?data[last])) { last = last - 1; }
+        first = first + 1;
+        for (first < last && !before[T, P](p, cmp, ?pivot, ?data[first])) { first = first + 1; }
+    }
+
+    data[0]    = data[last];
+    data[last] = pivot;
+    ret last;
+}
+
+# swap a few elements so the next pivot choice sees a different pattern
+fun break_pattern[T](data: *T, len: usize) {
+    if (len < INSERTION_LIMIT) { ret; }
+    val q: usize = len / 4;
+    swap[T](?data[0], ?data[q]);
+    swap[T](?data[len - 1], ?data[len - 1 - q]);
+    if (len > NINTHER_LIMIT) {
+        swap[T](?data[1], ?data[q + 1]);
+        swap[T](?data[2], ?data[q + 2]);
+        swap[T](?data[len - 2], ?data[len - 2 - q]);
+        swap[T](?data[len - 3], ?data[len - 3 - q]);
+    }
+}
+
+# the pdqsort loop over one range
+#
+# `pred` points at the element just before the range when there is one, which
+# is what the equal-elements partition keys on; it is nil for the leftmost
+# range. `bad_allowed` counts the badly unbalanced partitions still tolerated
+# before the range is heapsorted instead. the left side of each partition
+# recurses and the right side iterates.
+fun pdqsort[T, P](p: P, cmp: fun(*T, *T) i64, data0: *T, len0: usize, pred0: *T, bad0: usize) {
+    var data: *T    = data0;
+    var len:  usize = len0;
+    var pred: *T    = pred0;
+    var bad:  usize = bad0;
+
+    for {
+        if (len <= INSERTION_LIMIT) {
+            insertion_sort[T, P](p, cmp, data, len);
+            ret;
+        }
+
+        val half: usize = len / 2;
+        if (len > NINTHER_LIMIT) {
+            sort3[T, P](p, cmp, ?data[0], ?data[half], ?data[len - 1]);
+            sort3[T, P](p, cmp, ?data[1], ?data[half - 1], ?data[len - 2]);
+            sort3[T, P](p, cmp, ?data[2], ?data[half + 1], ?data[len - 3]);
+            sort3[T, P](p, cmp, ?data[half - 1], ?data[half], ?data[half + 1]);
+            swap[T](?data[0], ?data[half]);
+        }
+        or {
+            sort3[T, P](p, cmp, ?data[half], ?data[0], ?data[len - 1]);
+        }
+
+        if (pred != nil && !before[T, P](p, cmp, pred, ?data[0])) {
+            val pos: usize = partition_left[T, P](p, cmp, data, len);
+            pred = ?data[pos];
+            data = ?data[pos + 1];
+            len  = len - (pos + 1);
+            cnt;
+        }
+
+        val part:   Partition = partition_right[T, P](p, cmp, data, len);
+        val l_size: usize     = part.pivot;
+        val r_size: usize     = len - (part.pivot + 1);
+
+        if (l_size < len / 8 || r_size < len / 8) {
+            if (bad == 0) {
+                heapsort[T, P](p, cmp, data, len);
+                ret;
+            }
+            bad = bad - 1;
+            break_pattern[T](data, l_size);
+            break_pattern[T](?data[part.pivot + 1], r_size);
+        }
+        or (part.done) {
+            if (partial_insertion_sort[T, P](p, cmp, data, l_size)
+                && partial_insertion_sort[T, P](p, cmp, ?data[part.pivot + 1], r_size)) {
+                ret;
+            }
+        }
+
+        pdqsort[T, P](p, cmp, data, l_size, pred, bad);
+        pred = ?data[part.pivot];
+        data = ?data[part.pivot + 1];
+        len  = r_size;
+    }
+}
+
+# floor(log2(n)), the heapsort budget for a range of n elements
+fun log2_floor(n: usize) usize {
+    var v: usize = n;
+    var r: usize = 0;
+    for (v > 1) {
+        v = v >> 1;
+        r = r + 1;
+    }
+    ret r;
+}
+
+# sort in place by the element's natural order
+#
+# pattern-defeating quicksort, O(n log n) worst case, not stable. the compare
+# is `natural.less[T]`, resolved at compile time; a `T` without a natural order
+# is refused with its message.
+# ---
+# data: pointer to the array
+# len:  number of elements
+pub fun sort[T](data: *T, len: usize) {
+    if (len < 2) { ret; }
+    var p: Natural;
+    pdqsort[T, Natural](p, nil, data, len, nil, log2_floor(len));
+}
+
+# sort in place by a comparator
+#
+# the same algorithm as `sort`, with the order supplied as a function called
+# through its pointer per comparison.
 # ---
 # data: pointer to the array
 # len:  number of elements
 # cmp:  comparator returning negative if a < b, zero if equal, positive if a > b
-pub fun sort[T](data: *T, len: usize, cmp: fun(*T, *T) i64) {
+pub fun sort_by[T](data: *T, len: usize, cmp: fun(*T, *T) i64) {
     if (len < 2) { ret; }
+    var p: ByCmp;
+    pdqsort[T, ByCmp](p, cmp, data, len, nil, log2_floor(len));
+}
 
-    var gi: usize = 0;
-    for (gi < 8) {
-        val gap: usize = gap_at(gi);
-        if (gap < len) {
-            var i: usize = gap;
-            for (i < len) {
-                var j: usize = i;
-                for (j >= gap) {
-                    if (cmp(?data[j - gap], ?data[j]) > 0) {
-                        swap[T](?data[j - gap], ?data[j]);
-                        j = j - gap;
-                    }
-                    or {
-                        brk;
-                    }
-                }
-                i = i + 1;
-            }
+# merge the sorted runs [0, mid) and [mid, len) of `data` through `scratch`
+#
+# the left run is copied out and merged back; an element of the left run is
+# taken first whenever the two are not ordered, which is what keeps the merge
+# stable.
+fun merge[T, P](p: P, cmp: fun(*T, *T) i64, data: *T, mid: usize, len: usize, scratch: *T) {
+    var i: usize = 0;
+    for (i < mid) {
+        scratch[i] = data[i];
+        i          = i + 1;
+    }
+    var l: usize = 0;
+    var r: usize = mid;
+    var o: usize = 0;
+    for (l < mid && r < len) {
+        if (before[T, P](p, cmp, ?data[r], ?scratch[l])) {
+            data[o] = data[r];
+            r       = r + 1;
         }
-        gi = gi + 1;
+        or {
+            data[o] = scratch[l];
+            l       = l + 1;
+        }
+        o = o + 1;
+    }
+    for (l < mid) {
+        data[o] = scratch[l];
+        l       = l + 1;
+        o       = o + 1;
     }
 }
 
-# return the shell sort gap at the given index
-fun gap_at(idx: usize) usize {
-    if (idx == 0) { ret 701; }
-    if (idx == 1) { ret 301; }
-    if (idx == 2) { ret 132; }
-    if (idx == 3) { ret 57; }
-    if (idx == 4) { ret 23; }
-    if (idx == 5) { ret 10; }
-    if (idx == 6) { ret 4; }
-    ret 1;
+# top-down merge sort with insertion-sorted leaves
+fun mergesort[T, P](p: P, cmp: fun(*T, *T) i64, data: *T, len: usize, scratch: *T) {
+    if (len <= INSERTION_LIMIT) {
+        insertion_sort[T, P](p, cmp, data, len);
+        ret;
+    }
+    val mid: usize = len / 2;
+    mergesort[T, P](p, cmp, data, mid, scratch);
+    mergesort[T, P](p, cmp, ?data[mid], len - mid, scratch);
+    if (before[T, P](p, cmp, ?data[mid], ?data[mid - 1])) {
+        merge[T, P](p, cmp, data, mid, len, scratch);
+    }
+}
+
+# stable sort in place by the element's natural order
+#
+# merge sort over a caller-supplied scratch buffer, O(n log n), and equal
+# elements keep their input order. nothing is allocated.
+# ---
+# data:    pointer to the array
+# len:     number of elements
+# scratch: a buffer of at least `len / 2` elements the sort may overwrite
+pub fun sort_stable[T](data: *T, len: usize, scratch: *T) {
+    if (len < 2) { ret; }
+    var p: Natural;
+    mergesort[T, Natural](p, nil, data, len, scratch);
+}
+
+# stable sort in place by a comparator
+# ---
+# data:    pointer to the array
+# len:     number of elements
+# scratch: a buffer of at least `len / 2` elements the sort may overwrite
+# cmp:     comparator returning negative if a < b, zero if equal, positive if a > b
+pub fun sort_stable_by[T](data: *T, len: usize, scratch: *T, cmp: fun(*T, *T) i64) {
+    if (len < 2) { ret; }
+    var p: ByCmp;
+    mergesort[T, ByCmp](p, cmp, data, len, scratch);
+}
+
+# whether the range is in non-descending order
+fun sorted[T, P](p: P, cmp: fun(*T, *T) i64, data: *T, len: usize) bool {
+    var i: usize = 1;
+    for (i < len) {
+        if (before[T, P](p, cmp, ?data[i], ?data[i - 1])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# check if an array is sorted by the element's natural order
+# ---
+# data: pointer to the array
+# len:  number of elements
+# ret:  true if sorted in non-descending order
+pub fun is_sorted[T](data: *T, len: usize) bool {
+    var p: Natural;
+    ret sorted[T, Natural](p, nil, data, len);
 }
 
 # check if an array is sorted according to the comparator
@@ -94,46 +474,55 @@ fun gap_at(idx: usize) usize {
 # len:  number of elements
 # cmp:  comparator
 # ret:  true if sorted in non-descending order
-pub fun is_sorted[T](data: *T, len: usize, cmp: fun(*T, *T) i64) bool {
-    if (len < 2) { ret true; }
-    var i: usize = 1;
-    for (i < len) {
-        if (cmp(?data[i - 1], ?data[i]) > 0) {
-            ret false;
-        }
-        i = i + 1;
-    }
-    ret true;
+pub fun is_sorted_by[T](data: *T, len: usize, cmp: fun(*T, *T) i64) bool {
+    var p: ByCmp;
+    ret sorted[T, ByCmp](p, cmp, data, len);
 }
 
-# search for a target in a sorted array
-# ---
-# data:   pointer to the sorted array
-# len:    number of elements
-# target: pointer to the value to find
-# cmp:    comparator
-# ret:    found{index} for a match, insertion{position} otherwise
-pub fun binary_search[T](data: *T, len: usize, target: *T, cmp: fun(*T, *T) i64) SearchPosition {
-    if (len == 0) {
-        ret SearchPosition.insertion{0};
-    }
-
+# the first index whose element is not less than the target, then whether it matches
+fun search[T, P](p: P, cmp: fun(*T, *T) i64, data: *T, len: usize, target: *T) SearchPosition {
     var lo: usize = 0;
     var hi: usize = len;
     for (lo < hi) {
         val mid: usize = lo + (hi - lo) / 2;
-        val c:   i64   = cmp(?data[mid], target);
-        if (c == 0) {
-            ret SearchPosition.found{mid};
-        }
-        if (c < 0) {
+        if (before[T, P](p, cmp, ?data[mid], target)) {
             lo = mid + 1;
         }
         or {
             hi = mid;
         }
     }
+    if (lo < len && !before[T, P](p, cmp, target, ?data[lo])) {
+        ret SearchPosition.found{lo};
+    }
     ret SearchPosition.insertion{lo};
+}
+
+# search a sorted array for a target by the element's natural order
+#
+# with equal elements present, `found` names the first of them.
+# ---
+# data:   pointer to the sorted array
+# len:    number of elements
+# target: pointer to the value to find
+# ret:    found{index} for a match, insertion{position} otherwise
+pub fun binary_search[T](data: *T, len: usize, target: *T) SearchPosition {
+    var p: Natural;
+    ret search[T, Natural](p, nil, data, len, target);
+}
+
+# search a sorted array for a target by a comparator
+#
+# with equal elements present, `found` names the first of them.
+# ---
+# data:   pointer to the sorted array
+# len:    number of elements
+# target: pointer to the value to find
+# cmp:    comparator
+# ret:    found{index} for a match, insertion{position} otherwise
+pub fun binary_search_by[T](data: *T, len: usize, target: *T, cmp: fun(*T, *T) i64) SearchPosition {
+    var p: ByCmp;
+    ret search[T, ByCmp](p, cmp, data, len, target);
 }
 
 fun cmp_i64(a: *i64, b: *i64) i64 {
@@ -145,8 +534,8 @@ fun cmp_i64(a: *i64, b: *i64) i64 {
 test "sort: empty and single" {
     var data: [1]i64;
     data[0] = 42;
-    sort[i64](?data[0], 0, cmp_i64);
-    sort[i64](?data[0], 1, cmp_i64);
+    sort[i64](?data[0], 0);
+    sort[i64](?data[0], 1);
     if (data[0] != 42) { ret 1; }
     ret 0;
 }
@@ -159,7 +548,7 @@ test "sort: sorts array" {
     data[3] = 4;
     data[4] = 2;
 
-    sort[i64](?data[0], 5, cmp_i64);
+    sort[i64](?data[0], 5);
 
     if (data[0] != 1) { ret 1; }
     if (data[1] != 2) { ret 1; }
@@ -176,7 +565,7 @@ test "sort: already sorted" {
     data[2] = 3;
     data[3] = 4;
 
-    sort[i64](?data[0], 4, cmp_i64);
+    sort[i64](?data[0], 4);
 
     if (data[0] != 1) { ret 1; }
     if (data[1] != 2) { ret 1; }
@@ -192,7 +581,7 @@ test "sort: reverse sorted" {
     data[2] = 2;
     data[3] = 1;
 
-    sort[i64](?data[0], 4, cmp_i64);
+    sort[i64](?data[0], 4);
 
     if (data[0] != 1) { ret 1; }
     if (data[1] != 2) { ret 1; }
@@ -208,10 +597,10 @@ test "sort: is_sorted" {
     data[2] = 3;
     data[3] = 4;
 
-    if (!is_sorted[i64](?data[0], 4, cmp_i64)) { ret 1; }
+    if (!is_sorted[i64](?data[0], 4)) { ret 1; }
 
     data[2] = 99;
-    if (is_sorted[i64](?data[0], 4, cmp_i64)) { ret 1; }
+    if (is_sorted[i64](?data[0], 4)) { ret 1; }
     ret 0;
 }
 
@@ -224,7 +613,7 @@ test "sort: binary_search found" {
     data[4] = 50;
 
     val t: i64            = 30;
-    val r: SearchPosition = binary_search[i64](?data[0], 5, ?t, cmp_i64);
+    val r: SearchPosition = binary_search[i64](?data[0], 5, ?t);
     if (!sel r.found) { ret 1; }
     if (r.found != 2) { ret 1; }
     ret 0;
@@ -239,7 +628,7 @@ test "sort: binary_search not found" {
     data[4] = 50;
 
     val t: i64            = 25;
-    val r: SearchPosition = binary_search[i64](?data[0], 5, ?t, cmp_i64);
+    val r: SearchPosition = binary_search[i64](?data[0], 5, ?t);
     if (!sel r.insertion) { ret 1; }
     if (r.insertion != 2) { ret 1; }
     ret 0;
@@ -249,7 +638,7 @@ test "sort: binary_search empty" {
     var data: [1]i64;
     data[0] = 0;
     val t: i64            = 42;
-    val r: SearchPosition = binary_search[i64](?data[0], 0, ?t, cmp_i64);
+    val r: SearchPosition = binary_search[i64](?data[0], 0, ?t);
     if (!sel r.insertion) { ret 1; }
     if (r.insertion != 0) { ret 1; }
     ret 0;
@@ -291,7 +680,7 @@ test "sort: sort with duplicates" {
     data[4] = 1;
     data[5] = 2;
 
-    sort[i64](?data[0], 6, cmp_i64);
+    sort[i64](?data[0], 6);
 
     if (data[0] != 1) { ret 1; }
     if (data[1] != 1) { ret 1; }
@@ -301,3 +690,259 @@ test "sort: sort with duplicates" {
     if (data[5] != 3) { ret 1; }
     ret 0;
 }
+
+$if (capability.HOSTED) {
+    use std.allocator;
+    use std.allocator.page;
+
+    # a fixed xorshift walk, so every randomized case is reproducible
+    fun step(s: *u64) u64 {
+        var x: u64 = @s;
+        x  = x ^ (x << 13);
+        x  = x ^ (x >> 7);
+        x  = x ^ (x << 17);
+        @s = x;
+        ret x;
+    }
+
+    # the shape of an input: 0 random, 1 sorted, 2 reversed, 3 all equal,
+    # 4 sawtooth, 5 random over few keys, 6 sorted with a few swaps
+    fun fill(data: *i64, len: usize, shape: u64, s: *u64) {
+        var i: usize = 0;
+        for (i < len) {
+            if (shape == 0) { data[i] = (step(s) % 1000)::i64; }
+            or (shape == 1) { data[i] = i::i64; }
+            or (shape == 2) { data[i] = (len - i)::i64; }
+            or (shape == 3) { data[i] = 7; }
+            or (shape == 4) { data[i] = (i % 37)::i64; }
+            or (shape == 5) { data[i] = (step(s) % 4)::i64; }
+            or              { data[i] = i::i64; }
+            i = i + 1;
+        }
+        if (shape == 6 && len > 2) {
+            var k: usize = 0;
+            for (k < 4) {
+                val a: usize = (step(s) % (len::u64))::usize;
+                val b: usize = (step(s) % (len::u64))::usize;
+                swap[i64](?data[a], ?data[b]);
+                k = k + 1;
+            }
+        }
+    }
+
+    # a multiset fingerprint, so a sort can be checked as a permutation of its input
+    rec Fingerprint { sum: u64; squares: u64; cubes: u64; }
+
+    fun fingerprint(data: *i64, len: usize) Fingerprint {
+        var f: Fingerprint = Fingerprint{sum: 0, squares: 0, cubes: 0};
+        var i: usize       = 0;
+        for (i < len) {
+            val v: u64 = data[i]::u64;
+            f.sum     = f.sum + v;
+            f.squares = f.squares + v * v;
+            f.cubes   = f.cubes + v * v * v;
+            i         = i + 1;
+        }
+        ret f;
+    }
+
+    fun same_fingerprint(a: Fingerprint, b: Fingerprint) bool {
+        ret a.sum == b.sum && a.squares == b.squares && a.cubes == b.cubes;
+    }
+
+    fun cmp_desc(a: *i64, b: *i64) i64 {
+        if (@a > @b) { ret -1; }
+        if (@a < @b) { ret 1; }
+        ret 0;
+    }
+
+    # one input, sorted three ways, each checked as a sorted permutation of it
+    fun check_case(a: *allocator.Allocator, len: usize, shape: u64, s: *u64) i32 {
+        val need: usize                      = len + 1;
+        val r1:   res[*i64, allocator.Error] = allocator.allocate[i64](a, need);
+        if (sel r1.err) { ret 1; }
+        val r2: res[*i64, allocator.Error] = allocator.allocate[i64](a, need);
+        if (sel r2.err) { ret 1; }
+        val r3: res[*i64, allocator.Error] = allocator.allocate[i64](a, need);
+        if (sel r3.err) { ret 1; }
+        val rs: res[*i64, allocator.Error] = allocator.allocate[i64](a, need);
+        if (sel rs.err) { ret 1; }
+        val data:    *i64 = r1.ok;
+        val copy:    *i64 = r2.ok;
+        val stable:  *i64 = r3.ok;
+        val scratch: *i64 = rs.ok;
+
+        fill(data, len, shape, s);
+        var i: usize = 0;
+        for (i < len) {
+            copy[i]   = data[i];
+            stable[i] = data[i];
+            i         = i + 1;
+        }
+        val before_sort: Fingerprint = fingerprint(data, len);
+
+        sort[i64](data, len);
+        if (!is_sorted[i64](data, len))                             { ret 3; }
+        if (!same_fingerprint(before_sort, fingerprint(data, len))) { ret 5; }
+
+        sort_by[i64](copy, len, cmp_desc);
+        if (!is_sorted_by[i64](copy, len, cmp_desc)) { ret 6; }
+        i = 0;
+        for (i < len) {
+            if (copy[len - 1 - i] != data[i]) { ret 7; }
+            i = i + 1;
+        }
+
+        sort_stable[i64](stable, len, scratch);
+        i = 0;
+        for (i < len) {
+            if (stable[i] != data[i]) { ret 8; }
+            i = i + 1;
+        }
+
+        allocator.deallocate[i64](a, data, need);
+        allocator.deallocate[i64](a, copy, need);
+        allocator.deallocate[i64](a, stable, need);
+        allocator.deallocate[i64](a, scratch, need);
+        ret 0;
+    }
+
+    test "sort: every shape sorts as a permutation from 0 to 1e5 elements" {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var s: u64 = 0x9E3779B97F4A7C15;
+
+        var lens: [12]usize = [12]usize{0, 1, 2, 3, 23, 24, 25, 100, 128, 129, 1000, 100000};
+        var li:   usize     = 0;
+        for (li < 12) {
+            var shape: u64 = 0;
+            for (shape < 7) {
+                val code: i32 = check_case(?a, lens[li], shape, ?s);
+                if (code != 0) { ret code * 100 + li::i32 * 10 + shape::i32; }
+                shape = shape + 1;
+            }
+            li = li + 1;
+        }
+
+        var extra: usize = 0;
+        for (extra < 200) {
+            val len:  usize = (step(?s) % 3000)::usize;
+            val code: i32   = check_case(?a, len, step(?s) % 7, ?s);
+            if (code != 0) { ret code; }
+            extra = extra + 1;
+        }
+        ret 0;
+    }
+
+    rec Keyed { key: i64; seq: i64; }
+
+    fun cmp_key(a: *Keyed, b: *Keyed) i64 {
+        if (a.key < b.key) { ret -1; }
+        if (a.key > b.key) { ret 1; }
+        ret 0;
+    }
+
+    test "sort: sort_stable keeps the input order of equal keys" {
+        var a: allocator.Allocator;
+        page.make(?a);
+        val len: usize                        = 5000;
+        val r1:  res[*Keyed, allocator.Error] = allocator.allocate[Keyed](?a, len);
+        if (sel r1.err) { ret 1; }
+        val r2: res[*Keyed, allocator.Error] = allocator.allocate[Keyed](?a, len);
+        if (sel r2.err) { ret 1; }
+        val data:    *Keyed = r1.ok;
+        val scratch: *Keyed = r2.ok;
+
+        var s: u64   = 12345;
+        var i: usize = 0;
+        for (i < len) {
+            data[i] = Keyed{key: (step(?s) % 16)::i64, seq: i::i64};
+            i       = i + 1;
+        }
+        sort_stable_by[Keyed](data, len, scratch, cmp_key);
+        i = 1;
+        for (i < len) {
+            if (data[i].key < data[i - 1].key)                                   { ret 2; }
+            if (data[i].key == data[i - 1].key && data[i].seq < data[i - 1].seq) { ret 3; }
+            i = i + 1;
+        }
+        allocator.deallocate[Keyed](?a, data, len);
+        allocator.deallocate[Keyed](?a, scratch, len);
+        ret 0;
+    }
+
+    fun cmp_bad(a: *i64, b: *i64) i64 {
+        ret 1;
+    }
+
+    test "sort: a contradictory comparator leaves a permutation and stays in bounds" {
+        var a: allocator.Allocator;
+        page.make(?a);
+        val len: usize                      = 4096;
+        val r1:  res[*i64, allocator.Error] = allocator.allocate[i64](?a, len);
+        if (sel r1.err) { ret 1; }
+        val data: *i64  = r1.ok;
+        var s:    u64   = 777;
+        var i:    usize = 0;
+        for (i < len) {
+            data[i] = (step(?s) % 1000)::i64;
+            i       = i + 1;
+        }
+        val before_sort: Fingerprint = fingerprint(data, len);
+        sort_by[i64](data, len, cmp_bad);
+        if (!same_fingerprint(before_sort, fingerprint(data, len))) { ret 3; }
+        allocator.deallocate[i64](?a, data, len);
+        ret 0;
+    }
+}
+
+test "sort: records sort by their natural lexicographic order" {
+    var data: [4]Pt;
+    data[0] = Pt{x: 2, y: 1};
+    data[1] = Pt{x: 1, y: 9};
+    data[2] = Pt{x: 1, y: 2};
+    data[3] = Pt{x: 0, y: 5};
+    sort[Pt](?data[0], 4);
+    if (data[0].x != 0)                   { ret 1; }
+    if (data[1].x != 1 || data[1].y != 2) { ret 1; }
+    if (data[2].x != 1 || data[2].y != 9) { ret 1; }
+    if (data[3].x != 2)                   { ret 1; }
+    ret 0;
+}
+
+test "sort: strings sort by content" {
+    var data: [3]str;
+    data[0] = "pear";
+    data[1] = "apple";
+    data[2] = "fig";
+    sort[str](?data[0], 3);
+    if (!str_equals(data[0], "apple")) { ret 1; }
+    if (!str_equals(data[1], "fig"))   { ret 1; }
+    if (!str_equals(data[2], "pear"))  { ret 1; }
+    val t: str            = "fig";
+    val r: SearchPosition = binary_search[str](?data[0], 3, ?t);
+    if (!sel r.found) { ret 1; }
+    if (r.found != 1) { ret 1; }
+    ret 0;
+}
+
+test "sort: binary_search finds the first of equal elements" {
+    var data: [6]i64;
+    data[0] = 1;
+    data[1] = 3;
+    data[2] = 3;
+    data[3] = 3;
+    data[4] = 5;
+    data[5] = 9;
+    val t: i64            = 3;
+    val r: SearchPosition = binary_search[i64](?data[0], 6, ?t);
+    if (!sel r.found) { ret 1; }
+    if (r.found != 1) { ret 1; }
+    val u: i64            = 10;
+    val q: SearchPosition = binary_search[i64](?data[0], 6, ?u);
+    if (!sel q.insertion) { ret 1; }
+    if (q.insertion != 6) { ret 1; }
+    ret 0;
+}
+
+rec Pt { x: i64; y: i64; }

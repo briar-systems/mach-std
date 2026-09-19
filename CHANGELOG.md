@@ -7,6 +7,107 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.0.0] - 2026-09-19
+
+std 6.0.0 keeps `mach = "^5.8"`; nothing in it needs 5.9. Every removed or
+changed signature below is a compile-time refusal at the caller, so a
+program that builds against 6.0.0 has already moved. Three changes can
+newly fail or differ at run time in code that already compiles:
+
+- `buffers.open_account` and the source forms refuse, as counted misuse
+  with the trap fired, a `Budgets` whose `lanes` differs from the pool's.
+- `sort.binary_search` reports the first of several equal elements, where
+  5.x reported whichever the probe met.
+- The hash of a `str`, an integer or a record key is a different value:
+  `natural.hash` is not the 5.x `map.hash_*`, and hashes were never stable
+  across std versions.
+
+### Added
+
+- `std.collections.natural`: the natural order, equality and hash of a type,
+  resolved at compile time. `less[T]`, `eq[T]` and `hash[T]` use the operator
+  on integers and floats, content on `str`, and a lexicographic walk over a
+  record's fields in declaration order (nested records descended); a pointer,
+  union, tag, array, vector or `^` secret is refused at compile time with a
+  written message. Every collection that orders or hashes reads this module
+  (#655).
+- `sort.sort_stable[T](data, len, scratch)` and `sort_stable_by`: a stable
+  merge sort over a caller-supplied scratch buffer of `len / 2` elements,
+  with no allocation (#655).
+- `sort.sort_by`, `sort.is_sorted_by`, `sort.binary_search_by`: the
+  comparator-taking forms of the three, with the comparator called through
+  its pointer per comparison (#655).
+- `heap.HeapBy[T]` with `init_by(alloc, cmp)` and the `_by` operations: a
+  heap ordered by a stored comparator, called through its pointer per
+  comparison, the spelling for an order the element type does not carry
+  (#659).
+- `map.MapBy[K, V]` and `set.SetBy[K]` with `init_by(alloc, hash_fn, eq_fn)`
+  and the `_by` operations: a map or set keyed by stored, typed functions
+  (`fun(*K) u64`, `fun(*K, *K) bool`), called through their pointers per
+  probe, the spelling for a key the type does not carry a hash or equality
+  for (#656).
+- `std.crypto.ct.is_zero[T]`, `eq[T]`, `lt[T]` and `gt[T]`: the four
+  comparison families as one generic each over `^T`, each `#[oblivious]` and
+  `#[inline]`. Every instance is validated constant-time on its own, and the
+  release lowering of each width is unchanged instruction for instruction on
+  x86_64 and aarch64 (#660).
+
+### Changed
+
+- **Breaking.** `sort.sort`, `sort.is_sorted` and `sort.binary_search` no
+  longer take a comparator: they order by `natural.less[T]`, so the compare in
+  the emitted loop is the operator on `T` and no call is made per comparison.
+  A caller with a comparator moves to the `_by` form (MIGRATION.md) (#655).
+- `sort.sort` is pattern-defeating quicksort instead of Shell sort: O(n log n)
+  worst case, insertion sort below 24 elements, a bounded insertion pass that
+  confirms an already sorted range, an equal-elements partition, and a
+  heapsort fallback after log2(n) bad partitions. Every scan is bounded by
+  the range, so a comparator that contradicts itself leaves a permutation and
+  never reads out of bounds. Sorting one million random `i64` drops from
+  1148 ms to 85 ms by the natural order and 112 ms through a comparator
+  (#655).
+- `sort.binary_search` reports the first of several equal elements as `found`
+  (#655).
+- **Breaking.** `heap.Heap[T]` is `heap.Heap[T, D]` with `D` one of
+  `heap.Min` or `heap.Max`, ordered by `natural.less[T]`. The `cmp` field and
+  `init`'s `cmp` argument are gone, and every operation takes `[T, D]`. The
+  sift compares with the operator on `T` directly: `push` and `pop` on a
+  `Heap[i64, Min]` contain no indirect call in release output. A comparator
+  moves to `HeapBy[T]` (MIGRATION.md). Pushing and popping one million
+  random `i64` drops from 223 ms to 171 ms, and one thousand from 49 ns to
+  26 ns per operation (#659).
+- **Breaking.** `map.Map[K, V]` and `set.Set[K]` key by the natural hash and
+  equality of `K`: `init` takes only the allocator, the `hash_fn`/`eq_fn`
+  fields are gone, and so are the `ptr`-typed helpers `map.hash_str`,
+  `eq_str`, `hash_i64`, `eq_i64`, `hash_u64`, `eq_u64`, `hash_u32`, `eq_u32`.
+  A custom key moves to `MapBy` / `SetBy` (MIGRATION.md) (#656).
+- The map probes over control bytes and masks instead of dividing: capacity
+  is a power of two, the slot for a hash and every probe step is a mask, and
+  one control byte per slot holds emptiness, deletion, or seven bits of the
+  key's hash, so a mismatch is rejected without touching the key buffer.
+  `find_slot` for a `Map[u64, u64]` contains no divide and no call of any
+  kind in release output. Strings hash eight bytes at a time. Looking up one
+  hundred thousand `u64` keys drops from 29 ns to 19 ns per hit and from
+  21 ns to 15 ns per miss, one million from 39 ns to 28 ns per hit (#656).
+- **Breaking.** `buffers.open_account`, `source_open_account` and
+  `secret_source_open_account` take the per-lane budgets as a
+  `buffers.Budgets` value (`lanes` plus `[8]usize` bytes) instead of a
+  `*usize` the pool read `lanes` entries from, and `Source.fn_open_account`
+  / `SecretSource.fn_open_account` change to match. A `lanes` that differs
+  from the pool's is refused as counted misuse with the trap fired, so a
+  short budget array can no longer be read past its end (#804) and a count
+  mismatch is a loud refusal at open rather than lanes silently opened with
+  budget 0 (MIGRATION.md) (#807).
+
+### Removed
+
+- **Breaking.** The twenty width-named constant-time comparisons in
+  `std.crypto.ct`, `is_zero_u8`/`u16`/`u32`/`u64`/`usize`, `eq_*`, `lt_*`
+  and `gt_*`. #660 (above) made each the generic at one width; the generic
+  is the surface: `ct.lt_u32(a, b)` becomes `ct.lt[u32](a, b)`, and
+  likewise for the other nineteen. Every instance lowers, in release, to the
+  same instructions the removed function did, on x86_64 and aarch64 (#839).
+
 ## [5.8.0] - 2026-09-19
 
 std now requires mach 5.8.0 (`mach = "^5.8"`): every aarch64-linux and

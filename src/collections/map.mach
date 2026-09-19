@@ -1,7 +1,36 @@
-# generic hash map using open addressing with linear probing
+# generic hash map, open addressing with linear probing over control bytes
 #
-# keys and values are stored in parallel arrays. a separate "state" array tracks
-# which slots are empty, occupied, or tombstones (deleted).
+# THE KEY CONTRACT. `Map[K, V]` hashes and compares its keys by the key type's
+# natural equality and hash, `std.collections.natural.eq[K]` and `hash[K]`,
+# resolved at compile time: an integer key hashes with a multiply-xorshift
+# mixer and compares with `==`, a `str` key by content, a record key field by
+# field. nothing is stored in the record and no call is made per probe.
+# `MapBy[K, V]` is the spelling for a key the type does not carry a hash or
+# equality for: it stores the two functions and calls them through their
+# pointers, so a reader can tell from the type name whether a probe is direct
+# or indirect. they are runtime values because mach cannot yet take a
+# function as a comptime parameter of a generic (briar-systems/mach#3706,
+# #3707).
+#
+# THE LAYOUT. three buffers of `cap` slots: keys, values, and one control
+# byte per slot. a control byte is `EMPTY`, `DELETED` (a tombstone), or the
+# top seven bits of the key's hash with the high bit clear, which marks the
+# slot full. a probe compares control bytes first, so a mismatch is rejected
+# without touching the key buffer, and a miss on a full table walks one byte
+# per slot. this is the groundwork for matching a group of control bytes at
+# once with a vector compare; the byte layout is what that needs and it costs
+# nothing to adopt now.
+#
+# capacity is always a power of two, so the slot for a hash and every probe
+# step is a mask rather than a divide. the invariant is asserted where the
+# capacity is set.
+#
+# one core serves the two records: each carries a zero-size `policy` field,
+# the public entry point hands its value to the core, and the core is
+# generic over the record and the policy and dispatches on `$type_of(p)`, the
+# same shape `sort` and `heap` use. every routine in the core, the two
+# one-line policy readers included, is generic over exactly `[K, V, M, P]` in
+# that order, so a call from one to another forwards the whole list unchanged.
 
 use std.system.capability;
 use std.types.bool.bool;
@@ -12,9 +41,9 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.string.str_equals;
 
 use std.allocator;
+use std.collections.natural;
 
 $if (capability.HOSTED) {
     use std.allocator.page;
@@ -23,48 +52,98 @@ $if (capability.HOSTED) {
 
 use std.memory;
 
-val SLOT_EMPTY:     u8 = 0;
-val SLOT_OCCUPIED:  u8 = 1;
-val SLOT_TOMBSTONE: u8 = 2;
+# control byte of a slot that has never held a key
+val EMPTY: u8 = 0x80;
 
-val DEFAULT_CAPACITY:    usize = 16;
+# control byte of a slot whose key was removed
+val DELETED: u8 = 0xFE;
+
+# the smallest capacity a map grows to
+val DEFAULT_CAPACITY: usize = 16;
+
+# the map grows when full and deleted slots pass this share of the capacity
 val LOAD_FACTOR_PERCENT: usize = 70;
 
-# generic hash map with user-provided hash and equality functions
+# the policy of `Map`: the natural hash and equality of `K`
+rec Natural {}
+
+# the policy of `MapBy`: stored functions
+rec Custom {}
+
+# a map keyed by the natural hash and equality of `K`
 # ---
 # alloc:      allocator for backing storage
 # keys:       key buffer
 # values:     value buffer
-# states:     per-slot state (empty/occupied/tombstone)
+# ctrl:       one control byte per slot
 # len:        number of entries
-# tombstones: number of tombstone slots
-# cap:        total slot count
-# hash_fn:    hash function taking a ptr, returning u64
-# eq_fn:      equality function taking two ptrs, returning bool
+# tombstones: number of deleted slots
+# cap:        total slot count, a power of two or zero
+# policy:     the policy, a zero-size marker
 pub rec Map[K, V] {
     alloc:      *allocator.Allocator;
     keys:       *K;
     values:     *V;
-    states:     *u8;
+    ctrl:       *u8;
     len:        usize;
     tombstones: usize;
     cap:        usize;
-    hash_fn:    fun(ptr) u64;
-    eq_fn:      fun(ptr, ptr) bool;
+    policy:     Natural;
 }
 
-# create an empty map
+# a map keyed by caller-supplied hash and equality functions
 # ---
-# alloc:   allocator to use for backing storage
-# hash_fn: hash function for keys
-# eq_fn:   equality function for keys
-# ret:     a new empty Map[K, V]
-pub fun init[K, V](alloc: *allocator.Allocator, hash_fn: fun(ptr) u64, eq_fn: fun(ptr, ptr) bool) Map[K, V] {
+# alloc:      allocator for backing storage
+# keys:       key buffer
+# values:     value buffer
+# ctrl:       one control byte per slot
+# len:        number of entries
+# tombstones: number of deleted slots
+# cap:        total slot count, a power of two or zero
+# policy:     the policy, a zero-size marker
+# hash_fn:    hash function over a key
+# eq_fn:      equality function over two keys
+pub rec MapBy[K, V] {
+    alloc:      *allocator.Allocator;
+    keys:       *K;
+    values:     *V;
+    ctrl:       *u8;
+    len:        usize;
+    tombstones: usize;
+    cap:        usize;
+    policy:     Custom;
+    hash_fn:    fun(*K) u64;
+    eq_fn:      fun(*K, *K) bool;
+}
+
+# create an empty map keyed by the natural hash and equality of `K`
+# ---
+# alloc: allocator to use for backing storage
+# ret:   a new empty Map[K, V]
+pub fun init[K, V](alloc: *allocator.Allocator) Map[K, V] {
     var m: Map[K, V];
     m.alloc      = alloc;
     m.keys       = nil;
     m.values     = nil;
-    m.states     = nil;
+    m.ctrl       = nil;
+    m.len        = 0;
+    m.tombstones = 0;
+    m.cap        = 0;
+    ret m;
+}
+
+# create an empty map keyed by the given functions
+# ---
+# alloc:   allocator to use for backing storage
+# hash_fn: hash function over a key
+# eq_fn:   equality function over two keys
+# ret:     a new empty MapBy[K, V]
+pub fun init_by[K, V](alloc: *allocator.Allocator, hash_fn: fun(*K) u64, eq_fn: fun(*K, *K) bool) MapBy[K, V] {
+    var m: MapBy[K, V];
+    m.alloc      = alloc;
+    m.keys       = nil;
+    m.values     = nil;
+    m.ctrl       = nil;
     m.len        = 0;
     m.tombstones = 0;
     m.cap        = 0;
@@ -82,38 +161,23 @@ pub fun init[K, V](alloc: *allocator.Allocator, hash_fn: fun(ptr) u64, eq_fn: fu
 # ret: ok when every buffer was released (or there were none), or the first
 #      refusal
 pub fun dnit[K, V](m: *Map[K, V]) err[allocator.Error] {
-    if (m == nil) { ret err[allocator.Error].ok{}; }
-    if (m.cap == 0) {
-        m.keys       = nil;
-        m.values     = nil;
-        m.states     = nil;
-        m.len        = 0;
-        m.tombstones = 0;
-        ret err[allocator.Error].ok{};
-    }
+    ret core_dnit[K, V, Map[K, V]](m);
+}
 
-    var first:  err[allocator.Error] = err[allocator.Error].ok{};
-    val keys_r: err[allocator.Error] = allocator.deallocate[K](m.alloc, m.keys, m.cap);
-    if (sel keys_r.err) { first = keys_r; }
-    val values_r: err[allocator.Error] = allocator.deallocate[V](m.alloc, m.values, m.cap);
-    if (sel values_r.err && sel first.ok) { first = values_r; }
-    val states_r: err[allocator.Error] = allocator.deallocate[u8](m.alloc, m.states, m.cap);
-    if (sel states_r.err && sel first.ok) { first = states_r; }
-
-    m.keys       = nil;
-    m.values     = nil;
-    m.states     = nil;
-    m.len        = 0;
-    m.tombstones = 0;
-    m.cap        = 0;
-
-    ret first;
+# free all backing storage of a `MapBy`; see `dnit`
+pub fun dnit_by[K, V](m: *MapBy[K, V]) err[allocator.Error] {
+    ret core_dnit[K, V, MapBy[K, V]](m);
 }
 
 # check if the map has no entries
 # ---
 # ret: true if the map has no entries
 pub fun is_empty[K, V](m: Map[K, V]) bool {
+    ret m.len == 0;
+}
+
+# check if a `MapBy` has no entries; see `is_empty`
+pub fun is_empty_by[K, V](m: MapBy[K, V]) bool {
     ret m.len == 0;
 }
 
@@ -124,6 +188,11 @@ pub fun length[K, V](m: Map[K, V]) usize {
     ret m.len;
 }
 
+# return the number of entries in a `MapBy`; see `length`
+pub fun length_by[K, V](m: MapBy[K, V]) usize {
+    ret m.len;
+}
+
 # return the current capacity in slots
 # ---
 # ret: capacity in slots
@@ -131,163 +200,19 @@ pub fun capacity[K, V](m: Map[K, V]) usize {
     ret m.cap;
 }
 
+# return the current capacity of a `MapBy` in slots; see `capacity`
+pub fun capacity_by[K, V](m: MapBy[K, V]) usize {
+    ret m.cap;
+}
+
 # remove all entries but keep allocated capacity
 pub fun clear[K, V](m: *Map[K, V]) {
-    if (m == nil || m.cap == 0) { ret; }
-    memory.raw_fill(m.states::ptr, SLOT_EMPTY, m.cap);
-    m.len        = 0;
-    m.tombstones = 0;
+    core_clear[K, V, Map[K, V]](m);
 }
 
-# locate the slot for a key, or the first available slot
-# ---
-# key: pointer to the key to find
-# ret: (idx, found) where found indicates an exact match
-fun find_slot[K, V](m: *Map[K, V], key: *K) rec { idx: usize; found: bool; }
-{
-    var result: rec { idx: usize; found: bool; };
-    result.found = false;
-    result.idx   = 0;
-
-    if (m.cap == 0) { ret result; }
-
-    val hash:            u64   = m.hash_fn(key::ptr);
-    var idx:             usize = hash % m.cap;
-    var first_tombstone: usize = m.cap;
-
-    var probes: usize = 0;
-    for (probes < m.cap) {
-        val state: u8 = m.states[idx];
-
-        if (state == SLOT_EMPTY) {
-            if (first_tombstone < m.cap) {
-                result.idx = first_tombstone;
-            }
-            or {
-                result.idx = idx;
-            }
-            ret result;
-        }
-
-        if (state == SLOT_TOMBSTONE) {
-            if (first_tombstone >= m.cap) {
-                first_tombstone = idx;
-            }
-        }
-
-        if (state == SLOT_OCCUPIED) {
-            if (m.eq_fn(key::ptr, (?m.keys[idx])::ptr)) {
-                result.idx   = idx;
-                result.found = true;
-                ret result;
-            }
-        }
-
-        idx    = (idx + 1) % m.cap;
-        probes = probes + 1;
-    }
-
-    if (first_tombstone < m.cap) {
-        result.idx = first_tombstone;
-    }
-    or {
-        result.idx = 0;
-    }
-    ret result;
-}
-
-# resize the map and rehash all entries
-#
-# the three new buffers are acquired before anything is moved, so a refusal
-# part way through releases what was acquired and leaves the map as it was.
-# ---
-# new_cap: target capacity
-# ret:     the new capacity, or the allocator's refusal
-fun grow[K, V](m: *Map[K, V], new_cap: usize) res[usize, allocator.Error] {
-    if (new_cap < m.cap) {
-        ret res[usize, allocator.Error].ok{m.cap};
-    }
-
-    val keys_r: res[*K, allocator.Error] = allocator.allocate[K](m.alloc, new_cap);
-    if (sel keys_r.err) { ret res[usize, allocator.Error].err{keys_r.err}; }
-    val new_keys: *K = keys_r.ok;
-
-    val values_r: res[*V, allocator.Error] = allocator.allocate[V](m.alloc, new_cap);
-    if (sel values_r.err) {
-        allocator.deallocate[K](m.alloc, new_keys, new_cap);
-        ret res[usize, allocator.Error].err{values_r.err};
-    }
-    val new_values: *V = values_r.ok;
-
-    val states_r: res[*u8, allocator.Error] = allocator.zallocate[u8](m.alloc, new_cap);
-    if (sel states_r.err) {
-        allocator.deallocate[K](m.alloc, new_keys, new_cap);
-        allocator.deallocate[V](m.alloc, new_values, new_cap);
-        ret res[usize, allocator.Error].err{states_r.err};
-    }
-    val new_states: *u8 = states_r.ok;
-
-    val old_keys:   *K    = m.keys;
-    val old_values: *V    = m.values;
-    val old_states: *u8   = m.states;
-    val old_cap:    usize = m.cap;
-
-    m.keys       = new_keys;
-    m.values     = new_values;
-    m.states     = new_states;
-    m.cap        = new_cap;
-    m.len        = 0;
-    m.tombstones = 0;
-
-    if (old_cap > 0) {
-        var i: usize = 0;
-        for (i < old_cap) {
-            if (old_states[i] == SLOT_OCCUPIED) {
-                val hash: u64   = m.hash_fn((?old_keys[i])::ptr);
-                var idx:  usize = hash % new_cap;
-
-                for (m.states[idx] != SLOT_EMPTY) {
-                    idx = (idx + 1) % new_cap;
-                }
-
-                m.keys[idx]   = old_keys[i];
-                m.values[idx] = old_values[i];
-                m.states[idx] = SLOT_OCCUPIED;
-                m.len         = m.len + 1;
-            }
-            i = i + 1;
-        }
-
-        allocator.deallocate[K](m.alloc, old_keys, old_cap);
-        allocator.deallocate[V](m.alloc, old_values, old_cap);
-        allocator.deallocate[u8](m.alloc, old_states, old_cap);
-    }
-
-    ret res[usize, allocator.Error].ok{new_cap};
-}
-
-# ensure room for at least one more entry
-# ---
-# ret: the current capacity, or the allocator's refusal
-fun ensure_capacity[K, V](m: *Map[K, V]) res[usize, allocator.Error] {
-    if (m.cap == 0) {
-        ret grow[K, V](m, DEFAULT_CAPACITY);
-    }
-
-    val threshold: usize = (m.cap * LOAD_FACTOR_PERCENT) / 100;
-    if ((m.len + m.tombstones) >= threshold) {
-        val new_cap: usize = m.cap * 2;
-        if (new_cap < m.cap) {
-            ret res[usize, allocator.Error].err{allocator.Error.overflow{}};
-        }
-        ret grow[K, V](m, new_cap);
-    }
-
-    if (m.tombstones > m.len) {
-        ret grow[K, V](m, m.cap);
-    }
-
-    ret res[usize, allocator.Error].ok{m.cap};
+# remove all entries of a `MapBy` but keep allocated capacity; see `clear`
+pub fun clear_by[K, V](m: *MapBy[K, V]) {
+    core_clear[K, V, MapBy[K, V]](m);
 }
 
 # insert or update a key-value pair
@@ -302,26 +227,12 @@ fun ensure_capacity[K, V](m: *Map[K, V]) res[usize, allocator.Error] {
 # ret:   true if a new entry was inserted, false if an existing entry was
 #        updated, or the allocator's refusal
 pub fun insert[K, V](m: *Map[K, V], key: K, value: V) res[bool, allocator.Error] {
-    if (m == nil) { ret res[bool, allocator.Error].err{allocator.Error.invalid{}}; }
-    val room: res[usize, allocator.Error] = ensure_capacity[K, V](m);
-    if (sel room.err) { ret res[bool, allocator.Error].err{room.err}; }
+    ret core_insert[K, V, Map[K, V], Natural](m, m.policy, key, value);
+}
 
-    val slot: rec { idx: usize; found: bool; } = find_slot[K, V](m, ?key);
-
-    if (slot.found) {
-        m.values[slot.idx] = value;
-        ret res[bool, allocator.Error].ok{false};
-    }
-
-    if (m.states[slot.idx] == SLOT_TOMBSTONE) {
-        m.tombstones = m.tombstones - 1;
-    }
-    m.keys[slot.idx]   = key;
-    m.values[slot.idx] = value;
-    m.states[slot.idx] = SLOT_OCCUPIED;
-    m.len              = m.len + 1;
-
-    ret res[bool, allocator.Error].ok{true};
+# insert or update a key-value pair in a `MapBy`; see `insert`
+pub fun insert_by[K, V](m: *MapBy[K, V], key: K, value: V) res[bool, allocator.Error] {
+    ret core_insert[K, V, MapBy[K, V], Custom](m, m.policy, key, value);
 }
 
 # get a pointer to the value associated with a key
@@ -331,13 +242,12 @@ pub fun insert[K, V](m: *Map[K, V], key: K, value: V) res[bool, allocator.Error]
 # key: pointer to the key to look up
 # ret: pointer to the value, or none when the key is absent
 pub fun get[K, V](m: *Map[K, V], key: *K) opt[*V] {
-    if (m == nil)   { ret opt[*V].none{}; }
-    if (m.cap == 0) { ret opt[*V].none{}; }
+    ret core_get[K, V, Map[K, V], Natural](m, m.policy, key);
+}
 
-    val slot: rec { idx: usize; found: bool; } = find_slot[K, V](m, key);
-    if (!slot.found) { ret opt[*V].none{}; }
-
-    ret opt[*V].some{?m.values[slot.idx]};
+# get a pointer to the value for a key in a `MapBy`; see `get`
+pub fun get_by[K, V](m: *MapBy[K, V], key: *K) opt[*V] {
+    ret core_get[K, V, MapBy[K, V], Custom](m, m.policy, key);
 }
 
 # check if the map contains a key
@@ -345,10 +255,12 @@ pub fun get[K, V](m: *Map[K, V], key: *K) opt[*V] {
 # key: pointer to the key to check
 # ret: true if the key exists
 pub fun contains[K, V](m: *Map[K, V], key: *K) bool {
-    if (m == nil)   { ret false; }
-    if (m.cap == 0) { ret false; }
-    val slot: rec { idx: usize; found: bool; } = find_slot[K, V](m, key);
-    ret slot.found;
+    ret core_contains[K, V, Map[K, V], Natural](m, m.policy, key);
+}
+
+# check if a `MapBy` contains a key; see `contains`
+pub fun contains_by[K, V](m: *MapBy[K, V], key: *K) bool {
+    ret core_contains[K, V, MapBy[K, V], Custom](m, m.policy, key);
 }
 
 # remove a key-value pair from the map
@@ -360,110 +272,300 @@ pub fun contains[K, V](m: *Map[K, V], key: *K) bool {
 # key: pointer to the key to remove
 # ret: true if removed, false if the key was not found
 pub fun remove[K, V](m: *Map[K, V], key: *K) bool {
+    ret core_remove[K, V, Map[K, V], Natural](m, m.policy, key);
+}
+
+# remove a key-value pair from a `MapBy`; see `remove`
+pub fun remove_by[K, V](m: *MapBy[K, V], key: *K) bool {
+    ret core_remove[K, V, MapBy[K, V], Custom](m, m.policy, key);
+}
+
+# the hash of a key under the map's policy
+#[inline]
+fun hash_key[K, V, M, P](m: *M, p: P, key: *K) u64 {
+    $if ($type_of(p) == Natural) { ret natural.hash[K](key); }
+    $or ($type_of(p) == Custom)  { ret m.hash_fn(key); }
+    $or                          { $error("std.collections.map: the policy must be Natural or Custom"); }
+}
+
+# whether two keys are equal under the map's policy
+#[inline]
+fun keys_equal[K, V, M, P](m: *M, p: P, a: *K, b: *K) bool {
+    $if ($type_of(p) == Natural) { ret natural.eq[K](a, b); }
+    $or ($type_of(p) == Custom)  { ret m.eq_fn(a, b); }
+    $or                          { $error("std.collections.map: the policy must be Natural or Custom"); }
+}
+
+# the control byte a full slot holding this hash carries
+#[inline]
+fun h2_of(hash: u64) u8 {
+    ret (hash & 0x7F)::u8;
+}
+
+# the first slot the probe for this hash visits
+#[inline]
+fun home_of(hash: u64, cap: usize) usize {
+    ret ((hash >> 7)::usize) & (cap - 1);
+}
+
+fun core_dnit[K, V, M](m: *M) err[allocator.Error] {
+    if (m == nil) { ret err[allocator.Error].ok{}; }
+    if (m.cap == 0) {
+        m.keys       = nil;
+        m.values     = nil;
+        m.ctrl       = nil;
+        m.len        = 0;
+        m.tombstones = 0;
+        ret err[allocator.Error].ok{};
+    }
+
+    var first:  err[allocator.Error] = err[allocator.Error].ok{};
+    val keys_r: err[allocator.Error] = allocator.deallocate[K](m.alloc, m.keys, m.cap);
+    if (sel keys_r.err) { first = keys_r; }
+    val values_r: err[allocator.Error] = allocator.deallocate[V](m.alloc, m.values, m.cap);
+    if (sel values_r.err && sel first.ok) { first = values_r; }
+    val ctrl_r: err[allocator.Error] = allocator.deallocate[u8](m.alloc, m.ctrl, m.cap);
+    if (sel ctrl_r.err && sel first.ok) { first = ctrl_r; }
+
+    m.keys       = nil;
+    m.values     = nil;
+    m.ctrl       = nil;
+    m.len        = 0;
+    m.tombstones = 0;
+    m.cap        = 0;
+
+    ret first;
+}
+
+fun core_clear[K, V, M](m: *M) {
+    if (m == nil || m.cap == 0) { ret; }
+    memory.raw_fill(m.ctrl::ptr, EMPTY, m.cap);
+    m.len        = 0;
+    m.tombstones = 0;
+}
+
+# where a probe ended: the slot, and whether it holds the key. the caller owns
+# it and `find_slot` fills it in place.
+rec Slot {
+    idx:   usize;
+    found: bool;
+}
+
+# locate the slot for a key, or the slot an insert of it would take
+#
+# a full slot is compared by control byte before its key is read. the first
+# tombstone met is remembered so an insert reuses it, and an empty slot ends
+# the probe. the walk is bounded by the capacity, so a table with no empty
+# slot (which the load factor prevents) still terminates.
+# ---
+# key: pointer to the key to find
+# out: the slot, with `found` set when it holds the key
+fun find_slot[K, V, M, P](m: *M, p: P, key: *K, out: *Slot) {
+    out.idx   = 0;
+    out.found = false;
+    if (m.cap == 0) { ret; }
+
+    val hash: u64   = hash_key[K, V, M, P](m, p, key);
+    val h2:   u8    = h2_of(hash);
+    val mask: usize = m.cap - 1;
+    var idx:  usize = home_of(hash, m.cap);
+
+    var first_tombstone: usize = m.cap;
+    var probes:          usize = 0;
+    for (probes < m.cap) {
+        val c: u8 = m.ctrl[idx];
+
+        if (c == h2) {
+            if (keys_equal[K, V, M, P](m, p, key, ?m.keys[idx])) {
+                out.idx   = idx;
+                out.found = true;
+                ret;
+            }
+        }
+        or (c == EMPTY) {
+            if (first_tombstone < m.cap) {
+                out.idx = first_tombstone;
+            }
+            or {
+                out.idx = idx;
+            }
+            ret;
+        }
+        or (c == DELETED) {
+            if (first_tombstone >= m.cap) {
+                first_tombstone = idx;
+            }
+        }
+
+        idx    = (idx + 1) & mask;
+        probes = probes + 1;
+    }
+
+    if (first_tombstone < m.cap) {
+        out.idx = first_tombstone;
+    }
+}
+
+# resize the map and rehash all entries
+#
+# the three new buffers are acquired before anything is moved, so a refusal
+# part way through releases what was acquired and leaves the map as it was.
+# the new table has no tombstones, so the rehash probes only for empty slots.
+# ---
+# new_cap: target capacity, a power of two
+# ret:     the new capacity, or the allocator's refusal
+fun grow[K, V, M, P](m: *M, p: P, new_cap: usize) res[usize, allocator.Error] {
+    if (new_cap < m.cap) {
+        ret res[usize, allocator.Error].ok{m.cap};
+    }
+    if ((new_cap & (new_cap - 1)) != 0) {
+        ret res[usize, allocator.Error].err{allocator.Error.invalid{}};
+    }
+
+    val keys_r: res[*K, allocator.Error] = allocator.allocate[K](m.alloc, new_cap);
+    if (sel keys_r.err) { ret res[usize, allocator.Error].err{keys_r.err}; }
+    val new_keys: *K = keys_r.ok;
+
+    val values_r: res[*V, allocator.Error] = allocator.allocate[V](m.alloc, new_cap);
+    if (sel values_r.err) {
+        allocator.deallocate[K](m.alloc, new_keys, new_cap);
+        ret res[usize, allocator.Error].err{values_r.err};
+    }
+    val new_values: *V = values_r.ok;
+
+    val ctrl_r: res[*u8, allocator.Error] = allocator.allocate[u8](m.alloc, new_cap);
+    if (sel ctrl_r.err) {
+        allocator.deallocate[K](m.alloc, new_keys, new_cap);
+        allocator.deallocate[V](m.alloc, new_values, new_cap);
+        ret res[usize, allocator.Error].err{ctrl_r.err};
+    }
+    val new_ctrl: *u8 = ctrl_r.ok;
+    memory.raw_fill(new_ctrl::ptr, EMPTY, new_cap);
+
+    val old_keys:   *K    = m.keys;
+    val old_values: *V    = m.values;
+    val old_ctrl:   *u8   = m.ctrl;
+    val old_cap:    usize = m.cap;
+
+    m.keys       = new_keys;
+    m.values     = new_values;
+    m.ctrl       = new_ctrl;
+    m.cap        = new_cap;
+    m.len        = 0;
+    m.tombstones = 0;
+
+    if (old_cap > 0) {
+        val mask: usize = new_cap - 1;
+        var i:    usize = 0;
+        for (i < old_cap) {
+            if ((old_ctrl[i] & 0x80) == 0) {
+                val hash: u64   = hash_key[K, V, M, P](m, p, ?old_keys[i]);
+                var idx:  usize = home_of(hash, new_cap);
+                for (m.ctrl[idx] != EMPTY) {
+                    idx = (idx + 1) & mask;
+                }
+                m.keys[idx]   = old_keys[i];
+                m.values[idx] = old_values[i];
+                m.ctrl[idx]   = h2_of(hash);
+                m.len         = m.len + 1;
+            }
+            i = i + 1;
+        }
+
+        allocator.deallocate[K](m.alloc, old_keys, old_cap);
+        allocator.deallocate[V](m.alloc, old_values, old_cap);
+        allocator.deallocate[u8](m.alloc, old_ctrl, old_cap);
+    }
+
+    ret res[usize, allocator.Error].ok{new_cap};
+}
+
+# ensure room for at least one more entry
+# ---
+# ret: the current capacity, or the allocator's refusal
+fun ensure_capacity[K, V, M, P](m: *M, p: P) res[usize, allocator.Error] {
+    if (m.cap == 0) {
+        ret grow[K, V, M, P](m, p, DEFAULT_CAPACITY);
+    }
+
+    val threshold: usize = (m.cap * LOAD_FACTOR_PERCENT) / 100;
+    if ((m.len + m.tombstones) >= threshold) {
+        if (m.tombstones > m.len) {
+            ret grow[K, V, M, P](m, p, m.cap);
+        }
+        val new_cap: usize = m.cap * 2;
+        if (new_cap < m.cap) {
+            ret res[usize, allocator.Error].err{allocator.Error.overflow{}};
+        }
+        ret grow[K, V, M, P](m, p, new_cap);
+    }
+
+    ret res[usize, allocator.Error].ok{m.cap};
+}
+
+fun core_insert[K, V, M, P](m: *M, p: P, key: K, value: V) res[bool, allocator.Error] {
+    if (m == nil) { ret res[bool, allocator.Error].err{allocator.Error.invalid{}}; }
+    val room: res[usize, allocator.Error] = ensure_capacity[K, V, M, P](m, p);
+    if (sel room.err) { ret res[bool, allocator.Error].err{room.err}; }
+
+    var slot: Slot;
+    find_slot[K, V, M, P](m, p, ?key, ?slot);
+
+    if (slot.found) {
+        m.values[slot.idx] = value;
+        ret res[bool, allocator.Error].ok{false};
+    }
+
+    if (m.ctrl[slot.idx] == DELETED) {
+        m.tombstones = m.tombstones - 1;
+    }
+    m.keys[slot.idx]   = key;
+    m.values[slot.idx] = value;
+    m.ctrl[slot.idx]   = h2_of(hash_key[K, V, M, P](m, p, ?key));
+    m.len              = m.len + 1;
+
+    ret res[bool, allocator.Error].ok{true};
+}
+
+fun core_get[K, V, M, P](m: *M, p: P, key: *K) opt[*V] {
+    if (m == nil)   { ret opt[*V].none{}; }
+    if (m.cap == 0) { ret opt[*V].none{}; }
+
+    var slot: Slot;
+    find_slot[K, V, M, P](m, p, key, ?slot);
+    if (!slot.found) { ret opt[*V].none{}; }
+
+    ret opt[*V].some{?m.values[slot.idx]};
+}
+
+fun core_contains[K, V, M, P](m: *M, p: P, key: *K) bool {
+    if (m == nil)   { ret false; }
+    if (m.cap == 0) { ret false; }
+    var slot: Slot;
+    find_slot[K, V, M, P](m, p, key, ?slot);
+    ret slot.found;
+}
+
+fun core_remove[K, V, M, P](m: *M, p: P, key: *K) bool {
     if (m == nil)   { ret false; }
     if (m.cap == 0) { ret false; }
 
-    val slot: rec { idx: usize; found: bool; } = find_slot[K, V](m, key);
+    var slot: Slot;
+    find_slot[K, V, M, P](m, p, key, ?slot);
     if (!slot.found) { ret false; }
 
-    m.states[slot.idx] = SLOT_TOMBSTONE;
-    m.len              = m.len - 1;
-    m.tombstones       = m.tombstones + 1;
+    m.ctrl[slot.idx] = DELETED;
+    m.len            = m.len - 1;
+    m.tombstones     = m.tombstones + 1;
 
     ret true;
-}
-
-# FNV-1a hash for strings
-pub fun hash_str(p: ptr) u64 {
-    val s:          *str = p::*str;
-    val FNV_OFFSET: u64  = 14695981039346656037;
-    val FNV_PRIME:  u64  = 1099511628211;
-
-    var hash: u64 = FNV_OFFSET;
-    val sp:   str = @s;
-
-    if (sp == nil) { ret hash; }
-
-    var i: usize = 0;
-    for (sp[i] != 0) {
-        val byte: u64 = sp[i]::u64;
-        hash = hash ^ byte;
-        hash = hash * FNV_PRIME;
-        i    = i + 1;
-    }
-
-    ret hash;
-}
-
-# equality function for strings
-pub fun eq_str(pa: ptr, pb: ptr) bool {
-    val a: *str = pa::*str;
-    val b: *str = pb::*str;
-    ret str_equals(@a, @b);
-}
-
-# splitmix64 hash for i64
-pub fun hash_i64(p: ptr) u64 {
-    val n: *i64 = p::*i64;
-    var x: u64  = (@n)::u64;
-    x = x ^ (x >> 33);
-    x = x * 0xff51afd7ed558ccd;
-    x = x ^ (x >> 33);
-    x = x * 0xc4ceb9fe1a85ec53;
-    x = x ^ (x >> 33);
-    ret x;
-}
-
-# equality function for i64
-pub fun eq_i64(pa: ptr, pb: ptr) bool {
-    val a: *i64 = pa::*i64;
-    val b: *i64 = pb::*i64;
-    ret @a == @b;
-}
-
-# splitmix64 hash for u64
-pub fun hash_u64(p: ptr) u64 {
-    val n: *u64 = p::*u64;
-    var x: u64  = @n;
-    x = x ^ (x >> 33);
-    x = x * 0xff51afd7ed558ccd;
-    x = x ^ (x >> 33);
-    x = x * 0xc4ceb9fe1a85ec53;
-    x = x ^ (x >> 33);
-    ret x;
-}
-
-# equality function for u64
-pub fun eq_u64(pa: ptr, pb: ptr) bool {
-    val a: *u64 = pa::*u64;
-    val b: *u64 = pb::*u64;
-    ret @a == @b;
-}
-
-# splitmix64 hash for u32
-pub fun hash_u32(p: ptr) u64 {
-    val n: *u32 = p::*u32;
-    var x: u64  = (@n)::u64;
-    x = x ^ (x >> 33);
-    x = x * 0xff51afd7ed558ccd;
-    x = x ^ (x >> 33);
-    x = x * 0xc4ceb9fe1a85ec53;
-    x = x ^ (x >> 33);
-    ret x;
-}
-
-# equality function for u32
-pub fun eq_u32(pa: ptr, pb: ptr) bool {
-    val a: *u32 = pa::*u32;
-    val b: *u32 = pb::*u32;
-    ret @a == @b;
 }
 
 $if (capability.HOSTED) {
     test "map: init creates empty map" {
         var a: allocator.Allocator;
         page.make(?a);
-        val m: Map[i64, i64] = init[i64, i64](?a, hash_i64, eq_i64);
+        val m: Map[i64, i64] = init[i64, i64](?a);
         if (!is_empty[i64, i64](m))     { ret 1; }
         if (length[i64, i64](m) != 0)   { ret 1; }
         if (capacity[i64, i64](m) != 0) { ret 1; }
@@ -473,7 +575,7 @@ $if (capability.HOSTED) {
     test "map: insert and get" {
         var a: allocator.Allocator;
         page.make(?a);
-        var m: Map[i64, i64] = init[i64, i64](?a, hash_i64, eq_i64);
+        var m: Map[i64, i64] = init[i64, i64](?a);
 
         val r: res[bool, allocator.Error] = insert[i64, i64](?m, 42, 100);
         if (sel r.err) { ret 1; }
@@ -495,7 +597,7 @@ $if (capability.HOSTED) {
     test "map: insert updates existing" {
         var a: allocator.Allocator;
         page.make(?a);
-        var m: Map[i64, i64] = init[i64, i64](?a, hash_i64, eq_i64);
+        var m: Map[i64, i64] = init[i64, i64](?a);
 
         insert[i64, i64](?m, 10, 100);
         val r: res[bool, allocator.Error] = insert[i64, i64](?m, 10, 200);
@@ -517,7 +619,7 @@ $if (capability.HOSTED) {
     test "map: contains" {
         var a: allocator.Allocator;
         page.make(?a);
-        var m: Map[i64, i64] = init[i64, i64](?a, hash_i64, eq_i64);
+        var m: Map[i64, i64] = init[i64, i64](?a);
 
         insert[i64, i64](?m, 5, 50);
         insert[i64, i64](?m, 10, 100);
@@ -538,7 +640,7 @@ $if (capability.HOSTED) {
     test "map: remove" {
         var a: allocator.Allocator;
         page.make(?a);
-        var m: Map[i64, i64] = init[i64, i64](?a, hash_i64, eq_i64);
+        var m: Map[i64, i64] = init[i64, i64](?a);
 
         insert[i64, i64](?m, 1, 10);
         insert[i64, i64](?m, 2, 20);
@@ -565,7 +667,7 @@ $if (capability.HOSTED) {
     test "map: remove non-existent" {
         var a: allocator.Allocator;
         page.make(?a);
-        var m: Map[i64, i64] = init[i64, i64](?a, hash_i64, eq_i64);
+        var m: Map[i64, i64] = init[i64, i64](?a);
 
         insert[i64, i64](?m, 1, 10);
 
@@ -580,7 +682,7 @@ $if (capability.HOSTED) {
     test "map: get non-existent returns none" {
         var a: allocator.Allocator;
         page.make(?a);
-        var m: Map[i64, i64] = init[i64, i64](?a, hash_i64, eq_i64);
+        var m: Map[i64, i64] = init[i64, i64](?a);
 
         insert[i64, i64](?m, 1, 10);
 
@@ -596,7 +698,7 @@ $if (capability.HOSTED) {
     test "map: clear" {
         var a: allocator.Allocator;
         page.make(?a);
-        var m: Map[i64, i64] = init[i64, i64](?a, hash_i64, eq_i64);
+        var m: Map[i64, i64] = init[i64, i64](?a);
 
         insert[i64, i64](?m, 1, 10);
         insert[i64, i64](?m, 2, 20);
@@ -617,7 +719,7 @@ $if (capability.HOSTED) {
     test "map: many insertions trigger growth" {
         var a: allocator.Allocator;
         page.make(?a);
-        var m: Map[i64, i64] = init[i64, i64](?a, hash_i64, eq_i64);
+        var m: Map[i64, i64] = init[i64, i64](?a);
 
         var i: i64 = 0;
         for (i < 100) {
@@ -645,7 +747,7 @@ $if (capability.HOSTED) {
     test "map: insert after remove reuses tombstone" {
         var a: allocator.Allocator;
         page.make(?a);
-        var m: Map[i64, i64] = init[i64, i64](?a, hash_i64, eq_i64);
+        var m: Map[i64, i64] = init[i64, i64](?a);
 
         insert[i64, i64](?m, 1, 10);
         insert[i64, i64](?m, 2, 20);
@@ -671,7 +773,7 @@ $if (capability.HOSTED) {
     test "map: dnit on empty map" {
         var a: allocator.Allocator;
         page.make(?a);
-        var m:     Map[i64, i64]        = init[i64, i64](?a, hash_i64, eq_i64);
+        var m:     Map[i64, i64]        = init[i64, i64](?a);
         val freed: err[allocator.Error] = dnit[i64, i64](?m);
         if (sel freed.err) { ret 1; }
         ret 0;
@@ -680,7 +782,7 @@ $if (capability.HOSTED) {
     test "map: string keys" {
         var a: allocator.Allocator;
         page.make(?a);
-        var m: Map[str, i64] = init[str, i64](?a, hash_str, eq_str);
+        var m: Map[str, i64] = init[str, i64](?a);
 
         insert[str, i64](?m, "hello", 1);
         insert[str, i64](?m, "world", 2);
@@ -710,7 +812,7 @@ $if (capability.HOSTED) {
     test "map: get allows mutation" {
         var a: allocator.Allocator;
         page.make(?a);
-        var m: Map[i64, i64] = init[i64, i64](?a, hash_i64, eq_i64);
+        var m: Map[i64, i64] = init[i64, i64](?a);
 
         insert[i64, i64](?m, 42, 100);
 
@@ -737,7 +839,7 @@ $if (capability.HOSTED) {
         var t:  testing.Testing;
         val mr: err[allocator.Error] = testing.make(?t);
         if (sel mr.err) { ret 1; }
-        var m: Map[i64, i64] = init[i64, i64](?t.a, hash_i64, eq_i64);
+        var m: Map[i64, i64] = init[i64, i64](?t.a);
 
         # the first insert grows from nothing: keys, values, states
         var ordinal: usize = 1;
@@ -793,7 +895,7 @@ $if (capability.HOSTED) {
         var t:  testing.Testing;
         val mr: err[allocator.Error] = testing.make(?t);
         if (sel mr.err) { ret 1; }
-        var m: Map[i64, *u8] = init[i64, *u8](?t.a, hash_i64, eq_i64);
+        var m: Map[i64, *u8] = init[i64, *u8](?t.a);
 
         val first: res[*u8, allocator.Error] = allocator.allocate[u8](?t.a, 8);
         if (sel first.err) {
@@ -868,7 +970,7 @@ $if (capability.HOSTED) {
     test "map: values of canonical tag type round-trip" {
         var a: allocator.Allocator;
         page.make(?a);
-        var m: Map[i64, opt[i64]] = init[i64, opt[i64]](?a, hash_i64, eq_i64);
+        var m: Map[i64, opt[i64]] = init[i64, opt[i64]](?a);
 
         val absent: res[bool, allocator.Error] = insert[i64, opt[i64]](?m, 1, opt[i64].none{});
         if (sel absent.err) { ret 1; }
@@ -898,7 +1000,7 @@ $if (capability.HOSTED) {
         val freed: err[allocator.Error] = dnit[i64, opt[i64]](?m);
         if (sel freed.err) { ret 14; }
 
-        var outcomes: Map[i64, res[i64, allocator.Error]] = init[i64, res[i64, allocator.Error]](?a, hash_i64, eq_i64);
+        var outcomes: Map[i64, res[i64, allocator.Error]] = init[i64, res[i64, allocator.Error]](?a);
         val ok_in:    res[bool, allocator.Error]          = insert[i64, res[i64, allocator.Error]](?outcomes, 5, res[i64, allocator.Error].ok{500});
         if (sel ok_in.err) { ret 15; }
         val err_in: res[bool, allocator.Error] = insert[i64, res[i64, allocator.Error]](?outcomes, 6, res[i64, allocator.Error].err{allocator.Error.exhausted{}});
@@ -915,6 +1017,197 @@ $if (capability.HOSTED) {
         if (g5.some.ok != 500) { ret 22; }
         val freed2: err[allocator.Error] = dnit[i64, res[i64, allocator.Error]](?outcomes);
         if (sel freed2.err) { ret 23; }
+        ret 0;
+    }
+
+    fun step(s: *u64) u64 {
+        var x: u64 = @s;
+        x  = x ^ (x << 13);
+        x  = x ^ (x >> 7);
+        x  = x ^ (x << 17);
+        @s = x;
+        ret x;
+    }
+
+    # the reference model: one slot per key in [0, KEYS), holding presence and value
+    val KEYS: usize = 4096;
+
+    # randomized insert, remove and lookup against the model, through several
+    # doublings and heavy tombstone churn
+    test "map: randomized operations agree with a reference model" {
+        var a: allocator.Allocator;
+        page.make(?a);
+        val pr: res[*bool, allocator.Error] = allocator.zallocate[bool](?a, KEYS);
+        if (sel pr.err) { ret 1; }
+        val vr: res[*i64, allocator.Error] = allocator.zallocate[i64](?a, KEYS);
+        if (sel vr.err) { ret 1; }
+        val present: *bool = pr.ok;
+        val values:  *i64  = vr.ok;
+        var live:    usize = 0;
+
+        var m:       Map[u64, i64] = init[u64, i64](?a);
+        var s:       u64           = 0x853C49E6748FEA9B;
+        var step_no: usize         = 0;
+        for (step_no < 400000) {
+            val roll: u64   = step(?s) % 10;
+            val key:  u64   = step(?s) % (KEYS::u64);
+            val k:    usize = key::usize;
+            if (roll < 5) {
+                val v: i64                        = (step(?s) >> 1)::i64;
+                val r: res[bool, allocator.Error] = insert[u64, i64](?m, key, v);
+                if (sel r.err)          { ret 2; }
+                if (r.ok == present[k]) { ret 3; }
+                if (!present[k])        { live = live + 1; }
+                present[k] = true;
+                values[k]  = v;
+            }
+            or (roll < 8) {
+                val removed: bool = remove[u64, i64](?m, ?key);
+                if (removed != present[k]) { ret 4; }
+                if (present[k])            { live = live - 1; }
+                present[k] = false;
+            }
+            or {
+                val g: opt[*i64] = get[u64, i64](?m, ?key);
+                if (sel g.some != present[k])                   { ret 5; }
+                if (sel g.some && @g.some != values[k])         { ret 6; }
+                if (contains[u64, i64](?m, ?key) != present[k]) { ret 7; }
+            }
+            if (length[u64, i64](m) != live)              { ret 8; }
+            if (m.cap != 0 && (m.cap & (m.cap - 1)) != 0) { ret 9; }
+            step_no = step_no + 1;
+        }
+
+        # every key the model holds is found with its value, every other is absent
+        var k: usize = 0;
+        for (k < KEYS) {
+            val key: u64       = k::u64;
+            val g:   opt[*i64] = get[u64, i64](?m, ?key);
+            if (sel g.some != present[k])           { ret 10; }
+            if (sel g.some && @g.some != values[k]) { ret 11; }
+            k = k + 1;
+        }
+
+        dnit[u64, i64](?m);
+        allocator.deallocate[bool](?a, present, KEYS);
+        allocator.deallocate[i64](?a, values, KEYS);
+        ret 0;
+    }
+
+    test "map: growth across several doublings keeps every entry" {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var m: Map[u64, u64] = init[u64, u64](?a);
+        val n: u64           = 200000;
+        var i: u64           = 0;
+        for (i < n) {
+            val r: res[bool, allocator.Error] = insert[u64, u64](?m, i * 2654435761, i);
+            if (sel r.err) { ret 1; }
+            if (!r.ok)     { ret 2; }
+            i = i + 1;
+        }
+        if (length[u64, u64](m) != n::usize)  { ret 3; }
+        if (capacity[u64, u64](m) < n::usize) { ret 4; }
+        i = 0;
+        for (i < n) {
+            val key: u64       = i * 2654435761;
+            val g:   opt[*u64] = get[u64, u64](?m, ?key);
+            if (!sel g.some)  { ret 5; }
+            if (@g.some != i) { ret 6; }
+            i = i + 1;
+        }
+        dnit[u64, u64](?m);
+        ret 0;
+    }
+
+    # tombstone churn: the same few keys inserted and removed far more times
+    # than the table has slots, which must rehash rather than fill with
+    # tombstones
+    test "map: tombstone churn stays bounded" {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var m: Map[u64, u8] = init[u64, u8](?a);
+        var i: u64          = 0;
+        for (i < 100000) {
+            val key: u64 = i % 8;
+            insert[u64, u8](?m, key, 1);
+            remove[u64, u8](?m, ?key);
+            if (length[u64, u8](m) != 0)   { ret 1; }
+            if (capacity[u64, u8](m) > 64) { ret 2; }
+            if (m.tombstones > m.cap)      { ret 3; }
+            i = i + 1;
+        }
+        val key: u64 = 3;
+        if (contains[u64, u8](?m, ?key)) { ret 4; }
+        dnit[u64, u8](?m);
+        ret 0;
+    }
+
+    rec Point { x: i32; y: i32; }
+
+    test "map: record keys hash and compare by field" {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var m: Map[Point, i64] = init[Point, i64](?a);
+        insert[Point, i64](?m, Point{x: 1, y: 2}, 12);
+        insert[Point, i64](?m, Point{x: 2, y: 1}, 21);
+        val k1: Point     = Point{x: 1, y: 2};
+        val k2: Point     = Point{x: 2, y: 1};
+        val k3: Point     = Point{x: 1, y: 1};
+        val g1: opt[*i64] = get[Point, i64](?m, ?k1);
+        if (!sel g1.some)   { ret 1; }
+        if (@g1.some != 12) { ret 1; }
+        val g2: opt[*i64] = get[Point, i64](?m, ?k2);
+        if (!sel g2.some)                  { ret 1; }
+        if (@g2.some != 21)                { ret 1; }
+        if (contains[Point, i64](?m, ?k3)) { ret 1; }
+        dnit[Point, i64](?m);
+        ret 0;
+    }
+
+    # a key whose hash and equality the type does not carry: keyed by the
+    # string a pointer refers to, through stored functions
+    fun hash_by_len(k: *str) u64 {
+        var n: u64 = 0;
+        val s: str = @k;
+        for (s[n] != 0) { n = n + 1; }
+        ret n;
+    }
+
+    fun eq_by_len(a: *str, b: *str) bool {
+        ret hash_by_len(a) == hash_by_len(b);
+    }
+
+    test "map: MapBy keys through its functions" {
+        var a: allocator.Allocator;
+        page.make(?a);
+        var m: MapBy[str, i64] = init_by[str, i64](?a, hash_by_len, eq_by_len);
+        if (!is_empty_by[str, i64](m)) { ret 1; }
+        val r1: res[bool, allocator.Error] = insert_by[str, i64](?m, "abc", 3);
+        if (sel r1.err) { ret 2; }
+        if (!r1.ok)     { ret 2; }
+        val r2: res[bool, allocator.Error] = insert_by[str, i64](?m, "xyz", 30);
+        if (sel r2.err)                  { ret 3; }
+        if (r2.ok)                       { ret 4; }
+        if (length_by[str, i64](m) != 1) { ret 5; }
+        val k: str       = "qqq";
+        val g: opt[*i64] = get_by[str, i64](?m, ?k);
+        if (!sel g.some)                    { ret 6; }
+        if (@g.some != 30)                  { ret 7; }
+        if (!contains_by[str, i64](?m, ?k)) { ret 8; }
+        if (!remove_by[str, i64](?m, ?k))   { ret 9; }
+        if (contains_by[str, i64](?m, ?k))  { ret 10; }
+        var i: i64 = 0;
+        for (i < 1000) {
+            insert_by[str, i64](?m, "abcd", i);
+            i = i + 1;
+        }
+        if (length_by[str, i64](m) != 1) { ret 11; }
+        clear_by[str, i64](?m);
+        if (length_by[str, i64](m) != 0)   { ret 12; }
+        if (capacity_by[str, i64](m) == 0) { ret 13; }
+        val freed: err[allocator.Error] = dnit_by[str, i64](?m);
+        if (sel freed.err) { ret 14; }
         ret 0;
     }
 }
