@@ -1,0 +1,173 @@
+# the processor's data-independent-timing mode (PSTATE.DIT) on aarch64
+#
+# a secret integer multiply in an `#[oblivious]` function is constant time on
+# aarch64 only with FEAT_DIT on. the linker tags each aarch64-linux and
+# aarch64-darwin link with `__mach_dit_required`, a one-byte read-only cell
+# that is 1 when any input module admits such a multiply and 0 otherwise
+# (briar-systems/mach#3508). std owns process start and every thread it
+# spawns, so this module is the half that turns the mode on:
+#
+# - `_rt_init` calls `init` after envp is published and before main. byte 0
+#   does nothing. otherwise the OS says whether the processor and kernel
+#   provide DIT (linux: HWCAP_DIT in AT_HWCAP, darwin: hw.optional.arm.FEAT_DIT,
+#   both through `os.cpu_dit`), and the answer is enable or refuse. a refusal
+#   writes `REFUSAL` and a newline to stderr through the panic sink and ends
+#   the process with status 255, before any secret multiply could run without the mode.
+# - DIT is per thread and nothing guarantees a new thread inherits it, so
+#   every trampoline std owns calls `enter_thread` first, which sets the mode
+#   when the byte is nonzero.
+#
+# `decide` is the whole policy as a pure function, so the fail-closed branch
+# is unit tested on any processor by forcing the availability answer. the
+# enable sequence is `msr dit, 1` then `dsb nsh; isb sy`.
+# the module imports only the panic sink, so the OS layer's trampolines can
+# call it without a cycle; the tests that need the OS's answer live in
+# std.system.cpu. the module builds on every target and is empty except on
+# aarch64 linux and darwin, so the entry points can reference it
+# unconditionally.
+
+use std.system.panic;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+# what `init` does with the byte and the availability answer
+pub val SKIP:   i64 = 0;
+pub val ENABLE: i64 = 1;
+pub val REFUSE: i64 = 2;
+
+# the exact refusal text, byte-equal to the compiler's constant. `refuse`
+# writes it as one line, the newline after it
+pub val REFUSAL: str = "std.runtime: this program contains a constant-time multiply that requires the processor's data-independent-timing mode (PSTATE.DIT), and this processor or kernel does not provide it (aarch64-linux: HWCAP_DIT absent; aarch64-darwin: hw.optional.arm.FEAT_DIT is 0); refusing to start";
+
+# the longest line `refuse` writes, the text and its newline
+val LINE_CAPACITY: usize = 512;
+
+# write the refusal line to stderr and end the process with status 255
+#
+# the panic sink writes one buffer and never returns, so the line is
+# assembled first
+fun refuse() {
+    var line: [512]u8;
+    val len:  usize = str_len(REFUSAL);
+    var i:    usize = 0;
+    for (i < len && i < LINE_CAPACITY - 1) {
+        line[i] = REFUSAL[i];
+        i       = i + 1;
+    }
+    line[i] = 10;
+    panic.panic_sink(?line[0], i + 1);
+}
+
+# the policy: a link that needs the mode gets it or the process does not start
+# ---
+# required:  the link's `__mach_dit_required` byte, nonzero when a secret
+#            multiply is admitted
+# available: `os.cpu_dit()`: 1 when the processor and kernel provide DIT, 0
+#            when not, negative when the answer could not be read
+# ret:       SKIP, ENABLE or REFUSE
+pub fun decide(required: bool, available: i64) i64 {
+    if (!required)      { ret SKIP; }
+    if (available == 1) { ret ENABLE; }
+    ret REFUSE;
+}
+
+$if ($mach.build.arch == $mach.arch.aarch64 && ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin)) {
+    # the bit the mode occupies in PSTATE, as `mrs x0, dit` reads it
+    pub val DIT_BIT: u64 = 1 << 24;
+
+    # where the asm below stores what it read, addressed by symbol as `_start`
+    # addresses `_rt_argc`
+    #[symbol("_std_dit_probe")]
+    var probe: u64 = 0;
+
+    # whether this link admits a secret multiply
+    #
+    # the linker's `__mach_dit_required` is hidden and one byte, read with the
+    # page plus low-12 idiom rather than an `ext val`, which would go through
+    # the GOT that Mach-O output does not carry
+    pub fun required() bool {
+        asm aarch64 {
+            adrp x11, __mach_dit_required
+            ldrb w0, [x11, :lo12:__mach_dit_required]
+            adrp x11, _std_dit_probe
+            str x0, [x11, :lo12:_std_dit_probe]
+        }
+        ret probe != 0;
+    }
+
+    # set PSTATE.DIT for the calling thread
+    #
+    # `msr dit, 1`, then `dsb nsh` and `isb sy` so nothing after this point
+    # was fetched or issued under the old state
+    pub fun enable() {
+        asm aarch64 {
+            msr dit, 1
+            dsb nsh
+            isb sy
+        }
+    }
+
+    # the calling thread's PSTATE.DIT, `DIT_BIT` when the mode is on
+    pub fun read() u64 {
+        asm aarch64 {
+            mrs x0, dit
+            adrp x11, _std_dit_probe
+            str x0, [x11, :lo12:_std_dit_probe]
+        }
+        ret probe;
+    }
+
+    # process start: enable the mode or refuse to start
+    # ---
+    # available: `os.cpu_dit()`
+    pub fun init(available: i64) {
+        val outcome: i64 = decide(required(), available);
+        if (outcome == SKIP)   { ret; }
+        if (outcome == REFUSE) { refuse(); }
+        enable();
+    }
+
+    # thread start: set the mode when the link needs it
+    #
+    # every thread trampoline std owns calls this first. `init` already
+    # refused a processor without the mode, so a thread that gets here can
+    # set it
+    pub fun enter_thread() {
+        if (required()) { enable(); }
+    }
+}
+$or {
+    # no other target has the mode or the cell
+    pub fun required() bool {
+        ret false;
+    }
+
+    pub fun init(available: i64) {}
+
+    pub fun enter_thread() {}
+}
+
+test "dit: the policy fails closed when the link needs the mode and the processor does not provide it" {
+    if (decide(false, 0) != SKIP)    { ret 1; }
+    if (decide(false, 1) != SKIP)    { ret 2; }
+    if (decide(false, -38) != SKIP)  { ret 3; }
+    if (decide(true, 1) != ENABLE)   { ret 4; }
+    if (decide(true, 0) != REFUSE)   { ret 5; }
+    if (decide(true, -38) != REFUSE) { ret 6; }
+    ret 0;
+}
+
+test "dit: the refusal text is one line with no newline of its own, and fits the line buffer" {
+    val len: usize = str_len(REFUSAL);
+    if (len < 200 || len + 1 > LINE_CAPACITY) { ret 1; }
+    var i: usize = 0;
+    for (i < len) {
+        if (REFUSAL[i] == 10) { ret 2; }
+        i = i + 1;
+    }
+    ret 0;
+}

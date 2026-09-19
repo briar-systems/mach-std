@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.8.0] - 2026-09-19
+
+std now requires mach 5.8.0 (`mach = "^5.8"`): every aarch64-linux and
+aarch64-darwin link reads `__mach_dit_required`, the cell that release's
+linker defines (briar-systems/mach#3508), and the runtime spells the DIT
+enable sequence with the asm mnemonics it adds.
+
+### Added
+
+- The aarch64 data-independent-timing mode. When the linker's
+  `__mach_dit_required` byte says the link admits a secret integer multiply,
+  `_rt_init` on aarch64 linux and darwin turns PSTATE.DIT on before `main`, and
+  every thread trampoline std owns turns it on for its thread. A processor or
+  kernel without the mode (linux: HWCAP_DIT absent from AT_HWCAP, darwin:
+  `hw.optional.arm.FEAT_DIT` 0 or unreadable) makes the program refuse to
+  start through the panic sink with status 255 and the contract's one-line
+  message, before any secret multiply could run. `std.system.dit` holds the
+  policy (`decide`), the cell (`required`), the enable sequence and the
+  refusal text. The `cpu` capability group gains `cpu_dit()`, the OS's answer
+  on whether the mode is available, sharing the reader `cpu_features` uses.
+  `test/dit` runs a secret-multiply program and a plain one on the aarch64
+  legs, and under `qemu-aarch64 -cpu cortex-a57` shows the refusal (#831).
+
 ## [5.7.1] - 2026-09-19
 
 std now requires mach 5.5.2 (`mach = "^5.5.2"`): the hardware SHA-256 bodies
