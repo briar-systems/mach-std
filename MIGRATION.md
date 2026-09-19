@@ -1,3 +1,42 @@
+# std 5.x to 6.0.0
+
+std 6.0.0 gives the collections one ordering contract (#655). A collection orders, compares and hashes its elements by the type's natural order, `std.collections.natural`, resolved at compile time, and the comparator-taking spelling of every entry point is its `_by` form. See the contract on #655.
+
+## Sorting (#655)
+
+`sort`, `is_sorted` and `binary_search` no longer take a comparator: they order by `natural.less[T]`. The comparator forms are `sort_by`, `is_sorted_by` and `binary_search_by`, with the comparator in its old position. `sort` is now pattern-defeating quicksort rather than Shell sort, and `sort_stable` / `sort_stable_by` (merge sort over a caller-supplied scratch buffer) are new.
+
+| 5.x | 6.0.0 |
+| --- | --- |
+| `sort.sort[T](data, len, cmp)` | `sort.sort[T](data, len)` for a `T` with a natural order, else `sort.sort_by[T](data, len, cmp)` |
+| `sort.is_sorted[T](data, len, cmp)` | `sort.is_sorted[T](data, len)` or `sort.is_sorted_by[T](data, len, cmp)` |
+| `sort.binary_search[T](data, len, target, cmp)` | `sort.binary_search[T](data, len, target)` or `sort.binary_search_by[T](data, len, target, cmp)` |
+
+A natural order exists for integers, floats, `str` (by content) and records of those (lexicographic in field declaration order, nested records descended). A comparator that only spells `<` on such a type is redundant and its `_by` call is the slower path, so drop it:
+
+```mach
+# before
+fun cmp_i64(a: *i64, b: *i64) i64 { if (@a < @b) { ret -1; } if (@a > @b) { ret 1; } ret 0; }
+sort.sort[i64](data, len, cmp_i64);
+sort.sort[str](names, n, cmp_str);
+
+# after
+sort.sort[i64](data, len);
+sort.sort[str](names, n);
+```
+
+A comparator that expresses an order the type does not carry (a subset of the fields, a different field order, address order, a union) keeps its function and moves to the `_by` name:
+
+```mach
+# before
+sort.sort[Span](spans, n, span_compare);
+
+# after
+sort.sort_by[Span](spans, n, span_compare);
+```
+
+`binary_search` with equal elements present now reports the first of them as `found`.
+
 # std 4.x to 5.0.0
 
 std 5.0.0 separates the two clocks (#752). `time.Time` is wall-clock (calendar) time only. It can jump when the system clock is set. Monotonic readings get their own type, `time.Instant`. The two types don't convert into each other, so the compiler now rejects a wall-clock `Time` passed as a deadline. Every deadline and timer in std takes an `Instant`. In the same release, a deadline scope costs the runtime one timer entry no matter how many operations it holds (#741). That change is internal and needs no caller changes.
