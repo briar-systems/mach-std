@@ -37,6 +37,30 @@ sort.sort_by[Span](spans, n, span_compare);
 
 `binary_search` with equal elements present now reports the first of them as `found`.
 
+## Heap (#659)
+
+`Heap[T]` no longer stores a comparator. `Heap[T, D]` orders by the element's natural order with `D` naming the top: `heap.Min` or `heap.Max`. `init` loses its `cmp` argument. A comparator heap is `HeapBy[T]`, created with `init_by(alloc, cmp)`, whose operations carry the `_by` suffix (`push_by`, `pop_by`, `peek_by`, `dnit_by`, `is_empty_by`, `length_by`).
+
+| 5.x | 6.0.0 |
+| --- | --- |
+| `heap.Heap[T]` with a `<` comparator | `heap.Heap[T, heap.Min]` |
+| `heap.Heap[T]` with a `>` comparator | `heap.Heap[T, heap.Max]` |
+| `heap.Heap[T]` with any other comparator | `heap.HeapBy[T]` |
+| `heap.init[T](alloc, cmp)` | `heap.init[T, D](alloc)` or `heap.init_by[T](alloc, cmp)` |
+| `heap.push[T](?h, v)`, `pop`, `peek`, `dnit`, `is_empty`, `length` | `heap.push[T, D](?h, v)` and so on, or the `_by` form on a `HeapBy` |
+
+```mach
+# before
+var h: heap.Heap[i64] = heap.init[i64](?a, cmp_i64);
+heap.push[i64](?h, 3);
+
+# after
+var h: heap.Heap[i64, heap.Min] = heap.init[i64, heap.Min](?a);
+heap.push[i64, heap.Min](?h, 3);
+```
+
+A record element orders by its fields in declaration order, so "by priority, then by id" is `rec Task { prio: u8; id: u32; }` in a `Heap[Task, heap.Min]` with no comparator at all.
+
 # std 4.x to 5.0.0
 
 std 5.0.0 separates the two clocks (#752). `time.Time` is wall-clock (calendar) time only. It can jump when the system clock is set. Monotonic readings get their own type, `time.Instant`. The two types don't convert into each other, so the compiler now rejects a wall-clock `Time` passed as a deadline. Every deadline and timer in std takes an `Instant`. In the same release, a deadline scope costs the runtime one timer entry no matter how many operations it holds (#741). That change is internal and needs no caller changes.
