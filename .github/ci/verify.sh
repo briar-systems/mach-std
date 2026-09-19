@@ -68,7 +68,7 @@ case "$MACH_CI_LEG" in
         format_evidence "$target"
         bash test/sha256/verify.sh "$mach" "$target"
         # the data-independent-timing mode exists on aarch64 only
-        [ "$target" = darwin-aarch64 ] && bash test/dit/verify.sh "$mach" "$target"
+        if [ "$target" = darwin-aarch64 ]; then bash test/dit/verify.sh "$mach" "$target"; fi
         ;;
     # the library suite under qemu-user is real coverage for logic and a weak
     # signal for ABI constants. it is what caught #436
