@@ -3,9 +3,9 @@
 # admits a secret multiply starts with PSTATE.DIT on, on the main thread and
 # on a thread std spawned; a program without one leaves the mode off; and on
 # a processor without the mode the first program refuses to start with the
-# contract's text and status 255. the last case needs a runner that can model
-# such a processor (qemu-aarch64 -cpu cortex-a57), so it runs only where
-# qemu-aarch64 is on the path.
+# contract's text and status 255. which of the first and last applies is what
+# the OS says about FEAT_DIT; qemu-aarch64 -cpu cortex-a57 models a processor
+# without it wherever qemu is on the path.
 #
 # usage: verify.sh <mach> <target> [runner]
 set -euo pipefail
@@ -52,21 +52,43 @@ run() {
     echo "$code"
 }
 
-code="$(run "$secret")"
-[ "$code" -eq 0 ] || fail "secret: $(decode "$code")"
-echo "OK: a link with a secret multiply starts with PSTATE.DIT on, on the main thread and a spawned one"
+expected="std.runtime: this program contains a constant-time multiply that requires the processor's data-independent-timing mode (PSTATE.DIT), and this processor or kernel does not provide it (aarch64-linux: HWCAP_DIT absent; aarch64-darwin: hw.optional.arm.FEAT_DIT is 0); refusing to start"
+
+# the secret probe must start with the mode on where the OS reports it, and
+# refuse with the contract's text where it does not (a github arm64 runner is
+# Neoverse N1, which predates FEAT_DIT, so the refusal is what CI exercises)
+refuses() {
+    set +e
+    err="$(if [ -n "$2" ]; then $2 "$1" 2>&1 >/dev/null; else "$1" 2>&1 >/dev/null; fi)"
+    code=$?
+    set -e
+    [ "$code" -eq 255 ] || fail "on a processor without the mode the secret probe exited $code, not 255"
+    [ "$err" = "$expected" ] || { echo "$err"; fail "the refusal text differs from the contract"; }
+}
+
+has_dit=""
+case "$target" in
+    linux-arm64)
+        if [ -n "$runner" ]; then has_dit=1; else grep -qw dit /proc/cpuinfo && has_dit=1 || has_dit=0; fi ;;
+    darwin-aarch64)
+        [ "$(sysctl -n hw.optional.arm.FEAT_DIT 2>/dev/null || echo 0)" = 1 ] && has_dit=1 || has_dit=0 ;;
+esac
+[ -n "$has_dit" ] || fail "no way to ask the OS about FEAT_DIT on $target"
+
+if [ "$has_dit" = 1 ]; then
+    code="$(run "$secret")"
+    [ "$code" -eq 0 ] || fail "secret: $(decode "$code")"
+    echo "OK: a link with a secret multiply starts with PSTATE.DIT on, on the main thread and a spawned one"
+else
+    refuses "$secret" "$runner"
+    echo "OK: this processor lacks the mode and the runtime refuses to start with the contract's text"
+fi
 
 code="$(run "$plain")"
 [ "$code" -eq 0 ] || fail "plain: $(decode "$code")"
 echo "OK: a link without one leaves PSTATE.DIT off"
 
 if [ "$target" = linux-arm64 ] && command -v qemu-aarch64 >/dev/null; then
-    set +e
-    err="$(qemu-aarch64 -cpu cortex-a57 "$secret" 2>&1 >/dev/null)"
-    code=$?
-    set -e
-    [ "$code" -eq 255 ] || fail "on a processor without the mode the secret probe exited $code, not 255"
-    expected="std.runtime: this program contains a constant-time multiply that requires the processor's data-independent-timing mode (PSTATE.DIT), and this processor or kernel does not provide it (aarch64-linux: HWCAP_DIT absent; aarch64-darwin: hw.optional.arm.FEAT_DIT is 0); refusing to start"
-    [ "$err" = "$expected" ] || { echo "$err"; fail "the refusal text differs from the contract"; }
-    echo "OK: on a processor without the mode the runtime refuses to start with the contract's text"
+    refuses "$secret" "qemu-aarch64 -cpu cortex-a57"
+    echo "OK: under qemu-aarch64 -cpu cortex-a57 the runtime refuses to start with the contract's text"
 fi
