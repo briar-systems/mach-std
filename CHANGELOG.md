@@ -27,6 +27,7 @@ enable sequence with the asm mnemonics it adds.
   on whether the mode is available, sharing the reader `cpu_features` uses.
   `test/dit` runs a secret-multiply program and a plain one on the aarch64
   legs, and under `qemu-aarch64 -cpu cortex-a57` shows the refusal (#831).
+
 ## [5.7.1] - 2026-09-19
 
 std now requires mach 5.5.2 (`mach = "^5.5.2"`): the hardware SHA-256 bodies
