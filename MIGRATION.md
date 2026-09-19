@@ -88,6 +88,19 @@ val g: opt[*TypeId] = map.get_by[Type, TypeId](?dedup, ?t);
 
 A record key hashes and compares field by field, so a key such as `rec QueryKey { kind: u16; key: u64; }` needs no functions at all. The hash of a value is not stable across std versions.
 
+## Constant-time comparisons (#839)
+
+The width-named `ct.is_zero_*`, `eq_*`, `lt_*` and `gt_*` are gone; the four generics are the surface. Spell the width as the type argument:
+
+| 5.x | 6.0.0 |
+| --- | --- |
+| `ct.is_zero_u8(a)` | `ct.is_zero[u8](a)` |
+| `ct.eq_u32(a, b)` | `ct.eq[u32](a, b)` |
+| `ct.lt_u64(a, b)` / `ct.lt_usize(a, b)` | `ct.lt[u64](a, b)` / `ct.lt[usize](a, b)` |
+| `ct.gt_u16(a, b)` | `ct.gt[u16](a, b)` |
+
+The lowering is unchanged: each instance emits the same instructions the removed function did, carries `#[oblivious]`, and is validated constant-time on its own.
+
 # std 4.x to 5.0.0
 
 std 5.0.0 separates the two clocks (#752). `time.Time` is wall-clock (calendar) time only. It can jump when the system clock is set. Monotonic readings get their own type, `time.Instant`. The two types don't convert into each other, so the compiler now rejects a wall-clock `Time` passed as a deadline. Every deadline and timer in std takes an `Instant`. In the same release, a deadline scope costs the runtime one timer entry no matter how many operations it holds (#741). That change is internal and needs no caller changes.

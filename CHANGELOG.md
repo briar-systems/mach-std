@@ -33,10 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for (#656).
 - `std.crypto.ct.is_zero[T]`, `eq[T]`, `lt[T]` and `gt[T]`: the four
   comparison families as one generic each over `^T`, each `#[oblivious]` and
-  `#[inline]`. The twenty width-named functions (`is_zero_u8` through
-  `gt_usize`) stay as those generics at one width, so no caller moves. Every
-  instance is validated constant-time on its own, and the release lowering
-  of each width-named function is unchanged instruction for instruction on
+  `#[inline]`. Every instance is validated constant-time on its own, and the
+  release lowering of each width is unchanged instruction for instruction on
   x86_64 and aarch64 (#660).
 
 ### Changed
@@ -76,6 +74,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kind in release output. Strings hash eight bytes at a time. Looking up one
   hundred thousand `u64` keys drops from 29 ns to 19 ns per hit and from
   21 ns to 15 ns per miss, one million from 39 ns to 28 ns per hit (#656).
+
+### Removed
+
+- **Breaking.** The twenty width-named constant-time comparisons in
+  `std.crypto.ct`, `is_zero_u8`/`u16`/`u32`/`u64`/`usize`, `eq_*`, `lt_*`
+  and `gt_*`. #660 (above) made each the generic at one width; the generic
+  is the surface: `ct.lt_u32(a, b)` becomes `ct.lt[u32](a, b)`, and
+  likewise for the other nineteen. Every instance lowers, in release, to the
+  same instructions the removed function did, on x86_64 and aarch64 (#839).
 
 ## [5.8.0] - 2026-09-19
 
