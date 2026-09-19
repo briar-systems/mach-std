@@ -61,6 +61,33 @@ heap.push[i64, heap.Min](?h, 3);
 
 A record element orders by its fields in declaration order, so "by priority, then by id" is `rec Task { prio: u8; id: u32; }` in a `Heap[Task, heap.Min]` with no comparator at all.
 
+## Map and Set (#656)
+
+`Map[K, V]` and `Set[K]` no longer take hash and equality functions: they key by the natural hash and equality of `K` (`natural.hash[K]`, `natural.eq[K]`), so `init` takes only the allocator. The `hash_fn`/`eq_fn` fields and the `ptr`-typed helpers `map.hash_str`, `eq_str`, `hash_i64`, `eq_i64`, `hash_u64`, `eq_u64`, `hash_u32`, `eq_u32` are gone. A key whose hash or equality the type does not carry (a union, a record with a pointer field, a key compared by something other than all its fields) goes in `MapBy[K, V]` / `SetBy[K]`, created with `init_by(alloc, hash_fn, eq_fn)` where the functions are typed (`fun(*K) u64`, `fun(*K, *K) bool`, no `ptr` casts), and whose operations carry the `_by` suffix.
+
+| 5.x | 6.0.0 |
+| --- | --- |
+| `map.init[K, V](alloc, map.hash_u32, map.eq_u32)` (any of the `map.hash_*`/`eq_*` helpers) | `map.init[K, V](alloc)` |
+| `map.init[K, V](alloc, my_hash, my_eq)` with `my_hash(p: ptr) u64`, `my_eq(a: ptr, b: ptr) bool` | `map.init_by[K, V](alloc, my_hash, my_eq)` with `my_hash(k: *K) u64`, `my_eq(a: *K, b: *K) bool` |
+| `map.Map[K, V]` holding custom functions | `map.MapBy[K, V]` |
+| `map.get/insert/contains/remove/clear/dnit/is_empty/length/capacity` on a custom-keyed map | the `_by` form of each |
+| `set.init[K](alloc, hash, eq)` | `set.init[K](alloc)` or `set.init_by[K](alloc, hash, eq)` on a `set.SetBy[K]` |
+
+```mach
+# before
+var seen: map.Map[u64, u32] = map.init[u64, u32](alloc, map.hash_u64, map.eq_u64);
+var dedup: map.Map[Type, TypeId] = map.init[Type, TypeId](alloc, hash_type, eq_type);
+fun hash_type(p: ptr) u64 { val t: *Type = p::*Type; ... }
+
+# after
+var seen: map.Map[u64, u32] = map.init[u64, u32](alloc);
+var dedup: map.MapBy[Type, TypeId] = map.init_by[Type, TypeId](alloc, hash_type, eq_type);
+fun hash_type(t: *Type) u64 { ... }
+val g: opt[*TypeId] = map.get_by[Type, TypeId](?dedup, ?t);
+```
+
+A record key hashes and compares field by field, so a key such as `rec QueryKey { kind: u16; key: u64; }` needs no functions at all. The hash of a value is not stable across std versions.
+
 # std 4.x to 5.0.0
 
 std 5.0.0 separates the two clocks (#752). `time.Time` is wall-clock (calendar) time only. It can jump when the system clock is set. Monotonic readings get their own type, `time.Instant`. The two types don't convert into each other, so the compiler now rejects a wall-clock `Time` passed as a deadline. Every deadline and timer in std takes an `Instant`. In the same release, a deadline scope costs the runtime one timer entry no matter how many operations it holds (#741). That change is internal and needs no caller changes.

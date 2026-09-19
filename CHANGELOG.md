@@ -26,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   heap ordered by a stored comparator, called through its pointer per
   comparison, the spelling for an order the element type does not carry
   (#659).
+- `map.MapBy[K, V]` and `set.SetBy[K]` with `init_by(alloc, hash_fn, eq_fn)`
+  and the `_by` operations: a map or set keyed by stored, typed functions
+  (`fun(*K) u64`, `fun(*K, *K) bool`), called through their pointers per
+  probe, the spelling for a key the type does not carry a hash or equality
+  for (#656).
 - `std.crypto.ct.is_zero[T]`, `eq[T]`, `lt[T]` and `gt[T]`: the four
   comparison families as one generic each over `^T`, each `#[oblivious]` and
   `#[inline]`. The twenty width-named functions (`is_zero_u8` through
@@ -58,6 +63,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   moves to `HeapBy[T]` (MIGRATION.md). Pushing and popping one million
   random `i64` drops from 223 ms to 171 ms, and one thousand from 49 ns to
   26 ns per operation (#659).
+- **Breaking.** `map.Map[K, V]` and `set.Set[K]` key by the natural hash and
+  equality of `K`: `init` takes only the allocator, the `hash_fn`/`eq_fn`
+  fields are gone, and so are the `ptr`-typed helpers `map.hash_str`,
+  `eq_str`, `hash_i64`, `eq_i64`, `hash_u64`, `eq_u64`, `hash_u32`, `eq_u32`.
+  A custom key moves to `MapBy` / `SetBy` (MIGRATION.md) (#656).
+- The map probes over control bytes and masks instead of dividing: capacity
+  is a power of two, the slot for a hash and every probe step is a mask, and
+  one control byte per slot holds emptiness, deletion, or seven bits of the
+  key's hash, so a mismatch is rejected without touching the key buffer.
+  `find_slot` for a `Map[u64, u64]` contains no divide and no call of any
+  kind in release output. Strings hash eight bytes at a time. Looking up one
+  hundred thousand `u64` keys drops from 29 ns to 19 ns per hit and from
+  21 ns to 15 ns per miss, one million from 39 ns to 28 ns per hit (#656).
 
 ## [5.8.0] - 2026-09-19
 
