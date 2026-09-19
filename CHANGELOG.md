@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+std now requires the mach release that defines `__mach_dit_required`
+(briar-systems/mach#3508, version to be confirmed against its merged PR): every
+aarch64-linux and aarch64-darwin link references the cell.
+
+### Added
+
+- The aarch64 data-independent-timing mode. When the linker's
+  `__mach_dit_required` byte says the link admits a secret integer multiply,
+  `_rt_init` on aarch64 linux and darwin turns PSTATE.DIT on before `main`, and
+  every thread trampoline std owns turns it on for its thread. A processor or
+  kernel without the mode (linux: HWCAP_DIT absent from AT_HWCAP, darwin:
+  `hw.optional.arm.FEAT_DIT` 0 or unreadable) makes the program refuse to
+  start through the panic sink with status 255 and the contract's one-line
+  message, before any secret multiply could run. `std.system.dit` holds the
+  policy (`decide`), the cell (`required`), the enable sequence and the
+  refusal text. The `cpu` capability group gains `cpu_dit()`, the OS's answer
+  on whether the mode is available, sharing the reader `cpu_features` uses.
+  `test/dit` runs a secret-multiply program and a plain one on the aarch64
+  legs, and under `qemu-aarch64 -cpu cortex-a57` shows the refusal (#831).
+
 ## [5.7.0] - 2026-09-18
 
 Rebuild everything that links std, do not just recompile against the new
