@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `std.collections.natural`: the natural order, equality and hash of a type,
+  resolved at compile time. `less[T]`, `eq[T]` and `hash[T]` use the operator
+  on integers and floats, content on `str`, and a lexicographic walk over a
+  record's fields in declaration order (nested records descended); a pointer,
+  union, tag, array, vector or `^` secret is refused at compile time with a
+  written message. Every collection that orders or hashes reads this module
+  (#655).
+- `sort.sort_stable[T](data, len, scratch)` and `sort_stable_by`: a stable
+  merge sort over a caller-supplied scratch buffer of `len / 2` elements,
+  with no allocation (#655).
+- `sort.sort_by`, `sort.is_sorted_by`, `sort.binary_search_by`: the
+  comparator-taking forms of the three, with the comparator called through
+  its pointer per comparison. When briar-systems/mach#3706 and #3707 land, the
+  comparator becomes a comptime parameter with no call-site change (#655).
 - `std.crypto.ct.is_zero[T]`, `eq[T]`, `lt[T]` and `gt[T]`: the four
   comparison families as one generic each over `^T`, each `#[oblivious]` and
   `#[inline]`. The twenty width-named functions (`is_zero_u8` through
@@ -16,6 +30,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instance is validated constant-time on its own, and the release lowering
   of each width-named function is unchanged instruction for instruction on
   x86_64 and aarch64 (#660).
+
+### Changed
+
+- **Breaking.** `sort.sort`, `sort.is_sorted` and `sort.binary_search` no
+  longer take a comparator: they order by `natural.less[T]`, so the compare in
+  the emitted loop is the operator on `T` and no call is made per comparison.
+  A caller with a comparator moves to the `_by` form (MIGRATION.md) (#655).
+- `sort.sort` is pattern-defeating quicksort instead of Shell sort: O(n log n)
+  worst case, insertion sort below 24 elements, a bounded insertion pass that
+  confirms an already sorted range, an equal-elements partition, and a
+  heapsort fallback after log2(n) bad partitions. Every scan is bounded by
+  the range, so a comparator that contradicts itself leaves a permutation and
+  never reads out of bounds. Sorting one million random `i64` drops from
+  1148 ms to 85 ms by the natural order and 112 ms through a comparator
+  (#655).
+- `sort.binary_search` reports the first of several equal elements as `found`
+  (#655).
 
 ## [5.8.0] - 2026-09-19
 
