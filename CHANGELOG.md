@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `allocator.heap`: a span whose base is not a multiple of `SPAN_ALIGN` is
+  handed back to the source and the request refused as `exhausted`, instead
+  of being carved and then missed by the small-block lookup. The padding
+  `take_large` added above `SPAN_ALIGN` is gone: the source's base contract
+  already bounds the payload offset by the requested alignment (#665).
+
+### Changed
+
+- `allocator.heap` tests run every behavioural case against a member
+  matrix: the host mapper, `allocator_source` over `fixed`, and a mapper at
+  the weakest base the contract allows. A new `Source` member is one more
+  row (#665).
+
 ## [6.1.0] - 2026-09-19
 
 ### Added
