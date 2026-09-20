@@ -40,6 +40,7 @@ pub val TYPE_ARRAY:   u8 = 4;
 pub val TYPE_TABLE:   u8 = 5;
 
 val VALUE_SIZE: usize = $size_of(Value);
+val SPAN_SIZE:  usize = $size_of(Span);
 
 # every way a parse can fail
 # ---
@@ -58,11 +59,34 @@ pub tag TomlError: u8 {
     alloc:    Error;
 }
 
-# tagged TOML value
+# a byte range of the document handed to `parse`
 # ---
-# tag: type discriminator (TYPE_*)
+# at:  offset of the first byte, as `TomlError` positions its failures
+# len: byte count; a span of length 0 at offset 0 means "not parsed"
+pub rec Span {
+    at:  usize;
+    len: usize;
+}
+
+# tagged TOML value
+#
+# a parsed value records where it came from. `span` is the literal as written:
+# the quotes of a string, the brackets of an array or inline table, the whole
+# `[header]` or `[[header]]` line for a table a header defined, or the key token
+# that created a table implicitly (a dotted key's inner segment, a header's
+# inner segment). `key` is the key token that maps to this value in its table,
+# the last segment of a dotted key as written, quotes included. an array
+# element has no key of its own and carries the `[[header]]`'s final segment
+# when a header appended it, else the zero span. a value not produced by
+# `parse` carries the zero span in both.
+# ---
+# tag:  type discriminator (TYPE_*)
+# span: the value's literal in the source
+# key:  the key token that maps to it
 pub rec Value {
     tag:  u8;
+    span: Span;
+    key:  Span;
     data: uni {
         string: str;
         integer: i64;
@@ -85,6 +109,9 @@ pub rec Array {
 }
 
 # ordered map of string keys to TOML values
+#
+# a key's source position lives on the value it maps to (`Value.key`), so one
+# `get` answers both where the key and where its value were written.
 # ---
 # keys:   pointer to str array (parallel with values)
 # values: pointer to Value array
@@ -99,9 +126,10 @@ pub rec Table {
 
 # key path segments for dotted key navigation
 rec KeySegs {
-    segs: *str;
-    len:  usize;
-    cap:  usize;
+    segs:  *str;
+    spans: *Span;
+    len:   usize;
+    cap:   usize;
 }
 
 # keep the first refusal a release walk meets
@@ -178,10 +206,12 @@ fun keysegs_dnit(a: *Allocator, ks: *KeySegs) err[Error] {
     }
     if (ks.segs != nil && ks.cap > 0) {
         keep_first(?first, deallocate[u8](a, ks.segs::*u8, ks.cap * 8));
+        keep_first(?first, deallocate[u8](a, ks.spans::*u8, ks.cap * SPAN_SIZE));
     }
-    ks.segs = nil;
-    ks.len  = 0;
-    ks.cap  = 0;
+    ks.segs  = nil;
+    ks.spans = nil;
+    ks.len   = 0;
+    ks.cap   = 0;
     ret first;
 }
 
@@ -340,21 +370,23 @@ fun table_find(t: *Table, key: str) *Value {
 # a:   allocator for new table storage
 # t:   parent table
 # key: key for the sub-table
-# ret: pointer to the sub-table, or the failure
-fun table_ensure_subtable(a: *Allocator, t: *Table, key: str) res[*Table, TomlError] {
+# tok: the key token creating it, recorded as its span and key when it is new
+# ret: the table-typed value, or the failure
+fun table_ensure_subtable(a: *Allocator, t: *Table, key: str, tok: Span) res[*Value, TomlError] {
     val existing: *Value = table_find(t, key);
     if (existing != nil) {
         if (existing.tag != TYPE_TABLE) {
-            ret res[*Table, TomlError].err{TomlError.conflict{0}};
+            ret res[*Value, TomlError].err{TomlError.conflict{0}};
         }
-        ret res[*Table, TomlError].ok{?existing.data.table};
+        ret res[*Value, TomlError].ok{existing};
     }
 
-    val empty: Value      = value_table(table_make());
-    val sr:    err[Error] = table_set(a, t, key, empty);
-    if (sel sr.err) { ret res[*Table, TomlError].err{TomlError.alloc{sr.err}}; }
-    val v: *Value = table_find(t, key);
-    ret res[*Table, TomlError].ok{?v.data.table};
+    var empty: Value = value_table(table_make());
+    empty.span = tok;
+    empty.key  = tok;
+    val sr: err[Error] = table_set(a, t, key, empty);
+    if (sel sr.err) { ret res[*Value, TomlError].err{TomlError.alloc{sr.err}}; }
+    ret res[*Value, TomlError].ok{table_find(t, key)};
 }
 
 # place an unpositioned conflict at the key it was raised for
@@ -410,19 +442,21 @@ fun array_push(a: *Allocator, arr: *Array, val_: Value) err[Error] {
 # create an empty key segment list
 fun keysegs_make() KeySegs {
     var ks: KeySegs;
-    ks.segs = nil;
-    ks.len  = 0;
-    ks.cap  = 0;
+    ks.segs  = nil;
+    ks.spans = nil;
+    ks.len   = 0;
+    ks.cap   = 0;
     ret ks;
 }
 
 # append a segment to a key path
 # ---
-# a:   allocator for growth
-# ks:  target key segments
-# seg: segment string to append
-# ret: ok, or the allocator's refusal; the segment stays the caller's
-fun keysegs_push(a: *Allocator, ks: *KeySegs, seg: str) err[Error] {
+# a:    allocator for growth
+# ks:   target key segments
+# seg:  segment string to append
+# span: the segment token as written
+# ret:  ok, or the allocator's refusal; the segment stays the caller's
+fun keysegs_push(a: *Allocator, ks: *KeySegs, seg: str, span: Span) err[Error] {
     if (ks.len >= ks.cap) {
         var new_cap: usize = ks.cap * 2;
         if (ks.cap == 0)      { new_cap = 4; }
@@ -431,23 +465,53 @@ fun keysegs_push(a: *Allocator, ks: *KeySegs, seg: str) err[Error] {
         val r: res[*u8, Error] = allocate[u8](a, new_cap * 8);
         if (sel r.err) { ret err[Error].err{r.err}; }
         val new_segs: *str = r.ok::*str;
+
+        val sr: res[*u8, Error] = allocate[u8](a, new_cap * SPAN_SIZE);
+        if (sel sr.err) {
+            deallocate[u8](a, new_segs::*u8, new_cap * 8);
+            ret err[Error].err{sr.err};
+        }
+        val new_spans: *Span = sr.ok::*Span;
+
         if (ks.len > 0) {
             memory.raw_copy(new_segs::ptr, ks.segs::ptr, ks.len * 8);
+            memory.raw_copy(new_spans::ptr, ks.spans::ptr, ks.len * SPAN_SIZE);
         }
         if (ks.segs != nil && ks.cap > 0) {
             deallocate[u8](a, ks.segs::*u8, ks.cap * 8);
+            deallocate[u8](a, ks.spans::*u8, ks.cap * SPAN_SIZE);
         }
-        ks.segs = new_segs;
-        ks.cap  = new_cap;
+        ks.segs  = new_segs;
+        ks.spans = new_spans;
+        ks.cap   = new_cap;
     }
-    ks.segs[ks.len] = seg;
-    ks.len          = ks.len + 1;
+    ks.segs[ks.len]  = seg;
+    ks.spans[ks.len] = span;
+    ks.len           = ks.len + 1;
     ret err[Error].ok{};
+}
+
+# the zero span: not parsed
+fun span_none() Span {
+    var sp: Span;
+    sp.at  = 0;
+    sp.len = 0;
+    ret sp;
+}
+
+# the bytes from `start` to the cursor
+fun span_from(start: usize, end: usize) Span {
+    var sp: Span;
+    sp.at  = start;
+    sp.len = end - start;
+    ret sp;
 }
 
 fun value_string(s: str) Value {
     var v: Value;
     v.tag         = TYPE_STRING;
+    v.span        = span_none();
+    v.key         = span_none();
     v.data.string = s;
     ret v;
 }
@@ -455,6 +519,8 @@ fun value_string(s: str) Value {
 fun value_int(n: i64) Value {
     var v: Value;
     v.tag          = TYPE_INTEGER;
+    v.span         = span_none();
+    v.key          = span_none();
     v.data.integer = n;
     ret v;
 }
@@ -462,6 +528,8 @@ fun value_int(n: i64) Value {
 fun value_float(f: f64) Value {
     var v: Value;
     v.tag        = TYPE_FLOAT;
+    v.span       = span_none();
+    v.key        = span_none();
     v.data.float = f;
     ret v;
 }
@@ -469,6 +537,8 @@ fun value_float(f: f64) Value {
 fun value_bool(b: bool) Value {
     var v: Value;
     v.tag          = TYPE_BOOL;
+    v.span         = span_none();
+    v.key          = span_none();
     v.data.boolean = b;
     ret v;
 }
@@ -476,6 +546,8 @@ fun value_bool(b: bool) Value {
 fun value_table(t: Table) Value {
     var v: Value;
     v.tag        = TYPE_TABLE;
+    v.span       = span_none();
+    v.key        = span_none();
     v.data.table = t;
     ret v;
 }
@@ -483,6 +555,8 @@ fun value_table(t: Table) Value {
 fun value_array(a: Array) Value {
     var v: Value;
     v.tag        = TYPE_ARRAY;
+    v.span       = span_none();
+    v.key        = span_none();
     v.data.array = a;
     ret v;
 }
@@ -1372,10 +1446,11 @@ fun parse_key_segment(a: *Allocator, src: str, i: *usize) res[str, TomlError] {
 # ks:  the segment list to fill, empty on entry
 # ret: ok, or the failure
 fun parse_key_path(a: *Allocator, src: str, i: *usize, ks: *KeySegs) err[TomlError] {
-    val first: res[str, TomlError] = parse_key_segment(a, src, i);
+    val first_at: usize               = @i;
+    val first:    res[str, TomlError] = parse_key_segment(a, src, i);
     if (sel first.err) { ret err[TomlError].err{first.err}; }
 
-    val pr: err[Error] = keysegs_push(a, ks, first.ok);
+    val pr: err[Error] = keysegs_push(a, ks, first.ok, span_from(first_at, @i));
     if (sel pr.err) {
         free_str(a, first.ok);
         ret err[TomlError].err{TomlError.alloc{pr.err}};
@@ -1383,10 +1458,11 @@ fun parse_key_path(a: *Allocator, src: str, i: *usize, ks: *KeySegs) err[TomlErr
 
     for (src[@i] == '.') {
         @i = @i + 1;
-        val seg: res[str, TomlError] = parse_key_segment(a, src, i);
+        val seg_at: usize               = @i;
+        val seg:    res[str, TomlError] = parse_key_segment(a, src, i);
         if (sel seg.err) { ret err[TomlError].err{seg.err}; }
 
-        val pr2: err[Error] = keysegs_push(a, ks, seg.ok);
+        val pr2: err[Error] = keysegs_push(a, ks, seg.ok, span_from(seg_at, @i));
         if (sel pr2.err) {
             free_str(a, seg.ok);
             ret err[TomlError].err{TomlError.alloc{pr2.err}};
@@ -1407,9 +1483,9 @@ fun navigate_segs(a: *Allocator, t: *Table, ks: *KeySegs) res[*Table, TomlError]
     var current: *Table = t;
     var i:       usize  = 0;
     for (i < ks.len - 1) {
-        val tr: res[*Table, TomlError] = table_ensure_subtable(a, current, ks.segs[i]);
-        if (sel tr.err) { ret tr; }
-        current = tr.ok;
+        val tr: res[*Value, TomlError] = table_ensure_subtable(a, current, ks.segs[i], ks.spans[i]);
+        if (sel tr.err) { ret res[*Table, TomlError].err{tr.err}; }
+        current = ?tr.ok.data.table;
         i       = i + 1;
     }
     ret res[*Table, TomlError].ok{current};
@@ -1425,7 +1501,7 @@ fun navigate_segs(a: *Allocator, t: *Table, ks: *KeySegs) res[*Table, TomlError]
 # the reader runs on.
 pub val MAX_VALUE_DEPTH: usize = 64;
 
-# parse a TOML value at the current position
+# parse a TOML value at the current position, recording its literal's span
 # ---
 # a:     allocator
 # src:   source text
@@ -1434,6 +1510,16 @@ pub val MAX_VALUE_DEPTH: usize = 64;
 # ret:   parsed Value, or the failure
 fun parse_value(a: *Allocator, src: str, i: *usize, depth: usize) res[Value, TomlError] {
     skip_ws(src, i);
+    val start: usize                 = @i;
+    val r:     res[Value, TomlError] = parse_value_literal(a, src, i, depth);
+    if (sel r.err) { ret r; }
+    var v: Value = r.ok;
+    v.span = span_from(start, @i);
+    ret value_ok(v);
+}
+
+# the value dispatch, cursor on the literal's first byte
+fun parse_value_literal(a: *Allocator, src: str, i: *usize, depth: usize) res[Value, TomlError] {
     if (depth > MAX_VALUE_DEPTH) { ret value_fail(TomlError.depth{@i}); }
 
     val b: u8 = src[@i];
@@ -1566,16 +1652,17 @@ fun parse_inline_entries(a: *Allocator, src: str, i: *usize, t: *Table, ks: *Key
         val vr: res[Value, TomlError] = parse_value(a, src, i, depth);
         if (sel vr.err) { ret err[TomlError].err{vr.err}; }
 
+        var parsed: Value = vr.ok;
+        parsed.key = ks.spans[ks.len - 1];
+
         val nr: res[*Table, TomlError] = navigate_segs(a, t, ks);
         if (sel nr.err) {
-            var parsed: Value = vr.ok;
             value_dnit(a, ?parsed);
             ret err[TomlError].err{at(nr.err, key_at)};
         }
 
-        val sr: err[Error] = table_set(a, nr.ok, ks.segs[ks.len - 1], vr.ok);
+        val sr: err[Error] = table_set(a, nr.ok, ks.segs[ks.len - 1], parsed);
         if (sel sr.err) {
-            var parsed: Value = vr.ok;
             value_dnit(a, ?parsed);
             ret err[TomlError].err{TomlError.alloc{sr.err}};
         }
@@ -1605,9 +1692,9 @@ fun parse_inline_entries(a: *Allocator, src: str, i: *usize, t: *Table, ks: *Key
 # a:    allocator
 # root: document root table
 # ks:   key segments from the [[...]] header
-# ret:  pointer to the newly appended table, or the failure (a conflict
-#       unpositioned)
-fun navigate_for_array_table(a: *Allocator, root: *Table, ks: *KeySegs) res[*Table, TomlError] {
+# ret:  the newly appended table's value, its span still the caller's to
+#       stamp, or the failure (a conflict unpositioned)
+fun navigate_for_array_table(a: *Allocator, root: *Table, ks: *KeySegs) res[*Value, TomlError] {
     var parent: *Table = root;
     var i:      usize  = 0;
 
@@ -1623,18 +1710,18 @@ fun navigate_for_array_table(a: *Allocator, root: *Table, ks: *KeySegs) res[*Tab
                 val items: *Value = existing.data.array.items::*Value;
                 val last:  *Value = ?items[existing.data.array.len - 1];
                 if (last.tag != TYPE_TABLE) {
-                    ret res[*Table, TomlError].err{TomlError.conflict{0}};
+                    ret res[*Value, TomlError].err{TomlError.conflict{0}};
                 }
                 parent = ?last.data.table;
             }
             or {
-                ret res[*Table, TomlError].err{TomlError.conflict{0}};
+                ret res[*Value, TomlError].err{TomlError.conflict{0}};
             }
         }
         or {
-            val tr: res[*Table, TomlError] = table_ensure_subtable(a, parent, ks.segs[i]);
+            val tr: res[*Value, TomlError] = table_ensure_subtable(a, parent, ks.segs[i], ks.spans[i]);
             if (sel tr.err) { ret tr; }
-            parent = tr.ok;
+            parent = ?tr.ok.data.table;
         }
         i = i + 1;
     }
@@ -1645,15 +1732,15 @@ fun navigate_for_array_table(a: *Allocator, root: *Table, ks: *KeySegs) res[*Tab
 
     if (existing != nil) {
         if (existing.tag != TYPE_ARRAY) {
-            ret res[*Table, TomlError].err{TomlError.conflict{0}};
+            ret res[*Value, TomlError].err{TomlError.conflict{0}};
         }
         var new_table: Table      = table_make();
         val new_val:   Value      = value_table(new_table);
         val pr:        err[Error] = array_push(a, ?existing.data.array, new_val);
-        if (sel pr.err) { ret res[*Table, TomlError].err{TomlError.alloc{pr.err}}; }
+        if (sel pr.err) { ret res[*Value, TomlError].err{TomlError.alloc{pr.err}}; }
 
         val items: *Value = existing.data.array.items::*Value;
-        ret res[*Table, TomlError].ok{?items[existing.data.array.len - 1].data.table};
+        ret res[*Value, TomlError].ok{?items[existing.data.array.len - 1]};
     }
 
     # first occurrence: create the array with one empty table
@@ -1661,18 +1748,21 @@ fun navigate_for_array_table(a: *Allocator, root: *Table, ks: *KeySegs) res[*Tab
     var new_table: Table      = table_make();
     val new_val:   Value      = value_table(new_table);
     val pr:        err[Error] = array_push(a, ?arr, new_val);
-    if (sel pr.err) { ret res[*Table, TomlError].err{TomlError.alloc{pr.err}}; }
+    if (sel pr.err) { ret res[*Value, TomlError].err{TomlError.alloc{pr.err}}; }
 
-    val arr_val: Value      = value_array(arr);
-    val sr:      err[Error] = table_set(a, parent, final_key, arr_val);
+    # the array itself is positioned at the header that first named it
+    var arr_val: Value = value_array(arr);
+    arr_val.span = ks.spans[ks.len - 1];
+    arr_val.key  = ks.spans[ks.len - 1];
+    val sr: err[Error] = table_set(a, parent, final_key, arr_val);
     if (sel sr.err) {
         array_dnit(a, ?arr);
-        ret res[*Table, TomlError].err{TomlError.alloc{sr.err}};
+        ret res[*Value, TomlError].err{TomlError.alloc{sr.err}};
     }
 
     val added: *Value = table_find(parent, final_key);
     val items: *Value = added.data.array.items::*Value;
-    ret res[*Table, TomlError].ok{?items[0].data.table};
+    ret res[*Value, TomlError].ok{?items[0]};
 }
 
 # parse a TOML document into a table tree
@@ -1720,6 +1810,7 @@ fun parse_walk(a: *Allocator, src: str, root: *Table, ks: *KeySegs) err[TomlErro
 
         # array of tables: [[key]]
         if (src[i] == '[' && src[i + 1] == '[') {
+            val header_at: usize = i;
             i = i + 2;
             skip_ws(src, ?i);
 
@@ -1734,9 +1825,11 @@ fun parse_walk(a: *Allocator, src: str, root: *Table, ks: *KeySegs) err[TomlErro
             }
             i = i + 2;
 
-            val tr: res[*Table, TomlError] = navigate_for_array_table(a, root, ks);
+            val tr: res[*Value, TomlError] = navigate_for_array_table(a, root, ks);
             if (sel tr.err) { ret err[TomlError].err{at(tr.err, key_at)}; }
-            current = tr.ok;
+            tr.ok.span = span_from(header_at, i);
+            tr.ok.key  = ks.spans[ks.len - 1];
+            current    = ?tr.ok.data.table;
 
             skip_to_newline(src, ?i);
             cnt;
@@ -1744,6 +1837,7 @@ fun parse_walk(a: *Allocator, src: str, root: *Table, ks: *KeySegs) err[TomlErro
 
         # table header: [key]
         if (src[i] == '[') {
+            val header_at: usize = i;
             i = i + 1;
             skip_ws(src, ?i);
 
@@ -1758,12 +1852,19 @@ fun parse_walk(a: *Allocator, src: str, root: *Table, ks: *KeySegs) err[TomlErro
             }
             i = i + 1;
 
+            # inner segments record the token that created them; the table the
+            # header defines records the header, whether the header created it
+            # or a dotted key or deeper header reached it first
             var target: *Table = root;
             var si:     usize  = 0;
             for (si < ks.len) {
-                val tr: res[*Table, TomlError] = table_ensure_subtable(a, target, ks.segs[si]);
+                val tr: res[*Value, TomlError] = table_ensure_subtable(a, target, ks.segs[si], ks.spans[si]);
                 if (sel tr.err) { ret err[TomlError].err{at(tr.err, key_at)}; }
-                target = tr.ok;
+                if (si == ks.len - 1) {
+                    tr.ok.span = span_from(header_at, i);
+                    tr.ok.key  = ks.spans[si];
+                }
+                target = ?tr.ok.data.table;
                 si     = si + 1;
             }
             current = target;
@@ -1787,16 +1888,17 @@ fun parse_walk(a: *Allocator, src: str, root: *Table, ks: *KeySegs) err[TomlErro
         val vr: res[Value, TomlError] = parse_value(a, src, ?i, 0);
         if (sel vr.err) { ret err[TomlError].err{vr.err}; }
 
+        var parsed: Value = vr.ok;
+        parsed.key = ks.spans[ks.len - 1];
+
         val nr: res[*Table, TomlError] = navigate_segs(a, current, ks);
         if (sel nr.err) {
-            var parsed: Value = vr.ok;
             value_dnit(a, ?parsed);
             ret err[TomlError].err{at(nr.err, key_at)};
         }
 
-        val sr: err[Error] = table_set(a, nr.ok, ks.segs[ks.len - 1], vr.ok);
+        val sr: err[Error] = table_set(a, nr.ok, ks.segs[ks.len - 1], parsed);
         if (sel sr.err) {
-            var parsed: Value = vr.ok;
             value_dnit(a, ?parsed);
             ret err[TomlError].err{TomlError.alloc{sr.err}};
         }
@@ -2267,5 +2369,127 @@ $if (capability.HOSTED) {
             ordinal = ordinal + 1;
         }
         ret 9;
+    }
+
+    # source positions (#811). every span is checked against a fixed document by
+    # its byte offset and length, so a drift in what a token "as written" means
+    # (quotes, brackets, the header line) is a number and not an opinion
+    fun span_is(sp: Span, at_: usize, len: usize) bool {
+        ret sp.at == at_ && sp.len == len;
+    }
+
+    test "toml: keys, values, headers and elements carry their source spans" {
+        var c: CountingAlloc;
+        var a: Allocator;
+        if (!counting_make(?c, ?a)) { ret 1; }
+
+        val doc: str                   = "# manifest\n[project]\nname = \"std\"\nmach = \"^5.8\"\ndeps.core.version = 2\ntargets = [ \"linux\", 'win' ]\n[project.\"quoted key\"]\nx = { y = true }\n[[artifact]]\nkind = \"lib\"\n[[artifact]]\nkind = \"bin\"\n";
+        val r:   res[Table, TomlError] = parse(?a, doc);
+        if (sel r.err) { ret 2; }
+        var t: Table = r.ok;
+
+        # a header-defined table: the header line is its span, the last segment its key
+        val project: opt[*Value] = get(?t, "project");
+        if (!sel project.some)                  { ret 3; }
+        if (!span_is(project.some.span, 11, 9)) { ret 4; }
+        if (!span_is(project.some.key, 12, 7))  { ret 5; }
+
+        # a nested key and its string literal, quotes included
+        val name: opt[*Value] = get(?t, "project.name");
+        if (!sel name.some)                  { ret 6; }
+        if (!span_is(name.some.key, 21, 4))  { ret 7; }
+        if (!span_is(name.some.span, 28, 5)) { ret 8; }
+        val mach: opt[*Value] = get(?t, "project.mach");
+        if (!sel mach.some)                  { ret 9; }
+        if (!span_is(mach.some.span, 41, 6)) { ret 10; }
+
+        # a dotted key: the implicit tables record the segment that created them,
+        # the leaf its last segment and its literal
+        val deps: opt[*Value] = get(?t, "project.deps");
+        if (!sel deps.some)                  { ret 11; }
+        if (!span_is(deps.some.span, 48, 4)) { ret 12; }
+        if (!span_is(deps.some.key, 48, 4))  { ret 13; }
+        val core: opt[*Value] = get(?t, "project.deps.core");
+        if (!sel core.some)                 { ret 14; }
+        if (!span_is(core.some.key, 53, 4)) { ret 15; }
+        val version: opt[*Value] = get(?t, "project.deps.core.version");
+        if (!sel version.some)                  { ret 16; }
+        if (!span_is(version.some.key, 58, 7))  { ret 17; }
+        if (!span_is(version.some.span, 68, 1)) { ret 18; }
+
+        # an array literal and its elements: elements have no key
+        val targets: opt[*Value] = get(?t, "project.targets");
+        if (!sel targets.some)                   { ret 19; }
+        if (!span_is(targets.some.span, 80, 18)) { ret 20; }
+        val linux: opt[*Value] = array_get(?targets.some.data.array, 0);
+        if (!sel linux.some)                  { ret 21; }
+        if (!span_is(linux.some.span, 82, 7)) { ret 22; }
+        if (!span_is(linux.some.key, 0, 0))   { ret 23; }
+        val win: opt[*Value] = array_get(?targets.some.data.array, 1);
+        if (!sel win.some)                  { ret 24; }
+        if (!span_is(win.some.span, 91, 5)) { ret 25; }
+
+        # a quoted header segment keeps its quotes; the outer table an earlier
+        # header defined is not re-stamped by being passed through
+        val quoted: *Value = find_by_seg(?project.some.data.table, "quoted key", 10);
+        if (quoted == nil)                      { ret 26; }
+        if (!span_is(quoted.span, 99, 22))      { ret 27; }
+        if (!span_is(quoted.key, 108, 12))      { ret 28; }
+        if (!span_is(project.some.span, 11, 9)) { ret 29; }
+
+        # an inline table is the braces; its entries are positioned like any other
+        val x: opt[*Value] = get(?quoted.data.table, "x");
+        if (!sel x.some)                    { ret 30; }
+        if (!span_is(x.some.span, 126, 12)) { ret 31; }
+        val y: opt[*Value] = get(?quoted.data.table, "x.y");
+        if (!sel y.some)                   { ret 32; }
+        if (!span_is(y.some.key, 128, 1))  { ret 33; }
+        if (!span_is(y.some.span, 132, 4)) { ret 34; }
+
+        # an array of tables: the array is positioned at the segment that first
+        # named it, each element at the header that appended it
+        val artifact: opt[*Value] = get(?t, "artifact");
+        if (!sel artifact.some)                   { ret 35; }
+        if (!span_is(artifact.some.span, 141, 8)) { ret 36; }
+        if (!span_is(artifact.some.key, 141, 8))  { ret 37; }
+        val first: opt[*Value] = array_get(?artifact.some.data.array, 0);
+        if (!sel first.some)                    { ret 38; }
+        if (!span_is(first.some.span, 139, 12)) { ret 39; }
+        val second: opt[*Value] = array_get(?artifact.some.data.array, 1);
+        if (!sel second.some)                    { ret 40; }
+        if (!span_is(second.some.span, 165, 12)) { ret 41; }
+        if (!span_is(second.some.key, 167, 8))   { ret 42; }
+        val kind: opt[*Value] = get(?second.some.data.table, "kind");
+        if (!sel kind.some)                   { ret 43; }
+        if (!span_is(kind.some.key, 178, 4))  { ret 44; }
+        if (!span_is(kind.some.span, 185, 5)) { ret 45; }
+
+        dnit(?a, ?t);
+        if (c.live != 0) { ret 46; }
+        ret 0;
+    }
+
+    # a header that names a table a dotted key created first re-positions it at
+    # the header, so a missing key is reported against the definition
+    test "toml: a header re-stamps a table a dotted key created" {
+        var c: CountingAlloc;
+        var a: Allocator;
+        if (!counting_make(?c, ?a)) { ret 1; }
+
+        val r: res[Table, TomlError] = parse(?a, "a.b = 1\n[a]\nc = 2\n");
+        if (sel r.err) { ret 2; }
+        var t:  Table       = r.ok;
+        val av: opt[*Value] = get(?t, "a");
+        if (!sel av.some)                 { ret 3; }
+        if (!span_is(av.some.span, 8, 3)) { ret 4; }
+        if (!span_is(av.some.key, 9, 1))  { ret 5; }
+        val bv: opt[*Value] = get(?t, "a.b");
+        if (!sel bv.some)                 { ret 6; }
+        if (!span_is(bv.some.key, 2, 1))  { ret 7; }
+        if (!span_is(bv.some.span, 6, 1)) { ret 8; }
+
+        dnit(?a, ?t);
+        if (c.live != 0) { ret 9; }
+        ret 0;
     }
 }
