@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.0.0] - 2026-09-19
+
+std 7.0.0 keeps `mach = "^5.8"`; nothing in it needs 5.9. Two things are
+silent to the compiler and need a rebuild or a reading rather than a fix at
+the call site:
+
+- `data.toml.Value` grew by two `Span`s. Anything that links std and stores a
+  `Value` or a `Table` across the boundary must be rebuilt against 7.0.0.
+- `io.runtime.make` keeps a copy of the allocator it is handed, so that
+  allocator's context must outlive the runtime. A stack-local allocator that
+  goes out of scope before `io.runtime.destroy` is a use after free, not a
+  refusal.
+
+The one changed signature, `io.runtime.make(runtime, a, initial)`, is a
+compile-time refusal at the caller, so a program that builds against 7.0.0
+has already moved. Three changes can newly fail or differ at run time in code
+that already compiles:
+
+- A refusal from the runtime's allocator is now its only ceiling: a
+  submission that used to grow a private page allocator fails with
+  `RESOURCE_EXHAUSTED` (`ENOMEM` inside a backend) when `a` refuses, with
+  nothing live moved and every operation still settling once.
+- `allocator.page`, `allocator.testing` and `allocator.arena` honor `align`,
+  so a block's address may differ from 6.x (only ever more aligned), and
+  `page` maps wider than the request for an alignment above the page.
+- `allocator.heap` refuses, as `exhausted`, a span whose base is not a
+  multiple of `SPAN_ALIGN`, where 6.x carved it and then lost its small
+  blocks. Only a `Source` outside the base contract reaches this.
+
 ### Added
 
 - `data.toml.Span` and, on every parsed `Value`, `span` and `key`: the byte
@@ -36,7 +65,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the weakest base the contract allows. A new `Source` member is one more
   row (#665). `allocator_source` over `page` and over `testing` are rows
   too (#851).
-
 
 ### Fixed
 
