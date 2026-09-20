@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `data.toml.Span` and, on every parsed `Value`, `span` and `key`: the byte
+  offset and length in the document handed to `parse` of the value's literal
+  as written and of the key token that maps to it, so a consumer can report a
+  semantic problem against the source without text-matching. A table a
+  header defines is positioned at the header line, a table a dotted key or an
+  inner header segment created at that segment, and each `[[header]]`
+  element at its header. A value not produced by `parse` carries the zero
+  span in both. `Value` grows, so anything that links std and stores a
+  `Value` or a `Table` must be rebuilt (#811).
+
 ### Changed
 
 - **Breaking**: `io.runtime.make(runtime, a, initial)` takes the allocator
@@ -24,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the weakest base the contract allows. A new `Source` member is one more
   row (#665). `allocator_source` over `page` and over `testing` are rows
   too (#851).
+
 
 ### Fixed
 
