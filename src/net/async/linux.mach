@@ -8,6 +8,7 @@ $if ($mach.build.os != $mach.os.linux) {
 
 use std.allocator;
 use std.allocator.page;
+use std.allocator.testing;
 use std.io.runtime;
 use std.memory;
 use std.memory.table;
@@ -22,6 +23,7 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
 
 # cancel ends native access synchronously, so it runs while no thread is
@@ -281,10 +283,9 @@ fun resource_map_remove(backend: *Backend, index: u32) {
 fun rehash_resources(backend: *Backend) bool {
     val required: usize = required_map_capacity(backend.resources.capacity);
     if (required == 0 || required <= backend.map_capacity) { ret required != 0; }
-    var bytes: usize = 0;
-    if (!memory.range_scaled(required, $size_of(u32), ?bytes)) { ret false; }
-    val fresh: *u32 = linux.allocate(bytes)::*u32;
-    if (fresh == nil) { ret false; }
+    val got: res[*u32, allocator.Error] = allocator.allocate[u32](?backend.allocator, required);
+    if (sel got.err) { ret false; }
+    val fresh:             *u32  = got.ok;
     val previous:          *u32  = backend.resource_map;
     val previous_capacity: usize = backend.map_capacity;
     var i:                 usize = 0;
@@ -300,12 +301,12 @@ fun rehash_resources(backend: *Backend) bool {
         if (resource.state == RESOURCE_ACTIVE && !resource_map_insert(backend, i::u32)) {
             backend.resource_map = previous;
             backend.map_capacity = previous_capacity;
-            linux.deallocate(fresh::ptr, bytes);
+            allocator.deallocate[u32](?backend.allocator, fresh, required);
             ret false;
         }
         i = i + 1;
     }
-    linux.deallocate(previous::ptr, $size_of(u32) * previous_capacity);
+    allocator.deallocate[u32](?backend.allocator, previous, previous_capacity);
     ret true;
 }
 
@@ -755,17 +756,14 @@ fun submission_done(backend: *Backend, resource: *Resource) {
 
 # initial is the size the backend starts at: the operation, resource and ready
 # tables grow on demand and the resource map rehashes with them
-pub fun make(backend: *Backend, queue: *shared.IoQueue, initial: usize, source_id: u16) i64 {
-    if (backend == nil || queue == nil || initial == 0 || source_id == 0) { ret invalid(); }
+# ---
+# a: where the tables, the resource map and the completion batch come from;
+#    the backend keeps a copy, so a's context must outlive it
+pub fun make(backend: *Backend, queue: *shared.IoQueue, a: *allocator.Allocator, initial: usize, source_id: u16) i64 {
+    if (backend == nil || queue == nil || a == nil || initial == 0 || source_id == 0) { ret invalid(); }
     val map_capacity: usize = required_map_capacity(initial);
     if (map_capacity == 0) { ret linux.ENOMEM; }
-    var map_bytes:    usize = 0;
-    var native_bytes: usize = 0;
-    if (!memory.range_scaled(map_capacity, $size_of(u32), ?map_bytes) ||
-        !memory.range_scaled(NATIVE_BATCH, $size_of(linux.IoCompletion), ?native_bytes)) { ret linux.ENOMEM; }
-
-    val allocated: err[allocator.Error] = page.make(?backend.allocator);
-    if (sel allocated.err)                                                                  { ret linux.ENOMEM; }
+    backend.allocator = @a;
     if (!table.make(?backend.operations, ?backend.allocator, $size_of(Operation), initial)) { ret linux.ENOMEM; }
     if (!table.make(?backend.resources, ?backend.allocator, $size_of(Resource), initial) ||
         !table.make(?backend.ready, ?backend.allocator, $size_of(types.NativeCompletion), initial)) {
@@ -774,22 +772,24 @@ pub fun make(backend: *Backend, queue: *shared.IoQueue, initial: usize, source_i
         table.destroy(?backend.operations);
         ret linux.ENOMEM;
     }
-    backend.resource_map = linux.allocate(map_bytes)::*u32;
-    if (backend.resource_map == nil) {
+    val map: res[*u32, allocator.Error] = allocator.zallocate[u32](?backend.allocator, map_capacity);
+    if (sel map.err) {
         table.destroy(?backend.ready);
         table.destroy(?backend.resources);
         table.destroy(?backend.operations);
         ret linux.ENOMEM;
     }
-    backend.native = linux.allocate(native_bytes)::*linux.IoCompletion;
-    if (backend.native == nil) {
-        linux.deallocate(backend.resource_map::ptr, map_bytes);
+    backend.resource_map = map.ok;
+    val batch: res[*linux.IoCompletion, allocator.Error] = allocator.allocate[linux.IoCompletion](?backend.allocator, NATIVE_BATCH);
+    if (sel batch.err) {
+        allocator.deallocate[u32](?backend.allocator, backend.resource_map, map_capacity);
         backend.resource_map = nil;
         table.destroy(?backend.ready);
         table.destroy(?backend.resources);
         table.destroy(?backend.operations);
         ret linux.ENOMEM;
     }
+    backend.native = batch.ok;
 
     backend.queue           = queue;
     backend.source_id       = source_id;
@@ -1153,10 +1153,8 @@ pub fun destroy(backend: *Backend) i64 {
     }
     # a registration left behind could name this source id after it is reused
     if (backend.registered != 0) { panic.panic("std.net.async: destroy left a native registration behind\n"); }
-    val map_bytes:    usize = $size_of(u32) * backend.map_capacity;
-    val native_bytes: usize = $size_of(linux.IoCompletion) * NATIVE_BATCH;
-    linux.deallocate(backend.native::ptr, native_bytes);
-    linux.deallocate(backend.resource_map::ptr, map_bytes);
+    allocator.deallocate[linux.IoCompletion](?backend.allocator, backend.native, NATIVE_BATCH);
+    allocator.deallocate[u32](?backend.allocator, backend.resource_map, backend.map_capacity);
     table.destroy(?backend.ready);
     table.destroy(?backend.resources);
     table.destroy(?backend.operations);
@@ -1433,10 +1431,12 @@ fun test_datagram(socket: *usize, endpoint: *ip.Endpoint) i64 {
 }
 
 test "async linux: UDP batch preserves boundaries and metadata" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 8, 1) < 0) {
+    if (make(?backend, ?queue, ?pa, 8, 1) < 0) {
         linux.io_queue_close(?queue);
         ret 1;
     }
@@ -1535,10 +1535,12 @@ test "async linux: UDP batch preserves boundaries and metadata" {
 }
 
 test "async linux: vectored writes and fragmented reads report progress" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 8, 1) < 0) {
+    if (make(?backend, ?queue, ?pa, 8, 1) < 0) {
         linux.io_queue_close(?queue);
         ret 1;
     }
@@ -1618,10 +1620,12 @@ test "async linux: vectored writes and fragmented reads report progress" {
 }
 
 test "async linux: remote half-close reports EOF and preserves writes" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 4, 1) < 0) {
+    if (make(?backend, ?queue, ?pa, 4, 1) < 0) {
         linux.io_queue_close(?queue);
         ret 1;
     }
@@ -1680,10 +1684,12 @@ test "async linux: remote half-close reports EOF and preserves writes" {
 }
 
 test "async linux: reset completes a pending read once" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 4, 1) < 0) {
+    if (make(?backend, ?queue, ?pa, 4, 1) < 0) {
         linux.io_queue_close(?queue);
         ret 1;
     }
@@ -1750,10 +1756,12 @@ test "async linux: reset completes a pending read once" {
 
 # the old encoding packed the index into 16 bits and make refused past 65535
 test "async linux: a resource index past the old bound survives the wire" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 1, 7) < 0) {
+    if (make(?backend, ?queue, ?pa, 1, 7) < 0) {
         linux.io_queue_close(?queue);
         ret 2;
     }
@@ -1789,10 +1797,12 @@ test "async linux: a resource index past the old bound survives the wire" {
 }
 
 test "async linux: storage grows past the initial size and recycles" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 2, 1) < 0) {
+    if (make(?backend, ?queue, ?pa, 2, 1) < 0) {
         linux.io_queue_close(?queue);
         ret 1;
     }
@@ -1852,11 +1862,100 @@ test "async linux: storage grows past the initial size and recycles" {
     ret 0;
 }
 
-test "async linux: canceling close preserves handle ownership" {
+# the backend's tables come from the allocator it was made with, so a
+# refusal there is the one way to reach the ENOMEM path on purpose
+test "async linux: a refused table growth is ENOMEM and settles what is live" {
+    # the tracker is too large for the stack, so it lives on the mapper
+    val t: *testing.Testing = linux.allocate($size_of(testing.Testing))::*testing.Testing;
+    if (t == nil) { ret 1; }
+    fin { linux.deallocate(t::ptr, $size_of(testing.Testing)); }
+    val tr: err[allocator.Error] = testing.make(t);
+    if (sel tr.err) { ret 1; }
+    fin { testing.dnit(t); }
+
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 8, 1) < 0) {
+    if (make(?backend, ?queue, testing.allocator_of(t), 2, 1) < 0) {
+        linux.io_queue_close(?queue);
+        ret 1;
+    }
+    var listener: usize;
+    var endpoint: ip.Endpoint;
+    if (test_listener(?listener, ?endpoint) < 0) {
+        destroy(?backend);
+        linux.io_queue_close(?queue);
+        ret 1;
+    }
+    var client: usize;
+    if (test_client(endpoint, ?client) < 0) {
+        linux.sock_close(listener);
+        destroy(?backend);
+        linux.io_queue_close(?queue);
+        ret 1;
+    }
+    var server: usize = (-1)::usize;
+    if (stream_accept(listener, nil, ?server) < 0) {
+        linux.sock_close(client);
+        linux.sock_close(listener);
+        destroy(?backend);
+        linux.io_queue_close(?queue);
+        ret 1;
+    }
+
+    var storage: [3]u8;
+    storage[0] = 0xa1;
+    storage[1] = 0xb2;
+    storage[2] = 0xc3;
+    var tokens: [3]types.Token;
+    val first:  i64        = submit_read(?backend, server, 1, ?storage[0], 1, 89, ?tokens[0]);
+    val second: i64        = submit_read(?backend, server, 1, ?storage[1], 1, 90, ?tokens[1]);
+    val held:   *Operation = operation_at(?backend, tokens[0].index::usize);
+    # the third operation needs a chunk, and each allocation of that growth
+    # is refused in turn; the ordinal counts refused attempts, so it is
+    # re-based each time
+    var refused:   usize = 0;
+    var offset:    usize = 1;
+    var grown:     i64   = 0;
+    var disturbed: bool  = false;
+    for (offset <= 8) {
+        testing.fail_at_ordinal(t, testing.attempt_count(t) + offset);
+        grown = submit_read(?backend, server, 1, ?storage[2], 1, 91, ?tokens[2]);
+        if (grown == 0)                                                    { brk; }
+        if (grown != linux.ENOMEM)                                         { disturbed = true; }
+        if (operation_at(?backend, tokens[0].index::usize) != held)        { disturbed = true; }
+        if (held.context != 89 || held.generation != tokens[0].generation) { disturbed = true; }
+        if (backend.live != 2 || backend.operation_slots != 2)             { disturbed = true; }
+        refused = refused + 1;
+        offset  = offset + 1;
+    }
+    testing.clear_failure(t);
+    val grew:          bool = grown == 0 && refused > 0 && !disturbed && backend.operations.capacity == 4 && tokens[2].index == 2;
+    val cancel_first:  i64  = cancel(?backend, tokens[0], nil);
+    val cancel_second: i64  = cancel(?backend, tokens[1], nil);
+    val cancel_third:  i64  = cancel(?backend, tokens[2], nil);
+    var byte:          u8   = 'x';
+    val sent:          i64  = linux.sock_send(client, ?byte, 1);
+    val after:         i64  = poll(?backend, 0);
+    val valid:         bool = first == 0 && second == 0 && grew && cancel_first == 0 && cancel_second == 0 && cancel_third == 0 && sent == 1 && after == 0 && storage[0] == 0xa1 && storage[1] == 0xb2 && storage[2] == 0xc3 && backend.live == 0 && backend.resource_count == 1;
+    linux.sock_close(server);
+    linux.sock_close(client);
+    linux.sock_close(listener);
+    val destroyed: i64 = destroy(?backend);
+    linux.io_queue_close(?queue);
+    if (!valid || destroyed < 0)           { ret 1; }
+    if (testing.leaked(t))                 { ret 2; }
+    if (testing.double_free_count(t) != 0) { ret 2; }
+    ret 0;
+}
+
+test "async linux: canceling close preserves handle ownership" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    var queue: shared.IoQueue;
+    if (linux.io_queue_create(?queue) < 0) { ret 1; }
+    var backend: Backend;
+    if (make(?backend, ?queue, ?pa, 8, 1) < 0) {
         linux.io_queue_close(?queue);
         ret 1;
     }
@@ -1939,10 +2038,12 @@ test "async linux: canceling close preserves handle ownership" {
 }
 
 test "async linux: queued cancellation preserves FIFO" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 4, 1) < 0) {
+    if (make(?backend, ?queue, ?pa, 4, 1) < 0) {
         linux.io_queue_close(?queue);
         ret 1;
     }
@@ -1985,10 +2086,12 @@ test "async linux: queued cancellation preserves FIFO" {
 }
 
 test "async linux: queued accept cancellation closes handle" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 4, 1) < 0) {
+    if (make(?backend, ?queue, ?pa, 4, 1) < 0) {
         linux.io_queue_close(?queue);
         ret 1;
     }
@@ -2023,10 +2126,12 @@ test "async linux: queued accept cancellation closes handle" {
 }
 
 test "async linux: one stream drives concurrent read and write" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 8, 1) < 0) {
+    if (make(?backend, ?queue, ?pa, 8, 1) < 0) {
         linux.io_queue_close(?queue);
         ret 1;
     }
@@ -2100,10 +2205,12 @@ test "async linux: one stream drives concurrent read and write" {
 }
 
 test "async linux: listener owns multiple bounded accepts" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 8, 1) < 0) {
+    if (make(?backend, ?queue, ?pa, 8, 1) < 0) {
         linux.io_queue_close(?queue);
         ret 1;
     }
@@ -2167,10 +2274,12 @@ test "async linux: listener owns multiple bounded accepts" {
 }
 
 test "async linux: shutdown and close follow prior writes" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 8, 1) < 0) {
+    if (make(?backend, ?queue, ?pa, 8, 1) < 0) {
         linux.io_queue_close(?queue);
         ret 1;
     }
@@ -2237,10 +2346,12 @@ test "async linux: shutdown and close follow prior writes" {
 }
 
 test "async linux: a local socket is refused before any registration" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 2, 1) < 0) {
+    if (make(?backend, ?queue, ?pa, 2, 1) < 0) {
         linux.io_queue_close(?queue);
         ret 1;
     }
@@ -2302,10 +2413,12 @@ fun test_map_probes(backend: *Backend, value: usize) usize {
 # n resources registered and released for several rounds, then n live ones:
 # reports leftover stale slots and the longest hit and miss probe
 fun test_map_churn(n: usize, stale: *usize, max_hit: *usize, max_miss: *usize) i64 {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, n, 1) < 0) {
+    if (make(?backend, ?queue, ?pa, n, 1) < 0) {
         linux.io_queue_close(?queue);
         ret 2;
     }
@@ -2373,10 +2486,12 @@ test "async linux: resource lookups stay bounded after churn at 1k, 10k and 100k
 # the blocked operations a socket carries one after another register it once:
 # only the first finds its address and adds it, every later one rearms (#737)
 test "async linux: a socket stays registered across blocked operations" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 8, 1) < 0) {
+    if (make(?backend, ?queue, ?pa, 8, 1) < 0) {
         linux.io_queue_close(?queue);
         ret 2;
     }
@@ -2476,10 +2591,12 @@ fun test_await(backend: *Backend, context: usize, out: *types.NativeCompletion) 
 # stale operation completes stale, and the socket now behind that value is
 # registered only when submitted with its own opening (#737)
 test "async linux: a vanished registration marks the resource stale" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, 8, 1) < 0) {
+    if (make(?backend, ?queue, ?pa, 8, 1) < 0) {
         linux.io_queue_close(?queue);
         ret 2;
     }
@@ -2532,6 +2649,8 @@ test "async linux: a vanished registration marks the resource stale" {
 # destroy gives up every registration it holds, so no event can name its source
 # id once the runtime reuses it (#740)
 test "async linux: destroy removes every registration it holds" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var queue: shared.IoQueue;
     if (linux.io_queue_create(?queue) < 0) { ret 1; }
     fin { linux.io_queue_close(?queue); }
@@ -2542,7 +2661,7 @@ test "async linux: destroy removes every registration it holds" {
         linux.close(pipe[1]);
     }
     var backend: Backend;
-    if (make(?backend, ?queue, 8, 1) < 0) { ret 3; }
+    if (make(?backend, ?queue, ?pa, 8, 1) < 0) { ret 3; }
     var created:  bool      = false;
     val resource: *Resource = resource_acquire(?backend, pipe[0]::usize, 0, ?created);
     if (resource == nil) { ret 4; }

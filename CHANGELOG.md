@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking**: `io.runtime.make(runtime, a, initial)` takes the allocator
+  every one of the runtime's allocations comes from, as `memory.table.make`
+  does, and keeps a copy of it, so `a`'s context must outlive the runtime.
+  The runtime no longer builds a page allocator of its own; its tables and
+  its native event batch come from `a`, and `net.async`, `net.async.local`
+  and their backends draw from `runtime.allocator` instead of a private page
+  allocator. A refusal from `a` is the runtime's only ceiling, so a test
+  allocator reaches every refusal branch: the submission fails with
+  `RESOURCE_EXHAUSTED` (`ENOMEM` inside a backend), nothing live moves, and
+  every operation still settles once. See MIGRATION.md (#677).
+- `allocator.heap` tests run every behavioural case against a member
+  matrix: the host mapper, `allocator_source` over `fixed`, and a mapper at
+  the weakest base the contract allows. A new `Source` member is one more
+  row (#665). `allocator_source` over `page` and over `testing` are rows
+  too (#851).
+
 ### Fixed
 
 - `allocator.page`, `allocator.testing` and `allocator.arena` honor the
@@ -23,14 +41,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of being carved and then missed by the small-block lookup. The padding
   `take_large` added above `SPAN_ALIGN` is gone: the source's base contract
   already bounds the payload offset by the requested alignment (#665).
-
-### Changed
-
-- `allocator.heap` tests run every behavioural case against a member
-  matrix: the host mapper, `allocator_source` over `fixed`, and a mapper at
-  the weakest base the contract allows. A new `Source` member is one more
-  row (#665). `allocator_source` over `page` and over `testing` are rows
-  too (#851).
 
 ## [6.1.0] - 2026-09-19
 

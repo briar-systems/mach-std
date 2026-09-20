@@ -14,6 +14,7 @@
 
 use std.allocator;
 use std.allocator.page;
+use std.allocator.testing;
 use std.chrono.time;
 use io_error:  std.io.error;
 use io_handle: std.io.handle;
@@ -398,12 +399,14 @@ $if ($mach.build.os == $mach.os.windows) {
     }
 
     test "async local windows: native handles are nonblocking and non-inheritable" {
+        var pa: allocator.Allocator;
+        page.make(?pa);
         if (windows_os.running_under_wine()) { ret 0; }
         val endpoint_result: res[endpoint.Endpoint, io_error.Error] = windows_test_endpoint();
         if (sel endpoint_result.err) { ret 1; }
         val bound:   endpoint.Endpoint = endpoint_result.ok;
         var runtime: io_runtime.Runtime;
-        if (!ok_err(io_runtime.make(?runtime, 8))) { ret 2; }
+        if (!ok_err(io_runtime.make(?runtime, ?pa, 8))) { ret 2; }
         var driver:      Driver;
         val make_result: err[io_error.Error] = make(?driver, ?runtime);
         if (sel make_result.err) { ret 3; }
@@ -547,12 +550,14 @@ $if ($mach.build.os == $mach.os.windows) {
     # a cancel that settles through dispatch must not wait for the thread
     # blocked in the native wait (#787)
     test "async local windows: a cancel does not wait for the native waiter" {
+        var pa: allocator.Allocator;
+        page.make(?pa);
         if (windows_os.running_under_wine()) { ret 0; }
         val endpoint_result: res[endpoint.Endpoint, io_error.Error] = windows_test_endpoint();
         if (sel endpoint_result.err) { ret 1; }
         val bound:   endpoint.Endpoint = endpoint_result.ok;
         var runtime: io_runtime.Runtime;
-        if (!ok_err(io_runtime.make(?runtime, 8))) { ret 2; }
+        if (!ok_err(io_runtime.make(?runtime, ?pa, 8))) { ret 2; }
         var driver:      Driver;
         val make_result: err[io_error.Error] = make(?driver, ?runtime);
         if (sel make_result.err) { ret 3; }
@@ -690,9 +695,10 @@ pub fun make(driver: *Driver, runtime: *io_runtime.Runtime) err[io_error.Error] 
     if (driver == nil || runtime == nil || runtime.initial == 0) {
         ret err[io_error.Error].err{invalid(io_error.OP_CREATE)};
     }
-    val capacity:  usize                = runtime.initial;
-    val allocated: err[allocator.Error] = page.make(?driver.allocator);
-    if (sel allocated.err) { ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)}; }
+    val capacity: usize = runtime.initial;
+    # the runtime owns the memory: the driver draws from the allocator the
+    # runtime was made with
+    driver.allocator = runtime.allocator;
     if (!table.make(?driver.slots, ?driver.allocator, $size_of(Slot), capacity)) {
         ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
     }
@@ -736,7 +742,7 @@ pub fun make(driver: *Driver, runtime: *io_runtime.Runtime) err[io_error.Error] 
         ret err[io_error.Error].err{registered.err};
     }
     driver.source = registered.ok;
-    val code: i64 = impl.make(?driver.backend, ?runtime.queue, capacity, io_runtime.source_id(driver.source));
+    val code: i64 = impl.make(?driver.backend, ?runtime.queue, ?driver.allocator, capacity, io_runtime.source_id(driver.source));
     if (code < 0) {
         io_runtime.unregister_source(runtime, driver.source);
         table.destroy(?driver.streams);
@@ -1475,12 +1481,14 @@ pub fun destroy(driver: *Driver) err[io_error.Error] {
 }
 
 test "async local: ownership query includes driver backend and runtime" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime:  io_runtime.Runtime;
     var external: [8]u8;
     var empty:    Driver;
     if (!aliases(?empty, ?external[0], 1) ||
         !aliases((~(0::usize) - 1)::*Driver, ?external[0], 1) ||
-        !ok_err(io_runtime.make(?runtime, 2))) { ret 1; }
+        !ok_err(io_runtime.make(?runtime, ?pa, 2))) { ret 1; }
     var partial: impl.Backend;
     partial.queue = ?runtime.queue;
     $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
@@ -1525,11 +1533,71 @@ test "async local: ownership query includes driver backend and runtime" {
     ret 0;
 }
 
+# the driver's tables come from the runtime's allocator, so a refusal there
+# is the driver's only ceiling and the runtime's allocator is how a test
+# reaches it
+test "local: a refused stream table growth leaves every held entry in place" {
+    # the tracker is too large for the stack, so it lives on the mapper
+    val t: *testing.Testing = os.allocate($size_of(testing.Testing))::*testing.Testing;
+    if (t == nil) { ret 1; }
+    fin { os.deallocate(t::ptr, $size_of(testing.Testing)); }
+    val tr: err[allocator.Error] = testing.make(t);
+    if (sel tr.err) { ret 1; }
+    fin { testing.dnit(t); }
+
+    var runtime: io_runtime.Runtime;
+    if (refused(io_runtime.make(?runtime, testing.allocator_of(t), 2))) { ret 2; }
+    var driver: Driver;
+    if (refused(make(?driver, ?runtime))) { ret 3; }
+
+    # fill the initial table, remembering where each entry lives
+    var held: [2]*StreamEntry;
+    var i:    usize = 0;
+    for (i < 2) {
+        val stream: *StreamEntry = stream_claim(?driver);
+        if (stream == nil) { ret 4; }
+        stream_take(?driver, stream, STREAM_OPEN);
+        held[i] = stream;
+        i       = i + 1;
+    }
+
+    # the next claim needs a chunk, and the allocator refuses it
+    testing.fail_at_ordinal(t, testing.attempt_count(t) + 1);
+    if (stream_claim(?driver) != nil) { ret 5; }
+    testing.clear_failure(t);
+    if (driver.stream_count != 2) { ret 6; }
+    i = 0;
+    for (i < 2) {
+        if (stream_at(?driver, i) != held[i]) { ret 7; }
+        if (held[i].state != STREAM_OPEN)     { ret 7; }
+        i = i + 1;
+    }
+
+    # the same claim goes through once the allocator allows it
+    val third: *StreamEntry = stream_claim(?driver);
+    if (third == nil)             { ret 8; }
+    if (driver.stream_count != 3) { ret 8; }
+    stream_take(?driver, third, STREAM_OPEN);
+    if (stream_at(?driver, 0) != held[0] || stream_at(?driver, 1) != held[1]) { ret 9; }
+
+    stream_free(?driver, third);
+    stream_free(?driver, held[1]);
+    stream_free(?driver, held[0]);
+    if (refused(destroy(?driver)))             { ret 10; }
+    if (!ok_bool(io_runtime.close(?runtime)))  { ret 11; }
+    if (!ok_err(io_runtime.destroy(?runtime))) { ret 11; }
+    if (testing.leaked(t))                     { ret 12; }
+    if (testing.double_free_count(t) != 0)     { ret 12; }
+    ret 0;
+}
+
 # claim cost at n streams: with every entry held but a freed last one, then
 # with every entry held, after the last entry has churned
 fun claim_after_churn(n: usize, freed_cost: *u64, full_cost: *u64) i32 {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: io_runtime.Runtime;
-    if (refused(io_runtime.make(?runtime, 4))) { ret 1; }
+    if (refused(io_runtime.make(?runtime, ?pa, 4))) { ret 1; }
     var driver: Driver;
     if (refused(make(?driver, ?runtime))) { ret 2; }
     var i: usize = 0;
@@ -1649,11 +1717,13 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
     }
 
     test "async local: listener stream cancellation half close and cleanup" {
+        var pa: allocator.Allocator;
+        page.make(?pa);
         val endpoint_result: res[endpoint.Endpoint, io_error.Error] = test_endpoint();
         if (sel endpoint_result.err) { ret 1; }
         val bound:   endpoint.Endpoint = endpoint_result.ok;
         var runtime: io_runtime.Runtime;
-        if (!ok_err(io_runtime.make(?runtime, 8))) { ret 2; }
+        if (!ok_err(io_runtime.make(?runtime, ?pa, 8))) { ret 2; }
         var driver:      Driver;
         val make_result: err[io_error.Error] = make(?driver, ?runtime);
         if (sel make_result.err) {
@@ -1874,12 +1944,14 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
     }
 
     test "async local: queued bind and listen success stay valid through runtime close" {
+        var pa: allocator.Allocator;
+        page.make(?pa);
         val endpoint_result: res[endpoint.Endpoint, io_error.Error] = test_endpoint();
         if (sel endpoint_result.err) { ret 1; }
         var first: endpoint.Endpoint = endpoint_result.ok;
         first.name[first.length - 1] = 'b';
         var runtime: io_runtime.Runtime;
-        if (!ok_err(io_runtime.make(?runtime, 4))) { ret 2; }
+        if (!ok_err(io_runtime.make(?runtime, ?pa, 4))) { ret 2; }
         var driver:      Driver;
         val make_result: err[io_error.Error] = make(?driver, ?runtime);
         if (sel make_result.err) { ret 3; }
@@ -1903,7 +1975,7 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
 
         var second: endpoint.Endpoint = endpoint_result.ok;
         second.name[second.length - 1] = 'l';
-        if (!ok_err(io_runtime.make(?runtime, 4))) { ret 10; }
+        if (!ok_err(io_runtime.make(?runtime, ?pa, 4))) { ret 10; }
         val make_result2: err[io_error.Error] = make(?driver, ?runtime);
         if (sel make_result2.err)                                          { ret 11; }
         if (!scope_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 12; }
@@ -1930,12 +2002,14 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
     }
 
     test "async local: stale listener tokens do not survive driver recreation" {
+        var pa: allocator.Allocator;
+        page.make(?pa);
         val endpoint_result: res[endpoint.Endpoint, io_error.Error] = test_endpoint();
         if (sel endpoint_result.err) { ret 1; }
         var bound: endpoint.Endpoint = endpoint_result.ok;
         bound.name[bound.length - 1] = 'a';
         var runtime: io_runtime.Runtime;
-        if (!ok_err(io_runtime.make(?runtime, 4))) { ret 2; }
+        if (!ok_err(io_runtime.make(?runtime, ?pa, 4))) { ret 2; }
         var driver:      Driver;
         val make_result: err[io_error.Error] = make(?driver, ?runtime);
         if (sel make_result.err) { ret 3; }
@@ -1964,7 +2038,7 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
             ret 9;
         }
 
-        if (!ok_err(io_runtime.make(?runtime, 4))) { ret 10; }
+        if (!ok_err(io_runtime.make(?runtime, ?pa, 4))) { ret 10; }
         val make_result2: err[io_error.Error] = make(?driver, ?runtime);
         if (sel make_result2.err)                                          { ret 11; }
         if (!scope_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 12; }
@@ -1994,6 +2068,8 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
     }
 
     test "async local: managed rename requires owned filesystem listener" {
+        var pa: allocator.Allocator;
+        page.make(?pa);
         val endpoint_result: res[endpoint.Endpoint, io_error.Error] = test_endpoint();
         if (sel endpoint_result.err) { ret 1; }
         var first:  endpoint.Endpoint = endpoint_result.ok;
@@ -2001,7 +2077,7 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
         first.name[first.length - 1]   = 'o';
         second.name[second.length - 1] = 'p';
         var runtime: io_runtime.Runtime;
-        if (!ok_err(io_runtime.make(?runtime, 4))) { ret 2; }
+        if (!ok_err(io_runtime.make(?runtime, ?pa, 4))) { ret 2; }
         var driver:      Driver;
         val make_result: err[io_error.Error] = make(?driver, ?runtime);
         if (sel make_result.err) { ret 3; }
@@ -2040,6 +2116,8 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
 
     $if ($mach.build.os == $mach.os.linux) {
         test "async local: managed rename rejects abstract listener" {
+            var pa: allocator.Allocator;
+            page.make(?pa);
             val endpoint_result: res[endpoint.Endpoint, io_error.Error] = test_endpoint();
             if (sel endpoint_result.err) { ret 1; }
             val replacement:     endpoint.Endpoint                      = endpoint_result.ok;
@@ -2047,7 +2125,7 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
             if (sel abstract_result.err) { ret 2; }
             val bound:   endpoint.Endpoint = abstract_result.ok;
             var runtime: io_runtime.Runtime;
-            if (!ok_err(io_runtime.make(?runtime, 4))) { ret 3; }
+            if (!ok_err(io_runtime.make(?runtime, ?pa, 4))) { ret 3; }
             var driver:      Driver;
             val make_result: err[io_error.Error] = make(?driver, ?runtime);
             if (sel make_result.err) { ret 4; }
@@ -2081,6 +2159,8 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
     }
 
     test "async local: managed rename cleanup follows runtime close" {
+        var pa: allocator.Allocator;
+        page.make(?pa);
         val endpoint_result: res[endpoint.Endpoint, io_error.Error] = test_endpoint();
         if (sel endpoint_result.err) { ret 1; }
         var first:  endpoint.Endpoint = endpoint_result.ok;
@@ -2088,7 +2168,7 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
         first.name[first.length - 1]   = 'r';
         second.name[second.length - 1] = 's';
         var runtime: io_runtime.Runtime;
-        if (!ok_err(io_runtime.make(?runtime, 4))) { ret 2; }
+        if (!ok_err(io_runtime.make(?runtime, ?pa, 4))) { ret 2; }
         var driver:      Driver;
         val make_result: err[io_error.Error] = make(?driver, ?runtime);
         if (sel make_result.err) { ret 3; }
