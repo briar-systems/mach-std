@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `simd.matmul` kernels run as scalar loops (#858, mach#3736). The lane
+  form of every `dot_*` and `matmul_*` measured 15x to 25x slower than the
+  plain loop on x86-64: a vector literal built from memory lanes, a lane
+  read and an `i32x4` or `i64x2` lane multiply each lower to a stack round
+  trip on the SSE2 baseline. Signatures, results and the `TERMS_*` bounds are
+  unchanged. The module header states when the lane form returns, and a
+  performance test holds `dot_i16` within 3x of the reference loop.
+
 ## [7.0.0] - 2026-09-19
 
 std 7.0.0 keeps `mach = "^5.8"`; nothing in it needs 5.9. Two things are
