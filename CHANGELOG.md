@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.0.2] - 2026-09-20
+
+### Fixed
+
+- `process.events`: a runtime-attached source (`make_runtime`) never ended
+  `io.runtime.wait` (#863, hedge#182). The native handler published its bit
+  and woke the runtime's queue, but the source consumed nothing, so a `-1`
+  wait slept again and a process that waited on its runtime never saw
+  SIGTERM. The source now ends the wait through a caller wake: a pending
+  event returns the wait with zero completions and the caller drains with
+  `next`, as after the standalone `wait`. The runtime test waits unbounded,
+  so a timeout can no longer pass it.
+
 ## [7.0.1] - 2026-09-19
 
 ### Fixed
