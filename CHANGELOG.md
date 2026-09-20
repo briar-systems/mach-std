@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.0.1] - 2026-09-19
+
 ### Fixed
 
 - `simd.matmul` kernels run as scalar loops (#858, mach#3736). The lane
