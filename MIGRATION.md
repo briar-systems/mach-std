@@ -1,3 +1,31 @@
+# std 6.x to 7.0.0
+
+std 7.0.0 makes the memory behind `io.runtime` reachable (#677). A runtime takes the allocator every one of its allocations comes from, and every driver registered on it draws from the same allocator.
+
+## io.runtime.make takes an allocator (#677)
+
+`io.runtime.make` gains a positional `*allocator.Allocator` parameter, in the position `memory.table.make` uses, and no longer builds a page allocator of its own. The runtime keeps a copy of the allocator, so its context must outlive the runtime, the same rule `memory.table` has. The runtime's tables and its native event batch come from it, and `net.async`, `net.async.local` and their backends take `runtime.allocator` instead of a private page allocator, so a program's whole I/O runtime is on one allocator the program chose.
+
+| 6.x | 7.0.0 |
+| --- | --- |
+| `io_runtime.make(?runtime, initial)` | `io_runtime.make(?runtime, ?a, initial)` |
+
+The direct replacement is a page allocator, which is what 6.x built internally:
+
+```mach
+# before
+var runtime: io_runtime.Runtime;
+if (sel io_runtime.make(?runtime, 16).err) { ... }
+
+# after
+var pa: allocator.Allocator;
+page.make(?pa);
+var runtime: io_runtime.Runtime;
+if (sel io_runtime.make(?runtime, ?pa, 16).err) { ... }
+```
+
+Any allocator honoring the `Allocator` contract works. `std.allocator.testing` with `fail_at_ordinal` drives the runtime and every driver on it to a refused growth on purpose: the submission fails with `RESOURCE_EXHAUSTED` (`ENOMEM` inside a backend), nothing already live moves, and every operation still settles exactly once.
+
 # std 5.x to 6.0.0
 
 std 6.0.0 gives the collections one ordering contract (#655). A collection orders, compares and hashes its elements by the type's natural order, `std.collections.natural`, resolved at compile time, and the comparator-taking spelling of every entry point is its `_by` form. See the contract on #655.

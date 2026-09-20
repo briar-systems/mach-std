@@ -62,6 +62,9 @@ use std.memory;
 use std.system.capability;
 
 $if (capability.HAS_PAGES) {
+    use std.allocator.fixed;
+    use std.allocator.page;
+    use std.allocator.testing;
     use std.sync.mutex;
     use std.sync.thread;
     use std.system.os;
@@ -265,6 +268,13 @@ fun obtain(h: *Heap, size: usize) *Span {
     val got: opt[ptr] = h.src.fn_obtain(h.src.ctx, size);
     if (!sel got.some) { ret nil; }
 
+    # the base is the contract the small-block lookup is built on, so a
+    # span that breaks it is handed straight back and the request refused
+    if ((got.some::usize & (SPAN_ALIGN - 1)) != 0) {
+        if (h.src.fn_release != nil) { h.src.fn_release(h.src.ctx, got.some, size); }
+        ret nil;
+    }
+
     val s: *Span = got.some::*Span;
     s.magic  = SPAN_MAGIC;
     s.owner  = h::ptr;
@@ -392,10 +402,10 @@ fun take_large(h: *Heap, size: usize, align: usize, zeroed: *bool) ptr {
 
     val page: usize = os.page_size();
 
-    # an alignment past SPAN_ALIGN is more than the source promises, so the
-    # span carries room to align the payload inside it
-    var head: usize = align_up(span_header_size(), want);
-    if (want > SPAN_ALIGN) { head = span_header_size() + want; }
+    # the source promises a base at SPAN_ALIGN and the header is smaller
+    # than that, so a payload offset of at most `want` always fits, for an
+    # alignment above SPAN_ALIGN too
+    val head: usize = align_up(span_header_size(), want);
 
     # refuse a request whose span geometry would wrap usize
     if (head < want)              { ret nil; }
@@ -964,7 +974,9 @@ fun native_release(ctx: ptr, span: ptr, size: usize) i64 {
 #
 # spans are requested at SPAN_ALIGN and zeroed on the way out, so any backing
 # allocator that honors alignment can host a heap: a fixed buffer, an arena,
-# or the testing allocator for span-level accounting.
+# the page allocator, or the testing allocator for span-level accounting. a
+# backing that hands back a span off the SPAN_ALIGN grid gets it straight back
+# and the request is refused.
 # ---
 # s:       Source to initialize
 # backing: allocator spans are drawn from (must outlive the heap)
@@ -995,14 +1007,152 @@ fun backed_release(ctx: ptr, span: ptr, size: usize) i64 {
     ret 0;
 }
 
-# a heap over the host mapper, wired to an Allocator
-fun test_heap(h: *Heap, s: *Source, a: *allocator.Allocator, budget: usize) bool {
-    native_source(s);
-    val ir: err[allocator.Error] = init(h, s, budget);
-    if (sel ir.err) { ret false; }
+# the Source members every behavioural case runs against
+#
+# a member is a row here and a branch in test_bed_open: the host mapper, the
+# allocator adapter over a fixed buffer, over the page allocator and over the
+# testing allocator, and a mapper that hands out the weakest base the
+# contract allows. a new Source member is one more row.
+val TEST_MEMBER_NATIVE:  usize = 0;
+val TEST_MEMBER_FIXED:   usize = 1;
+val TEST_MEMBER_PAGE:    usize = 2;
+val TEST_MEMBER_TESTING: usize = 3;
+val TEST_MEMBER_WEAK:    usize = 4;
+val TEST_MEMBER_COUNT:   usize = 5;
+
+# the fixed buffer never reclaims, so it holds every span the heaviest case
+# ever obtains: the million-operation case runs through about 170 MiB
+val TEST_FIXED_BYTES: usize = 512 * 1024 * 1024;
+
+# a mapper at the weakest legal base: every span is a multiple of SPAN_ALIGN
+# and never a multiple of 2 * SPAN_ALIGN, so an alignment above SPAN_ALIGN
+# has to come from the heap and cannot be inherited from the mapper. the raw
+# base is stashed ahead of the span, the shape native_obtain uses on windows.
+fun test_weak_obtain(ctx: ptr, size: usize) opt[ptr] {
+    val raw: ptr = os.allocate(size + 2 * SPAN_ALIGN);
+    if (raw == nil) { ret opt[ptr].none{}; }
+
+    var base: usize = align_up(raw::usize + 1, SPAN_ALIGN);
+    if (base % (2 * SPAN_ALIGN) == 0) { base = base + SPAN_ALIGN; }
+    @((base - 8)::*usize) = base - raw::usize;
+    ret opt[ptr].some{base::ptr};
+}
+
+fun test_weak_release(ctx: ptr, span: ptr, size: usize) i64 {
+    val back: usize = @((span::usize - 8)::*usize);
+    ret os.deallocate((span::usize - back)::ptr, size + 2 * SPAN_ALIGN);
+}
+
+# one member's source and whatever it stands on
+rec TestBed {
+    member:  usize;
+    src:     Source;
+    region:  ptr;
+    state:   fixed.FixedState;
+    tracker: *testing.Testing;
+    backing: allocator.Allocator;
+}
+
+fun test_bed_open(bed: *TestBed, member: usize) bool {
+    bed.member  = member;
+    bed.region  = nil;
+    bed.tracker = nil;
+
+    if (member == TEST_MEMBER_NATIVE) {
+        native_source(?bed.src);
+        ret true;
+    }
+    if (member == TEST_MEMBER_FIXED) {
+        bed.region = os.allocate(TEST_FIXED_BYTES);
+        if (bed.region == nil) { ret false; }
+        val mr: err[allocator.Error] = fixed.make(?bed.backing, ?bed.state, bed.region::*u8, TEST_FIXED_BYTES);
+        if (sel mr.err) { ret false; }
+        allocator_source(?bed.src, ?bed.backing);
+        ret true;
+    }
+    if (member == TEST_MEMBER_PAGE) {
+        val mr: err[allocator.Error] = page.make(?bed.backing);
+        if (sel mr.err) { ret false; }
+        allocator_source(?bed.src, ?bed.backing);
+        ret true;
+    }
+    if (member == TEST_MEMBER_TESTING) {
+        # the tracker is too large for the stack, so it lives on the mapper
+        bed.tracker = os.allocate($size_of(testing.Testing))::*testing.Testing;
+        if (bed.tracker == nil) { ret false; }
+        val mr: err[allocator.Error] = testing.make(bed.tracker);
+        if (sel mr.err) {
+            os.deallocate(bed.tracker::ptr, $size_of(testing.Testing));
+            ret false;
+        }
+        allocator_source(?bed.src, testing.allocator_of(bed.tracker));
+        ret true;
+    }
+    if (member == TEST_MEMBER_WEAK) {
+        bed.src.ctx        = nil;
+        bed.src.fn_obtain  = test_weak_obtain;
+        bed.src.fn_release = test_weak_release;
+        ret true;
+    }
+    ret false;
+}
+
+# false when the member's own accounting says a span was leaked or freed twice
+fun test_bed_close(bed: *TestBed) bool {
+    var clean: bool = true;
+    if (bed.region != nil) { os.deallocate(bed.region, TEST_FIXED_BYTES); }
+    if (bed.tracker != nil) {
+        if (testing.leaked(bed.tracker))                 { clean = false; }
+        if (testing.double_free_count(bed.tracker) != 0) { clean = false; }
+        testing.dnit(bed.tracker);
+        os.deallocate(bed.tracker::ptr, $size_of(testing.Testing));
+    }
+    bed.region  = nil;
+    bed.tracker = nil;
+    ret clean;
+}
+
+# a heap over one member, wired to an Allocator
+fun test_heap_on(bed: *TestBed, member: usize, h: *Heap, a: *allocator.Allocator) bool {
+    if (!test_bed_open(bed, member)) { ret false; }
+    val ir: err[allocator.Error] = init(h, ?bed.src, 0);
+    if (sel ir.err) {
+        test_bed_close(bed);
+        ret false;
+    }
     val mr: err[allocator.Error] = make(a, h);
-    if (sel mr.err) { ret false; }
+    if (sel mr.err) {
+        dnit(h);
+        test_bed_close(bed);
+        ret false;
+    }
     ret true;
+}
+
+# run one behavioural case against every member
+#
+# a failure is reported as member * 100 + the case's own code; a case that
+# leaves spans the source refuses to take back, or that the member's own
+# accounting reports as leaked or freed twice, fails too
+fun test_each(body: fun(*Heap, *allocator.Allocator) i32) i32 {
+    var member: usize = 0;
+    for (member < TEST_MEMBER_COUNT) {
+        var bed: TestBed;
+        var h:   Heap;
+        var a:   allocator.Allocator;
+        if (!test_heap_on(?bed, member, ?h, ?a)) { ret (member * 100 + 1)::i32; }
+
+        val code:  i32                  = body(?h, ?a);
+        val dr:    err[allocator.Error] = dnit(?h);
+        val clean: bool                 = test_bed_close(?bed);
+
+        if (code != 0)             { ret (member * 100)::i32 + code; }
+        if (sel dr.err)            { ret (member * 100 + 97)::i32; }
+        if (!clean)                { ret (member * 100 + 98)::i32; }
+        if (mapped_bytes(?h) != 0) { ret (member * 100 + 99)::i32; }
+        member = member + 1;
+    }
+    ret 0;
 }
 
 fun test_rand(state: *usize) usize {
@@ -1034,55 +1184,46 @@ fun test_painted(p: ptr, size: usize, seed: u8) bool {
     ret true;
 }
 
-test "heap: init and dnit with no allocations" {
-    var h: Heap;
-    var s: Source;
-    var a: allocator.Allocator;
-    if (!test_heap(?h, ?s, ?a, 0)) { ret 1; }
+fun test_case_init_and_dnit_with_no_allocations(h: *Heap, a: *allocator.Allocator) i32 {
+    if (!check(h))            { ret 2; }
+    if (live_bytes(h) != 0)   { ret 3; }
+    if (mapped_bytes(h) != 0) { ret 4; }
 
-    if (!check(?h))            { ret 2; }
-    if (live_bytes(?h) != 0)   { ret 3; }
-    if (mapped_bytes(?h) != 0) { ret 4; }
-
-    val dr: err[allocator.Error] = dnit(?h);
+    val dr: err[allocator.Error] = dnit(h);
     if (sel dr.err) { ret 5; }
     ret 0;
 }
 
-test "heap: allocator round trip" {
-    var h: Heap;
-    var s: Source;
-    var a: allocator.Allocator;
-    if (!test_heap(?h, ?s, ?a, 0)) { ret 1; }
-    fin { dnit(?h); }
+test "heap: init and dnit with no allocations" {
+    ret test_each(test_case_init_and_dnit_with_no_allocations);
+}
 
-    val got: res[ptr, allocator.Error] = allocator.allocate_raw(?a, 64, 8);
+fun test_case_allocator_round_trip(h: *Heap, a: *allocator.Allocator) i32 {
+    val got: res[ptr, allocator.Error] = allocator.allocate_raw(a, 64, 8);
     if (sel got.err)   { ret 2; }
     if (got.ok == nil) { ret 3; }
 
     test_paint(got.ok, 64, 7);
     if (!test_painted(got.ok, 64, 7)) { ret 4; }
 
-    if (live_blocks(?h) != 1)          { ret 5; }
-    if (live_bytes(?h) != 64)          { ret 6; }
-    if (mapped_bytes(?h) != SPAN_SIZE) { ret 7; }
-    if (!check(?h))                    { ret 8; }
+    if (live_blocks(h) != 1)          { ret 5; }
+    if (live_bytes(h) != 64)          { ret 6; }
+    if (mapped_bytes(h) != SPAN_SIZE) { ret 7; }
+    if (!check(h))                    { ret 8; }
 
-    val gone: err[allocator.Error] = allocator.deallocate_raw(?a, got.ok, 64, 8);
-    if (sel gone.err)         { ret 9; }
-    if (live_blocks(?h) != 0) { ret 10; }
-    if (live_bytes(?h) != 0)  { ret 11; }
-    if (!check(?h))           { ret 12; }
+    val gone: err[allocator.Error] = allocator.deallocate_raw(a, got.ok, 64, 8);
+    if (sel gone.err)        { ret 9; }
+    if (live_blocks(h) != 0) { ret 10; }
+    if (live_bytes(h) != 0)  { ret 11; }
+    if (!check(h))           { ret 12; }
     ret 0;
 }
 
-test "heap: every size straddling a class boundary is served" {
-    var h: Heap;
-    var s: Source;
-    var a: allocator.Allocator;
-    if (!test_heap(?h, ?s, ?a, 0)) { ret 1; }
-    fin { dnit(?h); }
+test "heap: allocator round trip" {
+    ret test_each(test_case_allocator_round_trip);
+}
 
+fun test_case_every_size_straddling_a_class_boundary_is_served(h: *Heap, a: *allocator.Allocator) i32 {
     # one byte under, on, and one byte over every class boundary
     var c: usize = 0;
     for (c < CLASS_COUNT) {
@@ -1093,7 +1234,7 @@ test "heap: every size straddling a class boundary is served" {
             val size: usize = (cs - 1) + d;
             if (size == 0) { cnt; }
 
-            val got: res[ptr, allocator.Error] = allocator.allocate_raw(?a, size, 8);
+            val got: res[ptr, allocator.Error] = allocator.allocate_raw(a, size, 8);
             if (sel got.err)   { ret 2; }
             if (got.ok == nil) { ret 3; }
 
@@ -1102,28 +1243,26 @@ test "heap: every size straddling a class boundary is served" {
             if (!test_painted(got.ok, size, 3)) { ret 4; }
 
             # the charge is the class that covers the size
-            val charged: usize = live_bytes(?h);
+            val charged: usize = live_bytes(h);
             if (size <= MAX_SMALL && charged < size) { ret 5; }
 
-            val gone: err[allocator.Error] = allocator.deallocate_raw(?a, got.ok, size, 8);
-            if (sel gone.err)        { ret 6; }
-            if (live_bytes(?h) != 0) { ret 7; }
+            val gone: err[allocator.Error] = allocator.deallocate_raw(a, got.ok, size, 8);
+            if (sel gone.err)       { ret 6; }
+            if (live_bytes(h) != 0) { ret 7; }
             d = d + 1;
         }
 
-        if (!check(?h)) { ret 8; }
+        if (!check(h)) { ret 8; }
         c = c + 1;
     }
     ret 0;
 }
 
-test "heap: alignment is honored above class granularity" {
-    var h: Heap;
-    var s: Source;
-    var a: allocator.Allocator;
-    if (!test_heap(?h, ?s, ?a, 0)) { ret 1; }
-    fin { dnit(?h); }
+test "heap: every size straddling a class boundary is served" {
+    ret test_each(test_case_every_size_straddling_a_class_boundary_is_served);
+}
 
+fun test_case_alignment_is_honored_above_class_granularity(h: *Heap, a: *allocator.Allocator) i32 {
     var kept:  [16]ptr;
     var sizes: [16]usize;
 
@@ -1133,7 +1272,7 @@ test "heap: alignment is honored above class granularity" {
         for (n < 16) {
             # a size that is not a multiple of the alignment on purpose
             val size: usize                     = align + 1 + n;
-            val got:  res[ptr, allocator.Error] = allocator.allocate_raw(?a, size, align);
+            val got:  res[ptr, allocator.Error] = allocator.allocate_raw(a, size, align);
             if (sel got.err)                        { ret 2; }
             if (got.ok == nil)                      { ret 3; }
             if ((got.ok::usize & (align - 1)) != 0) { ret 4; }
@@ -1144,57 +1283,53 @@ test "heap: alignment is honored above class granularity" {
             n        = n + 1;
         }
 
-        if (!check(?h)) { ret 5; }
+        if (!check(h)) { ret 5; }
 
         n = 0;
         for (n < 16) {
             if (!test_painted(kept[n], sizes[n], 11)) { ret 6; }
-            val gone: err[allocator.Error] = allocator.deallocate_raw(?a, kept[n], sizes[n], align);
+            val gone: err[allocator.Error] = allocator.deallocate_raw(a, kept[n], sizes[n], align);
             if (sel gone.err) { ret 7; }
             n = n + 1;
         }
 
-        if (live_bytes(?h) != 0) { ret 8; }
-        if (!check(?h))          { ret 9; }
+        if (live_bytes(h) != 0) { ret 8; }
+        if (!check(h))          { ret 9; }
         align = align * 2;
     }
     ret 0;
 }
 
-test "heap: zero size allocates nil" {
-    var h: Heap;
-    var s: Source;
-    var a: allocator.Allocator;
-    if (!test_heap(?h, ?s, ?a, 0)) { ret 1; }
-    fin { dnit(?h); }
+test "heap: alignment is honored above class granularity" {
+    ret test_each(test_case_alignment_is_honored_above_class_granularity);
+}
 
-    val got: res[ptr, allocator.Error] = allocator.allocate_raw(?a, 0, 8);
+fun test_case_zero_size_allocates_nil(h: *Heap, a: *allocator.Allocator) i32 {
+    val got: res[ptr, allocator.Error] = allocator.allocate_raw(a, 0, 8);
     if (sel got.err)   { ret 2; }
     if (got.ok != nil) { ret 3; }
 
-    val direct: opt[ptr] = do_allocate((?h)::ptr, 0, 8);
+    val direct: opt[ptr] = do_allocate(h::ptr, 0, 8);
     if (!sel direct.some)   { ret 4; }
     if (direct.some != nil) { ret 5; }
 
-    val zero: res[ptr, allocator.Error] = zallocate_raw(?h, 0, 8);
+    val zero: res[ptr, allocator.Error] = zallocate_raw(h, 0, 8);
     if (sel zero.err)   { ret 6; }
     if (zero.ok != nil) { ret 7; }
 
-    val gone: err[allocator.Error] = allocator.deallocate_raw(?a, nil, 0, 8);
-    if (sel gone.err)          { ret 8; }
-    if (mapped_bytes(?h) != 0) { ret 9; }
+    val gone: err[allocator.Error] = allocator.deallocate_raw(a, nil, 0, 8);
+    if (sel gone.err)         { ret 8; }
+    if (mapped_bytes(h) != 0) { ret 9; }
     ret 0;
 }
 
-test "heap: a block above the largest class owns its span" {
-    var h: Heap;
-    var s: Source;
-    var a: allocator.Allocator;
-    if (!test_heap(?h, ?s, ?a, 0)) { ret 1; }
-    fin { dnit(?h); }
+test "heap: zero size allocates nil" {
+    ret test_each(test_case_zero_size_allocates_nil);
+}
 
+fun test_case_a_block_above_the_largest_class_owns_its_span(h: *Heap, a: *allocator.Allocator) i32 {
     val size: usize                     = MAX_SMALL * 9 + 17;
-    val got:  res[ptr, allocator.Error] = allocator.allocate_raw(?a, size, 16);
+    val got:  res[ptr, allocator.Error] = allocator.allocate_raw(a, size, 16);
     if (sel got.err)   { ret 2; }
     if (got.ok == nil) { ret 3; }
 
@@ -1202,34 +1337,32 @@ test "heap: a block above the largest class owns its span" {
     if (!test_painted(got.ok, size, 5)) { ret 4; }
 
     # its span is sized for the block, not rounded to a class span
-    if (mapped_bytes(?h) < size)             { ret 5; }
-    if (mapped_bytes(?h) > size + SPAN_SIZE) { ret 6; }
-    if (live_blocks(?h) != 1)                { ret 7; }
-    if (!check(?h))                          { ret 8; }
+    if (mapped_bytes(h) < size)             { ret 5; }
+    if (mapped_bytes(h) > size + SPAN_SIZE) { ret 6; }
+    if (live_blocks(h) != 1)                { ret 7; }
+    if (!check(h))                          { ret 8; }
 
-    val gone: err[allocator.Error] = allocator.deallocate_raw(?a, got.ok, size, 16);
-    if (sel gone.err)         { ret 9; }
-    if (live_blocks(?h) != 0) { ret 10; }
-    if (!check(?h))           { ret 11; }
+    val gone: err[allocator.Error] = allocator.deallocate_raw(a, got.ok, size, 16);
+    if (sel gone.err)        { ret 9; }
+    if (live_blocks(h) != 0) { ret 10; }
+    if (!check(h))           { ret 11; }
     ret 0;
 }
 
-test "heap: reallocate grows across classes and keeps the bytes" {
-    var h: Heap;
-    var s: Source;
-    var a: allocator.Allocator;
-    if (!test_heap(?h, ?s, ?a, 0)) { ret 1; }
-    fin { dnit(?h); }
+test "heap: a block above the largest class owns its span" {
+    ret test_each(test_case_a_block_above_the_largest_class_owns_its_span);
+}
 
+fun test_case_reallocate_grows_across_classes_and_keeps_the_bytes(h: *Heap, a: *allocator.Allocator) i32 {
     var size: usize                     = 24;
-    val got:  res[ptr, allocator.Error] = allocator.allocate_raw(?a, size, 8);
+    val got:  res[ptr, allocator.Error] = allocator.allocate_raw(a, size, 8);
     if (sel got.err) { ret 2; }
     test_paint(got.ok, size, 9);
 
     var p: ptr = got.ok;
     for (size < MAX_SMALL * 4) {
         val next: usize                     = size * 2 + 1;
-        val grew: res[ptr, allocator.Error] = allocator.reallocate_raw(?a, p, size, next, 8);
+        val grew: res[ptr, allocator.Error] = allocator.reallocate_raw(a, p, size, next, 8);
         if (sel grew.err)   { ret 3; }
         if (grew.ok == nil) { ret 4; }
 
@@ -1239,214 +1372,206 @@ test "heap: reallocate grows across classes and keeps the bytes" {
 
         p    = grew.ok;
         size = next;
-        if (!check(?h)) { ret 6; }
+        if (!check(h)) { ret 6; }
     }
 
-    val gone: err[allocator.Error] = allocator.deallocate_raw(?a, p, size, 8);
-    if (sel gone.err)         { ret 7; }
-    if (live_blocks(?h) != 0) { ret 8; }
-    if (!check(?h))           { ret 9; }
+    val gone: err[allocator.Error] = allocator.deallocate_raw(a, p, size, 8);
+    if (sel gone.err)        { ret 7; }
+    if (live_blocks(h) != 0) { ret 8; }
+    if (!check(h))           { ret 9; }
+    ret 0;
+}
+
+test "heap: reallocate grows across classes and keeps the bytes" {
+    ret test_each(test_case_reallocate_grows_across_classes_and_keeps_the_bytes);
+}
+
+fun test_case_reallocate_shrinking_hands_the_class_back(h: *Heap, a: *allocator.Allocator) i32 {
+    val big: res[ptr, allocator.Error] = allocator.allocate_raw(a, 4096, 8);
+    if (sel big.err) { ret 2; }
+    test_paint(big.ok, 4096, 13);
+
+    val before: usize = live_bytes(h);
+    if (before != 4096) { ret 3; }
+
+    # a shrink to a fraction of the block relocates and returns the difference
+    val small: res[ptr, allocator.Error] = allocator.reallocate_raw(a, big.ok, 4096, 100, 8);
+    if (sel small.err)                    { ret 4; }
+    if (!test_painted(small.ok, 100, 13)) { ret 5; }
+    if (live_bytes(h) >= before)          { ret 6; }
+    if (live_bytes(h) != 112)             { ret 7; }
+    if (!check(h))                        { ret 8; }
+
+    val gone: err[allocator.Error] = allocator.deallocate_raw(a, small.ok, 100, 8);
+    if (sel gone.err)       { ret 9; }
+    if (live_bytes(h) != 0) { ret 10; }
+
+    # a large block shrinking below the class ceiling lands in a class
+    val huge: res[ptr, allocator.Error] = allocator.allocate_raw(a, 200000, 16);
+    if (sel huge.err) { ret 11; }
+    test_paint(huge.ok, 4096, 21);
+
+    val cut: res[ptr, allocator.Error] = allocator.reallocate_raw(a, huge.ok, 200000, 300, 16);
+    if (sel cut.err)                    { ret 12; }
+    if (!test_painted(cut.ok, 300, 21)) { ret 13; }
+    if (live_bytes(h) != 320)           { ret 14; }
+    if (!check(h))                      { ret 15; }
+
+    val last: err[allocator.Error] = allocator.deallocate_raw(a, cut.ok, 300, 16);
+    if (sel last.err)       { ret 16; }
+    if (live_bytes(h) != 0) { ret 17; }
     ret 0;
 }
 
 test "heap: reallocate shrinking hands the class back" {
-    var h: Heap;
-    var s: Source;
-    var a: allocator.Allocator;
-    if (!test_heap(?h, ?s, ?a, 0)) { ret 1; }
-    fin { dnit(?h); }
+    ret test_each(test_case_reallocate_shrinking_hands_the_class_back);
+}
 
-    val big: res[ptr, allocator.Error] = allocator.allocate_raw(?a, 4096, 8);
-    if (sel big.err) { ret 2; }
-    test_paint(big.ok, 4096, 13);
+fun test_case_reallocate_inside_a_class_stays_in_place(h: *Heap, a: *allocator.Allocator) i32 {
+    val got: res[ptr, allocator.Error] = allocator.allocate_raw(a, 200, 8);
+    if (sel got.err) { ret 2; }
 
-    val before: usize = live_bytes(?h);
-    if (before != 4096) { ret 3; }
+    # 200 and 224 are the same class, so neither step moves the block
+    val up: res[ptr, allocator.Error] = allocator.reallocate_raw(a, got.ok, 200, 224, 8);
+    if (sel up.err)      { ret 3; }
+    if (up.ok != got.ok) { ret 4; }
 
-    # a shrink to a fraction of the block relocates and returns the difference
-    val small: res[ptr, allocator.Error] = allocator.reallocate_raw(?a, big.ok, 4096, 100, 8);
-    if (sel small.err)                    { ret 4; }
-    if (!test_painted(small.ok, 100, 13)) { ret 5; }
-    if (live_bytes(?h) >= before)         { ret 6; }
-    if (live_bytes(?h) != 112)            { ret 7; }
-    if (!check(?h))                       { ret 8; }
+    val down: res[ptr, allocator.Error] = allocator.reallocate_raw(a, up.ok, 224, 201, 8);
+    if (sel down.err)         { ret 5; }
+    if (down.ok != got.ok)    { ret 6; }
+    if (live_bytes(h) != 224) { ret 7; }
 
-    val gone: err[allocator.Error] = allocator.deallocate_raw(?a, small.ok, 100, 8);
-    if (sel gone.err)        { ret 9; }
-    if (live_bytes(?h) != 0) { ret 10; }
-
-    # a large block shrinking below the class ceiling lands in a class
-    val huge: res[ptr, allocator.Error] = allocator.allocate_raw(?a, 200000, 16);
-    if (sel huge.err) { ret 11; }
-    test_paint(huge.ok, 4096, 21);
-
-    val cut: res[ptr, allocator.Error] = allocator.reallocate_raw(?a, huge.ok, 200000, 300, 16);
-    if (sel cut.err)                    { ret 12; }
-    if (!test_painted(cut.ok, 300, 21)) { ret 13; }
-    if (live_bytes(?h) != 320)          { ret 14; }
-    if (!check(?h))                     { ret 15; }
-
-    val last: err[allocator.Error] = allocator.deallocate_raw(?a, cut.ok, 300, 16);
-    if (sel last.err)        { ret 16; }
-    if (live_bytes(?h) != 0) { ret 17; }
+    val gone: err[allocator.Error] = allocator.deallocate_raw(a, down.ok, 201, 8);
+    if (sel gone.err) { ret 8; }
+    if (!check(h))    { ret 9; }
     ret 0;
 }
 
 test "heap: reallocate inside a class stays in place" {
-    var h: Heap;
-    var s: Source;
-    var a: allocator.Allocator;
-    if (!test_heap(?h, ?s, ?a, 0)) { ret 1; }
-    fin { dnit(?h); }
+    ret test_each(test_case_reallocate_inside_a_class_stays_in_place);
+}
 
-    val got: res[ptr, allocator.Error] = allocator.allocate_raw(?a, 200, 8);
+fun test_case_reallocate_to_zero_frees_the_block(h: *Heap, a: *allocator.Allocator) i32 {
+    val got: res[ptr, allocator.Error] = allocator.allocate_raw(a, 900, 8);
     if (sel got.err) { ret 2; }
 
-    # 200 and 224 are the same class, so neither step moves the block
-    val up: res[ptr, allocator.Error] = allocator.reallocate_raw(?a, got.ok, 200, 224, 8);
-    if (sel up.err)      { ret 3; }
-    if (up.ok != got.ok) { ret 4; }
+    val gone: res[ptr, allocator.Error] = allocator.reallocate_raw(a, got.ok, 900, 0, 8);
+    if (sel gone.err)        { ret 3; }
+    if (gone.ok != nil)      { ret 4; }
+    if (live_blocks(h) != 0) { ret 5; }
+    if (!check(h))           { ret 6; }
 
-    val down: res[ptr, allocator.Error] = allocator.reallocate_raw(?a, up.ok, 224, 201, 8);
-    if (sel down.err)          { ret 5; }
-    if (down.ok != got.ok)     { ret 6; }
-    if (live_bytes(?h) != 224) { ret 7; }
+    # a nil pointer into reallocate is an allocation
+    val fresh: res[ptr, allocator.Error] = allocator.reallocate_raw(a, nil, 0, 48, 8);
+    if (sel fresh.err)       { ret 7; }
+    if (fresh.ok == nil)     { ret 8; }
+    if (live_blocks(h) != 1) { ret 9; }
 
-    val gone: err[allocator.Error] = allocator.deallocate_raw(?a, down.ok, 201, 8);
-    if (sel gone.err) { ret 8; }
-    if (!check(?h))   { ret 9; }
+    val last: err[allocator.Error] = allocator.deallocate_raw(a, fresh.ok, 48, 8);
+    if (sel last.err) { ret 10; }
+    if (!check(h))    { ret 11; }
     ret 0;
 }
 
 test "heap: reallocate to zero frees the block" {
-    var h: Heap;
-    var s: Source;
-    var a: allocator.Allocator;
-    if (!test_heap(?h, ?s, ?a, 0)) { ret 1; }
-    fin { dnit(?h); }
-
-    val got: res[ptr, allocator.Error] = allocator.allocate_raw(?a, 900, 8);
-    if (sel got.err) { ret 2; }
-
-    val gone: res[ptr, allocator.Error] = allocator.reallocate_raw(?a, got.ok, 900, 0, 8);
-    if (sel gone.err)         { ret 3; }
-    if (gone.ok != nil)       { ret 4; }
-    if (live_blocks(?h) != 0) { ret 5; }
-    if (!check(?h))           { ret 6; }
-
-    # a nil pointer into reallocate is an allocation
-    val fresh: res[ptr, allocator.Error] = allocator.reallocate_raw(?a, nil, 0, 48, 8);
-    if (sel fresh.err)        { ret 7; }
-    if (fresh.ok == nil)      { ret 8; }
-    if (live_blocks(?h) != 1) { ret 9; }
-
-    val last: err[allocator.Error] = allocator.deallocate_raw(?a, fresh.ok, 48, 8);
-    if (sel last.err) { ret 10; }
-    if (!check(?h))   { ret 11; }
-    ret 0;
+    ret test_each(test_case_reallocate_to_zero_frees_the_block);
 }
 
-test "heap: a pointer it never handed out is refused" {
-    var ha: Heap;
-    var sa: Source;
-    var aa: allocator.Allocator;
-    if (!test_heap(?ha, ?sa, ?aa, 0)) { ret 1; }
-    fin { dnit(?ha); }
+fun test_case_foreign_pointer_refused(ha: *Heap, aa: *allocator.Allocator) i32 {
+    # the other heap stands on the host mapper whichever member ha is on
+    var bed: TestBed;
+    var hb:  Heap;
+    var ab:  allocator.Allocator;
+    if (!test_heap_on(?bed, TEST_MEMBER_NATIVE, ?hb, ?ab)) { ret 2; }
+    fin {
+        dnit(?hb);
+        test_bed_close(?bed);
+    }
 
-    var hb: Heap;
-    var sb: Source;
-    var ab: allocator.Allocator;
-    if (!test_heap(?hb, ?sb, ?ab, 0)) { ret 2; }
-    fin { dnit(?hb); }
-
-    val mine: res[ptr, allocator.Error] = allocator.allocate_raw(?aa, 64, 8);
+    val mine: res[ptr, allocator.Error] = allocator.allocate_raw(aa, 64, 8);
     if (sel mine.err) { ret 3; }
 
     val theirs: res[ptr, allocator.Error] = allocator.allocate_raw(?ab, 64, 8);
     if (sel theirs.err) { ret 4; }
 
     # another heap's block sits in a span this heap does not own
-    val foreign: err[allocator.Error] = allocator.deallocate_raw(?aa, theirs.ok, 64, 8);
+    val foreign: err[allocator.Error] = allocator.deallocate_raw(aa, theirs.ok, 64, 8);
     if (!sel foreign.err)              { ret 5; }
     if (!sel foreign.err.release)      { ret 6; }
     if (foreign.err.release != EINVAL) { ret 7; }
 
     # an address inside a block of this heap is not a block of this heap
     val interior: err[allocator.Error] =
-        allocator.deallocate_raw(?aa, (mine.ok::usize + 8)::ptr, 64, 8);
+        allocator.deallocate_raw(aa, (mine.ok::usize + 8)::ptr, 64, 8);
     if (!sel interior.err) { ret 8; }
 
     # the span header is not a block either
     val header: err[allocator.Error] =
-        allocator.deallocate_raw(?aa, span_of(mine.ok)::ptr, 64, 8);
+        allocator.deallocate_raw(aa, span_of(mine.ok)::ptr, 64, 8);
     if (!sel header.err) { ret 9; }
 
     # a size larger than the block's class is a contract violation
-    val oversize: err[allocator.Error] = allocator.deallocate_raw(?aa, mine.ok, 4096, 8);
+    val oversize: err[allocator.Error] = allocator.deallocate_raw(aa, mine.ok, 4096, 8);
     if (!sel oversize.err) { ret 10; }
 
     # none of the refusals disturbed either heap
-    if (!check(?ha))           { ret 11; }
+    if (!check(ha))            { ret 11; }
     if (!check(?hb))           { ret 12; }
-    if (live_blocks(?ha) != 1) { ret 13; }
+    if (live_blocks(ha) != 1)  { ret 13; }
     if (live_blocks(?hb) != 1) { ret 14; }
 
-    val a_gone: err[allocator.Error] = allocator.deallocate_raw(?aa, mine.ok, 64, 8);
+    val a_gone: err[allocator.Error] = allocator.deallocate_raw(aa, mine.ok, 64, 8);
     if (sel a_gone.err) { ret 15; }
     val b_gone: err[allocator.Error] = allocator.deallocate_raw(?ab, theirs.ok, 64, 8);
     if (sel b_gone.err) { ret 16; }
     ret 0;
 }
 
-test "heap: an empty span goes back for another class" {
-    var h: Heap;
-    var s: Source;
-    var a: allocator.Allocator;
-    if (!test_heap(?h, ?s, ?a, 0)) { ret 1; }
-    fin { dnit(?h); }
+test "heap: a pointer it never handed out is refused" {
+    ret test_each(test_case_foreign_pointer_refused);
+}
 
+fun test_case_an_empty_span_goes_back_for_another_class(h: *Heap, a: *allocator.Allocator) i32 {
     var kept: [8]ptr;
     var i:    usize = 0;
     for (i < 8) {
-        val got: res[ptr, allocator.Error] = allocator.allocate_raw(?a, 16, 8);
+        val got: res[ptr, allocator.Error] = allocator.allocate_raw(a, 16, 8);
         if (sel got.err) { ret 2; }
         kept[i] = got.ok;
         i       = i + 1;
     }
 
-    val mapped: usize = mapped_bytes(?h);
+    val mapped: usize = mapped_bytes(h);
     if (mapped != SPAN_SIZE) { ret 3; }
 
     i = 0;
     for (i < 8) {
-        val gone: err[allocator.Error] = allocator.deallocate_raw(?a, kept[i], 16, 8);
+        val gone: err[allocator.Error] = allocator.deallocate_raw(a, kept[i], 16, 8);
         if (sel gone.err) { ret 4; }
         i = i + 1;
     }
 
     # the emptied span is held, not returned, and serves the next class asked for
-    if (mapped_bytes(?h) != mapped) { ret 5; }
-    if (!check(?h))                 { ret 6; }
+    if (mapped_bytes(h) != mapped) { ret 5; }
+    if (!check(h))                 { ret 6; }
 
-    val other: res[ptr, allocator.Error] = allocator.allocate_raw(?a, 4096, 8);
-    if (sel other.err)              { ret 7; }
-    if (mapped_bytes(?h) != mapped) { ret 8; }
-    if (!check(?h))                 { ret 9; }
+    val other: res[ptr, allocator.Error] = allocator.allocate_raw(a, 4096, 8);
+    if (sel other.err)             { ret 7; }
+    if (mapped_bytes(h) != mapped) { ret 8; }
+    if (!check(h))                 { ret 9; }
 
-    val gone: err[allocator.Error] = allocator.deallocate_raw(?a, other.ok, 4096, 8);
+    val gone: err[allocator.Error] = allocator.deallocate_raw(a, other.ok, 4096, 8);
     if (sel gone.err) { ret 10; }
     ret 0;
 }
 
-test "heap: zallocate_raw zeroes a reused block" {
-    var h: Heap;
-    var s: Source;
-    var a: allocator.Allocator;
-    if (!test_heap(?h, ?s, ?a, 0)) { ret 1; }
-    fin { dnit(?h); }
+test "heap: an empty span goes back for another class" {
+    ret test_each(test_case_an_empty_span_goes_back_for_another_class);
+}
 
+fun test_case_zallocate_raw_zeroes_a_reused_block(h: *Heap, a: *allocator.Allocator) i32 {
     # a block off a fresh span is already zero
-    val first: res[ptr, allocator.Error] = zallocate_raw(?h, 300, 8);
+    val first: res[ptr, allocator.Error] = zallocate_raw(h, 300, 8);
     if (sel first.err) { ret 2; }
     var i: usize = 0;
     for (i < 300) {
@@ -1455,11 +1580,11 @@ test "heap: zallocate_raw zeroes a reused block" {
     }
 
     test_paint(first.ok, 300, 0x5A);
-    val gone: err[allocator.Error] = allocator.deallocate_raw(?a, first.ok, 300, 8);
+    val gone: err[allocator.Error] = allocator.deallocate_raw(a, first.ok, 300, 8);
     if (sel gone.err) { ret 4; }
 
     # the same block handed out again is zeroed explicitly
-    val again: res[ptr, allocator.Error] = zallocate_raw(?h, 300, 8);
+    val again: res[ptr, allocator.Error] = zallocate_raw(h, 300, 8);
     if (sel again.err)        { ret 5; }
     if (again.ok != first.ok) { ret 6; }
     i = 0;
@@ -1468,19 +1593,17 @@ test "heap: zallocate_raw zeroes a reused block" {
         i = i + 1;
     }
 
-    val last: err[allocator.Error] = allocator.deallocate_raw(?a, again.ok, 300, 8);
+    val last: err[allocator.Error] = allocator.deallocate_raw(a, again.ok, 300, 8);
     if (sel last.err) { ret 8; }
-    if (!check(?h))   { ret 9; }
+    if (!check(h))    { ret 9; }
     ret 0;
 }
 
-test "heap: interleaved mixed sizes keep the invariants" {
-    var h: Heap;
-    var s: Source;
-    var a: allocator.Allocator;
-    if (!test_heap(?h, ?s, ?a, 0)) { ret 1; }
-    fin { dnit(?h); }
+test "heap: zallocate_raw zeroes a reused block" {
+    ret test_each(test_case_zallocate_raw_zeroes_a_reused_block);
+}
 
+fun test_case_interleaved_mixed_sizes_keep_the_invariants(h: *Heap, a: *allocator.Allocator) i32 {
     val slots: usize = 512;
     var live:  [512]ptr;
     var sizes: [512]usize;
@@ -1504,7 +1627,7 @@ test "heap: interleaved mixed sizes keep the invariants" {
             if (roll < 33) {
                 val next: usize                     = 1 + (test_rand(?state) % 9000);
                 val grew: res[ptr, allocator.Error] =
-                    allocator.reallocate_raw(?a, live[slot], sizes[slot], next, 16);
+                    allocator.reallocate_raw(a, live[slot], sizes[slot], next, 16);
                 if (sel grew.err) { ret 3; }
 
                 var keep: usize = sizes[slot];
@@ -1519,7 +1642,7 @@ test "heap: interleaved mixed sizes keep the invariants" {
             }
 
             val gone: err[allocator.Error] =
-                allocator.deallocate_raw(?a, live[slot], sizes[slot], 16);
+                allocator.deallocate_raw(a, live[slot], sizes[slot], 16);
             if (sel gone.err) { ret 5; }
             live[slot]  = nil;
             sizes[slot] = 0;
@@ -1530,7 +1653,7 @@ test "heap: interleaved mixed sizes keep the invariants" {
         var size: usize = 1 + (test_rand(?state) % 9000);
         if (roll < 5) { size = size * 40; }
 
-        val got: res[ptr, allocator.Error] = allocator.allocate_raw(?a, size, 16);
+        val got: res[ptr, allocator.Error] = allocator.allocate_raw(a, size, 16);
         if (sel got.err)   { ret 6; }
         if (got.ok == nil) { ret 7; }
         test_paint(got.ok, size, slot::u8);
@@ -1539,22 +1662,26 @@ test "heap: interleaved mixed sizes keep the invariants" {
         step        = step + 1;
     }
 
-    if (!check(?h)) { ret 8; }
+    if (!check(h)) { ret 8; }
 
     i = 0;
     for (i < slots) {
         if (live[i] != nil) {
             if (!test_painted(live[i], sizes[i], i::u8)) { ret 9; }
-            val gone: err[allocator.Error] = allocator.deallocate_raw(?a, live[i], sizes[i], 16);
+            val gone: err[allocator.Error] = allocator.deallocate_raw(a, live[i], sizes[i], 16);
             if (sel gone.err) { ret 10; }
         }
         i = i + 1;
     }
 
-    if (!check(?h))           { ret 11; }
-    if (live_bytes(?h) != 0)  { ret 12; }
-    if (live_blocks(?h) != 0) { ret 13; }
+    if (!check(h))           { ret 11; }
+    if (live_bytes(h) != 0)  { ret 12; }
+    if (live_blocks(h) != 0) { ret 13; }
     ret 0;
+}
+
+test "heap: interleaved mixed sizes keep the invariants" {
+    ret test_each(test_case_interleaved_mixed_sizes_keep_the_invariants);
 }
 
 # a grow-only span source: it hands out spans from one region and can never
@@ -1633,6 +1760,68 @@ test "heap: a source that cannot release keeps its spans" {
 
     val dr: err[allocator.Error] = dnit(?h);
     if (sel dr.err) { ret 13; }
+    ret 0;
+}
+
+# a source that breaks the base contract: pages, but not SPAN_ALIGN
+rec TestSkewed {
+    region:   ptr;
+    bytes:    usize;
+    obtained: usize;
+    released: ptr;
+}
+
+fun test_skewed_obtain(ctx: ptr, size: usize) opt[ptr] {
+    val k: *TestSkewed = ctx::*TestSkewed;
+    if (size + os.page_size() > k.bytes) { ret opt[ptr].none{}; }
+    k.obtained = k.obtained + 1;
+    ret opt[ptr].some{(align_up(k.region::usize, SPAN_ALIGN) + os.page_size())::ptr};
+}
+
+fun test_skewed_release(ctx: ptr, span: ptr, size: usize) i64 {
+    val k: *TestSkewed = ctx::*TestSkewed;
+    k.released = span;
+    ret 0;
+}
+
+test "heap: a span off the SPAN_ALIGN grid is handed back and refused" {
+    var k: TestSkewed;
+    k.bytes    = SPAN_SIZE * 3;
+    k.region   = os.allocate(k.bytes);
+    k.obtained = 0;
+    k.released = nil;
+    if (k.region == nil) { ret 1; }
+    fin { os.deallocate(k.region, k.bytes); }
+
+    var s: Source;
+    s.ctx        = (?k)::ptr;
+    s.fn_obtain  = test_skewed_obtain;
+    s.fn_release = test_skewed_release;
+
+    var h:  Heap;
+    val ir: err[allocator.Error] = init(?h, ?s, 0);
+    if (sel ir.err) { ret 2; }
+    fin { dnit(?h); }
+
+    var a:  allocator.Allocator;
+    val mr: err[allocator.Error] = make(?a, ?h);
+    if (sel mr.err) { ret 3; }
+
+    val small: res[ptr, allocator.Error] = allocator.allocate_raw(?a, 64, 8);
+    if (!sel small.err)           { ret 4; }
+    if (!sel small.err.exhausted) { ret 5; }
+
+    # the span went back to the source before the refusal was reported
+    if (k.obtained != 1)       { ret 6; }
+    if (k.released == nil)     { ret 7; }
+    if (mapped_bytes(?h) != 0) { ret 8; }
+    if (live_blocks(?h) != 0)  { ret 9; }
+    if (!check(?h))            { ret 10; }
+
+    val large: res[ptr, allocator.Error] = allocator.allocate_raw(?a, MAX_SMALL * 2, 8);
+    if (!sel large.err)        { ret 11; }
+    if (k.obtained != 2)       { ret 12; }
+    if (mapped_bytes(?h) != 0) { ret 13; }
     ret 0;
 }
 
@@ -1752,19 +1941,13 @@ fun test_share_worker(arg: *u8) {
     }
 }
 
-test "heap: threads share one heap without corrupting it" {
-    var h: Heap;
-    var s: Source;
-    var a: allocator.Allocator;
-    if (!test_heap(?h, ?s, ?a, 0)) { ret 1; }
-    fin { dnit(?h); }
-
+fun test_case_threads_share_one_heap_without_corrupting_it(h: *Heap, a: *allocator.Allocator) i32 {
     var work:    [4]TestShare;
     var threads: [4]thread.Thread;
 
     var i: usize = 0;
     for (i < 4) {
-        work[i].a     = ?a;
+        work[i].a     = a;
         work[i].seed  = 0x2545F4914F6CDD1D + i * 7919;
         work[i].fault = 0;
         val up: thread.Operation = thread.spawn_with(test_share_worker, (?work[i])::*u8, ?threads[i]);
@@ -1780,19 +1963,17 @@ test "heap: threads share one heap without corrupting it" {
         i = i + 1;
     }
 
-    if (!check(?h))           { ret 5; }
-    if (live_blocks(?h) != 0) { ret 6; }
-    if (live_bytes(?h) != 0)  { ret 7; }
+    if (!check(h))           { ret 5; }
+    if (live_blocks(h) != 0) { ret 6; }
+    if (live_bytes(h) != 0)  { ret 7; }
     ret 0;
 }
 
-test "heap: a million mixed operations stay within twice the live bytes" {
-    var h: Heap;
-    var s: Source;
-    var a: allocator.Allocator;
-    if (!test_heap(?h, ?s, ?a, 0)) { ret 1; }
-    fin { dnit(?h); }
+test "heap: threads share one heap without corrupting it" {
+    ret test_each(test_case_threads_share_one_heap_without_corrupting_it);
+}
 
+fun test_case_a_million_mixed_operations_stay_within_twice_the_live_bytes(h: *Heap, a: *allocator.Allocator) i32 {
     val slots: usize = 65536;
     val table: ptr   = os.allocate(slots * 16);
     if (table == nil) { ret 2; }
@@ -1811,7 +1992,7 @@ test "heap: a million mixed operations stay within twice the live bytes" {
 
         if (live[slot] != 0) {
             val gone: err[allocator.Error] =
-                allocator.deallocate_raw(?a, live[slot]::ptr, sizes[slot], 16);
+                allocator.deallocate_raw(a, live[slot]::ptr, sizes[slot], 16);
             if (sel gone.err) { ret 3; }
             wanted      = wanted - sizes[slot];
             live[slot]  = 0;
@@ -1823,7 +2004,7 @@ test "heap: a million mixed operations stay within twice the live bytes" {
         var size: usize = 1 + (test_rand(?state) % 2048);
         if (test_rand(?state) % 100 < 5) { size = size * 32; }
 
-        val got: res[ptr, allocator.Error] = allocator.allocate_raw(?a, size, 16);
+        val got: res[ptr, allocator.Error] = allocator.allocate_raw(a, size, 16);
         if (sel got.err)   { ret 4; }
         if (got.ok == nil) { ret 5; }
 
@@ -1835,20 +2016,24 @@ test "heap: a million mixed operations stay within twice the live bytes" {
     }
 
     # the mapping never ran past twice the bytes the caller asked for
-    if (peak_mapped_bytes(?h) > peak * 2) { ret 6; }
-    if (!check(?h))                       { ret 7; }
+    if (peak_mapped_bytes(h) > peak * 2) { ret 6; }
+    if (!check(h))                       { ret 7; }
 
     var i: usize = 0;
     for (i < slots) {
         if (live[i] != 0) {
             val gone: err[allocator.Error] =
-                allocator.deallocate_raw(?a, live[i]::ptr, sizes[i], 16);
+                allocator.deallocate_raw(a, live[i]::ptr, sizes[i], 16);
             if (sel gone.err) { ret 8; }
         }
         i = i + 1;
     }
 
-    if (!check(?h))           { ret 9; }
-    if (live_blocks(?h) != 0) { ret 10; }
+    if (!check(h))           { ret 9; }
+    if (live_blocks(h) != 0) { ret 10; }
     ret 0;
+}
+
+test "heap: a million mixed operations stay within twice the live bytes" {
+    ret test_each(test_case_a_million_mixed_operations_stay_within_twice_the_live_bytes);
 }

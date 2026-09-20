@@ -17,6 +17,7 @@ use std.types.size.usize;
 
 $if (capability.HAS_CLOCK && capability.HAS_IO_QUEUE && capability.HAS_PAGES) {
     use std.allocator.page;
+    use std.allocator.testing;
     use std.io.lifecycle;
     use std.sync.cancel;
     use std.sync.mutex;
@@ -482,19 +483,22 @@ fun reserve_timers(runtime: *Runtime) bool {
     ret table.reserve(?runtime.timers, runtime.slots.capacity * 2) && reserve_deadlines(runtime);
 }
 
-# initial is the size the runtime starts at, not a ceiling: the slot, timer and
-# source tables grow on demand and only memory bounds them
-pub fun make(runtime: *Runtime, initial: usize) err[io_error.Error] {
-    if (runtime == nil || initial == 0 || initial > 0xffffffff) {
+# every byte the runtime owns comes from a: its tables, its native event
+# batch, and the tables of every driver registered on it. the runtime keeps a
+# copy of a, so a's context must outlive the runtime. a refusal from a is the
+# only ceiling: initial is the size the runtime starts at, and the slot, timer
+# and source tables grow on demand until a refuses.
+# ---
+# runtime: the runtime to initialize
+# a:       where every allocation is taken from and returned to
+# initial: slots, timers and deadline records to start with, at least one
+# ret:     ok, INVALID for a nil runtime or allocator or an initial size of
+#          zero, RESOURCE_EXHAUSTED when a refuses
+pub fun make(runtime: *Runtime, a: *allocator.Allocator, initial: usize) err[io_error.Error] {
+    if (runtime == nil || a == nil || initial == 0 || initial > 0xffffffff) {
         ret err[io_error.Error].err{invalid(io_error.OP_CREATE)};
     }
-    var native_event_bytes: usize = 0;
-    if (!memory.range_scaled(NATIVE_BATCH, $size_of(NativeEvent),
-        ?native_event_bytes)) {
-        ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
-    }
-    val allocated: err[allocator.Error] = page.make(?runtime.allocator);
-    if (sel allocated.err) { ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)}; }
+    runtime.allocator = @a;
     if (!table.make(?runtime.slots, ?runtime.allocator, $size_of(Slot), initial)) {
         ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
     }
@@ -510,11 +514,12 @@ pub fun make(runtime: *Runtime, initial: usize) err[io_error.Error] {
         release_tables(runtime);
         ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
     }
-    runtime.native_events = os.allocate(native_event_bytes)::*NativeEvent;
-    if (runtime.native_events == nil) {
+    val batch: res[*NativeEvent, allocator.Error] = allocator.zallocate[NativeEvent](?runtime.allocator, NATIVE_BATCH);
+    if (sel batch.err) {
         release_tables(runtime);
         ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
     }
+    runtime.native_events = batch.ok;
 
     runtime.initial           = initial;
     runtime.slot_count        = 0;
@@ -542,7 +547,7 @@ pub fun make(runtime: *Runtime, initial: usize) err[io_error.Error] {
     runtime.control_lock = mutex.make();
     val code: i64 = os.io_queue_create(?runtime.queue);
     if (code < 0) {
-        os.deallocate(runtime.native_events::ptr, native_event_bytes);
+        allocator.deallocate[NativeEvent](?runtime.allocator, runtime.native_events, NATIVE_BATCH);
         release_tables(runtime);
         runtime.native_events = nil;
         runtime.destroyed     = true;
@@ -1926,7 +1931,7 @@ fun destroy_with_native_ownership(runtime: *Runtime) err[io_error.Error] {
     val index_result:  err[allocator.Error] = table.destroy(?runtime.deadline_index);
     val record_result: err[allocator.Error] = table.destroy(?runtime.deadlines);
     val slot_result:   err[allocator.Error] = table.destroy(?runtime.slots);
-    val native_result: i64                  = os.deallocate(native_events::ptr, $size_of(NativeEvent) * NATIVE_BATCH);
+    val native_result: err[allocator.Error] = allocator.deallocate[NativeEvent](?runtime.allocator, native_events, NATIVE_BATCH);
     runtime.native_events = nil;
     runtime.slot_count    = 0;
     runtime.source_slots  = 0;
@@ -1934,8 +1939,8 @@ fun destroy_with_native_ownership(runtime: *Runtime) err[io_error.Error] {
     runtime.free_tail     = NO_SLOT;
     runtime.head          = NO_SLOT;
     runtime.tail          = NO_SLOT;
-    if (queue_result < 0)                                                                                                                                                   { ret err[io_error.Error].err{os.error(queue_result, io_error.OP_CLOSE)}; }
-    if (sel timer_result.err || sel index_result.err || sel record_result.err || sel source_result.err || sel route_result.err || native_result < 0 || sel slot_result.err) { ret err[io_error.Error].err{io_error.make(io_error.IO, io_error.OP_CLOSE)}; }
+    if (queue_result < 0)                                                                                                                                                       { ret err[io_error.Error].err{os.error(queue_result, io_error.OP_CLOSE)}; }
+    if (sel timer_result.err || sel index_result.err || sel record_result.err || sel source_result.err || sel route_result.err || sel native_result.err || sel slot_result.err) { ret err[io_error.Error].err{io_error.make(io_error.IO, io_error.OP_CLOSE)}; }
     ret err[io_error.Error].ok{};
 }
 
@@ -2011,11 +2016,13 @@ fun succeeded(operation: cancel.Operation) bool {
 }
 
 test "runtime: ownership query covers every backing allocation" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime:  Runtime;
     var external: [8]u8;
     if (!aliases(?runtime, ?external[0], 1) || aliases(nil, nil, 0) ||
         !aliases((~(0::usize) - 1)::*Runtime, ?external[0], 1)) { ret 1; }
-    if (!ok_err(make(?runtime, 2))) { ret 2; }
+    if (!ok_err(make(?runtime, ?pa, 2))) { ret 2; }
     if (!aliases(?runtime, (?runtime)::*u8, $size_of(Runtime)) ||
         !aliases(?runtime, runtime.slots.chunks[0]::*u8, $size_of(Slot) * 2) ||
         !aliases(?runtime, runtime.timers.chunks[0]::*u8,
@@ -2043,10 +2050,100 @@ test "runtime: ownership query covers every backing allocation" {
     ret 0;
 }
 
-test "runtime: submission past the initial size grows the slot table" {
+# a refused growth is the only ceiling the runtime has, and this is the one
+# way to reach it on purpose: the allocator the runtime was made with refuses
+test "runtime: a refused growth is reported and disturbs nothing live" {
+    # the tracker is too large for the stack, so it lives on the mapper
+    val t: *testing.Testing = os.allocate($size_of(testing.Testing))::*testing.Testing;
+    if (t == nil) { ret 1; }
+    fin { os.deallocate(t::ptr, $size_of(testing.Testing)); }
+    val tr: err[allocator.Error] = testing.make(t);
+    if (sel tr.err) { ret 1; }
+    fin { testing.dnit(t); }
+
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 2))) { ret 1; }
-    if (capacity(?runtime) != 2)    { ret 2; }
+    if (!ok_err(make(?runtime, testing.allocator_of(t), 2))) { ret 2; }
+    if (capacity(?runtime) != 2)                             { ret 2; }
+
+    val first:  res[Token, io_error.Error] = submit(?runtime, test_operation(READ, 1));
+    val second: res[Token, io_error.Error] = submit(?runtime, test_operation(WRITE, 2));
+    if (sel first.err)  { ret 3; }
+    if (sel second.err) { ret 3; }
+    val first_slot:  *Slot     = slot_at(?runtime, first.ok.index::usize);
+    val second_slot: *Slot     = slot_at(?runtime, second.ok.index::usize);
+    val first_op:    Operation = first_slot.operation;
+    val second_op:   Operation = second_slot.operation;
+
+    # fail each allocation the growth makes in turn: every refusal is a clean
+    # RESOURCE_EXHAUSTED with both live slots untouched, and the growth that
+    # gets past them all succeeds
+    var refused: usize                      = 0;
+    var offset:  usize                      = 1;
+    var third:   res[Token, io_error.Error] = res[Token, io_error.Error].err{invalid(io_error.OP_SUBMIT)};
+    for (offset <= 8) {
+        # the ordinal counts refused attempts too, so it is re-based each time
+        testing.fail_at_ordinal(t, testing.attempt_count(t) + offset);
+        third = submit(?runtime, test_operation(TIMER, 3));
+        if (sel third.ok) { brk; }
+        if (sel third.err) {
+            if (third.err.kind != io_error.RESOURCE_EXHAUSTED) { ret 4; }
+            if (third.err.operation != io_error.OP_SUBMIT)     { ret 4; }
+        }
+        if (slot_at(?runtime, first.ok.index::usize) != first_slot)   { ret 5; }
+        if (slot_at(?runtime, second.ok.index::usize) != second_slot) { ret 5; }
+        if (first_slot.operation.context != first_op.context)         { ret 5; }
+        if (second_slot.operation.context != second_op.context)       { ret 5; }
+        if (first_slot.generation != first.ok.generation)             { ret 5; }
+        if (second_slot.generation != second.ok.generation)           { ret 5; }
+        if (runtime.slot_count != 2)                                  { ret 5; }
+        refused = refused + 1;
+        offset  = offset + 1;
+    }
+    testing.clear_failure(t);
+    if (refused == 0)           { ret 7; }
+    if (!sel third.ok)          { ret 7; }
+    if (capacity(?runtime) < 3) { ret 7; }
+    var third_token: Token;
+    if (sel third.ok) {
+        if (third.ok.index != 2) { ret 7; }
+        third_token = third.ok;
+    }
+
+    # every operation, including the ones outstanding across the refusals,
+    # settles exactly once
+    if (!ok_err(complete(?runtime, first.ok, 10, 0, false)))    { ret 8; }
+    if (!ok_err(complete(?runtime, second.ok, 20, 0, false)))   { ret 8; }
+    if (!ok_err(complete(?runtime, third_token, 30, 0, false))) { ret 8; }
+    var output: [8]Completion;
+    val polled: res[usize, io_error.Error] = poll(?runtime, ?output[0], 8);
+    if (sel polled.err) { ret 9; }
+    if (polled.ok != 3) { ret 9; }
+    var seen: usize = 0;
+    var i:    usize = 0;
+    for (i < 3) {
+        if (output[i].context < 1 || output[i].context > 3) { ret 9; }
+        if ((seen & (1 << output[i].context)) != 0)         { ret 9; }
+        seen = seen | (1 << output[i].context);
+        if (output[i].bytes != output[i].context * 10) { ret 9; }
+        i = i + 1;
+    }
+    val again: res[usize, io_error.Error] = poll(?runtime, ?output[0], 8);
+    if (sel again.err) { ret 10; }
+    if (again.ok != 0) { ret 10; }
+
+    if (!ok_bool(close(?runtime)))         { ret 11; }
+    if (!ok_err(destroy(?runtime)))        { ret 11; }
+    if (testing.leaked(t))                 { ret 12; }
+    if (testing.double_free_count(t) != 0) { ret 12; }
+    ret 0;
+}
+
+test "runtime: submission past the initial size grows the slot table" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, ?pa, 2))) { ret 1; }
+    if (capacity(?runtime) != 2)         { ret 2; }
     val first:  res[Token, io_error.Error] = submit(?runtime, test_operation(READ, 1));
     val second: res[Token, io_error.Error] = submit(?runtime, test_operation(WRITE, 2));
     val third:  res[Token, io_error.Error] = submit(?runtime, test_operation(TIMER, 3));
@@ -2066,8 +2163,10 @@ test "runtime: submission past the initial size grows the slot table" {
 
 # growth must not move a slot a completion context or a caller already holds
 test "runtime: a slot address taken before a growth survives it" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 2))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 2))) { ret 1; }
     val held: res[Token, io_error.Error] = submit(?runtime, test_operation(READ, 5));
     if (sel held.err) { ret 2; }
     val address:   *Slot    = slot_at(?runtime, held.ok.index::usize);
@@ -2104,8 +2203,10 @@ test "runtime: a slot address taken before a growth survives it" {
 
 # a token is only ever reused after its generation has moved on
 test "runtime: stale tokens stay refused across growth and reuse" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 2))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 2))) { ret 1; }
     val first: res[Token, io_error.Error] = submit(?runtime, test_operation(READ, 1));
     if (sel first.err) { ret 2; }
     val stale: Token = first.ok;
@@ -2140,8 +2241,10 @@ test "runtime: stale tokens stay refused across growth and reuse" {
 }
 
 test "runtime: external wait preparation never consumes completions" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
     val submitted: res[Token, io_error.Error] = submit(?runtime, test_operation(READ, 41));
     if (sel submitted.err)                                      { ret 1; }
     if (!ok_err(complete(?runtime, submitted.ok, 3, 0, false))) { ret 1; }
@@ -2168,8 +2271,10 @@ test "runtime: external wait preparation never consumes completions" {
 }
 
 test "runtime: one token resolves exactly once" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
     val submitted: res[Token, io_error.Error] = submit(?runtime, test_operation(READ, 77));
     if (sel submitted.err) { ret 1; }
     val token: Token = submitted.ok;
@@ -2186,8 +2291,10 @@ test "runtime: one token resolves exactly once" {
 }
 
 test "runtime: copy completion publishes bytes atomically" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
     var destination: [4]u8;
     var source:      [4]u8;
     source[0] = 1;
@@ -2211,8 +2318,10 @@ test "runtime: copy completion publishes bytes atomically" {
 }
 
 test "runtime: close wins copy completion without touching caller bytes" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
     var destination: [2]u8;
     destination[0] = 9;
     destination[1] = 9;
@@ -2237,9 +2346,11 @@ test "runtime: close wins copy completion without touching caller bytes" {
 }
 
 test "runtime: cancellation wins copy completion without touching caller bytes" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
     var scope:   cancel.Scope;
-    if (!ok_err(make(?runtime, 1)) || !succeeded(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1)) || !succeeded(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 1; }
     var destination: [2]u8;
     destination[0] = 8;
     destination[1] = 8;
@@ -2266,8 +2377,10 @@ test "runtime: cancellation wins copy completion without touching caller bytes" 
 }
 
 test "runtime: close settles every operation and is idempotent" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 32))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 32))) { ret 1; }
     var i: usize = 0;
     for (i < 32) {
         if (!ok_token(submit(?runtime, test_operation((i % 11)::Kind, i)))) { ret 1; }
@@ -2319,11 +2432,13 @@ $if ($mach.build.os == $mach.os.windows) {
 }
 
 test "runtime: wake cannot be lost before a blocked wait" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     $if ($mach.build.os == $mach.os.windows) {
         if (windows.running_under_wine()) { ret 0; }
     }
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
     var started:  i64         = 0;
     var returned: i64         = 0;
     var context:  WakeContext = WakeContext{runtime: ?runtime, started: ?started, returned: ?returned};
@@ -2340,9 +2455,11 @@ test "runtime: wake cannot be lost before a blocked wait" {
 }
 
 test "runtime: wake is retained until the next wait" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
-    if (!ok_err(wake(?runtime)))    { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
+    if (!ok_err(wake(?runtime)))         { ret 1; }
     var output: [1]Completion;
     val waited: res[usize, io_error.Error] = wait(?runtime, ?output[0], 1, -1);
     if (sel waited.err) { ret 1; }
@@ -2360,8 +2477,10 @@ fun elapsed_ms(start: time.Instant) i64 {
 
 # a submission wake is the runtime's own and must not end a wait (#676)
 test "runtime: a submission wake does not end a wait early" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
     val start: time.InstantClock = time.instant();
     if (sel start.err) { ret 2; }
     var scope: cancel.Scope;
@@ -2387,8 +2506,10 @@ test "runtime: a submission wake does not end a wait early" {
 # native wakes posted while count operations are submitted and completed
 # between two waits, then drained
 fun wakes_between_waits(count: usize, posted: *i64) i32 {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, count))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, count))) { ret 1; }
     var output: [64]Completion;
     val before: i64   = runtime.queue.wakes_posted;
     var i:      usize = 0;
@@ -2453,9 +2574,11 @@ fun racing_completer(arg: *u8) {
 # every completion made while another thread waits reaches it promptly: a
 # coalesced wake is never lost between a harvest and the next request
 test "runtime: coalesced wakes lose no completion against a racing waiter" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     val total:   usize = 5000;
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 64))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 64))) { ret 1; }
     var started: i64             = 0;
     var context: RacingCompleter = RacingCompleter{runtime: ?runtime, started: ?started, count: total, failed: 0};
     var worker:  thread.Thread;
@@ -2506,8 +2629,10 @@ fun notify_worker(arg: *u8) {
 
 # an internal wake mid-wait resumes with the time left, not the whole timeout
 test "runtime: an internal wake keeps the wait's deadline" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
     var started: i64           = 0;
     var context: NotifyContext = NotifyContext{runtime: ?runtime, started: ?started, delay: 400000000, wake: false};
     var worker:  thread.Thread;
@@ -2531,8 +2656,10 @@ test "runtime: an internal wake keeps the wait's deadline" {
 }
 
 test "runtime: a caller wake ends a wait that an internal wake did not" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
     var started: i64           = 0;
     var context: NotifyContext = NotifyContext{runtime: ?runtime, started: ?started, delay: 100000000, wake: true};
     var worker:  thread.Thread;
@@ -2555,8 +2682,10 @@ test "runtime: a caller wake ends a wait that an internal wake did not" {
 }
 
 test "runtime: a return with completions answers a pending wake" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
     val submitted: res[Token, io_error.Error] = submit(?runtime, test_operation(READ, 92));
     if (sel submitted.err)                                      { ret 2; }
     if (!ok_err(wake(?runtime)))                                { ret 3; }
@@ -2577,9 +2706,11 @@ test "runtime: a return with completions answers a pending wake" {
 }
 
 test "runtime: a wait plan reports and answers only a caller wake" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
-    if (!ok_err(notify(?runtime)))  { ret 2; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
+    if (!ok_err(notify(?runtime)))       { ret 2; }
     val internal: res[WaitPlan, io_error.Error] = prepare_wait(?runtime, 5);
     if (sel internal.err)                       { ret 3; }
     if (!internal.ok.wait || internal.ok.woken) { ret 3; }
@@ -2596,8 +2727,10 @@ test "runtime: a wait plan reports and answers only a caller wake" {
 }
 
 test "runtime: sustained mixed completions remain bounded and fair" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 16))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 16))) { ret 1; }
     var round: usize = 0;
     for (round < 100) {
         var tokens: [16]Token;
@@ -2626,8 +2759,10 @@ test "runtime: sustained mixed completions remain bounded and fair" {
 }
 
 test "runtime timer: large heaps expire in deadline order" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1024))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1024))) { ret 1; }
     val base: time.Instant = time.Instant{sec: 10, nsec: 0};
     var i:    usize        = 0;
     for (i < 1024) {
@@ -2659,8 +2794,10 @@ test "runtime timer: large heaps expire in deadline order" {
 # n operations under one deadline scope hold one heap entry, and expiry still
 # ends every one still registered
 fun scope_deadline_scale(n: usize) i32 {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 64))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 64))) { ret 1; }
     val clock: time.InstantClock = time.instant();
     if (sel clock.err) { ret 1; }
     var scope: cancel.Scope;
@@ -2714,8 +2851,10 @@ test "runtime scope: one deadline entry serves 1k, 10k and 100k operations" {
 
 # owners sharing one index bucket chain stay findable as records come and go
 test "runtime scope: deadline records recycle across distinct scopes" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 4))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 4))) { ret 1; }
     val clock: time.InstantClock = time.instant();
     if (sel clock.err) { ret 1; }
     var scopes: [8]cancel.Scope;
@@ -2753,8 +2892,10 @@ test "runtime scope: deadline records recycle across distinct scopes" {
 }
 
 test "runtime timer: cancellation and expiry each publish once" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 2))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 2))) { ret 1; }
     val base:             time.Instant               = time.Instant{sec: 10, nsec: 0};
     val cancelled_result: res[Token, io_error.Error] = submit_timer(?runtime, time.instant_add(base, 1000000), 1);
     if (sel cancelled_result.err) { ret 1; }
@@ -2785,8 +2926,10 @@ test "runtime timer: cancellation and expiry each publish once" {
 }
 
 test "runtime timer: wall clock adjustments cannot change ordering" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
     val monotonic_base: time.Instant               = time.Instant{sec: 50, nsec: 0};
     val submitted:      res[Token, io_error.Error] = submit_timer(?runtime, time.instant_add(monotonic_base, 20000000), 7);
     if (sel submitted.err) { ret 1; }
@@ -2835,8 +2978,10 @@ fun timer_cancel_worker(arg: *u8) {
 }
 
 test "runtime timer: concurrent cancellation and expiry have one winner" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
     var round: usize = 0;
     for (round < 32) {
         val now: time.InstantClock = time.instant();
@@ -2907,8 +3052,10 @@ fun native_control_worker(arg: *u8) {
 }
 
 test "runtime wait and destroy serialize both native ownership interleavings" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
     val prepared: res[WaitPlan, io_error.Error] = prepare_wait(?runtime, -1);
     if (sel prepared.err) { ret 2; }
     val plan: WaitPlan = prepared.ok;
@@ -2923,7 +3070,7 @@ test "runtime wait and destroy serialize both native ownership interleavings" {
     mutex.unlock(?runtime.native_lock);
     if (!(sel stale_wait.err && stale_wait.err.kind == io_error.CLOSED)) { ret 4; }
 
-    if (!ok_err(make(?runtime, 1))) { ret 5; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 5; }
     val second_prepared: res[WaitPlan, io_error.Error] = prepare_wait(?runtime, -1);
     if (sel second_prepared.err) { ret 6; }
     val second_plan: WaitPlan           = second_prepared.ok;
@@ -2953,7 +3100,7 @@ test "runtime wait and destroy serialize both native ownership interleavings" {
     thread.join(?worker);
     if (sel owned_wait.err || atomic.load(?destroyed) != 1) { ret 9; }
 
-    if (!ok_err(make(?runtime, 1))
+    if (!ok_err(make(?runtime, ?pa, 1))
         || !ok_bool(close(?runtime))) {
         ret 10;
     }
@@ -3000,8 +3147,10 @@ test "runtime wait and destroy serialize both native ownership interleavings" {
 }
 
 test "runtime timer: native wait uses monotonic deadlines" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
     val now: time.InstantClock = time.instant();
     if (sel now.err) { ret 1; }
     val start:     time.Instant               = now.ok;
@@ -3027,9 +3176,11 @@ test "runtime timer: native wait uses monotonic deadlines" {
 }
 
 test "runtime scope: prior cancellation rejects submission" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
     var scope:   cancel.Scope;
-    if (!ok_err(make(?runtime, 1)))                                                                             { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1)))                                                                        { ret 1; }
     if (!succeeded(cancel.make_root(?scope, opt[time.Instant].none{})) || !transitioned(cancel.cancel(?scope))) { ret 1; }
     val submitted: res[Token, io_error.Error] = submit_scoped(?runtime, ?scope, test_operation(READ, 1));
     if (!sel submitted.err)                                           { ret 1; }
@@ -3041,10 +3192,12 @@ test "runtime scope: prior cancellation rejects submission" {
 }
 
 test "runtime scope: parent cancellation settles descendant work once" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
     var root:    cancel.Scope;
     var child:   cancel.Scope;
-    if (!ok_err(make(?runtime, 3)))                                                                                                              { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 3)))                                                                                                         { ret 1; }
     if (!succeeded(cancel.make_root(?root, opt[time.Instant].none{})) || !succeeded(cancel.make_child(?child, ?root, opt[time.Instant].none{}))) { ret 1; }
     var tokens: [3]Token;
     val first:  res[Token, io_error.Error] = submit_scoped(?runtime, ?root, test_operation(READ, 10));
@@ -3076,9 +3229,11 @@ test "runtime scope: parent cancellation settles descendant work once" {
 }
 
 test "runtime scope: completion before cancellation remains successful" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
     var scope:   cancel.Scope;
-    if (!ok_err(make(?runtime, 1)))                                     { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1)))                                { ret 1; }
     if (!succeeded(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 1; }
     val submitted: res[Token, io_error.Error] = submit_scoped(?runtime, ?scope, test_operation(READ, 15));
     if (sel submitted.err) { ret 1; }
@@ -3097,9 +3252,11 @@ test "runtime scope: completion before cancellation remains successful" {
 }
 
 test "runtime scope: equal operation and scope deadlines prefer timeout" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
     var scope:   cancel.Scope;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
     val now: time.InstantClock = time.instant();
     if (sel now.err) { ret 1; }
     val deadline: time.Instant = time.instant_add(now.ok, 20000000);
@@ -3141,8 +3298,10 @@ fun completion_race_worker(arg: *u8) {
 }
 
 test "runtime scope: completion and cancellation races report one transfer" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
     var round: usize = 0;
     for (round < 32) {
         var scope: cancel.Scope;
@@ -3199,8 +3358,10 @@ fun submission_race_worker(arg: *u8) {
 }
 
 test "runtime scope: submission and cancellation races preserve ownership" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
     var round: usize = 0;
     for (round < 32) {
         var scope: cancel.Scope;
@@ -3247,8 +3408,10 @@ fun timeout_race_worker(arg: *u8) {
 }
 
 test "runtime scope: deadline and cancellation races preserve the first reason" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
     var round: usize = 0;
     for (round < 32) {
         var scope: cancel.Scope;
@@ -3277,9 +3440,11 @@ test "runtime scope: deadline and cancellation races preserve the first reason" 
 }
 
 test "runtime scope: close remains distinct from cancellation" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
     var scope:   cancel.Scope;
-    if (!ok_err(make(?runtime, 1)))                                           { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1)))                                      { ret 1; }
     if (!succeeded(cancel.make_root(?scope, opt[time.Instant].none{})))       { ret 1; }
     if (!ok_token(submit_scoped(?runtime, ?scope, test_operation(READ, 31)))) { ret 1; }
     if (succeeded(cancel.destroy(?scope)) || !ok_bool(close(?runtime)))       { ret 1; }
@@ -3297,8 +3462,10 @@ test "runtime scope: close remains distinct from cancellation" {
 }
 
 test "runtime scope: failed submission wake rolls ownership back" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1)))            { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1)))       { ret 1; }
     if (os.io_queue_close(?runtime.queue) < 0) { ret 1; }
     val now: time.InstantClock = time.instant();
     if (sel now.err) { ret 1; }
@@ -3321,8 +3488,10 @@ test "runtime scope: failed submission wake rolls ownership back" {
 }
 
 test "runtime: batch completion separates bytes and items" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
     val submitted: res[Token, io_error.Error] = submit(?runtime, test_operation(RECEIVE_FROM, 81));
     if (sel submitted.err) { ret 2; }
     val token: Token = submitted.ok;
@@ -3379,8 +3548,10 @@ fun routed_source_dispatch(context: ptr, native_context: usize, events: u32, sta
 
 # offers made to deliver one event to the last of count sources
 fun routed_offers(count: usize, offers: *usize) i32 {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
     var sources: [100]RoutedSource;
     var tokens:  [100]SourceToken;
     var offered: usize = 0;
@@ -3427,8 +3598,10 @@ test "runtime: native event dispatch cost stays flat from 1 to 100 sources" {
 }
 
 test "runtime: an event for a released source is counted, never offered" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
     var offered: usize                            = 0;
     var gone:    RoutedSource                     = RoutedSource{id: 0, offers: ?offered, claimed: 0};
     val first:   res[SourceToken, io_error.Error] = register_source(?runtime, (?gone)::ptr, routed_source_dispatch, test_source_cancel, test_source_release);
@@ -3487,8 +3660,10 @@ fun racing_cycle(runtime: *Runtime, old: *RoutedSource, fresh: *RoutedSource) i3
 }
 
 test "runtime: 70,000 source registrations on one runtime never reach a stale source" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
     var offered: usize        = 0;
     var old:     RoutedSource = RoutedSource{id: 0, offers: ?offered, claimed: 0};
     var fresh:   RoutedSource = RoutedSource{id: 0, offers: ?offered, claimed: 0};
@@ -3513,8 +3688,10 @@ test "runtime: 70,000 source registrations on one runtime never reach a stale so
 # a source keeps its id while it owns an operation, so the runtime never reuses
 # an id a pending native completion could still carry (#740)
 test "runtime: a source with a live operation cannot be released" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
     var context:    TestSource                       = TestSource{released: 0, cancellation_pending: false, cancelled: Token{index: 0, generation: 0}};
     val registered: res[SourceToken, io_error.Error] = register_source(?runtime, (?context)::ptr, test_source_dispatch, test_source_cancel, test_source_release);
     if (sel registered.err) { ret 2; }
@@ -3535,8 +3712,10 @@ test "runtime: a source with a live operation cannot be released" {
 }
 
 test "runtime: retired source slots reject stale tokens and remain reusable" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 1))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
     var context:      TestSource                       = TestSource{released: 0, cancellation_pending: false, cancelled: Token{index: 0, generation: 0}};
     val first_result: res[SourceToken, io_error.Error] = register_source(?runtime, (?context)::ptr, test_source_dispatch, test_source_cancel, test_source_release);
     if (sel first_result.err) { ret 2; }
@@ -3569,8 +3748,10 @@ test "runtime: retired source slots reject stale tokens and remain reusable" {
 }
 
 test "runtime: source and operation ownership share one close lifecycle" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 2))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 2))) { ret 1; }
     var context:       TestSource                       = TestSource{released: 0, cancellation_pending: false, cancelled: Token{index: 0, generation: 0}};
     val source_result: res[SourceToken, io_error.Error] = register_source(?runtime, (?context)::ptr, test_source_dispatch, test_source_cancel, test_source_release);
     if (sel source_result.err) { ret 2; }
@@ -3613,8 +3794,10 @@ test "runtime: source and operation ownership share one close lifecycle" {
 }
 
 test "runtime: asynchronous source cancellation publishes after quiescence" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 2))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 2))) { ret 1; }
     var context:       TestSource                       = TestSource{released: 0, cancellation_pending: true, cancelled: Token{index: 0, generation: 0}};
     val source_result: res[SourceToken, io_error.Error] = register_source(?runtime, (?context)::ptr, test_source_dispatch, test_source_cancel, test_source_release);
     if (sel source_result.err) { ret 2; }
@@ -3654,8 +3837,10 @@ test "runtime: asynchronous source cancellation publishes after quiescence" {
 }
 
 test "runtime: first abortive escalation updates unresolved source work" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 2))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 2))) { ret 1; }
     var context:       TestSource                       = TestSource{released: 0, cancellation_pending: true, cancelled: Token{index: 0, generation: 0}};
     val source_result: res[SourceToken, io_error.Error] = register_source(?runtime, (?context)::ptr, test_source_dispatch, test_source_cancel, test_source_release);
     if (sel source_result.err) { ret 2; }
@@ -3737,8 +3922,10 @@ fun racing_release(context: ptr, completion: *Completion) {}
 # submit one operation on a racing source, cancel or time out its scope, and
 # return the terminal completion
 fun raced_cancellation(source: *RacingSource, operation: Operation, timed_out: bool, output: *Completion) i32 {
+    var pa: allocator.Allocator;
+    page.make(?pa);
     var runtime: Runtime;
-    if (!ok_err(make(?runtime, 2))) { ret 1; }
+    if (!ok_err(make(?runtime, ?pa, 2))) { ret 1; }
     source.runtime = ?runtime;
     val registered: res[SourceToken, io_error.Error] = register_source(?runtime, source::ptr, test_source_dispatch, racing_cancel, racing_release);
     if (sel registered.err) { ret 2; }

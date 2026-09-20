@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.0.0] - 2026-09-19
+
+std 7.0.0 keeps `mach = "^5.8"`; nothing in it needs 5.9. Two things are
+silent to the compiler and need a rebuild or a reading rather than a fix at
+the call site:
+
+- `data.toml.Value` grew by two `Span`s. Anything that links std and stores a
+  `Value` or a `Table` across the boundary must be rebuilt against 7.0.0.
+- `io.runtime.make` keeps a copy of the allocator it is handed, so that
+  allocator's context must outlive the runtime. A stack-local allocator that
+  goes out of scope before `io.runtime.destroy` is a use after free, not a
+  refusal.
+
+The one changed signature, `io.runtime.make(runtime, a, initial)`, is a
+compile-time refusal at the caller, so a program that builds against 7.0.0
+has already moved. Three changes can newly fail or differ at run time in code
+that already compiles:
+
+- A refusal from the runtime's allocator is now its only ceiling: a
+  submission that used to grow a private page allocator fails with
+  `RESOURCE_EXHAUSTED` (`ENOMEM` inside a backend) when `a` refuses, with
+  nothing live moved and every operation still settling once.
+- `allocator.page`, `allocator.testing` and `allocator.arena` honor `align`,
+  so a block's address may differ from 6.x (only ever more aligned), and
+  `page` maps wider than the request for an alignment above the page.
+- `allocator.heap` refuses, as `exhausted`, a span whose base is not a
+  multiple of `SPAN_ALIGN`, where 6.x carved it and then lost its small
+  blocks. Only a `Source` outside the base contract reaches this.
+
+### Added
+
+- `data.toml.Span` and, on every parsed `Value`, `span` and `key`: the byte
+  offset and length in the document handed to `parse` of the value's literal
+  as written and of the key token that maps to it, so a consumer can report a
+  semantic problem against the source without text-matching. A table a
+  header defines is positioned at the header line, a table a dotted key or an
+  inner header segment created at that segment, and each `[[header]]`
+  element at its header. A value not produced by `parse` carries the zero
+  span in both. `Value` grows, so anything that links std and stores a
+  `Value` or a `Table` must be rebuilt (#811).
+
+### Changed
+
+- **Breaking**: `io.runtime.make(runtime, a, initial)` takes the allocator
+  every one of the runtime's allocations comes from, as `memory.table.make`
+  does, and keeps a copy of it, so `a`'s context must outlive the runtime.
+  The runtime no longer builds a page allocator of its own; its tables and
+  its native event batch come from `a`, and `net.async`, `net.async.local`
+  and their backends draw from `runtime.allocator` instead of a private page
+  allocator. A refusal from `a` is the runtime's only ceiling, so a test
+  allocator reaches every refusal branch: the submission fails with
+  `RESOURCE_EXHAUSTED` (`ENOMEM` inside a backend), nothing live moves, and
+  every operation still settles once. See MIGRATION.md (#677).
+- `allocator.heap` tests run every behavioural case against a member
+  matrix: the host mapper, `allocator_source` over `fixed`, and a mapper at
+  the weakest base the contract allows. A new `Source` member is one more
+  row (#665). `allocator_source` over `page` and over `testing` are rows
+  too (#851).
+
+### Fixed
+
+- `allocator.page`, `allocator.testing` and `allocator.arena` honor the
+  `align` argument, as the `Allocator` contract states. `page` widens the
+  mapping and places the block for an alignment above the page (posix trims
+  the pages around it, windows stashes the raw base ahead of it), `testing`
+  places the block as close to its guard as the alignment allows, with fewer
+  than `align` bytes of slack when the size is not a multiple of it, and
+  `arena` aligns the address rather than the offset into its chunk. Before
+  this, `testing` returned addresses aligned to nothing, `page` to the page
+  and `arena` to the chunk header (#851).
+- `allocator.heap`: a span whose base is not a multiple of `SPAN_ALIGN` is
+  handed back to the source and the request refused as `exhausted`, instead
+  of being carved and then missed by the small-block lookup. The padding
+  `take_large` added above `SPAN_ALIGN` is gone: the source's base contract
+  already bounds the payload offset by the requested alignment (#665).
+
 ## [6.1.0] - 2026-09-19
 
 ### Added
