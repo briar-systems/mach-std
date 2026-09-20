@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `allocator.page`, `allocator.testing` and `allocator.arena` honor the
+  `align` argument, as the `Allocator` contract states. `page` widens the
+  mapping and places the block for an alignment above the page (posix trims
+  the pages around it, windows stashes the raw base ahead of it), `testing`
+  places the block as close to its guard as the alignment allows, with fewer
+  than `align` bytes of slack when the size is not a multiple of it, and
+  `arena` aligns the address rather than the offset into its chunk. Before
+  this, `testing` returned addresses aligned to nothing, `page` to the page
+  and `arena` to the chunk header (#851).
 - `allocator.heap`: a span whose base is not a multiple of `SPAN_ALIGN` is
   handed back to the source and the request refused as `exhausted`, instead
   of being carved and then missed by the small-block lookup. The padding
@@ -20,7 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `allocator.heap` tests run every behavioural case against a member
   matrix: the host mapper, `allocator_source` over `fixed`, and a mapper at
   the weakest base the contract allows. A new `Source` member is one more
-  row (#665).
+  row (#665). `allocator_source` over `page` and over `testing` are rows
+  too (#851).
 
 ## [6.1.0] - 2026-09-19
 
