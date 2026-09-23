@@ -154,11 +154,11 @@ val NO_SOURCE:         u32 = 0xffffffff;
 # where a source id leads
 # ---
 # index:    the source slot holding the id while it is registered
-# next:     the next released id, 0 at the tail
+# next:     the next free id of its chunk
 # released: collections begun when the id was released
 rec Route {
     index:    u32;
-    next:     u32;
+    next:     usize;
     released: u64;
 }
 
@@ -173,6 +173,22 @@ rec Source {
     live:       usize;
     busy:       usize;
     attachment: lifecycle.Attachment;
+}
+
+# free indices of a chunked table, handed out lowest chunk first and oldest
+# first within a chunk, so steady churn drains the high chunks and an index
+# waits behind the other free ones of its chunk. the free lists link through
+# the elements themselves
+# ---
+# live:   occupied indices per chunk
+# head:   each chunk's oldest free index
+# tail:   each chunk's newest free index
+# lowest: no chunk below this one holds a free index
+rec Pool {
+    live:   [table.DIRECTORY]usize;
+    head:   [table.DIRECTORY]usize;
+    tail:   [table.DIRECTORY]usize;
+    lowest: usize;
 }
 
 rec Slot {
@@ -237,27 +253,30 @@ pub rec Runtime {
     source_routes: table.Table;
     deadlines:     table.Table;
     # open addressed on (owner, at), a power of two at least twice the slots
-    deadline_index:  table.Table;
-    deadline_used:   usize;
-    deadline_free:   usize;
-    deadline_live:   usize;
-    native_events:   *NativeEvent;
-    initial:         usize;
-    slot_count:      usize;
-    free_head:       usize;
-    free_tail:       usize;
-    head:            usize;
-    tail:            usize;
-    count:           usize;
-    live:            usize;
-    timer_count:     usize;
-    source_count:    usize;
-    source_slots:    usize;
-    next_source_tag: u32;
-    # released ids, oldest first, reused once no collection can still hold
-    # an event harvested for them
-    route_free_head: u32;
-    route_free_tail: u32;
+    deadline_index: table.Table;
+    deadline_pool:  Pool;
+    deadline_live:  usize;
+    native_events:  *NativeEvent;
+    initial:        usize;
+    slot_pool:      Pool;
+    # a slot made in a regrown chunk starts at this generation, the highest
+    # any slot of a released chunk reached, so no token issued there matches
+    slot_floor:   u32;
+    head:         usize;
+    tail:         usize;
+    count:        usize;
+    live:         usize;
+    timer_count:  usize;
+    source_count: usize;
+    # sources below this index have been initialised
+    source_slots: usize;
+    # registered sources per chunk of the source table
+    source_live: [table.DIRECTORY]usize;
+    # the source counterpart of slot_floor
+    source_floor: u32;
+    # free source ids, each reused once no collection can still hold an event
+    # harvested for it. id 0 is never issued
+    route_pool: Pool;
     # native collections begun and ended, each a harvest and its dispatch
     collections_begun: u64;
     collections_ended: u64;
@@ -276,10 +295,12 @@ pub rec Runtime {
 
 # whether a byte range overlaps the runtime or any storage reachable through it
 #
-# read-only and allocation-free. the ownership-defining pointers and capacities,
-# and the queried range, must not change during the query. a caller may query
-# while ordinary operations run, since those fields stay put, but must
-# synchronize with initialization and destruction.
+# read-only and allocation-free. the queried range must not change during the
+# query. a caller may query while ordinary operations run, but must synchronize
+# with initialization and destruction. ordinary operations grow the tables and
+# release what a peak grew, so a query racing one can answer either way for a
+# range in a chunk being added or released. any other range answers the same
+# either way.
 #
 # a non-empty malformed range, or an uninitialized, partially initialized,
 # partially torn-down or destroyed owner, reports overlap. an empty range owns
@@ -327,6 +348,7 @@ fun bucket_at(runtime: *Runtime, index: usize) *usize {
 }
 
 # the slot table is the runtime's current size, not a limit it was given
+# the slots the runtime holds now, which grow with load and fall back after it
 pub fun capacity(runtime: *Runtime) usize {
     if (runtime == nil || runtime.destroyed) { ret 0; }
     ret runtime.slots.capacity;
@@ -343,7 +365,7 @@ fun exhausted(operation: io_error.Operation) io_error.Error {
 fun init_slot(runtime: *Runtime, index: usize) {
     val slot: *Slot = slot_at(runtime, index);
     slot.state                  = SLOT_FREE;
-    slot.generation             = 0;
+    slot.generation             = runtime.slot_floor;
     slot.index                  = index::u32;
     slot.runtime                = runtime;
     slot.next                   = NO_SLOT;
@@ -365,7 +387,7 @@ fun init_slot(runtime: *Runtime, index: usize) {
 fun init_source(runtime: *Runtime, index: usize) {
     val source: *Source = source_at(runtime, index);
     source.state                 = SOURCE_UNUSED;
-    source.generation            = 0;
+    source.generation            = runtime.source_floor;
     source.tag                   = 0;
     source.context               = nil;
     source.live                  = 0;
@@ -376,23 +398,90 @@ fun init_source(runtime: *Runtime, index: usize) {
     source.attachment.active     = false;
 }
 
-fun free_push(runtime: *Runtime, index: usize) {
-    val slot: *Slot = slot_at(runtime, index);
-    slot.next = NO_SLOT;
-    if (runtime.free_tail == NO_SLOT) { runtime.free_head = index; }
-    or                                { slot_at(runtime, runtime.free_tail).next = index; }
-    runtime.free_tail = index;
+# where an element of a pooled table keeps its free-list link
+def LinkFun: fun(*Runtime, usize) *usize;
+
+fun slot_link(runtime: *Runtime, index: usize) *usize {
+    ret ?slot_at(runtime, index).next;
 }
 
-# oldest first, so a released index waits behind every other free one
-fun free_pop(runtime: *Runtime) usize {
-    val index: usize = runtime.free_head;
-    if (index == NO_SLOT) { ret NO_SLOT; }
-    val slot: *Slot = slot_at(runtime, index);
-    runtime.free_head = slot.next;
-    if (runtime.free_head == NO_SLOT) { runtime.free_tail = NO_SLOT; }
-    slot.next = NO_SLOT;
+fun deadline_link(runtime: *Runtime, index: usize) *usize {
+    ret ?deadline_at(runtime, index).next;
+}
+
+fun pool_reset(pool: *Pool) {
+    var chunk: usize = 0;
+    for (chunk < table.DIRECTORY) {
+        pool.live[chunk] = 0;
+        pool.head[chunk] = table.NO_INDEX;
+        pool.tail[chunk] = table.NO_INDEX;
+        chunk            = chunk + 1;
+    }
+    pool.lowest = 0;
+}
+
+fun pool_append(runtime: *Runtime, pool: *Pool, link: LinkFun, chunk: usize, index: usize) {
+    @link(runtime, index) = table.NO_INDEX;
+    if (pool.tail[chunk] == table.NO_INDEX) { pool.head[chunk] = index; }
+    or                                      { @link(runtime, pool.tail[chunk]) = index; }
+    pool.tail[chunk] = index;
+}
+
+# every index of a freshly grown last chunk joins the pool, in index order
+fun pool_adopt(runtime: *Runtime, pool: *Pool, owner: *table.Table, link: LinkFun) {
+    val chunk: usize = owner.chunk_count - 1;
+    val start: usize = table.chunk_start(owner, chunk);
+    val end:   usize = start + table.chunk_capacity(owner, chunk);
+    pool.live[chunk] = 0;
+    pool.head[chunk] = table.NO_INDEX;
+    pool.tail[chunk] = table.NO_INDEX;
+    var index: usize = start;
+    for (index < end) {
+        pool_append(runtime, pool, link, chunk, index);
+        index = index + 1;
+    }
+    if (chunk < pool.lowest) { pool.lowest = chunk; }
+}
+
+# the lowest chunk's oldest free index, NO_INDEX when every index is taken
+fun pool_take(runtime: *Runtime, pool: *Pool, owner: *table.Table, link: LinkFun) usize {
+    for (pool.lowest < owner.chunk_count && pool.head[pool.lowest] == table.NO_INDEX) {
+        pool.lowest = pool.lowest + 1;
+    }
+    if (pool.lowest >= owner.chunk_count) { ret table.NO_INDEX; }
+    val chunk: usize = pool.lowest;
+    val index: usize = pool.head[chunk];
+    pool.head[chunk] = @link(runtime, index);
+    if (pool.head[chunk] == table.NO_INDEX) { pool.tail[chunk] = table.NO_INDEX; }
+    @link(runtime, index) = table.NO_INDEX;
+    pool.live[chunk]      = pool.live[chunk] + 1;
     ret index;
+}
+
+fun pool_put(runtime: *Runtime, pool: *Pool, owner: *table.Table, link: LinkFun, index: usize) {
+    val chunk: usize = table.chunk_of(owner, index);
+    pool_append(runtime, pool, link, chunk, index);
+    pool.live[chunk] = pool.live[chunk] - 1;
+    if (chunk < pool.lowest) { pool.lowest = chunk; }
+}
+
+# release the owner's last chunk, whose indices are all free, with its list
+fun pool_shrink(pool: *Pool, owner: *table.Table) bool {
+    val chunk:    usize                = owner.chunk_count - 1;
+    val released: err[allocator.Error] = table.shrink(owner);
+    if (sel released.err) { ret false; }
+    pool.head[chunk] = table.NO_INDEX;
+    pool.tail[chunk] = table.NO_INDEX;
+    pool.live[chunk] = 0;
+    ret true;
+}
+
+fun free_push(runtime: *Runtime, index: usize) {
+    pool_put(runtime, ?runtime.slot_pool, ?runtime.slots, slot_link, index);
+}
+
+fun free_pop(runtime: *Runtime) usize {
+    ret pool_take(runtime, ?runtime.slot_pool, ?runtime.slots, slot_link);
 }
 
 fun release_tables(runtime: *Runtime) {
@@ -460,7 +549,7 @@ fun deadline_rebuild(runtime: *Runtime, buckets: usize) bool {
     runtime.deadline_index = fresh;
     memory.raw_zero(runtime.deadline_index.chunks[0], runtime.deadline_index.capacity * $size_of(usize));
     var index: usize = 0;
-    for (index < runtime.deadline_used) {
+    for (index < runtime.deadlines.capacity) {
         if (deadline_at(runtime, index).refs > 0) { deadline_index_insert(runtime, index); }
         index = index + 1;
     }
@@ -468,26 +557,149 @@ fun deadline_rebuild(runtime: *Runtime, buckets: usize) bool {
     ret true;
 }
 
+fun adopt_deadlines(runtime: *Runtime) {
+    val chunk: usize = runtime.deadlines.chunk_count - 1;
+    val start: usize = table.chunk_start(?runtime.deadlines, chunk);
+    val end:   usize = start + table.chunk_capacity(?runtime.deadlines, chunk);
+    var index: usize = start;
+    for (index < end) {
+        @deadline_at(runtime, index) = DeadlineRecord{
+            owner:       nil,
+            at:          time.Instant{sec: 0, nsec: 0},
+            refs:        0,
+            timer_index: NO_TIMER,
+            next:        NO_RECORD,
+        };
+        index = index + 1;
+    }
+    pool_adopt(runtime, ?runtime.deadline_pool, ?runtime.deadlines, deadline_link);
+}
+
 # a live record holds at least one live slot, so records never outnumber slots
 # and the index stays at most half full
-fun reserve_deadlines(runtime: *Runtime) bool {
-    if (!table.reserve(?runtime.deadlines, runtime.slots.capacity))    { ret false; }
-    if (runtime.deadline_index.capacity >= runtime.slots.capacity * 2) { ret true; }
-    ret deadline_rebuild(runtime, runtime.slots.capacity * 2);
+fun reserve_deadlines(runtime: *Runtime, slots: usize) bool {
+    for (runtime.deadlines.capacity < slots) {
+        if (!table.grow(?runtime.deadlines)) { ret false; }
+        adopt_deadlines(runtime);
+    }
+    if (runtime.deadline_index.capacity >= slots * 2) { ret true; }
+    ret deadline_rebuild(runtime, slots * 2);
 }
 
 # every slot carries at most an operation timer and holds at most one deadline
-# record, so a reserve of twice the slot table is a push that cannot fail
-fun reserve_timers(runtime: *Runtime) bool {
-    if (runtime.slots.capacity > ~(0::usize) / 4) { ret false; }
-    ret table.reserve(?runtime.timers, runtime.slots.capacity * 2) && reserve_deadlines(runtime);
+# record, so a reserve of twice the slot table is a push that cannot fail. it
+# is made for a slot capacity before the slot table reaches it
+fun reserve_timers(runtime: *Runtime, slots: usize) bool {
+    if (slots > ~(0::usize) / 4) { ret false; }
+    ret table.reserve(?runtime.timers, slots * 2) && reserve_deadlines(runtime, slots);
+}
+
+# grow the slot table by one chunk, whose slots are initialised and join the
+# pool. a token index is 32 bits wide on every backend
+fun grow_slots(runtime: *Runtime) bool {
+    if (runtime.slots.chunk_count >= table.DIRECTORY) { ret false; }
+    val added: usize = table.chunk_capacity(?runtime.slots, runtime.slots.chunk_count);
+    if (runtime.slots.capacity + added - 1 > 0xffffffff)          { ret false; }
+    if (!reserve_timers(runtime, runtime.slots.capacity + added)) { ret false; }
+    if (!table.grow(?runtime.slots))                              { ret false; }
+    adopt_slots(runtime);
+    ret true;
+}
+
+fun adopt_slots(runtime: *Runtime) {
+    val chunk: usize = runtime.slots.chunk_count - 1;
+    val start: usize = table.chunk_start(?runtime.slots, chunk);
+    val end:   usize = start + table.chunk_capacity(?runtime.slots, chunk);
+    var index: usize = start;
+    for (index < end) {
+        init_slot(runtime, index);
+        index = index + 1;
+    }
+    pool_adopt(runtime, ?runtime.slot_pool, ?runtime.slots, slot_link);
+}
+
+# the highest generation among a slot chunk's slots, which the slots of a
+# regrown chunk start from
+fun slot_chunk_floor(runtime: *Runtime, chunk: usize) u32 {
+    val start: usize = table.chunk_start(?runtime.slots, chunk);
+    val end:   usize = start + table.chunk_capacity(?runtime.slots, chunk);
+    var floor: u32   = runtime.slot_floor;
+    var index: usize = start;
+    for (index < end) {
+        val generation: u32 = slot_at(runtime, index).generation;
+        if (generation > floor) { floor = generation; }
+        index = index + 1;
+    }
+    ret floor;
+}
+
+# release the capacity a peak left behind. a slot chunk goes once it and the
+# chunk below it are both empty, so one empty chunk always remains as slack
+# and a load that crosses a chunk boundary back and forth never reallocates.
+# the timer heap, deadline records and deadline index then follow the slot
+# capacity down to the reserve it needs. only empty chunks are released, so
+# nothing live moves
+fun trim_locked(runtime: *Runtime) {
+    for (runtime.slots.chunk_count > 1) {
+        val top: usize = runtime.slots.chunk_count - 1;
+        if (runtime.slot_pool.live[top] != 0 || runtime.slot_pool.live[top - 1] != 0) { brk; }
+        val floor: u32 = slot_chunk_floor(runtime, top);
+        if (!pool_shrink(?runtime.slot_pool, ?runtime.slots)) { brk; }
+        runtime.slot_floor = floor;
+    }
+    val slots: usize = runtime.slots.capacity;
+    for (runtime.timers.chunk_count > 1) {
+        val top: usize = runtime.timers.chunk_count - 1;
+        if (runtime.timers.capacity - table.chunk_capacity(?runtime.timers, top) < slots * 2) { brk; }
+        val released: err[allocator.Error] = table.shrink(?runtime.timers);
+        if (sel released.err) { brk; }
+    }
+    for (runtime.deadlines.chunk_count > 1) {
+        val top: usize = runtime.deadlines.chunk_count - 1;
+        if (runtime.deadline_pool.live[top] != 0 ||
+            runtime.deadlines.capacity - table.chunk_capacity(?runtime.deadlines, top) < slots) { brk; }
+        if (!pool_shrink(?runtime.deadline_pool, ?runtime.deadlines)) { brk; }
+    }
+    # a refused rebuild keeps the larger index, which is still valid
+    if (runtime.deadline_index.capacity > slots * 2) { deadline_rebuild(runtime, slots * 2); }
+}
+
+# the source table's counterpart of trim_locked, under the same slack rule
+fun trim_sources_locked(runtime: *Runtime) {
+    for (runtime.sources.chunk_count > 1) {
+        val top: usize = runtime.sources.chunk_count - 1;
+        if (runtime.source_live[top] != 0 || runtime.source_live[top - 1] != 0) { brk; }
+        val start: usize = table.chunk_start(?runtime.sources, top);
+        var end:   usize = start + table.chunk_capacity(?runtime.sources, top);
+        if (end > runtime.source_slots) { end = runtime.source_slots; }
+        var floor: u32   = runtime.source_floor;
+        var index: usize = start;
+        for (index < end) {
+            val generation: u32 = source_at(runtime, index).generation;
+            if (generation > floor) { floor = generation; }
+            index = index + 1;
+        }
+        val released: err[allocator.Error] = table.shrink(?runtime.sources);
+        if (sel released.err) { brk; }
+        runtime.source_floor = floor;
+        if (runtime.source_slots > start) { runtime.source_slots = start; }
+    }
+    # a chunk's newest free id is the last to become reusable
+    for (runtime.source_routes.chunk_count > 1) {
+        val top: usize = runtime.source_routes.chunk_count - 1;
+        if (runtime.route_pool.live[top] != 0 || runtime.route_pool.live[top - 1] != 0 ||
+            !route_reusable(runtime, runtime.route_pool.tail[top])) { brk; }
+        if (!pool_shrink(?runtime.route_pool, ?runtime.source_routes)) { brk; }
+    }
 }
 
 # every byte the runtime owns comes from a: its tables, its native event
 # batch, and the tables of every driver registered on it. the runtime keeps a
 # copy of a, so a's context must outlive the runtime. a refusal from a is the
 # only ceiling: initial is the size the runtime starts at, and the slot, timer
-# and source tables grow on demand until a refuses.
+# and source tables grow on demand until a refuses. what a peak grew goes back
+# to a once the load drains, keeping one chunk of slack above what is live, and
+# nothing live moves when it does.
 # ---
 # runtime: the runtime to initialize
 # a:       where every allocation is taken from and returned to
@@ -502,15 +714,26 @@ pub fun make(runtime: *Runtime, a: *allocator.Allocator, initial: usize) err[io_
     if (!table.make(?runtime.slots, ?runtime.allocator, $size_of(Slot), initial)) {
         ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
     }
-    runtime.deadline_used = 0;
-    runtime.deadline_free = NO_RECORD;
+    runtime.slot_floor    = 0;
+    runtime.source_floor  = 0;
     runtime.deadline_live = 0;
+    pool_reset(?runtime.slot_pool);
+    pool_reset(?runtime.deadline_pool);
+    adopt_slots(runtime);
+    var chunk: usize = 0;
+    for (chunk < table.DIRECTORY) {
+        runtime.source_live[chunk] = 0;
+        chunk                      = chunk + 1;
+    }
     if (!table.make(?runtime.timers, ?runtime.allocator, $size_of(TimerEntry), initial) ||
         !table.make(?runtime.sources, ?runtime.allocator, $size_of(Source), SOURCE_INITIAL) ||
         !table.make(?runtime.source_routes, ?runtime.allocator, $size_of(Route), SOURCE_INITIAL) ||
-        !table.make(?runtime.deadlines, ?runtime.allocator, $size_of(DeadlineRecord), initial) ||
-        !deadline_rebuild(runtime, initial * 2) ||
-        !reserve_timers(runtime)) {
+        !table.make(?runtime.deadlines, ?runtime.allocator, $size_of(DeadlineRecord), initial)) {
+        release_tables(runtime);
+        ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
+    }
+    adopt_deadlines(runtime);
+    if (!deadline_rebuild(runtime, initial * 2) || !reserve_timers(runtime, runtime.slots.capacity)) {
         release_tables(runtime);
         ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
     }
@@ -521,20 +744,17 @@ pub fun make(runtime: *Runtime, a: *allocator.Allocator, initial: usize) err[io_
     }
     runtime.native_events = batch.ok;
 
-    runtime.initial           = initial;
-    runtime.slot_count        = 0;
-    runtime.free_head         = NO_SLOT;
-    runtime.free_tail         = NO_SLOT;
-    runtime.head              = NO_SLOT;
-    runtime.tail              = NO_SLOT;
-    runtime.count             = 0;
-    runtime.live              = 0;
-    runtime.timer_count       = 0;
-    runtime.source_count      = 0;
-    runtime.source_slots      = 0;
-    runtime.next_source_tag   = 1;
-    runtime.route_free_head   = 0;
-    runtime.route_free_tail   = 0;
+    runtime.initial      = initial;
+    runtime.head         = NO_SLOT;
+    runtime.tail         = NO_SLOT;
+    runtime.count        = 0;
+    runtime.live         = 0;
+    runtime.timer_count  = 0;
+    runtime.source_count = 0;
+    runtime.source_slots = 0;
+    pool_reset(?runtime.route_pool);
+    adopt_routes(runtime);
+    pool_take(runtime, ?runtime.route_pool, ?runtime.source_routes, route_link);
     runtime.collections_begun = 0;
     runtime.collections_ended = 0;
     runtime.unrouted          = 0;
@@ -560,37 +780,63 @@ fun route_at(runtime: *Runtime, id: u16) *Route {
     ret table.at(?runtime.source_routes, id::usize)::*Route;
 }
 
+fun route_link(runtime: *Runtime, id: usize) *usize {
+    ret ?route_at(runtime, id::u16).next;
+}
+
+fun route_reusable(runtime: *Runtime, id: usize) bool {
+    ret route_at(runtime, id::u16).released <= runtime.collections_ended;
+}
+
+# the ids of a freshly grown last chunk of the route table join the pool
+fun adopt_routes(runtime: *Runtime) {
+    val chunk: usize = runtime.source_routes.chunk_count - 1;
+    val start: usize = table.chunk_start(?runtime.source_routes, chunk);
+    val end:   usize = start + table.chunk_capacity(?runtime.source_routes, chunk);
+    var id:    usize = start;
+    for (id < end) {
+        val route: *Route = route_at(runtime, id::u16);
+        route.index    = NO_SOURCE;
+        route.released = 0;
+        id             = id + 1;
+    }
+    pool_adopt(runtime, ?runtime.route_pool, ?runtime.source_routes, route_link);
+}
+
 # the id a registration will take, 0 when every id is live or still held by a
-# collection that began before its release. nothing changes until commit
+# collection that began before its release. a chunk's ids are released in
+# order, so its oldest free id is the first to become reusable, and the
+# lowest chunk with a reusable one is taken so the high ids drain. nothing
+# but growth changes until commit
 fun take_source_id(runtime: *Runtime) u16 {
-    val head: u32 = runtime.route_free_head;
-    if (head != 0 && route_at(runtime, head::u16).released <= runtime.collections_ended)                                { ret head::u16; }
-    if (runtime.next_source_tag > 0xffff || !table.reserve(?runtime.source_routes, runtime.next_source_tag::usize + 1)) { ret 0; }
-    ret runtime.next_source_tag::u16;
+    var chunk: usize = 0;
+    for (chunk < runtime.source_routes.chunk_count) {
+        val head: usize = runtime.route_pool.head[chunk];
+        if (head != table.NO_INDEX && route_reusable(runtime, head)) { ret head::u16; }
+        chunk = chunk + 1;
+    }
+    # ids are 16 bits wide
+    if (runtime.source_routes.capacity > 0xffff || !table.grow(?runtime.source_routes)) { ret 0; }
+    adopt_routes(runtime);
+    ret runtime.route_pool.head[runtime.source_routes.chunk_count - 1]::u16;
 }
 
 fun commit_source_id(runtime: *Runtime, id: u16, index: u32) {
+    val chunk: usize = table.chunk_of(?runtime.source_routes, id::usize);
+    val pool:  *Pool = ?runtime.route_pool;
+    pool.head[chunk] = @route_link(runtime, id::usize);
+    if (pool.head[chunk] == table.NO_INDEX) { pool.tail[chunk] = table.NO_INDEX; }
+    pool.live[chunk] = pool.live[chunk] + 1;
     val route: *Route = route_at(runtime, id);
-    if (id::u32 == runtime.next_source_tag) {
-        runtime.next_source_tag = runtime.next_source_tag + 1;
-    }
-    or {
-        runtime.route_free_head = route.next;
-        if (runtime.route_free_head == 0) { runtime.route_free_tail = 0; }
-    }
     route.index = index;
-    route.next  = 0;
+    route.next  = table.NO_INDEX;
 }
 
 # an event harvested before this point may still name the id, so it waits for
 # every collection already begun to end
 fun release_source_id(runtime: *Runtime, id: u16) {
-    val route: *Route = route_at(runtime, id);
-    route.next     = 0;
-    route.released = runtime.collections_begun;
-    if (runtime.route_free_tail == 0) { runtime.route_free_head = id::u32; }
-    or                                { route_at(runtime, runtime.route_free_tail::u16).next = id::u32; }
-    runtime.route_free_tail = id::u32;
+    route_at(runtime, id).released = runtime.collections_begun;
+    pool_put(runtime, ?runtime.route_pool, ?runtime.source_routes, route_link, id::usize);
 }
 
 fun collection_begin(runtime: *Runtime) {
@@ -602,6 +848,8 @@ fun collection_begin(runtime: *Runtime) {
 fun collection_end(runtime: *Runtime) {
     mutex.lock(?runtime.lock);
     runtime.collections_ended = runtime.collections_ended + 1;
+    # ids released during the collection may now free their chunk
+    trim_sources_locked(runtime);
     mutex.unlock(?runtime.lock);
 }
 
@@ -653,6 +901,7 @@ pub fun register_source(
         init_source(runtime, index);
         runtime.source_slots = runtime.source_slots + 1;
     }
+    val chunk:      usize   = table.chunk_of(?runtime.sources, index);
     val source:     *Source = source_at(runtime, index);
     var generation: u32     = source.generation + 1;
     if (generation == 0) { generation = 1; }
@@ -675,7 +924,8 @@ pub fun register_source(
         ret res[SourceToken, io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_CREATE)};
     }
     commit_source_id(runtime, tag, index::u32);
-    runtime.source_count = runtime.source_count + 1;
+    runtime.source_count       = runtime.source_count + 1;
+    runtime.source_live[chunk] = runtime.source_live[chunk] + 1;
     mutex.unlock(?runtime.lock);
     ret res[SourceToken, io_error.Error].ok{SourceToken{index: index::u32, generation: generation, tag: tag}};
 }
@@ -710,13 +960,16 @@ pub fun release_source(runtime: *Runtime, token: SourceToken) err[io_error.Error
         ret err[io_error.Error].err{invalid(io_error.OP_CLOSE)};
     }
     release_source_id(runtime, source.tag);
-    source.state         = SOURCE_UNUSED;
-    source.tag           = 0;
-    source.context       = nil;
-    runtime.source_count = runtime.source_count - 1;
+    val chunk: usize = table.chunk_of(?runtime.sources, token.index::usize);
+    source.state               = SOURCE_UNUSED;
+    source.tag                 = 0;
+    source.context             = nil;
+    runtime.source_count       = runtime.source_count - 1;
+    runtime.source_live[chunk] = runtime.source_live[chunk] - 1;
     val settled:     res[bool, lifecycle.StateError] = lifecycle.settle(?source.attachment);
     var wake_result: i64                             = 0;
     if (sel settled.ok && settled.ok) { wake_result = os.io_queue_wake(?runtime.queue); }
+    trim_sources_locked(runtime);
     mutex.unlock(?runtime.lock);
     if (wake_result < 0) {
         ret err[io_error.Error].err{os.error(wake_result, io_error.OP_WAKE)};
@@ -748,22 +1001,16 @@ pub fun unrouted_events(runtime: *Runtime) u64 {
     ret count;
 }
 
-# a fresh index is appended and an index is never recycled while it is live,
-# so growth adds storage and moves nothing
+# the lowest free index is taken and an index is never recycled while it is
+# live, so growth adds storage and moves nothing
 fun claim_locked(runtime: *Runtime, operation: Operation, source_index: u32, token: *Token) err[io_error.Kind] {
     if (runtime.destroyed || lifecycle.snapshot(?runtime.lifecycle).state != lifecycle.OPEN) {
         ret err[io_error.Kind].err{io_error.CLOSED};
     }
     var index: usize = free_pop(runtime);
     if (index == NO_SLOT) {
-        # a token index is 32 bits wide on every backend
-        if (runtime.slot_count > 0xffffffff) { ret err[io_error.Kind].err{io_error.RESOURCE_EXHAUSTED}; }
-        if (runtime.slot_count == runtime.slots.capacity &&
-            !table.grow(?runtime.slots)) { ret err[io_error.Kind].err{io_error.RESOURCE_EXHAUSTED}; }
-        if (!reserve_timers(runtime)) { ret err[io_error.Kind].err{io_error.RESOURCE_EXHAUSTED}; }
-        index = runtime.slot_count;
-        init_slot(runtime, index);
-        runtime.slot_count = runtime.slot_count + 1;
+        if (!grow_slots(runtime)) { ret err[io_error.Kind].err{io_error.RESOURCE_EXHAUSTED}; }
+        index = free_pop(runtime);
     }
     val slot:       *Slot = slot_at(runtime, index);
     var generation: u32   = slot.generation + 1;
@@ -838,7 +1085,7 @@ fun enqueue_cancellation(runtime: *Runtime, token: Token, slot: *Slot, failure: 
 }
 
 fun slot_for(runtime: *Runtime, token: Token) *Slot {
-    if (token.index::usize >= runtime.slot_count) { ret nil; }
+    if (token.index::usize >= runtime.slots.capacity) { ret nil; }
     val slot: *Slot = slot_at(runtime, token.index::usize);
     if (slot.generation != token.generation || slot.state != SLOT_ACTIVE) { ret nil; }
     ret slot;
@@ -955,14 +1202,8 @@ fun deadline_acquire(runtime: *Runtime, owner: *cancel.Scope, at: time.Instant) 
         if (shared.timer_index == NO_TIMER) { deadline_push(runtime, found); }
         ret found;
     }
-    var index: usize = runtime.deadline_free;
-    if (index != NO_RECORD) {
-        runtime.deadline_free = deadline_at(runtime, index).next;
-    }
-    or {
-        index                 = runtime.deadline_used;
-        runtime.deadline_used = runtime.deadline_used + 1;
-    }
+    # the record table holds at least one record per slot, so one is free
+    val index: usize = pool_take(runtime, ?runtime.deadline_pool, ?runtime.deadlines, deadline_link);
     @deadline_at(runtime, index) = DeadlineRecord{
         owner:       owner,
         at:          at,
@@ -985,9 +1226,8 @@ fun deadline_release(runtime: *Runtime, slot: *Slot) {
     if (record.refs > 0)                { ret; }
     if (record.timer_index != NO_TIMER) { timer_remove_at(runtime, record.timer_index); }
     deadline_index_remove(runtime, index);
-    record.owner          = nil;
-    record.next           = runtime.deadline_free;
-    runtime.deadline_free = index;
+    record.owner = nil;
+    pool_put(runtime, ?runtime.deadline_pool, ?runtime.deadlines, deadline_link, index);
     runtime.deadline_live = runtime.deadline_live - 1;
 }
 
@@ -1121,6 +1361,7 @@ fun release_claim_locked(runtime: *Runtime, token: Token) {
             panic.panic("std.io.runtime: released claim did not settle open lifecycle\n");
         }
     }
+    trim_locked(runtime);
 }
 
 fun attach_scope_locked(runtime: *Runtime, token: Token, scope: *cancel.Scope) cancel.Reason {
@@ -1199,7 +1440,7 @@ pub fun submit_scoped_owned(
 # the slot a completion for token may still settle: one not yet published,
 # whether active or already cancelling
 fun slot_unsettled(runtime: *Runtime, token: Token) *Slot {
-    if (token.index::usize >= runtime.slot_count) { ret nil; }
+    if (token.index::usize >= runtime.slots.capacity) { ret nil; }
     val slot: *Slot = slot_at(runtime, token.index::usize);
     if (slot.generation != token.generation)                        { ret nil; }
     if (slot.state != SLOT_ACTIVE && slot.state != SLOT_CANCELLING) { ret nil; }
@@ -1304,7 +1545,7 @@ pub fun complete_cancellation(runtime: *Runtime, token: Token) err[io_error.Erro
 pub fun complete_cancellation_transfer(runtime: *Runtime, token: Token, bytes: usize, items: usize, end_of_stream: bool) err[io_error.Error] {
     if (runtime == nil) { ret err[io_error.Error].err{invalid(io_error.OP_SUBMIT)}; }
     mutex.lock(?runtime.lock);
-    if (token.index::usize >= runtime.slot_count) {
+    if (token.index::usize >= runtime.slots.capacity) {
         mutex.unlock(?runtime.lock);
         ret err[io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_SUBMIT)};
     }
@@ -1487,6 +1728,7 @@ fun drain(runtime: *Runtime, output: *Completion, output_capacity: usize) usize 
         if (sel settled.ok && settled.ok && os.io_queue_wake(?runtime.queue) < 0) {
             panic.panic("std.io.runtime: terminal lifecycle wake failed\n");
         }
+        trim_locked(runtime);
         written = written + 1;
     }
     ret written;
@@ -1670,7 +1912,7 @@ fun dispatch_sources(runtime: *Runtime, event: NativeEvent) {
         ret;
     }
     var source: *Source = nil;
-    if (event.source != 0 && event.source::u32 < runtime.next_source_tag) {
+    if (event.source != 0 && event.source::usize < runtime.source_routes.capacity) {
         val index: usize = route_at(runtime, event.source).index::usize;
         if (index < runtime.source_slots) {
             val candidate: *Source = source_at(runtime, index);
@@ -1843,7 +2085,7 @@ pub fun begin_close(runtime: *Runtime, mode: lifecycle.Mode, cause: lifecycle.Ca
     val closed_error: io_error.Error = close_error(closing.snapshot.terminal_cause);
     if (closing.escalated) {
         var i: usize = 0;
-        for (i < runtime.slot_count) {
+        for (i < runtime.slots.capacity) {
             val slot: *Slot = slot_at(runtime, i);
             if (slot.state == SLOT_CANCELLING && slot.cancellation_pending && slot.lifecycle_cancellation) {
                 slot.terminal_error = closed_error;
@@ -1853,7 +2095,7 @@ pub fun begin_close(runtime: *Runtime, mode: lifecycle.Mode, cause: lifecycle.Ca
     }
     if (closing.started) {
         var i: usize = 0;
-        for (i < runtime.slot_count) {
+        for (i < runtime.slots.capacity) {
             val slot: *Slot = slot_at(runtime, i);
             if (slot.state == SLOT_ACTIVE) {
                 val token: Token = Token{index: i::u32, generation: slot.generation};
@@ -1933,12 +2175,12 @@ fun destroy_with_native_ownership(runtime: *Runtime) err[io_error.Error] {
     val slot_result:   err[allocator.Error] = table.destroy(?runtime.slots);
     val native_result: err[allocator.Error] = allocator.deallocate[NativeEvent](?runtime.allocator, native_events, NATIVE_BATCH);
     runtime.native_events = nil;
-    runtime.slot_count    = 0;
     runtime.source_slots  = 0;
-    runtime.free_head     = NO_SLOT;
-    runtime.free_tail     = NO_SLOT;
-    runtime.head          = NO_SLOT;
-    runtime.tail          = NO_SLOT;
+    pool_reset(?runtime.slot_pool);
+    pool_reset(?runtime.deadline_pool);
+    pool_reset(?runtime.route_pool);
+    runtime.head = NO_SLOT;
+    runtime.tail = NO_SLOT;
     if (queue_result < 0)                                                                                                                                                       { ret err[io_error.Error].err{os.error(queue_result, io_error.OP_CLOSE)}; }
     if (sel timer_result.err || sel index_result.err || sel record_result.err || sel source_result.err || sel route_result.err || sel native_result.err || sel slot_result.err) { ret err[io_error.Error].err{io_error.make(io_error.IO, io_error.OP_CLOSE)}; }
     ret err[io_error.Error].ok{};
@@ -2032,21 +2274,25 @@ test "runtime: ownership query covers every backing allocation" {
         $size_of(NativeEvent) * 2) ||
         aliases(?runtime, ?external[0], 8) ||
         !aliases(?runtime, (~(0::usize) - 1)::*u8, 3)) { ret 3; }
-    # every chunk a growth adds is owned as well
-    val token: res[Token, io_error.Error] = submit(?runtime, test_operation(READ, 1));
-    if (sel token.err)                                                { ret 5; }
-    if (!ok_err(fail(?runtime, token.ok, invalid(io_error.OP_READ)))) { ret 5; }
-    var output: Completion;
-    if (!ok_usize(poll(?runtime, ?output, 1))) { ret 5; }
+    # every chunk a growth adds is owned as well: eight live operations fill
+    # the chunks of 2, 2 and 4 slots, and the ninth grows a fourth
     var grown: usize = 0;
-    for (grown < 3) {
-        if (!table.grow(?runtime.slots)) { ret 6; }
+    for (grown < 9) {
+        val token: res[Token, io_error.Error] = submit(?runtime, test_operation(READ, grown));
+        if (sel token.err) { ret 5; }
         grown = grown + 1;
     }
+    if (runtime.slots.chunk_count != 4)                                   { ret 6; }
     if (!aliases(?runtime, runtime.slots.chunks[3]::*u8, $size_of(Slot))) { ret 7; }
-    if (!ok_bool(close(?runtime)) ||
-        !ok_err(destroy(?runtime)) ||
-        !aliases(?runtime, ?external[0], 1)) { ret 4; }
+    if (!ok_bool(close(?runtime)))                                        { ret 4; }
+    var output:  [16]Completion;
+    var settled: usize = 0;
+    for (settled < 9) {
+        val waited: res[usize, io_error.Error] = wait(?runtime, ?output[0], 16, 0);
+        if (sel waited.err) { ret 8; }
+        settled = settled + waited.ok;
+    }
+    if (!ok_err(destroy(?runtime)) || !aliases(?runtime, ?external[0], 1)) { ret 4; }
     ret 0;
 }
 
@@ -2095,7 +2341,7 @@ test "runtime: a refused growth is reported and disturbs nothing live" {
         if (second_slot.operation.context != second_op.context)       { ret 5; }
         if (first_slot.generation != first.ok.generation)             { ret 5; }
         if (second_slot.generation != second.ok.generation)           { ret 5; }
-        if (runtime.slot_count != 2)                                  { ret 5; }
+        if (capacity(?runtime) != 2)                                  { ret 5; }
         refused = refused + 1;
         offset  = offset + 1;
     }
@@ -4021,5 +4267,377 @@ test "runtime: a failure after a cancel is refused" {
     if (raced != 0)                                                                        { ret raced; }
     if (source.accepted)                                                                   { ret 10; }
     if (!output.has_error || output.error.kind != io_error.CANCELLED || output.bytes != 0) { ret 11; }
+    ret 0;
+}
+
+# a page allocator that counts the bytes it has handed out and not taken back
+rec Counting {
+    inner:       allocator.Allocator;
+    live:        usize;
+    allocations: usize;
+}
+
+# a poll's completion count, 0 for a refused poll
+fun polled_count(r: res[usize, io_error.Error]) usize {
+    if (sel r.ok) { ret r.ok; }
+    ret 0;
+}
+
+fun counting_allocate(context: ptr, size: usize, align: usize) opt[ptr] {
+    val counting: *Counting = context::*Counting;
+    val got:      opt[ptr]  = counting.inner.fn_allocate(counting.inner.ctx, size, align);
+    if (sel got.some) {
+        counting.live        = counting.live + size;
+        counting.allocations = counting.allocations + 1;
+    }
+    ret got;
+}
+
+fun counting_reallocate(context: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) opt[ptr] {
+    val counting: *Counting = context::*Counting;
+    val got:      opt[ptr]  = counting.inner.fn_reallocate(counting.inner.ctx, p, old_size, new_size, align);
+    if (sel got.some) {
+        counting.live        = counting.live - old_size + new_size;
+        counting.allocations = counting.allocations + 1;
+    }
+    ret got;
+}
+
+fun counting_deallocate(context: ptr, p: ptr, size: usize, align: usize) i64 {
+    val counting: *Counting = context::*Counting;
+    val code:     i64       = counting.inner.fn_deallocate(counting.inner.ctx, p, size, align);
+    if (code == 0) { counting.live = counting.live - size; }
+    ret code;
+}
+
+fun counting_make(counting: *Counting, a: *allocator.Allocator) {
+    page.make(?counting.inner);
+    counting.live        = 0;
+    counting.allocations = 0;
+    a.ctx                = counting::ptr;
+    a.fn_allocate        = counting_allocate;
+    a.fn_reallocate      = counting_reallocate;
+    a.fn_deallocate      = counting_deallocate;
+}
+
+val PEAK_OPERATIONS: usize = 3000;
+val PEAK_SOURCES:    usize = 300;
+
+# the scopes and handles one peak holds, on the mapper since they outgrow a stack
+rec Peak {
+    scopes:  [1000]cancel.Scope;
+    tokens:  [3000]Token;
+    sources: [300]SourceToken;
+}
+
+# drive a runtime to a peak of operations, timers, scoped deadlines and
+# sources, then settle every one. first_growth is the bytes the first growth
+# of the slot table added, peak the bytes held at the peak
+fun run_peak(runtime: *Runtime, counting: *Counting, peak: *Peak, host: *TestSource, first_growth: *usize, held: *usize) i32 {
+    val clock: time.InstantClock = time.instant();
+    if (sel clock.err) { ret 1; }
+    val start:   usize = counting.live;
+    val initial: usize = capacity(runtime);
+    var i:       usize = 0;
+    for (i < PEAK_OPERATIONS) {
+        var submitted: res[Token, io_error.Error];
+        if (i % 3 == 0) { submitted = submit(runtime, test_operation(READ, i)); }
+        or (i % 3 == 1) { submitted = submit_timer(runtime, time.instant_add(clock.ok, 3600000000000), i); }
+        or {
+            val scope: *cancel.Scope = ?peak.scopes[i / 3];
+            val at:    time.Instant  = time.instant_add(clock.ok, (3600 + i)::i64 * 1000000000);
+            if (!succeeded(cancel.make_root(scope, opt[time.Instant].some{at}))) { ret 2; }
+            submitted = submit_scoped(runtime, scope, test_operation(READ, i));
+        }
+        if (sel submitted.err) { ret 3; }
+        peak.tokens[i] = submitted.ok;
+        if (@first_growth == 0 && capacity(runtime) != initial) { @first_growth = counting.live - start; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < PEAK_SOURCES) {
+        val registered: res[SourceToken, io_error.Error] = register_source(runtime, host::ptr, test_source_dispatch, test_source_cancel, test_source_release);
+        if (sel registered.err) { ret 4; }
+        peak.sources[i] = registered.ok;
+        i               = i + 1;
+    }
+    @held = counting.live;
+    i     = 0;
+    for (i < PEAK_OPERATIONS) {
+        if (i % 3 == 1) {
+            if (!ok_err(cancel_timer(runtime, peak.tokens[i]))) { ret 5; }
+        }
+        or {
+            if (!ok_err(complete(runtime, peak.tokens[i], i, 0, false))) { ret 5; }
+        }
+        i = i + 1;
+    }
+    var output:  [64]Completion;
+    var drained: usize = 0;
+    for (drained < PEAK_OPERATIONS) {
+        val polled: res[usize, io_error.Error] = poll(runtime, ?output[0], 64);
+        if (polled_count(polled) == 0) { ret 6; }
+        drained = drained + polled_count(polled);
+    }
+    i = 0;
+    for (i < PEAK_SOURCES) {
+        if (!ok_err(unregister_source(runtime, peak.sources[i]))) { ret 7; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < PEAK_OPERATIONS / 3) {
+        if (!succeeded(cancel.destroy(?peak.scopes[i]))) { ret 8; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# #868: the slot, timer, deadline and source tables give a peak's capacity back
+test "runtime: a drained peak returns the tables to within one growth step of idle" {
+    val peak: *Peak = os.allocate($size_of(Peak))::*Peak;
+    if (peak == nil) { ret 1; }
+    fin { os.deallocate(peak::ptr, $size_of(Peak)); }
+    var counting: Counting;
+    var a:        allocator.Allocator;
+    counting_make(?counting, ?a);
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, ?a, 4))) { ret 2; }
+    var host: TestSource = TestSource{released: 0, cancellation_pending: false, cancelled: Token{index: 0, generation: 0}};
+    val idle: usize      = counting.live;
+    # two peaks, so a runtime that shrank grows and shrinks again
+    var round: usize = 0;
+    for (round < 2) {
+        var first_growth: usize = 0;
+        var held:         usize = 0;
+        val ran:          i32   = run_peak(?runtime, ?counting, peak, ?host, ?first_growth, ?held);
+        if (ran != 0)                         { ret 10 + ran; }
+        if (first_growth == 0)                { ret 20; }
+        if (held < idle + 100 * first_growth) { ret 21; }
+        if (runtime.live != 0 || runtime.timer_count != 0 ||
+            runtime.deadline_live != 0 || runtime.source_count != 0) { ret 22; }
+        if (counting.live > idle + first_growth) { ret 23; }
+        if (capacity(?runtime) > 8)              { ret 24; }
+        round = round + 1;
+    }
+    if (!ok_bool(close(?runtime)) || !ok_err(destroy(?runtime))) { ret 3; }
+    if (counting.live != 0)                                      { ret 4; }
+    ret 0;
+}
+
+# #868: shrinking releases only empty chunks, so nothing live moves or goes
+# stale, a handle pinned high holds its chunk, and a token from a released
+# chunk stays refused once the chunk is grown again
+test "runtime: live handles survive a shrink and stale ones stay refused" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, ?pa, 4))) { ret 1; }
+    var host:  TestSource        = TestSource{released: 0, cancellation_pending: false, cancelled: Token{index: 0, generation: 0}};
+    val clock: time.InstantClock = time.instant();
+    if (sel clock.err) { ret 1; }
+    var scope: cancel.Scope;
+    if (!succeeded(cancel.make_root(?scope, opt[time.Instant].some{time.instant_add(clock.ok, 3600000000000)}))) { ret 1; }
+
+    val held: res[Token, io_error.Error] = submit(?runtime, test_operation(READ, 7));
+    if (sel held.err) { ret 2; }
+    val source: res[SourceToken, io_error.Error] = register_source(?runtime, (?host)::ptr, test_source_dispatch, test_source_cancel, test_source_release);
+    if (sel source.err) { ret 2; }
+    val scoped: res[Token, io_error.Error] = submit_scoped_owned(?runtime, source.ok, ?scope, test_operation(READ, 8));
+    if (sel scoped.err) { ret 2; }
+    val held_slot:   *Slot   = slot_at(?runtime, held.ok.index::usize);
+    val scoped_slot: *Slot   = slot_at(?runtime, scoped.ok.index::usize);
+    val held_source: *Source = source_at(?runtime, source.ok.index::usize);
+
+    var ramp: [512]Token;
+    var i:    usize = 0;
+    for (i < 512) {
+        val submitted: res[Token, io_error.Error] = submit(?runtime, test_operation(WRITE, 100 + i));
+        if (sel submitted.err) { ret 3; }
+        ramp[i] = submitted.ok;
+        i       = i + 1;
+    }
+    var extra: [64]SourceToken;
+    i = 0;
+    for (i < 64) {
+        val registered: res[SourceToken, io_error.Error] = register_source(?runtime, (?host)::ptr, test_source_dispatch, test_source_cancel, test_source_release);
+        if (sel registered.err) { ret 3; }
+        extra[i] = registered.ok;
+        i        = i + 1;
+    }
+    val pinned:      Token = ramp[511];
+    val peak_slots:  usize = capacity(?runtime);
+    val peak_chunks: usize = runtime.sources.chunk_count;
+
+    # everything but the pinned operation and the held handles settles
+    i = 0;
+    for (i < 511) {
+        if (!ok_err(complete(?runtime, ramp[i], 0, 0, false))) { ret 4; }
+        i = i + 1;
+    }
+    var output: [64]Completion;
+    var total:  usize = 0;
+    for (total < 511) {
+        val polled: res[usize, io_error.Error] = poll(?runtime, ?output[0], 64);
+        if (polled_count(polled) == 0) { ret 5; }
+        total = total + polled_count(polled);
+    }
+    i = 0;
+    for (i < 64) {
+        if (!ok_err(unregister_source(?runtime, extra[i]))) { ret 5; }
+        i = i + 1;
+    }
+    # the pinned operation keeps the chunk holding it
+    if (capacity(?runtime) <= pinned.index::usize)        { ret 6; }
+    if (runtime.sources.chunk_count >= peak_chunks)       { ret 7; }
+    if (!ok_err(complete(?runtime, pinned, 0, 0, false))) { ret 8; }
+    val last: res[usize, io_error.Error] = poll(?runtime, ?output[0], 64);
+    if (polled_count(last) != 1)                                    { ret 8; }
+    if (capacity(?runtime) >= peak_slots || capacity(?runtime) > 8) { ret 9; }
+
+    # the held handles never moved and still work
+    if (slot_at(?runtime, held.ok.index::usize) != held_slot ||
+        slot_at(?runtime, scoped.ok.index::usize) != scoped_slot ||
+        source_at(?runtime, source.ok.index::usize) != held_source) { ret 10; }
+    if (source_for(?runtime, source.ok) != held_source)                                                            { ret 10; }
+    if (deadline_find(?runtime, ?scope, time.instant_add(clock.ok, 3600000000000)) != scoped_slot.deadline_record) { ret 10; }
+
+    # a released chunk's token is refused, and still refused once regrown
+    val stale:        Token       = ramp[300];
+    val stale_source: SourceToken = extra[63];
+    if (ok_err(complete(?runtime, stale, 0, 0, false))) { ret 11; }
+    i = 0;
+    for (i < 512) {
+        val submitted: res[Token, io_error.Error] = submit(?runtime, test_operation(WRITE, 1000 + i));
+        if (sel submitted.err) { ret 12; }
+        ramp[i] = submitted.ok;
+        i       = i + 1;
+    }
+    i = 0;
+    for (i < 64) {
+        val registered: res[SourceToken, io_error.Error] = register_source(?runtime, (?host)::ptr, test_source_dispatch, test_source_cancel, test_source_release);
+        if (sel registered.err) { ret 12; }
+        extra[i] = registered.ok;
+        i        = i + 1;
+    }
+    if (capacity(?runtime) <= stale.index::usize)       { ret 13; }
+    if (ok_err(complete(?runtime, stale, 0, 0, false))) { ret 14; }
+    val owned: res[Token, io_error.Error] = submit_owned(?runtime, stale_source, test_operation(READ, 9));
+    if (sel owned.ok) { ret 15; }
+
+    # the held operations settle with their own contexts
+    if (!ok_err(complete(?runtime, held.ok, 5, 0, false))) { ret 16; }
+    if (!transitioned(cancel.cancel(?scope)))              { ret 16; }
+    i = 0;
+    for (i < 512) {
+        if (!ok_err(complete(?runtime, ramp[i], 0, 0, false))) { ret 17; }
+        i = i + 1;
+    }
+    var seen_held:   bool  = false;
+    var seen_scoped: bool  = false;
+    var settled:     usize = 0;
+    for (settled < 514) {
+        val polled: res[usize, io_error.Error] = poll(?runtime, ?output[0], 64);
+        if (polled_count(polled) == 0) { ret 18; }
+        var k: usize = 0;
+        for (k < polled_count(polled)) {
+            if (token_equal(output[k].token, held.ok)) {
+                seen_held = output[k].context == 7 && output[k].bytes == 5 && !output[k].has_error;
+            }
+            if (token_equal(output[k].token, scoped.ok)) {
+                seen_scoped = output[k].context == 8 && output[k].has_error && output[k].error.kind == io_error.CANCELLED;
+            }
+            k = k + 1;
+        }
+        settled = settled + polled_count(polled);
+    }
+    if (!seen_held || !seen_scoped) { ret 19; }
+    i = 0;
+    for (i < 64) {
+        if (!ok_err(unregister_source(?runtime, extra[i]))) { ret 20; }
+        i = i + 1;
+    }
+    if (!ok_err(unregister_source(?runtime, source.ok)))         { ret 20; }
+    if (!succeeded(cancel.destroy(?scope)))                      { ret 21; }
+    if (!ok_bool(close(?runtime)) || !ok_err(destroy(?runtime))) { ret 22; }
+    ret 0;
+}
+
+# #868: one empty chunk of slack stays, so a load crossing a chunk boundary
+# back and forth allocates only the first time it crosses
+test "runtime: a load oscillating across a chunk boundary allocates once" {
+    var counting: Counting;
+    var a:        allocator.Allocator;
+    counting_make(?counting, ?a);
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, ?a, 4))) { ret 1; }
+    var base: [4]Token;
+    var i:    usize = 0;
+    for (i < 4) {
+        val submitted: res[Token, io_error.Error] = submit(?runtime, test_operation(READ, i));
+        if (sel submitted.err) { ret 2; }
+        base[i] = submitted.ok;
+        i       = i + 1;
+    }
+    if (capacity(?runtime) != 4) { ret 3; }
+    var after_first: usize = 0;
+    var round:       usize = 0;
+    var output:      Completion;
+    for (round < 100) {
+        val crossing: res[Token, io_error.Error] = submit(?runtime, test_operation(WRITE, round));
+        if (sel crossing.err)                                      { ret 4; }
+        if (!ok_err(complete(?runtime, crossing.ok, 0, 0, false))) { ret 5; }
+        val polled: res[usize, io_error.Error] = poll(?runtime, ?output, 1);
+        if (polled_count(polled) != 1) { ret 6; }
+        if (round == 0)                { after_first = counting.allocations; }
+        round = round + 1;
+    }
+    if (counting.allocations != after_first) { ret 7; }
+    if (capacity(?runtime) != 8)             { ret 8; }
+    # once the base drains too, the slack chunk goes
+    i = 0;
+    for (i < 4) {
+        if (!ok_err(complete(?runtime, base[i], 0, 0, false))) { ret 9; }
+        i = i + 1;
+    }
+    var drained: [4]Completion;
+    val polled:  res[usize, io_error.Error] = poll(?runtime, ?drained[0], 4);
+    if (polled_count(polled) != 4)                               { ret 10; }
+    if (capacity(?runtime) != 4)                                 { ret 11; }
+    if (!ok_bool(close(?runtime)) || !ok_err(destroy(?runtime))) { ret 12; }
+    if (counting.live != 0)                                      { ret 13; }
+    ret 0;
+}
+
+# #868: an id released while a collection runs may still be named by an event
+# that collection harvested, so its chunk waits for the collection to end
+test "runtime: source ids released during a collection give back their chunk when it ends" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, ?pa, 1))) { ret 1; }
+    var host:    TestSource = TestSource{released: 0, cancellation_pending: false, cancelled: Token{index: 0, generation: 0}};
+    val idle:    usize      = runtime.source_routes.chunk_count;
+    var sources: [64]SourceToken;
+    var i:       usize      = 0;
+    for (i < 64) {
+        val registered: res[SourceToken, io_error.Error] = register_source(?runtime, (?host)::ptr, test_source_dispatch, test_source_cancel, test_source_release);
+        if (sel registered.err) { ret 2; }
+        sources[i] = registered.ok;
+        i          = i + 1;
+    }
+    val peak: usize = runtime.source_routes.chunk_count;
+    if (peak <= idle + 1) { ret 3; }
+    collection_begin(?runtime);
+    i = 0;
+    for (i < 64) {
+        if (!ok_err(unregister_source(?runtime, sources[i]))) { ret 4; }
+        i = i + 1;
+    }
+    # the source table shrank, the ids wait for the collection
+    if (runtime.sources.chunk_count > 2)           { ret 5; }
+    if (runtime.source_routes.chunk_count != peak) { ret 6; }
+    collection_end(?runtime);
+    if (runtime.source_routes.chunk_count > idle + 1)            { ret 7; }
+    if (!ok_bool(close(?runtime)) || !ok_err(destroy(?runtime))) { ret 8; }
     ret 0;
 }

@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.1.0] - 2026-09-23
+
+### Added
+
+- `memory.table.shrink` returns a table's last chunk to its allocator and
+  never the first. Everything below the new capacity stays where it was, and
+  a refused release leaves the table as it was. `chunk_of`, `chunk_start`,
+  `chunk_capacity` and `DIRECTORY` expose the chunk geometry a caller needs
+  to know which elements a chunk holds. `Table`'s layout is unchanged (#868).
+
+### Changed
+
+- `io.runtime` gives back what a load peak grew (#868, hedge#235). The slot,
+  timer, deadline record, deadline index, source and source id tables used
+  to hold their peak capacity for the runtime's life. Now a slot chunk is
+  released once it and the chunk below it are both empty, so one empty chunk
+  stays as slack and a load crossing a chunk boundary back and forth does not
+  reallocate. The timer heap, deadline records and deadline index follow the
+  slot capacity down, and the source and source id tables follow the same
+  rule. Only empty chunks are released, so nothing live moves, and a token
+  or source token from a released chunk stays refused after the chunk is
+  grown again. Measured with a counting allocator (`io.runtime.make(r, a,
+  64)`, one scoped read per operation with its own deadline, completed and
+  polled): at 1k, 10k and 100k operations 7.0.2 still held 499,200,
+  8,486,400 and 68,124,160 bytes over idle after the drain, and this release
+  holds 0. Slot indices are now taken lowest chunk first, and source ids
+  lowest chunk first among the reusable ones, so which index or id a
+  submission or registration gets differs from 7.0.2. `capacity` can now
+  fall as well as rise.
+
 ## [7.0.2] - 2026-09-20
 
 ### Fixed
