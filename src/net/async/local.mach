@@ -1696,6 +1696,83 @@ test "async local: managed listener tokens are distinct from raw listeners" {
     ret 0;
 }
 
+# a stream and a listener taken the way a submission takes them, with the
+# handles a caller would hold
+fun test_take_pair(driver: *Driver, stream_handle: *Stream, listener_handle: *Listener) bool {
+    val stream: *StreamEntry = stream_claim(driver);
+    if (stream == nil) { ret false; }
+    stream.generation = stream.generation + 1;
+    stream_take(driver, stream, STREAM_PENDING);
+    @stream_handle = Stream{index: stream_index(driver, stream), generation: stream.generation, owner: driver.instance};
+    val listener: *ListenerEntry = listener_claim(driver);
+    if (listener == nil) { ret false; }
+    listener.generation = listener.generation + 1;
+    listener_take(driver, listener, LISTENER_BIND_PENDING);
+    @listener_handle = Listener{index: listener_index(driver, listener), generation: listener.generation, owner: driver.instance};
+    ret true;
+}
+
+fun test_free_pair(driver: *Driver, stream_handle: Stream, listener_handle: Listener) {
+    stream_free(driver, stream_for(driver, stream_handle));
+    listener_free(driver, listener_for(driver, listener_handle));
+}
+
+# #874: a trim releases only free entries, so a live stream or listener keeps
+# its address and its handle, one pinned high keeps its chunk, and a handle
+# from a released chunk stays refused once the chunk is grown again
+test "async local: live handles survive a shrink and stale handles stay refused" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    var runtime: io_runtime.Runtime;
+    var driver:  Driver;
+    if (!ok_err(io_runtime.make(?runtime, ?pa, 4)) || !ok_err(make(?driver, ?runtime))) { ret 1; }
+    mutex.lock(?driver.lock);
+    var streams:   [65]Stream;
+    var listeners: [65]Listener;
+    var j:         usize = 0;
+    for (j < 65) {
+        if (!test_take_pair(?driver, ?streams[j], ?listeners[j])) { ret 2; }
+        j = j + 1;
+    }
+    val low_stream:   *StreamEntry   = stream_for(?driver, streams[0]);
+    val low_listener: *ListenerEntry = listener_for(?driver, listeners[0]);
+    val chunks:       usize          = driver.streams.chunk_count;
+    # the last pair pins the top chunks
+    j = 1;
+    for (j < 64) {
+        test_free_pair(?driver, streams[j], listeners[j]);
+        j = j + 1;
+    }
+    trim_locked(?driver);
+    if (driver.streams.chunk_count != chunks || driver.listeners.chunk_count != chunks) { ret 3; }
+    test_free_pair(?driver, streams[64], listeners[64]);
+    trim_locked(?driver);
+    # chunk 0 holds the low pair and chunk 1 stays as slack
+    if (driver.streams.chunk_count != 2 || driver.listeners.chunk_count != 2)                                 { ret 4; }
+    if (stream_for(?driver, streams[0]) != low_stream || listener_for(?driver, listeners[0]) != low_listener) { ret 5; }
+    if (stream_for(?driver, streams[64]) != nil || listener_for(?driver, listeners[64]) != nil)               { ret 6; }
+    # regrown, the released indices come back under generations no old handle has
+    var fresh_stream:   Stream;
+    var fresh_listener: Listener;
+    j = 1;
+    for (j < 65) {
+        if (!test_take_pair(?driver, ?fresh_stream, ?fresh_listener)) { ret 7; }
+        j = j + 1;
+    }
+    if (streams[64].index::usize >= driver.streams.capacity || listeners[64].index::usize >= driver.listeners.capacity) { ret 8; }
+    if (stream_for(?driver, streams[64]) != nil || listener_for(?driver, listeners[64]) != nil)                         { ret 9; }
+    if (stream_for(?driver, streams[0]) != low_stream || listener_for(?driver, listeners[0]) != low_listener)           { ret 10; }
+    var i: usize = 0;
+    for (i < driver.streams.capacity) {
+        stream_free(?driver, stream_at(?driver, i));
+        listener_free(?driver, listener_at(?driver, i));
+        i = i + 1;
+    }
+    mutex.unlock(?driver.lock);
+    if (refused(destroy(?driver)) || !ok_bool(io_runtime.close(?runtime)) || !ok_err(io_runtime.destroy(?runtime))) { ret 11; }
+    ret 0;
+}
+
 $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
     fun test_endpoint() res[endpoint.Endpoint, io_error.Error] {
         val prefix: *u8   = "/tmp/mach-std-async-local-502-";
@@ -2236,6 +2313,122 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
             || io_runtime.snapshot(?runtime).state != lifecycle.CLOSED
             || !ok_err(io_runtime.destroy(?runtime))) {
             ret 15;
+        }
+        ret 0;
+    }
+
+    # bytes live at the allocator a runtime is made with, which its drivers share
+    rec Counting {
+        inner: allocator.Allocator;
+        live:  usize;
+    }
+
+    fun counting_allocate(context: ptr, size: usize, align: usize) opt[ptr] {
+        val counting: *Counting = context::*Counting;
+        val got:      opt[ptr]  = counting.inner.fn_allocate(counting.inner.ctx, size, align);
+        if (sel got.some) { counting.live = counting.live + size; }
+        ret got;
+    }
+
+    fun counting_reallocate(context: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) opt[ptr] {
+        val counting: *Counting = context::*Counting;
+        val got:      opt[ptr]  = counting.inner.fn_reallocate(counting.inner.ctx, p, old_size, new_size, align);
+        if (sel got.some) { counting.live = counting.live - old_size + new_size; }
+        ret got;
+    }
+
+    fun counting_deallocate(context: ptr, p: ptr, size: usize, align: usize) i64 {
+        val counting: *Counting = context::*Counting;
+        val code:     i64       = counting.inner.fn_deallocate(counting.inner.ctx, p, size, align);
+        if (code == 0) { counting.live = counting.live - size; }
+        ret code;
+    }
+
+    fun counting_make(counting: *Counting, a: *allocator.Allocator) {
+        page.make(?counting.inner);
+        counting.live = 0;
+        @a            = allocator.Allocator{
+            ctx:           counting::ptr,
+            fn_allocate:   counting_allocate,
+            fn_reallocate: counting_reallocate,
+            fn_deallocate: counting_deallocate,
+        };
+    }
+
+    # n accepts pending on one listener, all cancelled and drained: the bytes
+    # the runtime, the driver and its backend hold idle, at the peak and after
+    fun accept_peak(n: usize, idle: *usize, peak: *usize, after: *usize) i32 {
+        var counting: Counting;
+        var a:        allocator.Allocator;
+        counting_make(?counting, ?a);
+        val endpoint_result: res[endpoint.Endpoint, io_error.Error] = test_endpoint();
+        if (sel endpoint_result.err) { ret 1; }
+        val bound:   endpoint.Endpoint = endpoint_result.ok;
+        var runtime: io_runtime.Runtime;
+        var driver:  Driver;
+        var scope:   cancel.Scope;
+        if (!ok_err(io_runtime.make(?runtime, ?a, 8)) || !ok_err(make(?driver, ?runtime))) { ret 2; }
+        if (!scope_ok(cancel.make_root(?scope, opt[time.Instant].none{})))                 { ret 2; }
+        var options: types.BindOptions = local.default_bind_options();
+        options.stale = types.REMOVE_STALE_SOCKET;
+        if (failed[io_runtime.Token](submit_bind(?driver, ?scope, bound, options, 1))) { ret 3; }
+        var output: [256]io_runtime.Completion;
+        var waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 256, 1000);
+        if (!(sel waited.ok && waited.ok == 1)) { ret 3; }
+        val listener_result: res[Listener, io_error.Error] = bound_listener(?driver, output[0]);
+        if (sel listener_result.err) { ret 3; }
+        var listener: Listener = listener_result.ok;
+        if (failed[io_runtime.Token](submit_listen(?driver, ?scope, ?listener, 8, 2))) { ret 4; }
+        waited = wait(?driver, ?output[0], 256, 1000);
+        if (!(sel waited.ok && waited.ok == 1) || refused(listening(?driver, output[0]))) { ret 4; }
+        @idle = counting.live;
+        var child: cancel.Scope;
+        if (!scope_ok(cancel.make_child(?child, ?scope, opt[time.Instant].none{}))) { ret 5; }
+        var j: usize = 0;
+        for (j < n) {
+            if (failed[io_runtime.Token](submit_accept(?driver, ?child, ?listener, 100 + j))) { ret 6; }
+            j = j + 1;
+        }
+        @peak = counting.live;
+        if (!scope_changed(cancel.cancel(?child))) { ret 7; }
+        var settled:    usize = 0;
+        var idle_waits: usize = 0;
+        for (settled < n && idle_waits < 16) {
+            waited = wait(?driver, ?output[0], 256, 1000);
+            if (sel waited.err) { ret 8; }
+            if (waited.ok == 0) { idle_waits = idle_waits + 1; }
+            var i: usize = 0;
+            for (i < waited.ok) {
+                if (!output[i].has_error || output[i].error.kind != io_error.CANCELLED) { ret 9; }
+                i = i + 1;
+            }
+            settled = settled + waited.ok;
+        }
+        if (settled != n || !scope_ok(cancel.destroy(?child))) { ret 10; }
+        @after = counting.live;
+        if (failed[io_runtime.Token](submit_listener_close(?driver, ?scope, ?listener, 3))) { ret 11; }
+        waited = wait(?driver, ?output[0], 256, 1000);
+        if (!(sel waited.ok && waited.ok == 1) || output[0].has_error) { ret 11; }
+        if (!scope_ok(cancel.destroy(?scope)) || refused(destroy(?driver)) ||
+            !ok_bool(io_runtime.close(?runtime)) || !ok_err(io_runtime.destroy(?runtime))) { ret 12; }
+        if (counting.live != 0) { ret 13; }
+        ret 0;
+    }
+
+    # #874: after a peak drains, the runtime, the driver's slots and streams and
+    # the local backend's tables are all back at their idle size
+    test "async local: a drained accept peak returns the driver to idle at 1k, 10k and 100k" {
+        val sizes: [3]usize = [3]usize{1000, 10000, 100000};
+        var i:     usize    = 0;
+        for (i < 3) {
+            var idle:  usize = 0;
+            var peak:  usize = 0;
+            var after: usize = 0;
+            val ran:   i32   = accept_peak(sizes[i], ?idle, ?peak, ?after);
+            if (ran != 0)                    { ret 20 * (i::i32 + 1) + ran; }
+            if (peak < idle + 64 * sizes[i]) { ret 80 + i::i32; }
+            if (after != idle)               { ret 90 + i::i32; }
+            i = i + 1;
         }
         ret 0;
     }
