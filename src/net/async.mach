@@ -34,6 +34,7 @@ use std.types.size.usize;
 use std.system.capability;
 
 $if (capability.HAS_CLOCK && capability.HAS_SOCKETS) {
+    use std.allocator.fixed;
     use std.allocator.page;
     use std.io.lifecycle;
     use io_runtime: std.io.runtime;
@@ -2814,12 +2815,18 @@ fun counting_deallocate(context: ptr, p: ptr, size: usize, align: usize) i64 {
 
 fun counting_make(counting: *Counting, a: *allocator.Allocator) {
     page.make(?counting.inner);
+    counting_wrap(counting, a);
+}
+
+# the count over whatever counting.inner already is, reclaiming as it does
+fun counting_wrap(counting: *Counting, a: *allocator.Allocator) {
     counting.live = 0;
     @a            = allocator.Allocator{
         ctx:           counting::ptr,
         fn_allocate:   counting_allocate,
         fn_reallocate: counting_reallocate,
         fn_deallocate: counting_deallocate,
+        retains:       counting.inner.retains,
     };
 }
 
@@ -2890,6 +2897,79 @@ test "async network: a drained peak returns the driver to idle at 1k, 10k and 10
         if (after != idle)               { ret 90 + i::i32; }
         i = i + 1;
     }
+    ret 0;
+}
+
+# rounds peaks of n readiness waits on one stream, each cancelled and drained,
+# on one driver over a bump arena of the given bytes. used is what the arena
+# gave out by the first peak
+fun driver_fixed_peaks(bytes: usize, n: usize, rounds: usize, used: *usize) i32 {
+    val region: ptr = os.allocate(bytes);
+    if (region == nil) { ret 1; }
+    fin { os.deallocate(region, bytes); }
+    var state:    fixed.FixedState;
+    var counting: Counting;
+    var a:        allocator.Allocator;
+    val made:     err[allocator.Error] = fixed.make(?counting.inner, ?state, region::*u8, bytes);
+    if (sel made.err) { ret 1; }
+    counting_wrap(?counting, ?a);
+    if (allocator.reclaims(?a)) { ret 1; }
+    var runtime: io_runtime.Runtime;
+    var driver:  Driver;
+    var scope:   cancel.Scope;
+    if (!ok_err(io_runtime.make(?runtime, ?a, 8)))                     { ret 2; }
+    if (!ok_err(make(?driver, ?runtime)))                              { ret 2; }
+    if (!scope_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 2; }
+    val listener_result: res[tcp.Listener, io_error.Error] = listen(ip.endpoint(127, 0, 0, 1, 0), 16);
+    if (sel listener_result.err) { ret 3; }
+    var listener: tcp.Listener = listener_result.ok;
+    var server:   tcp.Stream;
+    var client:   tcp.Stream;
+    if (readable_pair(?driver, ?scope, ?listener, ?server, ?client) != 0) { ret 4; }
+    var output:    [256]io_runtime.Completion;
+    var remaining: usize = 0;
+    var round:     usize = 0;
+    for (round < rounds) {
+        var child: cancel.Scope;
+        if (!scope_ok(cancel.make_child(?child, ?scope, opt[time.Instant].none{}))) { ret 5; }
+        var j: usize = 0;
+        for (j < n) {
+            if (!ok_token(submit_readable(?driver, ?child, ?server, j))) { ret 6; }
+            j = j + 1;
+        }
+        if (!scope_changed(cancel.cancel(?child))) { ret 7; }
+        var settled:    usize = 0;
+        var idle_waits: usize = 0;
+        for (settled < n && idle_waits < 16) {
+            val waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 256, 1000);
+            if (sel waited.err) { ret 8; }
+            if (waited.ok == 0) { idle_waits = idle_waits + 1; }
+            settled = settled + waited.ok;
+        }
+        if (settled != n || !scope_ok(cancel.destroy(?child))) { ret 9; }
+        if (round == 0)                                        { remaining = fixed.remaining(?state); }
+        or (fixed.remaining(?state) != remaining)              { ret 10; }
+        round = round + 1;
+    }
+    @used = bytes - remaining;
+    if (refused(tcp.stream_close(?client)))                                                    { ret 11; }
+    if (!ok_token(submit_stream_close(?driver, ?scope, ?server, lifecycle.ABORTIVE, 1)))       { ret 11; }
+    if (!waited_one(wait(?driver, ?output[0], 1, 1000)) || output[0].kind != io_runtime.CLOSE) { ret 11; }
+    if (!readable_teardown(?runtime, ?driver, ?scope, ?listener))                              { ret 12; }
+    ret 0;
+}
+
+# #880: a bump arena never reuses what the driver gives back, so the runtime,
+# driver and backend tables keep their peak over one, and a peak of 10k that
+# drains and returns many times fits an arena sized for a single peak
+test "async network: a repeated peak over a fixed arena sized for one peak never grows it" {
+    var used:  usize = 0;
+    val probe: i32   = driver_fixed_peaks(64 << 20, 10000, 1, ?used);
+    if (probe != 0) { ret 20 + probe; }
+    var again: usize = 0;
+    val ran:   i32   = driver_fixed_peaks(used + used / 2, 10000, 16, ?again);
+    if (ran != 0)      { ret 40 + ran; }
+    if (again != used) { ret 60; }
     ret 0;
 }
 

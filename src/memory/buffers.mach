@@ -68,6 +68,7 @@ use std.types.size.usize;
 
 $if (capability.HOSTED) {
     use std.allocator.fixed;
+    use std.allocator.heap;
     use std.allocator.page;
 }
 
@@ -1495,10 +1496,11 @@ pub fun secret_source_view(s: *SecretSource, chunk: Chunk) *^u8 {
 # bytes an allocator.fixed arena needs to hold a pool's slot metadata and the
 # given number of plain chunks of every class, for embedded use
 #
-# a fixed arena never takes memory back, so the bound holds only while nothing
-# the pool gives back is taken again: every class keeps its chunks with a
-# high_water that covers them, and the slot table is not trimmed and grown
-# again, which a peak of reservations that drains and returns does
+# a fixed arena does not reclaim, so the slot table never gives back what a
+# peak grew and the metadata part of the bound holds however often a peak
+# returns. a chunk given back past its class high_water still goes to the
+# arena, which never reuses it, so the chunk part holds only while every class
+# keeps its chunks with a high_water that covers them
 # ---
 # config: the pool configuration
 # chunks: chunks per class, one entry per class
@@ -1652,10 +1654,16 @@ $if (capability.HOSTED) {
         ret c.inner.fn_deallocate(c.inner.ctx, p, size, align);
     }
 
-    # a counted bump arena over one page region, so a test's memory is bounded
+    # a counted bump arena over one page region, so a test's memory is bounded.
+    # a reclaiming arena puts a heap between the count and the bump arena, so
+    # what the pool gives back is reused
     rec Arena {
         page:    A.Allocator;
         state:   fixed.FixedState;
+        fixed:   A.Allocator;
+        source:  heap.Source;
+        heap:    heap.Heap;
+        heaped:  bool;
         count:   Counting;
         counted: A.Allocator;
         base:    ptr;
@@ -1674,11 +1682,24 @@ $if (capability.HOSTED) {
             fn_allocate:   counting_allocate,
             fn_reallocate: counting_reallocate,
             fn_deallocate: counting_deallocate,
+            retains:       arena.count.inner.retains,
         };
         ret true;
     }
 
+    fun arena_reclaiming_make(arena: *Arena, bytes: usize) bool {
+        if (!arena_make(arena, bytes)) { ret false; }
+        arena.fixed = arena.count.inner;
+        heap.allocator_source(?arena.source, ?arena.fixed);
+        if (failed(heap.init(?arena.heap, ?arena.source, 0))) { ret false; }
+        arena.heaped = true;
+        if (failed(heap.make(?arena.count.inner, ?arena.heap))) { ret false; }
+        arena.counted.retains = arena.count.inner.retains;
+        ret true;
+    }
+
     fun arena_free(arena: *Arena) {
+        if (arena.heaped) { heap.dnit(?arena.heap); }
         A.deallocate_raw(?arena.page, arena.base, arena.bytes, 16);
     }
 
@@ -2728,7 +2749,7 @@ $if (capability.HOSTED) {
     # back but the reservations still open, and once every account closed
     fun footprint_peak(n: usize, idle: *usize, peak: *usize, after: *usize, chunks: *usize) i64 {
         var arena: Arena;
-        if (!arena_make(?arena, n * 512 + (1 << 20))) { ret 1; }
+        if (!arena_reclaiming_make(?arena, n * 512 + (1 << 20))) { ret 1; }
         fin { arena_free(?arena); }
         var classes: [1]ClassConfig = [1]ClassConfig{
             ClassConfig{size: 64, align: 0, secret: false, high_water: 4},
@@ -2797,7 +2818,7 @@ $if (capability.HOSTED) {
     # chunk is refused once the table grows again
     test "buffers: held slots survive a shrink and stale refs stay refused after regrowth" {
         var arena: Arena;
-        if (!arena_make(?arena, 4 << 20)) { ret 1; }
+        if (!arena_reclaiming_make(?arena, 4 << 20)) { ret 1; }
         fin { arena_free(?arena); }
         var classes: [1]ClassConfig = [1]ClassConfig{
             ClassConfig{size: 64, align: 0, secret: false, high_water: 0},
@@ -2858,7 +2879,7 @@ $if (capability.HOSTED) {
     # the backing
     test "buffers: retained chunks move below a drained peak and are reused" {
         var arena: Arena;
-        if (!arena_make(?arena, 4 << 20)) { ret 1; }
+        if (!arena_reclaiming_make(?arena, 4 << 20)) { ret 1; }
         fin { arena_free(?arena); }
         var classes: [1]ClassConfig = [1]ClassConfig{
             ClassConfig{size: 64, align: 0, secret: false, high_water: 4},
@@ -2918,7 +2939,7 @@ $if (capability.HOSTED) {
     # the same holds for a reservation crossing it
     test "buffers: a load oscillating across a slot chunk boundary grows the table once" {
         var arena: Arena;
-        if (!arena_make(?arena, 4 << 20)) { ret 1; }
+        if (!arena_reclaiming_make(?arena, 4 << 20)) { ret 1; }
         fin { arena_free(?arena); }
         var classes: [1]ClassConfig = [1]ClassConfig{
             ClassConfig{size: 64, align: 0, secret: false, high_water: 0},
@@ -2966,6 +2987,65 @@ $if (capability.HOSTED) {
             i = i + 1;
         }
         if (!is_none(close_account(?pool, ?account)) || pool.slots.chunk_count != 1) { ret 14; }
+        ret 0;
+    }
+
+    # n accounts each open with a reservation of one chunk and then close,
+    # rounds times over one pool on a bump arena of the given bytes. the
+    # reservations keep their slots backed, so each peak grows the slot table,
+    # and nothing else the pool allocates is given back. a held chunk is left
+    # out: past its class high_water it goes back to the arena, which never
+    # reuses it, and under it the retained chunk pins its slot. used is what the
+    # arena gave out by the first peak
+    fun fixed_peaks(bytes: usize, n: usize, rounds: usize, used: *usize) i64 {
+        var arena: Arena;
+        if (!arena_make(?arena, bytes)) { ret 1; }
+        fin { arena_free(?arena); }
+        if (A.reclaims(?arena.counted)) { ret 1; }
+        var classes: [1]ClassConfig = [1]ClassConfig{
+            ClassConfig{size: 64, align: 0, secret: false, high_water: 0},
+        };
+        var pool: Pool;
+        if (!make(?pool, test_config(?classes[0], 1, 1 << 30), ?arena.counted)) { ret 2; }
+        fin { destroy(?pool); }
+        var pa: A.Allocator;
+        page.make(?pa);
+        val accounts: res[*Account, A.Error] = A.allocate[Account](?pa, n);
+        if (sel accounts.err) { ret 3; }
+        fin { A.deallocate[Account](?pa, accounts.ok, n); }
+        var remaining: usize = 0;
+        var round:     usize = 0;
+        for (round < rounds) {
+            var i: usize = 0;
+            for (i < n) {
+                if (!is_none(open_account(?pool, ?accounts.ok[i], i::u64, budgets_of(64), 64))) { ret 4; }
+                i = i + 1;
+            }
+            if (pool.slots.capacity < n) { ret 5; }
+            i = 0;
+            for (i < n) {
+                if (!is_none(close_account(?pool, ?accounts.ok[i]))) { ret 6; }
+                i = i + 1;
+            }
+            if (round == 0)                                 { remaining = fixed.remaining(?arena.state); }
+            or (fixed.remaining(?arena.state) != remaining) { ret 8; }
+            round = round + 1;
+        }
+        @used = bytes - remaining;
+        ret 0;
+    }
+
+    # #880: a bump arena never reuses what the pool gives back, so the slot
+    # table keeps its peak over one, and a peak of 10k accounts that drains and
+    # returns many times fits an arena sized for a single peak
+    test "buffers: a repeated peak over a fixed arena sized for one peak never grows it" {
+        var used:  usize = 0;
+        val probe: i64   = fixed_peaks(10000 * 512 + (1 << 20), 10000, 1, ?used);
+        if (probe != 0) { ret 10 + probe::i32; }
+        var again: usize = 0;
+        val ran:   i64   = fixed_peaks(used + used / 2, 10000, 16, ?again);
+        if (ran != 0)      { ret 20 + ran::i32; }
+        if (again != used) { ret 30; }
         ret 0;
     }
 }
