@@ -30,7 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `Pool.tail` now hold only the indices given back, and `Pool` has a
   `frontier` field. A trim reads generations only below the frontier. A
   `buffers` ref naming a slot never taken is refused whatever its bytes
-  hold.
+  hold. Measured with hedge's scale lane (hedge `52184ad`, release build on
+  linux-x86_64, 1000 to 10000 held connections): 7.3.0 held 21,031 bytes
+  per TCP connection and 30,365 per TLS connection, and this change holds
+  13,166 and 22,501. 7.2.0 held 13,134 per TCP connection in hedge#235.
 
 ## [7.3.0] - 2026-09-23
 
