@@ -93,10 +93,13 @@ pub rec Listener {
     owner:      u64;
 }
 
+# pending: slots that name the stream, each an operation whose completion wait
+#          has not yet returned
 rec StreamEntry {
     state:            u8;
     generation:       u32;
     next_free:        usize;
+    pending:          usize;
     completion_token: io_runtime.Token;
     value:            types.Stream;
 }
@@ -105,6 +108,13 @@ pub rec Stream {
     index:      u32;
     generation: u32;
     owner:      u64;
+}
+
+# an accepted or connected stream taken out of its driver by detach, owning the
+# socket and nothing of any driver. adopt hands it to a driver, and one never
+# adopted is closed with std.net.local.stream_close
+pub rec Detached {
+    stream: types.Stream;
 }
 
 pub rec Driver {
@@ -340,7 +350,8 @@ fun stream_take(driver: *Driver, stream: *StreamEntry, state: u8) {
         panic.panic("std.net.async.local: a stream was taken that was not claimed\n");
     }
     table.pool_take(?driver.stream_pool, ?driver.streams);
-    stream.state = state;
+    stream.state   = state;
+    stream.pending = 0;
 }
 
 # every change into the free state goes through here
@@ -348,6 +359,13 @@ fun stream_free(driver: *Driver, stream: *StreamEntry) {
     if (stream.state == STREAM_FREE) { ret; }
     stream.state = STREAM_FREE;
     table.pool_put(?driver.stream_pool, ?driver.streams, stream_index(driver, stream)::usize);
+}
+
+# the operation in slot is one on stream, which stays in the driver until the
+# operation's completion is released
+fun stream_hold(driver: *Driver, slot: *Slot, stream: *StreamEntry) {
+    slot.stream_index = stream_index(driver, stream);
+    stream.pending    = stream.pending + 1;
 }
 
 fun stream_resource(stream: *StreamEntry) usize {
@@ -1042,8 +1060,7 @@ pub fun submit_accept(
         stream.value.handle      = io_handle.INVALID_VALUE;
         stream.value.server_side = true;
         stream.completion_token  = token;
-        val slot: *Slot = slot_for(driver, token);
-        slot.stream_index = stream_index(driver, stream);
+        stream_hold(driver, slot_for(driver, token), stream);
         var native: async_types.Token;
         val code:   i64 = impl.submit_accept(?driver.backend, entry.value.handle, token_context(token), ?native);
         publish_submission(driver, token, native, code);
@@ -1089,7 +1106,7 @@ pub fun submit_connect(
         stream.value.handle      = resource;
         stream.value.server_side = false;
         stream.completion_token  = token;
-        slot.stream_index        = stream_index(driver, stream);
+        stream_hold(driver, slot, stream);
         var native: async_types.Token;
         val code:   i64 = impl.submit_connect(?driver.backend, resource, remote, token_context(token), ?native);
         publish_submission(driver, token, native, code);
@@ -1127,6 +1144,7 @@ fun submit_buffer(
         ret res[io_runtime.Token, io_error.Error].err{claimed.err};
     }
     if (claimed.ok) {
+        stream_hold(driver, slot_for(driver, token), entry);
         var native: async_types.Token;
         var code:   i64;
         if (kind == io_runtime.READ) {
@@ -1192,6 +1210,7 @@ fun submit_stream_control(
         ret res[io_runtime.Token, io_error.Error].err{claimed.err};
     }
     if (claimed.ok) {
+        stream_hold(driver, slot_for(driver, token), entry);
         var native: async_types.Token;
         var code:   i64;
         if (kind == io_runtime.SHUTDOWN) {
@@ -1202,8 +1221,6 @@ fun submit_stream_control(
         }
         publish_submission(driver, token, native, code);
         if (kind == io_runtime.CLOSE && code >= 0) {
-            val slot: *Slot = slot_for(driver, token);
-            slot.stream_index = stream_index(driver, entry);
             entry.state       = STREAM_CLOSING;
             stream.generation = 0;
         }
@@ -1275,6 +1292,11 @@ fun cleanup_locked(driver: *Driver, completion: *io_runtime.Completion) {
     if (slot.native_active) {
         panic.panic("std.net.async.local: completion released before native quiescence\n");
     }
+    var held: *StreamEntry = nil;
+    if (slot.stream_index != NONE) {
+        held         = stream_at(driver, slot.stream_index::usize);
+        held.pending = held.pending - 1;
+    }
     if ((slot.kind == io_runtime.ACCEPT || slot.kind == io_runtime.CONNECT) && slot.stream_index != NONE) {
         val stream: *StreamEntry = stream_at(driver, slot.stream_index::usize);
         if (completion.has_error) {
@@ -1325,10 +1347,10 @@ fun cleanup_locked(driver: *Driver, completion: *io_runtime.Completion) {
         listener.value.handle = io_handle.INVALID_VALUE;
         listener_free(driver, listener);
     }
-    if (slot.kind == io_runtime.CLOSE && slot.stream_index != NONE) {
-        val stream: *StreamEntry = stream_at(driver, slot.stream_index::usize);
-        stream.value.handle = io_handle.INVALID_VALUE;
-        stream_free(driver, stream);
+    # a closed stream leaves once the last operation on it has
+    if (held != nil && held.state == STREAM_CLOSING && held.pending == 0) {
+        held.value.handle = io_handle.INVALID_VALUE;
+        stream_free(driver, held);
     }
     slot.state          = SLOT_FREE;
     slot.listener_index = NONE;
@@ -1443,6 +1465,80 @@ pub fun connected(driver: *Driver, completion: io_runtime.Completion) res[Stream
         ret res[Stream, io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_CONNECT)};
     }
     val value: Stream = Stream{index: stream_index(driver, stream), generation: stream.generation, owner: driver.instance};
+    mutex.unlock(?driver.lock);
+    ret res[Stream, io_error.Error].ok{value};
+}
+
+# take an open stream out of this driver, so another driver, on this thread or
+# another, can adopt it
+#
+# the stream must be idle: every operation submitted on it has had its
+# completion returned by wait. a stream with an operation in flight is refused
+# BUSY and nothing changes. on success the driver keeps nothing of the stream:
+# its entry is freed under the table's generation floor and stream's token is
+# zeroed, so this token and every copy of it are refused by this driver and by
+# any other
+# ---
+# driver: the driver the stream belongs to
+# stream: the stream's token
+# ret:    the detached stream, which owns the socket, or the refusal: CLOSED for
+#         a token this driver does not hold open, BUSY while an operation is in
+#         flight, or the platform's refusal to give the socket up
+pub fun detach(driver: *Driver, stream: *Stream) res[Detached, io_error.Error] {
+    if (driver == nil || stream == nil) {
+        ret res[Detached, io_error.Error].err{invalid(io_error.OP_CLOSE)};
+    }
+    mutex.lock(?driver.lock);
+    val entry: *StreamEntry = stream_for(driver, @stream);
+    if (entry == nil || entry.state != STREAM_OPEN) {
+        mutex.unlock(?driver.lock);
+        ret res[Detached, io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_CLOSE)};
+    }
+    if (entry.pending != 0) {
+        mutex.unlock(?driver.lock);
+        ret res[Detached, io_error.Error].err{io_error.make(io_error.BUSY, io_error.OP_CLOSE)};
+    }
+    val code: i64 = impl.detach(?driver.backend, entry.value.handle);
+    if (code < 0) {
+        mutex.unlock(?driver.lock);
+        ret res[Detached, io_error.Error].err{os.error(code, io_error.OP_CLOSE)};
+    }
+    val detached: Detached = Detached{stream: entry.value};
+    entry.value.handle = io_handle.INVALID_VALUE;
+    stream_free(driver, entry);
+    stream.generation = 0;
+    trim_locked(driver);
+    mutex.unlock(?driver.lock);
+    ret res[Detached, io_error.Error].ok{detached};
+}
+
+# register a detached stream with this driver
+#
+# the stream is open here as though this driver had accepted or connected it.
+# on success detached gives up the socket, so a second adopt of it is refused
+# ---
+# driver:   the driver that takes the stream
+# detached: the stream detach returned
+# ret:      the stream's token in this driver, or the refusal, which leaves
+#           detached owning the socket
+pub fun adopt(driver: *Driver, detached: *Detached) res[Stream, io_error.Error] {
+    if (driver == nil || detached == nil || detached.stream.handle == io_handle.INVALID_VALUE) {
+        ret res[Stream, io_error.Error].err{invalid(io_error.OP_OPEN)};
+    }
+    mutex.lock(?driver.lock);
+    val entry: *StreamEntry = stream_claim(driver);
+    if (entry == nil) {
+        mutex.unlock(?driver.lock);
+        ret res[Stream, io_error.Error].err{exhausted(io_error.OP_OPEN)};
+    }
+    var generation: u32 = entry.generation + 1;
+    if (generation == 0) { generation = 1; }
+    entry.generation = generation;
+    stream_take(driver, entry, STREAM_OPEN);
+    entry.value            = detached.stream;
+    entry.completion_token = io_runtime.Token{index: 0, generation: 0};
+    detached.stream.handle = io_handle.INVALID_VALUE;
+    val value: Stream = Stream{index: stream_index(driver, entry), generation: entry.generation, owner: driver.instance};
     mutex.unlock(?driver.lock);
     ret res[Stream, io_error.Error].ok{value};
 }

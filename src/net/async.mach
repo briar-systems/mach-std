@@ -768,6 +768,93 @@ pub fun submit_listener_close(driver: *Driver, scope: *cancel.Scope, listener: *
     ret submitted;
 }
 
+# an accepted or connected stream taken out of its driver by detach, owning the
+# socket and nothing of any driver. adopt hands it to a driver, and one never
+# adopted is closed with tcp.stream_close
+pub rec Detached {
+    stream: tcp.Stream;
+}
+
+# whether an operation on the socket under handle's opening has a completion
+# wait has not yet returned
+fun in_flight_locked(driver: *Driver, handle: io_handle.SocketHandle) bool {
+    var i: usize = 0;
+    for (i < driver.slots.capacity) {
+        val slot: *Slot = slot_at(driver, i);
+        if (slot.state == SLOT_ACTIVE && slot.resource == handle.value && slot.opening == handle.opening) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# take a stream this driver accepted or connected out of it, so another driver,
+# on this thread or another, can adopt it
+#
+# the stream must be idle: every operation submitted on it has had its
+# completion returned by wait. a stream with an operation in flight is refused
+# BUSY and nothing changes. on success the socket leaves this driver's native
+# queue and the detached stream carries a new opening. stream's handle is
+# invalidated, and this driver keeps the old opening retired, so a copy of the
+# old handle is refused CLOSED here until a newer socket reuses its value, and
+# by the adopting driver, which knows the socket under the new opening
+# ---
+# driver: the driver the stream belongs to
+# stream: the stream
+# ret:    the detached stream, which owns the socket, or the refusal: CLOSED
+#         for a handle already known to be stale, BUSY while an operation is in
+#         flight, or the platform's refusal to give the socket up
+pub fun detach(driver: *Driver, stream: *tcp.Stream) res[Detached, io_error.Error] {
+    if (driver == nil || stream == nil) {
+        ret res[Detached, io_error.Error].err{invalid(io_error.OP_CLOSE)};
+    }
+    if (!io_handle.socket_is_valid(stream.handle)) {
+        ret res[Detached, io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_CLOSE)};
+    }
+    val handle: io_handle.SocketHandle = stream.handle;
+    mutex.lock(?driver.lock);
+    if (in_flight_locked(driver, handle)) {
+        mutex.unlock(?driver.lock);
+        ret res[Detached, io_error.Error].err{io_error.make(io_error.BUSY, io_error.OP_CLOSE)};
+    }
+    val code: i64 = impl.detach(?driver.backend, handle.value, handle.opening);
+    mutex.unlock(?driver.lock);
+    if (code == types.STATUS_STALE) {
+        ret res[Detached, io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_CLOSE)};
+    }
+    if (code < 0) {
+        ret res[Detached, io_error.Error].err{os.error(code, io_error.OP_CLOSE)};
+    }
+    stream.handle = io_handle.invalid_socket();
+    ret res[Detached, io_error.Error].ok{Detached{stream: tcp.Stream{handle: io_handle.socket(handle.value)}}};
+}
+
+# register a detached stream with this driver
+#
+# the stream is this driver's as though it had accepted or connected it, and is
+# closed through it. on success detached gives up the socket, so a second
+# adopt of it is refused
+# ---
+# driver:   the driver that takes the stream
+# detached: the stream detach returned
+# ret:      the stream, or the refusal, which leaves detached owning the socket
+pub fun adopt(driver: *Driver, detached: *Detached) res[tcp.Stream, io_error.Error] {
+    if (driver == nil || detached == nil || !io_handle.socket_is_valid(detached.stream.handle)) {
+        ret res[tcp.Stream, io_error.Error].err{invalid(io_error.OP_OPEN)};
+    }
+    val handle: io_handle.SocketHandle = detached.stream.handle;
+    mutex.lock(?driver.lock);
+    val code: i64 = impl.adopt(?driver.backend, handle.value, handle.opening);
+    mutex.unlock(?driver.lock);
+    if (code == types.STATUS_STALE) {
+        ret res[tcp.Stream, io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_OPEN)};
+    }
+    if (code < 0) {
+        ret res[tcp.Stream, io_error.Error].err{os.error(code, io_error.OP_OPEN)};
+    }
+    detached.stream.handle = io_handle.invalid_socket();
+    ret res[tcp.Stream, io_error.Error].ok{tcp.Stream{handle: handle}};
+}
+
 fun cleanup_locked(driver: *Driver, completion: *io_runtime.Completion) {
     val slot: *Slot = slot_for(driver, completion.token);
     if (slot == nil) { ret; }
@@ -3020,5 +3107,167 @@ test "async network: driver slots survive a shrink and stale tokens stay refused
     cleanup_locked(?driver, ?released);
     mutex.unlock(?driver.lock);
     if (refused(destroy(?driver)) || !ok_bool(io_runtime.close(?runtime)) || !ok_err(io_runtime.destroy(?runtime))) { ret 8; }
+    ret 0;
+}
+
+# the completion with context from driver, waiting a bounded number of rounds.
+# any other completion fails the wait
+fun await_one(driver: *Driver, context: usize, out: *io_runtime.Completion) bool {
+    var attempt: usize = 0;
+    for (attempt < 8) {
+        val waited: res[usize, io_error.Error] = wait(driver, out, 1, 1000);
+        if (sel waited.err) { ret false; }
+        if (waited.ok == 1) { ret out.context == context; }
+        attempt = attempt + 1;
+    }
+    ret false;
+}
+
+# whether a read submitted through handle completes CLOSED, the way a handle
+# whose socket moved to another driver or was closed does
+fun read_refused(driver: *Driver, scope: *cancel.Scope, handle: tcp.Stream, context: usize) bool {
+    var copy: tcp.Stream = handle;
+    var byte: u8         = 0;
+    if (!ok_token(submit_read(driver, scope, ?copy, ?byte, 1, context))) { ret false; }
+    var done: io_runtime.Completion;
+    ret await_one(driver, context, ?done) && done.has_error && done.error.kind == io_error.CLOSED;
+}
+
+rec AdoptWorker {
+    detached: Detached;
+    stale:    tcp.Stream;
+    result:   i32;
+}
+
+# thread 2: a driver of its own adopts the stream, refuses the handle driver A
+# knew it by, reads what the peer sent, answers, and closes once the peer has
+fun adopt_and_serve(context: *AdoptWorker) i32 {
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    var runtime: io_runtime.Runtime;
+    if (!ok_err(io_runtime.make(?runtime, ?pa, 4))) { ret 1; }
+    var driver: Driver;
+    if (!ok_err(make(?driver, ?runtime))) { ret 2; }
+    var scope: cancel.Scope;
+    if (!scope_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 3; }
+    val adopted: res[tcp.Stream, io_error.Error] = adopt(?driver, ?context.detached);
+    if (sel adopted.err) { ret 4; }
+    var moved: tcp.Stream = adopted.ok;
+    # the detached value gave its socket up, so a second adopt is refused
+    val again: res[tcp.Stream, io_error.Error] = adopt(?driver, ?context.detached);
+    if (!sel again.err)                                        { ret 5; }
+    if (!read_refused(?driver, ?scope, context.stale, 0xc100)) { ret 6; }
+    var input: [4]u8;
+    var got:   usize = 0;
+    for (got < 4) {
+        if (!ok_token(submit_read(?driver, ?scope, ?moved, ?input[got], 4 - got, 0xc101))) { ret 7; }
+        var done: io_runtime.Completion;
+        if (!await_one(?driver, 0xc101, ?done) || done.has_error || done.bytes == 0) { ret 8; }
+        got = got + done.bytes;
+    }
+    if (input[0] != 'p' || input[1] != 'i' || input[2] != 'n' || input[3] != 'g') { ret 9; }
+    var reply: [4]u8 = [4]u8{'p', 'o', 'n', 'g'};
+    if (!ok_token(submit_write(?driver, ?scope, ?moved, ?reply[0], 4, 0xc102))) { ret 10; }
+    var sent: io_runtime.Completion;
+    if (!await_one(?driver, 0xc102, ?sent) || sent.has_error || sent.bytes != 4) { ret 11; }
+    var byte: u8 = 0;
+    if (!ok_token(submit_read(?driver, ?scope, ?moved, ?byte, 1, 0xc103))) { ret 12; }
+    var ended: io_runtime.Completion;
+    if (!await_one(?driver, 0xc103, ?ended) || (!ended.has_error && ended.bytes != 0))       { ret 13; }
+    if (!ok_token(submit_stream_close(?driver, ?scope, ?moved, lifecycle.ABORTIVE, 0xc104))) { ret 14; }
+    var closed: io_runtime.Completion;
+    if (!await_one(?driver, 0xc104, ?closed) || closed.has_error) { ret 15; }
+    if (!scope_ok(cancel.destroy(?scope))
+        || refused(destroy(?driver))
+        || !ok_bool(io_runtime.close(?runtime))
+        || !ok_err(io_runtime.destroy(?runtime))) {
+        ret 16;
+    }
+    ret 0;
+}
+
+fun adopt_worker(arg: *u8) {
+    val context: *AdoptWorker = arg::*AdoptWorker;
+    context.result = adopt_and_serve(context);
+}
+
+# #891: a stream accepted on driver A in one thread is detached, adopted by
+# driver B in another, and carries data both ways. a detach with an operation
+# in flight is refused and changes nothing, and the handle driver A knew is
+# refused by A and by B once the stream has moved
+test "async network: a detached stream is adopted and served by a driver on another thread" {
+    $if ($mach.build.os == $mach.os.windows) {
+        # wine has no FileReplaceCompletionInformation, so no socket can leave its port
+        if (windows_os.running_under_wine()) { ret 0; }
+    }
+    var runtime:  io_runtime.Runtime;
+    var driver:   Driver;
+    var scope:    cancel.Scope;
+    var listener: tcp.Listener;
+    if (readable_setup(?runtime, ?driver, ?scope, ?listener) != 0) { ret 1; }
+    var server: tcp.Stream;
+    var client: tcp.Stream;
+    if (readable_pair(?driver, ?scope, ?listener, ?server, ?client) != 0) { ret 2; }
+    val before: tcp.Stream = server;
+
+    # a cancelled wait whose completion the driver has not yet returned still
+    # holds the stream, though the platform may have let the socket go
+    var held: cancel.Scope;
+    if (!scope_ok(cancel.make_root(?held, opt[time.Instant].none{}))) { ret 3; }
+    if (!ok_token(submit_readable(?driver, ?held, ?server, 0xc000)))  { ret 4; }
+    if (!scope_changed(cancel.cancel(?held)))                         { ret 5; }
+    val queued: res[Detached, io_error.Error] = detach(?driver, ?server);
+    if (!(sel queued.err && queued.err.kind == io_error.BUSY)) { ret 6; }
+    if (server.handle.opening != before.handle.opening)        { ret 6; }
+    var cancelled: io_runtime.Completion;
+    if (!await_one(?driver, 0xc000, ?cancelled) || !cancelled.has_error || cancelled.error.kind != io_error.CANCELLED) { ret 7; }
+    if (!scope_ok(cancel.destroy(?held)))                                                                              { ret 8; }
+
+    # a pending readiness wait keeps the stream in driver A
+    if (!ok_token(submit_readable(?driver, ?scope, ?server, 0xc001))) { ret 9; }
+    val busy: res[Detached, io_error.Error] = detach(?driver, ?server);
+    if (!(sel busy.err && busy.err.kind == io_error.BUSY)) { ret 10; }
+    if (server.handle.opening != before.handle.opening)    { ret 10; }
+    var payload: [4]u8                      = [4]u8{'p', 'i', 'n', 'g'};
+    val written: res[usize, io_error.Error] = tcp.stream_write(?client, ?payload[0], 4);
+    if (!(sel written.ok && written.ok == 4)) { ret 11; }
+    var ready: io_runtime.Completion;
+    if (!await_one(?driver, 0xc001, ?ready) || ready.has_error) { ret 12; }
+
+    # idle now, so the stream leaves A, and the handle A knew is refused here
+    val detached: res[Detached, io_error.Error] = detach(?driver, ?server);
+    if (sel detached.err)                         { ret 13; }
+    if (io_handle.socket_is_valid(server.handle)) { ret 13; }
+    if (detached.ok.stream.handle.value != before.handle.value ||
+        detached.ok.stream.handle.opening <= before.handle.opening) { ret 14; }
+    if (!read_refused(?driver, ?scope, before, 0xc002)) { ret 15; }
+    var copy:  tcp.Stream                    = before;
+    val again: res[Detached, io_error.Error] = detach(?driver, ?copy);
+    if (!(sel again.err && again.err.kind == io_error.CLOSED)) { ret 16; }
+
+    var context: AdoptWorker      = AdoptWorker{detached: detached.ok, stale: before, result: -1};
+    var worker:  thread.Thread;
+    val spawned: thread.Operation = thread.spawn_with(adopt_worker, (?context)::*u8, ?worker);
+    if (sel spawned.err) { ret 17; }
+    var reply:    [4]u8;
+    var got:      usize = 0;
+    var answered: bool  = ok_err(tcp.stream_set_read_timeout(?client, 8000));
+    for (answered && got < 4) {
+        val read: res[usize, io_error.Error] = tcp.stream_read(?client, ?reply[got], 4 - got);
+        answered = false;
+        if (sel read.ok) {
+            if (read.ok != 0) {
+                got      = got + read.ok;
+                answered = true;
+            }
+        }
+    }
+    val closed: bool             = ok_err(tcp.stream_close(?client));
+    val joined: thread.Operation = thread.join(?worker);
+    if (sel joined.err)                                                                        { ret 18; }
+    if (context.result != 0)                                                                   { ret 20 + context.result; }
+    if (!answered || reply[0] != 'p' || reply[1] != 'o' || reply[2] != 'n' || reply[3] != 'g') { ret 40; }
+    if (!closed)                                                                               { ret 41; }
+    if (!readable_teardown(?runtime, ?driver, ?scope, ?listener))                              { ret 42; }
     ret 0;
 }
