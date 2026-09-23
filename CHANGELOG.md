@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `memory.table.trim_backed` and `pool_trim_backed` trim like `trim` and
+  `pool_trim` for a table that has promised capacity no element holds yet.
+  The promised count stays backed as though it filled the lowest indices,
+  with one empty chunk of slack above it (#878).
+
+### Changed
+
+- `memory.buffers` gives back the slot metadata a peak grew (#878,
+  hedge#235). `Pool.slots` used to keep capacity for the peak count of held
+  chunks, retained chunks and open reservations for the pool's life. It now
+  shrinks under the #868 rule: a chunk of the table is released once it and
+  the chunk below it hold no slot in use and no open reservation needs them.
+  Reservations given up by `close_account` count toward that. Retained
+  chunks left in the upper slots move down into free slots first, and their
+  payloads stay where they were. Only empty chunks are released, so a held
+  chunk's slot never moves, and a `Ref` from a released chunk stays refused
+  after the table grows again. Measured with a counting allocator under a
+  pool of 4 KiB and 17 KiB classes with a `high_water` of 4: after 1k, 10k
+  and 100k accounts that each reserved and held one chunk and then released
+  it and closed, 7.2.0 held 80,896, 1,063,936 and 8,403,968 bytes over idle,
+  and this release holds 17,536, which is the four retained chunks and one
+  empty 16-slot chunk of slack. With reservations alone, 7.2.0 held 64,512,
+  1,047,552 and 8,387,584 bytes over idle, and this release holds 0. A slot
+  grew by 8 bytes for the pool link. Slots are now taken lowest chunk first
+  instead of most recently freed first, so which index a chunk's `Ref`
+  carries can differ from 7.2.0. `Pool`'s `slot_top` and `empty_head`
+  fields are gone, and `slot_pool` and `retained_in` take their place. A
+  pool whose backing is an `allocator.fixed` arena never gets the released
+  chunks back, so `arena_bytes` holds for such a pool only while nothing is
+  trimmed and grown again.
+
 ## [7.2.0] - 2026-09-23
 
 ### Added
