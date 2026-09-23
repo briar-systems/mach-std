@@ -16,6 +16,7 @@ use std.types.result.res;
 use std.types.size.usize;
 
 $if (capability.HAS_CLOCK && capability.HAS_IO_QUEUE && capability.HAS_PAGES) {
+    use std.allocator.fixed;
     use std.allocator.page;
     use std.allocator.testing;
     use std.io.lifecycle;
@@ -4184,34 +4185,44 @@ fun counting_deallocate(context: ptr, p: ptr, size: usize, align: usize) i64 {
 
 fun counting_make(counting: *Counting, a: *allocator.Allocator) {
     page.make(?counting.inner);
+    counting_wrap(counting, a);
+}
+
+# the count over whatever counting.inner already is, reclaiming as it does
+fun counting_wrap(counting: *Counting, a: *allocator.Allocator) {
     counting.live        = 0;
     counting.allocations = 0;
     a.ctx                = counting::ptr;
     a.fn_allocate        = counting_allocate;
     a.fn_reallocate      = counting_reallocate;
     a.fn_deallocate      = counting_deallocate;
+    a.retains            = counting.inner.retains;
 }
 
 val PEAK_OPERATIONS: usize = 3000;
 val PEAK_SOURCES:    usize = 300;
 
-# the scopes and handles one peak holds, on the mapper since they outgrow a stack
+val FIXED_PEAK_OPERATIONS: usize = 10000;
+val FIXED_PEAK_SOURCES:    usize = 1000;
+
+# the scopes and handles one peak holds, on the mapper since they outgrow a
+# stack, sized for the largest peak a test drives
 rec Peak {
-    scopes:  [1000]cancel.Scope;
-    tokens:  [3000]Token;
-    sources: [300]SourceToken;
+    scopes:  [3334]cancel.Scope;
+    tokens:  [10000]Token;
+    sources: [1000]SourceToken;
 }
 
 # drive a runtime to a peak of operations, timers, scoped deadlines and
 # sources, then settle every one. first_growth is the bytes the first growth
 # of the slot table added, peak the bytes held at the peak
-fun run_peak(runtime: *Runtime, counting: *Counting, peak: *Peak, host: *TestSource, first_growth: *usize, held: *usize) i32 {
+fun run_peak(runtime: *Runtime, counting: *Counting, peak: *Peak, host: *TestSource, operations: usize, sources: usize, first_growth: *usize, held: *usize) i32 {
     val clock: time.InstantClock = time.instant();
     if (sel clock.err) { ret 1; }
     val start:   usize = counting.live;
     val initial: usize = capacity(runtime);
     var i:       usize = 0;
-    for (i < PEAK_OPERATIONS) {
+    for (i < operations) {
         var submitted: res[Token, io_error.Error];
         if (i % 3 == 0) { submitted = submit(runtime, test_operation(READ, i)); }
         or (i % 3 == 1) { submitted = submit_timer(runtime, time.instant_add(clock.ok, 3600000000000), i); }
@@ -4227,7 +4238,7 @@ fun run_peak(runtime: *Runtime, counting: *Counting, peak: *Peak, host: *TestSou
         i = i + 1;
     }
     i = 0;
-    for (i < PEAK_SOURCES) {
+    for (i < sources) {
         val registered: res[SourceToken, io_error.Error] = register_source(runtime, host::ptr, test_source_dispatch, test_source_cancel, test_source_release);
         if (sel registered.err) { ret 4; }
         peak.sources[i] = registered.ok;
@@ -4235,7 +4246,7 @@ fun run_peak(runtime: *Runtime, counting: *Counting, peak: *Peak, host: *TestSou
     }
     @held = counting.live;
     i     = 0;
-    for (i < PEAK_OPERATIONS) {
+    for (i < operations) {
         if (i % 3 == 1) {
             if (!ok_err(cancel_timer(runtime, peak.tokens[i]))) { ret 5; }
         }
@@ -4246,18 +4257,18 @@ fun run_peak(runtime: *Runtime, counting: *Counting, peak: *Peak, host: *TestSou
     }
     var output:  [64]Completion;
     var drained: usize = 0;
-    for (drained < PEAK_OPERATIONS) {
+    for (drained < operations) {
         val polled: res[usize, io_error.Error] = poll(runtime, ?output[0], 64);
         if (polled_count(polled) == 0) { ret 6; }
         drained = drained + polled_count(polled);
     }
     i = 0;
-    for (i < PEAK_SOURCES) {
+    for (i < sources) {
         if (!ok_err(unregister_source(runtime, peak.sources[i]))) { ret 7; }
         i = i + 1;
     }
     i = 0;
-    for (i < PEAK_OPERATIONS / 3) {
+    for (i < operations / 3) {
         if (!succeeded(cancel.destroy(?peak.scopes[i]))) { ret 8; }
         i = i + 1;
     }
@@ -4281,7 +4292,7 @@ test "runtime: a drained peak returns the tables to within one growth step of id
     for (round < 2) {
         var first_growth: usize = 0;
         var held:         usize = 0;
-        val ran:          i32   = run_peak(?runtime, ?counting, peak, ?host, ?first_growth, ?held);
+        val ran:          i32   = run_peak(?runtime, ?counting, peak, ?host, PEAK_OPERATIONS, PEAK_SOURCES, ?first_growth, ?held);
         if (ran != 0)                         { ret 10 + ran; }
         if (first_growth == 0)                { ret 20; }
         if (held < idle + 100 * first_growth) { ret 21; }
@@ -4293,6 +4304,57 @@ test "runtime: a drained peak returns the tables to within one growth step of id
     }
     if (!ok_bool(close(?runtime)) || !ok_err(destroy(?runtime))) { ret 3; }
     if (counting.live != 0)                                      { ret 4; }
+    ret 0;
+}
+
+# rounds peaks of 10k operations and 1k sources on one runtime over a bump
+# arena of the given bytes. used is what the arena gave out by the first peak
+fun fixed_peaks(bytes: usize, rounds: usize, used: *usize) i32 {
+    val peak: *Peak = os.allocate($size_of(Peak))::*Peak;
+    if (peak == nil) { ret 1; }
+    fin { os.deallocate(peak::ptr, $size_of(Peak)); }
+    val region: ptr = os.allocate(bytes);
+    if (region == nil) { ret 1; }
+    fin { os.deallocate(region, bytes); }
+    var state:    fixed.FixedState;
+    var counting: Counting;
+    var a:        allocator.Allocator;
+    val made:     err[allocator.Error] = fixed.make(?counting.inner, ?state, region::*u8, bytes);
+    if (sel made.err) { ret 2; }
+    counting_wrap(?counting, ?a);
+    if (allocator.reclaims(?a)) { ret 2; }
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, ?a, 4))) { ret 3; }
+    var host:      TestSource = TestSource{released: 0, cancellation_pending: false, cancelled: Token{index: 0, generation: 0}};
+    var remaining: usize      = 0;
+    var round:     usize      = 0;
+    for (round < rounds) {
+        var first_growth: usize = 0;
+        var held:         usize = 0;
+        val ran:          i32   = run_peak(?runtime, ?counting, peak, ?host, FIXED_PEAK_OPERATIONS, FIXED_PEAK_SOURCES, ?first_growth, ?held);
+        if (ran != 0) { ret 10 + ran; }
+        if (runtime.live != 0 || runtime.timer_count != 0 ||
+            runtime.deadline_live != 0 || runtime.source_count != 0) { ret 4; }
+        if (round == 0)                           { remaining = fixed.remaining(?state); }
+        or (fixed.remaining(?state) != remaining) { ret 5; }
+        round = round + 1;
+    }
+    @used = bytes - remaining;
+    if (!ok_bool(close(?runtime)) || !ok_err(destroy(?runtime))) { ret 6; }
+    ret 0;
+}
+
+# #880: a bump arena never reuses what the runtime gives back, so its tables
+# keep their peak over one, and a peak of 10k that drains and returns many
+# times fits an arena sized for a single peak
+test "runtime: a repeated peak over a fixed arena sized for one peak never grows it" {
+    var used:  usize = 0;
+    val probe: i32   = fixed_peaks(64 << 20, 1, ?used);
+    if (probe != 0) { ret 20 + probe; }
+    var again: usize = 0;
+    val ran:   i32   = fixed_peaks(used + used / 2, 16, ?again);
+    if (ran != 0)      { ret 40 + ran; }
+    if (again != used) { ret 60; }
     ret 0;
 }
 
