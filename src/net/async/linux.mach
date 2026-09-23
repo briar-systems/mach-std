@@ -77,7 +77,10 @@ rec Resource {
     write_closed: bool;
     opening:      u64;
     configured:   bool;
-    next_free:    usize;
+    # detached under opening: the socket belongs to another driver, so a
+    # handle still carrying opening is stale
+    retired:   bool;
+    next_free: usize;
 }
 
 pub rec Backend {
@@ -345,8 +348,9 @@ fun grow_resources(backend: *Backend) bool {
 
 fun resource_acquire(backend: *Backend, native: usize, opening: u64, created: *bool) *Resource {
     val existing: *Resource = resource_lookup(backend, native);
-    # openings only grow, so the older of two openings is the socket that was closed
-    if (existing != nil && opening < existing.opening) {
+    # openings only grow, so the older of two openings is the socket that was
+    # closed, and a retired resource's own opening is a handle its socket left
+    if (existing != nil && (opening < existing.opening || (existing.retired && opening == existing.opening))) {
         @created = false;
         ret nil;
     }
@@ -364,6 +368,7 @@ fun resource_acquire(backend: *Backend, native: usize, opening: u64, created: *b
     resource.resource     = native;
     resource.opening      = opening;
     resource.configured   = false;
+    resource.retired      = false;
     resource.watched      = false;
     resource.read_head    = NONE;
     resource.read_tail    = NONE;
@@ -748,20 +753,33 @@ fun drive_resource(backend: *Backend, resource: *Resource, events: u32) {
     arm_resource(backend, resource);
 }
 
+# only an internet socket reaches this backend
+fun locate(backend: *Backend, native: usize) i64 {
+    var address:        [128]u8;
+    var address_length: u32 = 128;
+    backend.locates = backend.locates + 1;
+    val located: i64 = linux.sock_local_addr(native, ?address[0], ?address_length);
+    if (located < 0)        { ret located; }
+    if (address_length < 2) { ret linux.EINVAL; }
+    val family: i32 = ip.sockaddr_family(?address[0]);
+    if (family != linux.AF_INET && family != linux.AF_INET6) { ret linux.ENOTSUP; }
+    ret 0;
+}
+
+# whether a handle under opening names a socket this backend knows was closed
+# and reused, or detached
+fun stale(backend: *Backend, native: usize, opening: u64) bool {
+    val known: *Resource = resource_lookup(backend, native);
+    ret known != nil && (opening < known.opening || (known.retired && opening == known.opening));
+}
+
 fun prepare(backend: *Backend, native: usize, opening: u64, kind: runtime.Kind, context: usize, lane: u8, token: *types.Token, resource_out: **Resource, operation_out: **Operation) i64 {
     if (backend == nil || token == nil || resource_out == nil || operation_out == nil) { ret invalid(); }
     if (resource_lookup(backend, native) == nil) {
-        var address:        [128]u8;
-        var address_length: u32 = 128;
-        backend.locates = backend.locates + 1;
-        val located: i64 = linux.sock_local_addr(native, ?address[0], ?address_length);
-        if (located < 0)        { ret located; }
-        if (address_length < 2) { ret linux.EINVAL; }
-        val family: i32 = ip.sockaddr_family(?address[0]);
-        if (family != linux.AF_INET && family != linux.AF_INET6) { ret linux.ENOTSUP; }
+        val located: i64 = locate(backend, native);
+        if (located < 0) { ret located; }
     }
-    val known: *Resource = resource_lookup(backend, native);
-    if (known != nil && opening < known.opening) { ret types.STATUS_STALE; }
+    if (stale(backend, native, opening)) { ret types.STATUS_STALE; }
     var created:  bool      = false;
     val resource: *Resource = resource_acquire(backend, native, opening, ?created);
     if (resource == nil || resource.closing) { ret linux.EBADF; }
@@ -1051,6 +1069,76 @@ pub fun submit_close(backend: *Backend, native: usize, opening: u64, context: us
         finish(backend, resource, read_operation, linux.ECANCELED, 0, 0, native, false);
     }
     submission_done(backend, resource);
+    ret 0;
+}
+
+# give up a socket with nothing queued on it, so another backend can take it.
+# its registration goes and the socket stays open. its resource is kept, retired
+# under opening, so a handle still carrying opening is refused as stale until a
+# newer opening reuses the value
+# ---
+# ret: 0, EBUSY while an operation or a close is queued on it, STATUS_STALE for
+#      a handle this backend already knows to be stale, ENOMEM when no resource
+#      can be kept, or the native refusal to deregister, which leaves the
+#      resource as it was
+pub fun detach(backend: *Backend, native: usize, opening: u64) i64 {
+    if (backend == nil) { ret invalid(); }
+    mutex.lock(?backend.lock);
+    if (stale(backend, native, opening)) {
+        mutex.unlock(?backend.lock);
+        ret types.STATUS_STALE;
+    }
+    var created:  bool      = false;
+    val resource: *Resource = resource_acquire(backend, native, opening, ?created);
+    if (resource == nil) {
+        trim_locked(backend);
+        mutex.unlock(?backend.lock);
+        ret linux.ENOMEM;
+    }
+    if (resource.read_head != NONE || resource.write_head != NONE ||
+        resource.close_index != NONE || resource.closing) {
+        mutex.unlock(?backend.lock);
+        ret linux.EBUSY;
+    }
+    if (resource.watched) {
+        val removed: i64 = linux.io_queue_unwatch(backend.queue, resource.resource);
+        if (removed < 0) {
+            mutex.unlock(?backend.lock);
+            ret removed;
+        }
+        backend.unwatches = backend.unwatches + 1;
+        set_watched(backend, resource, false);
+    }
+    resource.armed   = false;
+    resource.retired = true;
+    trim_locked(backend);
+    mutex.unlock(?backend.lock);
+    ret 0;
+}
+
+# take a socket another backend detached, under the opening its handle now
+# carries, so a handle with an older opening is refused as stale. the socket is
+# registered with its first operation
+# ---
+# ret: 0, STATUS_STALE when this backend knows the value under a newer opening,
+#      the refusal of a socket that is not an internet socket, or ENOMEM
+pub fun adopt(backend: *Backend, native: usize, opening: u64) i64 {
+    if (backend == nil) { ret invalid(); }
+    mutex.lock(?backend.lock);
+    val located: i64 = locate(backend, native);
+    if (located < 0) {
+        mutex.unlock(?backend.lock);
+        ret located;
+    }
+    if (stale(backend, native, opening)) {
+        mutex.unlock(?backend.lock);
+        ret types.STATUS_STALE;
+    }
+    var created:  bool      = false;
+    val resource: *Resource = resource_acquire(backend, native, opening, ?created);
+    trim_locked(backend);
+    mutex.unlock(?backend.lock);
+    if (resource == nil) { ret linux.ENOMEM; }
     ret 0;
 }
 
