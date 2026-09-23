@@ -10,6 +10,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 std now requires mach 5.12.0 (`mach = "^5.12"`) (#908). No source change is
 needed to build against it.
 
+Rebuild everything that links std, do not just recompile against the new
+sources. `buffers.SecretSource` grew by one word (`fn_bind`). Source that builds
+the record still compiles unchanged, but an object file built against 7.5.x
+that stores or passes one uses the old layout, still links, and reads a stray
+word as the bind callback. A hand-written source that leaves `fn_bind` nil
+refuses every typed view.
+
+### Added
+
+- `buffers.secret_typed[T]` views a held secret-class chunk as `count` records
+  of `T`, with no cast in the caller, so a pool-accounted secret chunk can hold
+  a record such as mach-crypto's `aes_gcm.Context` whose secret words sit in
+  nested arrays beside public state (#905). `buffers.secret_source_view_typed[T]`
+  reaches the same view through `SecretSource`, whose new `fn_bind` member
+  carries it, and `buffers.secret_bind` with `buffers.Shape` is the pool side a
+  wrapping source forwards to. A hold sees its chunk as bytes or as one type,
+  fixed by its first view until release, so no byte is aliased under two
+  secrecy shapes: `secret` refuses a typed hold and the typed view refuses a
+  byte-viewed one or another type. The view is `nil` for a plain chunk, a stale
+  ref, a zero count, a count whose bytes overflow or exceed the chunk, and a
+  `T` aligned beyond what the class declares or the storage actually has. Release wipes
+  the whole chunk as before, which covers every byte of the typed region.
+- `memory.secret.typed_aligned[T]` is public. It tells whether a typed pointer
+  sits on an alignment boundary without turning the address into an integer.
+
 ### Changed
 
 - The tests of modules the library does not reach run under
