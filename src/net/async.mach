@@ -119,9 +119,12 @@ pub rec Driver {
     source:  io_runtime.SourceToken;
     backend: impl.Backend;
     # where every table's chunks come from
-    allocator:         allocator.Allocator;
-    slots:             table.Table;
-    slot_count:        usize;
+    allocator: allocator.Allocator;
+    # indexed by runtime token index, and the runtime's generations tell
+    # every token apart, so a slot needs no generation floor of its own
+    slots: table.Table;
+    # active slots per chunk of the slot table
+    slot_live:         [table.DIRECTORY]usize;
     backend_destroyed: bool;
     lock:              mutex.Mutex;
 }
@@ -152,12 +155,22 @@ fun init_slot(driver: *Driver, index: usize) {
     slot.owns_resource = false;
 }
 
+# set up the slot table's newest chunk, every slot free
+fun adopt_slots(driver: *Driver) {
+    val chunk: usize = driver.slots.chunk_count - 1;
+    var index: usize = table.chunk_start(?driver.slots, chunk);
+    for (index < driver.slots.capacity) {
+        init_slot(driver, index);
+        index = index + 1;
+    }
+    driver.slot_live[chunk] = 0;
+}
+
 # the runtime owns the index space, so the driver grows to whatever it hands out
 fun ensure_slot(driver: *Driver, index: usize) *Slot {
-    if (!table.reserve(?driver.slots, index + 1)) { ret nil; }
-    for (driver.slot_count <= index) {
-        init_slot(driver, driver.slot_count);
-        driver.slot_count = driver.slot_count + 1;
+    for (driver.slots.capacity <= index) {
+        if (!table.grow(?driver.slots)) { ret nil; }
+        adopt_slots(driver);
     }
     ret slot_at(driver, index);
 }
@@ -197,7 +210,7 @@ fun context_token(context: usize, token: *io_runtime.Token) bool {
 }
 
 fun slot_for(driver: *Driver, token: io_runtime.Token) *Slot {
-    if (token.index::usize >= driver.slot_count) { ret nil; }
+    if (token.index::usize >= driver.slots.capacity) { ret nil; }
     val slot: *Slot = slot_at(driver, token.index::usize);
     if (slot.state != SLOT_ACTIVE || slot.generation != token.generation) { ret nil; }
     ret slot;
@@ -280,8 +293,8 @@ pub fun make(driver: *Driver, runtime: *io_runtime.Runtime) err[io_error.Error] 
     if (!table.make(?driver.slots, ?driver.allocator, $size_of(Slot), capacity)) {
         ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
     }
-    driver.runtime           = runtime;
-    driver.slot_count        = 0;
+    driver.runtime = runtime;
+    adopt_slots(driver);
     driver.backend_destroyed = false;
     driver.lock              = mutex.make();
     val registered: res[io_runtime.SourceToken, io_error.Error] = io_runtime.register_source(
@@ -340,13 +353,15 @@ fun claim_locked(
         io_runtime.fail(driver.runtime, @token, io_error.make(io_error.BUSY, io_error.OP_SUBMIT));
         ret res[bool, io_error.Error].ok{false};
     }
-    slot.state         = SLOT_ACTIVE;
-    slot.generation    = token.generation;
-    slot.native_active = false;
-    slot.owns_resource = false;
-    slot.kind          = kind;
-    slot.resource      = resource;
-    slot.opening       = opening;
+    val chunk: usize = table.chunk_of(?driver.slots, token.index::usize);
+    driver.slot_live[chunk] = driver.slot_live[chunk] + 1;
+    slot.state              = SLOT_ACTIVE;
+    slot.generation         = token.generation;
+    slot.native_active      = false;
+    slot.owns_resource      = false;
+    slot.kind               = kind;
+    slot.resource           = resource;
+    slot.opening            = opening;
     ret res[bool, io_error.Error].ok{true};
 }
 
@@ -763,6 +778,9 @@ fun cleanup_locked(driver: *Driver, completion: *io_runtime.Completion) {
     }
     slot.state         = SLOT_FREE;
     slot.owns_resource = false;
+    val chunk: usize = table.chunk_of(?driver.slots, completion.token.index::usize);
+    driver.slot_live[chunk] = driver.slot_live[chunk] - 1;
+    table.trim(?driver.slots, ?driver.slot_live[0], table.NO_INDEX, nil);
 }
 
 fun resolve_native_locked(driver: *Driver, native: types.NativeCompletion) {
@@ -858,7 +876,7 @@ pub fun destroy(driver: *Driver) err[io_error.Error] {
     }
     mutex.lock(?driver.lock);
     var i: usize = 0;
-    for (i < driver.slot_count) {
+    for (i < driver.slots.capacity) {
         if (slot_at(driver, i).state != SLOT_FREE) {
             mutex.unlock(?driver.lock);
             ret err[io_error.Error].err{io_error.make(io_error.BUSY, io_error.OP_CLOSE)};
@@ -886,8 +904,7 @@ pub fun destroy(driver: *Driver) err[io_error.Error] {
     }
     mutex.lock(?driver.lock);
     val released: err[allocator.Error] = table.destroy(?driver.slots);
-    driver.slot_count = 0;
-    driver.runtime    = nil;
+    driver.runtime = nil;
     mutex.unlock(?driver.lock);
     if (sel released.err) {
         if (sel released.err.release) {
