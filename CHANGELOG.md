@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `memory.table.pool_untouched`, `pool_oldest` and `pool_newest` (#886).
+  `pool_untouched` says whether the pool has never handed an index out
+  since its chunk was adopted, so a caller can initialise an element when
+  it is first taken. `pool_oldest` and `pool_newest` give a chunk's oldest
+  and newest free index, which `Pool.head` and `Pool.tail` no longer hold
+  alone.
+
+### Fixed
+
+- The slots an account reserves in `memory.buffers` cost address space
+  again, not resident memory (#886, hedge#235). Since 7.3.0 (#878) growing
+  the slot table wrote every slot of the new chunk and linked it into the
+  pool's free list, so an account made its whole reservation resident when
+  it opened. A slot is now written first when a chunk takes it, as in
+  7.2.0, and the #878 trim is unchanged. `memory.table.pool_adopt` writes
+  nothing into the adopted chunk: each chunk keeps a frontier, its lowest
+  index never handed out, which the pool hands out before any index given
+  back, so the order indices are handed out in is unchanged. `Pool.head`
+  and `Pool.tail` now hold only the indices given back, and `Pool` has a
+  `frontier` field. A trim reads generations only below the frontier. A
+  `buffers` ref naming a slot never taken is refused whatever its bytes
+  hold.
+
 ## [7.3.0] - 2026-09-23
 
 ### Added
