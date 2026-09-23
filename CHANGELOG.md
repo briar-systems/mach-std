@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `net.async.local.detach` and `adopt` move an accepted or connected stream
+  from one driver to another, which may run on another thread (#891,
+  hedge#173). A server that accepts on one unix listener can hand each
+  connection to another worker's driver. `detach` refuses the stream with
+  `BUSY`, and changes nothing, until wait has returned the completion of
+  every operation submitted on it. This is the idle rule mach-tls `destroy`
+  uses. It returns a `Detached`, which owns the socket and holds nothing of
+  any driver. A `Detached` that is never adopted is closed with
+  `net.local.stream_close`. The old entry is freed under the stream table's
+  generation floor, so the old token and every copy of it are refused by the
+  old driver, also after its chunk is given back and grown again. Any other
+  driver refuses it as well. `adopt` gives a fresh token owned by the
+  adopting driver, and a second `adopt` of the same `Detached` is refused.
+- `net.async.detach` and `adopt` do the same for TCP streams, with the same
+  idle rule. The detached stream carries a new opening. The old driver keeps
+  the old opening retired, so a copy of the old handle completes `CLOSED`
+  there until a newer socket reuses the native value. The adopting driver
+  records the new opening, so the old handle completes `CLOSED` there too.
+  A driver that never saw the socket cannot tell the old handle apart, as
+  for any TCP handle. The retired record costs the old driver one socket
+  record until the value is reused or the driver is destroyed.
+- `system.os.windows.io_queue_detach` takes a handle off its completion
+  port with `NtSetInformationFile` (`FileReplaceCompletionInformation`), so
+  another port can attach it. It needs Windows 8.1 or later. Wine does not
+  implement it, so on Wine `detach` fails once a stream has had a read, a
+  readiness wait or a write, which attach its socket to the port.
+
 ## [7.4.0] - 2026-09-23
 
 ### Added
