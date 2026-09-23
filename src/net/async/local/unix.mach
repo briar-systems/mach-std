@@ -60,6 +60,8 @@ pub rec Operation {
     resource_index: u32;
     lane:           u8;
     stage:          u8;
+    # the pool's free-list link while the operation is free
+    pool_next: usize;
 }
 
 rec Resource {
@@ -76,31 +78,31 @@ rec Resource {
     watched:      bool;
     closing:      bool;
     write_closed: bool;
-    next_free:    u32;
+    next_free:    usize;
 }
 
 pub rec Backend {
     queue:     *shared.IoQueue;
     source_id: u16;
     # where every table's chunks come from
-    allocator:       allocator.Allocator;
-    operations:      table.Table;
-    resources:       table.Table;
-    ready:           table.Table;
-    resource_map:    *u32;
-    native:          *native.IoCompletion;
-    operation_slots: usize;
-    resource_slots:  usize;
-    map_capacity:    usize;
-    live:            usize;
-    resource_count:  usize;
-    free_operation:  u32;
-    free_resource:   u32;
-    queued_head:     u32;
-    queued_tail:     u32;
-    queued_count:    usize;
-    ready_count:     usize;
-    sequence:        u64;
+    allocator:      allocator.Allocator;
+    operations:     table.Table;
+    resources:      table.Table;
+    ready:          table.Table;
+    resource_map:   *u32;
+    native:         *native.IoCompletion;
+    map_capacity:   usize;
+    live:           usize;
+    resource_count: usize;
+    # free operations and resources, lowest chunk first. each pool's floor is
+    # the generation an entry of a regrown chunk starts from
+    operation_pool: table.Pool;
+    resource_pool:  table.Pool;
+    queued_head:    u32;
+    queued_tail:    u32;
+    queued_count:   usize;
+    ready_count:    usize;
+    sequence:       u64;
     # native registration and address calls, counted for the scaling tests
     watches:   u64;
     rearms:    u64;
@@ -189,21 +191,21 @@ fun next_wire_generation(current: u32) u32 {
 }
 
 fun operation_for(backend: *Backend, token: types.Token) *Operation {
-    if (token.index::usize >= backend.operation_slots) { ret nil; }
+    if (token.index::usize >= backend.operations.capacity) { ret nil; }
     val operation: *Operation = operation_at(backend, token.index::usize);
     if (operation.state != SLOT_ACTIVE || operation.generation != token.generation) { ret nil; }
     ret operation;
 }
 
 fun operation_any(backend: *Backend, token: types.Token) *Operation {
-    if (token.index::usize >= backend.operation_slots) { ret nil; }
+    if (token.index::usize >= backend.operations.capacity) { ret nil; }
     val operation: *Operation = operation_at(backend, token.index::usize);
     if (operation.state == SLOT_FREE || operation.generation != token.generation) { ret nil; }
     ret operation;
 }
 
 fun resource_for(backend: *Backend, token: types.Token) *Resource {
-    if (token.index::usize >= backend.resource_slots) { ret nil; }
+    if (token.index::usize >= backend.resources.capacity) { ret nil; }
     val resource: *Resource = resource_at(backend, token.index::usize);
     if (resource.state != RESOURCE_ACTIVE || resource.generation != token.generation) { ret nil; }
     ret resource;
@@ -277,10 +279,13 @@ fun resource_map_remove(backend: *Backend, index: u32) {
     }
 }
 
-# the map holds indices, so a rehash may move it while every resource stays put
-fun rehash_resources(backend: *Backend) bool {
-    val required: usize = required_map_capacity(backend.resources.capacity);
-    if (required == 0 || required <= backend.map_capacity) { ret required != 0; }
+# the map holds indices, so a rehash may move it while every resource stays
+# put. it is sized for a resource capacity, up before growth and down after a
+# trim
+fun resize_map(backend: *Backend, capacity: usize) bool {
+    val required: usize = required_map_capacity(capacity);
+    if (required == 0)                    { ret false; }
+    if (required == backend.map_capacity) { ret true; }
     val got: res[*u32, allocator.Error] = allocator.allocate[u32](?backend.allocator, required);
     if (sel got.err) { ret false; }
     val fresh:             *u32  = got.ok;
@@ -294,7 +299,7 @@ fun rehash_resources(backend: *Backend) bool {
     backend.resource_map = fresh;
     backend.map_capacity = required;
     i                    = 0;
-    for (i < backend.resource_slots) {
+    for (i < backend.resources.capacity) {
         val entry: *Resource = resource_at(backend, i);
         if (entry.state == RESOURCE_ACTIVE && !resource_map_insert(backend, i::u32)) {
             backend.resource_map = previous;
@@ -308,22 +313,31 @@ fun rehash_resources(backend: *Backend) bool {
     ret true;
 }
 
-fun resource_append(backend: *Backend) bool {
-    if (backend.resource_slots > 0xffffffff) { ret false; }
-    if (backend.resource_slots == backend.resources.capacity) {
-        if (!table.grow(?backend.resources) || !rehash_resources(backend)) { ret false; }
+# the resource table's newest chunk joins the pool, every resource free
+fun adopt_resources(backend: *Backend) {
+    var index: usize = table.chunk_start(?backend.resources, backend.resources.chunk_count - 1);
+    for (index < backend.resources.capacity) {
+        val entry: *Resource = resource_at(backend, index);
+        entry.state        = RESOURCE_FREE;
+        entry.generation   = backend.resource_pool.floor;
+        entry.index        = index::u32;
+        entry.armed        = false;
+        entry.closing      = false;
+        entry.write_closed = false;
+        index              = index + 1;
     }
-    val index: usize     = backend.resource_slots;
-    val entry: *Resource = resource_at(backend, index);
-    entry.state            = RESOURCE_FREE;
-    entry.generation       = 0;
-    entry.index            = index::u32;
-    entry.armed            = false;
-    entry.closing          = false;
-    entry.write_closed     = false;
-    entry.next_free        = backend.free_resource;
-    backend.free_resource  = index::u32;
-    backend.resource_slots = index + 1;
+    table.pool_adopt(?backend.resource_pool, ?backend.resources);
+}
+
+# a resource index is 32 bits wide. the map is sized for the new chunk before
+# the table grows, so it always fits the table
+fun grow_resources(backend: *Backend) bool {
+    val chunk: usize = backend.resources.chunk_count;
+    if (chunk >= table.DIRECTORY) { ret false; }
+    val grown: usize = backend.resources.capacity + table.chunk_capacity(?backend.resources, chunk);
+    if (grown - 1 > 0xffffffff || !resize_map(backend, grown) ||
+        !table.grow(?backend.resources)) { ret false; }
+    adopt_resources(backend);
     ret true;
 }
 
@@ -333,11 +347,10 @@ fun resource_acquire(backend: *Backend, resource_value: usize, created: *bool) *
         @created = false;
         ret existing;
     }
-    if (backend.free_resource == NONE && !resource_append(backend)) { ret nil; }
-    val index:    u32       = backend.free_resource;
-    val resource: *Resource = resource_at(backend, index::usize);
-    backend.free_resource = resource.next_free;
-    val generation: u32 = next_wire_generation(resource.generation);
+    if (table.pool_peek(?backend.resource_pool, ?backend.resources) == table.NO_INDEX && !grow_resources(backend)) { ret nil; }
+    val index:      u32       = table.pool_take(?backend.resource_pool, ?backend.resources)::u32;
+    val resource:   *Resource = resource_at(backend, index::usize);
+    val generation: u32       = next_wire_generation(resource.generation);
     resource.state        = RESOURCE_ACTIVE;
     resource.generation   = generation;
     resource.resource     = resource_value;
@@ -351,9 +364,8 @@ fun resource_acquire(backend: *Backend, resource_value: usize, created: *bool) *
     resource.closing      = false;
     resource.write_closed = false;
     if (!resource_map_insert(backend, index)) {
-        resource.state        = RESOURCE_FREE;
-        resource.next_free    = backend.free_resource;
-        backend.free_resource = index;
+        resource.state = RESOURCE_FREE;
+        table.pool_put(?backend.resource_pool, ?backend.resources, index::usize);
         ret nil;
     }
     backend.resource_count = backend.resource_count + 1;
@@ -367,9 +379,8 @@ fun resource_release_unwatched(backend: *Backend, resource: *Resource) {
     resource_map_remove(backend, index);
     resource.state         = RESOURCE_FREE;
     resource.armed         = false;
-    resource.next_free     = backend.free_resource;
-    backend.free_resource  = index;
     backend.resource_count = backend.resource_count - 1;
+    table.pool_put(?backend.resource_pool, ?backend.resources, index::usize);
 }
 
 # every registration change goes through here, so destroy can prove it gave up
@@ -395,31 +406,39 @@ fun unwatch_owned(backend: *Backend, resource: *Resource) {
     resource.armed = false;
 }
 
-# the ready table is held at the operation table's size, so a finished
-# operation always has somewhere to publish
-fun operation_append(backend: *Backend) bool {
-    if (backend.operation_slots > 0xffffffff) { ret false; }
-    if (backend.operation_slots == backend.operations.capacity &&
+# the ready table is held at least at the operation table's size, reserved
+# before the operations grow, so a finished operation always has somewhere to
+# publish. an operation index is 32 bits wide
+fun grow_operations(backend: *Backend) bool {
+    val chunk: usize = backend.operations.chunk_count;
+    if (chunk >= table.DIRECTORY) { ret false; }
+    val grown: usize = backend.operations.capacity + table.chunk_capacity(?backend.operations, chunk);
+    if (grown - 1 > 0xffffffff || !table.reserve(?backend.ready, grown) ||
         !table.grow(?backend.operations)) { ret false; }
-    if (!table.reserve(?backend.ready, backend.operations.capacity)) { ret false; }
-    val index: usize      = backend.operation_slots;
-    val entry: *Operation = operation_at(backend, index);
-    entry.state             = SLOT_FREE;
-    entry.generation        = 0;
-    entry.index             = index::u32;
-    entry.previous          = NONE;
-    entry.next              = backend.free_operation;
-    backend.free_operation  = index::u32;
-    backend.operation_slots = index + 1;
+    adopt_operations(backend);
     ret true;
 }
 
+# the operation table's newest chunk joins the pool, every operation free
+fun adopt_operations(backend: *Backend) {
+    var index: usize = table.chunk_start(?backend.operations, backend.operations.chunk_count - 1);
+    for (index < backend.operations.capacity) {
+        val entry: *Operation = operation_at(backend, index);
+        entry.state      = SLOT_FREE;
+        entry.generation = backend.operation_pool.floor;
+        entry.index      = index::u32;
+        entry.previous   = NONE;
+        entry.next       = NONE;
+        index            = index + 1;
+    }
+    table.pool_adopt(?backend.operation_pool, ?backend.operations);
+}
+
 fun operation_claim(backend: *Backend, kind: runtime.Kind, resource_value: usize, context: usize, token: *types.Token) *Operation {
-    if (backend.free_operation == NONE && !operation_append(backend)) { ret nil; }
-    val index:     u32        = backend.free_operation;
-    val operation: *Operation = operation_at(backend, index::usize);
-    backend.free_operation = operation.next;
-    var generation: u32 = operation.generation + 1;
+    if (table.pool_peek(?backend.operation_pool, ?backend.operations) == table.NO_INDEX && !grow_operations(backend)) { ret nil; }
+    val index:      u32        = table.pool_take(?backend.operation_pool, ?backend.operations)::u32;
+    val operation:  *Operation = operation_at(backend, index::usize);
+    var generation: u32        = operation.generation + 1;
     if (generation == 0) { generation = 1; }
     operation.state      = SLOT_ACTIVE;
     operation.generation = generation;
@@ -439,11 +458,32 @@ fun operation_claim(backend: *Backend, kind: runtime.Kind, resource_value: usize
 
 fun operation_release(backend: *Backend, index: u32) {
     val operation: *Operation = operation_at(backend, index::usize);
-    operation.state        = SLOT_FREE;
-    operation.previous     = NONE;
-    operation.next         = backend.free_operation;
-    backend.free_operation = index;
-    backend.live           = backend.live - 1;
+    operation.state    = SLOT_FREE;
+    operation.previous = NONE;
+    operation.next     = NONE;
+    backend.live       = backend.live - 1;
+    table.pool_put(?backend.operation_pool, ?backend.operations, index::usize);
+}
+
+# give back what a peak grew. operations and resources release a chunk once it
+# and the chunk below it are free, the ready table follows the operations down
+# but never below what the last publish filled, and the resource map is
+# rehashed to the smaller table. only free entries are released, so no live
+# token, queued completion or registration context moves or goes stale
+fun trim_locked(backend: *Backend) {
+    table.pool_trim(?backend.operation_pool, ?backend.operations, $offset_of(Operation, generation));
+    var keep: usize = backend.operations.capacity;
+    if (keep < backend.ready_count) { keep = backend.ready_count; }
+    for (backend.ready.chunk_count > 1) {
+        val top: usize = backend.ready.chunk_count - 1;
+        if (backend.ready.capacity - table.chunk_capacity(?backend.ready, top) < keep) { brk; }
+        val released: err[allocator.Error] = table.shrink(?backend.ready);
+        if (sel released.err) { brk; }
+    }
+    # a refused rehash keeps the larger map, which still fits
+    if (table.pool_trim(?backend.resource_pool, ?backend.resources, $offset_of(Resource, generation)) != 0) {
+        resize_map(backend, backend.resources.capacity);
+    }
 }
 
 fun operation_index(backend: *Backend, operation: *Operation) u32 {
@@ -647,7 +687,7 @@ fun drive_resource(backend: *Backend, resource: *Resource, events: u32) {
     arm_resource(backend, resource);
 }
 
-fun begin(backend: *Backend, resource_value: usize, kind: runtime.Kind, context: usize, lane: u8, token: *types.Token, resource_out: **Resource, operation_out: **Operation) i64 {
+fun prepare(backend: *Backend, resource_value: usize, kind: runtime.Kind, context: usize, lane: u8, token: *types.Token, resource_out: **Resource, operation_out: **Operation) i64 {
     if (backend == nil || token == nil || resource_out == nil || operation_out == nil) { ret invalid(); }
     var created:  bool      = false;
     val resource: *Resource = resource_acquire(backend, resource_value, ?created);
@@ -670,8 +710,16 @@ fun begin(backend: *Backend, resource_value: usize, kind: runtime.Kind, context:
     ret 0;
 }
 
+# a refused submission may have dropped a stale resource, so it trims too
+fun begin(backend: *Backend, resource_value: usize, kind: runtime.Kind, context: usize, lane: u8, token: *types.Token, resource_out: **Resource, operation_out: **Operation) i64 {
+    val status: i64 = prepare(backend, resource_value, kind, context, lane, token, resource_out, operation_out);
+    if (status < 0) { trim_locked(backend); }
+    ret status;
+}
+
 fun submission_done(backend: *Backend, resource: *Resource) {
     drive_resource(backend, resource, native.IO_EVENT_READ | native.IO_EVENT_WRITE);
+    trim_locked(backend);
     mutex.unlock(?backend.lock);
     native.io_queue_wake(backend.queue);
 }
@@ -713,26 +761,26 @@ pub fun make(backend: *Backend, queue: *shared.IoQueue, a: *allocator.Allocator,
     }
     backend.native = batch.ok;
 
-    backend.queue           = queue;
-    backend.source_id       = source_id;
-    backend.map_capacity    = map_capacity;
-    backend.operation_slots = 0;
-    backend.resource_slots  = 0;
-    backend.live            = 0;
-    backend.resource_count  = 0;
-    backend.free_operation  = NONE;
-    backend.free_resource   = NONE;
-    backend.queued_head     = NONE;
-    backend.queued_tail     = NONE;
-    backend.queued_count    = 0;
-    backend.ready_count     = 0;
-    backend.sequence        = 1;
-    backend.watches         = 0;
-    backend.rearms          = 0;
-    backend.unwatches       = 0;
-    backend.registered      = 0;
-    backend.locates         = 0;
-    backend.lock            = mutex.make();
+    backend.queue          = queue;
+    backend.source_id      = source_id;
+    backend.map_capacity   = map_capacity;
+    backend.live           = 0;
+    backend.resource_count = 0;
+    table.pool_make(?backend.operation_pool, $offset_of(Operation, pool_next));
+    table.pool_make(?backend.resource_pool, $offset_of(Resource, next_free));
+    adopt_operations(backend);
+    adopt_resources(backend);
+    backend.queued_head  = NONE;
+    backend.queued_tail  = NONE;
+    backend.queued_count = 0;
+    backend.ready_count  = 0;
+    backend.sequence     = 1;
+    backend.watches      = 0;
+    backend.rearms       = 0;
+    backend.unwatches    = 0;
+    backend.registered   = 0;
+    backend.locates      = 0;
+    backend.lock         = mutex.make();
     var i: usize = 0;
     for (i < map_capacity) {
         backend.resource_map[i] = 0;
@@ -886,6 +934,7 @@ pub fun cancel(backend: *Backend, token: types.Token, finished: *opt[types.Nativ
         val removed: types.NativeCompletion = operation.completion;
         queued_unlink(backend, operation);
         operation_release(backend, token.index);
+        trim_locked(backend);
         mutex.unlock(?backend.lock);
         if (finished != nil)                                       { @finished = opt[types.NativeCompletion].some{removed}; }
         or (removed.kind == runtime.ACCEPT && removed.status == 0) { socket_close(removed.resource); }
@@ -901,6 +950,7 @@ pub fun cancel(backend: *Backend, token: types.Token, finished: *opt[types.Nativ
         unwatch_owned(backend, resource);
         socket_close(resource.resource);
         resource_release_unwatched(backend, resource);
+        trim_locked(backend);
         mutex.unlock(?backend.lock);
         native.io_queue_wake(backend.queue);
         ret 0;
@@ -908,6 +958,7 @@ pub fun cancel(backend: *Backend, token: types.Token, finished: *opt[types.Nativ
     unlink(backend, resource, operation);
     operation_release(backend, token.index);
     drive_resource(backend, resource, native.IO_EVENT_READ | native.IO_EVENT_WRITE);
+    trim_locked(backend);
     mutex.unlock(?backend.lock);
     native.io_queue_wake(backend.queue);
     ret 0;
@@ -924,6 +975,7 @@ fun publish_ready(backend: *Backend) usize {
         count = count + 1;
     }
     backend.ready_count = count;
+    trim_locked(backend);
     ret count;
 }
 
@@ -1009,7 +1061,7 @@ pub fun destroy(backend: *Backend) i64 {
     }
     # sockets idle at destruction still hold their resource and registration
     var slot: usize = 0;
-    for (slot < backend.resource_slots) {
+    for (slot < backend.resources.capacity) {
         val resource: *Resource = resource_at(backend, slot);
         if (resource.state == RESOURCE_ACTIVE) { resource_release(backend, resource); }
         slot = slot + 1;
@@ -1021,16 +1073,14 @@ pub fun destroy(backend: *Backend) i64 {
     table.destroy(?backend.ready);
     table.destroy(?backend.resources);
     table.destroy(?backend.operations);
-    backend.native          = nil;
-    backend.resource_map    = nil;
-    backend.operation_slots = 0;
-    backend.resource_slots  = 0;
-    backend.map_capacity    = 0;
-    backend.ready_count     = 0;
-    backend.queued_head     = NONE;
-    backend.queued_tail     = NONE;
-    backend.queue           = nil;
-    backend.source_id       = 0;
+    backend.native       = nil;
+    backend.resource_map = nil;
+    backend.map_capacity = 0;
+    backend.ready_count  = 0;
+    backend.queued_head  = NONE;
+    backend.queued_tail  = NONE;
+    backend.queue        = nil;
+    backend.source_id    = 0;
     mutex.unlock(?backend.lock);
     ret 0;
 }
@@ -1220,7 +1270,7 @@ fun test_map_stale(backend: *Backend) usize {
         val entry: u32 = backend.resource_map[slot];
         if (entry != 0) {
             val index: usize = (entry - 1)::usize;
-            if (index >= backend.resource_slots || resource_at(backend, index).state != RESOURCE_ACTIVE) { stale = stale + 1; }
+            if (index >= backend.resources.capacity || resource_at(backend, index).state != RESOURCE_ACTIVE) { stale = stale + 1; }
         }
         slot = slot + 1;
     }
@@ -1235,7 +1285,7 @@ fun test_map_probes(backend: *Backend, value: usize) usize {
         val entry: u32 = backend.resource_map[slot];
         if (entry == 0) { ret probes; }
         val index: usize = (entry - 1)::usize;
-        if (index < backend.resource_slots) {
+        if (index < backend.resources.capacity) {
             val candidate: *Resource = resource_at(backend, index);
             if (candidate.state == RESOURCE_ACTIVE && candidate.resource == value) { ret probes; }
         }
@@ -1346,5 +1396,216 @@ test "async local unix: resource lookups stay bounded after churn at 1k, 10k and
         if (max_hit > 32 || max_miss > 32) { ret 30 + i::i32; }
         i = i + 1;
     }
+    ret 0;
+}
+
+# bytes live at the allocator a backend is made with
+rec Counting {
+    inner: allocator.Allocator;
+    live:  usize;
+}
+
+fun counting_allocate(context: ptr, size: usize, align: usize) opt[ptr] {
+    val counting: *Counting = context::*Counting;
+    val got:      opt[ptr]  = counting.inner.fn_allocate(counting.inner.ctx, size, align);
+    if (sel got.some) { counting.live = counting.live + size; }
+    ret got;
+}
+
+fun counting_reallocate(context: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) opt[ptr] {
+    val counting: *Counting = context::*Counting;
+    val got:      opt[ptr]  = counting.inner.fn_reallocate(counting.inner.ctx, p, old_size, new_size, align);
+    if (sel got.some) { counting.live = counting.live - old_size + new_size; }
+    ret got;
+}
+
+fun counting_deallocate(context: ptr, p: ptr, size: usize, align: usize) i64 {
+    val counting: *Counting = context::*Counting;
+    val code:     i64       = counting.inner.fn_deallocate(counting.inner.ctx, p, size, align);
+    if (code == 0) { counting.live = counting.live - size; }
+    ret code;
+}
+
+fun counting_make(counting: *Counting, a: *allocator.Allocator) {
+    page.make(?counting.inner);
+    counting.live = 0;
+    @a            = allocator.Allocator{
+        ctx:           counting::ptr,
+        fn_allocate:   counting_allocate,
+        fn_reallocate: counting_reallocate,
+        fn_deallocate: counting_deallocate,
+    };
+}
+
+# n resources each carrying one operation, then all of them released: the
+# bytes held idle, at the peak and once the peak drained
+fun footprint_peak(n: usize, idle: *usize, peak: *usize, after: *usize) i64 {
+    var counting: Counting;
+    var a:        allocator.Allocator;
+    counting_make(?counting, ?a);
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    val tokens: res[*types.Token, allocator.Error] = allocator.allocate[types.Token](?pa, n);
+    if (sel tokens.err) { ret 1; }
+    var queue: shared.IoQueue;
+    if (native.io_queue_create(?queue) < 0) { ret 2; }
+    var backend: Backend;
+    if (make(?backend, ?queue, ?a, 64, 1) < 0) { ret 3; }
+    @idle = counting.live;
+    var j: usize = 0;
+    for (j < n) {
+        var created: bool = false;
+        if (resource_acquire(?backend, 0x100000 + j, ?created) == nil)                      { ret 4; }
+        if (operation_claim(?backend, runtime.READ, 0x100000 + j, j, ?tokens.ok[j]) == nil) { ret 5; }
+        j = j + 1;
+    }
+    @peak = counting.live;
+    j     = 0;
+    for (j < n) {
+        operation_release(?backend, tokens.ok[j].index);
+        resource_release_unwatched(?backend, resource_lookup(?backend, 0x100000 + j));
+        j = j + 1;
+    }
+    trim_locked(?backend);
+    @after = counting.live;
+    if (backend.live != 0 || backend.resource_count != 0) { ret 6; }
+    if (destroy(?backend) < 0)                            { ret 7; }
+    native.io_queue_close(?queue);
+    allocator.deallocate[types.Token](?pa, tokens.ok, n);
+    if (counting.live != 0) { ret 8; }
+    ret 0;
+}
+
+# #874: after a peak drains every table is back at its idle size, so what a
+# peak grew goes back to the allocator
+test "async local unix: a drained peak returns the tables to idle at 1k, 10k and 100k" {
+    val sizes: [3]usize = [3]usize{1000, 10000, 100000};
+    var i:     usize    = 0;
+    for (i < 3) {
+        var idle:  usize = 0;
+        var peak:  usize = 0;
+        var after: usize = 0;
+        val ran:   i64   = footprint_peak(sizes[i], ?idle, ?peak, ?after);
+        if (ran != 0)                    { ret 10 * (i::i32 + 1) + ran::i32; }
+        if (peak < idle + 64 * sizes[i]) { ret 40 + i::i32; }
+        if (after != idle)               { ret 50 + i::i32; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# #874: a trim releases only empty chunks, so a live operation and resource
+# stay where they were and still resolve, one pinned high keeps its chunk, and
+# a token or wire context from a released chunk stays refused once it is grown
+# again
+test "async local unix: live entries survive a shrink and stale tokens stay refused" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    var queue: shared.IoQueue;
+    if (native.io_queue_create(?queue) < 0) { ret 1; }
+    var backend: Backend;
+    if (make(?backend, ?queue, ?pa, 4, 1) < 0) { ret 1; }
+    var created: bool = false;
+    # a low operation and resource held across the shrink
+    val low:           *Resource  = resource_acquire(?backend, 0x200000, ?created);
+    var low_token:     types.Token;
+    val low_operation: *Operation = operation_claim(?backend, runtime.READ, 0x200000, 1, ?low_token);
+    if (low == nil || low_operation == nil) { ret 2; }
+    val low_resource: types.Token = types.Token{index: low.index, generation: low.generation};
+    var tokens:       [64]types.Token;
+    var j:            usize       = 0;
+    for (j < 64) {
+        if (resource_acquire(?backend, 0x300000 + j, ?created) == nil ||
+            operation_claim(?backend, runtime.READ, 0x300000 + j, 2, ?tokens[j]) == nil) { ret 3; }
+        j = j + 1;
+    }
+    if (backend.operations.chunk_count < 4 || backend.resources.chunk_count < 4) { ret 4; }
+    val high:          types.Token = tokens[63];
+    val high_resource: *Resource   = resource_lookup(?backend, 0x300000 + 63);
+    val high_context:  usize       = token_context(?backend, types.Token{index: high_resource.index, generation: high_resource.generation});
+    # the last entry pins the top chunk, so nothing goes
+    j = 0;
+    for (j < 63) {
+        operation_release(?backend, tokens[j].index);
+        resource_release_unwatched(?backend, resource_lookup(?backend, 0x300000 + j));
+        j = j + 1;
+    }
+    val chunks: usize = backend.operations.chunk_count;
+    trim_locked(?backend);
+    if (backend.operations.chunk_count != chunks || operation_for(?backend, high) == nil) { ret 5; }
+    # once it goes, every chunk above the live ones is released
+    operation_release(?backend, high.index);
+    resource_release_unwatched(?backend, high_resource);
+    trim_locked(?backend);
+    # chunk 0 holds the low entries and chunk 1 stays as slack
+    if (backend.operations.chunk_count != 2 || backend.resources.chunk_count != 2 ||
+        backend.ready.chunk_count != 2) { ret 6; }
+    if (operation_at(?backend, low_token.index::usize) != low_operation ||
+        operation_for(?backend, low_token) != low_operation ||
+        resource_for(?backend, low_resource) != low ||
+        resource_lookup(?backend, 0x200000) != low) { ret 7; }
+    var decoded: types.Token;
+    if (operation_for(?backend, high) != nil || operation_any(?backend, high) != nil ||
+        !context_token(?backend, high_context, ?decoded) || resource_for(?backend, decoded) != nil) { ret 8; }
+    # regrown, the released indices come back under generations no old token has
+    j = 0;
+    for (j < 64) {
+        if (resource_acquire(?backend, 0x400000 + j, ?created) == nil ||
+            operation_claim(?backend, runtime.READ, 0x400000 + j, 3, ?tokens[j]) == nil) { ret 9; }
+        j = j + 1;
+    }
+    if (high.index::usize >= backend.operations.capacity || decoded.index::usize >= backend.resources.capacity) { ret 10; }
+    if (operation_for(?backend, high) != nil || operation_any(?backend, high) != nil ||
+        resource_for(?backend, decoded) != nil) { ret 11; }
+    if (operation_for(?backend, low_token) != low_operation || resource_for(?backend, low_resource) != low) { ret 12; }
+    j = 0;
+    for (j < 64) {
+        operation_release(?backend, tokens[j].index);
+        resource_release_unwatched(?backend, resource_lookup(?backend, 0x400000 + j));
+        j = j + 1;
+    }
+    operation_release(?backend, low_token.index);
+    resource_release_unwatched(?backend, low);
+    if (destroy(?backend) < 0) { ret 13; }
+    native.io_queue_close(?queue);
+    ret 0;
+}
+
+# #874: a load that crosses a chunk boundary back and forth keeps the empty
+# chunk above it as slack, so only the first crossing allocates
+test "async local unix: a load oscillating across a chunk boundary allocates once" {
+    var counting: Counting;
+    var a:        allocator.Allocator;
+    counting_make(?counting, ?a);
+    var queue: shared.IoQueue;
+    if (native.io_queue_create(?queue) < 0) { ret 1; }
+    var backend: Backend;
+    if (make(?backend, ?queue, ?a, 4, 1) < 0) { ret 1; }
+    var tokens: [5]types.Token;
+    var j:      usize = 0;
+    for (j < 4) {
+        if (operation_claim(?backend, runtime.READ, 1, j, ?tokens[j]) == nil) { ret 2; }
+        j = j + 1;
+    }
+    var crossed: usize = 0;
+    var round:   usize = 0;
+    for (round < 100) {
+        if (operation_claim(?backend, runtime.READ, 1, 4, ?tokens[4]) == nil) { ret 3; }
+        if (round == 0)                                                       { crossed = counting.live; }
+        operation_release(?backend, tokens[4].index);
+        trim_locked(?backend);
+        if (counting.live != crossed) { ret 4; }
+        round = round + 1;
+    }
+    j = 0;
+    for (j < 4) {
+        operation_release(?backend, tokens[j].index);
+        j = j + 1;
+    }
+    trim_locked(?backend);
+    if (backend.operations.chunk_count != 1 || backend.ready.chunk_count != 1) { ret 5; }
+    if (destroy(?backend) < 0)                                                 { ret 6; }
+    native.io_queue_close(?queue);
+    if (counting.live != 0) { ret 7; }
     ret 0;
 }
