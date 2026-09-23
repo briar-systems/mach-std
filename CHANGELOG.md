@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.3.0] - 2026-09-23
+
 ### Added
 
 - `memory.table.trim_backed` and `pool_trim_backed` trim like `trim` and
