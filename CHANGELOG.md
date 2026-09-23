@@ -13,6 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pool_trim` for a table that has promised capacity no element holds yet.
   The promised count stays backed as though it filled the lowest indices,
   with one empty chunk of slack above it (#878).
+- `allocator.Allocator` has a `retains` field, and `allocator.reclaims`
+  asks it (#880). An allocator that never reuses what it is given back sets
+  `retains`. `allocator.fixed`, `allocator.bump` and `allocator.arena` set
+  it. Its zero value means the allocator reclaims, so an allocator built
+  field by field or from a literal reclaims unless it says otherwise. A
+  wrapper over another allocator should forward its backing's `retains`.
+  The field is added last, so the offsets of the other fields are unchanged,
+  but the record grows from 32 to 40 bytes on 64-bit targets.
 
 ### Changed
 
@@ -35,10 +43,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   grew by 8 bytes for the pool link. Slots are now taken lowest chunk first
   instead of most recently freed first, so which index a chunk's `Ref`
   carries can differ from 7.2.0. `Pool`'s `slot_top` and `empty_head`
-  fields are gone, and `slot_pool` and `retained_in` take their place. A
-  pool whose backing is an `allocator.fixed` arena never gets the released
-  chunks back, so `arena_bytes` holds for such a pool only while nothing is
-  trimmed and grown again.
+  fields are gone, and `slot_pool` and `retained_in` take their place. Over
+  an allocator that does not reclaim, such as an `allocator.fixed` arena,
+  the slot table keeps its peak instead (#880).
+
+### Fixed
+
+- A table that sheds a peak no longer does so over an allocator that never
+  reuses what it is given back (#880). Since 7.1.0 (#868) `io.runtime`,
+  since 7.2.0 (#874) `net.async` and `net.async.local`, and with #878
+  `memory.buffers` released a drained peak's trailing chunks. Over an
+  `allocator.fixed` arena each released chunk was gone for good, so a peak
+  that drained and came back took fresh arena bytes every time, until the
+  arena was exhausted. A peak of 10k over an arena sized for one peak was
+  refused on its second return in io.runtime, net.async and memory.buffers.
+  `memory.table.shrink` now refuses over such an allocator and keeps the
+  chunk, and `trim`, `trim_backed`, `pool_trim` and `pool_trim_backed`
+  release nothing, so every trimmed table keeps its peak capacity there, as
+  before 7.1.0. Over an allocator that reclaims nothing changes.
+  `memory.buffers.arena_bytes` now bounds the slot metadata however often a
+  peak returns. Its payload part still assumes every class's `high_water`
+  covers its chunks.
 
 ## [7.2.0] - 2026-09-23
 
