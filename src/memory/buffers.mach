@@ -40,7 +40,11 @@
 # class keeps up to its high_water released chunks for reuse; only the slot
 # metadata lives in a growable table, and nothing hands its addresses out.
 # opening an account reserves slot metadata for its reservation, so an acquire
-# inside the reservation never fails on metadata.
+# inside the reservation never fails on metadata. the table gives back what a
+# peak grew: a chunk of it goes once it and the chunk below it hold no slot in
+# use and no reservation needs them, so one empty chunk stays as slack. a held
+# slot never moves, and a ref from a released chunk is refused once the table
+# grows again.
 #
 # a pool is serialized-use: it is never entered concurrently. it is not tied to
 # a thread, so work may hand a pool between threads as long as the hand-off is
@@ -293,6 +297,7 @@ rec Slot {
     welded:     u32;
     welded_gen: u32;
     account:    *Account;
+    link:       usize;
 }
 
 pub rec ClassCounters {
@@ -345,8 +350,8 @@ pub rec Pool {
     bytes_live:          usize;
     bytes_peak:          usize;
     slots:               table.Table;
-    slot_top:            u32;
-    empty_head:          u32;
+    slot_pool:           table.Pool;
+    retained_in:         [table.DIRECTORY]usize;
     slots_in_use:        usize;
     slots_retained:      usize;
     slots_reserved:      usize;
@@ -427,26 +432,39 @@ fun slots_committed(pool: *Pool) usize {
     ret pool.slots_in_use + pool.slots_retained + pool.slots_reserved;
 }
 
-# keep demand slots backed
+# the table's newest chunk joins the slot pool, every slot empty and starting
+# from the pool's generation floor
+fun adopt_slots(pool: *Pool) {
+    var index: usize = table.chunk_start(?pool.slots, pool.slots.chunk_count - 1);
+    for (index < pool.slots.capacity) {
+        val slot:  *Slot = table.at(?pool.slots, index)::*Slot;
+        var blank: Slot;
+        @slot           = blank;
+        slot.generation = pool.slot_pool.floor;
+        slot.next       = NONE;
+        index           = index + 1;
+    }
+    table.pool_adopt(?pool.slot_pool, ?pool.slots);
+}
+
+# keep demand slots backed. a slot index is a u32 below NONE, so the table
+# never grows past that
 fun ensure_slots(pool: *Pool, demand: usize) bool {
     if (demand > 0xfffffffe) { ret false; }
-    ret table.reserve(?pool.slots, demand);
+    for (pool.slots.capacity < demand) {
+        val chunk: usize = pool.slots.chunk_count;
+        if (chunk >= table.DIRECTORY) { ret false; }
+        val grown: usize = pool.slots.capacity + table.chunk_capacity(?pool.slots, chunk);
+        if (grown - 1 >= NONE::usize || !table.grow(?pool.slots)) { ret false; }
+        adopt_slots(pool);
+    }
+    ret true;
 }
 
 fun take_slot(pool: *Pool) u32 {
-    if (pool.empty_head != NONE) {
-        val index: u32   = pool.empty_head;
-        val slot:  *Slot = slot_at(pool, index);
-        pool.empty_head = slot.next;
-        ret index;
-    }
-    if (pool.slot_top::usize >= pool.slots.capacity) { ret NONE; }
-    val index: u32   = pool.slot_top;
-    val slot:  *Slot = slot_at(pool, index);
-    slot.generation = 0;
-    slot.state      = SLOT_EMPTY;
-    pool.slot_top   = pool.slot_top + 1;
-    ret index;
+    val index: usize = table.pool_take(?pool.slot_pool, ?pool.slots);
+    if (index == table.NO_INDEX) { ret NONE; }
+    ret index::u32;
 }
 
 fun put_slot(pool: *Pool, index: u32) {
@@ -457,8 +475,79 @@ fun put_slot(pool: *Pool, index: u32) {
     slot.welded     = 0;
     slot.welded_gen = 0;
     slot.inflight   = 0;
-    slot.next       = pool.empty_head;
-    pool.empty_head = index;
+    slot.next       = NONE;
+    table.pool_put(?pool.slot_pool, ?pool.slots, index::usize);
+}
+
+# slots of chunk that are held, neither empty nor retained
+fun held_in(pool: *Pool, chunk: usize) usize {
+    ret pool.slot_pool.live[chunk] - pool.retained_in[chunk];
+}
+
+# move every retained chunk that sits above the lowest empty slot down into it.
+# a retained slot carries no ref, since its generation moved on at release, so
+# its payload may change slots while nothing held moves
+# ---
+# ret: how many retained chunks moved
+fun lower_retained(pool: *Pool) usize {
+    var moved: usize = 0;
+    var c:     usize = 0;
+    for (c < pool.class_count) {
+        val cls:    *ClassState = ?pool.classes[c];
+        var prev:   u32         = NONE;
+        var cursor: u32         = cls.retained_head;
+        for (cursor != NONE) {
+            val free: usize = table.pool_peek(?pool.slot_pool, ?pool.slots);
+            if (free == table.NO_INDEX) { ret moved; }
+            val from: usize = table.chunk_of(?pool.slots, cursor::usize);
+            val to:   usize = table.chunk_of(?pool.slots, free);
+            var kept: u32   = cursor;
+            if (to < from) {
+                kept = take_slot(pool);
+                val old:  *Slot = slot_at(pool, cursor);
+                val slot: *Slot = slot_at(pool, kept);
+                slot.state      = SLOT_RETAINED;
+                slot.class      = old.class;
+                slot.lane       = old.lane;
+                slot.secret     = old.secret;
+                slot.align      = old.align;
+                slot.bytes      = old.bytes;
+                slot.address    = old.address;
+                slot.welded     = old.welded;
+                slot.welded_gen = old.welded_gen;
+                slot.next       = old.next;
+                if (prev == NONE) { cls.retained_head = kept; }
+                or                { slot_at(pool, prev).next = kept; }
+                pool.retained_in[from] = pool.retained_in[from] - 1;
+                pool.retained_in[to]   = pool.retained_in[to] + 1;
+                put_slot(pool, cursor);
+                moved = moved + 1;
+            }
+            prev   = kept;
+            cursor = slot_at(pool, kept).next;
+        }
+        c = c + 1;
+    }
+    ret moved;
+}
+
+# give back what a peak grew, at the end of every entry that may have freed a
+# slot or a reservation. a chunk goes once it and the chunk below it hold
+# nothing and no reservation needs them. retained chunks pinning the top
+# chunks move down first when there is room below
+fun trim_locked(pool: *Pool) {
+    val generation: usize = $offset_of(Slot, generation);
+    for (true) {
+        table.pool_trim_backed(?pool.slot_pool, ?pool.slots, generation, slots_committed(pool));
+        if (pool.slots.chunk_count <= 1) { ret; }
+        val top: usize = pool.slots.chunk_count - 1;
+        if (held_in(pool, top) != 0 || held_in(pool, top - 1) != 0 ||
+            pool.retained_in[top] + pool.retained_in[top - 1] == 0 ||
+            slots_committed(pool) > table.chunk_start(?pool.slots, top - 1)) { ret; }
+        val free: usize = table.pool_peek(?pool.slot_pool, ?pool.slots);
+        if (free == table.NO_INDEX || table.chunk_of(?pool.slots, free) >= top - 1) { ret; }
+        if (lower_retained(pool) == 0)                                              { ret; }
+    }
 }
 
 fun plain_allocate(pool: *Pool, bytes: usize, align: usize) usize {
@@ -646,9 +735,11 @@ fun acquire_locked(pool: *Pool, account: *Account, request: Request, register: b
         cls.retained_head   = kept.next;
         cls.retained        = cls.retained - 1;
         pool.slots_retained = pool.slots_retained - 1;
-        address             = kept.address;
-        welded              = kept.welded;
-        wgen                = kept.welded_gen;
+        val home: usize = table.chunk_of(?pool.slots, index::usize);
+        pool.retained_in[home] = pool.retained_in[home] - 1;
+        address                = kept.address;
+        welded                 = kept.welded;
+        wgen                   = kept.welded_gen;
     }
     or {
         # a retained chunk brings its own slot, a fresh one needs one more
@@ -735,7 +826,7 @@ fun acquire_locked(pool: *Pool, account: *Account, request: Request, register: b
 }
 
 fun held_slot(pool: *Pool, ref: Ref) *Slot {
-    if (ref.index >= pool.slot_top) { ret nil; }
+    if (ref.index::usize >= pool.slots.capacity) { ret nil; }
     val slot: *Slot = slot_at(pool, ref.index);
     if (slot.state != SLOT_HELD || slot.generation != ref.generation) { ret nil; }
     ret slot;
@@ -775,6 +866,8 @@ fun release_locked(pool: *Pool, account: *Account, chunk: Chunk, wake: bool) Rea
             cls.retained_head   = chunk.ref.index;
             cls.retained        = cls.retained + 1;
             pool.slots_retained = pool.slots_retained + 1;
+            val home: usize = table.chunk_of(?pool.slots, chunk.ref.index::usize);
+            pool.retained_in[home] = pool.retained_in[home] + 1;
         }
         or {
             slot_release(pool, slot, cls.size, cls.align);
@@ -822,6 +915,8 @@ pub fun make(pool: *Pool, config: Config, plain: *A.Allocator) bool {
     var initial: usize = config.initial_slots;
     if (initial == 0)                                             { initial = 16; }
     if (!table.make(?pool.slots, plain, $size_of(Slot), initial)) { ret false; }
+    table.pool_make(?pool.slot_pool, $offset_of(Slot, link));
+    adopt_slots(pool);
     pool.class_count    = config.class_count;
     pool.lanes          = config.lanes::usize;
     pool.global_budget  = config.global_budget;
@@ -829,7 +924,6 @@ pub fun make(pool: *Pool, config: Config, plain: *A.Allocator) bool {
     pool.notify_context = config.notify_context;
     pool.trap           = config.trap;
     pool.trap_context   = config.trap_context;
-    pool.empty_head     = NONE;
     pool.made           = true;
     ret true;
 }
@@ -903,6 +997,7 @@ pub fun open_account(pool: *Pool, account: *Account, handle: u64, budgets: Budge
         slots = (reserve + smallest - 1) / smallest;
     }
     if (!ensure_slots(pool, slots_committed(pool) + slots)) {
+        trim_locked(pool);
         leave(pool);
         ret Reason.memory{};
     }
@@ -940,6 +1035,7 @@ pub fun close_account(pool: *Pool, account: *Account) Reason {
     pool.accounts       = pool.accounts - 1;
     account.open        = false;
     account.pool        = nil;
+    trim_locked(pool);
     leave(pool);
     ret Reason.none{};
 }
@@ -951,6 +1047,7 @@ pub fun acquire(pool: *Pool, account: *Account, request: Request, register: bool
     if (pool == nil || !pool.made) { ret refusal(Status.error{}, Reason.misuse{}); }
     if (!enter(pool))              { ret refusal(Status.error{}, Reason.misuse{}); }
     val out: Acquired = acquire_locked(pool, account, request, register);
+    trim_locked(pool);
     leave(pool);
     ret out;
 }
@@ -977,6 +1074,7 @@ pub fun acquire_n(pool: *Pool, account: *Account, requests: *Request, count: usi
                 j = j + 1;
             }
             if (register && (sel got.reason.exhausted || sel got.reason.memory)) { register_waiter(pool, account); }
+            trim_locked(pool);
             leave(pool);
             ret got;
         }
@@ -999,6 +1097,7 @@ pub fun release(pool: *Pool, account: *Account, chunk: Chunk) Reason {
     if (pool == nil || !pool.made) { ret Reason.misuse{}; }
     if (!enter(pool))              { ret Reason.misuse{}; }
     val r: Reason = release_locked(pool, account, chunk, true);
+    trim_locked(pool);
     leave(pool);
     ret r;
 }
@@ -1395,6 +1494,11 @@ pub fun secret_source_view(s: *SecretSource, chunk: Chunk) *^u8 {
 
 # bytes an allocator.fixed arena needs to hold a pool's slot metadata and the
 # given number of plain chunks of every class, for embedded use
+#
+# a fixed arena never takes memory back, so the bound holds only while nothing
+# the pool gives back is taken again: every class keeps its chunks with a
+# high_water that covers them, and the slot table is not trimmed and grown
+# again, which a peak of reservations that drains and returns does
 # ---
 # config: the pool configuration
 # chunks: chunks per class, one entry per class
@@ -1806,8 +1910,7 @@ $if (capability.HOSTED) {
         # a slot table the demand undercounts refuses, and gives the backing back
         val allocs: usize = arena.count.allocs;
         val frees:  usize = arena.count.frees;
-        pool.slot_top   = pool.slots.capacity::u32;
-        pool.empty_head = NONE;
+        for (take_slot(?pool) != NONE) {}
         val refused: Acquired = acquire(?pool, ?account, ask(100000), false);
         if (!sel refused.reason.memory)                                         { ret 9; }
         if (arena.count.allocs != allocs + 1 || arena.count.frees != frees + 1) { ret 10; }
