@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `memory.table.Pool` hands out a table's free indices lowest chunk first,
+  and oldest first within a chunk, so steady churn drains the high chunks.
+  It links through a `usize` inside each free element, so it allocates
+  nothing. `memory.table.trim` releases trailing chunks once a chunk and the
+  chunk below it hold nothing live, keeping one empty chunk as slack. It also
+  raises a generation floor so a handle from a released chunk never matches
+  the regrown one. `pool_trim` does the same for a pooled table. This is the
+  mechanism `io.runtime` built privately for #868, and `io.runtime` now uses
+  it (#874).
+
+### Changed
+
+- `net.async` and `net.async.local` give back what a load peak grew (#874,
+  hedge#235). The driver slot tables, the linux, darwin and local/unix
+  backends' operation, resource and ready tables and resource map, the
+  windows completion port's operation and completion tables, and its socket
+  records and map all used to hold their peak capacity for the driver's
+  life. They now shrink under the #868 rule. A chunk is released once it and
+  the chunk below it are both empty, the ready and completion tables follow
+  the operations down, and the maps are rehashed to the smaller tables. Only
+  empty chunks are released, so nothing live moves. A token, wire context or
+  stream or listener handle from a released chunk stays refused after the
+  chunk is grown again. Measured with a counting allocator under
+  `io.runtime.make(r, a, 64)` on linux: after 1k, 10k and 100k cancelled
+  readiness waits on one stream, 7.1.0 held 291,840, 4,961,280 and
+  39,826,432 bytes over idle, and this release holds 0. After 1k and 10k
+  accepted connections that each waited and then closed, 7.1.0 held 360,960
+  and 6,136,320 bytes over idle. This release holds 5,120 bytes, the empty
+  resource chunk kept as slack above the live listener. Operations,
+  resources, socket records, local streams and local listeners are now taken
+  lowest chunk first instead of most recently freed first, so which index a
+  submission gets can differ from 7.1.0. Some backend records grew by up to
+  8 bytes for the pool link, and the `operation_slots`, `resource_slots`,
+  `free_operation`, `free_resource`, `socket_slots`, `free_socket`,
+  `slot_count`, `listener_count`, `stream_count`, `free_listener` and
+  `free_stream` bookkeeping fields are gone.
+
 ## [7.1.0] - 2026-09-23
 
 ### Added

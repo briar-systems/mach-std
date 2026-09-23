@@ -119,9 +119,12 @@ pub rec Driver {
     source:  io_runtime.SourceToken;
     backend: impl.Backend;
     # where every table's chunks come from
-    allocator:         allocator.Allocator;
-    slots:             table.Table;
-    slot_count:        usize;
+    allocator: allocator.Allocator;
+    # indexed by runtime token index, and the runtime's generations tell
+    # every token apart, so a slot needs no generation floor of its own
+    slots: table.Table;
+    # active slots per chunk of the slot table
+    slot_live:         [table.DIRECTORY]usize;
     backend_destroyed: bool;
     lock:              mutex.Mutex;
 }
@@ -152,12 +155,22 @@ fun init_slot(driver: *Driver, index: usize) {
     slot.owns_resource = false;
 }
 
+# set up the slot table's newest chunk, every slot free
+fun adopt_slots(driver: *Driver) {
+    val chunk: usize = driver.slots.chunk_count - 1;
+    var index: usize = table.chunk_start(?driver.slots, chunk);
+    for (index < driver.slots.capacity) {
+        init_slot(driver, index);
+        index = index + 1;
+    }
+    driver.slot_live[chunk] = 0;
+}
+
 # the runtime owns the index space, so the driver grows to whatever it hands out
 fun ensure_slot(driver: *Driver, index: usize) *Slot {
-    if (!table.reserve(?driver.slots, index + 1)) { ret nil; }
-    for (driver.slot_count <= index) {
-        init_slot(driver, driver.slot_count);
-        driver.slot_count = driver.slot_count + 1;
+    for (driver.slots.capacity <= index) {
+        if (!table.grow(?driver.slots)) { ret nil; }
+        adopt_slots(driver);
     }
     ret slot_at(driver, index);
 }
@@ -197,7 +210,7 @@ fun context_token(context: usize, token: *io_runtime.Token) bool {
 }
 
 fun slot_for(driver: *Driver, token: io_runtime.Token) *Slot {
-    if (token.index::usize >= driver.slot_count) { ret nil; }
+    if (token.index::usize >= driver.slots.capacity) { ret nil; }
     val slot: *Slot = slot_at(driver, token.index::usize);
     if (slot.state != SLOT_ACTIVE || slot.generation != token.generation) { ret nil; }
     ret slot;
@@ -280,8 +293,8 @@ pub fun make(driver: *Driver, runtime: *io_runtime.Runtime) err[io_error.Error] 
     if (!table.make(?driver.slots, ?driver.allocator, $size_of(Slot), capacity)) {
         ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
     }
-    driver.runtime           = runtime;
-    driver.slot_count        = 0;
+    driver.runtime = runtime;
+    adopt_slots(driver);
     driver.backend_destroyed = false;
     driver.lock              = mutex.make();
     val registered: res[io_runtime.SourceToken, io_error.Error] = io_runtime.register_source(
@@ -340,13 +353,15 @@ fun claim_locked(
         io_runtime.fail(driver.runtime, @token, io_error.make(io_error.BUSY, io_error.OP_SUBMIT));
         ret res[bool, io_error.Error].ok{false};
     }
-    slot.state         = SLOT_ACTIVE;
-    slot.generation    = token.generation;
-    slot.native_active = false;
-    slot.owns_resource = false;
-    slot.kind          = kind;
-    slot.resource      = resource;
-    slot.opening       = opening;
+    val chunk: usize = table.chunk_of(?driver.slots, token.index::usize);
+    driver.slot_live[chunk] = driver.slot_live[chunk] + 1;
+    slot.state              = SLOT_ACTIVE;
+    slot.generation         = token.generation;
+    slot.native_active      = false;
+    slot.owns_resource      = false;
+    slot.kind               = kind;
+    slot.resource           = resource;
+    slot.opening            = opening;
     ret res[bool, io_error.Error].ok{true};
 }
 
@@ -763,6 +778,9 @@ fun cleanup_locked(driver: *Driver, completion: *io_runtime.Completion) {
     }
     slot.state         = SLOT_FREE;
     slot.owns_resource = false;
+    val chunk: usize = table.chunk_of(?driver.slots, completion.token.index::usize);
+    driver.slot_live[chunk] = driver.slot_live[chunk] - 1;
+    table.trim(?driver.slots, ?driver.slot_live[0], table.NO_INDEX, nil);
 }
 
 fun resolve_native_locked(driver: *Driver, native: types.NativeCompletion) {
@@ -858,7 +876,7 @@ pub fun destroy(driver: *Driver) err[io_error.Error] {
     }
     mutex.lock(?driver.lock);
     var i: usize = 0;
-    for (i < driver.slot_count) {
+    for (i < driver.slots.capacity) {
         if (slot_at(driver, i).state != SLOT_FREE) {
             mutex.unlock(?driver.lock);
             ret err[io_error.Error].err{io_error.make(io_error.BUSY, io_error.OP_CLOSE)};
@@ -886,8 +904,7 @@ pub fun destroy(driver: *Driver) err[io_error.Error] {
     }
     mutex.lock(?driver.lock);
     val released: err[allocator.Error] = table.destroy(?driver.slots);
-    driver.slot_count = 0;
-    driver.runtime    = nil;
+    driver.runtime = nil;
     mutex.unlock(?driver.lock);
     if (sel released.err) {
         if (sel released.err.release) {
@@ -2765,5 +2782,163 @@ test "async network: a cancel that settles through dispatch does not wait for th
     if (sel destroyed.err)                     { ret 12; }
     if (!ok_bool(io_runtime.close(?runtime)))  { ret 13; }
     if (!ok_err(io_runtime.destroy(?runtime))) { ret 14; }
+    ret 0;
+}
+
+# bytes live at the allocator a runtime is made with, which its drivers share
+rec Counting {
+    inner: allocator.Allocator;
+    live:  usize;
+}
+
+fun counting_allocate(context: ptr, size: usize, align: usize) opt[ptr] {
+    val counting: *Counting = context::*Counting;
+    val got:      opt[ptr]  = counting.inner.fn_allocate(counting.inner.ctx, size, align);
+    if (sel got.some) { counting.live = counting.live + size; }
+    ret got;
+}
+
+fun counting_reallocate(context: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) opt[ptr] {
+    val counting: *Counting = context::*Counting;
+    val got:      opt[ptr]  = counting.inner.fn_reallocate(counting.inner.ctx, p, old_size, new_size, align);
+    if (sel got.some) { counting.live = counting.live - old_size + new_size; }
+    ret got;
+}
+
+fun counting_deallocate(context: ptr, p: ptr, size: usize, align: usize) i64 {
+    val counting: *Counting = context::*Counting;
+    val code:     i64       = counting.inner.fn_deallocate(counting.inner.ctx, p, size, align);
+    if (code == 0) { counting.live = counting.live - size; }
+    ret code;
+}
+
+fun counting_make(counting: *Counting, a: *allocator.Allocator) {
+    page.make(?counting.inner);
+    counting.live = 0;
+    @a            = allocator.Allocator{
+        ctx:           counting::ptr,
+        fn_allocate:   counting_allocate,
+        fn_reallocate: counting_reallocate,
+        fn_deallocate: counting_deallocate,
+    };
+}
+
+# n readiness waits on one stream, all cancelled and drained: the bytes the
+# runtime, the driver and its backend hold idle, at the peak and after
+fun driver_peak(n: usize, idle: *usize, peak: *usize, after: *usize) i32 {
+    var counting: Counting;
+    var a:        allocator.Allocator;
+    counting_make(?counting, ?a);
+    var runtime: io_runtime.Runtime;
+    var driver:  Driver;
+    var scope:   cancel.Scope;
+    if (!ok_err(io_runtime.make(?runtime, ?a, 8)))                     { ret 1; }
+    if (!ok_err(make(?driver, ?runtime)))                              { ret 1; }
+    if (!scope_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 1; }
+    val listener_result: res[tcp.Listener, io_error.Error] = listen(ip.endpoint(127, 0, 0, 1, 0), 16);
+    if (sel listener_result.err) { ret 2; }
+    var listener: tcp.Listener = listener_result.ok;
+    var server:   tcp.Stream;
+    var client:   tcp.Stream;
+    if (readable_pair(?driver, ?scope, ?listener, ?server, ?client) != 0) { ret 3; }
+    @idle = counting.live;
+    var child: cancel.Scope;
+    if (!scope_ok(cancel.make_child(?child, ?scope, opt[time.Instant].none{}))) { ret 4; }
+    var j: usize = 0;
+    for (j < n) {
+        if (!ok_token(submit_readable(?driver, ?child, ?server, j))) { ret 5; }
+        j = j + 1;
+    }
+    @peak = counting.live;
+    if (!scope_changed(cancel.cancel(?child))) { ret 6; }
+    var output:     [256]io_runtime.Completion;
+    var settled:    usize = 0;
+    var idle_waits: usize = 0;
+    for (settled < n && idle_waits < 16) {
+        val waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 256, 1000);
+        if (sel waited.err) { ret 7; }
+        if (waited.ok == 0) { idle_waits = idle_waits + 1; }
+        var i: usize = 0;
+        for (i < waited.ok) {
+            if (!output[i].has_error || output[i].error.kind != io_error.CANCELLED) { ret 8; }
+            i = i + 1;
+        }
+        settled = settled + waited.ok;
+    }
+    if (settled != n || !scope_ok(cancel.destroy(?child))) { ret 9; }
+    @after = counting.live;
+    if (refused(tcp.stream_close(?client)))                                                    { ret 10; }
+    if (!ok_token(submit_stream_close(?driver, ?scope, ?server, lifecycle.ABORTIVE, 1)))       { ret 10; }
+    if (!waited_one(wait(?driver, ?output[0], 1, 1000)) || output[0].kind != io_runtime.CLOSE) { ret 10; }
+    if (!readable_teardown(?runtime, ?driver, ?scope, ?listener))                              { ret 11; }
+    if (counting.live != 0)                                                                    { ret 12; }
+    ret 0;
+}
+
+# #874: after a peak drains, the runtime, the driver's slots and the backend's
+# tables are all back at their idle size, whichever backend the target uses
+test "async network: a drained peak returns the driver to idle at 1k, 10k and 100k" {
+    val sizes: [3]usize = [3]usize{1000, 10000, 100000};
+    var i:     usize    = 0;
+    for (i < 3) {
+        var idle:  usize = 0;
+        var peak:  usize = 0;
+        var after: usize = 0;
+        val ran:   i32   = driver_peak(sizes[i], ?idle, ?peak, ?after);
+        if (ran != 0)                    { ret 20 * (i::i32 + 1) + ran; }
+        if (peak < idle + 64 * sizes[i]) { ret 80 + i::i32; }
+        if (after != idle)               { ret 90 + i::i32; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# #874: the driver's slots follow the runtime's token indices, so a slot held
+# across a trim stays put, a live one pins its chunk, and a token from a
+# released chunk finds no slot even once the chunk is grown again
+test "async network: driver slots survive a shrink and stale tokens stay refused" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    var runtime: io_runtime.Runtime;
+    var driver:  Driver;
+    if (!ok_err(io_runtime.make(?runtime, ?pa, 4)) || !ok_err(make(?driver, ?runtime))) { ret 1; }
+    mutex.lock(?driver.lock);
+    var tokens: [65]io_runtime.Token;
+    var j:      usize = 0;
+    for (j < 65) {
+        tokens[j] = io_runtime.Token{index: j::u32, generation: (j + 1)::u32};
+        val slot: *Slot = ensure_slot(?driver, j);
+        if (slot == nil) { ret 2; }
+        val chunk: usize = table.chunk_of(?driver.slots, j);
+        driver.slot_live[chunk] = driver.slot_live[chunk] + 1;
+        slot.state              = SLOT_ACTIVE;
+        slot.generation         = tokens[j].generation;
+        slot.native_active      = false;
+        slot.owns_resource      = false;
+        j                       = j + 1;
+    }
+    val low:      *Slot = slot_for(?driver, tokens[0]);
+    val chunks:   usize = driver.slots.chunk_count;
+    var released: io_runtime.Completion;
+    # the top slot pins its chunk
+    j = 1;
+    for (j < 64) {
+        released.token = tokens[j];
+        cleanup_locked(?driver, ?released);
+        j = j + 1;
+    }
+    if (driver.slots.chunk_count != chunks || slot_for(?driver, tokens[64]) == nil) { ret 3; }
+    released.token = tokens[64];
+    cleanup_locked(?driver, ?released);
+    # chunk 0 holds the low slot and chunk 1 stays as slack
+    if (driver.slots.chunk_count != 2 || slot_for(?driver, tokens[0]) != low) { ret 4; }
+    if (slot_for(?driver, tokens[64]) != nil)                                 { ret 5; }
+    # regrown, a slot starts free until the runtime hands out its index again
+    if (ensure_slot(?driver, 64) == nil)      { ret 6; }
+    if (slot_for(?driver, tokens[64]) != nil) { ret 7; }
+    released.token = tokens[0];
+    cleanup_locked(?driver, ?released);
+    mutex.unlock(?driver.lock);
+    if (refused(destroy(?driver)) || !ok_bool(io_runtime.close(?runtime)) || !ok_err(io_runtime.destroy(?runtime))) { ret 8; }
     ret 0;
 }

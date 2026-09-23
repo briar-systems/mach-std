@@ -53,7 +53,7 @@ pub rec Header {
     link:         iocp.Link;
     generation:   u32;
     index:        u32;
-    next_free:    u32;
+    next_free:    usize;
     resource:     usize;
     auxiliary:    usize;
     context:      usize;
@@ -78,25 +78,26 @@ pub rec Hooks {
 
 # a bounded completion port backend
 # ---
-# operations: operation records, each starting with a Header
-# core:       the socket records, their map and the control lists
-# awaiting:   cancelled operations whose packet has not arrived
+# operations:     operation records, each starting with a Header
+# core:           the socket records, their map and the control lists
+# operation_pool: free operations, lowest chunk first. its floor is the
+#                 generation an operation of a regrown chunk starts from
+# awaiting:       cancelled operations whose packet has not arrived
 pub rec Backend {
     queue:     *shared.IoQueue;
     source_id: u16;
     # where every table's chunks come from
-    allocator:       allocator.Allocator;
-    operations:      table.Table;
-    completions:     table.Table;
-    core:            iocp.Core;
-    native:          *windows.IoCompletion;
-    hooks:           Hooks;
-    operation_slots: usize;
-    free_operation:  u32;
-    active:          usize;
-    ready:           usize;
-    awaiting:        usize;
-    lock:            mutex.Mutex;
+    allocator:      allocator.Allocator;
+    operations:     table.Table;
+    completions:    table.Table;
+    core:           iocp.Core;
+    native:         *windows.IoCompletion;
+    hooks:          Hooks;
+    operation_pool: table.Pool;
+    active:         usize;
+    ready:          usize;
+    awaiting:       usize;
+    lock:           mutex.Mutex;
 }
 
 # readiness is harvested in fixed batches, so the batch is not a capacity
@@ -148,7 +149,7 @@ pub fun zero_overlapped(overlapped: *NativeOverlapped) {
 }
 
 pub fun operation_for(backend: *Backend, token: types.Token) *Header {
-    if (token.index::usize >= backend.operation_slots) { ret nil; }
+    if (token.index::usize >= backend.operations.capacity) { ret nil; }
     val operation: *Header = header_at(backend, token.index::usize);
     if (operation.link.state == iocp.FREE || operation.generation != token.generation) { ret nil; }
     ret operation;
@@ -159,7 +160,7 @@ fun operation_from_context(backend: *Backend, context: usize) *Header {
     val offset: usize = $offset_of(Header, overlapped);
     if (context < offset) { ret nil; }
     val index: usize = table.index_of(?backend.operations, context - offset);
-    if (index == table.NO_INDEX || index >= backend.operation_slots) { ret nil; }
+    if (index == table.NO_INDEX) { ret nil; }
     val operation: *Header = header_at(backend, index);
     if (operation.link.state == iocp.FREE) { ret nil; }
     ret operation;
@@ -171,34 +172,67 @@ fun clear_borrowed(backend: *Backend, operation: *Header) {
     backend.hooks.clear(operation);
 }
 
-# the completion table tracks the operation table, so publishing a completion
-# always has somewhere to land
-fun operation_append(backend: *Backend) bool {
-    if (backend.operation_slots >= iocp.NONE::usize) { ret false; }
-    if (backend.operation_slots == backend.operations.capacity &&
+# the operation table's newest chunk joins the pool, every operation free
+fun adopt_operations(backend: *Backend) {
+    var index: usize = table.chunk_start(?backend.operations, backend.operations.chunk_count - 1);
+    for (index < backend.operations.capacity) {
+        val entry: *Header = header_at(backend, index);
+        entry.link.state = iocp.FREE;
+        entry.generation = backend.operation_pool.floor;
+        entry.index      = index::u32;
+        entry.resource   = INVALID_SOCKET;
+        entry.auxiliary  = INVALID_SOCKET;
+        clear_borrowed(backend, entry);
+        index = index + 1;
+    }
+    table.pool_adopt(?backend.operation_pool, ?backend.operations);
+}
+
+# the completion table is held at least at the operation table's size,
+# reserved before the operations grow, so publishing a completion always has
+# somewhere to land. an operation index is 32 bits wide and never NONE
+fun grow_operations(backend: *Backend) bool {
+    val chunk: usize = backend.operations.chunk_count;
+    if (chunk >= table.DIRECTORY) { ret false; }
+    val grown: usize = backend.operations.capacity + table.chunk_capacity(?backend.operations, chunk);
+    if (grown > iocp.NONE::usize || !table.reserve(?backend.completions, grown) ||
         !table.grow(?backend.operations)) { ret false; }
-    if (!table.reserve(?backend.completions, backend.operations.capacity)) { ret false; }
-    val index: usize   = backend.operation_slots;
-    val entry: *Header = header_at(backend, index);
-    entry.link.state = iocp.FREE;
-    entry.generation = 0;
-    entry.index      = index::u32;
-    entry.resource   = INVALID_SOCKET;
-    entry.auxiliary  = INVALID_SOCKET;
-    clear_borrowed(backend, entry);
-    entry.next_free         = backend.free_operation;
-    backend.free_operation  = index::u32;
-    backend.operation_slots = index + 1;
+    adopt_operations(backend);
     ret true;
+}
+
+# give back what a peak grew. operations release a chunk once it and the chunk
+# below it are free, the completion table follows them down but never below
+# what the last publish filled, and the socket records trim with their map.
+# only free operations are released, and a free operation owes no packet, so
+# no overlapped address the kernel still holds moves. runs where a lock hold
+# ends, never inside a publish, so the completions being filled stay put
+pub fun trim_locked(backend: *Backend) {
+    table.pool_trim(?backend.operation_pool, ?backend.operations, $offset_of(Header, generation));
+    var keep: usize = backend.operations.capacity;
+    if (keep < backend.ready) { keep = backend.ready; }
+    for (backend.completions.chunk_count > 1) {
+        val top: usize = backend.completions.chunk_count - 1;
+        if (backend.completions.capacity - table.chunk_capacity(?backend.completions, top) < keep) { brk; }
+        val released: err[allocator.Error] = table.shrink(?backend.completions);
+        if (sel released.err) { brk; }
+    }
+    iocp.trim(?backend.core);
+}
+
+# every hold of backend.lock that may have freed something ends here, so what
+# a drained peak grew goes back as soon as the lock is let go
+pub fun unlock(backend: *Backend) {
+    trim_locked(backend);
+    mutex.unlock(?backend.lock);
 }
 
 # a free operation joins the socket record sock in state
 pub fun claim_locked(backend: *Backend, sock: u32, kind: runtime.Kind, resource: usize, context: usize, state: u8, token: *types.Token) *Header {
-    if (backend.free_operation == iocp.NONE && !operation_append(backend)) { ret nil; }
-    val index:     usize   = backend.free_operation::usize;
-    val operation: *Header = header_at(backend, index);
-    backend.free_operation = operation.next_free;
-    var generation: u32 = operation.generation + 1;
+    if (table.pool_peek(?backend.operation_pool, ?backend.operations) == table.NO_INDEX && !grow_operations(backend)) { ret nil; }
+    val index:      usize   = table.pool_take(?backend.operation_pool, ?backend.operations);
+    val operation:  *Header = header_at(backend, index);
+    var generation: u32     = operation.generation + 1;
     if (generation == 0) { generation = 1; }
     zero_overlapped(?operation.overlapped);
     operation.generation   = generation;
@@ -243,11 +277,10 @@ pub fun release_locked(backend: *Backend, operation: *Header) {
     if (operation.link.state == iocp.CANCELLED) { backend.awaiting = backend.awaiting - 1; }
     val sock: u32 = iocp.release(?backend.core, ?backend.operations, operation.index);
     clear_borrowed(backend, operation);
-    operation.resource     = INVALID_SOCKET;
-    operation.auxiliary    = INVALID_SOCKET;
-    operation.next_free    = backend.free_operation;
-    backend.free_operation = operation.index;
-    backend.active         = backend.active - 1;
+    operation.resource  = INVALID_SOCKET;
+    operation.auxiliary = INVALID_SOCKET;
+    backend.active      = backend.active - 1;
+    table.pool_put(?backend.operation_pool, ?backend.operations, operation.index::usize);
     if (sock != iocp.NONE) { settle_socket_locked(backend, sock); }
 }
 
@@ -314,16 +347,16 @@ pub fun make(backend: *Backend, queue: *shared.IoQueue, a: *allocator.Allocator,
         table.destroy(?backend.operations);
         ret windows.ENOMEM;
     }
-    backend.native          = batch.ok;
-    backend.queue           = queue;
-    backend.source_id       = source_id;
-    backend.hooks           = hooks;
-    backend.operation_slots = 0;
-    backend.free_operation  = iocp.NONE;
-    backend.active          = 0;
-    backend.ready           = 0;
-    backend.awaiting        = 0;
-    backend.lock            = mutex.make();
+    backend.native    = batch.ok;
+    backend.queue     = queue;
+    backend.source_id = source_id;
+    backend.hooks     = hooks;
+    backend.active    = 0;
+    backend.ready     = 0;
+    backend.awaiting  = 0;
+    backend.lock      = mutex.make();
+    table.pool_make(?backend.operation_pool, $offset_of(Header, next_free));
+    adopt_operations(backend);
     ret 0;
 }
 
@@ -358,11 +391,11 @@ pub fun admit(backend: *Backend, resource: usize, opening: u64, sock: *u32) i64 
     mutex.lock(?backend.lock);
     val acquired: i64 = acquire_locked(backend, resource, opening, true, sock);
     if (acquired < 0) {
-        mutex.unlock(?backend.lock);
+        unlock(backend);
         ret acquired;
     }
     if (controlled_locked(backend, @sock)) {
-        mutex.unlock(?backend.lock);
+        unlock(backend);
         ret windows.ENOTCONN;
     }
     ret 0;
@@ -378,7 +411,7 @@ pub fun submit_buffer(backend: *Backend, resource: usize, opening: u64, buffer: 
     if (iocp.must_defer(?backend.core, sock, kind)) { state = iocp.DEFERRED; }
     val operation: *Header = claim_locked(backend, sock, kind, resource, context, state, token);
     if (operation == nil) {
-        mutex.unlock(?backend.lock);
+        unlock(backend);
         ret windows.ENOMEM;
     }
     operation.buffer = NativeBuffer{length: length::u32, data: buffer};
@@ -390,7 +423,7 @@ pub fun submit_buffer(backend: *Backend, resource: usize, opening: u64, buffer: 
         result = windows.sock_async_send(resource, (?operation.buffer)::ptr, 1, 0, (?operation.overlapped)::ptr);
     }
     if (result < 0) { release_locked(backend, operation); }
-    mutex.unlock(?backend.lock);
+    unlock(backend);
     ret result;
 }
 
@@ -400,16 +433,16 @@ fun submit_control(backend: *Backend, resource: usize, opening: u64, context: us
     var sock:     u32 = iocp.NONE;
     val acquired: i64 = acquire_locked(backend, resource, opening, false, ?sock);
     if (acquired < 0) {
-        mutex.unlock(?backend.lock);
+        unlock(backend);
         ret acquired;
     }
     if (controlled_locked(backend, sock)) {
-        mutex.unlock(?backend.lock);
+        unlock(backend);
         ret windows.EBUSY;
     }
     val operation: *Header = claim_locked(backend, sock, kind, resource, context, iocp.CONTROL_PENDING, token);
     if (operation == nil) {
-        mutex.unlock(?backend.lock);
+        unlock(backend);
         ret windows.ENOMEM;
     }
     if (kind == runtime.CLOSE) {
@@ -425,7 +458,7 @@ fun submit_control(backend: *Backend, resource: usize, opening: u64, context: us
         iocp.unmap(?backend.core, sock);
     }
     settle_socket_locked(backend, sock);
-    mutex.unlock(?backend.lock);
+    unlock(backend);
     windows.io_queue_wake(backend.queue);
     ret 0;
 }
@@ -449,7 +482,7 @@ pub fun close_socket(backend: *Backend, resource: usize, opening: u64) i64 {
     val closed: i64 = windows.sock_close(resource);
     val sock:   u32 = iocp.lookup(?backend.core, resource);
     if (sock != iocp.NONE && socket_record(backend, sock).opening == opening) { iocp.unmap(?backend.core, sock); }
-    mutex.unlock(?backend.lock);
+    unlock(backend);
     ret closed;
 }
 
@@ -467,22 +500,22 @@ pub fun cancel(backend: *Backend, token: types.Token, finished: *opt[types.Nativ
     mutex.lock(?backend.lock);
     val operation: *Header = operation_for(backend, token);
     if (operation == nil) {
-        mutex.unlock(?backend.lock);
+        unlock(backend);
         ret windows.EBADF;
     }
     val state: u8 = operation.link.state;
     if (state == iocp.CONTROL_PENDING || state == iocp.CONTROL_READY || state == iocp.DEFERRED) {
         release_locked(backend, operation);
-        mutex.unlock(?backend.lock);
+        unlock(backend);
         windows.io_queue_wake(backend.queue);
         ret 0;
     }
     if (state == iocp.CANCELLED) {
-        mutex.unlock(?backend.lock);
+        unlock(backend);
         ret runtime.CANCELLATION_PENDING;
     }
     if (state != iocp.ACTIVE && state != iocp.CANCEL_READY) {
-        mutex.unlock(?backend.lock);
+        unlock(backend);
         ret windows.EBADF;
     }
     # a close already aborted a cancel-ready request, so only its packet is owed
@@ -492,7 +525,7 @@ pub fun cancel(backend: *Backend, token: types.Token, finished: *opt[types.Nativ
     if (state == iocp.ACTIVE) { windows.io_queue_cancel(operation.resource, (?operation.overlapped)::ptr); }
     iocp.transition(?backend.core, ?backend.operations, operation.index, iocp.CANCELLED, 0);
     backend.awaiting = backend.awaiting + 1;
-    mutex.unlock(?backend.lock);
+    unlock(backend);
     ret runtime.CANCELLATION_PENDING;
 }
 
@@ -596,7 +629,7 @@ pub fun flush(backend: *Backend) i64 {
     backend.ready = 0;
     emit_control_locked(backend);
     val ready: usize = backend.ready;
-    mutex.unlock(?backend.lock);
+    unlock(backend);
     ret ready::i64;
 }
 
@@ -613,7 +646,7 @@ pub fun dispatch(
     mutex.lock(?backend.lock);
     val operation: *Header = operation_from_context(backend, context);
     if (operation == nil) {
-        mutex.unlock(?backend.lock);
+        unlock(backend);
         ret 0;
     }
     @claimed      = true;
@@ -627,7 +660,7 @@ pub fun dispatch(
     });
     emit_control_locked(backend);
     val ready: usize = backend.ready;
-    mutex.unlock(?backend.lock);
+    unlock(backend);
     ret ready::i64;
 }
 
@@ -638,7 +671,7 @@ pub fun poll(backend: *Backend, timeout_ms: i32) i64 {
     backend.ready = 0;
     emit_control_locked(backend);
     val immediately_ready: usize = backend.ready;
-    mutex.unlock(?backend.lock);
+    unlock(backend);
     if (immediately_ready != 0) { ret immediately_ready::i64; }
 
     val count: i64 = windows.io_queue_poll(backend.queue, backend.native, NATIVE_BATCH, timeout_ms);
@@ -651,7 +684,7 @@ pub fun poll(backend: *Backend, timeout_ms: i32) i64 {
     }
     emit_control_locked(backend);
     val ready: usize = backend.ready;
-    mutex.unlock(?backend.lock);
+    unlock(backend);
     ret ready::i64;
 }
 
@@ -673,13 +706,11 @@ pub fun destroy(backend: *Backend) i64 {
     iocp.destroy(?backend.core);
     table.destroy(?backend.completions);
     table.destroy(?backend.operations);
-    backend.native          = nil;
-    backend.operation_slots = 0;
-    backend.free_operation  = iocp.NONE;
-    backend.active          = 0;
-    backend.ready           = 0;
-    backend.queue           = nil;
-    backend.source_id       = 0;
+    backend.native    = nil;
+    backend.active    = 0;
+    backend.ready     = 0;
+    backend.queue     = nil;
+    backend.source_id = 0;
     mutex.unlock(?backend.lock);
     ret 0;
 }
