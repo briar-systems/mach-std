@@ -374,6 +374,10 @@ ext fun GetCurrentThread() isize;
 ext fun GetCurrentThreadId() u32;
 #[library("kernel32.dll")]
 ext fun LocalFree(p0: ptr) ptr;
+#[library("kernel32.dll")]
+ext fun TlsAlloc() u32;
+#[library("kernel32.dll")]
+ext fun TlsSetValue(index: u32, value: ptr) i32;
 
 # access control lives in advapi32.dll
 #[library("advapi32.dll")]
@@ -4491,6 +4495,84 @@ fwd os_shared.PROCESS_OP_TERMINATE;
 
 # threads
 
+# the thread block
+#
+# std's block rides one TLS index. TlsSetValue installs it and the read goes
+# straight to the TEB's slots at their public winternl.h offsets: TlsGetValue
+# would clear the thread's last error on every read. the index is allocated
+# once, by the runtime before main or by the first spawn.
+
+val TLS_OUT_OF_INDEXES:      u32   = 0xFFFFFFFF;
+val TLS_MINIMUM_AVAILABLE:   usize = 64;
+val TEB_TLS_SLOTS:           usize = 0x1480;
+val TEB_TLS_EXPANSION_SLOTS: usize = 0x1780;
+
+# 0 = untouched, 1 = one thread is allocating the index, 2 = ready, 3 = refused
+var block_index_state: i64 = 0;
+var block_index:       u32 = 0;
+var block_index_error: i64 = 0;
+
+# allocate std's TLS index exactly once, whoever gets there first
+# ---
+# ret: 0 once the index exists, or TlsAlloc's refusal
+fun ensure_block_index() i64 {
+    val state: i64 = atomic.load(?block_index_state);
+    if (state == 2) { ret 0; }
+    if (state == 3) { ret block_index_error; }
+    var expected: i64 = 0;
+    if (atomic.cas(?block_index_state, ?expected, 1)) {
+        val index: u32 = TlsAlloc();
+        if (index == TLS_OUT_OF_INDEXES) {
+            block_index_error = last_error();
+            atomic.store(?block_index_state, 3);
+            ret block_index_error;
+        }
+        block_index = index;
+        atomic.store(?block_index_state, 2);
+        ret 0;
+    }
+    for (atomic.load(?block_index_state) == 1) { atomic.spin_hint(); }
+    if (atomic.load(?block_index_state) == 3) { ret block_index_error; }
+    ret 0;
+}
+
+# install block as the calling thread's
+# ---
+# ret: 0, or the refusal of TlsAlloc or TlsSetValue
+pub fun thread_block_enter(block: *os_shared.ThreadBlock) i64 {
+    val index_error: i64 = ensure_block_index();
+    if (index_error < 0) { ret index_error; }
+    block.self_addr = block::usize;
+    if (TlsSetValue(block_index, block::ptr) == 0) { ret last_error(); }
+    ret 0;
+}
+
+# forget the calling thread's block before the frame holding it returns
+fun thread_block_leave() {
+    if (atomic.load(?block_index_state) == 2) { TlsSetValue(block_index, nil); }
+}
+
+# the calling thread's block, read from its TEB without a system call
+# ---
+# ret: the block, or nil on a thread nothing installed one on
+pub fun thread_block() *os_shared.ThreadBlock {
+    if (atomic.load(?block_index_state) != 2) { ret nil; }
+    var teb: usize = 0;
+    asm x86_64 {
+        mov rax, qword gs:[0x30]
+        mov {teb}, rax
+    }
+    val index: usize = block_index::usize;
+    var slot:  usize = teb + TEB_TLS_SLOTS + index * 8;
+    if (index >= TLS_MINIMUM_AVAILABLE) {
+        val expansion: usize = @((teb + TEB_TLS_EXPANSION_SLOTS)::*usize);
+        if (expansion == 0) { ret nil; }
+        slot = expansion + (index - TLS_MINIMUM_AVAILABLE) * 8;
+    }
+    val block: usize = @(slot::*usize);
+    ret block::*os_shared.ThreadBlock;
+}
+
 rec ThreadStart {
     fn_addr:          usize;
     arg_addr:         usize;
@@ -4504,6 +4586,10 @@ rec ThreadStart {
 val THREAD_START_SIZE: usize = 4096;
 
 fun thread_trampoline(arg: ptr) {
+    # the spawning thread allocated the index, so only an out-of-memory
+    # expansion slot refuses this, and the thread then reads as blockless
+    var block: os_shared.ThreadBlock;
+    thread_block_enter(?block);
     val start: *ThreadStart = arg::usize::*ThreadStart;
     for (atomic.load(?start.run) == 0) {
         atomic.spin_hint();
@@ -4519,12 +4605,14 @@ fun thread_trampoline(arg: ptr) {
     deallocate(start::ptr, THREAD_START_SIZE);
 
     if (run < 0) {
+        thread_block_leave();
         atomic.store(reclaimable_addr::*i64, 1);
         ret;
     }
 
     val fn_ptr: fun(*u8) = fn_addr::fun(*u8);
     fn_ptr(arg_addr::*u8);
+    thread_block_leave();
 
     val state:    *i64 = state_addr::*i64;
     var expected: i64  = 0;
@@ -4574,6 +4662,8 @@ pub fun thread_spawn(
     stack_reserve: usize, stack_commit: usize, native: *usize,
 ) i64 {
     if (stack_commit != 0) { ret -95; }
+    val index_error: i64 = ensure_block_index();
+    if (index_error < 0) { ret index_error; }
 
     val start_mem: ptr = allocate(THREAD_START_SIZE);
     if (start_mem == nil) { ret -12; }
@@ -4801,6 +4891,28 @@ pub fun io_queue_attach(queue: *os_shared.IoQueue, resource: usize, source: u16)
     val attached: isize = CreateIoCompletionPort(resource::isize, queue.handle::isize, key, 0);
     if (attached == 0)                   { ret win32_error(GetLastError()); }
     if (attached::usize != queue.handle) { ret EINVAL; }
+    ret 0;
+}
+
+rec FILE_COMPLETION_INFORMATION {
+    port: isize;
+    key:  usize;
+}
+
+val FILE_REPLACE_COMPLETION_INFORMATION: u32 = 61;
+
+# resource leaves the completion port it is attached to, so another queue can
+# attach it. the resource must have no request outstanding. windows 8.1 and
+# later replace a handle's port this way
+pub fun io_queue_detach(queue: *os_shared.IoQueue, resource: usize) i64 {
+    if (queue == nil || queue.handle == 0 || resource == INVALID_SOCKET) { ret EINVAL; }
+    val procedure: ptr = ntdll_procedure("NtSetInformationFile");
+    if (procedure == nil) { ret ENOTSUP; }
+    val set_information: fun(isize, *IO_STATUS_BLOCK, ptr, u32, u32) i32 = procedure::usize::fun(isize, *IO_STATUS_BLOCK, ptr, u32, u32) i32;
+    var information:     FILE_COMPLETION_INFORMATION                     = FILE_COMPLETION_INFORMATION{port: 0, key: 0};
+    var status_block:    IO_STATUS_BLOCK;
+    val status:          i32                                             = set_information(resource::isize, ?status_block, (?information)::ptr, $size_of(FILE_COMPLETION_INFORMATION)::u32, FILE_REPLACE_COMPLETION_INFORMATION);
+    if (status < 0) { ret ntstatus_error(status); }
     ret 0;
 }
 

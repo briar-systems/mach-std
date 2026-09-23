@@ -7,6 +7,7 @@ use io_runtime:  std.io.runtime;
 use local_async: std.net.async.local;
 use std.net.local;
 use std.sync.cancel;
+use std.sync.thread;
 use std.system.os;
 use std.types.option.opt;
 use std.types.bool.bool;
@@ -861,6 +862,208 @@ test "async local readiness waits hold no buffer and settle like reads" {
         || !ok_bool(io_runtime.close(?runtime))
         || !ok_err(io_runtime.destroy(?runtime))) {
         ret 25;
+    }
+    ret 0;
+}
+
+# the completion with context from driver, waiting a bounded number of rounds.
+# any other completion fails the wait
+fun await_local(driver: *local_async.Driver, context: usize, out: *io_runtime.Completion) bool {
+    var output:  [1]io_runtime.Completion;
+    var attempt: usize = 0;
+    for (attempt < 8) {
+        val waited: res[usize, io_error.Error] = local_async.wait(driver, ?output[0], 1, 1000);
+        if (sel waited.err) { ret false; }
+        if (waited.ok == 1) {
+            if (output[0].context != context) { ret false; }
+            @out = output[0];
+            ret true;
+        }
+        attempt = attempt + 1;
+    }
+    ret false;
+}
+
+# exactly length bytes into buffer from stream, or false at an error, end of
+# stream or timeout
+fun read_exact_local(driver: *local_async.Driver, scope: *cancel.Scope, stream: *local_async.Stream, buffer: *u8, length: usize, context: usize) bool {
+    var got: usize = 0;
+    for (got < length) {
+        if (failed[io_runtime.Token](local_async.submit_read(driver, scope, stream, ?buffer[got], length - got, context))) { ret false; }
+        var done: io_runtime.Completion;
+        if (!await_local(driver, context, ?done) || done.has_error || done.bytes == 0) { ret false; }
+        got = got + done.bytes;
+    }
+    ret true;
+}
+
+fun write_all_local(driver: *local_async.Driver, scope: *cancel.Scope, stream: *local_async.Stream, buffer: *u8, length: usize, context: usize) bool {
+    var sent: usize = 0;
+    for (sent < length) {
+        if (failed[io_runtime.Token](local_async.submit_write(driver, scope, stream, ?buffer[sent], length - sent, context))) { ret false; }
+        var done: io_runtime.Completion;
+        if (!await_local(driver, context, ?done) || done.has_error || done.bytes == 0) { ret false; }
+        sent = sent + done.bytes;
+    }
+    ret true;
+}
+
+rec AdoptWorker {
+    detached: local_async.Detached;
+    stale:    local_async.Stream;
+    result:   i32;
+}
+
+# thread 2: a driver of its own adopts the stream, refuses driver A's token,
+# reads what the peer sent before and after the move, answers, and closes once
+# the peer has
+fun adopt_and_serve(context: *AdoptWorker) i32 {
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    var runtime: io_runtime.Runtime;
+    if (!ok_err(io_runtime.make(?runtime, ?pa, 4))) { ret 1; }
+    var driver: local_async.Driver;
+    if (refused(local_async.make(?driver, ?runtime))) { ret 2; }
+    var scope: cancel.Scope;
+    if (!scope_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 3; }
+    var byte:  u8                                    = 0;
+    val early: res[io_runtime.Token, io_error.Error] = local_async.submit_read(?driver, ?scope, ?context.stale, ?byte, 1, 0xb100);
+    if (!(sel early.err && early.err.kind == io_error.CLOSED)) { ret 4; }
+    val adopted: res[local_async.Stream, io_error.Error] = local_async.adopt(?driver, ?context.detached);
+    if (sel adopted.err) { ret 5; }
+    var stream: local_async.Stream = adopted.ok;
+    # the detached value gave its socket up, so a second adopt is refused
+    if (!failed[local_async.Stream](local_async.adopt(?driver, ?context.detached))) { ret 6; }
+    val late: res[io_runtime.Token, io_error.Error] = local_async.submit_read(?driver, ?scope, ?context.stale, ?byte, 1, 0xb101);
+    if (!(sel late.err && late.err.kind == io_error.CLOSED)) { ret 7; }
+    var input: [4]u8;
+    if (!read_exact_local(?driver, ?scope, ?stream, ?input[0], 4, 0xb102))        { ret 8; }
+    if (input[0] != 'p' || input[1] != 'i' || input[2] != 'n' || input[3] != 'g') { ret 9; }
+    var reply: [4]u8 = [4]u8{'p', 'o', 'n', 'g'};
+    if (!write_all_local(?driver, ?scope, ?stream, ?reply[0], 4, 0xb103)) { ret 10; }
+    # the peer closes once it has the reply
+    if (failed[io_runtime.Token](local_async.submit_read(?driver, ?scope, ?stream, ?byte, 1, 0xb104))) { ret 11; }
+    var done: io_runtime.Completion;
+    if (!await_local(?driver, 0xb104, ?done) || (!done.has_error && done.bytes != 0))                                    { ret 12; }
+    if (failed[io_runtime.Token](local_async.submit_stream_close(?driver, ?scope, ?stream, lifecycle.ABORTIVE, 0xb105))) { ret 13; }
+    if (!await_local(?driver, 0xb105, ?done) || done.has_error)                                                          { ret 14; }
+    if (!scope_ok(cancel.destroy(?scope))
+        || refused(local_async.destroy(?driver))
+        || !ok_bool(io_runtime.close(?runtime))
+        || !ok_err(io_runtime.destroy(?runtime))) {
+        ret 15;
+    }
+    ret 0;
+}
+
+fun adopt_worker(arg: *u8) {
+    val context: *AdoptWorker = arg::*AdoptWorker;
+    context.result = adopt_and_serve(context);
+}
+
+# #891: a stream accepted on driver A in one thread is detached, adopted by
+# driver B in another, and carries data both ways. a detach with an operation
+# in flight is refused and changes nothing, and driver A's token is refused by
+# A and by B once the stream has moved
+test "async local: a detached stream is adopted and served by a driver on another thread" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    $if ($mach.build.os == $mach.os.windows) {
+        if (windows.running_under_wine()) { ret 0; }
+    }
+    var name:   [108]u8;
+    val length: usize = saturation_endpoint_name(?name[0]);
+    name[length - 1] = 'd';
+    val endpoint_result: res[local.Endpoint, io_error.Error] = local.filesystem_bytes(?name[0], length);
+    if (sel endpoint_result.err) { ret 1; }
+    val bound:   local.Endpoint = endpoint_result.ok;
+    var runtime: io_runtime.Runtime;
+    if (!ok_err(io_runtime.make(?runtime, ?pa, 8))) { ret 2; }
+    var driver: local_async.Driver;
+    if (refused(local_async.make(?driver, ?runtime))) { ret 3; }
+    var listener: local_async.Listener;
+    if (!managed_listen(?driver, bound, ?listener)) { ret 4; }
+    var server: local_async.Stream;
+    var client: local_async.Stream;
+    if (readable_local_pair(?driver, ?listener, bound, ?server, ?client) != 0) { ret 5; }
+    var scope: cancel.Scope;
+    if (!scope_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 6; }
+
+    # a cancelled wait whose completion the driver has not yet returned still
+    # holds the stream, though the platform has let the socket go
+    var held: cancel.Scope;
+    if (!scope_ok(cancel.make_root(?held, opt[time.Instant].none{})))                           { ret 50; }
+    if (failed[io_runtime.Token](local_async.submit_readable(?driver, ?held, ?server, 0xb006))) { ret 51; }
+    if (!scope_changed(cancel.cancel(?held)))                                                   { ret 52; }
+    val queued: res[local_async.Detached, io_error.Error] = local_async.detach(?driver, ?server);
+    if (!(sel queued.err && queued.err.kind == io_error.BUSY) || server.generation == 0) { ret 53; }
+    var cancelled: io_runtime.Completion;
+    if (!await_local(?driver, 0xb006, ?cancelled) || !cancelled.has_error || cancelled.error.kind != io_error.CANCELLED) { ret 54; }
+    if (!scope_ok(cancel.destroy(?held)))                                                                                { ret 55; }
+
+    # a pending readiness wait keeps the stream in driver A
+    if (failed[io_runtime.Token](local_async.submit_readable(?driver, ?scope, ?server, 0xb000))) { ret 7; }
+    val busy: res[local_async.Detached, io_error.Error] = local_async.detach(?driver, ?server);
+    if (!(sel busy.err && busy.err.kind == io_error.BUSY) || server.generation == 0) { ret 8; }
+    var payload: [4]u8 = [4]u8{'p', 'i', 'n', 'g'};
+    if (failed[io_runtime.Token](local_async.submit_write(?driver, ?scope, ?client, ?payload[0], 4, 0xb001))) { ret 9; }
+    var output:  [2]io_runtime.Completion;
+    var settled: usize = 0;
+    var attempt: usize = 0;
+    for (attempt < 8 && settled < 2) {
+        val waited: res[usize, io_error.Error] = local_async.wait(?driver, ?output[0], 2, 1000);
+        if (sel waited.err) { ret 10; }
+        var i: usize = 0;
+        for (i < waited.ok) {
+            if (output[i].has_error || (output[i].context != 0xb000 && output[i].context != 0xb001)) { ret 11; }
+            if (output[i].context == 0xb001 && output[i].bytes != 4)                                 { ret 11; }
+            settled = settled + 1;
+            i       = i + 1;
+        }
+        attempt = attempt + 1;
+    }
+    if (settled != 2) { ret 12; }
+
+    # idle now, so the stream leaves A, and every copy of its token is refused
+    val stale:    local_async.Stream                        = server;
+    val detached: res[local_async.Detached, io_error.Error] = local_async.detach(?driver, ?server);
+    if (sel detached.err)       { ret 13; }
+    if (server.generation != 0) { ret 13; }
+    var byte:         u8                                    = 0;
+    var copy:         local_async.Stream                    = stale;
+    val refused_read: res[io_runtime.Token, io_error.Error] = local_async.submit_read(?driver, ?scope, ?copy, ?byte, 1, 0xb002);
+    if (!(sel refused_read.err && refused_read.err.kind == io_error.CLOSED)) { ret 14; }
+    val refused_detach: res[local_async.Detached, io_error.Error] = local_async.detach(?driver, ?copy);
+    if (!(sel refused_detach.err && refused_detach.err.kind == io_error.CLOSED)) { ret 15; }
+
+    var context: AdoptWorker      = AdoptWorker{detached: detached.ok, stale: stale, result: -1};
+    var worker:  thread.Thread;
+    val spawned: thread.Operation = thread.spawn_with(adopt_worker, (?context)::*u8, ?worker);
+    if (sel spawned.err) { ret 16; }
+    var reply:    [4]u8;
+    val answered: bool = read_exact_local(?driver, ?scope, ?client, ?reply[0], 4, 0xb003);
+    var closed:   bool = false;
+    if (!failed[io_runtime.Token](local_async.submit_stream_close(?driver, ?scope, ?client, lifecycle.ABORTIVE, 0xb004))) {
+        var done: io_runtime.Completion;
+        closed = await_local(?driver, 0xb004, ?done) && !done.has_error;
+    }
+    val joined: thread.Operation = thread.join(?worker);
+    if (sel joined.err)                                                                        { ret 17; }
+    if (context.result != 0)                                                                   { ret 20 + context.result; }
+    if (!answered || reply[0] != 'p' || reply[1] != 'o' || reply[2] != 'n' || reply[3] != 'g') { ret 18; }
+    if (!closed)                                                                               { ret 19; }
+
+    var close_scope: cancel.Scope;
+    var done:        io_runtime.Completion;
+    if (!scope_ok(cancel.make_root(?close_scope, opt[time.Instant].none{}))
+        || failed[io_runtime.Token](local_async.submit_listener_close(?driver, ?close_scope, ?listener, 0xb005))
+        || !await_local(?driver, 0xb005, ?done) || done.has_error
+        || !scope_ok(cancel.destroy(?close_scope))
+        || !scope_ok(cancel.destroy(?scope))
+        || refused(local_async.destroy(?driver))
+        || !ok_bool(io_runtime.close(?runtime))
+        || !ok_err(io_runtime.destroy(?runtime))) {
+        ret 40;
     }
     ret 0;
 }
