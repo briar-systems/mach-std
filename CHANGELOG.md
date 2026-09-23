@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `sync.thread.current_token` names the calling thread without a system call
+  (#894, mach-quic#231). A `Token` is an `i64`, positive and never 0, distinct
+  across live threads and stable for a thread's life. It is the address of
+  the thread's block, which std now installs on the main thread at process
+  entry and on every thread it spawns: linux sets the thread pointer
+  (`CLONE_SETTLS`, and `arch_prctl` on x86_64, `tpidr_el0` on aarch64, `tp` on
+  riscv64), darwin uses a pthread key and windows a TLS index read from the
+  TEB. A thread std did not create falls back to its thread id with bit 62
+  set, except on linux x86_64, where it must not ask. The OS contract's
+  threads group gains `ThreadBlock`, `thread_block` and `thread_block_enter`.
+  No freestanding target has threads, so none of this is built there.
+
 ## [7.4.0] - 2026-09-23
 
 ### Added
