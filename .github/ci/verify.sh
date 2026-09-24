@@ -26,6 +26,8 @@ case "$MACH_CI_LEG" in
         # classification is target-independent, so one leg is the whole signal
         bash test/derive/verify.sh
         bash test/secret/verify.sh
+        # every module with a test is reached by `mach test .` or `--lib tests`, per target
+        bash test/selections/verify.sh "$mach"
         bash test/deadline/verify.sh
         bash test/sha256/verify.sh "$mach" linux-x86_64
         bash test/sha256/refusals.sh "$mach"
