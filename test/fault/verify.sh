@@ -38,10 +38,19 @@ if grep -qF "[target.$target]" "$scratch/repo/mach.toml"; then
     release_checked=1
 fi
 
-test_args=(test "$scratch/repo/test/fault" --target "$target" --profile "$profile")
+test_args=(test "$scratch/repo/test/fault" --lib tests --target "$target" --profile "$profile")
 if [ -n "$runner" ]; then
     test_args+=(--runner "$runner")
 fi
+
+# mach 5.12 tests only the selected artifact's closure, so a module the tests
+# artifact does not reach would drop its tests without a word
+listed="$(mach_run "${test_args[@]}" --list | tr '\134' '/')" || fail "fault tests could not be listed"
+for source in "$here"/src/*.mach; do
+    grep -qE '^[[:space:]]*test "' "$source" || continue
+    grep -qF "test/fault/src/$(basename "$source"):" <<< "$listed" \
+        || fail "fault.$(basename "$source" .mach) holds tests that lib/tests.mach does not reach"
+done
 mach_run "${test_args[@]}"
 mach_run "${test_args[@]}" -O2
 mach_run build "$scratch/repo/test/fault" -O2 --target "$target" --profile "$profile"
