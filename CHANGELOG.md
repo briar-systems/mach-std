@@ -7,7 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-std now requires mach 5.12.0 (`mach = "^5.12"`) (#908). The typed secret view
+## [8.0.0] - 2026-09-23
+
+std now requires mach 5.12.0 (`mach = "^5.12"`) (#908). That drops mach 5.8
+through 5.11, so this is a major release. The typed secret view
 takes its type identity from `$type_id(T)`, which that release adds
 (briar-systems/mach#3861). No source change is needed to build against it.
 
