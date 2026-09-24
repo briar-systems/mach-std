@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+std now requires mach 5.12.0 (`mach = "^5.12"`) (#908). No source change is
+needed to build against it.
+
+### Changed
+
+- The tests of modules the library does not reach run under
+  `mach test . --lib tests`. mach 5.12 tests only the selected artifact's
+  closure (briar-systems/mach#3813), so `mach test .` alone no longer collects
+  the capability conformance, DIT, process limit, IOCP and name resolution
+  tests on every target. `[artifact.std]` is marked `default = true`, so
+  `mach build .` and `--all-targets` still build the library alone, and
+  `test/selections/verify.sh` fails when a test is collected by neither run
+  (#908).
+
 ## [7.5.0] - 2026-09-23
 
 ### Added
