@@ -25,9 +25,15 @@
 # a secret class is backed by welded storage from std.memory.secret, held as a
 # borrow so the pool itself carries no welded pointer: its chunks carry no plain
 # data pointer, `secret` gives the welded view, and release wipes the whole
-# chunk. secret chunks are served through `SecretSource`, never through
-# `Source`, so only a holder of a `SecretSource` is welded. welded storage needs the pages capability (HAS_PAGES), so a secret class
-# or request is refused on a target without it (WELDED is false). a
+# chunk. `secret_typed[T]` views a held secret chunk as T values instead, with
+# T's own secrecy shape, so a record with secret fields lives in the chunk with
+# no cast. a hold sees its chunk one way only: once as bytes, the typed view is
+# refused, and once as T, the byte view and every other type are refused, so no
+# byte or field of one view aliases a byte of different secrecy in another. the
+# next hold starts over on wiped storage. secret chunks are served through
+# `SecretSource`, never through `Source`, so only a holder of a `SecretSource`
+# is welded. welded storage needs the pages capability (HAS_PAGES), so a secret
+# class or request is refused on a target without it (WELDED is false). a
 # bring-your-own-OS implementation gets secret classes by providing the os
 # contract's secret primitives.
 #
@@ -86,6 +92,9 @@ val SLOT_EMPTY:    u8    = 0;
 val SLOT_HELD:     u8    = 1;
 val SLOT_RETAINED: u8    = 2;
 val DEFAULT_ALIGN: usize = 16;
+val VIEW_NONE:     u8    = 0;
+val VIEW_BYTES:    u8    = 1;
+val VIEW_TYPED:    u8    = 2;
 
 # what a caller asks for
 # ---
@@ -173,6 +182,19 @@ pub rec Account {
     next:           *Account;
 }
 
+# the typed shape a held secret chunk is viewed as, built by the typed views
+# ---
+# kind:  the element type's identity, from `$type_id`
+# size:  bytes per element
+# align: the element alignment
+# count: elements in the view
+pub rec Shape {
+    kind:  u64;
+    size:  usize;
+    align: usize;
+    count: usize;
+}
+
 # the interface every plain buffer source implements
 #
 # a consumer drives a source only through these members, through the `source_*`
@@ -223,6 +245,7 @@ pub rec Source {
 # fn_view:          the welded view of a held secret chunk, nil when stale
 # fn_lanes:         budget lanes per account, 0 when undeclared
 # fn_measure:       the bytes an acquisition would charge, 0 when refused
+# fn_bind:          bind a held secret chunk to a typed shape, as `secret_bind`
 pub rec SecretSource {
     ctx:              ptr;
     fn_open_account:  fun(ptr, *Account, u64, Budgets, usize) Reason;
@@ -232,6 +255,7 @@ pub rec SecretSource {
     fn_view:          fun(ptr, Chunk) *^u8;
     fn_lanes:         fun(ptr) usize;
     fn_measure:       fun(ptr, Request) usize;
+    fn_bind:          fun(ptr, Chunk, Shape) *^u8;
 }
 
 # one declared size class
@@ -298,6 +322,8 @@ rec Slot {
     address:    usize;
     welded:     u32;
     welded_gen: u32;
+    view:       u8;
+    view_kind:  u64;
     account:    *Account;
     link:       usize;
 }
@@ -793,6 +819,8 @@ fun acquire_locked(pool: *Pool, account: *Account, request: Request, register: b
     slot.inflight   = 0;
     slot.next       = NONE;
     slot.secret     = secret_chunk;
+    slot.view       = VIEW_NONE;
+    slot.view_kind  = 0;
     charge(pool, account, lane, bytes);
     account.chunks = account.chunks + 1;
     if (!inside) { pool.slots_in_use = pool.slots_in_use + 1; }
@@ -1100,15 +1128,76 @@ pub fun release(pool: *Pool, account: *Account, chunk: Chunk) Reason {
     ret r;
 }
 
-# the welded view of a held secret chunk, nil for a plain or stale one
+# the welded view of a held secret chunk, nil for a plain or stale one, or one
+# this hold already views as a type
 pub fun secret(pool: *Pool, chunk: Chunk) *^u8 {
     if (pool == nil || !pool.made || chunk.data != nil) { ret nil; }
     if (!enter(pool))                                   { ret nil; }
     val slot: *Slot = held_slot(pool, chunk.ref);
     var view: *^u8  = nil;
-    if (slot != nil && slot.secret) { view = welded_view(slot.welded, slot.welded_gen); }
+    if (slot != nil && slot.secret && slot.view != VIEW_TYPED) {
+        view = welded_view(slot.welded, slot.welded_gen);
+        if (view != nil) { slot.view = VIEW_BYTES; }
+    }
     leave(pool);
     ret view;
+}
+
+# whether a shape fits a held secret chunk: its whole span inside the usable
+# bytes, and its alignment one the chunk's class or request guarantees
+fun shape_fits(slot: *Slot, shape: Shape) bool {
+    if (shape.size == 0 || shape.count == 0)    { ret false; }
+    if (shape.count > ~(0::usize) / shape.size) { ret false; }
+    ret shape.size * shape.count <= slot.bytes && power_of_two(shape.align) && shape.align <= slot.align;
+}
+
+# bind a held secret chunk to a typed shape for the rest of its hold
+#
+# this is the pool's side of the typed views. it returns the chunk's storage for
+# `secret_typed` or `secret_source_view_typed` to retype, and a source's
+# `fn_bind` forwards here. it is not a byte view: reading or writing the result
+# as bytes breaks the one-way rule the binding exists for. nil for a plain, stale
+# or foreign chunk, a shape that does not fit, storage not aligned for the
+# shape, a chunk this hold already views as bytes, or one bound to another type
+# ---
+# shape: the element type's identity, size and alignment, and the count
+pub fun secret_bind(pool: *Pool, chunk: Chunk, shape: Shape) *^u8 {
+    if (pool == nil || !pool.made || chunk.data != nil) { ret nil; }
+    if (!enter(pool))                                   { ret nil; }
+    val slot: *Slot = held_slot(pool, chunk.ref);
+    var view: *^u8  = nil;
+    if (slot != nil && slot.secret && slot.view != VIEW_BYTES && shape_fits(slot, shape) &&
+        (slot.view == VIEW_NONE || slot.view_kind == shape.kind)) {
+        view = welded_view(slot.welded, slot.welded_gen);
+        if (view != nil && !welded_aligned(view, shape.align)) { view = nil; }
+        if (view != nil) {
+            slot.view      = VIEW_TYPED;
+            slot.view_kind = shape.kind;
+        }
+    }
+    leave(pool);
+    ret view;
+}
+
+fun shape_of[T](count: usize) Shape {
+    ret Shape{kind: $type_id(T), size: $size_of(T), align: $align_of(T), count: count};
+}
+
+# a held secret chunk viewed as count values of T, with T's secrecy shape
+#
+# T may be any record, secret fields, nested records and secret arrays
+# included. the chunk's storage is used as is: it is zero at the first view of
+# a fresh hold, and release wipes every byte of it. the view binds the hold to
+# T, so later calls with T give the same address for any count that fits, and
+# `secret` and a view as any other type are refused until the chunk is released
+# ---
+# count: T values the view holds
+# ret:   the view, or nil for a plain, stale or foreign chunk, a zero or
+#        overflowing count, `count * $size_of(T)` past the chunk's bytes, a
+#        class or request alignment below `$align_of(T)`, a chunk this hold
+#        already views as bytes, or one it views as another type
+pub fun secret_typed[T](pool: *Pool, chunk: Chunk, count: usize) *T {
+    ret welded_as[T](secret_bind(pool, chunk, shape_of[T](count)));
 }
 
 # the address of a held plain chunk, nil when the ref is stale or secret
@@ -1293,6 +1382,10 @@ fun pool_secret_view(context: ptr, chunk: Chunk) *^u8 {
     ret secret(context::*Pool, chunk);
 }
 
+fun pool_secret_bind(context: ptr, chunk: Chunk, shape: Shape) *^u8 {
+    ret secret_bind(context::*Pool, chunk, shape);
+}
+
 fun pool_data(context: ptr, ref: Ref) *u8 {
     ret data(context::*Pool, ref);
 }
@@ -1351,6 +1444,7 @@ pub fun secret_source(pool: *Pool) SecretSource {
         fn_view:          pool_secret_view,
         fn_lanes:         pool_lanes,
         fn_measure:       pool_measure,
+        fn_bind:          pool_secret_bind,
     };
 }
 
@@ -1484,10 +1578,19 @@ pub fun secret_source_release(s: *SecretSource, account: *Account, chunk: Chunk)
     ret s.fn_release(s.ctx, account, chunk);
 }
 
-# the welded view of a held secret chunk, nil when stale
+# the welded view of a held secret chunk, nil when stale, as `secret`
 pub fun secret_source_view(s: *SecretSource, chunk: Chunk) *^u8 {
     if (s == nil || s.fn_view == nil) { ret nil; }
     ret s.fn_view(s.ctx, chunk);
+}
+
+# a held secret chunk viewed as count values of T, as `secret_typed`
+#
+# nil as well for a source without `fn_bind`, or storage it returns that is not
+# aligned for T
+pub fun secret_source_view_typed[T](s: *SecretSource, chunk: Chunk, count: usize) *T {
+    if (s == nil || s.fn_bind == nil) { ret nil; }
+    ret welded_as[T](s.fn_bind(s.ctx, chunk, shape_of[T](count)));
 }
 
 # bytes an allocator.fixed arena needs to hold a pool's slot metadata and the
@@ -1556,6 +1659,38 @@ $if (capability.HAS_PAGES) {
         secret_memory.borrow_wipe(secret_memory.Borrow{index: index, generation: generation}, 0, size);
     }
 
+    fun welded_aligned(data: *^u8, alignment: usize) bool {
+        ret secret_memory.typed_aligned[^u8](data, alignment);
+    }
+
+    # welded storage bound to T, retyped with T's own secrecy shape. only the
+    # typed views call this, on storage `secret_bind` bound to T, so no byte
+    # view of it exists this hold. nil for nil or storage not aligned for T
+    fun welded_as[T](data: *^u8) *T {
+        if (data == nil) { ret nil; }
+        var out: *T = nil;
+        $if ($mach.build.arch == $mach.arch.x86_64) {
+            asm x86_64 {
+                mov rax, {data}
+                mov {out}, rax
+            }
+        }
+        $or ($mach.build.arch == $mach.arch.aarch64) {
+            asm aarch64 {
+                ldr x0, {data}
+                str x0, {out}
+            }
+        }
+        $or ($mach.build.arch == $mach.arch.riscv64) {
+            asm riscv64 {
+                ld t0, {data}
+                sd t0, {out}
+            }
+        }
+        if (!secret_memory.typed_aligned[T](out, $align_of(T))) { ret nil; }
+        ret out;
+    }
+
     # whether the borrow closed and the storage went back
     fun welded_release(index: u32, generation: u32, size: usize) bool {
         val borrow: secret_memory.Borrow = secret_memory.Borrow{index: index, generation: generation};
@@ -1581,6 +1716,14 @@ $or {
     }
 
     fun welded_wipe(index: u32, generation: u32, size: usize) {}
+
+    fun welded_aligned(data: *^u8, alignment: usize) bool {
+        ret false;
+    }
+
+    fun welded_as[T](data: *^u8) *T {
+        ret nil;
+    }
 
     fun welded_release(index: u32, generation: u32, size: usize) bool {
         ret false;
@@ -1884,6 +2027,152 @@ $if (capability.HOSTED) {
         if (!sel large.status.ok || large.chunk.class != OVERSIZE || large.chunk.data != nil) { ret 10; }
         if (secret(?pool, large.chunk) == nil)                                                { ret 11; }
         if (!is_none(release(?pool, ?account, large.chunk)))                                  { ret 12; }
+        ret 0;
+    }
+
+    # the shape of mach-crypto's aes_gcm.Context: an expanded AES schedule and a
+    # GHASH key held as secret arrays in nested records, beside public state
+    rec TestSchedule {
+        round_planes: [120]^u64;
+        rounds:       usize;
+    }
+
+    rec TestCipher {
+        software: TestSchedule;
+        backend:  u8;
+        active:   bool;
+    }
+
+    rec TestGhash {
+        h:      [2]^u64;
+        powers: [8][2]^u64;
+    }
+
+    rec TestAeadContext {
+        cipher: TestCipher;
+        hash:   TestGhash;
+        state:  u8;
+    }
+
+    rec TestKey {
+        key: [4]^u64;
+    }
+
+    # TestKey's size and layout under another name, a distinct type all the same
+    rec TestTwinKey {
+        key: [4]^u64;
+    }
+
+    #[align(64)]
+    rec TestWideKey {
+        lanes: [8]^u64;
+    }
+
+    fun fill_context(context: *TestAeadContext, seed: u64) {
+        var i: usize = 0;
+        for (i < 120) {
+            val plane: u64 = seed + i;
+            context.cipher.software.round_planes[i] = plane;
+            i                                       = i + 1;
+        }
+        context.cipher.software.rounds = 14;
+        context.cipher.backend         = 1;
+        context.cipher.active          = true;
+        context.hash.h[1]              = seed;
+        val power: u64 = seed + 7;
+        context.hash.powers[7][1] = power;
+        context.state             = 1;
+    }
+
+    fun context_holds(context: *TestAeadContext, seed: u64) bool {
+        var i: usize = 0;
+        for (i < 120) {
+            if (context.cipher.software.round_planes[i]:>u64 != seed + i) { ret false; }
+            i = i + 1;
+        }
+        ret context.cipher.software.rounds == 14 && context.cipher.backend == 1 && context.cipher.active &&
+            context.hash.h[1]:>u64 == seed && context.hash.powers[7][1]:>u64 == seed + 7 && context.state == 1;
+    }
+
+    test "buffers: a secret chunk holds a typed secret record through the typed view" {
+        var arena: Arena;
+        if (!arena_make(?arena, 1 << 22)) { ret 1; }
+        fin { arena_free(?arena); }
+        var classes: [2]ClassConfig = [2]ClassConfig{
+            ClassConfig{size: 64, align: 0, secret: false, high_water: 1},
+            ClassConfig{size: 4096, align: 0, secret: true, high_water: 1},
+        };
+        var pool: Pool;
+        if (!make(?pool, test_config(?classes[0], 2, 1 << 20), ?arena.counted)) { ret 2; }
+        fin { destroy(?pool); }
+        var account: Account;
+        if (!is_none(open_account(?pool, ?account, 1, budgets_of(1 << 20), 0))) { ret 3; }
+        fin { close_account(?pool, ?account); }
+        val plain: Acquired = acquire(?pool, ?account, ask(64), false);
+        if (!status_ok(plain) || plain.chunk.data == nil) { ret 4; }
+        var request: Request = ask(4096);
+        request.secret = true;
+        val got: Acquired = acquire(?pool, ?account, request, false);
+        if (!status_ok(got) || got.chunk.class != 1) { ret 5; }
+
+        # every refusal leaves the chunk unbound
+        val size: usize = $size_of(TestAeadContext);
+        val fits: usize = 4096 / size;
+        if (secret_typed[TestAeadContext](nil, got.chunk, 1) != nil)                        { ret 6; }
+        if (secret_typed[TestAeadContext](?pool, plain.chunk, 1) != nil)                    { ret 7; }
+        if (secret_typed[TestAeadContext](?pool, got.chunk, 0) != nil)                      { ret 8; }
+        if (secret_typed[TestAeadContext](?pool, got.chunk, ~(0::usize) / size + 1) != nil) { ret 9; }
+        if (secret_typed[TestAeadContext](?pool, got.chunk, fits + 1) != nil)               { ret 10; }
+        if (secret_typed[TestWideKey](?pool, got.chunk, 1) != nil)                          { ret 11; }
+
+        val context: *TestAeadContext = secret_typed[TestAeadContext](?pool, got.chunk, fits);
+        if (context == nil) { ret 12; }
+        fill_context(?context[0], 3);
+        fill_context(?context[fits - 1], 5);
+        val again: *TestAeadContext = secret_typed[TestAeadContext](?pool, got.chunk, 1);
+        if (again != context || !context_holds(?again[0], 3) || !context_holds(?again[fits - 1], 5)) { ret 13; }
+        # bound to TestAeadContext: no byte view and no other type this hold
+        if (secret(?pool, got.chunk) != nil)                           { ret 14; }
+        if (secret_typed[TestKey](?pool, got.chunk, 1) != nil)         { ret 15; }
+        if (!is_none(release(?pool, ?account, got.chunk)))             { ret 16; }
+        if (secret_typed[TestAeadContext](?pool, got.chunk, 1) != nil) { ret 17; }
+
+        # the next hold takes the retained chunk, wiped in full, padding included
+        val backed: u64      = pool.backing_allocations;
+        val next:   Acquired = acquire(?pool, ?account, request, false);
+        if (!status_ok(next) || pool.backing_allocations != backed) { ret 18; }
+        val bytes: *^u8 = secret(?pool, next.chunk);
+        if (bytes == nil) { ret 19; }
+        var i: usize = 0;
+        for (i < 4096) {
+            if (bytes[i]:>u8 != 0) { ret 20; }
+            i = i + 1;
+        }
+        # seen as bytes, the hold refuses the typed view
+        if (secret_typed[TestAeadContext](?pool, next.chunk, 1) != nil) { ret 21; }
+        if (!is_none(release(?pool, ?account, next.chunk)))             { ret 22; }
+
+        # an oversize secret chunk holds what its rounded bytes fit
+        request.bytes = 5000;
+        val large: Acquired = acquire(?pool, ?account, request, false);
+        if (!status_ok(large) || large.chunk.class != OVERSIZE)                        { ret 23; }
+        if (secret_typed[TestAeadContext](?pool, large.chunk, 5000 / size + 1) != nil) { ret 24; }
+        val wide: *TestAeadContext = secret_typed[TestAeadContext](?pool, large.chunk, 5000 / size);
+        if (wide == nil) { ret 25; }
+        fill_context(?wide[5000 / size - 1], 9);
+        if (!context_holds(?wide[5000 / size - 1], 9))       { ret 26; }
+        if (!is_none(release(?pool, ?account, large.chunk))) { ret 27; }
+        if (!is_none(release(?pool, ?account, plain.chunk))) { ret 28; }
+
+        # identity is the type, not its size: a same-size twin is another type
+        request.bytes = 4096;
+        val keyed: Acquired = acquire(?pool, ?account, request, false);
+        if (!status_ok(keyed))                                       { ret 29; }
+        if ($size_of(TestTwinKey) != $size_of(TestKey))              { ret 30; }
+        if (secret_typed[TestKey](?pool, keyed.chunk, 1) == nil)     { ret 31; }
+        if (secret_typed[TestTwinKey](?pool, keyed.chunk, 1) != nil) { ret 32; }
+        if (secret_typed[TestKey](?pool, keyed.chunk, 2) == nil)     { ret 33; }
+        if (!is_none(release(?pool, ?account, keyed.chunk)))         { ret 34; }
         ret 0;
     }
 
@@ -2604,13 +2893,25 @@ $if (capability.HOSTED) {
             view[i] = 0x5a;
             i       = i + 1;
         }
-        if (!is_none(secret_source_release(s, ?account, got.chunk))) { ret 5; }
-        if (secret_source_view(s, got.chunk) != nil)                 { ret 6; }
+        if (secret_source_view_typed[TestKey](s, got.chunk, 1) != nil) { ret 8; }
+        if (!is_none(secret_source_release(s, ?account, got.chunk)))   { ret 5; }
+        if (secret_source_view(s, got.chunk) != nil)                   { ret 6; }
         i = 0;
         for (i < 64) {
             if (view[i]:>u8 != 0) { ret 7; }
             i = i + 1;
         }
+        # the same chunk again, seen as two keys through the source alone
+        val typed: Acquired = secret_source_acquire(s, ?account, request, false);
+        if (!sel typed.status.ok) { ret 9; }
+        val keys: *TestKey = secret_source_view_typed[TestKey](s, typed.chunk, 2);
+        if (keys == nil || secret_source_view_typed[TestKey](s, typed.chunk, 3) != nil) { ret 10; }
+        keys[1].key[3] = 0x77;
+        if (secret_source_view_typed[TestKey](s, typed.chunk, 2)[1].key[3]:>u64 != 0x77) { ret 11; }
+        if (secret_source_view(s, typed.chunk) != nil)                                   { ret 12; }
+        if (!is_none(secret_source_release(s, ?account, typed.chunk)))                   { ret 13; }
+        if (secret_source_view_typed[TestKey](s, typed.chunk, 2) != nil)                 { ret 14; }
+        if (keys[1].key[3]:>u64 != 0)                                                    { ret 15; }
         ret 0;
     }
 
@@ -2722,6 +3023,7 @@ $if (capability.HOSTED) {
             if (!is_misuse(secret_source_release(s, ?account, chunk))) { ret 23; }
             if (secret_source_view(s, chunk) != nil)                   { ret 24; }
             if (secret_source_lanes(s) != 0)                           { ret 25; }
+            if (secret_source_view_typed[TestKey](s, chunk, 1) != nil) { ret 26; }
             round = round + 1;
         }
         ret 0;
