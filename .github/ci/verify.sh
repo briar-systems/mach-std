@@ -78,6 +78,8 @@ case "$MACH_CI_LEG" in
         bash test/riscv64/verify.sh "$mach"
         python3 test/lib/compiler-census.py test/native/results test linux-riscv64
         "$mach" test . --target linux-riscv64 --runner qemu-riscv64
+        python3 test/lib/compiler-census.py test/native/results test linux-riscv64 tests
+        "$mach" test . --lib tests --target linux-riscv64 --runner qemu-riscv64
         python3 test/lib/compiler-census.py test/native/results test linux-riscv64 ownership
         "$mach" test . --target linux-riscv64 --runner qemu-riscv64 -O2 --filter 'ownership query'
         bash test/fault/verify.sh "$mach" linux-riscv64 qemu-riscv64
