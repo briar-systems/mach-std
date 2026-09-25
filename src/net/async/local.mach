@@ -719,7 +719,7 @@ fun source_cancel(context: ptr, token: io_runtime.Token, reason: io_error.Error)
         # a pending cancellation keeps the kernel's hold until its packet is published
         if (code >= 0 && code != io_runtime.CANCELLATION_PENDING) { slot.native_active = false; }
         # an operation that finished first is resolved as usual, so the runtime
-        # carries its transfer on the cancellation and an opened socket is closed
+        # carries its transfer, or the stream an accept took, on the cancellation
         if (sel finished.some) {
             if (code >= 0) { resolve_native_locked(driver, finished.some); }
         }
@@ -1299,7 +1299,9 @@ fun cleanup_locked(driver: *Driver, completion: *io_runtime.Completion) {
     }
     if ((slot.kind == io_runtime.ACCEPT || slot.kind == io_runtime.CONNECT) && slot.stream_index != NONE) {
         val stream: *StreamEntry = stream_at(driver, slot.stream_index::usize);
-        if (completion.has_error) {
+        # a cancelled accept that took a connection first hands it over (#927)
+        val handed: bool = slot.kind == io_runtime.ACCEPT && completion.opening != 0;
+        if (completion.has_error && !handed) {
             if (stream.value.handle != io_handle.INVALID_VALUE) { impl.close_resource(?driver.backend, stream.value.handle); }
             stream.value.handle = io_handle.INVALID_VALUE;
             stream_free(driver, stream);
@@ -1382,6 +1384,12 @@ fun resolve_native_locked(driver: *Driver, native: async_types.NativeCompletion)
     if (native.status < 0) {
         resolved = io_runtime.fail(driver.runtime, token, os.error(native.status, operation_for_kind(native.kind)));
     }
+    or (native.kind == io_runtime.ACCEPT) {
+        # stamped so the completion says it hands a stream over, which a
+        # cancellation that claimed the accept then carries
+        val accepted: io_handle.SocketHandle = io_handle.socket(native.resource);
+        resolved = io_runtime.complete_opened(driver.runtime, token, accepted.value, accepted.opening);
+    }
     or {
         resolved = io_runtime.complete(driver.runtime, token, native.bytes, native.resource, native.end_of_stream);
     }
@@ -1433,8 +1441,15 @@ pub fun wait(
     ret res[usize, io_error.Error].ok{waited.ok};
 }
 
+# the stream an accept completion hands over, whether it succeeded or was
+# cancelled after its stream was already accepted. a caller that cancels
+# accepts takes the stream from every accept completion and serves or closes it
+# ---
+# ret: the stream, which the caller now owns, or the completion's error when it
+#      hands nothing over
 pub fun accepted(driver: *Driver, completion: io_runtime.Completion) res[Stream, io_error.Error] {
-    if (driver == nil || completion.kind != io_runtime.ACCEPT || completion.has_error) {
+    val handed: bool = completion.kind == io_runtime.ACCEPT && completion.opening != 0;
+    if (driver == nil || completion.kind != io_runtime.ACCEPT || (completion.has_error && !handed)) {
         if (completion.has_error) { ret res[Stream, io_error.Error].err{completion.error}; }
         ret res[Stream, io_error.Error].err{invalid(io_error.OP_ACCEPT)};
     }
@@ -2147,6 +2162,104 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
         if (sel destroy_result.err)                { ret 32; }
         if (!ok_bool(io_runtime.close(?runtime)))  { ret 33; }
         if (!ok_err(io_runtime.destroy(?runtime))) { ret 34; }
+        ret 0;
+    }
+
+    # an accept cancelled after it took a stream hands the stream over on its
+    # cancellation, so cancelling an accept never loses a connection (#927). a
+    # platform whose accept had not finished leaves the connection queued for
+    # the next accept instead
+    test "async local: a cancelled accept hands over the stream it already took" {
+        var pa: allocator.Allocator;
+        page.make(?pa);
+        val endpoint_result: res[endpoint.Endpoint, io_error.Error] = test_endpoint();
+        if (sel endpoint_result.err) { ret 1; }
+        var bound: endpoint.Endpoint = endpoint_result.ok;
+        bound.name[bound.length - 1] = 'a';
+        var runtime: io_runtime.Runtime;
+        if (!ok_err(io_runtime.make(?runtime, ?pa, 8))) { ret 2; }
+        var driver: Driver;
+        if (refused(make(?driver, ?runtime))) { ret 3; }
+        var scope: cancel.Scope;
+        if (!scope_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 4; }
+        var options: types.BindOptions = local.default_bind_options();
+        options.stale = types.REMOVE_STALE_SOCKET;
+        var output: [8]io_runtime.Completion;
+        if (failed[io_runtime.Token](submit_bind(?driver, ?scope, bound, options, 301))) { ret 5; }
+        var waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, 1000);
+        if (!(sel waited.ok && waited.ok == 1)) { ret 5; }
+        val listener_result: res[Listener, io_error.Error] = bound_listener(?driver, output[0]);
+        if (sel listener_result.err) { ret 5; }
+        var listener: Listener = listener_result.ok;
+        if (failed[io_runtime.Token](submit_listen(?driver, ?scope, ?listener, 16, 302))) { ret 6; }
+        waited = wait(?driver, ?output[0], 8, 1000);
+        if (!(sel waited.ok && waited.ok == 1) || refused(listening(?driver, output[0]))) { ret 6; }
+        # the client connects first, so the connection waits in the backlog
+        if (failed[io_runtime.Token](submit_connect(?driver, ?scope, bound, 303))) { ret 7; }
+        waited = wait(?driver, ?output[0], 8, 1000);
+        if (!(sel waited.ok && waited.ok == 1) || output[0].context != 303) { ret 7; }
+        val client_result: res[Stream, io_error.Error] = connected(?driver, output[0]);
+        if (sel client_result.err) { ret 7; }
+        var client: Stream = client_result.ok;
+        var child:  cancel.Scope;
+        if (!scope_ok(cancel.make_child(?child, ?scope, opt[time.Instant].none{})))   { ret 8; }
+        if (failed[io_runtime.Token](submit_accept(?driver, ?child, ?listener, 304))) { ret 8; }
+        if (!scope_changed(cancel.cancel(?child)))                                    { ret 8; }
+        waited = wait(?driver, ?output[0], 8, 1000);
+        if (!(sel waited.ok && waited.ok == 1) || output[0].context != 304
+            || !output[0].has_error || output[0].error.kind != io_error.CANCELLED) {
+            ret 9;
+        }
+        if (!scope_ok(cancel.destroy(?child))) { ret 10; }
+        var server: Stream;
+        val handed: res[Stream, io_error.Error] = accepted(?driver, output[0]);
+        if (sel handed.ok) {
+            server = handed.ok;
+        }
+        or {
+            if (failed[io_runtime.Token](submit_accept(?driver, ?scope, ?listener, 305))) { ret 11; }
+            waited = wait(?driver, ?output[0], 8, 1000);
+            if (!(sel waited.ok && waited.ok == 1) || output[0].context != 305) { ret 12; }
+            val taken: res[Stream, io_error.Error] = accepted(?driver, output[0]);
+            if (sel taken.err) { ret 13; }
+            server = taken.ok;
+        }
+        # the stream is live: what the client writes reaches the server
+        var payload: [1]u8 = [1]u8{'k'};
+        var input:   [1]u8;
+        if (failed[io_runtime.Token](submit_write(?driver, ?scope, ?client, ?payload[0], 1, 306))
+            || failed[io_runtime.Token](submit_read(?driver, ?scope, ?server, ?input[0], 1, 307))) {
+            ret 14;
+        }
+        var moved:  usize = 0;
+        var rounds: usize = 0;
+        for (moved < 2 && rounds < 8) {
+            waited = wait(?driver, ?output[0], 8, 1000);
+            if (sel waited.err) { ret 15; }
+            var i: usize = 0;
+            for (i < waited.ok) {
+                if (output[i].has_error || output[i].bytes != 1) { ret 16; }
+                moved = moved + 1;
+                i     = i + 1;
+            }
+            rounds = rounds + 1;
+        }
+        if (moved != 2 || input[0] != 'k') { ret 17; }
+        if (failed[io_runtime.Token](submit_stream_close(?driver, ?scope, ?client, lifecycle.ABORTIVE, 308))
+            || failed[io_runtime.Token](submit_stream_close(?driver, ?scope, ?server, lifecycle.ABORTIVE, 309))
+            || failed[io_runtime.Token](submit_listener_close(?driver, ?scope, ?listener, 310))) {
+            ret 18;
+        }
+        var closed: usize = 0;
+        rounds = 0;
+        for (closed < 3 && rounds < 8) {
+            waited = wait(?driver, ?output[0], 8, 1000);
+            if (sel waited.err) { ret 19; }
+            closed = closed + waited.ok;
+            rounds = rounds + 1;
+        }
+        if (closed != 3 || !scope_ok(cancel.destroy(?scope)) || refused(destroy(?driver))) { ret 20; }
+        if (!ok_bool(io_runtime.close(?runtime)) || !ok_err(io_runtime.destroy(?runtime))) { ret 21; }
         ret 0;
     }
 
