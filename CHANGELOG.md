@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [8.2.0] - 2026-09-25
+
 ### Added
 
 - `io_runtime.pins_capacity(runtime, token)` says whether a live operation
