@@ -21,6 +21,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the lowest free slot, which never pins. It is false for a stale token and
   over an allocator that never reclaims.
 
+### Fixed
+
+- A cancelled accept that had already accepted a connection no longer loses it
+  (#927). `net.async` closed the accepted socket, and `net.async.local` leaked
+  it, because `io_runtime.complete_opened` refused a completion that lost to a
+  cancellation. On Windows the backend closed a socket that `AcceptEx` took
+  before its abort landed. The accepted socket now rides on the cancelled
+  completion, the way a cancelled read reports its bytes, and the caller owns
+  it: `net_async.accepted` returns the stream an accept completion hands over,
+  successful or cancelled, and `net.async.local`'s `accepted` does the same. A
+  completion's `opening` is nonzero exactly when it hands a socket over. This
+  changes documented behaviour: a caller that cancels accepts and ignores a
+  cancelled completion's socket now leaks it, so take the stream from every
+  accept completion and serve or close it.
+
 ### Changed
 
 - Secret wipes no longer store one byte at a time (#924). `crypto.ct.zeroize`
