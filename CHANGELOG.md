@@ -17,7 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with overlapping stores for the unaligned head and tail. On riscv64 it
   stores doublewords between byte-wise head and tail. The stores stay in
   inline assembly, so no optimization can drop or reorder them, and branches
-  read only the address and length.
+  read only the address and length. `zeroize` is now never inlined, so an
+  `#[oblivious]` caller that still holds secrets in registers passes the
+  constant-time check.
 
 ## [8.1.1] - 2026-09-25
 
