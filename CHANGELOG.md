@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Secret wipes no longer store one byte at a time (#924). `crypto.ct.zeroize`
+  is an inline-asm kernel on every target, and every wipe in
+  `memory.secret` goes through it: release, typed release, the fill-failure
+  wipes and `borrow_wipe`, which `memory.buffers` uses for secret chunks. On
+  x86_64 and aarch64 it stores 16 bytes at a time over a body aligned to 16,
+  with overlapping stores for the unaligned head and tail. On riscv64 it
+  stores doublewords between byte-wise head and tail. The stores stay in
+  inline assembly, so no optimization can drop or reorder them, and branches
+  read only the address and length.
+
 ## [8.1.1] - 2026-09-25
 
 ### Changed
