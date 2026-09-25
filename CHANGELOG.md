@@ -7,15 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `io_runtime.pins_capacity(runtime, token)` says whether a live operation
+  keeps capacity the runtime would otherwise give back (#928). The runtime
+  releases a chunk of its slot table only once it and the chunk below it hold
+  nothing live, so an operation submitted at a peak and left pending after the
+  load leaves, such as an accept, keeps every chunk up to its own, and the
+  timer, deadline and driver tables with them. It is true when the
+  operation's slot lies above the slack chunk past where the live count would
+  end if packed from index 0, and a chunk past that slack exists. A caller can
+  cancel such an operation and submit it again, and the new submission takes
+  the lowest free slot, which never pins. It is false for a stale token and
+  over an allocator that never reclaims.
+
 ### Fixed
 
 - A cancelled accept that had already accepted a connection no longer loses it
   (#927). `net.async` closed the accepted socket, and `net.async.local` leaked
   it, because `io_runtime.complete_opened` refused a completion that lost to a
   cancellation. On Windows the backend closed a socket that `AcceptEx` took
-  before its abort landed. The accepted socket now rides on the cancelled completion, the
-  way a cancelled read reports its bytes, and the caller owns it:
-  `net_async.accepted` returns the stream an accept completion hands over,
+  before its abort landed. The accepted socket now rides on the cancelled
+  completion, the way a cancelled read reports its bytes, and the caller owns
+  it: `net_async.accepted` returns the stream an accept completion hands over,
   successful or cancelled, and `net.async.local`'s `accepted` does the same. A
   completion's `opening` is nonzero exactly when it hands a socket over. This
   changes documented behaviour: a caller that cancels accepts and ignores a
