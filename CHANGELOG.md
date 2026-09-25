@@ -12,7 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A cancelled accept that had already accepted a connection no longer loses it
   (#927). `net.async` closed the accepted socket, and `net.async.local` leaked
   it, because `io_runtime.complete_opened` refused a completion that lost to a
-  cancellation. The accepted socket now rides on the cancelled completion, the
+  cancellation. On Windows the backend closed a socket that `AcceptEx` took
+  before its abort landed. The accepted socket now rides on the cancelled completion, the
   way a cancelled read reports its bytes, and the caller owns it:
   `net_async.accepted` returns the stream an accept completion hands over,
   successful or cancelled, and `net.async.local`'s `accepted` does the same. A
