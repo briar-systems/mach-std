@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [8.1.1] - 2026-09-25
+
 ### Changed
 
 - `memory.raw_move` no longer copies one byte at a time, and `memory.raw_copy`
