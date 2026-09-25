@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `std.system.cpu.Features` reports AES and carry-less multiply (#893):
+  `aes` and `pclmul` on x86_64 from cpuid leaf 1 (ecx bits 25 and 1), and
+  `aes` and `pmull` on aarch64 from the OS, linux `AT_HWCAP` (bits 3 and 4)
+  and darwin sysctl (`hw.optional.arm.FEAT_AES`, `FEAT_PMULL`). The names are
+  the compiler's extension names, so the x86_64 field is `pclmul`, not
+  `pclmulqdq`. A processor without an extension reads false, never an error.
+  A build that selects the extensions reports them without a probe on mach
+  5.12.2 and later, the first release that knows them. On 5.12.0 and 5.12.1
+  no build can select them, and the fields are what the probe finds. std
+  still requires `^5.12`. Windows has no aarch64 target in std, so there is
+  no `IsProcessorFeaturePresent` path.
 - `io_runtime.pins_capacity(runtime, token)` says whether a live operation
   keeps capacity the runtime would otherwise give back (#928). The runtime
   releases a chunk of its slot table only once it and the chunk below it hold
