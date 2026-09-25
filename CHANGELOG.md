@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [8.1.0] - 2026-09-25
+
 ### Fixed
 
 - On linux, std no longer overwrites the thread pointer a loader set (#915).
