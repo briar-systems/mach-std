@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- On linux, std no longer overwrites the thread pointer a loader set (#915).
+  Since 7.5.0 (#894) the runtime installed std's block as the main thread's
+  thread pointer at entry. In a dynamic image the loader has already set it to
+  its C runtime's thread control block, so the next C call that read
+  thread-local state faulted (signal 11 in `malloc` or `dlopen`), or on aarch64
+  read the wrong memory without faulting. Whoever starts the process now owns
+  the main thread's thread pointer. The runtime installs std's block only when
+  `AT_BASE` in the auxiliary vector is 0, meaning the kernel started no
+  interpreter. std still links no C runtime and assumes nothing about one.
+  Threads std spawns keep their own block through `CLONE_SETTLS`.
+- `sync.thread.current_token` is distinct and stable, with no system call, on
+  the main thread under a loader and on a thread C code created that calls back
+  into mach, on linux x86_64, aarch64 and riscv64 (#898). There the token is the
+  C runtime's thread pointer. On x86_64 it is read through `fs:[0]`, which the
+  psABI has point to the control block itself. A thread made by a raw `clone`
+  without `CLONE_SETTLS` inherits its parent's token and must not call into
+  std. An interpreter run by hand (`ld.so ./program`) still has `AT_BASE` 0 and
+  is not supported. darwin and windows are unchanged: they keep the block in a
+  pthread key and a TLS index and never write a thread register.
+
+### Added
+
+- `system.os.linux.x86_64`, `.aarch64` and `.riscv64` gain `loader_present`,
+  which says from `AT_BASE` whether the kernel started a program interpreter.
+  The runtime uses it to decide who owns the main thread's thread pointer.
+
 ## [8.0.0] - 2026-09-23
 
 std now requires mach 5.12.0 (`mach = "^5.12"`) (#908). That drops mach 5.8

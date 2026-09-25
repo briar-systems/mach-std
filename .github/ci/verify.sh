@@ -13,6 +13,7 @@ case "$MACH_CI_LEG" in
         bash test/fault/verify.sh "$mach" linux-x86_64
         bash test/thread-resources/verify.sh "$mach" linux-x86_64
         bash test/thread-resources/verify-release.sh "$mach" linux-x86_64
+        bash test/thread-pointer/verify.sh "$mach" linux-x86_64
         # the release archive carries no test-only fault module
         "$mach" build .
         bash test/fault/verify-release.sh out/linux-x86_64/debug/lib/std
@@ -36,6 +37,7 @@ case "$MACH_CI_LEG" in
         bash test/native/verify.sh "$mach" linux-arm64
         bash test/fault/verify.sh "$mach" linux-arm64
         bash test/thread-resources/verify.sh "$mach" linux-arm64
+        bash test/thread-pointer/verify.sh "$mach" linux-arm64
         format_evidence linux-arm64
         bash test/relro/verify.sh "$mach" linux-arm64
         bash test/sigpipe/verify.sh "$mach" linux-arm64
@@ -84,6 +86,8 @@ case "$MACH_CI_LEG" in
         "$mach" test . --target linux-riscv64 --runner qemu-riscv64 -O2 --filter 'ownership query'
         bash test/fault/verify.sh "$mach" linux-riscv64 qemu-riscv64
         bash test/thread-resources/verify.sh "$mach" linux-riscv64 qemu-riscv64
+        CC=riscv64-linux-gnu-gcc QEMU_LD_PREFIX=/usr/riscv64-linux-gnu \
+            bash test/thread-pointer/verify.sh "$mach" linux-riscv64 qemu-riscv64
         bash test/relro/verify.sh "$mach" linux-riscv64 qemu-riscv64
         bash test/sigpipe/verify.sh "$mach" linux-riscv64 qemu-riscv64
         bash test/terminate-child/verify.sh "$mach" linux-riscv64 qemu-riscv64
