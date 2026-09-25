@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `io_runtime.pins_capacity(runtime, token)` says whether a live operation
+  keeps capacity the runtime would otherwise give back (#928). The runtime
+  releases a chunk of its slot table only once it and the chunk below it hold
+  nothing live, so an operation submitted at a peak and left pending after the
+  load leaves, such as an accept, keeps every chunk up to its own, and the
+  timer, deadline and driver tables with them. It is true when the
+  operation's slot lies above the slack chunk past where the live count would
+  end if packed from index 0, and a chunk past that slack exists. A caller can
+  cancel such an operation and submit it again, and the new submission takes
+  the lowest free slot, which never pins. It is false for a stale token and
+  over an allocator that never reclaims.
+
 ### Changed
 
 - Secret wipes no longer store one byte at a time (#924). `crypto.ct.zeroize`
