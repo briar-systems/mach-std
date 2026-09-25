@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `memory.raw_move` no longer copies one byte at a time, and `memory.raw_copy`
+  no longer falls back to bytes when source and destination are not co-aligned
+  (#900). On x86_64 and aarch64 both move 16-byte unaligned vectors through a
+  body aligned to the destination, with both ends loaded before anything is
+  stored. `raw_move` copies backward only when the destination lies inside the
+  source range. On riscv64 they move machine words when source and destination
+  share an alignment offset, and bytes otherwise. Results are byte-for-byte
+  what they were. `memory.move` goes through `raw_move` and speeds up with it.
+
 ## [8.1.0] - 2026-09-25
 
 ### Fixed
