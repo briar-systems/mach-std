@@ -10,7 +10,7 @@ import re
 import sys
 from pathlib import Path
 
-TEST = re.compile(r'^\s*test "', re.M)
+TEST = re.compile(r'^\s*test\s+[A-Za-z_]\w*\s*\{', re.M)
 OS_ONLY = re.compile(r'^(\s*(\$mach\.build\.os|\$mach\.os\.[a-z]+|==|!=|&&|\|\|)\s*)+$')
 
 
