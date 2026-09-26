@@ -4,7 +4,7 @@
 # about the processor. usage: verify.sh <mach> <target> [runner]
 set -euo pipefail
 mach="$1" target="$2" runner="${3:-}"
-args=(test . --target "$target" -O2 -vv --filter "sha256: benchmark")
+args=(test . --target "$target" -O2 -vv --filter "sha256__benchmark")
 [ -n "$runner" ] && args+=(--runner "$runner")
 out="$("$mach" "${args[@]}" 2>&1)"
 echo "$out" | grep -E "sha256 bench" || { echo "$out"; echo "FAIL: no benchmark output"; exit 1; }

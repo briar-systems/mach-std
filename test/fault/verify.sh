@@ -47,7 +47,7 @@ fi
 # artifact does not reach would drop its tests without a word
 listed="$(mach_run "${test_args[@]}" --list | tr '\134' '/')" || fail "fault tests could not be listed"
 for source in "$here"/src/*.mach; do
-    grep -qE '^[[:space:]]*test "' "$source" || continue
+    grep -qE '^[[:space:]]*test[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\{' "$source" || continue
     grep -qF "test/fault/src/$(basename "$source"):" <<< "$listed" \
         || fail "fault.$(basename "$source" .mach) holds tests that lib/tests.mach does not reach"
 done
