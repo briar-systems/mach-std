@@ -168,7 +168,7 @@ for target in "${targets[@]}"; do
         [ -f "$storage_asm" ] || fail "$target $profile: secret storage assembly missing"
         [ -f "$main_ir" ] || fail "$target $profile: typed boundary IR missing"
         [ -f "$main_asm" ] || fail "$target $profile: typed boundary assembly missing"
-        python3 "$here/verify-ir.py" "$secret_ir" "$storage_ir" "$main_ir" "$profile" \
+        python3 "$here/verify-ir.py" "$secret_ir" "$storage_ir" "$main_ir" \
             || fail "$target $profile: secret IR contract failed"
         case "$target" in
             linux-*)
@@ -219,9 +219,8 @@ for target in "${targets[@]}"; do
         esac
         if [ "$profile" = release ]; then
             release_body="$(sed -n '/std.memory.secret.deallocate:/,/std.memory.secret.random_fill:/p' "$storage_asm")"
-            # the oblivious wipe stays a call under the v5 inlining policy (mach
-            # N6, PR #3270), so the call site counts as the wipe here
-            wipe_line="$(echo "$release_body" | grep -n -m1 -E 'mov byte \[[^]]+\], 0|strb wzr|sb zero|std\.memory\.secret\.wipe([^_]|$)' | cut -d: -f1 || true)"
+            # every wipe is a call to the never-inlined zeroize kernel
+            wipe_line="$(echo "$release_body" | grep -n -m1 -E 'std\.crypto\.ct\.zeroize([^_]|$)' | cut -d: -f1 || true)"
             case "$target" in
                 linux-*)
                     release_line="$(echo "$release_body" | grep -n -m1 -E 'syscall|ecall|svc|native_release' | cut -d: -f1 || true)"
@@ -239,7 +238,7 @@ for target in "${targets[@]}"; do
                 || fail "$target release: native release precedes secret wipe in assembly"
 
             typed_release_body="$(sed -n '/# std.memory.secret.release_typed\$backends.main.SecretRecord:/,/^# /p' "$main_asm")"
-            typed_wipe_line="$(echo "$typed_release_body" | grep -n -m1 -E 'mov byte \[[^]]+\], 0|strb wzr|sb zero' | cut -d: -f1 || true)"
+            typed_wipe_line="$(echo "$typed_release_body" | grep -n -m1 -E 'std\.crypto\.ct\.zeroize([^_]|$)|std\.memory\.secret\.wipe_typed' | cut -d: -f1 || true)"
             case "$target" in
                 *-x86_64)
                     typed_release_line="$(echo "$typed_release_body" | grep -n -E 'call r[0-9]+' | tail -1 | cut -d: -f1 || true)"
