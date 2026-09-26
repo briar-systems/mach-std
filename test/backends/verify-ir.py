@@ -1,12 +1,10 @@
 # secret IR contract: the native secret primitives exist, std.memory.secret
 # wipes before it calls the native release, no integer pointer alias is
 # materialized, and no test-only inspection enters production IR.
-# under the v5 inlining policy (mach N6, PR #3270) an #[oblivious] callee is
-# inlined only into an oblivious caller, so the oblivious `wipe` stays a call
-# in `release_all` in both profiles rather than becoming the inlined zero-byte
-# store, and the ordering is asserted on that call. `wipe_typed` is not
-# oblivious, so release inlines it into `release_typed` as its asm byte-store
-# loop, and release accepts either the call or that inlined `asm`.
+# every wipe goes through std.crypto.ct.zeroize, which is never inlined, so
+# release_all holds a call to it in both profiles and the ordering is asserted
+# on that call. release inlines wipe_typed into release_typed, leaving only its
+# own zeroize call, so the typed wipe is either call.
 from pathlib import Path
 import re
 import sys
@@ -45,10 +43,11 @@ def first(lines, predicate, label):
 
 
 PORTABLE = 'std.memory.secret.'
+ZEROIZE = '@"std.crypto.ct.zeroize"'
 TYPED = '$backends.main.SecretRecord'
 
 
-def verify(native_text, portable_text, main_text, profile):
+def verify(native_text, portable_text, main_text):
     native, portable, main = IR(native_text), IR(portable_text), IR(main_text)
     for name in ('allocate', 'release', 'random_fill', 'read_at', 'write_at'):
         native.function('std.system.os.secret.' + name)
@@ -62,21 +61,21 @@ def verify(native_text, portable_text, main_text, profile):
     if re.search(re.escape(PORTABLE) + fixtures, portable.text):
         raise ValueError('test-only secret inspection entered production IR')
     body = portable.function(PORTABLE + 'release_all').splitlines()
-    wipe = first(body, lambda line: portable.call(line, 'void', '@"' + PORTABLE + 'wipe"'), 'release wipe')
+    wipe = first(body, lambda line: portable.call(line, 'void', ZEROIZE), 'release wipe')
     release = first(body, lambda line: portable.call(line, 'i64', '%p3'), 'native release call')
     if wipe >= release:
         raise ValueError('native release precedes secret wipe')
     typed = main.function(PORTABLE + 'release_typed' + TYPED).splitlines()
     typed_release = first(typed, lambda line: main.call(line, 'i64', '%p3'), 'typed native release call')
     typed_wipe = first(typed, lambda line: main.call(line, 'void', '@"' + PORTABLE + 'wipe_typed' + TYPED + '"')
-                       or (profile == 'release' and re.match(r'\s+asm\b', line) is not None), 'typed release wipe')
+                       or main.call(line, 'void', ZEROIZE), 'typed release wipe')
     if typed_wipe >= typed_release:
         raise ValueError('native typed release precedes full-layout wipe')
     return portable, body, wipe, release
 
 
-def controls(native_text, portable_text, main_text, profile):
-    portable, body, wipe, release = verify(native_text, portable_text, main_text, profile)
+def controls(native_text, portable_text, main_text):
+    portable, body, wipe, release = verify(native_text, portable_text, main_text)
     original = portable.raw_function(PORTABLE + 'release_all')
     deleted = body[:wipe] + body[wipe + 1:]
     reordered = list(body)
@@ -88,7 +87,7 @@ def controls(native_text, portable_text, main_text, profile):
     }
     for name, changed in variants.items():
         try:
-            verify(native_text, changed, main_text, profile)
+            verify(native_text, changed, main_text)
         except ValueError:
             continue
         raise ValueError('IR oracle accepted control: ' + name)
@@ -97,9 +96,8 @@ def controls(native_text, portable_text, main_text, profile):
 
 if __name__ == '__main__':
     native_text, portable_text, main_text = (Path(name).read_text() for name in sys.argv[1:4])
-    profile = sys.argv[4]
     try:
-        verify(native_text, portable_text, main_text, profile)
-        controls(native_text, portable_text, main_text, profile)
+        verify(native_text, portable_text, main_text)
+        controls(native_text, portable_text, main_text)
     except ValueError as error:
         raise SystemExit('FAIL: ' + str(error))
