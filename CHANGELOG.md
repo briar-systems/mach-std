@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.4.1] - 2026-09-26
+
+### Changed
+
+- Every test is declared with an identifier, `test name { ... }`, rather
+  than a string label, and std requires mach `>=5.13, <7` (#939).
+
 ## [7.4.0] - 2026-09-23
 
 ### Added
