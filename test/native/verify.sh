@@ -100,7 +100,7 @@ echo "OK: thread, process, file, socket, and timer coverage is present"
 
 release_result="$here/results/$target-ownership-release.log"
 mach_run test "$here" --target "$target" --profile release --include-deps \
-    --filter 'ownership query' 2>&1 | tee "$release_result" \
+    --filter 'ownership_query' 2>&1 | tee "$release_result" \
     || fail "$target release ownership suite failed"
 grep -qE '[0-9]+ passed, 0 failed, [0-9]+ total' "$release_result" \
     || fail "$target release ownership suite produced no clean result"
