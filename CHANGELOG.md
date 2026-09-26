@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [9.0.0] - 2026-09-26
+
+### Breaking
+
+- std requires mach 6 (`mach = "^6"`) and no longer builds with mach 5
+  (#938, briar-systems/mach#3955).
+- `str_index_of`, `str_contains` and `str_find` treat an empty or nil needle
+  as a match (#946). `str_index_of("abc", "")` is `some(0)` where it was none,
+  `str_contains(s, "")` is true, and `str_find(s, "")` yields `s`.
+  `str_index_of_from`, `str_last_index_of` and `str_find_last` follow, the
+  last two matching at the end of `s`.
+- The internal backend modules `std.net.async.linux` and `.darwin` no longer
+  expose `Backend` or the submit calls (#937). They were outside the semver
+  promise. Use `std.net.async`.
+
+### Added
+
+- `std.system.os.errors` holds `error_kind` over the selected OS's codes
+  (#937). `std.system.os.<os>.error_kind` and `os.error_kind` are unchanged.
+
+### Changed
+
+- The linux and darwin internet backends and the local unix backend share one
+  readiness engine, `std.net.async.readiness`, and linux and darwin share one
+  internet backend, `std.net.async.unix` (#937). Behaviour is unchanged,
+  except that `destroy` now clears `source_id` for the internet backend too.
+- Tests are named with identifiers (`test <identifier>`) and were pruned to
+  the test policy, from 1727 to 993 (#938).
+
+### Fixed
+
+- The windows pipe handle leak test no longer depends on timing (#942).
+- The darwin backend check expects the import GOT in `__DATA_CONST,__got`,
+  where mach 5.13 and later put it.
+
+### Removed
+
+- The sha256 benchmark and the tests that asserted elapsed-time bounds (#938).
+
 ## [8.2.0] - 2026-09-25
 
 ### Added
