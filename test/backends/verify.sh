@@ -77,16 +77,22 @@ inspect_macho() {
 
     local segments seg
     segments="$(llvm-readobj --macho-segment "$exe")"
-    for seg in __PAGEZERO __TEXT __DATA __GOT __LINKEDIT; do
+    for seg in __PAGEZERO __TEXT __DATA_CONST __DATA __LINKEDIT; do
         grep -q "Name: $seg\$" <<< "$segments" \
             || fail "$target $profile: segment $seg is missing"
     done
     # call stubs sit at the end of the code, in reach of every call (mach #3888)
     ! grep -q 'Name: __STUBS$' <<< "$segments" \
         || fail "$target $profile: call stubs sit in a __STUBS segment past the data"
-    llvm-readobj --sections "$exe" | awk '$1 == "Name:" { name = $2 } $1 == "Segment:" { print name, $2 }' \
-        | grep -qx '__stubs __TEXT' \
+    # the import GOT sits ahead of the zero-fill, in __DATA_CONST (mach #3903)
+    ! grep -q 'Name: __GOT$' <<< "$segments" \
+        || fail "$target $profile: the import GOT sits in a __GOT segment"
+    local sections
+    sections="$(llvm-readobj --sections "$exe" | awk '$1 == "Name:" { name = $2 } $1 == "Segment:" { print name, $2 }')"
+    grep -qx '__stubs __TEXT' <<< "$sections" \
         || fail "$target $profile: no __TEXT,__stubs section"
+    grep -qx '__got __DATA_CONST' <<< "$sections" \
+        || fail "$target $profile: no __DATA_CONST,__got section"
 
     local imports sym
     imports="$(llvm-nm -u "$exe" | awk '{print $NF}')"
