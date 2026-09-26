@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [8.2.0] - 2026-09-25
+
+### Added
+
+- `std.system.cpu.Features` reports AES and carry-less multiply (#893):
+  `aes` and `pclmul` on x86_64 from cpuid leaf 1 (ecx bits 25 and 1), and
+  `aes` and `pmull` on aarch64 from the OS, linux `AT_HWCAP` (bits 3 and 4)
+  and darwin sysctl (`hw.optional.arm.FEAT_AES`, `FEAT_PMULL`). The names are
+  the compiler's extension names, so the x86_64 field is `pclmul`, not
+  `pclmulqdq`. A processor without an extension reads false, never an error.
+  A build that selects the extensions reports them without a probe on mach
+  5.12.2 and later, the first release that knows them. On 5.12.0 and 5.12.1
+  no build can select them, and the fields are what the probe finds. std
+  still requires `^5.12`. Windows has no aarch64 target in std, so there is
+  no `IsProcessorFeaturePresent` path.
+- `io_runtime.pins_capacity(runtime, token)` says whether a live operation
+  keeps capacity the runtime would otherwise give back (#928). The runtime
+  releases a chunk of its slot table only once it and the chunk below it hold
+  nothing live, so an operation submitted at a peak and left pending after the
+  load leaves, such as an accept, keeps every chunk up to its own, and the
+  timer, deadline and driver tables with them. It is true when the
+  operation's slot lies above the slack chunk past where the live count would
+  end if packed from index 0, and a chunk past that slack exists. A caller can
+  cancel such an operation and submit it again, and the new submission takes
+  the lowest free slot, which never pins. It is false for a stale token and
+  over an allocator that never reclaims.
+
+### Fixed
+
+- A cancelled accept that had already accepted a connection no longer loses it
+  (#927). `net.async` closed the accepted socket, and `net.async.local` leaked
+  it, because `io_runtime.complete_opened` refused a completion that lost to a
+  cancellation. On Windows the backend closed a socket that `AcceptEx` took
+  before its abort landed. The accepted socket now rides on the cancelled
+  completion, the way a cancelled read reports its bytes, and the caller owns
+  it: `net_async.accepted` returns the stream an accept completion hands over,
+  successful or cancelled, and `net.async.local`'s `accepted` does the same. A
+  completion's `opening` is nonzero exactly when it hands a socket over. This
+  changes documented behaviour: a caller that cancels accepts and ignores a
+  cancelled completion's socket now leaks it, so take the stream from every
+  accept completion and serve or close it.
+
+### Changed
+
+- Secret wipes no longer store one byte at a time (#924). `crypto.ct.zeroize`
+  is an inline-asm kernel on every target, and every wipe in
+  `memory.secret` goes through it: release, typed release, the fill-failure
+  wipes and `borrow_wipe`, which `memory.buffers` uses for secret chunks. On
+  x86_64 and aarch64 it stores 16 bytes at a time over a body aligned to 16,
+  with overlapping stores for the unaligned head and tail. On riscv64 it
+  stores doublewords between byte-wise head and tail. The stores stay in
+  inline assembly, so no optimization can drop or reorder them, and branches
+  read only the address and length. `zeroize` is now never inlined, so an
+  `#[oblivious]` caller that still holds secrets in registers passes the
+  constant-time check.
+
 ## [8.1.1] - 2026-09-25
 
 ### Changed

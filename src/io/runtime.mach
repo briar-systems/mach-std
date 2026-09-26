@@ -84,7 +84,10 @@ pub rec Operation {
 # end_of_stream the transfer that finished before the cancellation took
 # effect: bytes a read placed in its buffer, bytes a write sent, datagrams a
 # batch filled. those bytes belong to the stream, so a caller that cancels a
-# read consumes them like any other read's
+# read consumes them like any other read's. opening is nonzero exactly when the
+# completion hands the caller a socket in resource: a successful accept or
+# connect, or a cancelled accept that had already accepted, whose socket the
+# caller owns and closes like any other
 pub rec Completion {
     token:         Token;
     kind:          Kind;
@@ -198,6 +201,10 @@ rec Slot {
     settled_bytes: usize;
     settled_items: usize;
     settled_eof:   bool;
+    # the socket an accept took before the cancellation claimed it, handed over
+    # with the cancellation. settled_opening is zero when there is none
+    settled_resource: usize;
+    settled_opening:  u64;
 }
 
 val TIMER_OPERATION:      u8 = 0;
@@ -335,6 +342,43 @@ fun bucket_at(runtime: *Runtime, index: usize) *usize {
 pub fun capacity(runtime: *Runtime) usize {
     if (runtime == nil || runtime.destroyed) { ret 0; }
     ret runtime.slots.capacity;
+}
+
+# whether the live operation token names keeps capacity the runtime would
+# otherwise give back
+#
+# the runtime gives back a chunk of its slot table only once that chunk and the
+# one below it hold nothing live, and its timer, deadline and driver tables
+# follow the slot table down. an operation submitted at a peak takes the lowest
+# free slot, which is as high as the peak, so one that stays pending after the
+# load leaves holds every chunk up to its own. this is true when the
+# operation's slot lies above the slack chunk past where the live count would
+# end if every live slot were packed from index 0, and the table holds a chunk
+# past that slack: moving every such operation to the lowest free slots lets
+# the runtime release it. an operation submitted now takes the lowest free
+# slot, which never pins, so a caller that cancels and resubmits an operation
+# that pins never has to do it twice for the same peak
+# ---
+# runtime: the runtime the operation was submitted to
+# token:   the operation
+# ret:     false for a stale token, an operation whose completion was taken,
+#          or a runtime over an allocator that never reclaims, whose tables
+#          keep their peak anyway
+pub fun pins_capacity(runtime: *Runtime, token: Token) bool {
+    if (runtime == nil || runtime.destroyed) { ret false; }
+    mutex.lock(?runtime.lock);
+    var pins: bool = false;
+    if (token.index::usize < runtime.slots.capacity && runtime.live > 0 &&
+        allocator.reclaims(?runtime.allocator)) {
+        val slot: *Slot = slot_at(runtime, token.index::usize);
+        if (slot.generation == token.generation && slot.state != SLOT_FREE) {
+            val needed: usize = table.chunk_of(?runtime.slots, runtime.live - 1);
+            pins = table.chunk_of(?runtime.slots, token.index::usize) >= needed + 2 &&
+                runtime.slots.chunk_count > needed + 3;
+        }
+    }
+    mutex.unlock(?runtime.lock);
+    ret pins;
 }
 
 fun invalid(operation: io_error.Operation) io_error.Error {
@@ -939,9 +983,11 @@ pub fun submit_owned(runtime: *Runtime, source_token: SourceToken, operation: Op
 }
 
 fun settle_clear(slot: *Slot) {
-    slot.settled_bytes = 0;
-    slot.settled_items = 0;
-    slot.settled_eof   = false;
+    slot.settled_bytes    = 0;
+    slot.settled_items    = 0;
+    slot.settled_eof      = false;
+    slot.settled_resource = 0;
+    slot.settled_opening  = 0;
 }
 
 # two reports of one operation's transfer describe the same native request, so
@@ -954,7 +1000,7 @@ fun settle_merge(slot: *Slot, bytes: usize, items: usize, eof: bool) {
 
 # a cancellation publishes whatever transfer settled before it
 fun enqueue_cancellation(runtime: *Runtime, token: Token, slot: *Slot, failure: io_error.Error) {
-    enqueue(runtime, token, slot, slot.settled_bytes, slot.settled_items, 0, 0, true, failure, slot.settled_eof);
+    enqueue(runtime, token, slot, slot.settled_bytes, slot.settled_items, slot.settled_resource, slot.settled_opening, true, failure, slot.settled_eof);
 }
 
 fun slot_for(runtime: *Runtime, token: Token) *Slot {
@@ -1322,8 +1368,10 @@ fun slot_unsettled(runtime: *Runtime, token: Token) *Slot {
 
 # a completion that loses to a cancellation already underway is not published
 # itself. when transfer is set its bytes, items and end of stream (and a copy)
-# are recorded for the cancellation to carry, and it succeeds. otherwise it is
-# refused with CLOSED, so its caller still owns anything it would have handed over
+# are recorded for the cancellation to carry, and it succeeds. so is the socket
+# an accept hands over (a nonzero opening), which nothing but the cancellation
+# can give the caller. otherwise it is refused with CLOSED, so its caller still
+# owns anything it would have handed over
 fun resolve_with_copy(runtime: *Runtime, token: Token, source: *u8, copy: bool, transfer: bool, bytes: usize, items: usize, resource: usize, opening: u64, has_error: bool, failure: io_error.Error, eof: bool) err[io_error.Error] {
     if (runtime == nil) { ret err[io_error.Error].err{invalid(io_error.OP_SUBMIT)}; }
     mutex.lock(?runtime.lock);
@@ -1341,6 +1389,12 @@ fun resolve_with_copy(runtime: *Runtime, token: Token, source: *u8, copy: bool, 
     var lost: bool = slot.state == SLOT_CANCELLING;
     if (!lost && slot.cancellation_active && !transitioned(cancel.unregister(?slot.cancellation))) { lost = true; }
     if (lost) {
+        if (opening != 0 && slot.operation.kind == ACCEPT && slot.settled_opening == 0) {
+            slot.settled_resource = resource;
+            slot.settled_opening  = opening;
+            mutex.unlock(?runtime.lock);
+            ret err[io_error.Error].ok{};
+        }
         if (!transfer) {
             mutex.unlock(?runtime.lock);
             ret err[io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_SUBMIT)};
@@ -1380,9 +1434,11 @@ pub fun complete_copy(runtime: *Runtime, token: Token, source: *u8, bytes: usize
 }
 
 # a completion that hands the caller a socket it did not open itself, such as
-# an accepted or a connected one, also carries that socket's opening. a
-# cancellation cannot carry a socket, so after one claimed the operation this
-# is refused with CLOSED and the caller keeps, and closes, the socket
+# an accepted or a connected one, also carries that socket's opening, which is
+# never zero. after a cancellation claimed an accept, the accepted socket rides
+# on the cancelled completion and this succeeds: the caller of the accept owns
+# it. after a cancellation claimed any other operation this is refused with
+# CLOSED, and the caller of this keeps, and closes, the socket
 # ---
 # resource: the native socket
 # opening:  the opening its handle was stamped with (std.io.handle)
@@ -4121,10 +4177,25 @@ test "runtime: a cancelled copy lands in the buffer and reports its bytes" {
 }
 
 # an opened socket cannot ride on a cancellation, so the source keeps it and closes it
-test "runtime: a cancelled opened completion is refused and carries nothing" {
+# an accept that took a socket before its cancellation hands it over with the
+# cancellation, since nothing else can give it to the caller (#927)
+test "runtime: a cancelled accept carries the socket it already accepted" {
     var source: RacingSource = racing_source(RACE_OPENED, 0, 0, false, nil);
     var output: Completion;
     val raced:  i32          = raced_cancellation(?source, test_operation(ACCEPT, 100), false, ?output);
+    if (raced != 0)                                                        { ret raced; }
+    if (!source.accepted)                                                  { ret 10; }
+    if (!output.has_error || output.error.kind != io_error.CANCELLED)      { ret 11; }
+    if (output.bytes != 0 || output.resource != 77 || output.opening != 5) { ret 12; }
+    ret 0;
+}
+
+# a connect's socket is its driver's, so a connected completion that loses is
+# refused and the cancellation carries nothing
+test "runtime: a cancelled connect is refused its socket and carries nothing" {
+    var source: RacingSource = racing_source(RACE_OPENED, 0, 0, false, nil);
+    var output: Completion;
+    val raced:  i32          = raced_cancellation(?source, test_operation(CONNECT, 100), false, ?output);
     if (raced != 0)                                                       { ret raced; }
     if (source.accepted)                                                  { ret 10; }
     if (!output.has_error || output.error.kind != io_error.CANCELLED)     { ret 11; }
@@ -4304,6 +4375,98 @@ test "runtime: a drained peak returns the tables to within one growth step of id
     }
     if (!ok_bool(close(?runtime)) || !ok_err(destroy(?runtime))) { ret 3; }
     if (counting.live != 0)                                      { ret 4; }
+    ret 0;
+}
+
+# #928: an operation left pending at a peak says it keeps the peak's chunks,
+# and once it is resubmitted it takes the lowest free slot, says nothing, and
+# the runtime shrinks to its slack
+test "runtime: an operation left at a peak pins capacity until it is resubmitted" {
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, ?pa, 4))) { ret 1; }
+    var ramp: [512]Token;
+    var i:    usize = 0;
+    for (i < 512) {
+        val submitted: res[Token, io_error.Error] = submit(?runtime, test_operation(WRITE, i));
+        if (sel submitted.err) { ret 2; }
+        ramp[i] = submitted.ok;
+        i       = i + 1;
+    }
+    # at the peak nothing pins, since the live count needs every chunk
+    if (pins_capacity(?runtime, ramp[511]) || pins_capacity(?runtime, ramp[0])) { ret 3; }
+    val low:  Token = ramp[0];
+    val high: Token = ramp[511];
+    i = 1;
+    for (i < 511) {
+        if (!ok_err(complete(?runtime, ramp[i], 0, 0, false))) { ret 4; }
+        i = i + 1;
+    }
+    var output: [64]Completion;
+    var total:  usize = 0;
+    for (total < 510) {
+        val polled: res[usize, io_error.Error] = poll(?runtime, ?output[0], 64);
+        if (polled_count(polled) == 0) { ret 5; }
+        total = total + polled_count(polled);
+    }
+    val peak_slots: usize = capacity(?runtime);
+    if (peak_slots <= high.index::usize) { ret 6; }
+    if (!pins_capacity(?runtime, high))  { ret 7; }
+    if (pins_capacity(?runtime, low))    { ret 8; }
+    # resubmitted, the operation lands low and the peak's chunks go back
+    if (!ok_err(complete(?runtime, high, 0, 0, false)))    { ret 9; }
+    if (polled_count(poll(?runtime, ?output[0], 64)) != 1) { ret 9; }
+    if (pins_capacity(?runtime, high))                     { ret 10; }
+    val again: res[Token, io_error.Error] = submit(?runtime, test_operation(WRITE, 600));
+    if (sel again.err)                                                                                       { ret 11; }
+    if (pins_capacity(?runtime, again.ok))                                                                   { ret 12; }
+    if (capacity(?runtime) > 8)                                                                              { ret 13; }
+    if (!ok_err(complete(?runtime, low, 0, 0, false)) || !ok_err(complete(?runtime, again.ok, 0, 0, false))) { ret 14; }
+    if (polled_count(poll(?runtime, ?output[0], 64)) != 2)                                                   { ret 14; }
+    if (!ok_bool(close(?runtime)) || !ok_err(destroy(?runtime)))                                             { ret 15; }
+    ret 0;
+}
+
+# over an allocator that never reclaims the tables keep their peak whatever is
+# live, so no operation pins anything
+test "runtime: nothing pins capacity over an allocator that never reclaims" {
+    val bytes:  usize = 1 << 20;
+    val region: ptr   = os.allocate(bytes);
+    if (region == nil) { ret 1; }
+    fin { os.deallocate(region, bytes); }
+    var state: fixed.FixedState;
+    var a:     allocator.Allocator;
+    val made:  err[allocator.Error] = fixed.make(?a, ?state, region::*u8, bytes);
+    if (sel made.err || allocator.reclaims(?a)) { ret 2; }
+    var runtime: Runtime;
+    if (!ok_err(make(?runtime, ?a, 4))) { ret 3; }
+    var ramp: [512]Token;
+    var i:    usize = 0;
+    for (i < 512) {
+        val submitted: res[Token, io_error.Error] = submit(?runtime, test_operation(WRITE, i));
+        if (sel submitted.err) { ret 4; }
+        ramp[i] = submitted.ok;
+        i       = i + 1;
+    }
+    i = 0;
+    for (i < 511) {
+        if (!ok_err(complete(?runtime, ramp[i], 0, 0, false))) { ret 5; }
+        i = i + 1;
+    }
+    var output: [64]Completion;
+    var total:  usize = 0;
+    for (total < 511) {
+        val polled: res[usize, io_error.Error] = poll(?runtime, ?output[0], 64);
+        if (polled_count(polled) == 0) { ret 6; }
+        total = total + polled_count(polled);
+    }
+    if (pins_capacity(?runtime, ramp[511])) { ret 7; }
+    # a stale token pins nothing either
+    if (pins_capacity(?runtime, ramp[300]))                      { ret 8; }
+    if (!ok_err(complete(?runtime, ramp[511], 0, 0, false)))     { ret 9; }
+    if (polled_count(poll(?runtime, ?output[0], 64)) != 1)       { ret 9; }
+    if (!ok_bool(close(?runtime)) || !ok_err(destroy(?runtime))) { ret 10; }
     ret 0;
 }
 
