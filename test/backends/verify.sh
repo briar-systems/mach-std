@@ -77,10 +77,16 @@ inspect_macho() {
 
     local segments seg
     segments="$(llvm-readobj --macho-segment "$exe")"
-    for seg in __PAGEZERO __TEXT __DATA __STUBS __GOT __LINKEDIT; do
+    for seg in __PAGEZERO __TEXT __DATA __GOT __LINKEDIT; do
         grep -q "Name: $seg\$" <<< "$segments" \
             || fail "$target $profile: segment $seg is missing"
     done
+    # call stubs sit at the end of the code, in reach of every call (mach #3888)
+    ! grep -q 'Name: __STUBS$' <<< "$segments" \
+        || fail "$target $profile: call stubs sit in a __STUBS segment past the data"
+    llvm-readobj --sections "$exe" | awk '$1 == "Name:" { name = $2 } $1 == "Segment:" { print name, $2 }' \
+        | grep -qx '__stubs __TEXT' \
+        || fail "$target $profile: no __TEXT,__stubs section"
 
     local imports sym
     imports="$(llvm-nm -u "$exe" | awk '{print $NF}')"
