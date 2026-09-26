@@ -34,7 +34,8 @@ list() {
     shift
     local listed
     listed="$(mach_run test "$repo" "$@" --list)" || fail "could not list: mach test $*"
-    sed "s# $repo/# #" <<< "$listed" > "$out"
+    # each line is `<module>#<name> <test object>`, and the name alone identifies the test
+    cut -d' ' -f1 <<< "$listed" > "$out"
 }
 
 : > "$scratch/reached.txt"
@@ -45,7 +46,7 @@ for target in $targets; do
     list "$scratch/$target-every.txt" --lib every-test --target "$target"
     sort -u "$scratch/$target-std.txt" "$scratch/$target-tests.txt" > "$scratch/$target-union.txt"
     sort -u "$scratch/$target-every.txt" > "$scratch/$target-all.txt"
-    sed -E 's#.* (src/[^:]*):[0-9]+$#\1#' "$scratch/$target-all.txt" >> "$scratch/reached.txt"
+    sed -E 's|^std\.([^#]*)#.*$|\1|' "$scratch/$target-all.txt" | tr . / | sed 's|.*|src/&.mach|' >> "$scratch/reached.txt"
     dropped="$(comm -23 "$scratch/$target-all.txt" "$scratch/$target-union.txt")"
     printf '%s: std %d, tests %d, both %d of %d\n' "$target" \
         "$(wc -l < "$scratch/$target-std.txt")" "$(wc -l < "$scratch/$target-tests.txt")" \

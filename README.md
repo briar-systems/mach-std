@@ -20,7 +20,7 @@ mach dep add . std --git https://github.com/briar-systems/mach-std --ref tag/v6.
 
 ## Support
 
-std 6.x requires mach 5.8.0 or later. It is tested on linux (x86_64, arm64, riscv64), darwin (x86_64, aarch64) and windows (x86_64). Its OS-free core also builds for freestanding targets.
+std 9.x requires mach 6. It is tested on linux (x86_64, arm64, riscv64), darwin (x86_64, aarch64) and windows (x86_64). Its OS-free core also builds for freestanding targets.
 
 std follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See the [changelog](./CHANGELOG.md).
 
