@@ -30,6 +30,8 @@ The semantic versioning promise covers the driver and library modules, such as `
 
 std is designed so that callers can reach past a driver when it does not give them what they need, and doing so is expected. The only thing to know is what the version number covers. The `net.async` backend modules are outside the promise:
 
+- `std.net.async.readiness` (`src/net/async/readiness.mach`)
+- `std.net.async.unix` (`src/net/async/unix.mach`)
 - `std.net.async.linux` (`src/net/async/linux.mach`)
 - `std.net.async.darwin` (`src/net/async/darwin.mach`)
 - `std.net.async.windows` (`src/net/async/windows.mach`)
