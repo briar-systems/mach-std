@@ -26,6 +26,8 @@ case "$MACH_CI_LEG" in
         # classification is target-independent, so one leg is the whole signal
         bash test/derive/verify.sh
         bash test/secret/verify.sh
+        # every module with a test is reached by `mach test .` or `--lib tests`, per target
+        bash test/selections/verify.sh "$mach"
         bash test/deadline/verify.sh
         bash test/sha256/verify.sh "$mach" linux-x86_64
         bash test/sha256/refusals.sh "$mach"
@@ -76,6 +78,8 @@ case "$MACH_CI_LEG" in
         bash test/riscv64/verify.sh "$mach"
         python3 test/lib/compiler-census.py test/native/results test linux-riscv64
         "$mach" test . --target linux-riscv64 --runner qemu-riscv64
+        python3 test/lib/compiler-census.py test/native/results test linux-riscv64 tests
+        "$mach" test . --lib tests --target linux-riscv64 --runner qemu-riscv64
         python3 test/lib/compiler-census.py test/native/results test linux-riscv64 ownership
         "$mach" test . --target linux-riscv64 --runner qemu-riscv64 -O2 --filter 'ownership_query'
         bash test/fault/verify.sh "$mach" linux-riscv64 qemu-riscv64
