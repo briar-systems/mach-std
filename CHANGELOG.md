@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [7.4.1] - 2026-09-26
+
+### Changed
+
+- Every test is declared with an identifier, `test name { ... }`, rather
+  than a string label, and std requires mach `>=5.13, <7` (#939).
+- The test harness follows mach 5.13 without any API change (#939): the
+  fault harness and a new test-only `tests` artifact
+  (`mach test . --lib tests`) reach the modules the library does not, so
+  every test runs again, and 16 files are reformatted under the 5.13
+  formatter.
+
 ## [7.4.0] - 2026-09-23
 
 ### Added
