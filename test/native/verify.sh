@@ -36,24 +36,25 @@ mach_run test "$here" --target "$target" --profile "$profile" --include-deps --l
     | tr '\134' '/' > "$list" \
     || fail "$target suite could not be listed"
 
+# --list prints each test as <module>#<name> beside its test object
 required=(
-    'src/memory/secret.mach'
-    'src/sync/thread.mach'
-    'src/process/exec.mach'
-    'src/filesystem.mach'
-    'src/io/file/tests.mach'
-    'src/io/runtime.mach'
-    'src/net/tcp.mach'
-    'src/net/udp.mach'
-    'src/net/local.mach'
-    'src/net/async.mach'
-    'src/net/async/local.mach'
-    'src/chrono/time.mach'
-    'src/sync/channel.mach'
-    'src/sync/worker_pool.mach'
+    'std.memory.secret'
+    'std.sync.thread'
+    'std.process.exec'
+    'std.filesystem'
+    'std.io.file.tests'
+    'std.io.runtime'
+    'std.net.tcp'
+    'std.net.udp'
+    'std.net.local'
+    'std.net.async'
+    'std.net.async.local'
+    'std.chrono.time'
+    'std.sync.channel'
+    'std.sync.worker_pool'
 )
-for source in "${required[@]}"; do
-    grep -qF "$source" "$list" || fail "$target omitted required tests from $source"
+for module in "${required[@]}"; do
+    grep -q "^${module//./\\.}#" "$list" || fail "$target omitted required tests from $module"
 done
 
 { grep -vE '^[[:space:]]*(#|$)' "$known" || true; } \
@@ -73,8 +74,9 @@ failed="$(printf '%s\n' "$summary" \
     | sed -n 's/.* passed, \([0-9][0-9]*\) failed,.*/\1/p')"
 [ -n "$failed" ] || fail "$target suite result could not be parsed"
 
-sed -n 's/^[[:space:]]*FAIL[[:space:]]\{1,\}\(.*\)[[:space:]]\{2,\}[^[:space:]]*:[0-9][0-9]*[[:space:]]*(.*)[[:space:]]*$/\1/p' "$result" \
-    | sed 's/[[:space:]]*$//' | sort -u > "$actual_file"
+# the summary lists each failure as `  <module>#<name>  <file>:<line>  (<reason>)`
+awk '/^failures:$/ { on = 1; next } on && /^$/ { on = 0 } on && $2 ~ /:[0-9]+$/ { print $1 }' "$result" \
+    | sort -u > "$actual_file"
 
 actual_count="$(wc -l < "$actual_file" | tr -d '[:space:]')"
 [ "$actual_count" = "$failed" ] \
@@ -100,7 +102,7 @@ echo "OK: thread, process, file, socket, and timer coverage is present"
 
 release_result="$here/results/$target-ownership-release.log"
 mach_run test "$here" --target "$target" --profile release --include-deps \
-    --filter 'ownership query' 2>&1 | tee "$release_result" \
+    --filter 'ownership_query' 2>&1 | tee "$release_result" \
     || fail "$target release ownership suite failed"
 grep -qE '[0-9]+ passed, 0 failed, [0-9]+ total' "$release_result" \
     || fail "$target release ownership suite produced no clean result"

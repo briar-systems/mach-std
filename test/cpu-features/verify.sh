@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# std.system.cpu's aes and carry-less multiply fields against the host.
+# std.system.cpu's aes, carry-less multiply and sha fields against the host.
+# sha256 picks its backend from the sha field (a unit test pins that), so this
+# is also the check that the backend choice matches the processor.
 #
 # the probe program prints what std.system.cpu.features() reports and what
 # os.cpu_features reads. both must match the OS's own view of the processor:
@@ -31,8 +33,8 @@ cp ../../mach.toml dep/std/mach.toml
 cp -r ../../src dep/std/src
 
 case "$target" in
-    *x86_64) names=(aes pclmul) ;;
-    *) names=(aes pmull) ;;
+    *x86_64) names=(aes pclmul sha) ;;
+    *) names=(aes pmull sha2) ;;
 esac
 
 build() {
@@ -42,6 +44,11 @@ build() {
     [ -z "$bin" ] && bin="$(find "out/$1" -name 'cpu.exe' -type f -print -quit)"
     [ -n "$bin" ] || fail "no probe binary for $1"
     echo "$bin"
+}
+
+# the probe's answer without its sha field, for the qemu models whose sha support is not pinned here
+crypto() {
+    sed -E 's/ sha2?=[01]//g' <<<"$(probe "$@")"
 }
 
 # runs the probe and prints "<features line>|<probed line>"
@@ -65,19 +72,23 @@ os_view() {
     case "$target" in
         linux-x86_64)
             grep -qw aes /proc/cpuinfo && flags+=(1) || flags+=(0)
-            grep -qw pclmulqdq /proc/cpuinfo && flags+=(1) || flags+=(0) ;;
+            grep -qw pclmulqdq /proc/cpuinfo && flags+=(1) || flags+=(0)
+            grep -qw sha_ni /proc/cpuinfo && flags+=(1) || flags+=(0) ;;
         linux-arm64)
             grep -qw aes /proc/cpuinfo && flags+=(1) || flags+=(0)
-            grep -qw pmull /proc/cpuinfo && flags+=(1) || flags+=(0) ;;
+            grep -qw pmull /proc/cpuinfo && flags+=(1) || flags+=(0)
+            grep -qw sha2 /proc/cpuinfo && flags+=(1) || flags+=(0) ;;
         darwin-aarch64)
             [ "$(sysctl -n hw.optional.arm.FEAT_AES 2>/dev/null || echo 0)" = 1 ] && flags+=(1) || flags+=(0)
-            [ "$(sysctl -n hw.optional.arm.FEAT_PMULL 2>/dev/null || echo 0)" = 1 ] && flags+=(1) || flags+=(0) ;;
+            [ "$(sysctl -n hw.optional.arm.FEAT_PMULL 2>/dev/null || echo 0)" = 1 ] && flags+=(1) || flags+=(0)
+            [ "$(sysctl -n hw.optional.arm.FEAT_SHA256 2>/dev/null || echo 0)" = 1 ] && flags+=(1) || flags+=(0) ;;
         darwin-x86_64)
             sysctl -n machdep.cpu.features | grep -qw AES && flags+=(1) || flags+=(0)
-            sysctl -n machdep.cpu.features | grep -qw PCLMULQDQ && flags+=(1) || flags+=(0) ;;
+            sysctl -n machdep.cpu.features | grep -qw PCLMULQDQ && flags+=(1) || flags+=(0)
+            { sysctl -n machdep.cpu.leaf7_features 2>/dev/null || true; } | grep -qw SHA && flags+=(1) || flags+=(0) ;;
         *) return 0 ;;
     esac
-    line="${names[0]}=${flags[0]} ${names[1]}=${flags[1]}"
+    line="${names[0]}=${flags[0]} ${names[1]}=${flags[1]} ${names[2]}=${flags[2]}"
     echo "$line"
 }
 
@@ -97,10 +108,10 @@ fi
 
 # qemu models where this host can run them
 if [ "$target" = linux-x86_64 ] && command -v qemu-x86_64 >/dev/null; then
-    [ "$(probe qemu-x86_64 -cpu max "$bin")" = "aes=1 pclmul=1|aes=1 pclmul=1" ] \
+    [ "$(crypto qemu-x86_64 -cpu max "$bin")" = "aes=1 pclmul=1|aes=1 pclmul=1" ] \
         || fail "qemu-x86_64 -cpu max does not report aes and pclmul"
     echo "OK: qemu-x86_64 -cpu max reports aes=1 pclmul=1"
-    [ "$(probe qemu-x86_64 -cpu qemu64 "$bin")" = "aes=0 pclmul=0|aes=0 pclmul=0" ] \
+    [ "$(crypto qemu-x86_64 -cpu qemu64 "$bin")" = "aes=0 pclmul=0|aes=0 pclmul=0" ] \
         || fail "qemu-x86_64 -cpu qemu64 does not read aes and pclmul absent"
     echo "OK: qemu-x86_64 -cpu qemu64 reads aes=0 pclmul=0 without error"
 
@@ -123,7 +134,7 @@ extensions = ["aes", "pclmul"]
 EOF
         selected="$(cd "$sel" && build linux-x86_64-aes)"
         selected="$sel/$selected"
-        [ "$(probe qemu-x86_64 -cpu qemu64 "$selected")" = "aes=1 pclmul=1|aes=0 pclmul=0" ] \
+        [ "$(crypto qemu-x86_64 -cpu qemu64 "$selected")" = "aes=1 pclmul=1|aes=0 pclmul=0" ] \
             || fail "a build selecting aes and pclmul does not report them under qemu64"
         echo "OK: a build selecting aes and pclmul reports both under qemu64, where the probe reads them absent"
     else
@@ -132,7 +143,7 @@ EOF
 fi
 if [ "$target" = linux-x86_64 ] && command -v qemu-aarch64 >/dev/null; then
     arm="$(build linux-arm64)"
-    [ "$(probe qemu-aarch64 -cpu max "$arm")" = "aes=1 pmull=1|aes=1 pmull=1" ] \
+    [ "$(crypto qemu-aarch64 -cpu max "$arm")" = "aes=1 pmull=1|aes=1 pmull=1" ] \
         || fail "qemu-aarch64 -cpu max does not report aes and pmull"
     echo "OK: qemu-aarch64 -cpu max reports aes=1 pmull=1"
 fi

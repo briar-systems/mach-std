@@ -30,7 +30,6 @@ case "$MACH_CI_LEG" in
         # every module with a test is reached by `mach test .` or `--lib tests`, per target
         bash test/selections/verify.sh "$mach"
         bash test/deadline/verify.sh
-        bash test/sha256/verify.sh "$mach" linux-x86_64
         bash test/cpu-features/verify.sh "$mach" linux-x86_64
         bash test/sha256/refusals.sh "$mach"
         ;;
@@ -44,7 +43,6 @@ case "$MACH_CI_LEG" in
         bash test/sigpipe/verify.sh "$mach" linux-arm64
         bash test/terminate-child/verify.sh "$mach" linux-arm64
         bash test/process-status/verify.sh "$mach" linux-arm64
-        bash test/sha256/verify.sh "$mach" linux-arm64
         bash test/cpu-features/verify.sh "$mach" linux-arm64
         bash test/dit/verify.sh "$mach" linux-arm64
         ;;
@@ -58,7 +56,6 @@ case "$MACH_CI_LEG" in
         bash test/sigpipe/verify.sh "$mach" windows-x86_64
         bash test/terminate-child/verify.sh "$mach" windows-x86_64
         CC=gcc bash test/process-status/verify.sh "$mach" windows-x86_64
-        bash test/sha256/verify.sh "$mach" windows-x86_64
         bash test/cpu-features/verify.sh "$mach" windows-x86_64
         ;;
     aarch64-darwin|x86_64-darwin)
@@ -73,7 +70,6 @@ case "$MACH_CI_LEG" in
         # observable from outside the process (#415)
         bash test/darwin/verify.sh "$mach" "$target"
         format_evidence "$target"
-        bash test/sha256/verify.sh "$mach" "$target"
         bash test/cpu-features/verify.sh "$mach" "$target"
         # the data-independent-timing mode exists on aarch64 only
         if [ "$target" = darwin-aarch64 ]; then bash test/dit/verify.sh "$mach" "$target"; fi
@@ -87,7 +83,7 @@ case "$MACH_CI_LEG" in
         python3 test/lib/compiler-census.py test/native/results test linux-riscv64 tests
         "$mach" test . --lib tests --target linux-riscv64 --runner qemu-riscv64
         python3 test/lib/compiler-census.py test/native/results test linux-riscv64 ownership
-        "$mach" test . --target linux-riscv64 --runner qemu-riscv64 -O2 --filter 'ownership query'
+        "$mach" test . --target linux-riscv64 --runner qemu-riscv64 -O2 --filter 'ownership_query'
         bash test/fault/verify.sh "$mach" linux-riscv64 qemu-riscv64
         bash test/thread-resources/verify.sh "$mach" linux-riscv64 qemu-riscv64
         CC=riscv64-linux-gnu-gcc QEMU_LD_PREFIX=/usr/riscv64-linux-gnu \

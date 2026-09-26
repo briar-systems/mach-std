@@ -1,0 +1,1675 @@
+# bounded linux and darwin readiness backend for internet sockets
+# backend for std.net.async, signatures may change in a minor release (README, API surface)
+# the engine is std.net.async.readiness, and std.net.async.linux and .darwin hold
+# the control-message layout that differs between the two.
+# a local socket carries descriptor rights this byte backend cannot observe; std.net.async.local owns those.
+# attached handles remain exclusively owned by this backend through completion and close.
+
+$if ($mach.build.os == $mach.os.linux) {
+    use platform: std.net.async.linux;
+    use sys:      std.system.os.linux;
+}
+$or ($mach.build.os == $mach.os.darwin) {
+    use platform: std.net.async.darwin;
+    use sys:      std.system.os.darwin;
+}
+$or {
+    $error("std.net.async.unix: requires linux or darwin target");
+}
+
+use std.allocator;
+use std.allocator.page;
+use std.allocator.testing;
+use std.io.runtime;
+use std.memory.table;
+use std.net.async.readiness;
+use std.net.async.types;
+use std.net.ip;
+use std.sync.mutex;
+use std.system.os.shared;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.size.usize;
+
+fwd types.Vector;
+fwd types.Packet;
+fwd types.Token;
+fwd types.NativeCompletion;
+
+fwd readiness.CANCEL_NEEDS_NATIVE_CONTROL;
+fwd readiness.Backend;
+fwd readiness.aliases;
+fwd readiness.submit_read;
+fwd readiness.submit_readable;
+fwd readiness.submit_write;
+fwd readiness.submit_shutdown_write;
+fwd readiness.submit_close;
+fwd readiness.cancel;
+fwd readiness.flush;
+fwd readiness.dispatch;
+fwd readiness.poll;
+fwd readiness.completion;
+fwd readiness.destroy;
+
+# an internet operation: the engine's part, then what its kind carries
+rec Request {
+    operation:    readiness.Operation;
+    vectors:      *types.Vector;
+    vector_count: usize;
+    packets:      *types.Packet;
+    packet_count: usize;
+    peer:         ip.Endpoint;
+    accept_peer:  *ip.Endpoint;
+}
+
+# initial is the size the backend starts at: the operation, resource and ready
+# tables grow on demand and the resource map rehashes with them
+# ---
+# a: where the tables, the resource map and the completion batch come from;
+#    the backend keeps a copy, so a's context must outlive it
+pub fun make(backend: *readiness.Backend, queue: *shared.IoQueue, a: *allocator.Allocator, initial: usize, source_id: u16) i64 {
+    ret readiness.make(backend, queue, a, initial, source_id, readiness.Protocol{
+        operation_size: $size_of(Request),
+        attempt:        attempt,
+        admit:          locate,
+        openings:       true,
+    });
+}
+
+fun attempt(backend: *readiness.Backend, resource: *readiness.Resource, operation: *readiness.Operation) bool {
+    val request:            *Request = operation::*Request;
+    var result:             i64      = 0;
+    var completed_bytes:    usize    = 0;
+    var completed_items:    usize    = 0;
+    var completed_resource: usize    = operation.resource;
+    var end_of_stream:      bool     = false;
+    if (operation.kind == runtime.ACCEPT) {
+        result = stream_accept(operation.resource, request.accept_peer, ?completed_resource);
+    }
+    or (operation.kind == runtime.CONNECT) {
+        if (operation.stage == 0) {
+            result = stream_connect(operation.resource, request.peer);
+            if (readiness.would_block(result)) {
+                operation.stage = 1;
+                ret false;
+            }
+        }
+        or {
+            result = sys.sock_connect_status(operation.resource);
+        }
+    }
+    or (operation.kind == runtime.READ) {
+        result        = stream_read(operation.resource, operation.buffer, operation.length);
+        end_of_stream = result == 0 && operation.length != 0;
+    }
+    or (operation.kind == runtime.READABLE) {
+        result        = sys.sock_peek_readable(operation.resource);
+        end_of_stream = result == 0;
+    }
+    or (operation.kind == runtime.WRITE) {
+        if (request.vectors != nil) { result = stream_write_vector(operation.resource, request.vectors, request.vector_count); }
+        or                          { result = stream_write(operation.resource, operation.buffer, operation.length); }
+    }
+    or (operation.kind == runtime.RECEIVE_FROM) {
+        result = datagram_receive_batch(operation.resource, request.packets, request.packet_count);
+        if (result >= 0) {
+            completed_items = result::usize;
+            var i: usize = 0;
+            for (i < completed_items) {
+                var copied: usize = request.packets[i].length;
+                if (copied > request.packets[i].capacity) { copied = request.packets[i].capacity; }
+                completed_bytes = completed_bytes + copied;
+                i               = i + 1;
+            }
+        }
+    }
+    or (operation.kind == runtime.SEND_TO) {
+        result = datagram_send_batch(operation.resource, request.packets, request.packet_count);
+        if (result >= 0) {
+            completed_items = result::usize;
+            var i: usize = 0;
+            for (i < completed_items) {
+                completed_bytes = completed_bytes + request.packets[i].length;
+                i               = i + 1;
+            }
+        }
+    }
+    or (operation.kind == runtime.SHUTDOWN) {
+        result = sys.sock_shutdown(operation.resource, sys.SHUT_WR);
+        if (result >= 0) { resource.write_closed = true; }
+    }
+    or {
+        result = sys.EINVAL;
+    }
+    if (readiness.would_block(result)) { ret false; }
+    if (result < 0)                    { readiness.finish(backend, resource, operation, result, 0, 0, completed_resource, false); }
+    or {
+        var bytes: usize = 0;
+        if (operation.kind == runtime.READ || operation.kind == runtime.WRITE)           { bytes = result::usize; }
+        or (operation.kind == runtime.RECEIVE_FROM || operation.kind == runtime.SEND_TO) { bytes = completed_bytes; }
+        readiness.finish(backend, resource, operation, 0, bytes, completed_items, completed_resource, end_of_stream);
+    }
+    ret true;
+}
+
+# only an internet socket reaches this backend
+fun locate(backend: *readiness.Backend, native: usize) i64 {
+    var address:        [128]u8;
+    var address_length: u32 = 128;
+    backend.locates = backend.locates + 1;
+    val located: i64 = sys.sock_local_addr(native, ?address[0], ?address_length);
+    if (located < 0)        { ret located; }
+    if (address_length < 2) { ret sys.EINVAL; }
+    val family: i32 = ip.sockaddr_family(?address[0]);
+    if (family != sys.AF_INET && family != sys.AF_INET6) { ret sys.ENOTSUP; }
+    ret 0;
+}
+
+pub fun submit_accept(backend: *readiness.Backend, listener: usize, opening: u64, peer: *ip.Endpoint, context: usize, token: *types.Token) i64 {
+    if (backend == nil || token == nil) { ret readiness.invalid(); }
+    mutex.lock(?backend.lock);
+    var resource:  *readiness.Resource;
+    var operation: *readiness.Operation;
+    val status:    i64 = readiness.begin(backend, listener, opening, runtime.ACCEPT, context, readiness.LANE_READ, token, ?resource, ?operation);
+    if (status < 0) {
+        mutex.unlock(?backend.lock);
+        ret status;
+    }
+    (operation::*Request).accept_peer = peer;
+    readiness.submission_done(backend, resource);
+    ret 0;
+}
+
+pub fun submit_connect(backend: *readiness.Backend, native: usize, opening: u64, peer: ip.Endpoint, context: usize, token: *types.Token) i64 {
+    if (backend == nil || token == nil) { ret readiness.invalid(); }
+    mutex.lock(?backend.lock);
+    var resource:  *readiness.Resource;
+    var operation: *readiness.Operation;
+    val status:    i64 = readiness.begin(backend, native, opening, runtime.CONNECT, context, readiness.LANE_WRITE, token, ?resource, ?operation);
+    if (status < 0) {
+        mutex.unlock(?backend.lock);
+        ret status;
+    }
+    (operation::*Request).peer = peer;
+    readiness.submission_done(backend, resource);
+    ret 0;
+}
+
+pub fun submit_write_vector(backend: *readiness.Backend, native: usize, opening: u64, vectors: *types.Vector, count: usize, context: usize, token: *types.Token) i64 {
+    if (backend == nil || token == nil || vectors == nil || count == 0 || count > 1024) { ret readiness.invalid(); }
+    mutex.lock(?backend.lock);
+    var resource:  *readiness.Resource;
+    var operation: *readiness.Operation;
+    val status:    i64 = readiness.begin(backend, native, opening, runtime.WRITE, context, readiness.LANE_WRITE, token, ?resource, ?operation);
+    if (status < 0) {
+        mutex.unlock(?backend.lock);
+        ret status;
+    }
+    val request: *Request = operation::*Request;
+    request.vectors      = vectors;
+    request.vector_count = count;
+    readiness.submission_done(backend, resource);
+    ret 0;
+}
+
+pub fun submit_receive_batch(backend: *readiness.Backend, native: usize, opening: u64, packets: *types.Packet, count: usize, context: usize, token: *types.Token) i64 {
+    if (backend == nil || token == nil || packets == nil || count == 0) { ret readiness.invalid(); }
+    mutex.lock(?backend.lock);
+    val known: *readiness.Resource = readiness.resource_lookup(backend, native);
+    if (known == nil || known.opening != opening || !known.configured) {
+        backend.locates = backend.locates + 1;
+        val configured: i64 = configure_datagram_socket(native);
+        if (configured < 0) {
+            mutex.unlock(?backend.lock);
+            ret configured;
+        }
+    }
+    var resource:  *readiness.Resource;
+    var operation: *readiness.Operation;
+    val status:    i64 = readiness.begin(backend, native, opening, runtime.RECEIVE_FROM, context, readiness.LANE_READ, token, ?resource, ?operation);
+    if (status < 0) {
+        mutex.unlock(?backend.lock);
+        ret status;
+    }
+    resource.configured = true;
+    val request: *Request = operation::*Request;
+    request.packets      = packets;
+    request.packet_count = count;
+    readiness.submission_done(backend, resource);
+    ret 0;
+}
+
+# a send batch is validated whole before submission, as on windows: a packet
+# longer than its capacity, a missing buffer or an unsupported peer family
+# refuses the batch and nothing from it is sent
+fun validate_send_packets(packets: *types.Packet, count: usize) i64 {
+    var i: usize = 0;
+    for (i < count) {
+        val packet: *types.Packet = ?packets[i];
+        if (packet.length > packet.capacity || (packet.buffer == nil && (packet.capacity != 0 || packet.length != 0))) { ret readiness.invalid(); }
+        val family: i32 = ip.endpoint_family(packet.peer);
+        if (family != sys.AF_INET && family != sys.AF_INET6) { ret sys.ENOTSUP; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+pub fun submit_send_batch(backend: *readiness.Backend, native: usize, opening: u64, packets: *types.Packet, count: usize, context: usize, token: *types.Token) i64 {
+    if (backend == nil || token == nil || packets == nil || count == 0) { ret readiness.invalid(); }
+    val valid: i64 = validate_send_packets(packets, count);
+    if (valid < 0) { ret valid; }
+    mutex.lock(?backend.lock);
+    var resource:  *readiness.Resource;
+    var operation: *readiness.Operation;
+    val status:    i64 = readiness.begin(backend, native, opening, runtime.SEND_TO, context, readiness.LANE_WRITE, token, ?resource, ?operation);
+    if (status < 0) {
+        mutex.unlock(?backend.lock);
+        ret status;
+    }
+    val request: *Request = operation::*Request;
+    request.packets      = packets;
+    request.packet_count = count;
+    readiness.submission_done(backend, resource);
+    ret 0;
+}
+
+# give up a socket with nothing queued on it, so another backend can take it.
+# its registration goes and the socket stays open. its resource is kept, retired
+# under opening, so a handle still carrying opening is refused as stale until a
+# newer opening reuses the value
+# ---
+# ret: 0, EBUSY while an operation or a close is queued on it, STATUS_STALE for
+#      a handle this backend already knows to be stale, ENOMEM when no resource
+#      can be kept, or the native refusal to deregister, which leaves the
+#      resource as it was
+pub fun detach(backend: *readiness.Backend, native: usize, opening: u64) i64 {
+    if (backend == nil) { ret readiness.invalid(); }
+    mutex.lock(?backend.lock);
+    if (readiness.stale(backend, native, opening)) {
+        mutex.unlock(?backend.lock);
+        ret types.STATUS_STALE;
+    }
+    var created:  bool                = false;
+    val resource: *readiness.Resource = readiness.resource_acquire(backend, native, opening, ?created);
+    if (resource == nil) {
+        readiness.trim_locked(backend);
+        mutex.unlock(?backend.lock);
+        ret sys.ENOMEM;
+    }
+    if (resource.read_head != readiness.NONE || resource.write_head != readiness.NONE ||
+        resource.close_index != readiness.NONE || resource.closing) {
+        mutex.unlock(?backend.lock);
+        ret sys.EBUSY;
+    }
+    if (resource.watched) {
+        val removed: i64 = sys.io_queue_unwatch(backend.queue, resource.resource);
+        if (removed < 0) {
+            mutex.unlock(?backend.lock);
+            ret removed;
+        }
+        backend.unwatches = backend.unwatches + 1;
+        readiness.set_watched(backend, resource, false);
+    }
+    resource.armed   = false;
+    resource.retired = true;
+    readiness.trim_locked(backend);
+    mutex.unlock(?backend.lock);
+    ret 0;
+}
+
+# take a socket another backend detached, under the opening its handle now
+# carries, so a handle with an older opening is refused as stale. the socket is
+# registered with its first operation
+# ---
+# ret: 0, STATUS_STALE when this backend knows the value under a newer opening,
+#      the refusal of a socket that is not an internet socket, or ENOMEM
+pub fun adopt(backend: *readiness.Backend, native: usize, opening: u64) i64 {
+    if (backend == nil) { ret readiness.invalid(); }
+    mutex.lock(?backend.lock);
+    val located: i64 = locate(backend, native);
+    if (located < 0) {
+        mutex.unlock(?backend.lock);
+        ret located;
+    }
+    if (readiness.stale(backend, native, opening)) {
+        mutex.unlock(?backend.lock);
+        ret types.STATUS_STALE;
+    }
+    var created:  bool                = false;
+    val resource: *readiness.Resource = readiness.resource_acquire(backend, native, opening, ?created);
+    readiness.trim_locked(backend);
+    mutex.unlock(?backend.lock);
+    if (resource == nil) { ret sys.ENOMEM; }
+    ret 0;
+}
+
+fun stream_accept(listener: usize, peer: *ip.Endpoint, accepted: *usize) i64 {
+    if (accepted == nil) { ret readiness.invalid(); }
+    var address:        [128]u8;
+    var address_length: u32 = sys.SOCKADDR_STORAGE_SIZE::u32;
+    val result:         i64 = sys.sock_accept_flags(listener, ?address[0], ?address_length, true, true, accepted);
+    if (result < 0) { ret result; }
+    if (peer != nil && !ip.from_sockaddr(?address[0], peer)) {
+        sys.sock_close(@accepted);
+        @accepted = (-1)::usize;
+        ret sys.ENOTSUP;
+    }
+    ret 0;
+}
+
+fun stream_connect(resource: usize, peer: ip.Endpoint) i64 {
+    var address:        [128]u8;
+    val address_length: usize = ip.to_sockaddr(peer, ?address[0]);
+    ret sys.sock_connect(resource, ?address[0], address_length);
+}
+
+fun stream_read(resource: usize, buffer: *u8, length: usize) i64 {
+    if (buffer == nil && length != 0) { ret readiness.invalid(); }
+    ret sys.sock_recv(resource, buffer, length);
+}
+
+fun stream_write(resource: usize, buffer: *u8, length: usize) i64 {
+    if (buffer == nil && length != 0) { ret readiness.invalid(); }
+    ret sys.sock_send(resource, buffer, length);
+}
+
+fun stream_write_vector(resource: usize, vectors: *types.Vector, count: usize) i64 {
+    if ($size_of(types.Vector) != $size_of(sys.IoVector)) { ret sys.EINVAL; }
+    ret sys.sock_write_vector(resource, (vectors::usize)::*sys.IoVector, count);
+}
+
+fun configure_datagram_socket(resource: usize) i64 {
+    var address: [128]u8;
+    var length:  u32 = sys.SOCKADDR_STORAGE_SIZE::u32;
+    val status:  i64 = sys.sock_local_addr(resource, ?address[0], ?length);
+    if (status < 0) { ret status; }
+    ret platform.configure_datagram(resource, ip.sockaddr_family(?address[0]));
+}
+
+fun datagram_receive_batch(resource: usize, packets: *types.Packet, count: usize) i64 {
+    if (packets == nil || count == 0) { ret readiness.invalid(); }
+    var received: usize = 0;
+    for (received < count) {
+        var vector:         sys.IoVector = sys.IoVector{data: packets[received].buffer, length: packets[received].capacity};
+        var address:        [128]u8;
+        var address_length: u32          = sys.SOCKADDR_STORAGE_SIZE::u32;
+        var control:        [128]u8;
+        var control_length: usize        = 128;
+        var flags:          i32          = 0;
+        val result:         i64          = sys.sock_receive_message(resource, ?vector, 1, ?address[0], ?address_length, ?control[0], ?control_length, ?flags);
+        if (result < 0) {
+            if (received != 0) { ret received::i64; }
+            ret result;
+        }
+        if (!ip.from_sockaddr(?address[0], ?packets[received].peer)) {
+            if (received != 0) { ret received::i64; }
+            ret sys.ENOTSUP;
+        }
+        packets[received].length      = result::usize;
+        packets[received].truncated   = (flags & platform.MSG_TRUNC) != 0;
+        packets[received].zero_length = result == 0;
+        platform.packet_metadata(?packets[received], ?control[0], control_length);
+        received = received + 1;
+    }
+    ret received::i64;
+}
+
+fun datagram_send_batch(resource: usize, packets: *types.Packet, count: usize) i64 {
+    if (packets == nil || count == 0) { ret readiness.invalid(); }
+    var sent: usize = 0;
+    for (sent < count) {
+        if (packets[sent].buffer == nil && packets[sent].length != 0) {
+            if (sent != 0) { ret sent::i64; }
+            ret readiness.invalid();
+        }
+        var vector:         sys.IoVector = sys.IoVector{data: packets[sent].buffer, length: packets[sent].length};
+        var address:        [128]u8;
+        val address_length: usize        = ip.to_sockaddr(packets[sent].peer, ?address[0]);
+        var control:        [48]u8;
+        var control_length: usize        = 0;
+        val metadata:       i64          = platform.packet_send_metadata(?packets[sent], ?control[0], ?control_length);
+        if (metadata < 0) {
+            if (sent != 0) { ret sent::i64; }
+            ret metadata;
+        }
+        var control_pointer: *u8 = nil;
+        if (control_length != 0) { control_pointer = ?control[0]; }
+        val result: i64 = sys.sock_send_message(resource, ?vector, 1, ?address[0], address_length::u32, control_pointer, control_length);
+        if (result < 0) {
+            if (sent != 0) { ret sent::i64; }
+            ret result;
+        }
+        if (result::usize != packets[sent].length) {
+            if (sent != 0) { ret sent::i64; }
+            ret sys.EIO;
+        }
+        sent = sent + 1;
+    }
+    ret sent::i64;
+}
+
+#[testing]
+fun test_listener_flags(listener: *usize, endpoint: *ip.Endpoint, nonblocking: bool) i64 {
+    @listener = (-1)::usize;
+    val created: i64 = sys.sock_create_flags(sys.AF_INET, sys.SOCK_STREAM, 0, nonblocking, true, listener);
+    if (created < 0) { ret created; }
+    var address: [128]u8;
+    ip.to_sockaddr(ip.endpoint(127, 0, 0, 1, 0), ?address[0]);
+    var status: i64 = sys.sock_bind(@listener, ?address[0], sys.SOCKADDR_IN_SIZE);
+    if (status >= 0) { status = sys.sock_listen(@listener, 8); }
+    var length: u32 = sys.SOCKADDR_STORAGE_SIZE::u32;
+    if (status >= 0)                                             { status = sys.sock_local_addr(@listener, ?address[0], ?length); }
+    if (status >= 0 && !ip.from_sockaddr(?address[0], endpoint)) { status = sys.ENOTSUP; }
+    if (status < 0) {
+        sys.sock_close(@listener);
+        @listener = (-1)::usize;
+    }
+    ret status;
+}
+
+#[testing]
+fun test_listener(listener: *usize, endpoint: *ip.Endpoint) i64 {
+    ret test_listener_flags(listener, endpoint, false);
+}
+
+#[testing]
+fun test_async_listener(listener: *usize, endpoint: *ip.Endpoint) i64 {
+    ret test_listener_flags(listener, endpoint, true);
+}
+
+#[testing]
+fun test_client(endpoint: ip.Endpoint, client: *usize) i64 {
+    @client = (-1)::usize;
+    val created: i64 = sys.sock_create_flags(sys.AF_INET, sys.SOCK_STREAM, 0, false, true, client);
+    if (created < 0) { ret created; }
+    val status: i64 = stream_connect(@client, endpoint);
+    if (status < 0) {
+        sys.sock_close(@client);
+        @client = (-1)::usize;
+    }
+    ret status;
+}
+
+#[testing]
+fun test_send_exact(socket: usize, buffer: *u8, length: usize) i64 {
+    var sent: usize = 0;
+    for (sent < length) {
+        val result: i64 = sys.sock_send(socket, (buffer::usize + sent)::*u8, length - sent);
+        if (result < 0)  { ret result; }
+        if (result == 0) { ret sys.EIO; }
+        sent = sent + result::usize;
+    }
+    ret sent::i64;
+}
+
+#[testing]
+fun test_receive_exact(socket: usize, buffer: *u8, length: usize) i64 {
+    var received: usize = 0;
+    for (received < length) {
+        val result: i64 = sys.sock_recv(socket, (buffer::usize + received)::*u8, length - received);
+        if (result < 0)  { ret result; }
+        if (result == 0) { ret received::i64; }
+        received = received + result::usize;
+    }
+    ret received::i64;
+}
+
+#[testing]
+fun test_await_completion(backend: *Backend, context: usize, out: *types.NativeCompletion) i64 {
+    var attempts: usize = 0;
+    for (attempts < 6) {
+        val count: i64 = poll(backend, 1000);
+        if (count < 0) { ret count; }
+        var i: usize = 0;
+        for (i < count::usize) {
+            var native: types.NativeCompletion;
+            val read:   i64 = completion(backend, i, ?native);
+            if (read < 0) { ret read; }
+            if (native.context == context) {
+                @out = native;
+                ret 0;
+            }
+            i = i + 1;
+        }
+        attempts = attempts + 1;
+    }
+    ret sys.ETIMEDOUT;
+}
+
+#[testing]
+fun test_collect_completions(backend: *Backend, output: *types.NativeCompletion, wanted: usize) i64 {
+    if (backend == nil || output == nil || wanted == 0) { ret sys.EINVAL; }
+    var total:    usize = 0;
+    var attempts: usize = 0;
+    for (total < wanted && attempts < 8) {
+        val count: i64 = poll(backend, 1000);
+        if (count < 0) { ret count; }
+        var i: usize = 0;
+        for (i < count::usize && total < wanted) {
+            val read: i64 = completion(backend, i, ?output[total]);
+            if (read < 0) { ret read; }
+            total = total + 1;
+            i     = i + 1;
+        }
+        attempts = attempts + 1;
+    }
+    if (total != wanted) { ret sys.ETIMEDOUT; }
+    ret total::i64;
+}
+
+#[testing]
+fun test_datagram(socket: *usize, endpoint: *ip.Endpoint) i64 {
+    @socket = (-1)::usize;
+    val created: i64 = sys.sock_create_flags(sys.AF_INET, sys.SOCK_DGRAM, 0, true, true, socket);
+    if (created < 0) { ret created; }
+    var address: [128]u8;
+    ip.to_sockaddr(ip.endpoint(127, 0, 0, 1, 0), ?address[0]);
+    var status: i64 = sys.sock_bind(@socket, ?address[0], sys.SOCKADDR_IN_SIZE);
+    var length: u32 = sys.SOCKADDR_STORAGE_SIZE::u32;
+    if (status >= 0)                                             { status = sys.sock_local_addr(@socket, ?address[0], ?length); }
+    if (status >= 0 && !ip.from_sockaddr(?address[0], endpoint)) { status = sys.ENOTSUP; }
+    if (status < 0) {
+        sys.sock_close(@socket);
+        @socket = (-1)::usize;
+    }
+    ret status;
+}
+
+test async_unix__udp_batch_preserves_boundaries_and_metadata {
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    var queue: shared.IoQueue;
+    if (sys.io_queue_create(?queue) < 0) { ret 1; }
+    var backend: Backend;
+    if (make(?backend, ?queue, ?pa, 8, 1) < 0) {
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var receiver:          usize;
+    var receiver_endpoint: ip.Endpoint;
+    var sender:            usize;
+    var sender_endpoint:   ip.Endpoint;
+    if (test_datagram(?receiver, ?receiver_endpoint) < 0 || test_datagram(?sender, ?sender_endpoint) < 0) {
+        if (receiver != (-1)::usize) { sys.sock_close(receiver); }
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+
+    var first_out: [3]u8;
+    first_out[0] = 'o';
+    first_out[1] = 'n';
+    first_out[2] = 'e';
+    var third_out: [8]u8;
+    var i:         usize = 0;
+    for (i < 8) {
+        third_out[i] = (i + 1)::u8;
+        i            = i + 1;
+    }
+    var outgoing: [3]types.Packet;
+    outgoing[0].buffer = ?first_out[0];
+    outgoing[0].length = 3;
+    outgoing[1].buffer = nil;
+    outgoing[1].length = 0;
+    outgoing[2].buffer = ?third_out[0];
+    outgoing[2].length = 8;
+    i                  = 0;
+    for (i < 3) {
+        outgoing[i].capacity              = outgoing[i].length;
+        outgoing[i].peer                  = receiver_endpoint;
+        outgoing[i].local_destination     = ip.addr_v4(ip.ipv4_loopback());
+        outgoing[i].has_local_destination = true;
+        outgoing[i].interface_index       = 0;
+        outgoing[i].truncated             = false;
+        outgoing[i].zero_length           = outgoing[i].length == 0;
+        i                                 = i + 1;
+    }
+
+    var first_in: [3]u8;
+    var zero_in:  u8 = 0;
+    var third_in: [4]u8;
+    var incoming: [3]types.Packet;
+    incoming[0].buffer   = ?first_in[0];
+    incoming[0].capacity = 3;
+    incoming[1].buffer   = ?zero_in;
+    incoming[1].capacity = 1;
+    incoming[2].buffer   = ?third_in[0];
+    incoming[2].capacity = 4;
+    i                    = 0;
+    for (i < 3) {
+        incoming[i].length                = 0;
+        incoming[i].has_local_destination = false;
+        incoming[i].interface_index       = 0;
+        incoming[i].truncated             = false;
+        incoming[i].zero_length           = false;
+        i                                 = i + 1;
+    }
+
+    var receive_token:     types.Token;
+    var send_token:        types.Token;
+    var receive_submitted: i64   = submit_receive_batch(?backend, receiver, 1, ?incoming[0], 3, 81, ?receive_token);
+    var send_submitted:    i64   = submit_send_batch(?backend, sender, 1, ?outgoing[0], 3, 82, ?send_token);
+    var receive_items:     usize = 0;
+    var receive_bytes:     usize = 0;
+    var send_items:        usize = 0;
+    var send_bytes:        usize = 0;
+    var failed:            bool  = receive_submitted < 0 || send_submitted < 0;
+    var attempts:          usize = 0;
+    for (attempts < 12 && !failed && (receive_items < 3 || send_items < 3)) {
+        val count: i64 = poll(?backend, 1000);
+        if (count < 0) { failed = true; }
+        or {
+            i = 0;
+            for (i < count::usize) {
+                var native: types.NativeCompletion;
+                completion(?backend, i, ?native);
+                if (native.context == 81) {
+                    if (native.kind != runtime.RECEIVE_FROM || native.status != 0 || native.items == 0 || native.items > 3 - receive_items) { failed = true; }
+                    or {
+                        receive_items = receive_items + native.items;
+                        receive_bytes = receive_bytes + native.bytes;
+                        if (receive_items < 3) {
+                            receive_submitted = submit_receive_batch(?backend, receiver, 1, ?incoming[receive_items], 3 - receive_items, 81, ?receive_token);
+                            if (receive_submitted < 0) { failed = true; }
+                        }
+                    }
+                }
+                if (native.context == 82) {
+                    if (native.kind != runtime.SEND_TO || native.status != 0 || native.items == 0 || native.items > 3 - send_items) { failed = true; }
+                    or {
+                        send_items = send_items + native.items;
+                        send_bytes = send_bytes + native.bytes;
+                        if (send_items < 3) {
+                            send_submitted = submit_send_batch(?backend, sender, 1, ?outgoing[send_items], 3 - send_items, 82, ?send_token);
+                            if (send_submitted < 0) { failed = true; }
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+            attempts = attempts + 1;
+        }
+    }
+    val peer_valid:       bool = incoming[0].peer.port == sender_endpoint.port && incoming[1].peer.port == sender_endpoint.port && incoming[2].peer.port == sender_endpoint.port;
+    val metadata_valid:   bool = incoming[0].has_local_destination && incoming[0].local_destination.is_v6 == 0 && incoming[0].local_destination.v4.octets[0] == 127 && incoming[0].local_destination.v4.octets[3] == 1 && incoming[0].interface_index != 0;
+    val boundaries_valid: bool = incoming[0].length == 3 && !incoming[0].zero_length && !incoming[0].truncated && first_in[0] == 'o' && first_in[2] == 'e' && incoming[1].length == 0 && incoming[1].zero_length && !incoming[1].truncated && incoming[2].length == 4 && !incoming[2].zero_length && incoming[2].truncated && third_in[0] == 1 && third_in[3] == 4;
+    val valid:            bool = !failed && receive_items == 3 && receive_bytes == 7 && send_items == 3 && send_bytes == 11 && peer_valid && metadata_valid && boundaries_valid && backend.live == 0 && backend.resource_count == 2;
+    sys.sock_close(sender);
+    sys.sock_close(receiver);
+    val destroyed: i64 = destroy(?backend);
+    sys.io_queue_close(?queue);
+    if (!valid || destroyed < 0) { ret 1; }
+    ret 0;
+}
+
+test async_unix__vectored_writes_and_fragmented_reads_report_progress {
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    var queue: shared.IoQueue;
+    if (sys.io_queue_create(?queue) < 0) { ret 1; }
+    var backend: Backend;
+    if (make(?backend, ?queue, ?pa, 8, 1) < 0) {
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var listener: usize;
+    var endpoint: ip.Endpoint;
+    if (test_listener(?listener, ?endpoint) < 0) {
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var client: usize;
+    if (test_client(endpoint, ?client) < 0) {
+        sys.sock_close(listener);
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var server: usize = (-1)::usize;
+    if (stream_accept(listener, nil, ?server) < 0) {
+        sys.sock_close(client);
+        sys.sock_close(listener);
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+
+    var prefix: [2]u8;
+    prefix[0] = 'h';
+    prefix[1] = 'i';
+    var suffix: [3]u8;
+    suffix[0] = '!';
+    suffix[1] = '!';
+    suffix[2] = '!';
+    var vectors: [3]types.Vector;
+    vectors[0] = types.Vector{data: ?prefix[0], length: 2};
+    vectors[1] = types.Vector{data: nil, length: 0};
+    vectors[2] = types.Vector{data: ?suffix[0], length: 3};
+    var vector_token:      types.Token;
+    val vector_submitted:  i64 = submit_write_vector(?backend, server, 1, ?vectors[0], 3, 83, ?vector_token);
+    var vector_completion: types.NativeCompletion;
+    val vector_completed:  i64 = test_await_completion(?backend, 83, ?vector_completion);
+    var vector_input:      [5]u8;
+    val vector_bytes:      i64 = test_receive_exact(client, ?vector_input[0], 5);
+
+    var assembled:            [4]u8;
+    var first_read_token:     types.Token;
+    val first_read_submitted: i64 = submit_read(?backend, server, 1, ?assembled[0], 4, 84, ?first_read_token);
+    var first_fragment:       [2]u8;
+    first_fragment[0] = 'a';
+    first_fragment[1] = 'b';
+    val first_sent:       i64 = test_send_exact(client, ?first_fragment[0], 2);
+    var first_completion: types.NativeCompletion;
+    val first_completed:  i64 = test_await_completion(?backend, 84, ?first_completion);
+
+    var second_read_token:     types.Token;
+    val second_read_submitted: i64 = submit_read(?backend, server, 1, ?assembled[2], 2, 85, ?second_read_token);
+    var second_fragment:       [2]u8;
+    second_fragment[0] = 'c';
+    second_fragment[1] = 'd';
+    val second_sent:       i64 = test_send_exact(client, ?second_fragment[0], 2);
+    var second_completion: types.NativeCompletion;
+    val second_completed:  i64 = test_await_completion(?backend, 85, ?second_completion);
+
+    val vector_valid:    bool = vector_submitted == 0 && vector_completed == 0 && vector_bytes == 5 && vector_completion.context == 83 && vector_completion.kind == runtime.WRITE && vector_completion.status == 0 && vector_completion.bytes == 5 && vector_completion.items == 0 && vector_input[0] == 'h' && vector_input[1] == 'i' && vector_input[2] == '!' && vector_input[4] == '!';
+    val fragments_valid: bool = first_read_submitted == 0 && first_sent == 2 && first_completed == 0 && first_completion.context == 84 && first_completion.status == 0 && first_completion.bytes == 2 && first_completion.items == 0 && !first_completion.end_of_stream && second_read_submitted == 0 && second_sent == 2 && second_completed == 0 && second_completion.context == 85 && second_completion.status == 0 && second_completion.bytes == 2 && second_completion.items == 0 && assembled[0] == 'a' && assembled[1] == 'b' && assembled[2] == 'c' && assembled[3] == 'd';
+    val valid:           bool = vector_valid && fragments_valid && backend.live == 0 && backend.resource_count == 1;
+    sys.sock_close(server);
+    sys.sock_close(client);
+    sys.sock_close(listener);
+    val destroyed: i64 = destroy(?backend);
+    sys.io_queue_close(?queue);
+    if (!valid || destroyed < 0) { ret 1; }
+    ret 0;
+}
+
+test async_unix__remote_half_close_reports_eof_and_preserves_writes {
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    var queue: shared.IoQueue;
+    if (sys.io_queue_create(?queue) < 0) { ret 1; }
+    var backend: Backend;
+    if (make(?backend, ?queue, ?pa, 4, 1) < 0) {
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var listener: usize;
+    var endpoint: ip.Endpoint;
+    if (test_listener(?listener, ?endpoint) < 0) {
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var client: usize;
+    if (test_client(endpoint, ?client) < 0) {
+        sys.sock_close(listener);
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var server: usize = (-1)::usize;
+    if (stream_accept(listener, nil, ?server) < 0) {
+        sys.sock_close(client);
+        sys.sock_close(listener);
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+
+    var input:           u8  = 0;
+    var read_token:      types.Token;
+    val read_submitted:  i64 = submit_read(?backend, server, 1, ?input, 1, 86, ?read_token);
+    val half_closed:     i64 = sys.sock_shutdown(client, sys.SHUT_WR);
+    var read_completion: types.NativeCompletion;
+    val read_completed:  i64 = test_await_completion(?backend, 86, ?read_completion);
+
+    var output: [2]u8;
+    output[0] = 'o';
+    output[1] = 'k';
+    var write_token:      types.Token;
+    val write_submitted:  i64 = submit_write(?backend, server, 1, ?output[0], 2, 87, ?write_token);
+    var write_completion: types.NativeCompletion;
+    val write_completed:  i64 = test_await_completion(?backend, 87, ?write_completion);
+    var response:         [2]u8;
+    val response_bytes:   i64 = test_receive_exact(client, ?response[0], 2);
+
+    var failure: i32 = 0;
+    if (read_submitted != 0)                                        { failure = 2; }
+    or (half_closed != 0)                                           { failure = 3; }
+    or (read_completed != 0)                                        { failure = 4; }
+    or (read_completion.context != 86)                              { failure = 5; }
+    or (read_completion.kind != runtime.READ)                       { failure = 6; }
+    or (read_completion.status != 0)                                { failure = 7; }
+    or (read_completion.bytes != 0 || read_completion.items != 0)   { failure = 8; }
+    or (!read_completion.end_of_stream)                             { failure = 9; }
+    or (write_submitted != 0)                                       { failure = 10; }
+    or (write_completed != 0)                                       { failure = 11; }
+    or (response_bytes != 2)                                        { failure = 12; }
+    or (response[0] != 'o' || response[1] != 'k')                   { failure = 13; }
+    or (write_completion.context != 87)                             { failure = 14; }
+    or (write_completion.status != 0)                               { failure = 15; }
+    or (write_completion.bytes != 2 || write_completion.items != 0) { failure = 16; }
+    or (backend.live != 0)                                          { failure = 17; }
+    or (backend.resource_count != 1)                                { failure = 18; }
+    sys.sock_close(server);
+    sys.sock_close(client);
+    sys.sock_close(listener);
+    val destroyed: i64 = destroy(?backend);
+    sys.io_queue_close(?queue);
+    if (failure == 0 && destroyed < 0) { failure = 19; }
+    if (failure != 0)                  { ret failure; }
+    ret 0;
+}
+
+test async_unix__reset_completes_a_pending_read_once {
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    var queue: shared.IoQueue;
+    if (sys.io_queue_create(?queue) < 0) { ret 1; }
+    var backend: Backend;
+    if (make(?backend, ?queue, ?pa, 4, 1) < 0) {
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var listener: usize;
+    var endpoint: ip.Endpoint;
+    if (test_listener(?listener, ?endpoint) < 0) {
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var client: usize;
+    if (test_client(endpoint, ?client) < 0) {
+        sys.sock_close(listener);
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var server: usize = (-1)::usize;
+    if (stream_accept(listener, nil, ?server) < 0) {
+        sys.sock_close(client);
+        sys.sock_close(listener);
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+
+    var input:     u8  = 0;
+    var token:     types.Token;
+    val submitted: i64 = submit_read(?backend, server, 1, ?input, 1, 88, ?token);
+    var linger:    [2]i32;
+    linger[0] = 1;
+    linger[1] = 0;
+    val configured:       i64   = sys.sock_setopt(client, sys.SOL_SOCKET, sys.SO_LINGER, (?linger[0])::*u8, 8);
+    val closed:           i64   = sys.sock_close(client);
+    var saw_reset:        bool  = false;
+    var completion_count: usize = 0;
+    var attempts:         usize = 0;
+    for (attempts < 6 && !saw_reset) {
+        val count: i64 = poll(?backend, 1000);
+        if (count < 0) { attempts = 6; }
+        or {
+            var i: usize = 0;
+            for (i < count::usize) {
+                var native: types.NativeCompletion;
+                completion(?backend, i, ?native);
+                if (native.context == 88) {
+                    completion_count = completion_count + 1;
+                    if (native.kind == runtime.READ && native.status == sys.ECONNRESET && native.bytes == 0 && native.items == 0 && !native.end_of_stream) { saw_reset = true; }
+                }
+                i = i + 1;
+            }
+            attempts = attempts + 1;
+        }
+    }
+    val after: i64  = poll(?backend, 0);
+    val valid: bool = submitted == 0 && configured == 0 && closed == 0 && saw_reset && completion_count == 1 && after == 0 && backend.live == 0 && backend.resource_count == 1;
+    sys.sock_close(server);
+    sys.sock_close(listener);
+    val destroyed: i64 = destroy(?backend);
+    sys.io_queue_close(?queue);
+    if (!valid || destroyed < 0) { ret 1; }
+    ret 0;
+}
+
+# the old encoding packed the index into 16 bits and make refused past 65535
+test async_unix__storage_grows_past_the_initial_size_and_recycles {
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    var queue: shared.IoQueue;
+    if (sys.io_queue_create(?queue) < 0) { ret 1; }
+    var backend: Backend;
+    if (make(?backend, ?queue, ?pa, 2, 1) < 0) {
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var listener: usize;
+    var endpoint: ip.Endpoint;
+    if (test_listener(?listener, ?endpoint) < 0) {
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var client: usize;
+    if (test_client(endpoint, ?client) < 0) {
+        sys.sock_close(listener);
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var server: usize = (-1)::usize;
+    if (stream_accept(listener, nil, ?server) < 0) {
+        sys.sock_close(client);
+        sys.sock_close(listener);
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+
+    var storage: [3]u8;
+    storage[0] = 0xa1;
+    storage[1] = 0xb2;
+    storage[2] = 0xc3;
+    var tokens:    [3]types.Token;
+    val first:     i64 = submit_read(?backend, server, 1, ?storage[0], 1, 89, ?tokens[0]);
+    val second:    i64 = submit_read(?backend, server, 1, ?storage[1], 1, 90, ?tokens[1]);
+    val timed_out: i64 = poll(?backend, 5);
+    # the third operation is past the initial size and grows the table
+    val grown:              i64                  = submit_read(?backend, server, 1, ?storage[2], 1, 91, ?tokens[2]);
+    val grew:               bool                 = backend.operations.capacity == 4 && tokens[2].index == 2;
+    val held:               *readiness.Operation = readiness.operation_at(?backend, tokens[0].index::usize);
+    val cancel_first:       i64                  = cancel(?backend, tokens[0], nil);
+    var reused:             types.Token;
+    val replacement:        i64                  = submit_read(?backend, server, 1, ?storage[2], 1, 92, ?reused);
+    val generation_changed: bool                 = reused.index == tokens[0].index && reused.generation != tokens[0].generation;
+    val stable:             bool                 = readiness.operation_at(?backend, tokens[0].index::usize) == held;
+    val cancel_second:      i64                  = cancel(?backend, tokens[1], nil);
+    val cancel_third:       i64                  = cancel(?backend, tokens[2], nil);
+    val cancel_replacement: i64                  = cancel(?backend, reused, nil);
+    var byte:               u8                   = 'x';
+    val sent:               i64                  = test_send_exact(client, ?byte, 1);
+    val after:              i64                  = poll(?backend, 0);
+    val valid:              bool                 = first == 0 && second == 0 && timed_out == 0 && grown == 0 && grew && stable && cancel_first == 0 && replacement == 0 && generation_changed && cancel_second == 0 && cancel_third == 0 && cancel_replacement == 0 && sent == 1 && after == 0 && storage[0] == 0xa1 && storage[1] == 0xb2 && storage[2] == 0xc3 && backend.live == 0 && backend.resource_count == 1;
+    sys.sock_close(server);
+    sys.sock_close(client);
+    sys.sock_close(listener);
+    val destroyed: i64 = destroy(?backend);
+    sys.io_queue_close(?queue);
+    if (!valid || destroyed < 0) { ret 1; }
+    ret 0;
+}
+
+test async_unix__wake_only_poll_preserves_an_armed_read {
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    var queue: shared.IoQueue;
+    if (sys.io_queue_create(?queue) < 0) { ret 1; }
+    var backend: Backend;
+    if (make(?backend, ?queue, ?pa, 4, 1) < 0) {
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var listener: usize;
+    var endpoint: ip.Endpoint;
+    if (test_listener(?listener, ?endpoint) < 0) {
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var client: usize;
+    if (test_client(endpoint, ?client) < 0) {
+        sys.sock_close(listener);
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var server: usize = (-1)::usize;
+    if (stream_accept(listener, nil, ?server) < 0) {
+        sys.sock_close(client);
+        sys.sock_close(listener);
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+
+    var input:     u8  = 0;
+    var token:     types.Token;
+    val submitted: i64 = submit_read(?backend, server, 1, ?input, 1, 96, ?token);
+    val wake_only: i64 = poll(?backend, 0);
+    var output:    u8  = 'w';
+    val sent:      i64 = test_send_exact(client, ?output, 1);
+    var native:    types.NativeCompletion;
+    val completed: i64 = test_await_completion(?backend, 96, ?native);
+    var failure:   i32 = 0;
+    if (submitted != 0)              { failure = 2; }
+    or (wake_only != 0)              { failure = 3; }
+    or (sent != 1)                   { failure = 4; }
+    or (completed != 0)              { failure = 5; }
+    or (native.kind != runtime.READ) { failure = 6; }
+    or (native.status != 0)          { failure = 7; }
+    or (native.bytes != 1)           { failure = 8; }
+    or (native.items != 0)           { failure = 9; }
+    or (native.end_of_stream)        { failure = 10; }
+    or (input != 'w')                { failure = 11; }
+    or (backend.live != 0)           { failure = 12; }
+    or (backend.resource_count != 1) { failure = 13; }
+    sys.sock_close(server);
+    sys.sock_close(client);
+    sys.sock_close(listener);
+    val destroyed: i64 = destroy(?backend);
+    sys.io_queue_close(?queue);
+    if (failure == 0 && destroyed < 0) { failure = 14; }
+    if (failure != 0)                  { ret failure; }
+    ret 0;
+}
+
+# the backend's tables come from the allocator it was made with, so a
+# refusal there is the one way to reach the ENOMEM path on purpose
+test async_unix__a_refused_table_growth_is_enomem_and_settles_what_is_live {
+    # the tracker is too large for the stack, so it lives on the mapper
+    val t: *testing.Testing = sys.allocate($size_of(testing.Testing))::*testing.Testing;
+    if (t == nil) { ret 1; }
+    fin { sys.deallocate(t::ptr, $size_of(testing.Testing)); }
+    val tr: err[allocator.Error] = testing.make(t);
+    if (sel tr.err) { ret 1; }
+    fin { testing.dnit(t); }
+
+    var queue: shared.IoQueue;
+    if (sys.io_queue_create(?queue) < 0) { ret 1; }
+    var backend: Backend;
+    if (make(?backend, ?queue, testing.allocator_of(t), 2, 1) < 0) {
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var listener: usize;
+    var endpoint: ip.Endpoint;
+    if (test_listener(?listener, ?endpoint) < 0) {
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var client: usize;
+    if (test_client(endpoint, ?client) < 0) {
+        sys.sock_close(listener);
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var server: usize = (-1)::usize;
+    if (stream_accept(listener, nil, ?server) < 0) {
+        sys.sock_close(client);
+        sys.sock_close(listener);
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+
+    var storage: [3]u8;
+    storage[0] = 0xa1;
+    storage[1] = 0xb2;
+    storage[2] = 0xc3;
+    var tokens: [3]types.Token;
+    val first:  i64                  = submit_read(?backend, server, 1, ?storage[0], 1, 89, ?tokens[0]);
+    val second: i64                  = submit_read(?backend, server, 1, ?storage[1], 1, 90, ?tokens[1]);
+    val held:   *readiness.Operation = readiness.operation_at(?backend, tokens[0].index::usize);
+    # the third operation needs a chunk, and each allocation of that growth
+    # is refused in turn; the ordinal counts refused attempts, so it is
+    # re-based each time
+    var refused:   usize = 0;
+    var offset:    usize = 1;
+    var grown:     i64   = 0;
+    var disturbed: bool  = false;
+    for (offset <= 8) {
+        testing.fail_at_ordinal(t, testing.attempt_count(t) + offset);
+        grown = submit_read(?backend, server, 1, ?storage[2], 1, 91, ?tokens[2]);
+        if (grown == 0)                                                       { brk; }
+        if (grown != sys.ENOMEM)                                              { disturbed = true; }
+        if (readiness.operation_at(?backend, tokens[0].index::usize) != held) { disturbed = true; }
+        if (held.context != 89 || held.generation != tokens[0].generation)    { disturbed = true; }
+        if (backend.live != 2 || backend.operations.capacity != 2)            { disturbed = true; }
+        refused = refused + 1;
+        offset  = offset + 1;
+    }
+    testing.clear_failure(t);
+    val grew:          bool = grown == 0 && refused > 0 && !disturbed && backend.operations.capacity == 4 && tokens[2].index == 2;
+    val cancel_first:  i64  = cancel(?backend, tokens[0], nil);
+    val cancel_second: i64  = cancel(?backend, tokens[1], nil);
+    val cancel_third:  i64  = cancel(?backend, tokens[2], nil);
+    var byte:          u8   = 'x';
+    val sent:          i64  = test_send_exact(client, ?byte, 1);
+    val after:         i64  = poll(?backend, 0);
+    val valid:         bool = first == 0 && second == 0 && grew && cancel_first == 0 && cancel_second == 0 && cancel_third == 0 && sent == 1 && after == 0 && storage[0] == 0xa1 && storage[1] == 0xb2 && storage[2] == 0xc3 && backend.live == 0 && backend.resource_count == 1;
+    sys.sock_close(server);
+    sys.sock_close(client);
+    sys.sock_close(listener);
+    val destroyed: i64 = destroy(?backend);
+    sys.io_queue_close(?queue);
+    if (!valid || destroyed < 0)           { ret 1; }
+    if (testing.leaked(t))                 { ret 2; }
+    if (testing.double_free_count(t) != 0) { ret 2; }
+    ret 0;
+}
+
+test async_unix__canceling_close_preserves_handle_ownership {
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    var queue: shared.IoQueue;
+    if (sys.io_queue_create(?queue) < 0) { ret 1; }
+    var backend: Backend;
+    if (make(?backend, ?queue, ?pa, 8, 1) < 0) {
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var listener: usize;
+    var endpoint: ip.Endpoint;
+    if (test_listener(?listener, ?endpoint) < 0) {
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var client: usize;
+    if (test_client(endpoint, ?client) < 0) {
+        sys.sock_close(listener);
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var server: usize = (-1)::usize;
+    if (stream_accept(listener, nil, ?server) < 0) {
+        sys.sock_close(client);
+        sys.sock_close(listener);
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+
+    var pending_byte:    u8   = 'z';
+    var write_token:     types.Token;
+    var write_submitted: i64  = sys.EIO;
+    var close_token:     types.Token;
+    var close_submitted: i64  = sys.EIO;
+    var close_active:    bool = false;
+    mutex.lock(?backend.lock);
+    var write_resource:  *readiness.Resource;
+    var write_operation: *readiness.Operation;
+    write_submitted = readiness.begin(?backend, server, 1, runtime.WRITE, 93, readiness.LANE_WRITE, ?write_token, ?write_resource, ?write_operation);
+    if (write_submitted == 0) {
+        write_operation.buffer = ?pending_byte;
+        write_operation.length = 1;
+        var close_resource: *readiness.Resource;
+        close_submitted = readiness.begin_close_locked(?backend, server, 1, 94, ?close_token, ?close_resource);
+        close_active    = close_submitted == 0 && readiness.operation_for(?backend, close_token) != nil;
+    }
+    mutex.unlock(?backend.lock);
+    val canceled:  i64 = cancel(?backend, close_token, nil);
+    val raw_close: i64 = sys.sock_close(server);
+    var displaced: types.NativeCompletion;
+    val count:     i64 = test_collect_completions(?backend, ?displaced, 1);
+    var failure:   i32 = 0;
+    if (write_submitted != 0)              { failure = 2; }
+    or (close_submitted != 0)              { failure = 3; }
+    or (!close_active)                     { failure = 4; }
+    or (canceled != 0)                     { failure = 5; }
+    or (raw_close != sys.EBADF)            { failure = 6; }
+    or (count != 1)                        { failure = 7; }
+    or (displaced.context != 93)           { failure = 8; }
+    or (displaced.kind != runtime.WRITE)   { failure = 9; }
+    or (displaced.status != sys.ECANCELED) { failure = 10; }
+    or (displaced.bytes != 0)              { failure = 11; }
+    or (displaced.items != 0)              { failure = 12; }
+    or (backend.live != 0)                 { failure = 13; }
+    or (backend.resource_count != 0)       { failure = 14; }
+    sys.sock_close(client);
+
+    var second_client: usize;
+    if (test_client(endpoint, ?second_client) < 0) {
+        sys.sock_close(listener);
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var second_server: usize = (-1)::usize;
+    if (stream_accept(listener, nil, ?second_server) < 0) {
+        sys.sock_close(second_client);
+        sys.sock_close(listener);
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var queued_token:     types.Token;
+    val queued_submitted: i64  = submit_close(?backend, second_server, 1, 95, ?queued_token);
+    val close_queued:     bool = backend.queued_count == 1;
+    val queued_canceled:  i64  = cancel(?backend, queued_token, nil);
+    val second_raw_close: i64  = sys.sock_close(second_server);
+    val after:            i64  = poll(?backend, 0);
+    if (failure == 0 && queued_submitted != 0)         { failure = 15; }
+    or (failure == 0 && !close_queued)                 { failure = 16; }
+    or (failure == 0 && queued_canceled != 0)          { failure = 17; }
+    or (failure == 0 && second_raw_close != sys.EBADF) { failure = 18; }
+    or (failure == 0 && after != 0)                    { failure = 19; }
+    or (failure == 0 && backend.live != 0)             { failure = 20; }
+    or (failure == 0 && backend.resource_count != 0)   { failure = 21; }
+    sys.sock_close(second_client);
+    sys.sock_close(listener);
+    val destroyed: i64 = destroy(?backend);
+    sys.io_queue_close(?queue);
+    if (failure == 0 && destroyed < 0) { failure = 22; }
+    if (failure != 0)                  { ret failure; }
+    ret 0;
+}
+
+test async_unix__queued_cancellation_preserves_fifo {
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    var queue: shared.IoQueue;
+    if (sys.io_queue_create(?queue) < 0) { ret 1; }
+    var backend: Backend;
+    if (make(?backend, ?queue, ?pa, 4, 1) < 0) {
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var socket: usize = (-1)::usize;
+    if (sys.sock_create_flags(sys.AF_INET, sys.SOCK_DGRAM, 0, true, true, ?socket) < 0) {
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    val destination: ip.Endpoint = ip.endpoint(127, 0, 0, 1, 9);
+    var packets:     [3]types.Packet;
+    var i:           usize       = 0;
+    for (i < 3) {
+        packets[i].buffer                = nil;
+        packets[i].capacity              = 0;
+        packets[i].length                = 0;
+        packets[i].peer                  = destination;
+        packets[i].has_local_destination = false;
+        packets[i].interface_index       = 0;
+        i                                = i + 1;
+    }
+    var tokens:      [3]types.Token;
+    val first:       i64 = submit_send_batch(?backend, socket, 1, ?packets[0], 1, 11, ?tokens[0]);
+    val second:      i64 = submit_send_batch(?backend, socket, 1, ?packets[1], 1, 22, ?tokens[1]);
+    val third:       i64 = submit_send_batch(?backend, socket, 1, ?packets[2], 1, 33, ?tokens[2]);
+    val cancelled:   i64 = cancel(?backend, tokens[1], nil);
+    var completions: [2]types.NativeCompletion;
+    val count:       i64 = test_collect_completions(?backend, ?completions[0], 2);
+    var a:           types.NativeCompletion;
+    var b:           types.NativeCompletion;
+    if (count == 2) {
+        a = completions[0];
+        b = completions[1];
+    }
+    val valid: bool = first == 0 && second == 0 && third == 0 && cancelled == 0 && count == 2 && a.context == 11 && b.context == 33 && a.kind == runtime.SEND_TO && b.kind == runtime.SEND_TO && backend.live == 0 && backend.resource_count == 1;
+    sys.sock_close(socket);
+    val destroyed: i64 = destroy(?backend);
+    sys.io_queue_close(?queue);
+    if (!valid || destroyed < 0) { ret 1; }
+    ret 0;
+}
+
+test async_unix__shutdown_and_close_follow_prior_writes {
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    var queue: shared.IoQueue;
+    if (sys.io_queue_create(?queue) < 0) { ret 1; }
+    var backend: Backend;
+    if (make(?backend, ?queue, ?pa, 8, 1) < 0) {
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var listener: usize;
+    var endpoint: ip.Endpoint;
+    if (test_listener(?listener, ?endpoint) < 0) {
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var client: usize;
+    if (test_client(endpoint, ?client) < 0) {
+        sys.sock_close(listener);
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var server: usize = (-1)::usize;
+    if (stream_accept(listener, nil, ?server) < 0) {
+        sys.sock_close(client);
+        sys.sock_close(listener);
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+
+    var first:          u8   = 'a';
+    var second:         u8   = 'b';
+    var tokens:         [5]types.Token;
+    val write_first:    i64  = submit_write(?backend, server, 1, ?first, 1, 71, ?tokens[0]);
+    val write_second:   i64  = submit_write(?backend, server, 1, ?second, 1, 72, ?tokens[1]);
+    val shutdown:       i64  = submit_shutdown_write(?backend, server, 1, 73, ?tokens[2]);
+    var received:       [2]u8;
+    val received_bytes: i64  = test_receive_exact(client, ?received[0], 2);
+    var eof_byte:       u8   = 0;
+    val eof:            i64  = sys.sock_recv(client, ?eof_byte, 1);
+    var pending:        u8   = 0;
+    val read_pending:   i64  = submit_read(?backend, server, 1, ?pending, 1, 74, ?tokens[3]);
+    val close_pending:  i64  = submit_close(?backend, server, 1, 75, ?tokens[4]);
+    var completions:    [5]types.NativeCompletion;
+    val count:          i64  = test_collect_completions(?backend, ?completions[0], 5);
+    var valid_order:    bool = count == 5;
+    var expected:       [5]usize;
+    expected[0] = 71;
+    expected[1] = 72;
+    expected[2] = 73;
+    expected[3] = 74;
+    expected[4] = 75;
+    var i: usize = 0;
+    for (count == 5 && i < 5) {
+        val native: types.NativeCompletion = completions[i];
+        if (native.context != expected[i])                                                { valid_order = false; }
+        if (native.context == 74 && native.status != sys.ECANCELED)                       { valid_order = false; }
+        if (native.context == 75 && (native.kind != runtime.CLOSE || native.status != 0)) { valid_order = false; }
+        i = i + 1;
+    }
+    var failure: i32 = 0;
+    if (write_first != 0)                         { failure = 2; }
+    or (write_second != 0)                        { failure = 3; }
+    or (shutdown != 0)                            { failure = 4; }
+    or (read_pending != 0)                        { failure = 5; }
+    or (close_pending != 0)                       { failure = 6; }
+    or (received_bytes != 2)                      { failure = 7; }
+    or (received[0] != 'a' || received[1] != 'b') { failure = 8; }
+    or (eof != 0)                                 { failure = 9; }
+    or (!valid_order)                             { failure = 10; }
+    or (backend.resource_count != 0)              { failure = 11; }
+    sys.sock_close(client);
+    sys.sock_close(listener);
+    val destroyed: i64 = destroy(?backend);
+    sys.io_queue_close(?queue);
+    if (failure == 0 && destroyed < 0) { failure = 12; }
+    if (failure != 0)                  { ret failure; }
+    ret 0;
+}
+
+test async_unix__queued_accept_cancellation_closes_handle {
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    var queue: shared.IoQueue;
+    if (sys.io_queue_create(?queue) < 0) { ret 1; }
+    var backend: Backend;
+    if (make(?backend, ?queue, ?pa, 4, 1) < 0) {
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var listener: usize;
+    var endpoint: ip.Endpoint;
+    if (test_listener(?listener, ?endpoint) < 0) {
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var client: usize;
+    if (test_client(endpoint, ?client) < 0) {
+        sys.sock_close(listener);
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var peer:      ip.Endpoint;
+    var token:     types.Token;
+    val submitted: i64   = submit_accept(?backend, listener, 1, ?peer, 44, ?token);
+    var accepted:  usize = (-1)::usize;
+    if (submitted == 0 && backend.queued_count == 1) { accepted = readiness.operation_at(?backend, backend.queued_head::usize).completion.resource; }
+    val cancelled: i64  = cancel(?backend, token, nil);
+    val closed:    i64  = sys.sock_close(accepted);
+    val valid:     bool = submitted == 0 && cancelled == 0 && accepted != (-1)::usize && closed == sys.EBADF && backend.live == 0 && backend.queued_count == 0 && backend.resource_count == 1;
+    sys.sock_close(client);
+    sys.sock_close(listener);
+    val destroyed: i64 = destroy(?backend);
+    sys.io_queue_close(?queue);
+    if (!valid || destroyed < 0) { ret 1; }
+    ret 0;
+}
+
+test async_unix__one_stream_drives_concurrent_read_and_write {
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    var queue: shared.IoQueue;
+    if (sys.io_queue_create(?queue) < 0) { ret 1; }
+    var backend: Backend;
+    if (make(?backend, ?queue, ?pa, 8, 1) < 0) {
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var listener: usize;
+    var endpoint: ip.Endpoint;
+    if (test_listener(?listener, ?endpoint) < 0) {
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var client: usize;
+    if (test_client(endpoint, ?client) < 0) {
+        sys.sock_close(listener);
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var server: usize = (-1)::usize;
+    if (stream_accept(listener, nil, ?server) < 0) {
+        sys.sock_close(client);
+        sys.sock_close(listener);
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+
+    var input:  [4]u8;
+    var output: [4]u8;
+    output[0] = 'p';
+    output[1] = 'o';
+    output[2] = 'n';
+    output[3] = 'g';
+    var read_token:      types.Token;
+    var write_token:     types.Token;
+    val read_submitted:  i64 = submit_read(?backend, server, 1, ?input[0], 4, 51, ?read_token);
+    val write_submitted: i64 = submit_write(?backend, server, 1, ?output[0], 4, 52, ?write_token);
+    var response:        [4]u8;
+    val response_bytes:  i64 = test_receive_exact(client, ?response[0], 4);
+    var request:         [4]u8;
+    request[0] = 'p';
+    request[1] = 'i';
+    request[2] = 'n';
+    request[3] = 'g';
+    val request_bytes: i64   = test_send_exact(client, ?request[0], 4);
+    var saw_read:      bool  = false;
+    var saw_write:     bool  = false;
+    var attempts:      usize = 0;
+    for (attempts < 6 && (!saw_read || !saw_write)) {
+        val count: i64 = poll(?backend, 1000);
+        if (count < 0) { attempts = 6; }
+        or {
+            var i: usize = 0;
+            for (i < count::usize) {
+                var native: types.NativeCompletion;
+                completion(?backend, i, ?native);
+                if (native.context == 51 && native.status == 0 && native.bytes == 4) { saw_read = true; }
+                if (native.context == 52 && native.status == 0 && native.bytes == 4) { saw_write = true; }
+                i = i + 1;
+            }
+            attempts = attempts + 1;
+        }
+    }
+    var failure: i32 = 0;
+    if (read_submitted != 0)                      { failure = 2; }
+    or (write_submitted != 0)                     { failure = 3; }
+    or (response_bytes != 4)                      { failure = 4; }
+    or (request_bytes != 4)                       { failure = 5; }
+    or (!saw_read)                                { failure = 6; }
+    or (!saw_write)                               { failure = 7; }
+    or (input[0] != 'p' || input[3] != 'g')       { failure = 8; }
+    or (response[0] != 'p' || response[3] != 'g') { failure = 9; }
+    or (backend.resource_count != 1)              { failure = 10; }
+    sys.sock_close(server);
+    sys.sock_close(client);
+    sys.sock_close(listener);
+    val destroyed: i64 = destroy(?backend);
+    sys.io_queue_close(?queue);
+    if (failure == 0 && destroyed < 0) { failure = 11; }
+    if (failure != 0)                  { ret failure; }
+    ret 0;
+}
+
+test async_unix__listener_owns_multiple_bounded_accepts {
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    var queue: shared.IoQueue;
+    if (sys.io_queue_create(?queue) < 0) { ret 1; }
+    var backend: Backend;
+    if (make(?backend, ?queue, ?pa, 8, 1) < 0) {
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var listener: usize;
+    var endpoint: ip.Endpoint;
+    if (test_async_listener(?listener, ?endpoint) < 0) {
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var peers:        [2]ip.Endpoint;
+    var tokens:       [2]types.Token;
+    val first:        i64  = submit_accept(?backend, listener, 1, ?peers[0], 61, ?tokens[0]);
+    val second:       i64  = submit_accept(?backend, listener, 1, ?peers[1], 62, ?tokens[1]);
+    val one_resource: bool = backend.resource_count == 1;
+    var clients:      [2]usize;
+    if (test_client(endpoint, ?clients[0]) < 0 || test_client(endpoint, ?clients[1]) < 0) {
+        cancel(?backend, tokens[0], nil);
+        cancel(?backend, tokens[1], nil);
+        sys.sock_close(listener);
+        destroy(?backend);
+        sys.io_queue_close(?queue);
+        ret 1;
+    }
+    var accepted: [2]usize;
+    accepted[0] = (-1)::usize;
+    accepted[1] = (-1)::usize;
+    var completions: usize = 0;
+    var attempts:    usize = 0;
+    for (attempts < 6 && completions < 2) {
+        val count: i64 = poll(?backend, 1000);
+        if (count < 0) { attempts = 6; }
+        or {
+            var i: usize = 0;
+            for (i < count::usize) {
+                var native: types.NativeCompletion;
+                completion(?backend, i, ?native);
+                if (native.context == 61) {
+                    accepted[0] = native.resource;
+                    completions = completions + 1;
+                }
+                if (native.context == 62) {
+                    accepted[1] = native.resource;
+                    completions = completions + 1;
+                }
+                i = i + 1;
+            }
+            attempts = attempts + 1;
+        }
+    }
+    val valid: bool = first == 0 && second == 0 && one_resource && completions == 2 && accepted[0] != (-1)::usize && accepted[1] != (-1)::usize && accepted[0] != accepted[1] && backend.resource_count == 1;
+    if (accepted[0] != (-1)::usize) { sys.sock_close(accepted[0]); }
+    if (accepted[1] != (-1)::usize) { sys.sock_close(accepted[1]); }
+    sys.sock_close(clients[0]);
+    sys.sock_close(clients[1]);
+    sys.sock_close(listener);
+    val destroyed: i64 = destroy(?backend);
+    sys.io_queue_close(?queue);
+    if (!valid || destroyed < 0) { ret 1; }
+    ret 0;
+}
+
+# the blocked operations a socket carries one after another register it once:
+# only the first finds its address and adds it, every later one rearms (#737)
+test async_unix__a_socket_stays_registered_across_blocked_operations {
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    var queue: shared.IoQueue;
+    if (sys.io_queue_create(?queue) < 0) { ret 1; }
+    var backend: Backend;
+    if (make(?backend, ?queue, ?pa, 8, 1) < 0) {
+        sys.io_queue_close(?queue);
+        ret 2;
+    }
+    var receiver:          usize;
+    var receiver_endpoint: ip.Endpoint;
+    var sender:            usize;
+    var sender_endpoint:   ip.Endpoint;
+    if (test_datagram(?receiver, ?receiver_endpoint) < 0 || test_datagram(?sender, ?sender_endpoint) < 0) { ret 3; }
+    var inbound:  [8]u8;
+    var outbound: [1]u8;
+    outbound[0] = 'x';
+    var incoming: types.Packet;
+    var outgoing: types.Packet;
+    outgoing.buffer   = ?outbound[0];
+    outgoing.length   = 1;
+    outgoing.capacity = 1;
+    outgoing.peer     = receiver_endpoint;
+    val rounds: usize = 32;
+    var round:  usize = 0;
+    for (round < rounds) {
+        incoming.buffer   = ?inbound[0];
+        incoming.capacity = 8;
+        incoming.length   = 0;
+        var token: types.Token;
+        if (submit_receive_batch(?backend, receiver, 1, ?incoming, 1, 100 + round, ?token) < 0) { ret 4; }
+        if (datagram_send_batch(sender, ?outgoing, 1) != 1)                                     { ret 5; }
+        var done:     bool  = false;
+        var attempts: usize = 0;
+        for (!done && attempts < 8) {
+            val count: i64 = poll(?backend, 1000);
+            if (count < 0) { ret 6; }
+            var i: usize = 0;
+            for (i < count::usize) {
+                var native: types.NativeCompletion;
+                if (completion(?backend, i, ?native) < 0) { ret 7; }
+                if (native.context == 100 + round) {
+                    if (native.status != 0 || native.items != 1) { ret 8; }
+                    done = true;
+                }
+                i = i + 1;
+            }
+            attempts = attempts + 1;
+        }
+        if (!done) { ret 9; }
+        round = round + 1;
+    }
+    if (backend.watches != 1)         { ret 10; }
+    if (backend.unwatches != 0)       { ret 11; }
+    if (backend.locates != 2)         { ret 12; }
+    if (backend.rearms != rounds - 1) { ret 13; }
+    var close_token: types.Token;
+    if (submit_close(?backend, receiver, 1, 200, ?close_token) < 0) { ret 14; }
+    var closed: bool  = false;
+    var tries:  usize = 0;
+    for (!closed && tries < 8) {
+        val count: i64 = poll(?backend, 1000);
+        if (count < 0) { ret 15; }
+        var i: usize = 0;
+        for (i < count::usize) {
+            var native: types.NativeCompletion;
+            if (completion(?backend, i, ?native) < 0) { ret 16; }
+            if (native.context == 200)                { closed = true; }
+            i = i + 1;
+        }
+        tries = tries + 1;
+    }
+    if (!closed)                { ret 17; }
+    if (backend.unwatches != 1) { ret 18; }
+    sys.sock_close(sender);
+    if (destroy(?backend) < 0) { ret 19; }
+    sys.io_queue_close(?queue);
+    ret 0;
+}

@@ -20,7 +20,7 @@ mach dep add . std --git https://github.com/briar-systems/mach-std --ref tag/v6.
 
 ## Support
 
-std 6.x requires mach 5.8.0 or later. It is tested on linux (x86_64, arm64, riscv64), darwin (x86_64, aarch64) and windows (x86_64). Its OS-free core also builds for freestanding targets.
+std 9.x requires mach 6. It is tested on linux (x86_64, arm64, riscv64), darwin (x86_64, aarch64) and windows (x86_64). Its OS-free core also builds for freestanding targets.
 
 std follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See the [changelog](./CHANGELOG.md).
 
@@ -30,6 +30,8 @@ The semantic versioning promise covers the driver and library modules, such as `
 
 std is designed so that callers can reach past a driver when it does not give them what they need, and doing so is expected. The only thing to know is what the version number covers. The `net.async` backend modules are outside the promise:
 
+- `std.net.async.readiness` (`src/net/async/readiness.mach`)
+- `std.net.async.unix` (`src/net/async/unix.mach`)
 - `std.net.async.linux` (`src/net/async/linux.mach`)
 - `std.net.async.darwin` (`src/net/async/darwin.mach`)
 - `std.net.async.windows` (`src/net/async/windows.mach`)

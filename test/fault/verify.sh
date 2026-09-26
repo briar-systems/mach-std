@@ -45,10 +45,10 @@ fi
 
 # mach 5.12 tests only the selected artifact's closure, so a module the tests
 # artifact does not reach would drop its tests without a word
-listed="$(mach_run "${test_args[@]}" --list | tr '\134' '/')" || fail "fault tests could not be listed"
+listed="$(mach_run "${test_args[@]}" --list)" || fail "fault tests could not be listed"
 for source in "$here"/src/*.mach; do
-    grep -qE '^[[:space:]]*test "' "$source" || continue
-    grep -qF "test/fault/src/$(basename "$source"):" <<< "$listed" \
+    grep -qE '^[[:space:]]*test[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\{' "$source" || continue
+    grep -q "^fault\.$(basename "$source" .mach)#" <<< "$listed" \
         || fail "fault.$(basename "$source" .mach) holds tests that lib/tests.mach does not reach"
 done
 mach_run "${test_args[@]}"
