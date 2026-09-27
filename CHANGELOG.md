@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [9.1.0] - 2026-09-27
+
+### Added
+
+- `std.crypto.hash.siphash`, keyed SipHash-2-4 for any table or shard choice
+  whose keys an untrusted peer can influence (#955). It holds `Key`,
+  `random_key()` from the OS entropy source with no fallback, a one-shot
+  `bytes`, and an incremental `init`, `update`, `update_u64` and `final`.
+  `random_key` exists only on targets with the entropy capability.
+- `std.collections.map.MapKeyed[K, V]`, a map hashed with SipHash under a key
+  it stores, with the `_keyed` surface that mirrors `MapBy` (#955). Its hash
+  is the new `std.collections.natural.hash_keyed`. `Map`'s default hashing is
+  unchanged.
+
+### Fixed
+
+- The sin64 x^11 coefficient is the double closest to -1/11!, where it was
+  one ulp below it (#953).
+- Inexact float literals in `std.math.float` and `std.math.quat` are spelled
+  as the value stored, so std builds without inexact-literal warnings (#951).
+  Every stored value is unchanged.
+
 ## [9.0.0] - 2026-09-26
 
 ### Breaking
