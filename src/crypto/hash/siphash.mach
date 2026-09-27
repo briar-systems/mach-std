@@ -1,0 +1,305 @@
+# keyed SipHash-2-4, a short-input pseudorandom function
+#
+# WHEN TO USE IT. any hash table, shard choice or bucket index whose keys an
+# untrusted peer can influence: a connection id, a header name, a path, an
+# address. an unkeyed hash (`fnv1a`, `std.collections.natural.hash`) is public
+# arithmetic, so a peer can precompute keys that all land in one bucket and
+# turn every lookup into a linear walk. SipHash under a secret random key makes
+# the placement unpredictable to anyone who does not hold the key. draw the key
+# once per table or per process with `random_key` and never send it anywhere.
+# `std.collections.map.MapKeyed` is a map hashed this way.
+#
+# WHAT IT IS NOT. a 64-bit output is a table hash, not a message
+# authenticator worth trusting at a protocol boundary and not a digest: use
+# sha256 or sha3 for those. the key is held in public words, so a record
+# holding it is not welded; it guards against flooding, not against a reader
+# of this process's memory.
+#
+# the algorithm is Aumasson and Bernstein's, "SipHash: a fast short-input
+# PRF" (2012): two compression rounds per 8-byte word, four finalization
+# rounds, the message length folded into the last word. `bytes` hashes a whole
+# buffer at once. `init`, `update`, `update_u64` and `final` hash a message
+# delivered in pieces and agree with `bytes` over the concatenation.
+
+use std.system.capability;
+use std.types.option.opt;
+use std.types.size.usize;
+
+$if (capability.HAS_ENTROPY) {
+    use std.crypto.rand;
+    use io_error: std.io.error;
+    use std.types.error.err;
+}
+
+# a 128-bit SipHash key as two little-endian words
+# ---
+# k0: key bytes 0 to 7
+# k1: key bytes 8 to 15
+pub rec Key {
+    k0: u64;
+    k1: u64;
+}
+
+# an incremental SipHash state
+# ---
+# v0:       internal word 0
+# v1:       internal word 1
+# v2:       internal word 2
+# v3:       internal word 3
+# tail:     the bytes of an incomplete word, little-endian
+# tail_len: number of bytes held in `tail`, below 8
+# total:    number of bytes absorbed so far
+pub rec State {
+    v0:       u64;
+    v1:       u64;
+    v2:       u64;
+    v3:       u64;
+    tail:     u64;
+    tail_len: usize;
+    total:    u64;
+}
+
+$if (capability.HAS_ENTROPY) {
+    # draw a key from the operating system entropy source
+    #
+    # there is no fallback: when the source refuses, no key is returned, and a
+    # table built on a guessable key would defeat the point of keying it.
+    # ---
+    # ret: a fresh key, or none when the entropy source refused
+    pub fun random_key() opt[Key] {
+        var key:    Key;
+        val filled: err[io_error.Error] = rand.fill((?key)::*u8, $size_of(Key));
+        if (sel filled.err) { ret opt[Key].none{}; }
+        ret opt[Key].some{key};
+    }
+}
+
+# start a hash under a key
+# ---
+# key: the key
+# ret: a state that has absorbed nothing
+pub fun init(key: Key) State {
+    ret State{
+        v0:       key.k0 ^ 0x736f6d6570736575,
+        v1:       key.k1 ^ 0x646f72616e646f6d,
+        v2:       key.k0 ^ 0x6c7967656e657261,
+        v3:       key.k1 ^ 0x7465646279746573,
+        tail:     0,
+        tail_len: 0,
+        total:    0,
+    };
+}
+
+# absorb bytes
+# ---
+# s:    the state
+# data: the bytes, which may be nil when len is 0
+# len:  number of bytes
+pub fun update(s: *State, data: *u8, len: usize) {
+    var i: usize = 0;
+    if (s.tail_len != 0) {
+        for (s.tail_len < 8 && i < len) {
+            s.tail     = s.tail | (data[i]::u64 << (8 * s.tail_len)::u64);
+            s.tail_len = s.tail_len + 1;
+            i          = i + 1;
+        }
+        if (s.tail_len == 8) {
+            absorb(s, s.tail);
+            s.tail     = 0;
+            s.tail_len = 0;
+        }
+    }
+    for (i + 8 <= len) {
+        absorb(s, read_little(data, i, 8));
+        i = i + 8;
+    }
+    if (i < len) {
+        s.tail     = read_little(data, i, len - i);
+        s.tail_len = len - i;
+    }
+    s.total = s.total + len::u64;
+}
+
+# absorb a word as its eight little-endian bytes, on any host byte order
+# ---
+# s:    the state
+# word: the word
+pub fun update_u64(s: *State, word: u64) {
+    if (s.tail_len == 0) {
+        absorb(s, word);
+        s.total = s.total + 8;
+        ret;
+    }
+    var le: [8]u8;
+    var i:  usize = 0;
+    for (i < 8) {
+        le[i] = ((word >> (8 * i)::u64) & 0xff)::u8;
+        i     = i + 1;
+    }
+    update(s, ?le[0], 8);
+}
+
+# the hash of everything absorbed
+#
+# the state is left as it was, so more bytes may follow and a later `final`
+# covers them too.
+# ---
+# s:   the state
+# ret: the 64-bit hash
+pub fun final(s: *State) u64 {
+    var t: State = @s;
+    absorb(?t, ((t.total & 0xff) << 56) | t.tail);
+    t.v2 = t.v2 ^ 0xff;
+    round(?t);
+    round(?t);
+    round(?t);
+    round(?t);
+    ret t.v0 ^ t.v1 ^ t.v2 ^ t.v3;
+}
+
+# hash a buffer in one call
+# ---
+# key:  the key
+# data: the bytes, which may be nil when len is 0
+# len:  number of bytes
+# ret:  the 64-bit hash
+pub fun bytes(key: Key, data: *u8, len: usize) u64 {
+    var s: State = init(key);
+    update(?s, data, len);
+    ret final(?s);
+}
+
+#[inline]
+fun rotate(value: u64, bits: u64) u64 {
+    ret (value << bits) | (value >> (64 - bits));
+}
+
+fun round(s: *State) {
+    s.v0 = s.v0 + s.v1;
+    s.v1 = rotate(s.v1, 13);
+    s.v1 = s.v1 ^ s.v0;
+    s.v0 = rotate(s.v0, 32);
+    s.v2 = s.v2 + s.v3;
+    s.v3 = rotate(s.v3, 16);
+    s.v3 = s.v3 ^ s.v2;
+    s.v0 = s.v0 + s.v3;
+    s.v3 = rotate(s.v3, 21);
+    s.v3 = s.v3 ^ s.v0;
+    s.v2 = s.v2 + s.v1;
+    s.v1 = rotate(s.v1, 17);
+    s.v1 = s.v1 ^ s.v2;
+    s.v2 = rotate(s.v2, 32);
+}
+
+# one message word through two compression rounds
+fun absorb(s: *State, word: u64) {
+    s.v3 = s.v3 ^ word;
+    round(s);
+    round(s);
+    s.v0 = s.v0 ^ word;
+}
+
+# up to eight bytes at `data + offset` as a little-endian word
+fun read_little(data: *u8, offset: usize, count: usize) u64 {
+    var value: u64   = 0;
+    var i:     usize = 0;
+    for (i < count) {
+        value = value | (data[offset + i]::u64 << (8 * i)::u64);
+        i     = i + 1;
+    }
+    ret value;
+}
+
+# the reference implementation's vectors: key 00..0f, message 00..(n-1) for n in 0..63
+#[testing]
+val VECTORS: [64]u64 = [64]u64{
+    0x726fdb47dd0e0e31, 0x74f839c593dc67fd,
+    0x0d6c8009d9a94f5a, 0x85676696d7fb7e2d,
+    0xcf2794e0277187b7, 0x18765564cd99a68d,
+    0xcbc9466e58fee3ce, 0xab0200f58b01d137,
+    0x93f5f5799a932462, 0x9e0082df0ba9e4b0,
+    0x7a5dbbc594ddb9f3, 0xf4b32f46226bada7,
+    0x751e8fbc860ee5fb, 0x14ea5627c0843d90,
+    0xf723ca908e7af2ee, 0xa129ca6149be45e5,
+    0x3f2acc7f57c29bdb, 0x699ae9f52cbe4794,
+    0x4bc1b3f0968dd39c, 0xbb6dc91da77961bd,
+    0xbed65cf21aa2ee98, 0xd0f2cbb02e3b67c7,
+    0x93536795e3a33e88, 0xa80c038ccd5ccec8,
+    0xb8ad50c6f649af94, 0xbce192de8a85b8ea,
+    0x17d835b85bbb15f3, 0x2f2e6163076bcfad,
+    0xde4daaaca71dc9a5, 0xa6a2506687956571,
+    0xad87a3535c49ef28, 0x32d892fad841c342,
+    0x7127512f72f27cce, 0xa7f32346f95978e3,
+    0x12e0b01abb051238, 0x15e034d40fa197ae,
+    0x314dffbe0815a3b4, 0x027990f029623981,
+    0xcadcd4e59ef40c4d, 0x9abfd8766a33735c,
+    0x0e3ea96b5304a7d0, 0xad0c42d6fc585992,
+    0x187306c89bc215a9, 0xd4a60abcf3792b95,
+    0xf935451de4f21df2, 0xa9538f0419755787,
+    0xdb9acddff56ca510, 0xd06c98cd5c0975eb,
+    0xe612a3cb9ecba951, 0xc766e62cfcadaf96,
+    0xee64435a9752fe72, 0xa192d576b245165a,
+    0x0a8787bf8ecb74b2, 0x81b3e73d20b49b6f,
+    0x7fa8220ba3b2ecea, 0x245731c13ca42499,
+    0xb78dbfaf3a8d83bd, 0xea1ad565322a1a0b,
+    0x60e61c23a3795013, 0x6606d7e446282b93,
+    0x6ca4ecb15c5f91e1, 0x9f626da15c9625f3,
+    0xe51b38608ef25f57, 0x958a324ceb064572,
+};
+
+#[testing]
+val REFERENCE_KEY: Key = Key{k0: 0x0706050403020100, k1: 0x0f0e0d0c0b0a0908};
+
+# one-shot, and incremental in three uneven pieces, over every length in the
+# table; the paper's own vector is the 15-byte one
+test siphash__matches_the_reference_vectors_whole_and_in_pieces {
+    var message: [64]u8;
+    var i:       usize = 0;
+    for (i < 64) {
+        message[i] = i::u8;
+        i          = i + 1;
+    }
+    var n: usize = 0;
+    for (n < 64) {
+        if (bytes(REFERENCE_KEY, ?message[0], n) != VECTORS[n]) { ret 1; }
+        val a: usize = n / 3;
+        val b: usize = (2 * n) / 3;
+        var s: State = init(REFERENCE_KEY);
+        update(?s, ?message[0], a);
+        update(?s, ?message[a], b - a);
+        update(?s, ?message[b], n - b);
+        if (final(?s) != VECTORS[n]) { ret 2; }
+        n = n + 1;
+    }
+    ret 0;
+}
+
+# a word absorbs as its little-endian bytes, aligned or behind a partial tail
+test siphash__update_u64_is_the_little_endian_bytes {
+    var message: [17]u8;
+    var i:       usize = 0;
+    for (i < 17) {
+        message[i] = i::u8;
+        i          = i + 1;
+    }
+    var aligned: State = init(REFERENCE_KEY);
+    update_u64(?aligned, 0x0706050403020100);
+    if (final(?aligned) != VECTORS[8]) { ret 1; }
+    var shifted: State = init(REFERENCE_KEY);
+    update(?shifted, ?message[0], 3);
+    update_u64(?shifted, 0x0a09080706050403);
+    update(?shifted, ?message[11], 6);
+    if (final(?shifted) != VECTORS[17]) { ret 2; }
+    ret 0;
+}
+
+$if (capability.HAS_ENTROPY) {
+    test siphash__random_keys_differ {
+        val first:  opt[Key] = random_key();
+        val second: opt[Key] = random_key();
+        if (!sel first.some)                                                    { ret 1; }
+        if (!sel second.some)                                                   { ret 1; }
+        if (first.some.k0 == second.some.k0 && first.some.k1 == second.some.k1) { ret 2; }
+        ret 0;
+    }
+}
