@@ -350,6 +350,85 @@ pub fun read_string(a: *A.Allocator, p: Path) res[str, FsError] {
     ret res[str, FsError].ok{buf::str};
 }
 
+# welded storage from std.memory.secret needs entropy and pages beside files
+$if (capability.HAS_ENTROPY && capability.HAS_PAGES) {
+    use secret_memory: std.memory.secret;
+
+    # a file's bytes in secret-welded storage
+    # ---
+    # data: allocation from std.memory.secret, nil for an empty file
+    # size: byte count, and the size to release with secret.deallocate
+    pub rec SecretBytes {
+        data: *^u8;
+        size: usize;
+    }
+
+    # read an entire file straight into secret-welded storage
+    #
+    # stats the file for its size, allocates welded storage once, and has the
+    # kernel read into it with positioned reads, so the bytes never pass
+    # through public memory. the caller owns the result and releases it with
+    # std.memory.secret.deallocate(data, size). the file must support
+    # positioned reads. a file that shrinks between the stat and the read is
+    # reported as read{eof} with the bytes that were delivered, and the storage
+    # is wiped and released before any error returns.
+    # ---
+    # p:   file path
+    # ret: the file contents in welded storage, or why they could not be read
+    pub fun read_secret(p: Path) res[SecretBytes, FsError] {
+        val ro: res[File, io_error.Error] = open(p);
+        if (sel ro.err) { ret res[SecretBytes, FsError].err{FsError.io{ro.err}}; }
+        var f: File = ro.ok;
+
+        var st: os.stat_t;
+        val sr: i64 = os.stat(f.handle.value, ?st);
+        if (sr < 0) {
+            val closed: err[io_error.Error] = close(?f);
+            ret res[SecretBytes, FsError].err{FsError.io{with_cleanup(os.error(sr, io_error.OP_OPTION), cleanup_code(closed))}};
+        }
+        if (st.st_size < 0 || st.st_size::u64 > (-1)::usize::u64) {
+            val closed: err[io_error.Error] = close(?f);
+            ret res[SecretBytes, FsError].err{FsError.io{with_cleanup(io_error.make(io_error.RANGE, io_error.OP_READ), cleanup_code(closed))}};
+        }
+        val size: usize = st.st_size::usize;
+        if (size == 0) {
+            val closed: err[io_error.Error] = close(?f);
+            if (sel closed.err) { ret res[SecretBytes, FsError].err{FsError.io{closed.err}}; }
+            ret res[SecretBytes, FsError].ok{SecretBytes{data: nil, size: 0}};
+        }
+
+        val data: *^u8 = secret_memory.allocate(size);
+        if (data == nil) {
+            close(?f);
+            ret res[SecretBytes, FsError].err{FsError.alloc{A.Error.exhausted{}}};
+        }
+
+        var total:  usize     = 0;
+        var failed: ReadError = ReadError.eof{0};
+        var short:  bool      = false;
+        for (total < size) {
+            val n: i64 = os.read_at_secret(f.handle.value, ?data[total], size - total, total::u64);
+            if (n <= 0) {
+                if (n == 0) { failed = ReadError.eof{total}; }
+                or          { failed = m_reader.native_failure(total, os.error(n, io_error.OP_READ)); }
+                short = true;
+                brk;
+            }
+            total = total + n::usize;
+        }
+        val closed: err[io_error.Error] = close(?f);
+        if (short) {
+            secret_memory.deallocate(data, size);
+            ret res[SecretBytes, FsError].err{FsError.read{failed}};
+        }
+        if (sel closed.err) {
+            secret_memory.deallocate(data, size);
+            ret res[SecretBytes, FsError].err{FsError.io{closed.err}};
+        }
+        ret res[SecretBytes, FsError].ok{SecretBytes{data: data, size: size}};
+    }
+}
+
 # write bytes to a file, creating or truncating it
 #
 # composes io.write_all over the file's Writer. a write failure carries the
@@ -1842,4 +1921,34 @@ test replace_bytes_atomic__every_allocation_refusal_preserves_the_destination {
         ordinal = ordinal + 1;
     }
     ret 0;
+}
+
+$if (capability.HAS_ENTROPY && capability.HAS_PAGES) {
+    # a file's bytes land in welded storage intact, compared through declassify,
+    # and an empty file is the empty owner
+    test read_secret__round_trips_a_file_into_welded_storage {
+        val p: Path = "mach_std_fs_read_secret";
+        if (refused_fs(write_bytes(p, "key_material", 12, 0o600))) { ret 1; }
+        fin { remove_file(p); }
+        val read: res[SecretBytes, FsError] = read_secret(p);
+        if (sel read.err) { ret 2; }
+        val bytes: SecretBytes = read.ok;
+        if (bytes.data == nil || bytes.size != 12) { ret 3; }
+        val expected: *u8   = "key_material";
+        var i:        usize = 0;
+        for (i < 12) {
+            if (bytes.data[i]:>u8 != expected[i]) {
+                secret_memory.deallocate(bytes.data, bytes.size);
+                ret 4;
+            }
+            i = i + 1;
+        }
+        val released: err[io_error.Error] = secret_memory.deallocate(bytes.data, bytes.size);
+        if (sel released.err)                          { ret 5; }
+        if (refused_fs(write_bytes(p, nil, 0, 0o600))) { ret 6; }
+        val empty: res[SecretBytes, FsError] = read_secret(p);
+        if (sel empty.err)                              { ret 7; }
+        if (empty.ok.data != nil || empty.ok.size != 0) { ret 8; }
+        ret 0;
+    }
 }
