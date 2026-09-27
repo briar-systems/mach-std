@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [9.2.0] - 2026-09-27
+
+### Added
+
+- `std.filesystem.read_secret`, which reads a whole file straight into
+  secret-welded storage, so key material read from disk is never held in
+  public memory (#959). It returns the new `SecretBytes { data, size }`, which
+  the caller releases with `std.memory.secret.deallocate`. The file must
+  support positioned reads, errors mirror `read_string`, and the storage is
+  wiped and released before any error returns. It exists only on targets with
+  the entropy and pages capabilities.
+- `std.memory.secret.read_at`, a positioned read from a file into welded
+  storage the caller owns (#959).
+
 ## [9.1.0] - 2026-09-27
 
 ### Added
