@@ -21,7 +21,7 @@ A target that claims a group exports every member listed here. `src/system/capab
 
 | flag | group | purpose |
 | --- | --- | --- |
-| `HOSTED` | core | required by every hosted std module: the translation of a native code into an `io.error.Error` (`error`, `error_kind`, `error_message`, `message`), and process termination |
+| `HOSTED` | core | required by every hosted std module: the translation of a native code into an `io.error.Error` (`error`, `error_kind`, `error_message`, `message`), process termination, and the calling thread's stack bounds |
 | `HAS_PAGES` | pages | page allocation, protection, locking and advice, and secret-welded storage |
 | `HAS_CLOCK` | clock | the realtime and monotonic clocks, and sleep |
 | `HAS_ENTROPY` | entropy | cryptographic random fill, public and secret |
@@ -36,7 +36,9 @@ A target that claims a group exports every member listed here. `src/system/capab
 
 ### core (`HOSTED`)
 
-`abort`, `error`, `error_kind`, `error_message`, `exit`, `message`, `panic_sink`
+`abort`, `error`, `error_kind`, `error_message`, `exit`, `message`, `panic_sink`, `stack_bounds`
+
+`stack_bounds(low: *usize, high: *usize) bool` writes the calling thread's stack, from its lowest address to one past its highest, and returns false where the implementation knows none. It makes no system call: the bounds are read once per thread and kept. `std.runtime.stack.remaining()` is the consumer, which subtracts `low` from the caller's frame on every call. linux reads the main thread's at entry, as the top of its stack mapping less the `RLIMIT_STACK` soft limit, and records a spawned thread's in its block. It knows none under an unlimited soft limit, nor on a thread whose thread pointer std does not own. darwin records libpthread's bounds in the block when it is installed and asks libpthread on a thread std did not create. windows reads `StackBase` and `DeallocationStack` from the TEB, which hold on every thread. `low` is the base of the reservation, so any guard pages the OS keeps there count as stack. A user-supplied implementation may return false.
 
 ### pages (`HAS_PAGES`)
 
@@ -63,7 +65,7 @@ On linux, whoever starts the process owns the main thread's thread pointer. std 
 - So `std.sync.thread.current_token` is distinct, stable and free of system calls on every one of those threads. A thread made by a raw `clone` without `CLONE_SETTLS` inherits its parent's thread pointer, and so its parent's token. It must not call into std. Neither may a thread whose thread pointer is 0, which faults on x86_64.
 - An interpreter run by hand (`ld.so ./program`) is loaded as the program itself, so `AT_BASE` is 0 and the runtime installs std's block over the interpreter's. That case is not supported.
 
-darwin's thread register belongs to libpthread, so the block rides a pthread key, and windows's rides a TLS index read straight from the TEB. Neither writes a thread register, so the ownership rule above changes nothing there. The block is not general thread-local storage. It is where per-thread state std owns, such as stack bounds, belongs. On linux there is no std block on a thread whose thread pointer a C runtime owns, so such state can't rely on one there. A user-supplied implementation that has no thread pointer may return nil from `thread_block`, and the token then falls back to the thread id.
+darwin's thread register belongs to libpthread, so the block rides a pthread key, and windows's rides a TLS index read straight from the TEB. Neither writes a thread register, so the ownership rule above changes nothing there. The block is not general thread-local storage. It is where per-thread state std owns belongs, such as the stack bounds linux and darwin record in its `stack_low` and `stack_high` (see `stack_bounds`). On linux there is no std block on a thread whose thread pointer a C runtime owns, so such state can't rely on one there. A user-supplied implementation that has no thread pointer may return nil from `thread_block`, and the token then falls back to the thread id.
 
 `thread_affinity(words: *u64, capacity: usize, out_count: *usize) i64` and `set_thread_affinity(words: *u64, count: usize) i64` act on the calling thread. CPU `i` is bit `i % 64` of `words[i / 64]`, and no set size is fixed: a read whose `capacity` is too small returns a code `error_kind` classifies as `RANGE`, with the words needed in `out_count`. linux reads and sets the kernel's cpumask at whatever size the kernel uses. windows numbers CPUs globally, a processor's index being the active counts of every lower processor group plus its bit within its own group; a thread's affinity is one group's mask, so a set spanning groups is `UNSUPPORTED` rather than truncated. darwin has no hard affinity and returns `UNSUPPORTED` from both. A user-supplied implementation may return `UNSUPPORTED` or its own numbering.
 
