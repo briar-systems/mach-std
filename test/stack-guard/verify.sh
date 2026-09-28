@@ -2,7 +2,7 @@
 # build and run the spawned-thread stack overflow probe against this checkout's
 # std. the probe's thread recurses past the bottom of its stack, and the process
 # must die by the OS's stack fault: SIGSEGV on linux, SIGSEGV or SIGBUS on darwin,
-# STATUS_STACK_OVERFLOW on windows. a normal exit means the overflow ran on.
+# STATUS_STACK_OVERFLOW (0xC00000FD) on windows. a normal exit means the overflow ran on.
 #
 # usage: verify.sh [path-to-mach] [target] [runner]
 set -euo pipefail
@@ -35,9 +35,21 @@ exe="$(cd "$(dirname "$exe")" && pwd)/$(basename "$exe")"
 
 echo "running $exe"
 set +e
-if [ -n "$runner" ]; then "$runner" "$exe"; else "$exe"; fi
-code=$?
+case "$target" in
+    # msys folds an NTSTATUS it has no signal for into 127, so read the real
+    # exit code through powershell
+    windows-*)
+        code="$(powershell.exe -NoProfile -Command \
+            "\$p = Start-Process -FilePath '$(cygpath -w "$exe")' -Wait -PassThru -NoNewWindow; \$p.ExitCode" \
+            | tr -d '\r')"
+        ;;
+    *)
+        if [ -n "$runner" ]; then "$runner" "$exe"; else "$exe"; fi
+        code=$?
+        ;;
+esac
 set -e
+[ -n "$code" ] || fail "the probe's exit code could not be read"
 
 case "$code" in
     0 | 1) fail "the thread ran past the bottom of its stack without faulting (exit $code)" ;;
@@ -48,7 +60,7 @@ esac
 case "$target" in
     linux-*) expected="139" ;;          # SIGSEGV
     darwin-*) expected="138 139" ;;     # SIGBUS or SIGSEGV
-    windows-*) expected="253" ;;        # STATUS_STACK_OVERFLOW, 0xC00000FD, low byte
+    windows-*) expected="-1073741571" ;; # STATUS_STACK_OVERFLOW, 0xC00000FD
 esac
 for e in $expected; do
     if [ "$code" -eq "$e" ]; then
