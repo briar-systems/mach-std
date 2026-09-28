@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [9.4.1] - 2026-09-28
+
+### Fixed
+
+- On linux, a spawned thread's stack now has a 64 KiB inaccessible guard below
+  it, so a thread that overflows its stack faults instead of writing silently
+  into the mapping below (#977). The guard sits outside `stack_reserve`, so a
+  thread still gets every usable byte it asked for, and `stack_bounds` and
+  `std.runtime.stack.remaining` report only the usable range. darwin and
+  windows already guarded their thread stacks.
+
 ## [9.4.0] - 2026-09-28
 
 ### Added
