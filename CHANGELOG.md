@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [9.3.0] - 2026-09-27
+
+### Added
+
+- `std.filesystem.read_secret_of(f: File)`, which reads an open file whole
+  into secret-welded storage (#963). A caller can stat and check one handle and
+  read that same handle. The handle stays open and its position is not used or
+  moved. `read_secret(path)` is now open, `read_secret_of` and close, with its
+  errors unchanged.
+- A `{:b}` binary format spec for every integer width (#965).
+
+### Changed
+
+- An argument whose type has no rendering is a compile error in `vformat`,
+  `format` and the print calls, as `write_value` already was, instead of a
+  runtime syntax error at the hole that a caller could drop (#965).
+
+### Fixed
+
+- `u128` and `i128` arguments format in decimal, hex, binary, width and
+  padding, where a 128-bit argument printed nothing and returned an error the
+  caller could drop (#965). `i128` hex and binary render the full 128-bit
+  two's-complement pattern. A value that fits a u64 does no 128-bit division.
+
 ## [9.2.0] - 2026-09-27
 
 ### Added
