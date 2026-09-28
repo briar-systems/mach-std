@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [9.4.0] - 2026-09-28
+
+### Added
+
+- `std.runtime.stack.remaining() opt[usize]` reports the stack left below the
+  caller's frame on the calling thread (#867). The bounds are read once per
+  thread, so a call makes no system call. It returns `none` where the bounds
+  are unknown: under an unlimited `RLIMIT_STACK` on linux's main thread, and
+  on a linux thread whose thread pointer a C runtime or loader owns. The count
+  runs to the base of the reservation, guard pages included, so a caller keeps
+  its own margin.
+- `std.system.os.stack_bounds(low, high) bool`, a core-group member of the OS
+  contract (#867). linux and darwin record the bounds in the thread block, and
+  windows reads them from the TEB. `ThreadBlock` gains `stack_low` and
+  `stack_high`.
+
+### Fixed
+
+- On windows, a read-only open of a directory succeeds as it does on posix, and
+  a write open of one is still refused (#972).
+- On windows, a listener no longer sets `SO_REUSEADDR`, which let a socket bind
+  an address another socket held. A second listener on a bound address now
+  fails with `ADDRESS_IN_USE` on every platform (#973). UDP sockets on windows
+  no longer set it either.
+
 ## [9.3.0] - 2026-09-27
 
 ### Added
