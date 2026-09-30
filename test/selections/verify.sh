@@ -4,7 +4,7 @@
 # mach 5.12 tests one artifact's closure (mach#3813), so a module no artifact
 # reaches has its tests dropped without a word. this lists, per target, what an
 # entry reaching every module with a test collects, and fails on any test that
-# neither `mach test .` nor `mach test . --lib tests` collects.
+# neither `mach test .` nor `mach test . -a tests` collects.
 set -euo pipefail
 
 mach="${1:-mach}"
@@ -42,8 +42,8 @@ list() {
 missing=0
 for target in $targets; do
     list "$scratch/$target-std.txt" --target "$target"
-    list "$scratch/$target-tests.txt" --lib tests --target "$target"
-    list "$scratch/$target-every.txt" --lib every-test --target "$target"
+    list "$scratch/$target-tests.txt" -a tests --target "$target"
+    list "$scratch/$target-every.txt" -a every-test --target "$target"
     sort -u "$scratch/$target-std.txt" "$scratch/$target-tests.txt" > "$scratch/$target-union.txt"
     sort -u "$scratch/$target-every.txt" > "$scratch/$target-all.txt"
     sed -E 's|^std\.([^#]*)#.*$|\1|' "$scratch/$target-all.txt" | tr . / | sed 's|.*|src/&.mach|' >> "$scratch/reached.txt"
@@ -67,4 +67,4 @@ if [ -n "$unreached" ]; then
 fi
 
 [ "$missing" = 0 ] || exit 1
-echo "OK: every test std holds runs under mach test . or mach test . --lib tests, on every target"
+echo "OK: every test std holds runs under mach test . or mach test . -a tests, on every target"

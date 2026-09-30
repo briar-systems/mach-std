@@ -40,8 +40,8 @@ echo "building the RELRO probes --pie with $mach (target $target)"
 rm -rf out
 # the manifest declares two bins; a plain build is intentionally ambiguous, so
 # select each probe explicitly.
-mach_run build . --bin relro_happy --target "$target" --pie --profile debug
-mach_run build . --bin relro_fault --target "$target" --pie --profile debug
+mach_run build . -a relro_happy --target "$target" --pie --profile debug
+mach_run build . -a relro_fault --target "$target" --pie --profile debug
 happy="$(find out -name relro_happy -type f -print -quit)"
 fault="$(find out -name relro_fault -type f -print -quit)"
 [ -n "$happy" ] || fail "no relro_happy binary produced"
