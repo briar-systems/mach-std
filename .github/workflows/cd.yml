@@ -3,7 +3,6 @@ name: Release
 on:
   push:
     tags: ['v*']
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -12,22 +11,91 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  MACH_VERSION: 6.8.0
+
 jobs:
   verify:
-    uses: briar-systems/.github/.github/workflows/mach-release.yml@main
-    with:
-      stage: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("mach.toml", "rb"))["project"]["version"])')
+          [ "$TAG" = "v$version" ] || { echo "::error::tag $TAG does not match mach.toml version $version"; exit 1; }
 
+  # the hosts this project ships to, tested natively before anything is published
   ci:
     needs: verify
     uses: ./.github/workflows/ci.yml
     with:
-      heavy: all
+      profile: release
+      runners: '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "macos-15", "macos-15-intel"]'
+
+  # one archive per artifact and target, cross-compiled at the paths mach's build plan reports
+  package:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: install mach
+        run: |
+          export MACH_INSTALL_DIR="$RUNNER_TEMP/mach"
+          curl -fsSL "https://raw.githubusercontent.com/briar-systems/mach/v$MACH_VERSION/dist/install.sh" | sh
+          echo "$MACH_INSTALL_DIR" >> "$GITHUB_PATH"
+      - run: mach dep pull .
+      - run: mach build . --all -p release
+      - name: package
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          mkdir dist
+          mach build . --all -p release --plan | awk '
+            /^unit / { name = $3; target = $6 }
+            $1 == "tuple" { split($2, t, "-"); os = t[2] }
+            $1 == "out" { print name, target, os, $2 }' |
+          while read -r name target os path; do
+            archive="$PWD/dist/$name-$version-$target"
+            case "$os" in
+              windows) (cd "$(dirname "$path")" && zip -q "$archive.zip" "$(basename "$path")") ;;
+              *)       tar -czf "$archive.tar.gz" -C "$(dirname "$path")" "$(basename "$path")" ;;
+            esac
+          done
+          (cd dist && sha256sum * > SHA256SUMS)
+          ls dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
 
   publish:
-    needs: [verify, ci]
-    uses: briar-systems/.github/.github/workflows/mach-release.yml@main
+    needs: [verify, ci, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
-    with:
-      stage: publish
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # a doubled tag push waits on the concurrency group, then finds the release
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "release $TAG already exists"
+            exit 0
+          fi
+          # notes are the changelog section for this version when there is one
+          notes=$(awk -v v="${TAG#v}" '/^## \[/ { on = index($0, "[" v "]") > 0; next } on' CHANGELOG.md 2>/dev/null || true)
+          flags=(--verify-tag --title "$TAG" --draft)
+          [ -n "$notes" ] && flags+=(--notes "$notes") || flags+=(--generate-notes)
+          case "$TAG" in *-*) flags+=(--prerelease) ;; esac
+          gh release create "$TAG" dist/* "${flags[@]}"
+          gh release edit "$TAG" --draft=false
