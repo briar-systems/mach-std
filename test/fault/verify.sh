@@ -38,7 +38,7 @@ if grep -qF "[target.$target]" "$scratch/repo/mach.toml"; then
     release_checked=1
 fi
 
-test_args=(test "$scratch/repo/test/fault" --lib tests --target "$target" --profile "$profile")
+test_args=(test "$scratch/repo/test/fault" -a tests --target "$target" --profile "$profile")
 if [ -n "$runner" ]; then
     test_args+=(--runner "$runner")
 fi
