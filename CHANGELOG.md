@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [9.5.0] - 2026-10-03
+
+### Added
+
+- DEFLATE compression (RFC 1951) in `std.compress.deflate`, with zlib
+  (RFC 1950) and gzip (RFC 1952) framing (#990). It streams like the
+  decompressors (`init(a, level, container)`, `compress`, `finish`, `reset`,
+  `dnit`, the same `Progress` and status values) and allocates its scratch
+  once at `init`. Levels 0 to 9 follow zlib's table: 0 stores, 1 to 3 are
+  greedy and 4 to 9 lazy, and each block is written stored, fixed or dynamic,
+  whichever is smallest. Output depends only on the input, level and
+  container, however the input is fed, and is the same on every host. The
+  gzip header carries mtime 0 and OS 255. `compress_into`, `compress_alloc`
+  and `bound` give one-shot use, and `std.compress.zlib` and
+  `std.compress.gzip` gain `compress_into`, `compress_alloc` and
+  `compress_bound`. The RFC 1951 tables move to `std.compress.format`
+  (re-exported as `compress_format`), shared by inflate and deflate.
+- `std.encoding.leb128`: `unsigned_size`, `signed_size`, `put_unsigned`,
+  `put_signed`, `get_unsigned` and `get_signed`, with `MAX_BYTES` and an
+  `Error` of `short` or `overflow` (#992). Writers emit the shortest form,
+  and readers accept a padded form up to ten bytes and refuse one whose bits
+  do not fit 64.
+- `std.format.put_u64` and `put_i64` write decimal into caller storage of
+  `DECIMAL_MAX` bytes, beside `write_u64` and `write_i64`, which now use them
+  (#992).
+- `std.process.exec.SpawnOptions` and `spawn_with_options(pathname, argv,
+  envp, options)`, one spawn carrying the working directory, the stdin,
+  stdout and stderr redirections and whether the child leads its own process
+  group (#993). `spawn_options()` gives the plain-spawn defaults. Every
+  existing `spawn*` variant, `run`, `output` and the posix shell spawn now go
+  through it, with behaviour unchanged.
+- `std.crypto.hash.fnv1a.step_bytes(h, p, n)` folds a run of bytes into a
+  running FNV-1a hash (#991).
+
+### Fixed
+
+- `std.memory.secret` documents that a refused `release_typed` or
+  `deallocate` writes nothing and leaves the caller's storage live and
+  unwiped, as the code always did, where the docs claimed a refusal wiped it
+  (#976). Only a native release failure wipes.
+
 ## [9.4.1] - 2026-09-28
 
 ### Fixed
