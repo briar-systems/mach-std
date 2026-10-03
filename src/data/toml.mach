@@ -50,12 +50,15 @@ val SPAN_SIZE:  usize = $size_of(Span);
 # conflict: the key at the payload offset collides with an existing value of
 #           another shape (a table where a scalar was set, an array of tables
 #           over a table, and the like)
+# nul:      a NUL byte at the payload offset, written raw or as a `\u0000` or
+#           `\U00000000` escape; a parsed string cannot carry one
 # alloc:    an acquisition was refused; nothing the parse built survives
 pub tag TomlError: u8 {
     syntax:   usize;
     overflow: usize;
     depth:    usize;
     conflict: usize;
+    nul:      usize;
     alloc:    Error;
 }
 
@@ -893,6 +896,20 @@ fun decode_escape(src: str, si: *usize, buf: *u8, di: usize) usize {
     ret 0;
 }
 
+# whether the escape whose letter is at src[at] is a `\u` or `\U` escape of
+# the NUL code point
+fun escape_is_nul(src: str, at: usize) bool {
+    var ndig: usize = 4;
+    if (src[at] == 'U') { ndig = 8; }
+    or (src[at] != 'u') { ret false; }
+    var k: usize = 1;
+    for (k <= ndig) {
+        if (src[at + k] != '0') { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
 # count output bytes for an escape at src[@i]
 # advances i past the escape sequence.
 fun count_escape_len(src: str, i: *usize) usize {
@@ -972,7 +989,8 @@ fun parse_basic_string(a: *Allocator, src: str, i: *usize) res[str, TomlError] {
         if (b == '"')            { brk; }
         if (b == '\\') {
             @i = @i + 1;
-            if (src[@i] == 0) { ret text_fail(TomlError.syntax{@i}); }
+            if (src[@i] == 0)           { ret text_fail(TomlError.syntax{@i}); }
+            if (escape_is_nul(src, @i)) { ret text_fail(TomlError.nul{@i - 1}); }
             out_len = out_len + count_escape_len(src, i);
             cnt;
         }
@@ -1036,6 +1054,7 @@ fun parse_ml_basic_string(a: *Allocator, src: str, i: *usize) res[str, TomlError
                 for (is_ws_or_newline(src[@i])) { @i = @i + 1; }
                 cnt;
             }
+            if (escape_is_nul(src, @i)) { ret text_fail(TomlError.nul{@i - 1}); }
             out_len = out_len + count_escape_len(src, i);
             cnt;
         }
@@ -1789,6 +1808,104 @@ pub fun parse(a: *Allocator, src: str) res[Table, TomlError] {
     ret res[Table, TomlError].ok{root};
 }
 
+# parse a TOML document held as `n` bytes that need not end in a NUL
+#
+# a raw NUL byte anywhere in the document is refused at its offset, since no
+# parsed string could carry it; the bytes are otherwise parsed as `parse` does
+# ---
+# a:   allocator for all internal allocations
+# src: the document's bytes
+# n:   how many
+# ret: the root table, or the failure; a failed parse strands nothing
+pub fun parse_bytes(a: *Allocator, src: *u8, n: usize) res[Table, TomlError] {
+    var i: usize = 0;
+    for (i < n) {
+        if (src[i] == 0) { ret res[Table, TomlError].err{TomlError.nul{i}}; }
+        i = i + 1;
+    }
+    if (n == 0xffffffffffffffff::usize) { ret res[Table, TomlError].err{TomlError.alloc{Error.overflow{}}}; }
+    val r: res[*u8, Error] = allocate[u8](a, n + 1);
+    if (sel r.err) { ret res[Table, TomlError].err{TomlError.alloc{r.err}}; }
+    val text: *u8 = r.ok;
+    memory.raw_copy(text::ptr, src::ptr, n);
+    text[n] = 0;
+    val parsed: res[Table, TomlError] = parse(a, text::str);
+    deallocate[u8](a, text, n + 1);
+    ret parsed;
+}
+
+# the body of a TOML basic string holding `s`: backslash, quote and control
+# bytes escaped so the text parses back to the same value
+# ---
+# a:   owns the returned text
+# s:   the value
+# ret: the escaped body, without the surrounding quotes; overflow when its
+#      length cannot be represented, or the allocator's refusal
+pub fun escape(a: *Allocator, s: str) res[str, Error] {
+    val n:   usize = str_len(s);
+    var cap: usize = 1;
+    var i:   usize = 0;
+    for (i < n) {
+        val width: usize = escaped_width(s[i]);
+        if (cap > 0xffffffffffffffff::usize - width) { ret res[str, Error].err{Error.overflow{}}; }
+        cap = cap + width;
+        i   = i + 1;
+    }
+    val r: res[*u8, Error] = allocate[u8](a, cap);
+    if (sel r.err) { ret res[str, Error].err{r.err}; }
+    val buf: *u8   = r.ok;
+    var k:   usize = 0;
+    i = 0;
+    for (i < n) {
+        k = escaped_put(buf, k, s[i]);
+        i = i + 1;
+    }
+    buf[k] = 0;
+    ret res[str, Error].ok{buf::str};
+}
+
+# the short escape letter of `c` in a basic string, 0 when it has none
+fun escape_letter(c: u8) u8 {
+    if (c == '\\') { ret '\\'; }
+    if (c == '"')  { ret '"'; }
+    if (c == '\n') { ret 'n'; }
+    if (c == '\r') { ret 'r'; }
+    if (c == '\t') { ret 't'; }
+    if (c == 8)    { ret 'b'; }
+    if (c == 12)   { ret 'f'; }
+    ret 0;
+}
+
+# how many bytes `c` takes in a basic string's body
+fun escaped_width(c: u8) usize {
+    if (escape_letter(c) != 0) { ret 2; }
+    if (c < 32 || c == 127)    { ret 6; }
+    ret 1;
+}
+
+# write `c` as a basic string's body spells it at buf[k], returning the
+# offset past it
+fun escaped_put(buf: *u8, k: usize, c: u8) usize {
+    val letter: u8 = escape_letter(c);
+    if (letter != 0) {
+        buf[k]     = '\\';
+        buf[k + 1] = letter;
+        ret k + 2;
+    }
+    if (c < 32 || c == 127) {
+        val digits: str = "0123456789abcdef";
+        buf[k]     = '\\';
+        buf[k + 1] = 'u';
+        buf[k + 2] = '0';
+        buf[k + 3] = '0';
+        buf[k + 4] = digits[(c >> 4)::usize];
+        buf[k + 5] = digits[(c & 15)::usize];
+        ret k + 6;
+    }
+    buf[k] = c;
+    ret k + 1;
+}
+
 # the document walk: table headers, arrays of tables, and key/value lines
 #
 # `root` and `ks` are borrowed from `parse`, which owns and releases them however
@@ -2155,6 +2272,7 @@ $if (capability.HOSTED) {
     }
 
     use std.allocator.testing;
+    use std_format: std.format;
 
     # each failure is classified and positioned: syntax at the offending byte,
     # overflow and conflict at the literal or key they were raised for
@@ -2194,6 +2312,72 @@ $if (capability.HOSTED) {
         if (open_.err.syntax != 8) { ret 13; }
 
         if (c.live != 0) { ret 14; }
+        ret 0;
+    }
+
+    # a NUL byte is refused at its offset, raw or as either escape, in a basic
+    # or a multi-line basic string; a literal string keeps a backslash as text
+    test toml__nul_is_refused_at_its_offset {
+        var c: testing.Counting;
+        var a: Allocator;
+        testing.counting_make(?c, ?a);
+
+        val short: res[Table, TomlError] = parse(?a, "s = \"ab\\u0000\"\n");
+        if (!sel short.err)     { ret 1; }
+        if (!sel short.err.nul) { ret 2; }
+        if (short.err.nul != 7) { ret 2; }
+
+        val long: res[Table, TomlError] = parse(?a, "x = 1\ns = \"\"\"a\\U00000000\"\"\"\n");
+        if (!sel long.err)      { ret 3; }
+        if (!sel long.err.nul)  { ret 4; }
+        if (long.err.nul != 14) { ret 4; }
+
+        val literal: res[Table, TomlError] = parse(?a, "s = 'a\\u0000'\n");
+        if (sel literal.err) { ret 5; }
+        var lt: Table = literal.ok;
+        dnit(?a, ?lt);
+
+        var raw: [8]u8;
+        raw[0] = 'x';
+        raw[1] = ' ';
+        raw[2] = '=';
+        raw[3] = ' ';
+        raw[4] = '1';
+        raw[5] = ' ';
+        raw[6] = 0;
+        raw[7] = '\n';
+        val bytes: res[Table, TomlError] = parse_bytes(?a, ?raw[0], 8);
+        if (!sel bytes.err)     { ret 6; }
+        if (!sel bytes.err.nul) { ret 7; }
+        if (bytes.err.nul != 6) { ret 7; }
+
+        val clean: res[Table, TomlError] = parse_bytes(?a, ?raw[0], 5);
+        if (sel clean.err) { ret 8; }
+        var ct: Table    = clean.ok;
+        val x:  opt[i64] = get_int(?ct, "x");
+        if (!sel x.some) { ret 9; }
+        dnit(?a, ?ct);
+
+        if (c.live != 0) { ret 10; }
+        ret 0;
+    }
+
+    # an escaped value parses back to the value it escaped
+    test toml__escape_parses_back {
+        var a: Allocator;
+        page.make(?a);
+        val value: str             = "q\"b\\n\nt\tc\x01d\x7f";
+        val e:     res[str, Error] = escape(?a, value);
+        if (sel e.err)                                               { ret 1; }
+        if (!str_equals(e.ok, "q\\\"b\\\\n\\nt\\tc\\u0001d\\u007f")) { ret 2; }
+        val doc: res[str, std_format.FormatError] = std_format.sprint(?a, "v = \"{}\"\n", e.ok);
+        if (sel doc.err) { ret 3; }
+        val r: res[Table, TomlError] = parse(?a, doc.ok);
+        if (sel r.err) { ret 4; }
+        var t:   Table    = r.ok;
+        val got: opt[str] = get_str(?t, "v");
+        if (!sel got.some)                { ret 5; }
+        if (!str_equals(got.some, value)) { ret 6; }
         ret 0;
     }
 
