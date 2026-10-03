@@ -48,9 +48,9 @@ $or {
     $error("std.process.exec needs the clock, files and process capabilities (std.system.capability.HAS_CLOCK, HAS_FILES, HAS_PROCESS)");
 }
 
-# spawn_grouped, spawn_redirected_grouped, and terminate_group below give
-# every target the same signature; the underlying primitive is platform-
-# specific (posix setpgid/kill(-pgid) vs a tracked windows job object), so the actual
+# a grouped spawn and terminate_group below give every target the same
+# signature; the underlying primitive is platform-specific (posix
+# setpgid/kill(-pgid) vs a tracked windows job object), so the actual
 # implementation is per-platform in each function body.
 $if ($mach.build.os == $mach.os.linux) {
     use std.system.os.linux;
@@ -71,8 +71,8 @@ fwd os.PROCESS_CONTINUED;
 # handle to a spawned child process
 # ---
 # pid:  process id of the child
-# pgid: 0 if the child was not placed in its own group (see spawn_grouped /
-#       spawn_redirected_grouped); otherwise the group token needed to signal
+# pgid: 0 if the child was not placed in its own group (see
+#       SpawnOptions.grouped); otherwise the group token needed to signal
 #       the whole group - on linux/darwin this is the posix process group id
 #       (pgid == pid, since the child is its own group's leader); on windows
 #       it is a tracked group token backed by the retained child process
@@ -208,9 +208,9 @@ pub rec Output {
 # envp:     null-terminated environment array
 # ret:      exit status, or an error retaining an unreaped child
 pub fun run(pathname: str, argv: **u8, envp: **u8) res[ExitStatus, Error] {
-    val pid: i64 = os.spawn(pathname, argv, envp);
-    if (pid < 0) { ret res[ExitStatus, Error].err{process_error(pid, os.PROCESS_OP_SPAWN)}; }
-    ret wait(Child{pid: pid});
+    val child: res[Child, Error] = spawn(pathname, argv, envp);
+    if (sel child.err) { ret res[ExitStatus, Error].err{child.err}; }
+    ret wait(child.ok);
 }
 
 # run a command through the host command interpreter, from `cwd`
@@ -327,7 +327,9 @@ $or {
         argv[1] = "-c";
         argv[2] = command;
         argv[3] = nil;
-        ret spawned(os.spawn_redirected_in(SHELL_PATH, ?argv[0], envp, cwd, os.INVALID_HANDLE, os.INVALID_HANDLE, os.INVALID_HANDLE), 0);
+        var options: SpawnOptions = spawn_options();
+        options.cwd = cwd;
+        ret spawn_with_options(SHELL_PATH, ?argv[0], envp, options);
     }
 }
 
@@ -368,11 +370,11 @@ pub fun output(a: *A.Allocator, pathname: str, argv: **u8, envp: **u8) res[Outpu
     val piped: i64 = os.pipe(?fds[0], ?fds[1]);
     if (piped < 0) { ret res[Output, Error].err{process_error(piped, os.PROCESS_OP_PIPE)}; }
 
-    val pid: i64 = os.spawn_redirected(pathname, argv, envp, os.INVALID_HANDLE, fds[1], os.INVALID_HANDLE);
-    if (pid < 0) {
+    val child: res[Child, Error] = spawn_redirected(pathname, argv, envp, fds[1], os.INVALID_HANDLE);
+    if (sel child.err) {
         os.close(fds[0]);
         os.close(fds[1]);
-        ret res[Output, Error].err{process_error(pid, os.PROCESS_OP_SPAWN)};
+        ret res[Output, Error].err{child.err};
     }
 
     # the parent never writes; closing its write end lets the drain see EOF
@@ -384,7 +386,7 @@ pub fun output(a: *A.Allocator, pathname: str, argv: **u8, envp: **u8) res[Outpu
     val bytes_r:   res[Vector[u8], ReadError] = m_reader.read_all(a, ?rd);
     os.close(fds[0]);
 
-    val waited: res[ExitStatus, Error] = wait(Child{pid: pid});
+    val waited: res[ExitStatus, Error] = wait(child.ok);
     ret finish_output(bytes_r, waited);
 }
 
@@ -419,6 +421,80 @@ fun spawned(pid: i64, pgid: i64) res[Child, Error] {
     ret res[Child, Error].ok{Child{pid: pid, pgid: pgid}};
 }
 
+# how spawn_with_options starts a child, spawn_options giving the defaults
+#
+# the working directory is applied in the child after the fork and before the
+# exec, so this process's own directory is never disturbed and two spawns into
+# different directories cannot race. the parent keeps ownership of every
+# redirected handle: close it after the child exits, or right after the spawn
+# to let a pipe's read end see end-of-file.
+#
+# a grouped child leads a new process group (a job object on windows), so
+# terminate_group later reaches the whole tree at once. a caller whose child
+# may spawn children of its own, such as a shell running a compiler, wants
+# this: terminate_child would leave the grandchildren orphaned and running.
+# ---
+# cwd:     directory to run in, or empty to inherit this process's
+# stdin:   handle for the child's stdin, or os.INVALID_HANDLE to inherit
+# stdout:  handle for the child's stdout, or os.INVALID_HANDLE to inherit
+# stderr:  handle for the child's stderr, or os.INVALID_HANDLE to inherit
+# grouped: place the child as the leader of its own new process group
+pub rec SpawnOptions {
+    cwd:     str;
+    stdin:   usize;
+    stdout:  usize;
+    stderr:  usize;
+    grouped: bool;
+}
+
+# the options of a plain spawn: this process's directory, every stream
+# inherited, and this process's group
+pub fun spawn_options() SpawnOptions {
+    ret SpawnOptions{
+        cwd:     "",
+        stdin:   os.INVALID_HANDLE,
+        stdout:  os.INVALID_HANDLE,
+        stderr:  os.INVALID_HANDLE,
+        grouped: false,
+    };
+}
+
+# start a process without waiting, as `options` describes
+#
+# every spawn of this module is this one with some options set.
+# ---
+# pathname: path to executable
+# argv:     null-terminated argument array
+# envp:     null-terminated environment array, or nil to inherit
+# options:  directory, stream redirections and grouping (see SpawnOptions)
+# ret:      child handle, whose pgid names the group when grouped, or the
+#           spawn failure
+pub fun spawn_with_options(pathname: str, argv: **u8, envp: **u8, options: SpawnOptions) res[Child, Error] {
+    val cwd: *u8 = cwd_or_inherit(options.cwd);
+    if (!options.grouped) {
+        ret spawned(os.spawn_redirected_in(pathname, argv, envp, cwd, options.stdin, options.stdout, options.stderr), 0);
+    }
+    val stdin_fd:  i32 = native_fd(options.stdin);
+    val stdout_fd: i32 = native_fd(options.stdout);
+    val stderr_fd: i32 = native_fd(options.stderr);
+    $if ($mach.build.os == $mach.os.linux) {
+        val pid: i64 = linux.spawn_redirected_in_grouped(pathname, argv, envp, cwd, stdin_fd, stdout_fd, stderr_fd);
+        ret spawned(pid, pid);
+    }
+    $or ($mach.build.os == $mach.os.darwin) {
+        val pid: i64 = darwin.spawn_redirected_in_grouped(pathname, argv, envp, cwd, stdin_fd, stdout_fd, stderr_fd);
+        ret spawned(pid, pid);
+    }
+    $or ($mach.build.os == $mach.os.windows) {
+        var job: isize = 0;
+        val pid: i64   = windows.spawn_redirected_in_grouped(pathname, argv, envp, cwd, stdin_fd, stdout_fd, stderr_fd, ?job);
+        ret spawned(pid, job::i64);
+    }
+    $or {
+        ret res[Child, Error].err{Error.unsupported{}};
+    }
+}
+
 # start a process without waiting
 # ---
 # pathname: path to executable
@@ -426,15 +502,11 @@ fun spawned(pid: i64, pgid: i64) res[Child, Error] {
 # envp:     null-terminated environment array
 # ret:      child handle, or the spawn failure
 pub fun spawn(pathname: str, argv: **u8, envp: **u8) res[Child, Error] {
-    ret spawned(os.spawn(pathname, argv, envp), 0);
+    ret spawn_with_options(pathname, argv, envp, spawn_options());
 }
 
-# start a process without waiting, with its stdout and/or
-# stderr bound to caller-supplied descriptors.
-#
-# the parent keeps ownership of the passed descriptors (close them after the
-# child exits, or after the spawn to let a pipe's read end see EOF); -1 leaves
-# that stream inherited. stdin is always inherited.
+# start a process without waiting, with its stdout and/or stderr bound to
+# caller-supplied descriptors, stdin inherited (see SpawnOptions)
 # ---
 # pathname:  path to executable
 # argv:      null-terminated argument array
@@ -443,43 +515,28 @@ pub fun spawn(pathname: str, argv: **u8, envp: **u8) res[Child, Error] {
 # stderr_fd: handle for the child's stderr, or os.INVALID_HANDLE to inherit
 # ret:       child handle, or the spawn failure
 pub fun spawn_redirected(pathname: str, argv: **u8, envp: **u8, stdout_fd: usize, stderr_fd: usize) res[Child, Error] {
-    ret spawned(os.spawn_redirected(pathname, argv, envp, os.INVALID_HANDLE, stdout_fd, stderr_fd), 0);
+    var options: SpawnOptions = spawn_options();
+    options.stdout = stdout_fd;
+    options.stderr = stderr_fd;
+    ret spawn_with_options(pathname, argv, envp, options);
 }
 
 # start a process without waiting, placed as the leader of its own new
-# process group
-#
-# a caller that spawns a tree of children (a test runner, a build-step
-# executor) uses this instead of spawn so terminate_group can later reach the
-# whole tree at once: any descendant that does not itself call setpgid
-# inherits this group from its parent.
+# process group (see SpawnOptions)
 # ---
 # pathname: path to executable
 # argv:     null-terminated argument array
 # envp:     null-terminated environment array
 # ret:      child handle, or the spawn failure
 pub fun spawn_grouped(pathname: str, argv: **u8, envp: **u8) res[Child, Error] {
-    $if ($mach.build.os == $mach.os.linux) {
-        val pid: i64 = linux.spawn_grouped(pathname, argv, envp);
-        ret spawned(pid, pid);
-    }
-    $or ($mach.build.os == $mach.os.darwin) {
-        val pid: i64 = darwin.spawn_grouped(pathname, argv, envp);
-        ret spawned(pid, pid);
-    }
-    $or ($mach.build.os == $mach.os.windows) {
-        var job: isize = 0;
-        val pid: i64   = windows.spawn_grouped(pathname, argv, envp, ?job);
-        ret spawned(pid, job::i64);
-    }
-    $or {
-        ret res[Child, Error].err{Error.unsupported{}};
-    }
+    var options: SpawnOptions = spawn_options();
+    options.grouped = true;
+    ret spawn_with_options(pathname, argv, envp, options);
 }
 
 # start a process without waiting, with its stdout and/or stderr bound to
 # caller-supplied descriptors, placed as the leader of its own new process
-# group (see spawn_grouped)
+# group (see SpawnOptions)
 # ---
 # pathname:  path to executable
 # argv:      null-terminated argument array
@@ -488,22 +545,11 @@ pub fun spawn_grouped(pathname: str, argv: **u8, envp: **u8) res[Child, Error] {
 # stderr_fd: handle for the child's stderr, or os.INVALID_HANDLE to inherit
 # ret:       child handle, or the spawn failure
 pub fun spawn_redirected_grouped(pathname: str, argv: **u8, envp: **u8, stdout_fd: usize, stderr_fd: usize) res[Child, Error] {
-    $if ($mach.build.os == $mach.os.linux) {
-        val pid: i64 = linux.spawn_redirected_grouped(pathname, argv, envp, -1, native_fd(stdout_fd), native_fd(stderr_fd));
-        ret spawned(pid, pid);
-    }
-    $or ($mach.build.os == $mach.os.darwin) {
-        val pid: i64 = darwin.spawn_redirected_grouped(pathname, argv, envp, -1, native_fd(stdout_fd), native_fd(stderr_fd));
-        ret spawned(pid, pid);
-    }
-    $or ($mach.build.os == $mach.os.windows) {
-        var job: isize = 0;
-        val pid: i64   = windows.spawn_redirected_grouped(pathname, argv, envp, -1, native_fd(stdout_fd), native_fd(stderr_fd), ?job);
-        ret spawned(pid, job::i64);
-    }
-    $or {
-        ret res[Child, Error].err{Error.unsupported{}};
-    }
+    var options: SpawnOptions = spawn_options();
+    options.stdout  = stdout_fd;
+    options.stderr  = stderr_fd;
+    options.grouped = true;
+    ret spawn_with_options(pathname, argv, envp, options);
 }
 
 # the spawn primitives take a nil cwd to mean "inherit this process's", and a
@@ -515,11 +561,8 @@ fun cwd_or_inherit(cwd: str) *u8 {
     ret cwd::*u8;
 }
 
-# start a process in a given working directory without waiting
-#
-# the directory is applied in the CHILD after the fork and before the exec, so
-# this process's own working directory is never disturbed and two spawns into
-# different directories cannot race each other.
+# start a process in a given working directory without waiting (see
+# SpawnOptions)
 # ---
 # pathname: path to executable
 # argv:     null-terminated argument array
@@ -527,7 +570,9 @@ fun cwd_or_inherit(cwd: str) *u8 {
 # cwd:      directory to run in, or empty to inherit this process's
 # ret:      child handle, or the spawn failure
 pub fun spawn_in(pathname: str, argv: **u8, envp: **u8, cwd: str) res[Child, Error] {
-    ret spawned(os.spawn_in(pathname, argv, envp, cwd_or_inherit(cwd)), 0);
+    var options: SpawnOptions = spawn_options();
+    options.cwd = cwd;
+    ret spawn_with_options(pathname, argv, envp, options);
 }
 
 # start a process in a given working directory with its standard streams bound
@@ -541,37 +586,21 @@ pub fun spawn_in(pathname: str, argv: **u8, envp: **u8, cwd: str) res[Child, Err
 pub fun spawn_redirected_in(pathname: str, argv: **u8, envp: **u8, cwd: str,
     stdin_fd: usize, stdout_fd: usize,
     stderr_fd: usize) res[Child, Error] {
-    ret spawned(os.spawn_redirected_in(pathname, argv, envp, cwd_or_inherit(cwd), stdin_fd, stdout_fd, stderr_fd), 0);
+    ret spawn_with_options(pathname, argv, envp, SpawnOptions{
+        cwd: cwd, stdin: stdin_fd, stdout: stdout_fd, stderr: stderr_fd, grouped: false,
+    });
 }
 
 # start a process in a given working directory, with redirected streams, as the
-# leader of its own group
-#
-# this is the form to reach for when the child may spawn children of its own: a
-# build step running a shell that runs a compiler. terminate_group then reaches
-# the whole tree, where terminate_child would leave the grandchildren orphaned
-# and still running.
+# leader of its own group (see SpawnOptions)
 # ---
 # ret: child handle whose pgid identifies the group, or the spawn failure
 pub fun spawn_redirected_in_grouped(pathname: str, argv: **u8, envp: **u8, cwd: str,
     stdin_fd: usize, stdout_fd: usize,
     stderr_fd: usize) res[Child, Error] {
-    $if ($mach.build.os == $mach.os.linux) {
-        val pid: i64 = linux.spawn_redirected_in_grouped(pathname, argv, envp, cwd_or_inherit(cwd), native_fd(stdin_fd), native_fd(stdout_fd), native_fd(stderr_fd));
-        ret spawned(pid, pid);
-    }
-    $or ($mach.build.os == $mach.os.darwin) {
-        val pid: i64 = darwin.spawn_redirected_in_grouped(pathname, argv, envp, cwd_or_inherit(cwd), native_fd(stdin_fd), native_fd(stdout_fd), native_fd(stderr_fd));
-        ret spawned(pid, pid);
-    }
-    $or ($mach.build.os == $mach.os.windows) {
-        var job: isize = 0;
-        val pid: i64   = windows.spawn_redirected_in_grouped(pathname, argv, envp, cwd_or_inherit(cwd), native_fd(stdin_fd), native_fd(stdout_fd), native_fd(stderr_fd), ?job);
-        ret spawned(pid, job::i64);
-    }
-    $or {
-        ret res[Child, Error].err{Error.unsupported{}};
-    }
+    ret spawn_with_options(pathname, argv, envp, SpawnOptions{
+        cwd: cwd, stdin: stdin_fd, stdout: stdout_fd, stderr: stderr_fd, grouped: true,
+    });
 }
 
 # the native descriptor behind a redirection handle, -1 for inherit
@@ -606,12 +635,12 @@ pub fun terminate_child(child: Child) err[Error] {
 # signal every process in a child's group, reaching descendants that spawned
 # their own children in turn
 #
-# `ungrouped` when `child` was not created through spawn_grouped /
-# spawn_redirected_grouped (child.pgid == 0): there is no group to signal.
+# `ungrouped` when `child` was not spawned grouped (child.pgid == 0): there is
+# no group to signal.
 # member processes remain individually waitable afterward, exactly as
 # terminate_child leaves a single child waitable.
 # ---
-# child: child handle from spawn_grouped or spawn_redirected_grouped
+# child: child handle from a grouped spawn
 # ret:   the native failure, which keeps the child with the caller
 pub fun terminate_group(child: Child) err[Error] {
     if (child.pgid == 0) { ret err[Error].err{Error.ungrouped{}}; }
@@ -2158,5 +2187,42 @@ test output__failed_wait_releases_capture_and_retains_the_child {
     if (!sel drained.err.output)           { ret 15; }
     if (retained(drained.err).pid != 0)    { ret 16; }
     if (!sel drained.err.output.wait.none) { ret 17; }
+    ret 0;
+}
+
+# one spawn applies the directory, the redirection and the group together
+test spawn_with_options__applies_the_directory_the_redirection_and_the_group {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var fds: [2]usize;
+    if (os.pipe(?fds[0], ?fds[1]) < 0) { ret 1; }
+    var argv: [4]usize;
+    argv[0] = ("/bin/sh")::usize;
+    argv[1] = ("-c")::usize;
+    argv[2] = ("pwd")::usize;
+    argv[3] = 0;
+    var options: SpawnOptions = spawn_options();
+    options.cwd     = "/";
+    options.stdout  = fds[1];
+    options.grouped = true;
+    val sr: res[Child, Error] = spawn_with_options("/bin/sh", (?argv[0])::**u8, nil, options);
+    os.close(fds[1]);
+    if (sel sr.err) {
+        os.close(fds[0]);
+        ret 2;
+    }
+    var out:   [8]u8;
+    var total: usize = 0;
+    for (total < 8) {
+        val n: i64 = os.read(fds[0], (?out[total])::*u8, 8 - total);
+        if (n <= 0) { brk; }
+        total = total + n::usize;
+    }
+    os.close(fds[0]);
+    val child:  Child                  = sr.ok;
+    val waited: res[ExitStatus, Error] = wait(child);
+    if (sel waited.err)                                        { ret 3; }
+    if (!exited(waited.ok) || code(waited.ok) != 0)            { ret 4; }
+    if (child.pgid != child.pid)                               { ret 5; }
+    if (total != 2 || out[0] != '/'::u8 || out[1] != '\n'::u8) { ret 6; }
     ret 0;
 }
