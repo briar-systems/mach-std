@@ -1,0 +1,1550 @@
+# DEFLATE compression (RFC 1951), raw or framed as zlib (RFC 1950) or gzip (RFC 1952)
+#
+# the encoder is a resumable state machine driven with caller buffers, the
+# mirror of std.compress.inflate: compress takes input and writes what is ready,
+# finish declares the end of input and drains the rest. every call reports what
+# it consumed and wrote, so input chunks may be released and output drained in
+# pieces of any size.
+#
+# matching is LZ77 over a sliding window with a hash chain, tuned by zlib's
+# level table: 0 stores, 1 to 3 match greedily, 4 to 9 defer each match by one
+# byte to look for a longer one. every block is written as the smallest of a
+# stored, fixed and dynamic huffman block, the dynamic codes length limited with
+# ties broken by symbol. block boundaries and window slides fall on token
+# boundaries, never on input chunk boundaries, so the output is a function of
+# the input, the level and the container alone: the same on every host and
+# however the input is fed.
+#
+# a block is also cut at every window slide, so its bytes are always still in
+# the window when the stored form is the smallest. that is what lets bound size
+# a whole stream exactly enough for compress_into.
+#
+# the window, hash chains, token buffer and pending output come from one
+# allocation of SCRATCH bytes made by init, so a freestanding caller can carve
+# it out of its own buffer. nothing is allocated after init, so compression
+# cannot fail once it starts: the only failures are the lifecycle ones, which
+# persist because they are the encoder's state (closed until init, finished
+# after finish until reset).
+#
+# zlib and gzip framing use the checksums the decoders verify, adler32 and
+# crc32 from std.crypto.hash. the gzip header carries no name, an mtime of 0 and
+# OS 255 (unknown), so it does not vary by host or clock.
+
+use std.system.capability;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.memory;
+
+use A: std.allocator;
+
+$if (capability.HOSTED) {
+    use std.allocator.page;
+    use std.allocator.testing;
+}
+
+use V: std.collections.vector;
+use F: std.compress.format;
+use I: std.compress.inflate;
+use std.crypto.hash.adler32;
+use std.crypto.hash.crc32;
+
+fwd I.Progress;
+fwd I.Status;
+fwd I.NEED_INPUT;
+fwd I.OUTPUT_FULL;
+fwd I.DONE;
+fwd I.Committed;
+
+# the framing around the deflate data
+pub def Container: u8;
+# bare deflate data, as inflate reads it
+pub val RAW: Container = 0;
+# a zlib stream (RFC 1950), as std.compress.zlib reads it
+pub val ZLIB: Container = 1;
+# a single gzip member (RFC 1952), as std.compress.gzip reads it
+pub val GZIP: Container = 2;
+
+# fastest level: no matching, stored blocks only
+pub val MIN_LEVEL: u8 = 0;
+# slowest level and usually the smallest output
+pub val MAX_LEVEL: u8 = 9;
+# zlib's default balance of speed and size
+pub val DEFAULT_LEVEL: u8 = 6;
+
+val W:          usize = 32768;
+val WMASK:      usize = 32767;
+val HASH_SIZE:  usize = 32768;
+val HASH_SHIFT: u32   = 17;
+val TOKENS:     usize = 16384;
+val PENDING:    usize = 65600;
+
+# lookahead the matcher keeps so a full-length match and its successor's hash fit
+val MIN_LOOKAHEAD: usize = 262;
+# farthest back a match may reach, which leaves the lookahead in the window
+val MAX_DIST: usize = 32506;
+# the matcher slides the window down by W once it reaches this position
+val SLIDE_AT: usize = 65274;
+# a three byte match further back than this costs more than its literals
+val TOO_FAR: usize = 4096;
+
+val U16S: usize = 155680;
+
+# bytes init allocates, in one allocation aligned for u16
+pub val SCRATCH: usize = 311360;
+
+def Phase: u8;
+val P_BODY: Phase = 0;
+val P_TAIL: Phase = 1;
+val P_DONE: Phase = 2;
+
+def Ran: u8;
+val R_BLOCK:   Ran = 0;
+val R_STARVED: Ran = 1;
+val R_DRAINED: Ran = 2;
+
+# every way compression can fail
+# ---
+# alloc:     init's allocation was refused, or compress_alloc's output vector
+#            could not grow; nothing survives
+# level:     the level is above MAX_LEVEL
+# container: the container is not RAW, ZLIB or GZIP
+# full:      dst cannot hold the whole stream (compress_into); the payload
+#            carries the committed counts
+# closed:    the encoder's scratch was released, or was never acquired
+# finished:  input after finish declared its end
+pub tag DeflateError: u8 {
+    alloc: A.Error;
+    level;
+    container;
+    full: I.Committed;
+    closed;
+    finished;
+}
+
+# streaming DEFLATE encoder state
+#
+# create with init, feed with compress, end with finish, release with dnit.
+# all fields are internal; the surface is the functions below.
+pub rec Deflater {
+    a:   *A.Allocator;
+    mem: *u16;
+
+    win:   *u8;
+    head:  *u16;
+    prev:  *u16;
+    tlit:  *u8;
+    tdist: *u16;
+    pend:  *u8;
+
+    level:     u8;
+    container: Container;
+    good:      usize;
+    lazy:      usize;
+    nice:      usize;
+    chain:     usize;
+    deferred:  bool;
+
+    strstart:    usize;
+    lookahead:   usize;
+    block_start: usize;
+    bend:        usize;
+    ntok:        usize;
+
+    match_len:   usize;
+    match_dist:  usize;
+    match_avail: bool;
+    found_dist:  usize;
+
+    lfreq: [286]u32;
+    dfreq: [30]u32;
+
+    bitbuf: u64;
+    bitcnt: u32;
+    pstart: usize;
+    plen:   usize;
+
+    phase: Phase;
+    check: u32;
+    total: u64;
+
+    lcode: [256]u8;
+    dcode: [512]u8;
+
+    fixed_lc: [288]u16;
+    fixed_ll: [288]u8;
+    fixed_dc: [30]u16;
+    fixed_dl: [30]u8;
+}
+
+# zlib's level table: good length, lazy (or insert) length, nice length, chain
+val CFG_GOOD:  [10]u16 = [10]u16{0, 4, 4, 4, 4, 8, 8, 8, 32, 32};
+val CFG_LAZY:  [10]u16 = [10]u16{0, 4, 5, 6, 4, 16, 16, 32, 128, 258};
+val CFG_NICE:  [10]u16 = [10]u16{0, 8, 16, 32, 16, 32, 128, 128, 258, 258};
+val CFG_CHAIN: [10]u16 = [10]u16{0, 4, 8, 32, 16, 32, 128, 256, 1024, 4096};
+
+# the most bytes a stream of src_len input bytes compresses to
+#
+# every block costs at most its stored form, five bytes over its input, and a
+# block holds at least TOKENS input bytes or ends at a window slide.
+# ---
+# src_len:   input length
+# container: framing the stream carries
+# ret:       an upper bound on the compressed length
+pub fun bound(src_len: usize, container: Container) usize {
+    var frame: usize = 0;
+    if (container == ZLIB) { frame = 6; }
+    if (container == GZIP) { frame = 18; }
+    ret src_len + (src_len >> 10) + 32 + frame;
+}
+
+# reverse the low n bits of v, since huffman codes go out most significant first
+fun reverse(v: u32, n: u32) u16 {
+    var r: u32 = 0;
+    var x: u32 = v;
+    var i: u32 = 0;
+    for (i < n) {
+        r = (r << 1) | (x & 1);
+        x = x >> 1;
+        i = i + 1;
+    }
+    ret r::u16;
+}
+
+# assign canonical codes to a list of code lengths, bit reversed for output
+fun gen_codes(lens: *u8, n: usize, codes: *u16) {
+    var count: [16]u32;
+    var i:     usize = 0;
+    for (i < n) {
+        count[lens[i]::usize] = count[lens[i]::usize] + 1;
+        i                     = i + 1;
+    }
+    count[0] = 0;
+
+    var next: [16]u32;
+    var code: u32   = 0;
+    var b:    usize = 1;
+    for (b <= F.MAX_BITS) {
+        code    = (code + count[b - 1]) << 1;
+        next[b] = code;
+        b       = b + 1;
+    }
+
+    i = 0;
+    for (i < n) {
+        val l: usize = lens[i]::usize;
+        if (l != 0) {
+            codes[i] = reverse(next[l], l::u32);
+            next[l]  = next[l] + 1;
+        }
+        or {
+            codes[i] = 0;
+        }
+        i = i + 1;
+    }
+}
+
+# in-place minimum redundancy code lengths (Moffat and Katajainen)
+#
+# a holds n weights in ascending order and is overwritten with the code length
+# of each position, the first position getting the longest.
+fun min_redundancy(a: *u32, n: usize) {
+    if (n == 0) { ret; }
+    if (n == 1) {
+        a[0] = 1;
+        ret;
+    }
+
+    a[0] = a[0] + a[1];
+    var root: usize = 0;
+    var leaf: usize = 2;
+    var next: usize = 1;
+    for (next < n - 1) {
+        if (leaf >= n || a[root] < a[leaf]) {
+            a[next] = a[root];
+            a[root] = next::u32;
+            root    = root + 1;
+        }
+        or {
+            a[next] = a[leaf];
+            leaf    = leaf + 1;
+        }
+        if (leaf >= n || (root < next && a[root] < a[leaf])) {
+            a[next] = a[next] + a[root];
+            a[root] = next::u32;
+            root    = root + 1;
+        }
+        or {
+            a[next] = a[next] + a[leaf];
+            leaf    = leaf + 1;
+        }
+        next = next + 1;
+    }
+
+    a[n - 2] = 0;
+    var k: i64 = n::i64 - 3;
+    for (k >= 0) {
+        a[k::usize] = a[a[k::usize]::usize] + 1;
+        k           = k - 1;
+    }
+
+    var avbl: i64 = 1;
+    var used: i64 = 0;
+    var dpth: u32 = 0;
+    var r:    i64 = n::i64 - 2;
+    var w:    i64 = n::i64 - 1;
+    for (avbl > 0) {
+        for (r >= 0 && a[r::usize] == dpth) {
+            used = used + 1;
+            r    = r - 1;
+        }
+        for (avbl > used) {
+            a[w::usize] = dpth;
+            w           = w - 1;
+            avbl        = avbl - 1;
+        }
+        avbl = 2 * used;
+        dpth = dpth + 1;
+        used = 0;
+    }
+}
+
+# build length-limited huffman code lengths for a frequency table
+#
+# symbols sort by frequency, ties by symbol, so the result depends on the
+# frequencies alone. fewer than two used symbols are padded with the lowest
+# unused ones, since a deflate code always needs two.
+# ---
+# freq:  frequency per symbol
+# n:     number of symbols, at most 288
+# limit: longest code allowed
+# out:   code length per symbol
+fun build_lengths(freq: *u32, n: usize, limit: usize, out: *u8) {
+    var syms: [288]u16;
+    var keys: [288]u32;
+    var used: usize = 0;
+
+    var i: usize = 0;
+    for (i < n) {
+        out[i] = 0;
+        if (freq[i] != 0) {
+            syms[used] = i::u16;
+            keys[used] = freq[i];
+            used       = used + 1;
+        }
+        i = i + 1;
+    }
+
+    i = 0;
+    for (used < 2 && i < n) {
+        if (freq[i] == 0) {
+            syms[used] = i::u16;
+            keys[used] = 1;
+            used       = used + 1;
+        }
+        i = i + 1;
+    }
+
+    # stable insertion sort by weight keeps symbol order within a weight
+    i = 1;
+    for (i < used) {
+        val ks: u32   = keys[i];
+        val ss: u16   = syms[i];
+        var j:  usize = i;
+        for (j > 0 && (keys[j - 1] > ks || (keys[j - 1] == ks && syms[j - 1] > ss))) {
+            keys[j] = keys[j - 1];
+            syms[j] = syms[j - 1];
+            j       = j - 1;
+        }
+        keys[j] = ks;
+        syms[j] = ss;
+        i       = i + 1;
+    }
+
+    min_redundancy(?keys[0], used);
+
+    var num: [16]u32;
+    i = 0;
+    for (i < used) {
+        var l: usize = keys[i]::usize;
+        if (l > limit) { l = limit; }
+        num[l] = num[l] + 1;
+        i      = i + 1;
+    }
+
+    # pull overlong codes back under the limit until the code is complete again
+    var total: u32   = 0;
+    var b:     usize = limit;
+    for (b > 0) {
+        total = total + (num[b] << (limit - b)::u32);
+        b     = b - 1;
+    }
+    val full: u32 = 1::u32 << limit::u32;
+    for (total != full) {
+        num[limit] = num[limit] - 1;
+        b          = limit - 1;
+        for (b > 0) {
+            if (num[b] != 0) {
+                num[b]     = num[b] - 1;
+                num[b + 1] = num[b + 1] + 2;
+                brk;
+            }
+            b = b - 1;
+        }
+        total = total - 1;
+    }
+
+    var j: usize = used;
+    b = 1;
+    for (b <= limit) {
+        var c: u32 = num[b];
+        for (c > 0) {
+            j                   = j - 1;
+            out[syms[j]::usize] = b::u8;
+            c                   = c - 1;
+        }
+        b = b + 1;
+    }
+}
+
+# append n bits of v to the pending output, least significant first
+fun put(z: *Deflater, v: u32, n: u32) {
+    z.bitbuf = z.bitbuf | (v::u64 << z.bitcnt::u64);
+    z.bitcnt = z.bitcnt + n;
+    if (z.bitcnt >= 32) {
+        val p: usize = z.plen;
+        z.pend[p]     = (z.bitbuf & 0xFF)::u8;
+        z.pend[p + 1] = ((z.bitbuf >> 8) & 0xFF)::u8;
+        z.pend[p + 2] = ((z.bitbuf >> 16) & 0xFF)::u8;
+        z.pend[p + 3] = ((z.bitbuf >> 24) & 0xFF)::u8;
+        z.plen        = p + 4;
+        z.bitbuf      = z.bitbuf >> 32;
+        z.bitcnt      = z.bitcnt - 32;
+    }
+}
+
+# write out every buffered bit, padding the last byte with zeros
+fun align(z: *Deflater) {
+    for (z.bitcnt > 0) {
+        z.pend[z.plen] = (z.bitbuf & 0xFF)::u8;
+        z.plen         = z.plen + 1;
+        z.bitbuf       = z.bitbuf >> 8;
+        if (z.bitcnt >= 8) { z.bitcnt = z.bitcnt - 8; }
+        or                 { z.bitcnt = 0; }
+    }
+}
+
+fun put_byte(z: *Deflater, b: u8) {
+    z.pend[z.plen] = b;
+    z.plen         = z.plen + 1;
+}
+
+fun dist_code(z: *Deflater, d: usize) usize {
+    if (d <= 256) { ret z.dcode[d - 1]::usize; }
+    ret z.dcode[256 + ((d - 1) >> 7)]::usize;
+}
+
+fun put_tokens(z: *Deflater, lc: *u16, ll: *u8, dc: *u16, dl: *u8) {
+    var i: usize = 0;
+    for (i < z.ntok) {
+        val d: usize = z.tdist[i]::usize;
+        val v: usize = z.tlit[i]::usize;
+        if (d == 0) {
+            put(z, lc[v]::u32, ll[v]::u32);
+        }
+        or {
+            val c:  usize = z.lcode[v]::usize;
+            val ls: usize = 257 + c;
+            put(z, lc[ls]::u32, ll[ls]::u32);
+            val le: u32 = F.LEN_EXTRA[c]::u32;
+            if (le != 0) { put(z, (v + 3 - F.LEN_BASE[c]::usize)::u32, le); }
+
+            val k: usize = dist_code(z, d);
+            put(z, dc[k]::u32, dl[k]::u32);
+            val de: u32 = F.DIST_EXTRA[k]::u32;
+            if (de != 0) { put(z, (d - F.DIST_BASE[k]::usize)::u32, de); }
+        }
+        i = i + 1;
+    }
+    put(z, lc[F.END_OF_BLOCK]::u32, ll[F.END_OF_BLOCK]::u32);
+}
+
+# run-length code the concatenated code lengths with symbols 16, 17 and 18
+# ---
+# ret: number of (symbol, extra) pairs written to sym and extra
+fun rle(lens: *u8, n: usize, sym: *u8, extra: *u8) usize {
+    var m: usize = 0;
+    var i: usize = 0;
+    for (i < n) {
+        val l:   u8    = lens[i];
+        var run: usize = 1;
+        for (i + run < n && lens[i + run] == l) { run = run + 1; }
+        i = i + run;
+
+        if (l == 0) {
+            for (run >= 11) {
+                var r: usize = run;
+                if (r > 138) { r = 138; }
+                sym[m]   = 18;
+                extra[m] = (r - 11)::u8;
+                m        = m + 1;
+                run      = run - r;
+            }
+            if (run >= 3) {
+                sym[m]   = 17;
+                extra[m] = (run - 3)::u8;
+                m        = m + 1;
+                run      = 0;
+            }
+        }
+        or {
+            sym[m]   = l;
+            extra[m] = 0;
+            m        = m + 1;
+            run      = run - 1;
+            for (run >= 3) {
+                var r: usize = run;
+                if (r > 6) { r = 6; }
+                sym[m]   = 16;
+                extra[m] = (r - 3)::u8;
+                m        = m + 1;
+                run      = run - r;
+            }
+        }
+        for (run > 0) {
+            sym[m]   = l;
+            extra[m] = 0;
+            m        = m + 1;
+            run      = run - 1;
+        }
+    }
+    ret m;
+}
+
+fun rle_extra_bits(s: u8) u32 {
+    if (s == 16) { ret 2; }
+    if (s == 17) { ret 3; }
+    if (s == 18) { ret 7; }
+    ret 0;
+}
+
+# write the tokens gathered since the last block as the smallest block form
+fun emit_block(z: *Deflater, last: bool) {
+    z.lfreq[F.END_OF_BLOCK] = 1;
+    val span: usize = z.bend - z.block_start;
+
+    var xbits: u64   = 0;
+    var c:     usize = 0;
+    for (c < 29) {
+        xbits = xbits + z.lfreq[257 + c]::u64 * F.LEN_EXTRA[c]::u64;
+        c     = c + 1;
+    }
+    c = 0;
+    for (c < 30) {
+        xbits = xbits + z.dfreq[c]::u64 * F.DIST_EXTRA[c]::u64;
+        c     = c + 1;
+    }
+
+    var fixed_bits: u64 = 3 + xbits;
+    c = 0;
+    for (c < 286) {
+        fixed_bits = fixed_bits + z.lfreq[c]::u64 * z.fixed_ll[c]::u64;
+        c          = c + 1;
+    }
+    c = 0;
+    for (c < 30) {
+        fixed_bits = fixed_bits + z.dfreq[c]::u64 * F.FIXED_DISTANCE_BITS::u64;
+        c          = c + 1;
+    }
+
+    var ll: [286]u8;
+    var dl: [30]u8;
+    build_lengths(?z.lfreq[0], 286, F.MAX_BITS, ?ll[0]);
+    build_lengths(?z.dfreq[0], 30, F.MAX_BITS, ?dl[0]);
+
+    var hlit: usize = 286;
+    for (hlit > 257 && ll[hlit - 1] == 0) { hlit = hlit - 1; }
+    var hdist: usize = 30;
+    for (hdist > 1 && dl[hdist - 1] == 0) { hdist = hdist - 1; }
+
+    var lens: [316]u8;
+    c = 0;
+    for (c < hlit) {
+        lens[c] = ll[c];
+        c       = c + 1;
+    }
+    c = 0;
+    for (c < hdist) {
+        lens[hlit + c] = dl[c];
+        c              = c + 1;
+    }
+
+    var rsym:   [316]u8;
+    var rextra: [316]u8;
+    val nrle:   usize = rle(?lens[0], hlit + hdist, ?rsym[0], ?rextra[0]);
+
+    var cfreq: [19]u32;
+    c = 0;
+    for (c < nrle) {
+        cfreq[rsym[c]::usize] = cfreq[rsym[c]::usize] + 1;
+        c                     = c + 1;
+    }
+    var cl: [19]u8;
+    build_lengths(?cfreq[0], 19, F.MAX_CLEN_BITS, ?cl[0]);
+
+    var hclen: usize = 19;
+    for (hclen > 4 && cl[F.CLEN_ORDER[hclen - 1]::usize] == 0) { hclen = hclen - 1; }
+
+    var dyn_bits: u64 = 3 + 14 + 3 * hclen::u64 + xbits;
+    c = 0;
+    for (c < nrle) {
+        dyn_bits = dyn_bits + cl[rsym[c]::usize]::u64 + rle_extra_bits(rsym[c])::u64;
+        c        = c + 1;
+    }
+    c = 0;
+    for (c < 286) {
+        dyn_bits = dyn_bits + z.lfreq[c]::u64 * ll[c]::u64;
+        c        = c + 1;
+    }
+    c = 0;
+    for (c < 30) {
+        dyn_bits = dyn_bits + z.dfreq[c]::u64 * dl[c]::u64;
+        c        = c + 1;
+    }
+
+    val pad:         u64 = ((8 - ((z.bitcnt + 3) % 8)) % 8)::u64;
+    val stored_bits: u64 = 3 + pad + 32 + 8 * span::u64;
+
+    var best: u64 = fixed_bits;
+    if (dyn_bits < best) { best = dyn_bits; }
+
+    if (z.level == 0 || stored_bits <= best) {
+        put(z, last::u32, 1);
+        put(z, 0, 2);
+        align(z);
+        put_byte(z, (span & 0xFF)::u8);
+        put_byte(z, ((span >> 8) & 0xFF)::u8);
+        put_byte(z, (~span & 0xFF)::u8);
+        put_byte(z, ((~span >> 8) & 0xFF)::u8);
+        memory.raw_copy((?z.pend[z.plen])::ptr, (?z.win[z.block_start])::ptr, span);
+        z.plen = z.plen + span;
+    }
+    or (dyn_bits < fixed_bits) {
+        var lc: [286]u16;
+        var dc: [30]u16;
+        var cc: [19]u16;
+        gen_codes(?ll[0], 286, ?lc[0]);
+        gen_codes(?dl[0], 30, ?dc[0]);
+        gen_codes(?cl[0], 19, ?cc[0]);
+
+        put(z, last::u32, 1);
+        put(z, 2, 2);
+        put(z, (hlit - 257)::u32, 5);
+        put(z, (hdist - 1)::u32, 5);
+        put(z, (hclen - 4)::u32, 4);
+        c = 0;
+        for (c < hclen) {
+            put(z, cl[F.CLEN_ORDER[c]::usize]::u32, 3);
+            c = c + 1;
+        }
+        c = 0;
+        for (c < nrle) {
+            val s: usize = rsym[c]::usize;
+            put(z, cc[s]::u32, cl[s]::u32);
+            val e: u32 = rle_extra_bits(rsym[c]);
+            if (e != 0) { put(z, rextra[c]::u32, e); }
+            c = c + 1;
+        }
+        put_tokens(z, ?lc[0], ?ll[0], ?dc[0], ?dl[0]);
+    }
+    or {
+        put(z, last::u32, 1);
+        put(z, 1, 2);
+        put_tokens(z, ?z.fixed_lc[0], ?z.fixed_ll[0], ?z.fixed_dc[0], ?z.fixed_dl[0]);
+    }
+
+    c = 0;
+    for (c < 286) {
+        z.lfreq[c] = 0;
+        c          = c + 1;
+    }
+    c = 0;
+    for (c < 30) {
+        z.dfreq[c] = 0;
+        c          = c + 1;
+    }
+    z.ntok        = 0;
+    z.block_start = z.bend;
+}
+
+fun tally_literal(z: *Deflater, pos: usize) {
+    val b: u8 = z.win[pos];
+    z.tlit[z.ntok]    = b;
+    z.tdist[z.ntok]   = 0;
+    z.ntok            = z.ntok + 1;
+    z.lfreq[b::usize] = z.lfreq[b::usize] + 1;
+    z.bend            = pos + 1;
+}
+
+fun tally_match(z: *Deflater, pos: usize, len: usize, dist: usize) {
+    z.tlit[z.ntok]  = (len - 3)::u8;
+    z.tdist[z.ntok] = dist::u16;
+    z.ntok          = z.ntok + 1;
+
+    val ls: usize = 257 + z.lcode[len - 3]::usize;
+    z.lfreq[ls] = z.lfreq[ls] + 1;
+    val k: usize = dist_code(z, dist);
+    z.dfreq[k] = z.dfreq[k] + 1;
+    z.bend     = pos + len;
+}
+
+# link position p into its hash chain and return the previous head
+fun insert(z: *Deflater, p: usize) usize {
+    val key: u32   = z.win[p]::u32 | (z.win[p + 1]::u32 << 8) | (z.win[p + 2]::u32 << 16);
+    val h:   usize = ((key * 0x9E3779B1) >> HASH_SHIFT)::usize;
+    val old: usize = z.head[h]::usize;
+    z.prev[p & WMASK] = old::u16;
+    z.head[h]         = p::u16;
+    ret old;
+}
+
+# walk the hash chain from cur for the longest match at strstart
+#
+# a match no longer than prev_len is not worth reporting, so prev_len is
+# returned unchanged when nothing beats it; found_dist holds the distance of
+# any longer match.
+fun longest_match(z: *Deflater, start: usize, prev_len: usize) usize {
+    var chain: usize = z.chain;
+    if (prev_len >= z.good) { chain = chain >> 2; }
+
+    var maxlen: usize = F.MAX_MATCH;
+    if (maxlen > z.lookahead) { maxlen = z.lookahead; }
+    var nice: usize = z.nice;
+    if (nice > maxlen) { nice = maxlen; }
+
+    var best: usize = prev_len;
+    if (best >= maxlen) { ret best; }
+
+    val scan:  usize = z.strstart;
+    var limit: usize = 0;
+    if (scan > MAX_DIST) { limit = scan - MAX_DIST; }
+
+    val win: *u8   = z.win;
+    var cur: usize = start;
+    for {
+        if (win[cur + best] == win[scan + best] && win[cur] == win[scan]
+            && win[cur + 1] == win[scan + 1] && win[cur + best - 1] == win[scan + best - 1]) {
+            var len: usize = 2;
+            for (len < maxlen && win[cur + len] == win[scan + len]) { len = len + 1; }
+            if (len > best) {
+                best         = len;
+                z.found_dist = scan - cur;
+                if (len >= nice) { brk; }
+            }
+        }
+        cur = z.prev[cur & WMASK]::usize;
+        if (cur <= limit) { brk; }
+        chain = chain - 1;
+        if (chain == 0) { brk; }
+    }
+    ret best;
+}
+
+# move the upper half of the window down and rebase every position into it
+fun slide(z: *Deflater) {
+    memory.raw_copy(z.win::ptr, (?z.win[W])::ptr, W);
+    var i: usize = 0;
+    for (i < HASH_SIZE) {
+        val v: usize = z.head[i]::usize;
+        if (v >= W) { z.head[i] = (v - W)::u16; }
+        or          { z.head[i] = 0; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < W) {
+        val v: usize = z.prev[i]::usize;
+        if (v >= W) { z.prev[i] = (v - W)::u16; }
+        or          { z.prev[i] = 0; }
+        i = i + 1;
+    }
+    z.strstart    = z.strstart - W;
+    z.block_start = z.block_start - W;
+    z.bend        = z.bend - W;
+}
+
+# one greedy step at strstart
+fun step_greedy(z: *Deflater) {
+    var head: usize = 0;
+    if (z.lookahead >= F.MIN_MATCH) { head = insert(z, z.strstart); }
+
+    var len: usize = 0;
+    if (head != 0 && z.strstart - head <= MAX_DIST) { len = longest_match(z, head, F.MIN_MATCH - 1); }
+
+    if (len >= F.MIN_MATCH) {
+        tally_match(z, z.strstart, len, z.found_dist);
+        z.lookahead = z.lookahead - len;
+        if (len <= z.lazy && z.lookahead >= F.MIN_MATCH) {
+            var k: usize = 1;
+            for (k < len) {
+                insert(z, z.strstart + k);
+                k = k + 1;
+            }
+        }
+        z.strstart = z.strstart + len;
+        ret;
+    }
+
+    tally_literal(z, z.strstart);
+    z.strstart  = z.strstart + 1;
+    z.lookahead = z.lookahead - 1;
+}
+
+# one lazy step at strstart: keep the match found one byte back unless this
+# position starts a longer one
+fun step_lazy(z: *Deflater) {
+    var head: usize = 0;
+    if (z.lookahead >= F.MIN_MATCH) { head = insert(z, z.strstart); }
+
+    val prev_len:  usize = z.match_len;
+    val prev_dist: usize = z.match_dist;
+    z.match_len = F.MIN_MATCH - 1;
+
+    if (head != 0 && prev_len < z.lazy && z.strstart - head <= MAX_DIST) {
+        val len: usize = longest_match(z, head, prev_len);
+        if (len > prev_len) {
+            z.match_len  = len;
+            z.match_dist = z.found_dist;
+            if (len == F.MIN_MATCH && z.match_dist > TOO_FAR) { z.match_len = F.MIN_MATCH - 1; }
+        }
+    }
+
+    if (prev_len >= F.MIN_MATCH && z.match_len <= prev_len) {
+        val end: usize = z.strstart + z.lookahead;
+        tally_match(z, z.strstart - 1, prev_len, prev_dist);
+        var p:    usize = z.strstart + 1;
+        val stop: usize = z.strstart - 1 + prev_len;
+        for (p < stop) {
+            if (p + F.MIN_MATCH <= end) { insert(z, p); }
+            p = p + 1;
+        }
+        z.lookahead   = z.lookahead - (prev_len - 1);
+        z.strstart    = stop;
+        z.match_avail = false;
+        z.match_len   = F.MIN_MATCH - 1;
+        ret;
+    }
+
+    if (z.match_avail) { tally_literal(z, z.strstart - 1); }
+    z.match_avail = true;
+    z.strstart    = z.strstart + 1;
+    z.lookahead   = z.lookahead - 1;
+}
+
+# advance over the window until a block is ready, input runs short, or (when
+# flushing) the input is exhausted
+fun run(z: *Deflater, flush: bool) Ran {
+    for {
+        if (z.ntok == TOKENS) {
+            emit_block(z, false);
+            ret R_BLOCK;
+        }
+        if (z.strstart >= SLIDE_AT) {
+            var cut: bool = false;
+            if (z.bend > z.block_start) {
+                emit_block(z, false);
+                cut = true;
+            }
+            slide(z);
+            if (cut) { ret R_BLOCK; }
+        }
+
+        if (z.level == 0) {
+            if (z.lookahead == 0) {
+                if (flush) { ret R_DRAINED; }
+                ret R_STARVED;
+            }
+            var adv: usize = z.lookahead;
+            if (adv > SLIDE_AT - z.strstart) { adv = SLIDE_AT - z.strstart; }
+            z.strstart  = z.strstart + adv;
+            z.lookahead = z.lookahead - adv;
+            z.bend      = z.strstart;
+            cnt;
+        }
+
+        if (z.lookahead < MIN_LOOKAHEAD && !flush) { ret R_STARVED; }
+        if (z.lookahead == 0) {
+            if (z.match_avail) {
+                tally_literal(z, z.strstart - 1);
+                z.match_avail = false;
+                cnt;
+            }
+            ret R_DRAINED;
+        }
+
+        if (z.deferred) { step_lazy(z); }
+        or              { step_greedy(z); }
+    }
+}
+
+# copy as much of src into the window as fits, folding it into the checksum
+fun fill(z: *Deflater, src: *u8, src_len: usize) usize {
+    var room: usize = 2 * W - (z.strstart + z.lookahead);
+    if (room > src_len) { room = src_len; }
+    if (room == 0)      { ret 0; }
+
+    memory.raw_copy((?z.win[z.strstart + z.lookahead])::ptr, src::ptr, room);
+    if (z.container == ZLIB) { z.check = adler32.update(z.check, src, room); }
+    if (z.container == GZIP) { z.check = crc32.update(z.check, src, room); }
+    z.total     = z.total + room::u64;
+    z.lookahead = z.lookahead + room;
+    ret room;
+}
+
+# copy pending output to dst
+fun drain(z: *Deflater, dst: *u8, dst_len: usize) usize {
+    var n: usize = z.plen - z.pstart;
+    if (n > dst_len) { n = dst_len; }
+    memory.raw_copy(dst::ptr, (?z.pend[z.pstart])::ptr, n);
+    z.pstart = z.pstart + n;
+    if (z.pstart == z.plen) {
+        z.pstart = 0;
+        z.plen   = 0;
+    }
+    ret n;
+}
+
+fun header(z: *Deflater) {
+    if (z.container == ZLIB) {
+        var flevel: u32 = 2;
+        if (z.level < 2) { flevel = 0; }
+        or (z.level < 6) { flevel = 1; }
+        or (z.level > 6) { flevel = 3; }
+        var flg: u32 = flevel << 6;
+        flg = flg + 31 - ((0x78 * 256 + flg) % 31);
+        put_byte(z, 0x78);
+        put_byte(z, flg::u8);
+    }
+    if (z.container == GZIP) {
+        var xfl: u8 = 0;
+        if (z.level == 9) { xfl = 2; }
+        if (z.level == 1) { xfl = 4; }
+        put_byte(z, 0x1F);
+        put_byte(z, 0x8B);
+        put_byte(z, 8);
+        put_byte(z, 0);
+        put_byte(z, 0);
+        put_byte(z, 0);
+        put_byte(z, 0);
+        put_byte(z, 0);
+        put_byte(z, xfl);
+        put_byte(z, 255);
+    }
+}
+
+fun trailer(z: *Deflater) {
+    if (z.container == ZLIB) {
+        put_byte(z, ((z.check >> 24) & 0xFF)::u8);
+        put_byte(z, ((z.check >> 16) & 0xFF)::u8);
+        put_byte(z, ((z.check >> 8) & 0xFF)::u8);
+        put_byte(z, (z.check & 0xFF)::u8);
+    }
+    if (z.container == GZIP) {
+        val crc:  u32 = crc32.final(z.check);
+        val size: u32 = (z.total & 0xFFFFFFFF)::u32;
+        put_byte(z, (crc & 0xFF)::u8);
+        put_byte(z, ((crc >> 8) & 0xFF)::u8);
+        put_byte(z, ((crc >> 16) & 0xFF)::u8);
+        put_byte(z, ((crc >> 24) & 0xFF)::u8);
+        put_byte(z, (size & 0xFF)::u8);
+        put_byte(z, ((size >> 8) & 0xFF)::u8);
+        put_byte(z, ((size >> 16) & 0xFF)::u8);
+        put_byte(z, ((size >> 24) & 0xFF)::u8);
+    }
+}
+
+fun progress(st: I.Status, consumed: usize, written: usize) res[I.Progress, DeflateError] {
+    var p: I.Progress;
+    p.status   = st;
+    p.consumed = consumed;
+    p.written  = written;
+    ret res[I.Progress, DeflateError].ok{p};
+}
+
+# restart the encoder on a new stream, keeping its scratch, level and container
+# ---
+# z: encoder to reset
+pub fun reset(z: *Deflater) {
+    if (z.mem == nil) { ret; }
+
+    memory.zero[u16](z.head, HASH_SIZE);
+    var i: usize = 0;
+    for (i < 286) {
+        z.lfreq[i] = 0;
+        i          = i + 1;
+    }
+    i = 0;
+    for (i < 30) {
+        z.dfreq[i] = 0;
+        i          = i + 1;
+    }
+
+    z.strstart    = 0;
+    z.lookahead   = 0;
+    z.block_start = 0;
+    z.bend        = 0;
+    z.ntok        = 0;
+    z.match_len   = F.MIN_MATCH - 1;
+    z.match_dist  = 0;
+    z.match_avail = false;
+    z.found_dist  = 0;
+    z.bitbuf      = 0;
+    z.bitcnt      = 0;
+    z.pstart      = 0;
+    z.plen        = 0;
+    z.phase       = P_BODY;
+    z.total       = 0;
+    z.check       = 0;
+    if (z.container == ZLIB) { z.check = adler32.init(); }
+    if (z.container == GZIP) { z.check = crc32.init(); }
+
+    header(z);
+}
+
+# fill the fixed length and distance lookup tables and the fixed code
+fun tables(z: *Deflater) {
+    var c: usize = 0;
+    for (c < 29) {
+        var l:   usize = F.LEN_BASE[c]::usize;
+        val end: usize = l + (1::usize << F.LEN_EXTRA[c]::usize);
+        for (l < end && l <= F.MAX_MATCH) {
+            z.lcode[l - 3] = c::u8;
+            l              = l + 1;
+        }
+        c = c + 1;
+    }
+
+    c = 0;
+    for (c < 30) {
+        var d:   usize = F.DIST_BASE[c]::usize;
+        val end: usize = d + (1::usize << F.DIST_EXTRA[c]::usize);
+        for (d < end) {
+            if (d <= 256) { z.dcode[d - 1] = c::u8; }
+            or            { z.dcode[256 + ((d - 1) >> 7)] = c::u8; }
+            d = d + 1;
+        }
+        c = c + 1;
+    }
+
+    c = 0;
+    for (c < 288) {
+        z.fixed_ll[c] = F.fixed_literal_bits(c);
+        c             = c + 1;
+    }
+    gen_codes(?z.fixed_ll[0], 288, ?z.fixed_lc[0]);
+    c = 0;
+    for (c < 30) {
+        z.fixed_dl[c] = F.FIXED_DISTANCE_BITS;
+        c             = c + 1;
+    }
+    gen_codes(?z.fixed_dl[0], 30, ?z.fixed_dc[0]);
+}
+
+# create an encoder, allocating its SCRATCH bytes from a
+# ---
+# a:         allocator used for the scratch and nothing else
+# level:     MIN_LEVEL to MAX_LEVEL, DEFAULT_LEVEL when in doubt
+# container: RAW, ZLIB or GZIP
+# ret:       a ready encoder, or the bad argument or the allocator's refusal
+pub fun init(a: *A.Allocator, level: u8, container: Container) res[Deflater, DeflateError] {
+    if (level > MAX_LEVEL) { ret res[Deflater, DeflateError].err{DeflateError.level{}}; }
+    if (container > GZIP)  { ret res[Deflater, DeflateError].err{DeflateError.container{}}; }
+
+    val mem: res[*u16, A.Error] = A.allocate[u16](a, U16S);
+    if (sel mem.err) { ret res[Deflater, DeflateError].err{DeflateError.alloc{mem.err}}; }
+
+    var z: Deflater;
+    z.a     = a;
+    z.mem   = mem.ok;
+    z.head  = z.mem;
+    z.prev  = ?z.mem[HASH_SIZE];
+    z.tdist = ?z.mem[HASH_SIZE + W];
+    val bytes: *u8 = (?z.mem[HASH_SIZE + W + TOKENS])::*u8;
+    z.win  = bytes;
+    z.tlit = ?bytes[2 * W];
+    z.pend = ?bytes[2 * W + TOKENS];
+
+    z.level     = level;
+    z.container = container;
+    z.good      = CFG_GOOD[level::usize]::usize;
+    z.lazy      = CFG_LAZY[level::usize]::usize;
+    z.nice      = CFG_NICE[level::usize]::usize;
+    z.chain     = CFG_CHAIN[level::usize]::usize;
+    z.deferred  = level >= 4;
+
+    tables(?z);
+    reset(?z);
+    ret res[Deflater, DeflateError].ok{z};
+}
+
+# release the scratch
+#
+# an encoder that holds no scratch is already released. a refused release
+# leaves the encoder owning its scratch.
+# ---
+# z:   encoder to deinitialize
+# ret: ok, or the allocator's refusal
+pub fun dnit(z: *Deflater) err[A.Error] {
+    if (z.mem == nil) { ret err[A.Error].ok{}; }
+
+    val freed: err[A.Error] = A.deallocate[u16](z.a, z.mem, U16S);
+    if (sel freed.err) { ret freed; }
+    z.mem = nil;
+    ret err[A.Error].ok{};
+}
+
+# check whether the whole stream, trailer included, has been written out
+# ---
+# z:   encoder to query
+# ret: true once finish has returned DONE
+pub fun is_done(z: *Deflater) bool {
+    ret z.phase == P_DONE && z.plen == 0;
+}
+
+# compress as much of src as dst allows
+#
+# returns NEED_INPUT once every byte of src is taken (some may wait in the
+# window for more input before they are encoded), or OUTPUT_FULL when dst
+# fills first. advance src by consumed and dst by written, then call again.
+# ---
+# z:       encoder created by init
+# src:     next chunk of input
+# src_len: length of that chunk
+# dst:     where compressed bytes go
+# dst_len: space available at dst
+# ret:     what the call accomplished, or closed, or finished after finish
+pub fun compress(z: *Deflater, src: *u8, src_len: usize, dst: *u8, dst_len: usize) res[I.Progress, DeflateError] {
+    if (z.mem == nil)      { ret res[I.Progress, DeflateError].err{DeflateError.closed{}}; }
+    if (z.phase != P_BODY) { ret res[I.Progress, DeflateError].err{DeflateError.finished{}}; }
+
+    var consumed: usize = 0;
+    var written:  usize = 0;
+    for {
+        written = written + drain(z, ?dst[written], dst_len - written);
+        if (z.plen != 0) { ret progress(I.OUTPUT_FULL, consumed, written); }
+
+        consumed = consumed + fill(z, ?src[consumed], src_len - consumed);
+        if (run(z, false) == R_BLOCK) { cnt; }
+        if (consumed == src_len)      { ret progress(I.NEED_INPUT, consumed, written); }
+    }
+}
+
+# declare the end of input and write out the rest of the stream
+#
+# repeat with more output space while it returns OUTPUT_FULL. DONE means the
+# final block and the trailer are all in dst, and is idempotent; compress is
+# refused from the first call until reset.
+# ---
+# z:       encoder created by init
+# dst:     where compressed bytes go
+# dst_len: space available at dst
+# ret:     what the call accomplished, or closed
+pub fun finish(z: *Deflater, dst: *u8, dst_len: usize) res[I.Progress, DeflateError] {
+    if (z.mem == nil)      { ret res[I.Progress, DeflateError].err{DeflateError.closed{}}; }
+    if (z.phase == P_BODY) { z.phase = P_TAIL; }
+
+    var written: usize = 0;
+    for {
+        written = written + drain(z, ?dst[written], dst_len - written);
+        if (z.plen != 0)       { ret progress(I.OUTPUT_FULL, 0, written); }
+        if (z.phase == P_DONE) { ret progress(I.DONE, 0, written); }
+
+        if (run(z, true) == R_BLOCK) { cnt; }
+        emit_block(z, true);
+        align(z);
+        trailer(z);
+        z.phase = P_DONE;
+    }
+}
+
+fun drive(z: *Deflater, src: *u8, src_len: usize, dst: *u8, dst_len: usize) res[usize, DeflateError] {
+    var in_off:  usize = 0;
+    var out_off: usize = 0;
+
+    for (!is_done(z)) {
+        var r: res[I.Progress, DeflateError];
+        if (in_off == src_len) { r = finish(z, ?dst[out_off], dst_len - out_off); }
+        or                     { r = compress(z, ?src[in_off], src_len - in_off, ?dst[out_off], dst_len - out_off); }
+        if (sel r.err)         { ret res[usize, DeflateError].err{r.err}; }
+
+        val p: I.Progress = r.ok;
+        in_off  = in_off + p.consumed;
+        out_off = out_off + p.written;
+
+        if (p.status == I.OUTPUT_FULL) {
+            ret res[usize, DeflateError].err{DeflateError.full{I.Committed{consumed: in_off, written: out_off}}};
+        }
+    }
+
+    ret res[usize, DeflateError].ok{out_off};
+}
+
+# compress a whole input into a caller-provided buffer
+#
+# a dst of bound(src_len, container) bytes always suffices.
+# ---
+# a:         allocator for the encoder's scratch
+# level:     MIN_LEVEL to MAX_LEVEL
+# container: RAW, ZLIB or GZIP
+# src:       the complete input
+# src_len:   length of that input
+# dst:       where compressed bytes go
+# dst_len:   space available at dst
+# ret:       bytes written, or the failure; full carries the counts committed
+#            over the whole call
+pub fun compress_into(a: *A.Allocator, level: u8, container: Container, src: *u8, src_len: usize, dst: *u8, dst_len: usize) res[usize, DeflateError] {
+    val ri: res[Deflater, DeflateError] = init(a, level, container);
+    if (sel ri.err) { ret res[usize, DeflateError].err{ri.err}; }
+
+    var z:   Deflater                 = ri.ok;
+    val out: res[usize, DeflateError] = drive(?z, src, src_len, dst, dst_len);
+    dnit(?z);
+
+    ret out;
+}
+
+fun grow(z: *Deflater, out: *V.Vector[u8], src: *u8, src_len: usize) res[usize, DeflateError] {
+    var in_off: usize = 0;
+
+    for (!is_done(z)) {
+        if (out.len == out.cap) {
+            var next: usize = out.cap * 2;
+            if (out.cap != 0 && next <= out.cap) {
+                ret res[usize, DeflateError].err{DeflateError.alloc{A.Error.overflow{}}};
+            }
+            if (next < 4096) { next = 4096; }
+            val e: res[usize, A.Error] = V.ensure[u8](out, next);
+            if (sel e.err) { ret res[usize, DeflateError].err{DeflateError.alloc{e.err}}; }
+        }
+
+        var r: res[I.Progress, DeflateError];
+        if (in_off == src_len) { r = finish(z, ?out.data[out.len], out.cap - out.len); }
+        or                     { r = compress(z, ?src[in_off], src_len - in_off, ?out.data[out.len], out.cap - out.len); }
+        if (sel r.err)         { ret res[usize, DeflateError].err{r.err}; }
+
+        val p: I.Progress = r.ok;
+        in_off  = in_off + p.consumed;
+        out.len = out.len + p.written;
+    }
+
+    ret res[usize, DeflateError].ok{out.len};
+}
+
+# compress a whole input into a vector that grows as needed
+# ---
+# a:         allocator for the encoder's scratch and the output vector
+# level:     MIN_LEVEL to MAX_LEVEL
+# container: RAW, ZLIB or GZIP
+# src:       the complete input
+# src_len:   length of that input
+# ret:       a vector owning the compressed bytes, which the caller must dnit,
+#            or the failure; on failure the vector is already released
+pub fun compress_alloc(a: *A.Allocator, level: u8, container: Container, src: *u8, src_len: usize) res[V.Vector[u8], DeflateError] {
+    val ri: res[Deflater, DeflateError] = init(a, level, container);
+    if (sel ri.err) { ret res[V.Vector[u8], DeflateError].err{ri.err}; }
+
+    var z:   Deflater     = ri.ok;
+    var out: V.Vector[u8] = V.init[u8](a);
+
+    val grown: res[usize, DeflateError] = grow(?z, ?out, src, src_len);
+    dnit(?z);
+
+    if (sel grown.err) {
+        V.dnit[u8](?out);
+        ret res[V.Vector[u8], DeflateError].err{grown.err};
+    }
+
+    ret res[V.Vector[u8], DeflateError].ok{out};
+}
+
+$if (capability.HOSTED) {
+    #[testing]
+    val CORPUS_LEN: usize = 200000;
+
+    #[testing]
+    var corpus: [200000]u8;
+
+    #[testing]
+    var packed: [204000]u8;
+
+    #[testing]
+    var unpacked: [200000]u8;
+
+    #[testing]
+    var chunked: [204000]u8;
+
+    #[testing]
+    val WORDS: [16]*u8 = [16]*u8{
+        "the ", "deflate ", "window ", "slides ", "over ", "a ", "stream ", "of ",
+        "bytes ", "and ", "every ", "match ", "points ", "back,\n", "huffman ", "codes "
+    };
+
+    #[testing]
+    fun xorshift(s: *u32) u32 {
+        var x: u32 = @s;
+        x  = x ^ (x << 13);
+        x  = x ^ (x >> 17);
+        x  = x ^ (x << 5);
+        @s = x;
+        ret x;
+    }
+
+    # the corpus kinds, each filling n bytes of corpus deterministically
+    #[testing]
+    fun make_corpus(kind: u8, n: usize) {
+        var s: u32   = 2463534242;
+        var i: usize = 0;
+        if (kind == 0) {
+            # text from a small vocabulary: dense, short and medium matches
+            for (i < n) {
+                val w: *u8   = WORDS[(xorshift(?s) >> 7) & 15];
+                var k: usize = 0;
+                for (w[k] != 0 && i < n) {
+                    corpus[i] = w[k];
+                    i         = i + 1;
+                    k         = k + 1;
+                }
+            }
+            ret;
+        }
+        for (i < n) {
+            if (kind == 1) { corpus[i] = (xorshift(?s) >> 11)::u8; }
+            or (kind == 2) { corpus[i] = 0; }
+            or             { corpus[i] = "abcdefghij-0123456789"[i % 21]; }
+            i = i + 1;
+        }
+    }
+
+    # compress, check the bound, inflate with the existing decoder and compare
+    #[testing]
+    fun round_trip(level: u8, n: usize) i32 {
+        var a: A.Allocator;
+        page.make(?a);
+
+        val c: res[usize, DeflateError] = compress_into(?a, level, RAW, ?corpus[0], n, ?packed[0], bound(n, RAW));
+        if (sel c.err) { ret 1; }
+
+        val d: res[usize, I.InflateError] = I.decompress_into(?a, ?packed[0], c.ok, ?unpacked[0], CORPUS_LEN);
+        if (sel d.err) { ret 2; }
+        if (d.ok != n) { ret 3; }
+
+        var i: usize = 0;
+        for (i < n) {
+            if (unpacked[i] != corpus[i]) { ret 4; }
+            i = i + 1;
+        }
+        ret 0;
+    }
+
+    test deflate__round_trips_through_inflate_at_every_level {
+        var level: u8 = 0;
+        for (level <= MAX_LEVEL) {
+            make_corpus(0, 0);
+            if (round_trip(level, 0) != 0) { ret 1; }
+            make_corpus(0, 1);
+            if (round_trip(level, 1) != 0) { ret 2; }
+            make_corpus(3, 64);
+            if (round_trip(level, 64) != 0) { ret 3; }
+            make_corpus(1, 70000);
+            if (round_trip(level, 70000) != 0) { ret 4; }
+            make_corpus(2, CORPUS_LEN);
+            if (round_trip(level, CORPUS_LEN) != 0) { ret 5; }
+            make_corpus(3, 100000);
+            if (round_trip(level, 100000) != 0) { ret 6; }
+            make_corpus(0, CORPUS_LEN);
+            if (round_trip(level, CORPUS_LEN) != 0) { ret 7; }
+            level = level + 1;
+        }
+        ret 0;
+    }
+
+    # feed the encoder in awkward pieces and drain it as awkwardly
+    #[testing]
+    fun stream(level: u8, n: usize, in_chunk: usize, out_chunk: usize) res[usize, DeflateError] {
+        var a: A.Allocator;
+        page.make(?a);
+
+        val ri: res[Deflater, DeflateError] = init(?a, level, RAW);
+        if (sel ri.err) { ret res[usize, DeflateError].err{ri.err}; }
+        var z: Deflater = ri.ok;
+
+        var in_off:  usize = 0;
+        var out_off: usize = 0;
+        for (!is_done(?z)) {
+            var room: usize = out_chunk;
+            if (out_off + room > 204000) { room = 204000 - out_off; }
+
+            var r: res[I.Progress, DeflateError];
+            if (in_off == n) { r = finish(?z, ?chunked[out_off], room); }
+            or {
+                var feed: usize = in_chunk;
+                if (in_off + feed > n) { feed = n - in_off; }
+                r = compress(?z, ?corpus[in_off], feed, ?chunked[out_off], room);
+            }
+            if (sel r.err) {
+                dnit(?z);
+                ret res[usize, DeflateError].err{r.err};
+            }
+            in_off  = in_off + r.ok.consumed;
+            out_off = out_off + r.ok.written;
+        }
+        dnit(?z);
+        ret res[usize, DeflateError].ok{out_off};
+    }
+
+    # the output is a function of the input and level, not of the chunking
+    test deflate__output_does_not_depend_on_how_input_is_fed {
+        var a: A.Allocator;
+        page.make(?a);
+        make_corpus(0, 150000);
+
+        val levels: [4]u8 = [4]u8{0, 1, 6, 9};
+        var li:     usize = 0;
+        for (li < 4) {
+            val whole: res[usize, DeflateError] = compress_into(?a, levels[li], RAW, ?corpus[0], 150000, ?packed[0], 204000);
+            if (sel whole.err) { ret 1; }
+
+            val pieces: [3]usize = [3]usize{1, 7, 4093};
+            var pi:     usize    = 0;
+            for (pi < 3) {
+                val s: res[usize, DeflateError] = stream(levels[li], 150000, pieces[pi], pieces[2 - pi]);
+                if (sel s.err)        { ret 2; }
+                if (s.ok != whole.ok) { ret 3; }
+                var i: usize = 0;
+                for (i < s.ok) {
+                    if (chunked[i] != packed[i]) { ret 4; }
+                    i = i + 1;
+                }
+                pi = pi + 1;
+            }
+            li = li + 1;
+        }
+        ret 0;
+    }
+
+    # the compressed corpus is pinned per level, so every host must agree on it
+    test deflate__output_is_pinned_on_every_host {
+        var a: A.Allocator;
+        page.make(?a);
+        make_corpus(0, CORPUS_LEN);
+
+        val levels: [5]u8    = [5]u8{0, 1, 4, 6, 9};
+        val sizes:  [5]usize = [5]usize{200030, 43977, 36628, 31378, 29598};
+        val sums:   [5]u32   = [5]u32{0x21FC1F6F, 0xB5284324, 0xEC3E246F, 0x7D550CC2, 0xFF61ADA7};
+        var li:     usize    = 0;
+        for (li < 5) {
+            val c: res[usize, DeflateError] = compress_into(?a, levels[li], RAW, ?corpus[0], CORPUS_LEN, ?packed[0], 204000);
+            if (sel c.err) { ret 1; }
+            val sum: u32 = crc32.hash(?packed[0], c.ok);
+            if (c.ok != sizes[li]) { ret 2; }
+            if (sum != sums[li])   { ret 3; }
+            li = li + 1;
+        }
+        ret 0;
+    }
+
+    # incompressible input fills bound and no more; a byte less is full
+    test deflate__bound_holds_and_a_short_buffer_is_full {
+        var a: A.Allocator;
+        page.make(?a);
+        make_corpus(1, CORPUS_LEN);
+
+        val levels: [3]u8 = [3]u8{0, 1, 9};
+        var li:     usize = 0;
+        for (li < 3) {
+            val c: res[usize, DeflateError] = compress_into(?a, levels[li], ZLIB, ?corpus[0], CORPUS_LEN, ?packed[0], bound(CORPUS_LEN, ZLIB));
+            if (sel c.err) { ret 1; }
+
+            val short: res[usize, DeflateError] = compress_into(?a, levels[li], ZLIB, ?corpus[0], CORPUS_LEN, ?packed[0], c.ok - 1);
+            if (!sel short.err)                     { ret 3; }
+            if (!sel short.err.full)                { ret 4; }
+            if (short.err.full.written != c.ok - 1) { ret 5; }
+            li = li + 1;
+        }
+        ret 0;
+    }
+
+    test deflate__lifecycle_and_argument_errors {
+        var a: A.Allocator;
+        page.make(?a);
+
+        val bad_level: res[Deflater, DeflateError] = init(?a, 10, RAW);
+        if (!sel bad_level.err)       { ret 1; }
+        if (!sel bad_level.err.level) { ret 1; }
+        val bad_frame: res[Deflater, DeflateError] = init(?a, 6, 3);
+        if (!sel bad_frame.err)           { ret 2; }
+        if (!sel bad_frame.err.container) { ret 2; }
+
+        val ri: res[Deflater, DeflateError] = init(?a, 6, GZIP);
+        if (sel ri.err) { ret 3; }
+        var z: Deflater = ri.ok;
+
+        val f: res[I.Progress, DeflateError] = finish(?z, ?packed[0], 64);
+        if (sel f.err)             { ret 4; }
+        if (f.ok.status != I.DONE) { ret 4; }
+        val again: res[I.Progress, DeflateError] = finish(?z, ?packed[0], 64);
+        if (sel again.err)                                      { ret 5; }
+        if (again.ok.status != I.DONE || again.ok.written != 0) { ret 5; }
+        val late: res[I.Progress, DeflateError] = compress(?z, ?corpus[0], 1, ?packed[0], 64);
+        if (!sel late.err)          { ret 6; }
+        if (!sel late.err.finished) { ret 6; }
+
+        # reset starts a new stream that reproduces the first
+        val first: usize = f.ok.written;
+        reset(?z);
+        val f2: res[I.Progress, DeflateError] = finish(?z, ?chunked[0], 64);
+        if (sel f2.err)             { ret 7; }
+        if (f2.ok.written != first) { ret 7; }
+
+        dnit(?z);
+        val closed: res[I.Progress, DeflateError] = compress(?z, ?corpus[0], 1, ?packed[0], 64);
+        if (!sel closed.err)        { ret 8; }
+        if (!sel closed.err.closed) { ret 8; }
+        ret 0;
+    }
+
+    # the scratch and the output vector are the acquisitions: each refused in
+    # turn is alloc and nothing leaks
+    test deflate__allocation_refusal_is_alloc_and_holds_nothing {
+        make_corpus(0, 50000);
+        var ordinal: usize = 1;
+        for (ordinal <= 16) {
+            var tracker: testing.Testing;
+            val made:    err[A.Error] = testing.make(?tracker);
+            if (sel made.err) { ret 1; }
+            testing.fail_at_ordinal(?tracker, ordinal);
+            val r:        res[V.Vector[u8], DeflateError] = compress_alloc(testing.allocator_of(?tracker), 6, RAW, ?corpus[0], 50000);
+            var accepted: bool                            = false;
+            if (sel r.err) {
+                if (!sel r.err.alloc) {
+                    testing.dnit(?tracker);
+                    ret 2;
+                }
+            }
+            if (sel r.ok) {
+                var out: V.Vector[u8] = r.ok;
+                accepted = true;
+                V.dnit[u8](?out);
+            }
+            val leaked: bool = testing.live_count(?tracker) != 0 || testing.double_free_count(?tracker) != 0;
+            testing.dnit(?tracker);
+            if (leaked)   { ret 3; }
+            if (accepted) { ret 0; }
+            ordinal = ordinal + 1;
+        }
+        ret 4;
+    }
+}
