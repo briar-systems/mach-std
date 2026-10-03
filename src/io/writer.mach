@@ -11,16 +11,21 @@
 # the persisted prefix in the error payload, so a caller always knows how many
 # bytes the sink accepted before the outcome.
 
+use std_memory: std.memory;
 use std.system.capability;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 
+use A:        std.allocator;
+use T:        std.allocator.testing;
 use io_error: std.io.error;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_equals;
 use std.types.string.str_len;
 
 # a native failure and the bytes persisted before it
@@ -274,6 +279,105 @@ pub fun flush(b: *Buffered) err[WriteError] {
 # bytes the inner writer has taken over this buffer's life
 pub fun pushed(b: *Buffered) usize {
     ret b.pushed;
+}
+
+# a writer into memory
+#
+# ctx for a Writer whose sink appends to `buf`. a fixed memory writes into
+# caller storage and accepts what fits, so a full one stalls; a growing memory
+# owns `buf` and grows it through `alloc`, failing natively when the allocator
+# refuses. either keeps one byte past the written bytes free, so text() can
+# terminate them. a limit scripts a refusal: once `limit` bytes are held, every
+# write fails natively, and a write that crosses it is cut at the limit.
+# ---
+# alloc: grows buf; nil for a fixed memory
+# buf:   the written bytes
+# cap:   capacity of buf in bytes
+# len:   bytes written
+# limit: the bytes held before every write is refused, or none
+pub rec Memory {
+    alloc: *A.Allocator;
+    buf:   *u8;
+    cap:   usize;
+    len:   usize;
+    limit: opt[usize];
+}
+
+fun memory_write(ctx: ptr, p: *u8, n: usize) res[usize, WriteError] {
+    val m:    *Memory = ctx::*Memory;
+    var take: usize   = n;
+    if (sel m.limit.some) {
+        if (m.len >= m.limit.some) {
+            ret res[usize, WriteError].err{native_failure(0, io_error.make(io_error.IO, io_error.OP_WRITE))};
+        }
+        if (take > m.limit.some - m.len) { take = m.limit.some - m.len; }
+    }
+    if (m.alloc != nil && m.len + take + 1 > m.cap) {
+        var grown: usize = m.cap * 2;
+        if (grown < m.len + take + 1) { grown = m.len + take + 1; }
+        if (grown < 64)               { grown = 64; }
+        var moved: res[*u8, A.Error];
+        if (m.buf == nil) { moved = A.allocate[u8](m.alloc, grown); }
+        or                { moved = A.reallocate[u8](m.alloc, m.buf, m.cap, grown); }
+        if (sel moved.err) {
+            ret res[usize, WriteError].err{native_failure(0, io_error.make(io_error.RESOURCE_EXHAUSTED, io_error.OP_WRITE))};
+        }
+        m.buf = moved.ok;
+        m.cap = grown;
+    }
+    var room: usize = 0;
+    if (m.cap > m.len + 1) { room = m.cap - m.len - 1; }
+    if (take > room)       { take = room; }
+    if (take == 0)         { ret res[usize, WriteError].ok{0}; }
+    std_memory.raw_copy(?m.buf[m.len], p, take);
+    m.len = m.len + take;
+    ret res[usize, WriteError].ok{take};
+}
+
+# wire a writer into caller storage
+# ---
+# m:   memory state, owned by the caller for the writer's whole life
+# buf: storage, owned by the caller
+# cap: capacity of buf in bytes; at most cap - 1 bytes are written
+# ret: a Writer appending to m
+pub fun memory(m: *Memory, buf: *u8, cap: usize) Writer {
+    m.alloc = nil;
+    m.buf   = buf;
+    m.cap   = cap;
+    m.len   = 0;
+    m.limit = opt[usize].none{};
+    ret Writer{ctx: m::ptr, f_write: memory_write};
+}
+
+# wire a writer into storage it grows through alloc
+# ---
+# m:     memory state, owned by the caller for the writer's whole life
+# alloc: grows the storage; released with memory_dnit
+# ret:   a Writer appending to m
+pub fun memory_growing(m: *Memory, alloc: *A.Allocator) Writer {
+    m.alloc = alloc;
+    m.buf   = nil;
+    m.cap   = 0;
+    m.len   = 0;
+    m.limit = opt[usize].none{};
+    ret Writer{ctx: m::ptr, f_write: memory_write};
+}
+
+# release the storage a growing memory holds; a fixed memory holds none
+pub fun memory_dnit(m: *Memory) {
+    if (m.alloc != nil) {
+        if (m.buf != nil) { A.deallocate[u8](m.alloc, m.buf, m.cap); }
+        m.buf = nil;
+        m.cap = 0;
+    }
+    m.len = 0;
+}
+
+# the written bytes as text, terminated in place; empty before any write
+pub fun memory_text(m: *Memory) str {
+    if (m.buf == nil || m.cap == 0) { ret ""; }
+    m.buf[m.len] = 0;
+    ret m.buf::str;
 }
 
 $if (capability.HOSTED) {
@@ -539,6 +643,68 @@ $if (capability.HOSTED) {
         val drained: err[WriteError] = flush(?b);
         if (!sel drained.ok) { ret 6; }
         if (m.calls != 1)    { ret 7; }
+        ret 0;
+    }
+
+    test memory__a_fixed_memory_holds_what_fits_and_then_stalls {
+        var out:  [6]u8;
+        var m:    Memory;
+        var w:    Writer          = memory(?m, ?out[0], 6);
+        val done: err[WriteError] = write_str(?w, "abc");
+        if (!sel done.ok)                        { ret 1; }
+        if (m.len != 3)                          { ret 2; }
+        if (!str_equals(memory_text(?m), "abc")) { ret 3; }
+        val full: err[WriteError] = write_str(?w, "defg");
+        if (!sel full.err)                         { ret 4; }
+        if (!sel full.err.stalled)                 { ret 5; }
+        if (persisted(full.err) != 2)              { ret 6; }
+        if (!str_equals(memory_text(?m), "abcde")) { ret 7; }
+        ret 0;
+    }
+
+    test memory__a_growing_memory_takes_everything_and_releases_it {
+        var tracker: T.Testing;
+        val made:    err[A.Error] = T.make(?tracker);
+        if (sel made.err) { ret 10; }
+        var m: Memory;
+        var w: Writer = memory_growing(?m, T.allocator_of(?tracker));
+        var i: usize  = 0;
+        for (i < 100) {
+            val put: err[WriteError] = write_str(?w, "0123456789");
+            if (sel put.err) {
+                T.dnit(?tracker);
+                ret 1;
+            }
+            i = i + 1;
+        }
+        val held: bool = m.len == 1000 && str_len(memory_text(?m)) == 1000 && m.buf[999] == '9';
+        memory_dnit(?m);
+        val leaked: bool = T.leaked(?tracker);
+        T.dnit(?tracker);
+        if (!held)  { ret 2; }
+        if (leaked) { ret 3; }
+        ret 0;
+    }
+
+    test memory__a_limit_cuts_the_crossing_write_and_refuses_the_next {
+        var tracker: T.Testing;
+        val made:    err[A.Error] = T.make(?tracker);
+        if (sel made.err) { ret 10; }
+        var m: Memory;
+        var w: Writer = memory_growing(?m, T.allocator_of(?tracker));
+        m.limit = opt[usize].some{4};
+        val crossing: err[WriteError] = write_str(?w, "abcdef");
+        val again:    err[WriteError] = write_str(?w, "g");
+        val text_ok:  bool            = str_equals(memory_text(?m), "abcd");
+        memory_dnit(?m);
+        T.dnit(?tracker);
+        if (!sel crossing.err)            { ret 1; }
+        if (!sel crossing.err.native)     { ret 2; }
+        if (persisted(crossing.err) != 4) { ret 3; }
+        if (!sel again.err)               { ret 4; }
+        if (!sel again.err.native)        { ret 4; }
+        if (persisted(again.err) != 0)    { ret 5; }
+        if (!text_ok)                     { ret 6; }
         ret 0;
     }
 }
