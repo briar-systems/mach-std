@@ -32,8 +32,8 @@ git -C "$scratch/repo" add -f mach.toml src test/fault
 
 release_checked=0
 if grep -qF "[target.$target]" "$scratch/repo/mach.toml"; then
-    mach_run build "$scratch/repo" -O2 --target "$target"
-    production="$scratch/repo/out/$target/debug/lib/std"
+    mach_run build "$scratch/repo" -O --target "$target" -o "out/$target/optimized/lib/std"
+    production="$scratch/repo/out/$target/optimized/lib/std"
     bash "$here/verify-release.sh" "$production"
     release_checked=1
 fi
@@ -52,8 +52,8 @@ for source in "$here"/src/*.mach; do
         || fail "fault.$(basename "$source" .mach) holds tests that lib/tests.mach does not reach"
 done
 mach_run "${test_args[@]}"
-mach_run "${test_args[@]}" -O2
-mach_run build "$scratch/repo/test/fault" -O2 --target "$target" --profile "$profile"
+mach_run "${test_args[@]}" -O
+mach_run build "$scratch/repo/test/fault" -O --target "$target" --profile "$profile" -o "out/$target/$profile/lib/fault"
 explicit="$scratch/repo/test/fault/out/$target/$profile/lib/fault"
 [ -f "$explicit" ] || fail "explicit fault archive was not built"
 

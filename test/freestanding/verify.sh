@@ -31,7 +31,7 @@ id = "freestanding_probe"
 version = "0.0.0"
 mach = "^6"
 src = "src"
-out = "out/{target.name}/{profile.name}"
+work = "out/{target.name}/{profile.name}"
 
 [target.freestanding-x86_64]
 isa = "x86_64"
@@ -41,11 +41,9 @@ of = "elf"
 
 [profile.debug]
 default = true
-opt = 0
+optimize = false
 debug = false
 simd = "scalarize"
-vectorize = false
-float_reassoc = false
 
 [artifact.probe]
 kind = "static"
