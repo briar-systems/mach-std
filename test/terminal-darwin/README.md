@@ -12,7 +12,8 @@ python3 test/terminal-darwin/verify.py <mach> darwin-aarch64 release
 resolves from the tree under test through `../..`, the C oracles build with the host
 SDK, and a pass prints one JSON record with the compiler, the std commit and every
 check result. Any failure or timeout exits nonzero with the failing check.
-`test/lib/darwin-fixtures.py <mach> <target> <profile>` runs every fixture.
+`test/lib/darwin-fixtures.py <mach> <target> <profile>` runs every fixture that owns
+a `verify.py` and declares the target in its `mach.toml`.
 
 The verifier always supplies a PTY for terminal behavior. A separate pipe carries
 phase acknowledgements, so test commands never become terminal input. The verifier
