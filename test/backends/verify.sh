@@ -153,12 +153,12 @@ for target in "${targets[@]}"; do
     rm -rf "out/$target"
     for profile in "${profiles[@]}"; do
         echo "cross-compiling the $profile backend smoke test for $target with $mach"
-        log="$(mach_run build . --target "$target" --profile "$profile" \
+        exe="out/$target/$profile/backends"
+        log="$(mach_run build . --target "$target" --profile "$profile" -o "$exe" \
             --emit-ir --emit-asm -vv 2>&1)" \
             || { echo "$log" >&2; fail "$target $profile failed to compile"; }
 
-        exe="$(find "out/$target/$profile" -name backends -type f -print -quit)"
-        [ -n "$exe" ] || fail "$target $profile: no backends binary produced"
+        [ -f "$exe" ] || fail "$target $profile: no backends binary produced"
 
         # confirm the backend's shared module was actually compiled
         grep -q "skipped .* target-gated modules" <<< "$log" \

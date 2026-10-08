@@ -18,9 +18,9 @@ cp -R "$root/src" "$here/dep/std/src"
 
 cd "$here"
 rm -rf "out/$target"
-mach_run build . --target "$target" --profile "$profile"
-exe="$(find "out/$target" -type f \( -name backends -o -name 'backends.exe' \) -print -quit)"
-[ -n "$exe" ] || fail "$target produced no native executable"
+exe="out/$target/$profile/backends"
+mach_run build . --target "$target" --profile "$profile" -o "$exe"
+[ -f "$exe" ] || fail "$target produced no native executable"
 
 echo "running $exe"
 "$exe"
