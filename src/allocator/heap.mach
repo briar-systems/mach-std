@@ -38,7 +38,10 @@
 # native_source maps through the platform, and allocator_source draws spans
 # from another Allocator. init's budget bounds the retained empty spans. a heap
 # over a source that cannot release keeps them past the budget, because there
-# is nowhere else for them to go.
+# is nowhere else for them to go. allocator_source makes that choice once: over
+# a backing that does not reclaim it leaves fn_release nil, so the heap keeps
+# every span it obtained and reuses it, and mapped_bytes still counts them
+# after dnit because the backing never took them back.
 #
 # the span header, not the caller's arguments, decides a block's class. a size
 # larger than the block's class is refused. releasing a pointer this heap never
@@ -978,6 +981,12 @@ fun native_release(ctx: ptr, span: ptr, size: usize) i64 {
 # the page allocator, or the testing allocator for span-level accounting. a
 # backing that hands back a span off the SPAN_ALIGN grid gets it straight back
 # and the request is refused.
+#
+# over a backing that does not reclaim (`allocator.reclaims` is false), giving
+# a span back would only spend the backing, so the source cannot release: the
+# heap keeps its spans, reuses them for any class, and growing past the budget
+# again takes nothing more from the backing. the backing's retains flag is read
+# here, so it must be settled before this call.
 # ---
 # s:       Source to initialize
 # backing: allocator spans are drawn from (must outlive the heap)
@@ -985,7 +994,8 @@ pub fun allocator_source(s: *Source, backing: *allocator.Allocator) {
     if (s == nil) { ret; }
     s.ctx        = backing::ptr;
     s.fn_obtain  = backed_obtain;
-    s.fn_release = backed_release;
+    s.fn_release = nil;
+    if (allocator.reclaims(backing)) { s.fn_release = backed_release; }
 }
 
 fun backed_obtain(ctx: ptr, size: usize) opt[ptr] {
@@ -1027,8 +1037,8 @@ val TEST_MEMBER_WEAK:    usize = 4;
 #[testing]
 val TEST_MEMBER_COUNT:   usize = 5;
 
-# the fixed buffer never reclaims, so it holds every span the heaviest case
-# ever obtains: the million-operation case runs through about 170 MiB
+# the fixed buffer never reclaims, so the heap over it keeps every span it
+# obtains and reuses them: the million-operation case peaks near 170 MiB
 #[testing]
 val TEST_FIXED_BYTES: usize = 512 * 1024 * 1024;
 
@@ -1146,7 +1156,8 @@ fun test_heap_on(bed: *TestBed, member: usize, h: *Heap, a: *allocator.Allocator
 #
 # a failure is reported as member * 100 + the case's own code; a case that
 # leaves spans the source refuses to take back, or that the member's own
-# accounting reports as leaked or freed twice, fails too
+# accounting reports as leaked or freed twice, fails too. the fixed member
+# never reclaims, so its heap must still count every span it held at dnit
 #[testing]
 fun test_each(body: fun(*Heap, *allocator.Allocator) i32) i32 {
     var member: usize = 0;
@@ -1157,13 +1168,18 @@ fun test_each(body: fun(*Heap, *allocator.Allocator) i32) i32 {
         if (!test_heap_on(?bed, member, ?h, ?a)) { ret (member * 100 + 1)::i32; }
 
         val code:  i32                  = body(?h, ?a);
+        val held:  usize                = mapped_bytes(?h);
         val dr:    err[allocator.Error] = dnit(?h);
         val clean: bool                 = test_bed_close(?bed);
 
-        if (code != 0)             { ret (member * 100)::i32 + code; }
-        if (sel dr.err)            { ret (member * 100 + 97)::i32; }
-        if (!clean)                { ret (member * 100 + 98)::i32; }
-        if (mapped_bytes(?h) != 0) { ret (member * 100 + 99)::i32; }
+        if (code != 0)  { ret (member * 100)::i32 + code; }
+        if (sel dr.err) { ret (member * 100 + 97)::i32; }
+        if (!clean)     { ret (member * 100 + 98)::i32; }
+
+        # a retaining backing keeps its spans by design, so dnit leaves them counted
+        var want: usize = 0;
+        if (member == TEST_MEMBER_FIXED) { want = held; }
+        if (mapped_bytes(?h) != want)    { ret (member * 100 + 99)::i32; }
         member = member + 1;
     }
     ret 0;
@@ -1741,6 +1757,61 @@ test heap__a_source_that_cannot_release_keeps_its_spans {
 
     val dr: err[allocator.Error] = dnit(?h);
     if (sel dr.err) { ret 13; }
+    ret 0;
+}
+
+test heap__growth_past_the_budget_over_a_fixed_backing_takes_nothing_more {
+    val bytes:  usize = SPAN_SIZE * 8;
+    val region: ptr   = os.allocate(bytes);
+    if (region == nil) { ret 1; }
+    fin { os.deallocate(region, bytes); }
+
+    var state: fixed.FixedState;
+    var back:  allocator.Allocator;
+    val fr:    err[allocator.Error] = fixed.make(?back, ?state, region::*u8, bytes);
+    if (sel fr.err) { ret 2; }
+
+    var s: Source;
+    allocator_source(?s, ?back);
+    if (s.fn_release != nil) { ret 3; }
+
+    var h: Heap;
+    # a budget of one byte: any span past it would be handed back
+    val ir: err[allocator.Error] = init(?h, ?s, 1);
+    if (sel ir.err) { ret 4; }
+
+    var a:  allocator.Allocator;
+    val mr: err[allocator.Error] = make(?a, ?h);
+    if (sel mr.err) { ret 5; }
+
+    var kept:  [16]ptr;
+    var left:  usize = 0;
+    var cycle: usize = 0;
+    for (cycle < 4) {
+        var i: usize = 0;
+        for (i < 16) {
+            val got: res[ptr, allocator.Error] = allocator.allocate_raw(?a, MAX_SMALL, 8);
+            if (sel got.err) { ret 6; }
+            kept[i] = got.ok;
+            i       = i + 1;
+        }
+        i = 0;
+        for (i < 16) {
+            val gone: err[allocator.Error] = allocator.deallocate_raw(?a, kept[i], MAX_SMALL, 8);
+            if (sel gone.err) { ret 7; }
+            i = i + 1;
+        }
+
+        if (cycle == 0)                      { left = fixed.remaining(?state); }
+        if (fixed.remaining(?state) != left) { ret 8; }
+        cycle = cycle + 1;
+    }
+
+    if (left == bytes) { ret 9; }
+    if (!check(?h))    { ret 10; }
+
+    val dr: err[allocator.Error] = dnit(?h);
+    if (sel dr.err) { ret 11; }
     ret 0;
 }
 

@@ -48,7 +48,7 @@ simd = "scalarize"
 [artifact.probe]
 kind = "static"
 entry = "probe.mach"
-out = "lib/probe"
+out = "{project.work}/lib/probe"
 targets = ["*"]
 link = []
 need = []
