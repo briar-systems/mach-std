@@ -682,6 +682,8 @@ class RiscV64:
 
 ISAS = {'x86_64': X86, 'aarch64': AArch64, 'riscv64': RiscV64}
 LABEL = re.compile(r'^(\.?[\w.$]+):$')
+# directives that only pad: any other directive is read as an unknown instruction
+LAYOUT = {'.balign', '.p2align', '.align'}
 
 
 def function_lines(text, name):
@@ -703,7 +705,7 @@ class Function:
         self.insts, self.labels, pending, after = [], {}, [], None
         for line, raw in enumerate(lines):
             text = raw.strip()
-            if not text or (text.startswith('.') and not text.endswith(':')):
+            if not text or text.split()[0] in LAYOUT:
                 continue
             match = LABEL.match(text)
             if match is not None:
