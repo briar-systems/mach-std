@@ -55,7 +55,7 @@ def controls(fixture, executable):
     accepted = fixture.build("socket", fixture.mutate("leak-accept", REFUSE, leak(ACCEPT)))
     fixture.exits(accepted, "accept-refusal", 45, "accept-refusal without the cleanup close")
     peekless = fixture.build("socket", fixture.mutate("no-peek", PEEK))
-    fixture.exits(peekless, "local-bytes", 133, "local-bytes without the peek")
+    fixture.exits(peekless, "local-bytes", 127, "local-bytes without the peek")
 
 
 def checks(fixture):

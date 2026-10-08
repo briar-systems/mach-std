@@ -60,9 +60,9 @@ verifier. Production source carries no injection hooks.
   sentinel and the descriptor count is unchanged. Removing only the cleanup close
   from the creation path makes `create-refusal` exit 111, and from the accept path
   makes `accept-refusal` exit 45, the descriptor leak.
-- In a copy with the `MSG_PEEK` removed from the local receive, `local-bytes` exits 133,
-  the ownership check that a refused rights message leaves the queue and the
-  descriptor count untouched.
+- In a copy with the `MSG_PEEK` removed from the local receive, `local-bytes` exits 127.
+  The receive consumes the queued rights with the clean prefix, so the prefix read is
+  refused and the descriptors are no longer owned by the queue.
 
 std's own socket, TCP, UDP and async tests run through `test/native/verify.sh` and
 `mach test . --all` on darwin.
