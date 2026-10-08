@@ -57,7 +57,7 @@
 # while claims are live. every valid prepared transaction is consumed by commit,
 # including an invalid owned-replacement request. failed validation leaves it owned.
 
-use std.crypto.hash.sha256;
+use H: std.crypto.hash.hasher;
 use std.format;
 use io_errors:  std.io.error;
 use identities: std.system.file_identity;
@@ -1073,14 +1073,13 @@ fun entry_absent(dirfd: usize, leaf: str) bool {
 # the writer end of a staged file
 #
 # every byte written to the transaction's writer lands here, which both writes
-# it to the staging descriptor and folds it into the digest when one was asked
-# for. a failing write records its errno so `prepare` can report a typed error
+# it to the staging descriptor and feeds it to the caller's hasher when one was
+# passed. a failing write records its errno so `prepare` can report a typed error
 # rather than parsing the string the writer interface requires.
 rec Sink {
-    fd:           usize;
-    digesting:    bool;
-    digest_state: sha256.State;
-    failed_code:  i64;
+    fd:          usize;
+    digest:      *H.Hasher;
+    failed_code: i64;
 }
 
 fun sink_write(ctx: ptr, buf: *u8, len: usize) res[usize, WriteError] {
@@ -1090,7 +1089,7 @@ fun sink_write(ctx: ptr, buf: *u8, len: usize) res[usize, WriteError] {
         s.failed_code = n;
         ret res[usize, WriteError].err{m_writer.native_failure(0, os.error(n, std_io_error.OP_WRITE))};
     }
-    if (s.digesting) { sha256.update(?s.digest_state, buf, n::usize); }
+    if (s.digest != nil) { H.update(s.digest, buf, n::usize); }
     ret res[usize, WriteError].ok{n::usize};
 }
 
@@ -1116,8 +1115,6 @@ pub rec Transaction {
     had_prior:       bool;
     prior:           Identity;
     len:             usize;
-    has_digest:      bool;
-    digest:          [32]u8;
     alloc:           *A.Allocator;
     options:         PrepareOptions;
     content_flushed: bool;
@@ -1219,19 +1216,6 @@ pub fun transaction_len(t: *Transaction) usize {
 
 pub fun transaction_kind(t: *Transaction) EntryKind {
     ret t.kind;
-}
-
-pub fun transaction_has_digest(t: *Transaction) bool {
-    ret t.has_digest;
-}
-
-# the sha-256 of the staged content, when one was requested at prepare
-# ---
-# ret: false when no digest was requested, leaving `out` untouched
-pub fun transaction_digest(t: *Transaction, out: *[32]u8) bool {
-    if (!t.has_digest) { ret false; }
-    @out = t.digest;
-    ret true;
 }
 
 # the identity the destination had when prepare ran
@@ -1412,20 +1396,19 @@ fun make_staging_dir(alloc: *A.Allocator, dirfd: usize, mode: i32,
 #              writer's own tag, rejects the prepare
 # mode:        creation permission bits, or final file bits when exact_mode is true
 # exact modes are applied after writing and before the requested durability barrier
-# want_digest: compute the sha-256 of what was written
-# ret:         none when out owns a prepared transaction
+# digest: fed every byte written, nil for none
+# ret:    none when out owns a prepared transaction
 pub fun prepare[W](out: *Transaction, alloc: *A.Allocator, destination: *Claim,
     write_ctx: *W, write_cb: fun(*W, *m_writer.Writer) err[WriteError],
-    mode: i32, want_digest: bool, options: PrepareOptions) err[Error] {
+    mode: i32, digest: *H.Hasher, options: PrepareOptions) err[Error] {
     if (write_ctx == nil || write_cb == nil) { ret err[Error].err{error(INVALID, OP_PREPARE)}; }
     val begun: err[Error] = begin_prepare(out, alloc, destination, ENTRY_FILE, options);
     if (sel begun.err) { ret begun; }
     val opened: err[Error] = open_staging(alloc, out.dirfd, mode, ?out.staging_name, ?out.staging_fd);
     if (sel opened.err) { ret prepare_failed(out, opened.err); }
     var sink: Sink;
-    sink.fd        = out.staging_fd;
-    sink.digesting = want_digest;
-    if (want_digest) { sink.digest_state = sha256.init(); }
+    sink.fd     = out.staging_fd;
+    sink.digest = digest;
     var writer:  m_writer.Writer = m_writer.Writer{ctx: (?sink)::ptr, f_write: sink_write};
     val written: err[WriteError] = write_cb(write_ctx, ?writer);
     if (sink.failed_code < 0) { ret prepare_failed(out, io_error(OP_PREPARE, sink.failed_code)); }
@@ -1440,9 +1423,7 @@ pub fun prepare[W](out: *Transaction, alloc: *A.Allocator, destination: *Claim,
     if (options.exact_mode && (fsnative.stat_mode(?st) & 0o7777) != (mode::u32 & 0o7777)) {
         ret prepare_failed(out, error(UNSUPPORTED, OP_PREPARE));
     }
-    out.len        = st.st_size::usize;
-    out.has_digest = want_digest;
-    if (want_digest) { sha256.final(?sink.digest_state, ?out.digest[0]); }
+    out.len = st.st_size::usize;
     val synced: err[Error] = prepare_barrier(out, out.staging_fd);
     if (sel synced.err) { ret prepare_failed(out, synced.err); }
     out.state = STATE_PREPARED;
@@ -1464,11 +1445,11 @@ fun bytes_write_cb(b: *BytesSource, w: *m_writer.Writer) err[WriteError] {
 # the trivial writer: everything `prepare` says applies, with the content
 # supplied as a buffer instead of a callback.
 pub fun prepare_bytes(out: *Transaction, alloc: *A.Allocator, destination: *Claim,
-    data: *u8, len: usize, mode: i32, want_digest: bool,
+    data: *u8, len: usize, mode: i32, digest: *H.Hasher,
     options: PrepareOptions) err[Error] {
     if (data == nil && len != 0) { ret err[Error].err{error(INVALID, OP_PREPARE)}; }
     var source: BytesSource = BytesSource{data: data, len: len};
-    ret prepare[BytesSource](out, alloc, destination, ?source, bytes_write_cb, mode, want_digest, options);
+    ret prepare[BytesSource](out, alloc, destination, ?source, bytes_write_cb, mode, digest, options);
 }
 
 # check the staged content before committing it
@@ -2793,7 +2774,7 @@ test commit__absent_at_commit_fills_a_vacancy_once_and_refuses_the_second_time {
         fin { t_session_dnit(?g_session); }
 
         var t1_storage: Transaction;
-        val t1:         err[Error] = prepare_bytes(?t1_storage, ?alloc, t_reserve(?g_session, "out"), "first", 5, 0o644, false, PrepareOptions{precondition: PRE_ABSENT, durability: durability_none()});
+        val t1:         err[Error] = prepare_bytes(?t1_storage, ?alloc, t_reserve(?g_session, "out"), "first", 5, 0o644, nil, PrepareOptions{precondition: PRE_ABSENT, durability: durability_none()});
         fin {
             if (t1_storage.state == STATE_PREPARED) { abort(?t1_storage); }
         }
@@ -2807,7 +2788,7 @@ test commit__absent_at_commit_fills_a_vacancy_once_and_refuses_the_second_time {
         # the destination now exists, so the same precondition must refuse and
         # must leave what is there alone
         var t2_storage: Transaction;
-        val t2:         err[Error] = prepare_bytes(?t2_storage, ?alloc, t_reserve(?g_session, "out"), "second", 6, 0o644, false, PrepareOptions{precondition: PRE_ABSENT, durability: durability_none()});
+        val t2:         err[Error] = prepare_bytes(?t2_storage, ?alloc, t_reserve(?g_session, "out"), "second", 6, 0o644, nil, PrepareOptions{precondition: PRE_ABSENT, durability: durability_none()});
         fin {
             if (t2_storage.state == STATE_PREPARED) { abort(?t2_storage); }
         }
@@ -2862,7 +2843,7 @@ test commit__same_object_since_prepare_detects_a_replacement_and_preserves_it {
             if (failed(t_session_init(?g_session, ?alloc, g))) { ret 90; }
             fin { t_session_dnit(?g_session); }
             var t_storage: Transaction;
-            val t:         err[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?g_session, "out"), "ours", 4, 0o644, false, PrepareOptions{precondition: PRE_SAME_OBJECT, durability: durability_none()});
+            val t:         err[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?g_session, "out"), "ours", 4, 0o644, nil, PrepareOptions{precondition: PRE_SAME_OBJECT, durability: durability_none()});
             fin {
                 if (t_storage.state == STATE_PREPARED) { abort(?t_storage); }
             }
@@ -2920,7 +2901,7 @@ test commit__same_object_since_prepare_succeeds_when_absent_stays_absent {
         # nothing was there at prepare and nothing appeared, which is still
         # "unchanged" and must be allowed to land
         var t_storage: Transaction;
-        val t:         err[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?g_session, "out"), "fresh", 5, 0o644, false, PrepareOptions{precondition: PRE_SAME_OBJECT, durability: durability_none()});
+        val t:         err[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?g_session, "out"), "fresh", 5, 0o644, nil, PrepareOptions{precondition: PRE_SAME_OBJECT, durability: durability_none()});
         fin {
             if (t_storage.state == STATE_PREPARED) { abort(?t_storage); }
         }
@@ -2973,7 +2954,7 @@ test commit__refuses_a_symlink_swapped_in_at_the_destination {
                 if (failed(t_session_init(?g_session, ?alloc, g))) { ret 90; }
                 fin { t_session_dnit(?g_session); }
                 var t_storage: Transaction;
-                val t:         err[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?g_session, "out"), "ours", 4, 0o644, false, PrepareOptions{precondition: PRE_SAME_OBJECT, durability: durability_none()});
+                val t:         err[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?g_session, "out"), "ours", 4, 0o644, nil, PrepareOptions{precondition: PRE_SAME_OBJECT, durability: durability_none()});
                 fin {
                     if (t_storage.state == STATE_PREPARED) { abort(?t_storage); }
                 }
@@ -3029,7 +3010,7 @@ test prepare__a_failed_producer_leaves_a_prior_file_whole {
 
         # publish a first version the failed attempt must not disturb
         var first_storage: Transaction;
-        val first:         err[Error] = prepare_bytes(?first_storage, ?alloc, t_reserve(?g_session, "out"), "original", 8, 0o644, false, PrepareOptions{precondition: PRE_ABSENT, durability: durability_none()});
+        val first:         err[Error] = prepare_bytes(?first_storage, ?alloc, t_reserve(?g_session, "out"), "original", 8, 0o644, nil, PrepareOptions{precondition: PRE_ABSENT, durability: durability_none()});
         fin {
             if (first_storage.state == STATE_PREPARED) { abort(?first_storage); }
         }
@@ -3044,7 +3025,7 @@ test prepare__a_failed_producer_leaves_a_prior_file_whole {
             var p: PartialThenFail;
             p.wrote = 0;
             var t_storage: Transaction;
-            val t:         err[Error] = prepare[PartialThenFail](?t_storage, ?alloc, t_reserve(?g_session, "out"), ?p, partial_then_fail, 0o644, false, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
+            val t:         err[Error] = prepare[PartialThenFail](?t_storage, ?alloc, t_reserve(?g_session, "out"), ?p, partial_then_fail, 0o644, nil, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
             fin {
                 if (t_storage.state == STATE_PREPARED) { abort(?t_storage); }
             }
@@ -3087,7 +3068,7 @@ test validate__a_rejection_leaves_staging_for_the_caller_to_abort {
         if (failed(t_session_init(?g_session, ?alloc, g))) { ret 90; }
         fin { t_session_dnit(?g_session); }
         var t_storage: Transaction;
-        val t:         err[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?g_session, "out"), "content", 7, 0o644, false, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
+        val t:         err[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?g_session, "out"), "content", 7, 0o644, nil, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
         fin {
             if (t_storage.state == STATE_PREPARED) { abort(?t_storage); }
         }
@@ -3136,7 +3117,7 @@ test validate__acceptance_sees_exactly_the_staged_bytes {
         if (failed(t_session_init(?g_session, ?alloc, g))) { ret 90; }
         fin { t_session_dnit(?g_session); }
         var t_storage: Transaction;
-        val t:         err[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?g_session, "out"), "abcdefgh", 8, 0o644, false, PrepareOptions{precondition: PRE_ABSENT, durability: durability_none()});
+        val t:         err[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?g_session, "out"), "abcdefgh", 8, 0o644, nil, PrepareOptions{precondition: PRE_ABSENT, durability: durability_none()});
         fin {
             if (t_storage.state == STATE_PREPARED) { abort(?t_storage); }
         }
@@ -3181,7 +3162,7 @@ test commit__durability_reports_what_was_achieved {
         fin { t_session_dnit(?g_session); }
 
         var t1_storage: Transaction;
-        val t1:         err[Error] = prepare_bytes(?t1_storage, ?alloc, t_reserve(?g_session, "full"), "x", 1, 0o644, false, PrepareOptions{precondition: PRE_ABSENT, durability: durability_full(true)});
+        val t1:         err[Error] = prepare_bytes(?t1_storage, ?alloc, t_reserve(?g_session, "full"), "x", 1, 0o644, nil, PrepareOptions{precondition: PRE_ABSENT, durability: durability_full(true)});
         fin {
             if (t1_storage.state == STATE_PREPARED) { abort(?t1_storage); }
         }
@@ -3198,7 +3179,7 @@ test commit__durability_reports_what_was_achieved {
         }
 
         var t2_storage: Transaction;
-        val t2:         err[Error] = prepare_bytes(?t2_storage, ?alloc, t_reserve(?g_session, "none"), "x", 1, 0o644, false, PrepareOptions{precondition: PRE_ABSENT, durability: durability_none()});
+        val t2:         err[Error] = prepare_bytes(?t2_storage, ?alloc, t_reserve(?g_session, "none"), "x", 1, 0o644, nil, PrepareOptions{precondition: PRE_ABSENT, durability: durability_none()});
         fin {
             if (t2_storage.state == STATE_PREPARED) { abort(?t2_storage); }
         }
@@ -3221,7 +3202,24 @@ test commit__durability_reports_what_was_achieved {
     ret bad;
 }
 
-test prepare__the_digest_matches_an_independent_sha_256 {
+#[testing]
+rec Recorder {
+    buf: [64]u8;
+    len: usize;
+}
+
+#[testing]
+fun recorder_update(ctx: ptr, data: *u8, len: usize) {
+    val r: *Recorder = ctx::*Recorder;
+    var i: usize     = 0;
+    for (i < len && r.len < 64) {
+        r.buf[r.len] = data[i];
+        r.len        = r.len + 1;
+        i            = i + 1;
+    }
+}
+
+test prepare__the_hasher_is_fed_exactly_the_bytes_written {
     var alloc:  A.Allocator;
     val page_r: err[A.Error] = page.make(?alloc);
     if (sel page_r.err) { ret 1; }
@@ -3239,27 +3237,22 @@ test prepare__the_digest_matches_an_independent_sha_256 {
         var g_session: TestSession;
         if (failed(t_session_init(?g_session, ?alloc, g))) { ret 90; }
         fin { t_session_dnit(?g_session); }
+        var recorded:  Recorder;
+        var hasher:    H.Hasher   = H.Hasher{ctx: (?recorded)::ptr, f_update: recorder_update};
         var t_storage: Transaction;
-        val t:         err[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?g_session, "out"), "the quick brown fox", 19, 0o644, true, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
+        val t:         err[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?g_session, "out"), "the quick brown fox", 19, 0o644, ?hasher, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
         fin {
             if (t_storage.state == STATE_PREPARED) { abort(?t_storage); }
         }
         if (sel t.err) { bad = 3; }
         or {
             val a: *Transaction = ?t_storage;
-            if (!transaction_has_digest(a)) { bad = 4; }
+            if (recorded.len != 19) { bad = 4; }
 
-            var got: [32]u8;
-            if (bad == 0 && !transaction_digest(a, ?got)) { bad = 5; }
-
-            var want: [32]u8;
-            var st:   sha256.State = sha256.init();
-            sha256.update(?st, "the quick brown fox", 19);
-            sha256.final(?st, ?want[0]);
-
-            var i: usize = 0;
-            for (i < 32 && bad == 0) {
-                if (got[i] != want[i]) { bad = 6; }
+            val want: str   = "the quick brown fox";
+            var i:    usize = 0;
+            for (i < 19 && bad == 0) {
+                if (recorded.buf[i] != want[i]) { bad = 5; }
                 i = i + 1;
             }
             abort(a);
@@ -3379,7 +3372,7 @@ test recover__a_crash_between_prepare_and_commit_leaves_recoverable_residue_only
 
         # process death closes descriptors but leaves prepared entries on disk
         var t_storage: Transaction;
-        val t:         err[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?g_session, "out"), "unfinished", 10, 0o644, false, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
+        val t:         err[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?g_session, "out"), "unfinished", 10, 0o644, nil, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
         fin {
             if (t_storage.state == STATE_PREPARED) { abort(?t_storage); }
         }
@@ -3600,7 +3593,7 @@ test root_open_with_home__a_rewrite_leaves_nothing_but_the_destination_beside_it
     val recovered: res[usize, Error] = recover(?alloc, ?session.held, "");
     if (sel recovered.err) { bad = 21; }
     var t_storage: Transaction;
-    val t:         err[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?session, "out"), "after", 5, 0o644, false,
+    val t:         err[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?session, "out"), "after", 5, 0o644, nil,
         PrepareOptions{precondition: PRE_SAME_OBJECT, prior_access: READ_AUTHORIZED, durability: durability_none()});
     if (bad == 0 && sel t.err) { bad = 22; }
     or {
@@ -3723,7 +3716,7 @@ test recover__an_interrupted_prepare_recovers_through_the_home {
     fin { t_session_dnit(?session); }
     var bad:       i32        = 0;
     var t_storage: Transaction;
-    val t:         err[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?session, "out"), "unfinished", 10, 0o644, false,
+    val t:         err[Error] = prepare_bytes(?t_storage, ?alloc, t_reserve(?session, "out"), "unfinished", 10, 0o644, nil,
         PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
     if (sel t.err) { ret 21; }
     # process death closes descriptors but leaves the staged entry beside the destination
@@ -4334,7 +4327,7 @@ test prepare__every_allocation_failure_leaks_nothing {
             testing.fail_at_ordinal(?t, ordinal);
 
             var txn_storage: Transaction;
-            val txn:         err[Error] = prepare_bytes(?txn_storage, testing.allocator_of(?t), t_reserve(?g_session, "out"), "replacement", 11, 0o644, true, PrepareOptions{precondition: PRE_SAME_OBJECT, durability: durability_none()});
+            val txn:         err[Error] = prepare_bytes(?txn_storage, testing.allocator_of(?t), t_reserve(?g_session, "out"), "replacement", 11, 0o644, nil, PrepareOptions{precondition: PRE_SAME_OBJECT, durability: durability_none()});
             fin {
                 if (txn_storage.state == STATE_PREPARED) { abort(?txn_storage); }
             }
@@ -4902,7 +4895,7 @@ fun t_journal_max_leaf(name: *u8) {
 fun t_journal_publish(a: *A.Allocator, session: *TestSession, leaf: str, content: str) i32 {
     val root:             *Root      = session.held.root;
     var prepared_storage: Transaction;
-    val prepared:         err[Error] = prepare_bytes(?prepared_storage, a, t_reserve(session, leaf), content, str_len(content), 0o644, false, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
+    val prepared:         err[Error] = prepare_bytes(?prepared_storage, a, t_reserve(session, leaf), content, str_len(content), 0o644, nil, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
     fin {
         if (prepared_storage.state == STATE_PREPARED) { abort(?prepared_storage); }
     }
@@ -5200,7 +5193,7 @@ test transaction__backup_containers_reject_symlinks_and_foreign_children {
 fun t_publish(a: *A.Allocator, session: *TestSession, leaf: str, content: str) i32 {
     val root:             *Root      = session.held.root;
     var prepared_storage: Transaction;
-    val prepared:         err[Error] = prepare_bytes(?prepared_storage, a, t_reserve(session, leaf), content, str_len(content), 0o644, false, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
+    val prepared:         err[Error] = prepare_bytes(?prepared_storage, a, t_reserve(session, leaf), content, str_len(content), 0o644, nil, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
     fin {
         if (prepared_storage.state == STATE_PREPARED) { abort(?prepared_storage); }
     }
@@ -5225,7 +5218,7 @@ fun t_root_operations(a: *A.Allocator, session: *TestSession) i32 {
 
     $if ($mach.build.os != $mach.os.darwin) {
         var stale_storage: Transaction;
-        val stale:         err[Error] = prepare_bytes(?stale_storage, a, t_reserve(session, "y"), "stale", 5, 0o644, false, PrepareOptions{precondition: PRE_SAME_OBJECT, durability: durability_none()});
+        val stale:         err[Error] = prepare_bytes(?stale_storage, a, t_reserve(session, "y"), "stale", 5, 0o644, nil, PrepareOptions{precondition: PRE_SAME_OBJECT, durability: durability_none()});
         fin {
             if (stale_storage.state == STATE_PREPARED) { abort(?stale_storage); }
         }
@@ -5795,7 +5788,7 @@ test commit__held_destinations_retain_old_content_through_root_rename {
     fin { os.close(held_handle); }
     if (os.write(held_handle, "old", 3) != 3) { ret 6; }
     var pr_storage: Transaction;
-    val pr:         err[Error] = prepare_bytes(?pr_storage, ?alloc, t_reserve(?root_session, "b"), "new", 3, 0o600, false, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
+    val pr:         err[Error] = prepare_bytes(?pr_storage, ?alloc, t_reserve(?root_session, "b"), "new", 3, 0o600, nil, PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()});
     fin {
         if (pr_storage.state == STATE_PREPARED) { abort(?pr_storage); }
     }
@@ -5912,7 +5905,7 @@ test lifecycle__copied_and_invalid_commits_preserve_exactly_one_claim_owner {
     if (destination == nil) { ret 5; }
     var first:   Transaction;
     val options: PrepareOptions = PrepareOptions{precondition: PRE_ABSENT, durability: durability_none()};
-    if (failed(prepare_bytes(?first, ?alloc, destination, "old", 3, 0o600, false, options))) { ret 6; }
+    if (failed(prepare_bytes(?first, ?alloc, destination, "old", 3, 0o600, nil, options))) { ret 6; }
     fin {
         if (prepared(?first)) { abort(?first); }
     }
@@ -5928,17 +5921,17 @@ test lifecycle__copied_and_invalid_commits_preserve_exactly_one_claim_owner {
     }
     if (!failed(abort(?copied)) || !prepared(?first) || !destination.active) { ret 8; }
     var competing: Transaction;
-    val conflict:  err[Error] = prepare_bytes(?competing, ?alloc, destination, "bad", 3, 0o600, false, options);
+    val conflict:  err[Error] = prepare_bytes(?competing, ?alloc, destination, "bad", 3, 0o600, nil, options);
     if (sel conflict.ok || error_of(conflict).kind != INVALID) { ret 9; }
     if (!failed(release_claim(destination)))                   { ret 10; }
     var ctx:     i32                 = 0;
     val invalid: res[Outcome, Error] = commit_replacing_owned[i32](?first, ?ctx, t_journal_owns);
-    if (sel invalid.ok || res_error[Outcome](invalid).kind != INVALID)                       { ret 11; }
-    if (first.state != STATE_SPENT || destination.active || session.held.borrowers != 1)     { ret 12; }
-    if (payload_entry_count(?alloc, base) != 0)                                              { ret 13; }
-    if (failed(prepare_bytes(?first, ?alloc, destination, "new", 3, 0o600, false, options))) { ret 14; }
-    if (res_failed[Outcome](commit(?first)))                                                 { ret 15; }
-    if (!failed(abort(?first)) || destination.active || session.held.borrowers != 1)         { ret 16; }
+    if (sel invalid.ok || res_error[Outcome](invalid).kind != INVALID)                     { ret 11; }
+    if (first.state != STATE_SPENT || destination.active || session.held.borrowers != 1)   { ret 12; }
+    if (payload_entry_count(?alloc, base) != 0)                                            { ret 13; }
+    if (failed(prepare_bytes(?first, ?alloc, destination, "new", 3, 0o600, nil, options))) { ret 14; }
+    if (res_failed[Outcome](commit(?first)))                                               { ret 15; }
+    if (!failed(abort(?first)) || destination.active || session.held.borrowers != 1)       { ret 16; }
     ret 0;
 }
 
@@ -5968,14 +5961,14 @@ test lifecycle__preparation_alone_selects_retained_identity_capability {
     if (os.write(old_handle, "old", 3) != 3) { ret 7; }
     var transaction: Transaction;
     val replace:     PrepareOptions = PrepareOptions{precondition: PRE_REPLACE, durability: durability_none()};
-    if (failed(prepare_bytes(?transaction, ?alloc, destination, "new", 3, 0o000, false, replace))) { ret 8; }
+    if (failed(prepare_bytes(?transaction, ?alloc, destination, "new", 3, 0o000, nil, replace))) { ret 8; }
     fin {
         if (prepared(?transaction)) { abort(?transaction); }
     }
     if (transaction.prior_fd != os.INVALID_HANDLE || transaction.had_prior) { ret 9; }
     if (failed(abort(?transaction)))                                        { ret 10; }
     val same:     PrepareOptions = PrepareOptions{precondition: PRE_SAME_OBJECT, durability: durability_none()};
-    val retained: err[Error]     = prepare_bytes(?transaction, ?alloc, destination, "new", 3, 0o000, false, same);
+    val retained: err[Error]     = prepare_bytes(?transaction, ?alloc, destination, "new", 3, 0o000, nil, same);
     $if ($mach.build.os == $mach.os.darwin) {
         if (sel retained.ok || error_of(retained).kind != UNSUPPORTED) { ret 11; }
         if (destination.active || transaction.state != STATE_SPENT)    { ret 12; }
@@ -6017,7 +6010,7 @@ test lifecycle__recovery_refuses_live_claims_and_closes_failed_admission {
     if (destination == nil) { ret 5; }
     var transaction: Transaction;
     val options:     PrepareOptions = PrepareOptions{precondition: PRE_ABSENT, durability: durability_none()};
-    if (failed(prepare_bytes(?transaction, ?alloc, destination, "new", 3, 0o600, false, options))) { ret 6; }
+    if (failed(prepare_bytes(?transaction, ?alloc, destination, "new", 3, 0o600, nil, options))) { ret 6; }
     fin {
         if (prepared(?transaction)) { abort(?transaction); }
     }
@@ -6248,10 +6241,10 @@ test prior_access__readable_outputs_replace_repeatedly_with_retained_identity {
     }
     val options: PrepareOptions = PrepareOptions{precondition: PRE_SAME_OBJECT,
         prior_access: READ_AUTHORIZED, durability: durability_none()};
-    if (failed(prepare_bytes(?t, ?alloc, destination, "first", 5, 0o600, false, options)))  { ret 6; }
-    if (t.had_prior || res_failed[Outcome](commit(?t)))                                     { ret 7; }
-    if (failed(prepare_bytes(?t, ?alloc, destination, "second", 6, 0o600, false, options))) { ret 8; }
-    if (!t.had_prior || t.prior_fd == os.INVALID_HANDLE)                                    { ret 9; }
+    if (failed(prepare_bytes(?t, ?alloc, destination, "first", 5, 0o600, nil, options)))  { ret 6; }
+    if (t.had_prior || res_failed[Outcome](commit(?t)))                                   { ret 7; }
+    if (failed(prepare_bytes(?t, ?alloc, destination, "second", 6, 0o600, nil, options))) { ret 8; }
+    if (!t.had_prior || t.prior_fd == os.INVALID_HANDLE)                                  { ret 9; }
     val retained: usize = t.prior_fd;
     var identity: Identity;
     if (os.file_identity(retained, ?identity) < 0 || !identity_equal(identity, t.prior)) { ret 10; }
@@ -6259,7 +6252,7 @@ test prior_access__readable_outputs_replace_repeatedly_with_retained_identity {
     var closed: os.stat_t;
     if (os.error_kind(os.stat(retained, ?closed)) != io_errors.CLOSED || destination.active) { ret 12; }
     val invalid: PrepareOptions = PrepareOptions{precondition: PRE_REPLACE, prior_access: 2, durability: durability_none()};
-    val denied:  err[Error]     = prepare_bytes(?t, ?alloc, destination, "bad", 3, 0o600, false, invalid);
+    val denied:  err[Error]     = prepare_bytes(?t, ?alloc, destination, "bad", 3, 0o600, nil, invalid);
     if (sel denied.ok || error_of(denied).kind != INVALID || destination.active) { ret 13; }
     ret 0;
 }
@@ -6304,7 +6297,7 @@ fun t_backup_commit_case(which: u8) i32 {
     val owned:   *A.Allocator   = testing.allocator_of(?tracker);
     var t:       Transaction;
     val options: PrepareOptions = PrepareOptions{precondition: PRE_SAME_OBJECT, prior_access: READ_AUTHORIZED, durability: durability_full(true)};
-    val made:    err[Error]     = prepare_bytes(?t, owned, destination, "next", 4, 0o600, false, options);
+    val made:    err[Error]     = prepare_bytes(?t, owned, destination, "next", 4, 0o600, nil, options);
     if (sel made.err) { ret 9; }
     fin {
         if (prepared(?t)) { abort(?t); }
@@ -6415,7 +6408,7 @@ test backup_commit__copied_owners_and_active_backups_cannot_consume_another_borr
     if (destination == nil || backup == nil) { ret 5; }
     var t:       Transaction;
     val options: PrepareOptions = PrepareOptions{precondition: PRE_SAME_OBJECT, durability: durability_none()};
-    if (failed(prepare_bytes(?t, ?alloc, destination, "next", 4, 0o600, false, options))) { ret 6; }
+    if (failed(prepare_bytes(?t, ?alloc, destination, "next", 4, 0o600, nil, options))) { ret 6; }
     fin {
         if (prepared(?t)) { abort(?t); }
     }
@@ -6540,7 +6533,7 @@ test exact_mode__file_permissions_finalize_before_publication_or_refuse {
     if (destination == nil) { ret 5; }
     var transaction: Transaction;
     val options:     PrepareOptions = PrepareOptions{precondition: PRE_ABSENT, exact_mode: true, durability: durability_file(true)};
-    val prepared:    err[Error]     = prepare_bytes(?transaction, ?alloc, destination, "exact", 5, 0o774, false, options);
+    val prepared:    err[Error]     = prepare_bytes(?transaction, ?alloc, destination, "exact", 5, 0o774, nil, options);
     $if ($mach.build.os == $mach.os.windows) {
         if (!sel prepared.err) {
             abort(?transaction);

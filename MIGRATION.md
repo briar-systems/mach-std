@@ -1,3 +1,26 @@
+# std 9.x to 10.0.0
+
+## filesystem.transaction takes its digest from the caller (#1003)
+
+`prepare` and `prepare_bytes` no longer compute a sha-256. Their `want_digest: bool` parameter becomes `digest: *hasher.Hasher`, a caller-owned running digest the transaction feeds every byte written, or `nil` for none. `transaction_has_digest` and `transaction_digest` are removed. The transaction never finishes or stores a digest, so any hash fits, whatever its output size.
+
+`std.crypto.hash.hasher.Hasher` is `{ctx: ptr, f_update: fun(ptr, *u8, usize)}`. The caller creates the hash state, passes a `Hasher` over it, and finishes it after `prepare` returns ok.
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `prepare_bytes(..., mode, false, options)` | `prepare_bytes(..., mode, nil, options)` |
+| `prepare_bytes(..., mode, true, options)` then `transaction_digest(t, ?out)` | `prepare_bytes(..., mode, ?hasher, options)` then finish the caller's own state |
+
+```mach
+# after
+fun feed(ctx: ptr, data: *u8, len: usize) { sha256.update(ctx::*sha256.State, data, len); }
+
+var state:  sha256.State = sha256.init();
+var hasher: hasher.Hasher = hasher.Hasher{ctx: (?state)::ptr, f_update: feed};
+prepare_bytes(?t, ?alloc, claim, data, len, 0o644, ?hasher, options);
+sha256.final(?state, ?digest[0]);
+```
+
 # std 6.x to 7.0.0
 
 std 7.0.0 makes the memory behind `io.runtime` reachable (#677). A runtime takes the allocator every one of its allocations comes from, and every driver registered on it draws from the same allocator.
