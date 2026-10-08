@@ -13,10 +13,7 @@ root="$(cd "$here/../../.." && pwd)"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
-rm -rf "$here/dep"
-mkdir -p "$here/dep/std"
-cp "$root/mach.toml" "$here/dep/std/mach.toml"
-cp -R "$root/src" "$here/dep/std/src"
+"$mach" dep pull "$here" --quiet
 
 cd "$here"
 set +e
@@ -36,10 +33,7 @@ expect 'a secret-welded pointer cannot be erased to the untyped `ptr`' "a record
 # the constant-time pins over asm are codegen errors, so they build apart
 # from the type errors above, which stop a build before codegen
 obl="$here/../oblivious"
-rm -rf "$obl/dep"
-mkdir -p "$obl/dep/std"
-cp "$root/mach.toml" "$obl/dep/std/mach.toml"
-cp -R "$root/src" "$obl/dep/std/src"
+"$mach" dep pull "$obl" --quiet
 cd "$obl"
 set +e
 log="$(mach_run build . 2>&1)"

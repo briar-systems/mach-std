@@ -18,10 +18,7 @@ cd "$here"
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
 # copy the dependency inside the fixture project
-rm -rf dep
-mkdir -p dep/std
-cp ../../mach.toml dep/std/mach.toml
-cp -R ../../src dep/std/src
+"$mach" dep pull . --quiet
 
 emit() {
     mkdir -p src

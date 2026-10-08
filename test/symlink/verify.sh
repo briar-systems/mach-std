@@ -36,10 +36,7 @@ decode() {
 
 # vendor this checkout's std as a physical copy: mach refuses a symlinked dep
 # root, and a probe for symlinks must not need a working symlink to set itself up.
-rm -rf dep
-mkdir -p dep/std
-cp ../../mach.toml dep/std/mach.toml
-cp -r ../../src dep/std/src
+"$mach" dep pull . --quiet
 
 echo "building the symlink probe with $mach (target $target)"
 rm -rf out work

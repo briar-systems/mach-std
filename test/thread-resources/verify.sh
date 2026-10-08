@@ -10,10 +10,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$here/../lib/compiler.sh"
 root="$(cd "$here/../.." && pwd)"
 
-rm -rf "$here/dep"
-mkdir -p "$here/dep/std"
-cp "$root/mach.toml" "$here/dep/std/mach.toml"
-cp -R "$root/src" "$here/dep/std/src"
+"$mach" dep pull "$here" --quiet
 
 args=(test "$here" --target "$target" --profile "$profile")
 if [ -n "$runner" ]; then args+=(--runner "$runner"); fi

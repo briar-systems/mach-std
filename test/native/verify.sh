@@ -20,10 +20,8 @@ grep -qE '^# owner: .+' "$known" || fail "$known has no owner"
 grep -qE '^# baseline: [0-9]{4}-[0-9]{2}-[0-9]{2}$' "$known" \
     || fail "$known has no baseline date"
 
-rm -rf "$here/dep"
-mkdir -p "$here/dep/std" "$here/results"
-cp "$root/mach.toml" "$here/dep/std/mach.toml"
-cp -R "$root/src" "$here/dep/std/src"
+mkdir -p "$here/results"
+"$mach" dep pull "$here" --quiet
 
 cd "$root"
 
