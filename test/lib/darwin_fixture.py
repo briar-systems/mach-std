@@ -48,10 +48,13 @@ class Fixture:
         check(self.target in TARGETS, f"unknown target {self.target}, expected one of {sorted(TARGETS)}")
         check(self.profile in PROFILES, f"unknown profile {self.profile}, expected one of {PROFILES}")
         check(sys.platform == "darwin", "the fixture runs on native darwin only")
-        # a translated process would run the x86_64 image under rosetta, which is not native evidence
         machine = platform.machine()
         check(machine == TARGETS[self.target],
               f"host is {machine}, {self.target} needs a native {TARGETS[self.target]} host")
+        # under rosetta machine() reports x86_64, and the sysctl is absent only on hosts without rosetta
+        translated = run(["sysctl", "-n", "sysctl.proc_translated"])
+        check(translated.returncode != 0 or translated.stdout.strip() == b"0",
+              f"this process runs translated, {self.target} needs a native host")
         check(self.mach.is_file(), f"no compiler at {self.mach}")
         self.work = self.here / "out" / self.target / self.profile
         self.evidence = self.work / "evidence"
