@@ -13,10 +13,7 @@ mach="${1:-mach}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 
-rm -rf "$here/dep"
-mkdir -p "$here/dep/std"
-cp "$root/mach.toml" "$here/dep/std/mach.toml"
-cp -R "$root/src" "$here/dep/std/src"
+"$mach" dep pull "$here" --quiet
 
 cd "$here"
 "$mach" build . -p release >/dev/null

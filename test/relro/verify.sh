@@ -31,10 +31,7 @@ fail() { echo "FAIL: $1" >&2; exit 1; }
 run()  { if [ -n "$runner" ]; then "$runner" "$@"; else "$@"; fi; }
 
 # copy the dependency inside the fixture project
-rm -rf dep
-mkdir -p dep/std
-cp ../../mach.toml dep/std/mach.toml
-cp -R ../../src dep/std/src
+"$mach" dep pull . --quiet
 
 echo "building the RELRO probes --pie with $mach (target $target)"
 rm -rf out

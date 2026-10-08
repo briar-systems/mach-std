@@ -18,10 +18,9 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$here/../lib/compiler.sh"
 cd "$here"
 
-rm -rf dep out c/out
-mkdir -p dep/std c/out
-cp ../../mach.toml dep/std/mach.toml
-cp -R ../../src dep/std/src
+rm -rf out c/out
+mkdir -p c/out
+"$mach" dep pull . --quiet
 
 # the fixture is C, so it is built by a C compiler and linked by pthread_create's owner
 $cc -shared -fPIC -O1 -Wl,-soname,libprobe.so -o c/out/libprobe.so c/probe.c -lpthread

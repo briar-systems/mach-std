@@ -31,10 +31,7 @@ decode() {
 
 # copy this checkout into the fixture rather than relying on symlink behaviour
 # under the native windows runner.
-rm -rf dep
-mkdir -p dep/std
-cp ../../mach.toml dep/std/mach.toml
-cp -r ../../src dep/std/src
+"$mach" dep pull . --quiet
 
 echo "building the SIGPIPE probe with $mach (target $target)"
 rm -rf out

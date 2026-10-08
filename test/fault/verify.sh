@@ -24,9 +24,7 @@ cp "$root/mach.toml" "$scratch/repo/mach.toml"
 cp -R "$root/src" "$scratch/repo/src"
 cp "$here/mach.toml" "$scratch/repo/test/fault/mach.toml"
 cp -R "$here/src" "$scratch/repo/test/fault/src"
-mkdir -p "$scratch/repo/test/fault/dep/std"
-cp "$root/mach.toml" "$scratch/repo/test/fault/dep/std/mach.toml"
-cp -R "$root/src" "$scratch/repo/test/fault/dep/std/src"
+"$mach" dep pull "$scratch/repo/test/fault" --quiet
 git init --quiet "$scratch/repo"
 git -C "$scratch/repo" add -f mach.toml src test/fault
 

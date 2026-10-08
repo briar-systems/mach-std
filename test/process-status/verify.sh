@@ -43,10 +43,7 @@ decode() {
 }
 
 # copy this checkout rather than relying on symlink behaviour on Windows.
-rm -rf dep
-mkdir -p dep/std
-cp ../../mach.toml dep/std/mach.toml
-cp -r ../../src dep/std/src
+"$mach" dep pull . --quiet
 
 cc="${CC:-cc}"
 child="$here/out/native-child"

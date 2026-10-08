@@ -28,9 +28,7 @@ cd "$here"
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
 rm -rf dep out
-mkdir -p dep/std
-cp ../../mach.toml dep/std/mach.toml
-cp -r ../../src dep/std/src
+"$mach" dep pull . --quiet
 
 case "$target" in
     *x86_64) names=(aes pclmul sha) ;;
