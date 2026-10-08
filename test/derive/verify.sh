@@ -13,11 +13,17 @@ set -euo pipefail
 mach="${1:-mach}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$here/../lib/compiler.sh"
-cd "$here"
+root="$(cd "$here/../.." && pwd)"
+work="$here/out/probe"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
-# copy the dependency inside the fixture project
+# the generated cases build in a scratch copy, so the tracked project stays
+# one formatted program and never holds a case
+rm -rf "$work"
+mkdir -p "$work"
+sed "s#^path = \"../..\"#path = \"$root\"#" "$here/mach.toml" > "$work/mach.toml"
+cd "$work"
 "$mach" dep pull . --quiet
 
 emit() {
