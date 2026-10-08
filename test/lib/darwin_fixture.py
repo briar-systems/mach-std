@@ -72,13 +72,14 @@ class Fixture:
         }
 
     def build(self, artifact):
+        # mach resolves -o against the project root and refuses an absolute path
         output = self.work / "bin" / artifact
         succeed([self.mach, "dep", "pull", self.here, "--quiet"], "mach dep pull", 600)
         census = run([sys.executable, ROOT / "test" / "lib" / "compiler-census.py", self.evidence,
                       "build", self.here, self.target, self.profile], 60)
         check(census.returncode == 0, f"compiler census refused the build: {census.stderr.decode().strip()}")
         succeed([self.mach, "build", self.here, "--target", self.target, "--profile", self.profile,
-                 "-o", output], "mach build", 1200)
+                 "-o", output.relative_to(self.here)], "mach build", 1200)
         check(output.is_file(), f"mach build produced no {output}")
         return output
 
