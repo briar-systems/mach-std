@@ -229,49 +229,8 @@ for target in "${targets[@]}"; do
                 ;;
         esac
         if [ "$profile" = release ]; then
-            release_body="$(sed -n '/std.memory.secret.deallocate:/,/std.memory.secret.random_fill:/p' "$storage_asm")"
-            # a wipe is a call to the zeroize kernel, or the kernel's wide zero stores where it inlined
-            case "$target" in
-                *-x86_64) kernel_stores='(movups|movaps) xmmword ptr \[[^]]*\], xmm0' ;;
-                *-arm64|*-aarch64) kernel_stores='stp xzr, xzr' ;;
-                linux-riscv64) kernel_stores='sd zero, ' ;;
-            esac
-            wipe_line="$(echo "$release_body" | grep -n -m1 -E "std\.crypto\.ct\.zeroize([^_]|\$)|$kernel_stores" | cut -d: -f1 || true)"
-            case "$target" in
-                linux-*)
-                    release_line="$(echo "$release_body" | grep -n -m1 -E 'syscall|ecall|svc|native_release' | cut -d: -f1 || true)"
-                    ;;
-                darwin-*)
-                    release_line="$(echo "$release_body" | grep -n -m1 -E '_free|native_release' | cut -d: -f1 || true)"
-                    ;;
-                windows-*)
-                    release_line="$(echo "$release_body" | grep -n -m1 -E 'VirtualFree|native_release' | cut -d: -f1 || true)"
-                    ;;
-            esac
-            [ -n "$wipe_line" ] || fail "$target release: secret release wipe missing from assembly"
-            [ -n "$release_line" ] || fail "$target release: native release missing from assembly"
-            [ "$wipe_line" -lt "$release_line" ] \
-                || fail "$target release: native release precedes secret wipe in assembly"
-
-            typed_release_body="$(sed -n '/# std.memory.secret.release_typed\$backends.main.SecretRecord:/,/^# /p' "$main_asm")"
-            typed_wipe_line="$(echo "$typed_release_body" | grep -n -m1 -E "std\.crypto\.ct\.zeroize([^_]|\$)|std\.memory\.secret\.wipe_typed|$kernel_stores" | cut -d: -f1 || true)"
-            case "$target" in
-                *-x86_64)
-                    typed_release_line="$(echo "$typed_release_body" | grep -n -E 'call r[0-9]+' | tail -1 | cut -d: -f1 || true)"
-                    ;;
-                *-arm64|*-aarch64)
-                    typed_release_line="$(echo "$typed_release_body" | grep -n -E 'blr x[0-9]+' | tail -1 | cut -d: -f1 || true)"
-                    ;;
-                linux-riscv64)
-                    typed_release_line="$(echo "$typed_release_body" | grep -n -E 'jalr ra, 0\(' | tail -1 | cut -d: -f1 || true)"
-                    ;;
-            esac
-            [ -n "$typed_wipe_line" ] \
-                || fail "$target release: typed full-layout wipe missing from assembly"
-            [ -n "$typed_release_line" ] \
-                || fail "$target release: typed native release missing from assembly"
-            [ "$typed_wipe_line" -lt "$typed_release_line" ] \
-                || fail "$target release: native typed release precedes full-layout wipe in assembly"
+            python3 "$here/verify-asm.py" "$here/mach.toml" "$target" "$storage_asm" "$main_asm" \
+                || fail "$target release: secret assembly contract failed"
         fi
 
         echo "OK: $target $profile backends compile ($exe)"
