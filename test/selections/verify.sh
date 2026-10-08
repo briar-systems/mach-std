@@ -23,7 +23,7 @@ cp -R "$root/src" "$repo/src"
 python3 "$here/entry.py" "$repo/src" "$repo/src/lib/every_test.mach" "$scratch/modules.txt"
 link="$(sed -n '/^\[artifact\.std\]/,/^\[/s/^link *= *//p' "$root/mach.toml")"
 [ -n "$link" ] || fail "mach.toml has no link list for the std artifact"
-printf '\n[artifact.every-test]\nkind = "static"\nentry = "lib/every_test.mach"\nout = "lib/every-test"\ntargets = ["*"]\nlink = %s\nneed = []\n' \
+printf '\n[artifact.every-test]\nkind = "static"\nentry = "lib/every_test.mach"\nout = "{project.work}/lib/every-test"\ntargets = ["*"]\nlink = %s\nneed = []\n' \
     "$link" >> "$repo/mach.toml"
 
 targets="$(sed -n 's/^\[target\.\([^]]*\)\]$/\1/p' "$root/mach.toml")"
