@@ -19,10 +19,7 @@ fail() { echo "FAIL: $1" >&2; exit 1; }
 
 case "$target" in darwin-*) ;; *) fail "the darwin probe has no $target target" ;; esac
 
-rm -rf dep
-mkdir -p dep/std
-cp ../../mach.toml dep/std/mach.toml
-cp -r ../../src dep/std/src
+"$mach" dep pull . --quiet
 
 for profile in debug release; do
     echo "building the darwin probe with $mach (target $target, profile $profile)"

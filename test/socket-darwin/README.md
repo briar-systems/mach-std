@@ -1,7 +1,7 @@
 # Darwin socket boundary probe
 
-Run natively on both Darwin architectures with debug and release builds. Snapshot
-the exact std manifest and source under this fixture's `dep/std`, then build the
+Run natively on both Darwin architectures with debug and release builds. Realize
+std with `mach dep pull` (the manifest points at the enclosing tree), then build the
 Mach probe with the matching target, profile and explicit `-o bin/socket`.
 
 Compile `layout.c` with the native SDK using C11 and warnings as errors. It checks

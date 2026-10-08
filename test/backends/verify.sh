@@ -18,10 +18,7 @@ command -v llvm-nm >/dev/null || fail "llvm-nm is required"
 command -v llvm-readobj >/dev/null || fail "llvm-readobj is required"
 
 # copy the dependency inside the fixture project
-rm -rf dep
-mkdir -p dep/std
-cp ../../mach.toml dep/std/mach.toml
-cp -R ../../src dep/std/src
+"$mach" dep pull . --quiet
 
 # the supported-boundary shape of a cross-built darwin image (#415)
 #

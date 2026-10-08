@@ -8,10 +8,7 @@ root="$(cd "$here/../.." && pwd)"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
-rm -rf "$here/dep"
-mkdir -p "$here/dep/std"
-cp "$root/mach.toml" "$here/dep/std/mach.toml"
-cp -R "$root/src" "$here/dep/std/src"
+"$mach" dep pull "$here" --quiet
 
 cd "$here"
 set +e
