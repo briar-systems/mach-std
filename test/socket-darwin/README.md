@@ -1,64 +1,53 @@
 # Darwin socket boundary probe
 
-Run natively on both Darwin architectures with debug and release builds. Realize
-std with `mach dep pull` (the manifest points at the enclosing tree), then build the
-Mach probe with the matching target, profile and explicit `-o bin/socket`.
+`verify.py` checks the darwin socket boundary against the host SDK. Run it on a
+native darwin host whose architecture matches the target, once per profile:
 
-Compile `layout.c` with the native SDK using C11 and warnings as errors. It checks
-all fifteen public function signatures and retains a reference to every symbol.
-Compare its output to `bin/socket layout` and inspect the C object's undefined
-symbols against the Mach image's imports. This detects SDK aliases as well as
-record size, alignment and field offsets. Run the C probe with `option` and
-compare its raw SO_KEEPALIVE value and length with the Mach `stream` output.
-An enabled native option need only be nonzero, not normalized to one. Endpoint
-checks compare the address fields, excluding reserved sockaddr padding.
+```sh
+python3 test/socket-darwin/verify.py <mach> darwin-aarch64 debug
+python3 test/socket-darwin/verify.py <mach> darwin-aarch64 release
+```
 
-The `errors`, `stream`, `vectors`, `messages` and `datagrams` modes must each exit
-zero. Stream and datagram traffic stays local. Blocking network reads have receive
-timeouts. The stream mode checks accepted flags before publication, endpoint
-agreement, options, would-block and shutdown EOF. The vector mode saturates a
-bounded local socket buffer, requires a positive partial count, and compares every
-received byte. The message mode verifies scatter/gather, transferred descriptor
-ownership, payload and ancillary truncation, and descriptor counts after discarded
-rights. The datagram mode checks explicit destination and returned source lengths.
+`test/lib/darwin_fixture.py` owns how a darwin fixture is built and run: std
+resolves from the tree under test through `../..`, the C oracles build with the host
+SDK, and a pass prints one JSON record with the compiler, the std commit and every
+check result. Any failure or timeout exits nonzero with the failing check.
+`test/lib/darwin-fixtures.py <mach> <target> <profile>` runs every fixture.
 
-`create-refusal` and `accept-refusal` are verification-only entry points for a
-controlled native flag-configuration error. The verifier must inject EIO into the
-corresponding configuration result, require the invalid output sentinel and
-unchanged descriptor count, then remove only the cleanup close and require the
-specific descriptor-leak failure. These modes are not baseline success tests.
+The verifier checks:
 
-Use the existing native fixture to run the socket, TCP, UDP and Darwin async tests
-as additional coverage. Record source/compiler provenance and a clear compiler
-process census before every Mach build or test. Timeouts and compilation failures
-never count as successful runtime controls.
+- `layout.c` statically checks every public socket function signature it declares
+  with `CHECK`, the control header ABI and the message flags. Its record layout
+  output must equal `socket layout`.
+- Each `CHECK` function binds exactly one symbol in the C object, and the Mach image
+  imports that same spelling, so an SDK alias is caught.
+- `errors` and `datagrams` exit zero and print nothing. `errors` covers invalid
+  descriptors and out-of-range lengths. `datagrams` checks explicit destination and
+  returned source lengths over local UDP with receive timeouts.
+- `stream` prints the SO_KEEPALIVE value and length it read, which must equal what
+  `layout.c option` reads natively. An enabled option need only be nonzero. The mode
+  itself checks accepted flags, endpoint agreement, would-block and shutdown EOF.
+- `vectors` saturates a bounded local socket buffer, compares every received byte
+  and prints a positive partial count.
+- `messages` checks scatter/gather, transferred descriptor ownership and payload
+  truncation, then receives a plain datagram with a nil control buffer. Its count,
+  flags, control length and descriptor delta must equal `control.c` on the same
+  host. A nil control buffer requests no ancillary output, so `MSG_CTRUNC` is not
+  required.
+- `local-bytes`, `local-async` and `internet-async-capability` check the byte-only
+  local contract and must print exactly their expected line. `local-bytes` reads a
+  clean prefix, then refuses eight queued rights messages with an unchanged
+  descriptor count and releases every queued pipe writer on close. `local-async`
+  completes a read as unsupported with zero bytes, then closes. The internet backend
+  refuses a local handle before claiming a token or slot, keeps EBADF for an invalid
+  handle, and leaves the refused handle usable.
 
-The nil-control receive uses a plain datagram with no ancillary data and checks payload truncation, zero returned control length and no acquired descriptor. Its raw result, flags, length and descriptor-count delta must match `control.c` on the same host. A nil control buffer requests no ancillary output, so this case does not require `MSG_CTRUNC`. The separate nonempty rights transfer and returned-flags control retain their strict checks.
+The fixture counts its own descriptors. Production never does. Darwin can install
+an unreported descriptor when `SCM_RIGHTS` arrives with a nil control pointer, so
+this raw boundary does not promise safe descriptor discard. The rights-transfer
+case supplies a sufficient control buffer and closes what it receives.
 
-Darwin can install an unreported descriptor when receiving `SCM_RIGHTS` with a nil control pointer. Native C reproduces this kernel behavior. This raw boundary does not promise safe descriptor discard. The rights-transfer fixture supplies a sufficient control buffer and closes the returned descriptor.
-
-## Local byte ownership controls
-
-The `local-bytes`, `local-async` and `internet-async-capability` modes exercise the
-std 2.0 byte-only contract. All must exit zero on both Darwin architectures.
-The first queues a clean prefix followed by two messages with sixteen rights
-apiece. It requires the exact clean prefix, a zero-length no-op, an actual EFAULT
-peek, eight typed ancillary refusals and unchanged descriptor count. Closing the
-stream must release all queued pipe writers, observed as pipe EOF. The async mode
-requires an unsupported completion with zero bytes, then successful queued close
-and pipe EOF. The internet backend mode refuses a local handle before claiming a
-token or owner slot, retains EBADF for an invalid handle, and proves that the
-refused caller-owned local handle remains usable.
-
-These fixture processes may count their descriptors. Production never does.
-The 12-byte control region holds one native header solely to detect ancillary
-presence. It is not claimed to fit a rights payload. `layout.c` checks the native
-header size/alignment and MSG_PEEK value without changing the existing layout
-output. Existing raw adequate-buffer descriptor-transfer coverage remains intact.
-
-A removed-peek control must fail an exact ownership/value assertion in these new
-modes. Compile refusal, timeout or signal is not acceptance. The previously
-retained nil/tiny/plain-read leak probes need not run again. Source review also
-requires the consuming length to be the returned peek count, not the original
-request. No claim is made that the original-length mutation necessarily crosses
-a control-record boundary on XNU's current record traversal.
+`create-refusal` and `accept-refusal` are verification-only modes that pass only
+against a std whose flag configuration returns EIO. The verifier does not run them.
+std's own socket, TCP, UDP and async tests run through `test/native/verify.sh` and
+`mach test . --all` on darwin.
