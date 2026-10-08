@@ -12,6 +12,8 @@ python3 test/socket-darwin/verify.py <mach> darwin-aarch64 release
 resolves from the tree under test through `../..`, the C oracles build with the host
 SDK, and a pass prints one JSON record with the compiler, the std commit and every
 check result. Any failure or timeout exits nonzero with the failing check.
+Before each build it starts a compiler, holds it stopped and requires the compiler
+census to report that process by PID, then stops it by that PID.
 `test/lib/darwin-fixtures.py <mach> <target> <profile>` runs every fixture that owns
 a `verify.py` and declares the target in its `mach.toml`.
 
@@ -48,7 +50,19 @@ an unreported descriptor when `SCM_RIGHTS` arrives with a nil control pointer, s
 this raw boundary does not promise safe descriptor discard. The rights-transfer
 case supplies a sufficient control buffer and closes what it receives.
 
-`create-refusal` and `accept-refusal` are verification-only modes that pass only
-against a std whose flag configuration returns EIO. The verifier does not run them.
+The controls prove the verifier can fail on the paths it guards. Each builds a copy of
+the std tree under test in a fresh directory with one source construct changed, named
+in `verify.py` by its text. A construct that is not found exactly once fails the
+verifier. Production source carries no injection hooks.
+
+- `create-refusal` and `accept-refusal` exit 110 and 44 against the honest build. In a
+  copy whose flag configuration returns EIO they pass: the output is the invalid
+  sentinel and the descriptor count is unchanged. Removing only the cleanup close
+  from the creation path makes `create-refusal` exit 111, and from the accept path
+  makes `accept-refusal` exit 45, the descriptor leak.
+- In a copy with the `MSG_PEEK` removed from the local receive, `local-bytes` exits 133,
+  the ownership check that a refused rights message leaves the queue and the
+  descriptor count untouched.
+
 std's own socket, TCP, UDP and async tests run through `test/native/verify.sh` and
 `mach test . --all` on darwin.

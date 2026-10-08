@@ -6,10 +6,31 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import darwin_fixture
-from darwin_fixture import check, run, succeed
+from darwin_fixture import Edit, check, run, succeed
 
 # the mapping probe's file offset, past 32 bits so a truncated offset maps byte zero
 FAR = 0x140000000
+
+
+SHARED = "src/system/os/darwin/shared.mach"
+
+# the heap reservation fails, and separately the protection that extends it fails
+RESERVE = Edit(SHARED,
+               "    val mapped: ptr = ls.mmap(nil, os_shared.HEAP_RESERVE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);\n",
+               "    val mapped: ptr = ((-1)::isize::usize)::ptr;\n")
+PROTECT = Edit(SHARED,
+               "    val result: i32   = ls.mprotect(_brk_end::ptr, size, PROT_READ | PROT_WRITE);\n",
+               "    val result: i32   = -1;\n")
+
+
+def controls(fixture, executable):
+    # the refusal modes only pass against a std whose heap fails, and fail against the honest build
+    fixture.exits(executable, "heap-refused", 55, "heap-refused against the honest build")
+    fixture.exits(executable, "heap-refusal", 51, "heap-refusal against the honest build")
+    reserve = fixture.build("vm", fixture.mutate("reserve", RESERVE))
+    fixture.exits(reserve, "heap-refused", 0, "heap-refused")
+    protect = fixture.build("vm", fixture.mutate("protect", PROTECT))
+    fixture.exits(protect, "heap-refusal", 0, "heap-refusal")
 
 
 def denied(command, label):
@@ -63,6 +84,7 @@ def checks(fixture):
     check(mach_fault == fault, f"vm denied died by signal {mach_fault}, native.c by {fault}")
     results["denied"] = signal.Signals(fault).name
     results["mapping"] = mapping(fixture, executable)
+    controls(fixture, executable)
     return results
 
 
