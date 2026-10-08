@@ -18,10 +18,7 @@ command -v llvm-nm >/dev/null || fail "llvm-nm is required"
 command -v llvm-readobj >/dev/null || fail "llvm-readobj is required"
 
 # copy the dependency inside the fixture project
-rm -rf dep
-mkdir -p dep/std
-cp ../../mach.toml dep/std/mach.toml
-cp -R ../../src dep/std/src
+"$mach" dep pull . --quiet
 
 # the supported-boundary shape of a cross-built darwin image (#415)
 #
@@ -153,12 +150,12 @@ for target in "${targets[@]}"; do
     rm -rf "out/$target"
     for profile in "${profiles[@]}"; do
         echo "cross-compiling the $profile backend smoke test for $target with $mach"
-        log="$(mach_run build . --target "$target" --profile "$profile" \
+        exe="out/$target/$profile/backends"
+        log="$(mach_run build . --target "$target" --profile "$profile" -o "$exe" \
             --emit-ir --emit-asm -vv 2>&1)" \
             || { echo "$log" >&2; fail "$target $profile failed to compile"; }
 
-        exe="$(find "out/$target/$profile" -name backends -type f -print -quit)"
-        [ -n "$exe" ] || fail "$target $profile: no backends binary produced"
+        [ -f "$exe" ] || fail "$target $profile: no backends binary produced"
 
         # confirm the backend's shared module was actually compiled
         grep -q "skipped .* target-gated modules" <<< "$log" \
@@ -180,7 +177,9 @@ for target in "${targets[@]}"; do
         [ -f "$storage_asm" ] || fail "$target $profile: secret storage assembly missing"
         [ -f "$main_ir" ] || fail "$target $profile: typed boundary IR missing"
         [ -f "$main_asm" ] || fail "$target $profile: typed boundary assembly missing"
-        python3 "$here/verify-ir.py" "$secret_ir" "$storage_ir" "$main_ir" \
+        kernel_ir="out/$target/$profile/ir/std/crypto/ct.ir"
+        [ -f "$kernel_ir" ] || fail "$target $profile: zeroize IR missing"
+        python3 "$here/verify-ir.py" "$secret_ir" "$storage_ir" "$main_ir" "$kernel_ir" \
             || fail "$target $profile: secret IR contract failed"
         case "$target" in
             linux-*)
@@ -231,8 +230,13 @@ for target in "${targets[@]}"; do
         esac
         if [ "$profile" = release ]; then
             release_body="$(sed -n '/std.memory.secret.deallocate:/,/std.memory.secret.random_fill:/p' "$storage_asm")"
-            # every wipe is a call to the never-inlined zeroize kernel
-            wipe_line="$(echo "$release_body" | grep -n -m1 -E 'std\.crypto\.ct\.zeroize([^_]|$)' | cut -d: -f1 || true)"
+            # a wipe is a call to the zeroize kernel, or the kernel's wide zero stores where it inlined
+            case "$target" in
+                *-x86_64) kernel_stores='(movups|movaps) xmmword ptr \[[^]]*\], xmm0' ;;
+                *-arm64|*-aarch64) kernel_stores='stp xzr, xzr' ;;
+                linux-riscv64) kernel_stores='sd zero, ' ;;
+            esac
+            wipe_line="$(echo "$release_body" | grep -n -m1 -E "std\.crypto\.ct\.zeroize([^_]|\$)|$kernel_stores" | cut -d: -f1 || true)"
             case "$target" in
                 linux-*)
                     release_line="$(echo "$release_body" | grep -n -m1 -E 'syscall|ecall|svc|native_release' | cut -d: -f1 || true)"
@@ -250,7 +254,7 @@ for target in "${targets[@]}"; do
                 || fail "$target release: native release precedes secret wipe in assembly"
 
             typed_release_body="$(sed -n '/# std.memory.secret.release_typed\$backends.main.SecretRecord:/,/^# /p' "$main_asm")"
-            typed_wipe_line="$(echo "$typed_release_body" | grep -n -m1 -E 'std\.crypto\.ct\.zeroize([^_]|$)|std\.memory\.secret\.wipe_typed' | cut -d: -f1 || true)"
+            typed_wipe_line="$(echo "$typed_release_body" | grep -n -m1 -E "std\.crypto\.ct\.zeroize([^_]|\$)|std\.memory\.secret\.wipe_typed|$kernel_stores" | cut -d: -f1 || true)"
             case "$target" in
                 *-x86_64)
                     typed_release_line="$(echo "$typed_release_body" | grep -n -E 'call r[0-9]+' | tail -1 | cut -d: -f1 || true)"

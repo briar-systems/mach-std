@@ -21,10 +21,7 @@ cd "$here"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
-rm -rf dep
-mkdir -p dep/std
-cp ../../mach.toml dep/std/mach.toml
-cp -r ../../src dep/std/src
+"$mach" dep pull . --quiet
 
 echo "building the stack guard probe with $mach (target $target)"
 rm -rf out

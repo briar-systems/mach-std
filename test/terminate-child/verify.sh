@@ -35,10 +35,7 @@ decode() {
 }
 
 # copy this checkout rather than relying on symlink behaviour on Windows.
-rm -rf dep
-mkdir -p dep/std
-cp ../../mach.toml dep/std/mach.toml
-cp -r ../../src dep/std/src
+"$mach" dep pull . --quiet
 
 echo "building the terminate-child probe with $mach (target $target)"
 rm -rf out

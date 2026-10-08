@@ -15,11 +15,12 @@ if grep -REn 'failure_stage|THREAD_SPAWN_FAIL|thread_resource_count' "$root/src"
 fi
 
 fixture="$scratch/repo/test/thread-resources"
-mkdir -p "$fixture/src" "$fixture/dep/std"
+mkdir -p "$fixture/src"
 cp "$here/mach.toml" "$fixture/mach.toml"
 cp -R "$here/src/." "$fixture/src"
-cp "$root/mach.toml" "$fixture/dep/std/mach.toml"
-cp -R "$root/src" "$fixture/dep/std/src"
+cp "$root/mach.toml" "$scratch/repo/mach.toml"
+cp -R "$root/src" "$scratch/repo/src"
+"$mach" dep pull "$fixture" --quiet
 git init --quiet "$scratch/repo"
 git -C "$scratch/repo" add -f test/thread-resources
 

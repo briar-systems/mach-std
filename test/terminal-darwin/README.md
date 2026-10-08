@@ -21,7 +21,7 @@ The probe checks:
 - Repeated enable and disable calls preserve the existing state contract.
 
 On each Darwin architecture, copy this fixture into an owned project directory
-and snapshot the exact standard library manifest and `src` tree into `dep/std`.
+and point its `[dep.std]` path at the std checkout, then run `mach dep pull`.
 Build `layout.c` with the native SDK using `xcrun clang -std=c11 -Wall -Wextra
 -Werror layout.c -o layout`. Build the Mach artifact with both `debug` and
 `release` profiles, explicit `-o bin/terminal`, and the matching `darwin-x86_64`

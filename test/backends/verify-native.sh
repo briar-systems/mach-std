@@ -11,16 +11,13 @@ root="$(cd "$here/../.." && pwd)"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
-rm -rf "$here/dep"
-mkdir -p "$here/dep/std"
-cp "$root/mach.toml" "$here/dep/std/mach.toml"
-cp -R "$root/src" "$here/dep/std/src"
+"$mach" dep pull "$here" --quiet
 
 cd "$here"
 rm -rf "out/$target"
-mach_run build . --target "$target" --profile "$profile"
-exe="$(find "out/$target" -type f \( -name backends -o -name 'backends.exe' \) -print -quit)"
-[ -n "$exe" ] || fail "$target produced no native executable"
+exe="out/$target/$profile/backends"
+mach_run build . --target "$target" --profile "$profile" -o "$exe"
+[ -f "$exe" ] || fail "$target produced no native executable"
 
 echo "running $exe"
 "$exe"

@@ -32,10 +32,7 @@ decode() {
     esac
 }
 
-rm -rf dep
-mkdir -p dep/std
-cp ../../mach.toml dep/std/mach.toml
-cp -r ../../src dep/std/src
+"$mach" dep pull . --quiet
 
 echo "building the dit probes with $mach (target $target)"
 rm -rf out
