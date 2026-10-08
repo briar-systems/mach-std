@@ -1,5 +1,11 @@
 # std 9.x to 10.0.0
 
+## a heap over a backing that never reclaims keeps its spans (#883)
+
+`heap.allocator_source` reads the backing's `retains` flag once, when the source is built. Over a backing that does not reclaim, such as `allocator.fixed`, `allocator.arena` or `allocator.bump`, the source can no longer release, so the heap keeps every span it obtained and reuses it. Growing past the `init` budget again takes nothing more from the backing, where before each span handed back was lost to it. Over a reclaiming backing nothing changes.
+
+The visible difference is teardown. `dnit` on such a heap leaves `mapped_bytes` at what the heap held, because the backing never took the spans back. Code that expected `mapped_bytes(h) == 0` after `dnit` there should reclaim through the backing instead, for example by resetting the fixed buffer. Set the backing's `retains` before calling `allocator_source`.
+
 ## filesystem.transaction takes its digest from the caller (#1003)
 
 `prepare` and `prepare_bytes` no longer compute a sha-256. Their `want_digest: bool` parameter becomes `digest: *hasher.Hasher`, a caller-owned running digest the transaction feeds every byte written, or `nil` for none. `transaction_has_digest` and `transaction_digest` are removed. The transaction never finishes or stores a digest, so any hash fits, whatever its output size.
