@@ -1,11 +1,50 @@
 # Darwin VM boundary probe
 
-The native verifier builds this fixture with the checksum-verified mach release pinned for the family in briar-systems/.github on both Darwin architectures in debug and release. `mach dep pull` realizes the candidate source from the enclosing tree.
+`verify.py` checks the darwin virtual memory boundary against the host SDK. Run it
+on a native darwin host whose architecture matches the target, once per profile:
 
-Before Mach execution, native.c checks SDK signatures, LP64 widths, constants and actual public import spellings. Its real error results and valid lock/advice results must match Mach exactly. Lock error probes use an owned mapping and SIZE_MAX minus one page as the length. The requested end overflows and remains below the start after page rounding. A separate native map/protect/unmap/protect sequence validates the release oracle before Mach execution. The Mach reallocation test checks that protection of each released range fails, rather than interpreting residency as mapping ownership. Its write to a read-only mapping establishes the host fault signal used by the Mach protection probe. Both children must first print the readiness marker. No timeout counts as a protection fault.
+```sh
+python3 test/vm-darwin/verify.py <mach> darwin-aarch64 debug
+python3 test/vm-darwin/verify.py <mach> darwin-aarch64 release
+```
 
-The mapping mode requires an exclusively owned sparse file supplied by the verifier. Byte0 is A and byte0x140000000 is B. The probe maps the latter offset, requires B, writes Z and syncs. The host independently checks the old byte and mapped byte. This catches accidental 32-bit offset truncation without allocating gigabytes of resident memory.
+`test/lib/darwin_fixture.py` owns how a darwin fixture is built and run: std
+resolves from the tree under test through `../..`, the C oracles build with the host
+SDK, and a pass prints one JSON record with the compiler, the std commit and every
+check result. Any failure or timeout exits nonzero with the failing check.
+`test/lib/darwin-fixtures.py <mach> <target> <profile>` runs every fixture that owns
+a `verify.py` and declares the target in its `mach.toml`. std CI
+builds its compiler from `MACH_REF` in `.github/workflows/ci.yml`, and that is the
+compiler to pass.
 
-Each heap test runs in its own process. Preparation-time native failure controls verify that failed reservation publishes no base and failed protection publishes no extended end. They inject native results only in verification source, never in production. The existing mapping and allocator guard tests run against the baseline snapshot separately.
+Before the Mach probe builds, `native.c` runs as the oracle:
 
-The public API retains nil on mapping failure and negative errno on integer-result failure. mmap uses MAP_FAILED, not nil or a broad signed-address check. Mapping offsets outside signed off_t are rejected before conversion. No allocator, heap reservation size, mapping ownership or concurrency contract changes.
+- It statically checks the SDK signatures, LP64 widths and constants.
+- Its `errors` and `access` results are recorded for comparison. Lock error probes
+  use an owned mapping and SIZE_MAX minus one page as the length, so the requested
+  end overflows and stays below the start after page rounding.
+- `released` maps, protects and unmaps a page and requires protecting the released
+  range to fail, which validates the release check the Mach `basic` mode relies on.
+- `denied` writes to a read-only mapping after printing `fault-ready`. The signal it
+  dies by is the host fault signal.
+
+Then the Mach probe runs, each mode in its own process:
+
+- `layout` equals the native widths, and every function `native.c` declares with
+  `CHECK` is imported by the Mach image under the spelling the SDK binds.
+- `errors` and `access` print exactly what `native.c` printed. The public API keeps
+  nil on mapping failure and negative errno on integer-result failure.
+- `basic` grows an allocation, checks its contents and requires protection of each
+  released range to fail, rather than reading residency as mapping ownership.
+- `heap` extends the heap region and checks its end, and `adapters` drives the page
+  and bump allocators. Both exit zero and print nothing.
+- `denied` prints `fault-ready` and dies by the same signal as `native.c`. Exiting,
+  printing anything else or timing out is a failure.
+- `mapping` gets a sparse file the verifier creates exclusively, with byte 0 set to
+  A and byte 0x140000000 set to B. The probe rejects an invalid descriptor, an unaligned offset, offsets
+  outside signed off_t and empty lengths, then maps the far offset, requires B,
+  writes Z and syncs. The verifier then reads A at byte 0 and Z at the far offset,
+  which catches a 32-bit offset truncation without gigabytes of resident memory.
+
+`heap-refusal` and `heap-refused` are verification-only modes that pass only against
+a std whose heap reservation or protection fails. The verifier does not run them.

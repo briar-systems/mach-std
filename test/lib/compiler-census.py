@@ -13,13 +13,26 @@ import sys
 # compiler still refuses rather than passing silently; one that vanished between the
 # listing and the read is gone and does not count. `seen` in the record keeps the unfiltered
 # list for the evidence
+def working_directory(pid):
+    if sys.platform == 'darwin':
+        # darwin has no /proc, lsof names the cwd and ps tells a vanished process from an unreadable one
+        result = subprocess.run(['lsof', '-a', '-p', pid, '-d', 'cwd', '-Fn'], capture_output=True, text=True)
+        for field in result.stdout.splitlines():
+            if field.startswith('n'):
+                return Path(field[1:]).resolve()
+        if subprocess.run(['ps', '-p', pid, '-o', 'pid='], capture_output=True).returncode != 0:
+            raise FileNotFoundError(pid)
+        raise PermissionError(pid)
+    return Path(os.readlink('/proc/' + pid + '/cwd')).resolve()
+
+
 def within_checkout(listing):
     root = Path(__file__).resolve().parents[2]
     kept = []
     for line in listing.splitlines():
         pid = line.split(' ', 1)[0]
         try:
-            cwd = Path(os.readlink('/proc/' + pid + '/cwd')).resolve()
+            cwd = working_directory(pid)
         except FileNotFoundError:
             # the process exited between the listing and this read; it is not running
             continue
@@ -39,8 +52,9 @@ def census(label, evidence):
                    "-and $_.CommandLine -match '\\s(build|test)(\\s|$)' } | "
                    'Select-Object ProcessId, Name, CommandLine) | ConvertTo-Json -Compress']
     else:
-        command = ['pgrep', '-af',
-                   r'^(\S*/)?(mach|m[0-9A-Za-z]*|A|B|C|D)(\.exe)? (build|test)( |$)']
+        # linux pgrep lists the command line with -a, darwin's with -l (its -a adds ancestors)
+        command = ['pgrep', '-lf' if sys.platform == 'darwin' else '-af',
+                   r'^([^[:space:]]*/)?(mach|m[0-9A-Za-z]*|A|B|C|D)(\.exe)? (build|test)( |$)']
     result = subprocess.run(command, capture_output=True, text=True)
     valid = not result.stderr.strip() and result.returncode in ((0,) if os.name == 'nt' else (0, 1))
     processes = result.stdout.strip()

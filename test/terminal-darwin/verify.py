@@ -1,14 +1,16 @@
 import array
 import copy
 import fcntl
-import json
 import os
-import pathlib
 import select
 import subprocess
 import sys
 import termios
 import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import darwin_fixture
 
 
 def write(fd, data):
@@ -119,10 +121,13 @@ def run(executable, layout, native_errors):
         os.close(slave)
 
 
+def checks(fixture):
+    _, layout = fixture.clang("layout.c")
+    executable = fixture.build("terminal")
+    expected = darwin_fixture.succeed([layout], "layout.c")
+    native = darwin_fixture.succeed([layout, "nonterminal"], "layout.c nonterminal", stdin=subprocess.DEVNULL)
+    return run(str(executable), expected, native)
+
+
 if __name__ == "__main__":
-    assert sys.platform == "darwin", "the terminal probe requires native Darwin"
-    layout = subprocess.check_output([sys.argv[2]], timeout=10)
-    native = subprocess.run([sys.argv[2], "nonterminal"], stdin=subprocess.DEVNULL,
-                            capture_output=True, timeout=10)
-    assert native.returncode == 0, native
-    print(json.dumps(run(str(pathlib.Path(sys.argv[1]).resolve()), layout, native.stdout), sort_keys=True))
+    darwin_fixture.main(__file__, checks)

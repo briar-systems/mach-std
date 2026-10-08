@@ -1,16 +1,32 @@
 # Darwin terminal contract probe
 
-This native Darwin probe requires a real pseudoterminal. A separate pipe carries
-phase acknowledgements, so test commands never become terminal input. The host
-retains the slave descriptor and compares every termios field before, during and
-after raw mode. Kernel queue counts acknowledge input arrival before the child
-polls or flushes it. Timeouts diagnose a stalled phase and never count as success.
+`verify.py` checks the darwin terminal contract against a real pseudoterminal. Run
+it on a native darwin host whose architecture matches the target, once per profile:
 
-The probe checks:
+```sh
+python3 test/terminal-darwin/verify.py <mach> darwin-aarch64 debug
+python3 test/terminal-darwin/verify.py <mach> darwin-aarch64 release
+```
 
-- The SDK termios layout, constants and typed C function signatures against Mach.
-- `/dev/null` rejects raw mode and flushing with the same producer errors as the
-  native C calls. The wrappers preserve those negative errno codes in
+`test/lib/darwin_fixture.py` owns how a darwin fixture is built and run: std
+resolves from the tree under test through `../..`, the C oracles build with the host
+SDK, and a pass prints one JSON record with the compiler, the std commit and every
+check result. Any failure or timeout exits nonzero with the failing check.
+`test/lib/darwin-fixtures.py <mach> <target> <profile>` runs every fixture that owns
+a `verify.py` and declares the target in its `mach.toml`.
+
+The verifier always supplies a PTY for terminal behavior. A separate pipe carries
+phase acknowledgements, so test commands never become terminal input. The verifier
+keeps the slave descriptor and compares every termios field before, during and after
+raw mode. Kernel queue counts acknowledge input arrival before the child polls or
+flushes it. Nonterminal behavior is a distinct run with stdin on `/dev/null`.
+
+It checks:
+
+- `layout.c` statically checks the typed C signatures of `tcgetattr`, `tcsetattr`
+  and `tcflush`. Its termios layout and constants output must equal `terminal layout`.
+- `/dev/null` rejects raw mode and flushing with the same errors as the native C
+  calls in `layout.c nonterminal`. The wrappers keep those negative errno codes in
   `TermError.native`, leave raw mode inactive and permit an inactive disable. A
   closed input descriptor produces a poll error carrying `EBADF`.
 - Raw mode clears only `ICANON` and `ECHO` and sets `VMIN` and `VTIME` to zero.
@@ -19,17 +35,3 @@ The probe checks:
 - Flushing removes queued input and still permits subsequent input.
 - Disabling restores the complete original settings and flushes unread input.
 - Repeated enable and disable calls preserve the existing state contract.
-
-On each Darwin architecture, copy this fixture into an owned project directory
-and point its `[dep.std]` path at the std checkout, then run `mach dep pull`.
-Build `layout.c` with the native SDK using `xcrun clang -std=c11 -Wall -Wextra
--Werror layout.c -o layout`. Build the Mach artifact with both `debug` and
-`release` profiles, explicit `-o bin/terminal`, and the matching `darwin-x86_64`
-or `darwin-aarch64` target.
-Then run `python3 verify.py bin/terminal ./layout` after each build. The runner
-must record the exact compiler and std source, a clear compiler-process census
-before every Mach build or test, and both profile results.
-
-The host probe always supplies a PTY for terminal behavior. A missing PTY is a
-failure. Nonterminal behavior is a distinct invocation with stdin connected to
-`/dev/null`.
