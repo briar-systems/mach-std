@@ -22,8 +22,9 @@
 # through a pointer the pass cannot place, and every call, clobbers each slot at
 # or above the lowest frame address that escaped (stored to memory, passed in an
 # argument register, or fed to an operation the pass does not model), the
-# caller's memory above the entry stack pointer, and the win64 home area. a
-# callee is assumed to write no stack argument slots beyond that home area.
+# caller's memory above the entry stack pointer, and the call's outgoing area:
+# the home area and every slot from the stack pointer at the call up to the
+# highest frame address stored since the previous call.
 from pathlib import Path
 import importlib.util
 import re
@@ -58,7 +59,7 @@ def unreadable(message):
 # per abi: integer argument registers, where the hidden result pointer goes
 # ('shift' takes the first argument register), the entry stack offset of the
 # first stack argument, the home area a callee owns above the call's stack
-# pointer, the registers a call preserves, and the frame pointer
+# pointer (which is also where the call's own stack arguments begin), the registers a call preserves, and the frame pointer
 ABIS = {
     'sysv64': dict(args=['rdi', 'rsi', 'rdx', 'rcx', 'r8', 'r9'], sret='shift', stack=8, home=0,
                    saved={'rbx', 'rbp', 'rsp', 'r12', 'r13', 'r14', 'r15'}, sp='rsp', fp='rbp'),
@@ -142,19 +143,21 @@ def show(v):
 
 
 class State:
-    def __init__(self, regs, mem, floor):
-        self.regs, self.mem, self.floor = regs, mem, floor
+    def __init__(self, regs, mem, floor, sp, out=NOWHERE):
+        # sp: the stack pointer's register. out: the end of the highest frame slot stored
+        # through it since the previous call
+        self.regs, self.mem, self.floor, self.sp, self.out = regs, mem, floor, sp, out
 
     def copy(self):
-        return State(dict(self.regs), dict(self.mem), self.floor)
+        return State(dict(self.regs), dict(self.mem), self.floor, self.sp, self.out)
 
     def __eq__(self, other):
-        return (self.regs, self.mem, self.floor) == (other.regs, other.mem, other.floor)
+        return (self.regs, self.mem, self.floor, self.out) == (other.regs, other.mem, other.floor, other.out)
 
     def join(self, other):
         regs = {r: v for r, v in self.regs.items() if other.regs.get(r) == v}
         mem = {o: v for o, v in self.mem.items() if other.mem.get(o) == v}
-        return State(regs, mem, min(self.floor, other.floor))
+        return State(regs, mem, min(self.floor, other.floor), self.sp, max(self.out, other.out))
 
     def get(self, reg):
         return self.regs.get(reg)
@@ -166,6 +169,9 @@ class State:
         return value
 
     def set(self, reg, value, *inputs):
+        # a new stack pointer starts a new frame, whose outgoing area is not yet written
+        if reg == self.sp:
+            self.out = NOWHERE
         if self.derive(value, *inputs) is None:
             self.regs.pop(reg, None)
         else:
@@ -188,9 +194,11 @@ class State:
             return None
         return self.mem.get(addr[2])
 
-    def store(self, addr, width, value):
+    def store(self, addr, width, value, via=None):
         self.escape(value)
         if is_frame(addr) and addr[1] == 1:
+            if via == self.sp:
+                self.out = max(self.out, addr[2] + width)
             self.forget(addr[2], width)
             if width == 8 and value is not None:
                 self.mem[addr[2]] = value
@@ -205,8 +213,10 @@ class State:
         sp = self.regs.get(abi['sp'])
         if not is_frame(sp):
             raise unreadable('the stack pointer is untraced at a call')
-        if abi['home']:
-            self.forget(sp[2], abi['home'])
+        outgoing = max(self.out, sp[2] + abi['home'])
+        if outgoing > sp[2]:
+            self.forget(sp[2], outgoing - sp[2])
+        self.out = NOWHERE
         self.regs = {reg: v for reg, v in self.regs.items() if not clobbers(reg)}
 
 
@@ -263,6 +273,8 @@ class X86:
     isa = 'x86_64'
     jump = 'jmp {label}'
     adjust = {'add': 'add {reg}, {imm}', 'sub': 'sub {reg}, {imm}'}
+    save = 'mov qword ptr [{sp}{off:+d}], {reg}'
+    restore = 'mov {reg}, qword ptr [{sp}{off:+d}]'
 
     def mem(self, operand, st):
         # (address, width) of a memory operand, or None when it is not one
@@ -272,7 +284,7 @@ class X86:
         width = X86_WIDTHS.get(match.group(1)) if match.group(1) else None
         if match.group(1) and width is None:
             raise unreadable('unknown operand size ' + match.group(1))
-        addr, sign = const(0), '+'
+        addr, sign, via = const(0), '+', None
         for token in re.findall(r'[+-]|[^\s+-]+', match.group(2)):
             if token in '+-':
                 sign = token
@@ -280,6 +292,7 @@ class X86:
             term = token.split('*')
             if term[0] in X86_NAMES:
                 value = self.reg(term[0], st)
+                via = via or X86_NAMES[term[0]][0]
                 if len(term) == 2:
                     value = mul(value, const(int(term[1])))
             elif number(token) is not None:
@@ -287,7 +300,7 @@ class X86:
             else:
                 value = None
             addr = st.derive(add(addr, value) if sign == '+' else sub(addr, value), addr, value)
-        return addr, width
+        return addr, width, via
 
     def reg(self, name, st):
         full, width = X86_NAMES[name]
@@ -318,7 +331,7 @@ class X86:
         mem = self.mem(operand, st)
         if mem is None:
             raise unreadable('unwritable operand ' + operand)
-        st.store(mem[0], mem[1] or width or 8, value)
+        st.store(mem[0], mem[1] or width or 8, value, mem[2])
 
     def decode(self, text, line, labels):
         text = re.sub(r'^\{disp32\}\s*', '', text)
@@ -421,7 +434,7 @@ class X86:
     def op_push(self, st, ops):
         value = self.read(ops[0], st)
         st.set('rsp', sub(st.get('rsp'), const(8)))
-        st.store(st.get('rsp'), 8, value)
+        st.store(st.get('rsp'), 8, value, 'rsp')
 
     def op_pop(self, st, ops):
         value = st.load(st.get('rsp'), 8)
@@ -443,6 +456,8 @@ class AArch64:
     isa = 'aarch64'
     jump = 'b {label}'
     adjust = {'add': 'add {reg}, {reg}, #{imm}', 'sub': 'sub {reg}, {reg}, #{imm}'}
+    save = 'str {reg}, [{sp}, #{off}]'
+    restore = 'ldr {reg}, [{sp}, #{off}]'
     widths = {'ldr': None, 'str': None, 'ldrb': 1, 'strb': 1, 'ldrh': 2, 'strh': 2, 'ldrsw': 4,
               'ldur': None, 'stur': None, 'ldp': None, 'stp': None}
 
@@ -475,10 +490,10 @@ class AArch64:
         offset = self.value(match.group(2), st) if match.group(2) else const(0)
         addr = st.derive(add(base, offset), base, offset)
         if match.group(3):
-            return addr, match.group(1), addr
+            return addr, match.group(1), addr, match.group(1)
         if len(ops) == 2:
-            return base, match.group(1), st.derive(add(base, self.value(ops[1], st)), base)
-        return addr, None, None
+            return base, match.group(1), st.derive(add(base, self.value(ops[1], st)), base), match.group(1)
+        return addr, None, None, match.group(1)
 
     def decode(self, text, line, labels):
         op, _, rest = text.partition(' ')
@@ -507,7 +522,7 @@ class AArch64:
     def memory(self, st, op, ops):
         pair = op in ('ldp', 'stp')
         regs, address = (ops[:2], ops[2:]) if pair else (ops[:1], ops[1:])
-        addr, base, writeback = self.address(address, st)
+        addr, base, writeback, via = self.address(address, st)
         for index, reg in enumerate(regs):
             parsed = a64_reg(reg)
             if parsed is None:
@@ -515,7 +530,7 @@ class AArch64:
             width = self.widths[op] or parsed[1]
             at = add(addr, const(index * width))
             if op.startswith('st'):
-                st.store(at, width, self.value(reg, st) if width == 8 else None)
+                st.store(at, width, self.value(reg, st) if width == 8 else None, via)
             else:
                 self.write(reg, st, st.load(at, width) if op != 'ldrsw' else None)
         if base is not None:
@@ -584,6 +599,8 @@ class RiscV64:
     isa = 'riscv64'
     jump = 'jal zero, {label}'
     adjust = {'add': 'addi {reg}, {reg}, {imm}', 'sub': 'addi {reg}, {reg}, -{imm}'}
+    save = 'sd {reg}, {off}({sp})'
+    restore = 'ld {reg}, {off}({sp})'
 
     def value(self, operand, st):
         if operand == 'zero':
@@ -635,8 +652,9 @@ class RiscV64:
                 ops[0], st, st.load(self.address(ops[1], st), width) if op == 'ld' else None))
         if op in RV_STORES:
             width = RV_STORES[op]
+            via = re.fullmatch(r'-?\w+\((\w+)\)', ops[1]).group(1)
             return Inst(text, line, 'op', apply=lambda st: st.store(
-                self.address(ops[1], st), width, self.value(ops[0], st) if width == 8 else None))
+                self.address(ops[1], st), width, self.value(ops[0], st) if width == 8 else None, via))
         handler = getattr(self, 'op_' + op, None)
         if handler is None:
             raise unreadable('unknown instruction ' + op + ': ' + text)
@@ -763,7 +781,7 @@ def entry_state(abi, sret, params):
             regs[slots[position]] = param(what)
         else:
             mem[abi['stack'] + 8 * (position - len(slots))] = param(what)
-    return State(regs, mem, 0)
+    return State(regs, mem, 0, abi['sp'])
 
 
 def flow(fn, abi, start, syscall):
@@ -880,7 +898,7 @@ def check(target, contract, lines):
                                for i, r in sorted(found.items()) if r != contract.region)
             raise Rejected('region', fn.name + ': the release ' + fn.where(index) + ' is reachable without a wipe of '
                            + want + ' (' + others + ')')
-    return fn, found, releases
+    return fn, found, releases, states
 
 
 def wipe_site(fn, found):
@@ -925,6 +943,29 @@ def bypass(fn, found):
     raise unreadable('control: ' + fn.name + ' has no branch whose taken arm avoids the wipe')
 
 
+def clobbered(target, fn, found, releases, states):
+    # the wipe's pointer is stored into a free outgoing stack slot of the call, and each release
+    # frees what it reads back from that slot after the call
+    abi, isa = target.abi, target.isa
+    call = next(iter(found))
+    base = states[call].get(abi['sp'])[2]
+    used = {o for st in states.values() for o in st.mem}
+    slot = base + abi['home']
+    while slot in used:
+        slot += 8
+    line = fn.insts[call].line
+    if ZEROIZE in fn.lines[line - 1]:
+        line -= 1
+    edits = [(line, isa.save.format(reg=abi['args'][0], sp=abi['sp'], off=slot - base))]
+    for index, regs in releases.items():
+        off = slot - states[index].get(abi['sp'])[2]
+        edits.append((fn.insts[index].line, isa.restore.format(reg=regs[0], sp=abi['sp'], off=off)))
+    lines = list(fn.lines)
+    for at, text in sorted(edits, reverse=True):
+        lines.insert(at, '  ' + text)
+    return lines
+
+
 def reversed_layout(target, fn):
     # the same graph with every labelled block after the first laid out in reverse
     blocks, current = [], []
@@ -947,7 +988,7 @@ def controls(target, sources):
     accepted, counts = [], {}
     for key, make in CONTRACTS.items():
         contract = make(target.os)
-        fn, found, releases = check(target, contract, function_lines(sources[key], contract.name))
+        fn, found, releases, states = check(target, contract, function_lines(sources[key], contract.name))
         label = contract.name.split('$')[0].rsplit('.', 1)[-1]
         name = label + ': reversed block layout'
         try:
@@ -961,6 +1002,8 @@ def controls(target, sources):
             ('wipe of the wrong pointer', 'region', adjusted(target, fn, found, 0, 'add', 8)),
             ('wipe of a short length', 'region', adjusted(target, fn, found, 1, 'sub', 1)),
             ('release of another pointer', 'region', moved(target, fn, releases)),
+            ('release of a pointer read back from a clobbered outgoing slot', 'unreadable',
+             clobbered(target, fn, found, releases, states)),
         ]
         for name, reason, changed in rejected:
             name = label + ': ' + name
