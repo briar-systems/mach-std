@@ -27,6 +27,18 @@ prepare_bytes(?t, ?alloc, claim, data, len, 0o644, ?hasher, options);
 sha256.final(?state, ?digest[0]);
 ```
 
+## filesystem.read_dir lists every entry (#1054)
+
+`read_dir` returns `res[Vector[Listed], FsError]` in place of `res[Vector[str], FsError]`. `Listed` is `tag Listed: u8 { name: str; unspellable: NativeName; }`, with `NativeName` from `std.runtime.native.view`, one per entry, in directory order. A windows directory can hold a name with an unpaired surrogate, which has no UTF-8 spelling. Before, such a name failed the whole listing with EINVAL. Now it is listed in sequence as `unspellable`, with its name in native units, so the native forms can reach it, and the listing goes on. Only a fault of the directory itself fails the listing. On linux and darwin every entry is a `name`.
+
+Release a listing with `listed_free(?entries)`, which frees every name of either kind and then the vector, in place of freeing each `str` and then `vector.dnit`. `read_dir_native(a, p)` lists a directory named in native units as `Vector[NativeName]`, released with `native_names_free`.
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `val names: Vector[str] = read_dir(a, p).ok` | `val entries: Vector[Listed] = read_dir(a, p).ok` |
+| `names.data[i]` | `val entry: Listed = entries.data[i]` then `if (sel entry.name) { ... entry.name ... }`, with `entry.unspellable` for a name with no UTF-8 spelling |
+| `str_free(a, names.data[i])` for each, then `vector.dnit[str](?names)` | `listed_free(?entries)` |
+
 ## the environment reads in native units and passes on only by the inherit form (#1065)
 
 A nil envp no longer means inherit. Every spawn and exec, in `std.process.exec` and `std.system.os` alike, refuses a nil envp with `EINVAL`. To hand a child this process's own environment, pass `exec.inherit_environment()`, or `exec.inherit_environment_native()` to a native spawn. It passes the native environment with no conversion: windows gives `CreateProcessW` a NULL environment and linux and darwin the envp the kernel gave the process, so a variable with no UTF-8 spelling reaches the child as it is. Before, a nil envp inherited on windows only, and linux and darwin handed the kernel a nil envp.
@@ -1109,7 +1121,7 @@ their shapes are frozen by this phase.
 | `filesystem.exists`, `is_file`, `is_dir`, `is_symlink` | `fun(p: Path) res[bool, io_error.Error]` (`ENOENT` and `ENOTDIR` are `ok{false}`) | yes |
 | `filesystem.create_dir`, `remove_file`, `remove_dir`, `rename`, `symlink` | `... err[io_error.Error]` | yes |
 | `filesystem.read_bytes` | `fun(a, p) res[Vector[u8], FsError]`; `read_string` `res[str, FsError]` (extent `size + 1`; a shrunk file is `read{eof{delivered}}`) | yes |
-| `filesystem.read_dir` | `fun(a, p) res[Vector[str], FsError]` (names owned by the caller, released whole on failure) | yes |
+| `filesystem.read_dir` | `fun(a, p) res[Vector[Listed], FsError]` (entries owned by the caller and released with `listed_free`, released whole on failure, an entry with no UTF-8 spelling listed as `unspellable`) | yes |
 | `filesystem.write_bytes` | `fun(p, data, len, mode) err[FsError]` (`write` carries the persisted prefix) | yes |
 | `filesystem.replace_bytes_atomic` | `fun(a, p, data, len, file_mode, dir_mode) err[FsError]` (`published{flush}` after the rename, every other case before it with the destination untouched) | yes |
 | `filesystem.create_dir_all`, `remove_all` | `... err[FsError]` (`remove_all` refuses roots and dot names as `removal` with `containment`) | yes |
