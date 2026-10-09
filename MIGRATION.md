@@ -29,7 +29,7 @@ sha256.final(?state, ?digest[0]);
 
 ## filesystem.read_dir lists every entry (#1054)
 
-`read_dir` returns `res[Vector[Listed], FsError]` in place of `res[Vector[str], FsError]`. `Listed` is `tag Listed: u8 { name: str; unspellable: NativeName; }`, one per entry, in directory order. A windows directory can hold a name with an unpaired surrogate, which has no UTF-8 spelling. Before, such a name failed the whole listing with EINVAL. Now it is listed in sequence as `unspellable`, with its name in native units, so the native forms can reach it, and the listing goes on. Only a fault of the directory itself fails the listing. On linux and darwin every entry is a `name`.
+`read_dir` returns `res[Vector[Listed], FsError]` in place of `res[Vector[str], FsError]`. `Listed` is `tag Listed: u8 { name: str; unspellable: NativeName; }`, with `NativeName` from `std.runtime.native.view`, one per entry, in directory order. A windows directory can hold a name with an unpaired surrogate, which has no UTF-8 spelling. Before, such a name failed the whole listing with EINVAL. Now it is listed in sequence as `unspellable`, with its name in native units, so the native forms can reach it, and the listing goes on. Only a fault of the directory itself fails the listing. On linux and darwin every entry is a `name`.
 
 Release a listing with `listed_free(?entries)`, which frees every name of either kind and then the vector, in place of freeing each `str` and then `vector.dnit`. `read_dir_native(a, p)` lists a directory named in native units as `Vector[NativeName]`, released with `native_names_free`.
 
