@@ -12,6 +12,8 @@ python3 test/terminal-darwin/verify.py <mach> darwin-aarch64 release
 resolves from the tree under test through `../..`, the C oracles build with the host
 SDK, and a pass prints one JSON record with the compiler, the std commit and every
 check result. Any failure or timeout exits nonzero with the failing check.
+Before each build it starts a compiler, holds it stopped and requires the compiler
+census to report that process by PID, then stops it by that PID.
 `test/lib/darwin-fixtures.py <mach> <target> <profile>` runs every fixture that owns
 a `verify.py` and declares the target in its `mach.toml`.
 

@@ -12,6 +12,8 @@ python3 test/vm-darwin/verify.py <mach> darwin-aarch64 release
 resolves from the tree under test through `../..`, the C oracles build with the host
 SDK, and a pass prints one JSON record with the compiler, the std commit and every
 check result. Any failure or timeout exits nonzero with the failing check.
+Before each build it starts a compiler, holds it stopped and requires the compiler
+census to report that process by PID, then stops it by that PID.
 `test/lib/darwin-fixtures.py <mach> <target> <profile>` runs every fixture that owns
 a `verify.py` and declares the target in its `mach.toml`. std CI
 builds its compiler from `MACH_REF` in `.github/workflows/ci.yml`, and that is the
@@ -46,5 +48,12 @@ Then the Mach probe runs, each mode in its own process:
   writes Z and syncs. The verifier then reads A at byte 0 and Z at the far offset,
   which catches a 32-bit offset truncation without gigabytes of resident memory.
 
-`heap-refusal` and `heap-refused` are verification-only modes that pass only against
-a std whose heap reservation or protection fails. The verifier does not run them.
+The controls prove the verifier can fail on the paths it guards. Each builds a copy of
+the std tree under test in a fresh directory with one source construct changed, named
+in `verify.py` by its text. A construct that is not found exactly once fails the
+verifier. Production source carries no injection hooks.
+
+- `heap-refused` exits 55 against the honest build. In a copy whose heap reservation
+  fails it passes: no base is published.
+- `heap-refusal` exits 51 against the honest build. In a copy whose protection fails
+  it passes: the heap end is not extended and the base is unchanged.

@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import darwin_fixture
-from darwin_fixture import check, succeed
+from darwin_fixture import Edit, check, succeed
 
 
 def line(output, mode):
@@ -18,6 +18,44 @@ def quiet(executable, mode):
     output = succeed([executable, mode], f"socket {mode}")
     check(output == b"", f"{mode} printed {output!r}, expected nothing")
     return True
+
+
+SHARED = "src/system/os/darwin/shared.mach"
+
+# the flag configuration answers EIO where it sets O_NONBLOCK
+REFUSE = Edit(SHARED,
+              "        val changed: i64 = set_file_flags(fd, current::i32 | O_NONBLOCK);\n",
+              "        val changed: i64 = EIO;\n")
+
+# each cleanup close sits in the creation or the accept path that owns the descriptor
+CREATE = "    val raw: i32 = ls.socket(domain, typ, protocol);\n"
+ACCEPT = "    val raw: i32 = ls.accept(fd::i32, addr, addrlen);\n"
+CLOSE = "    if (raw == -1) { ret ls.fail_errno(); }\n    val configured: i64 = configure_socket_flags(raw, nonblocking, non_inheritable);\n    if (configured < 0) {\n"
+
+
+def leak(path):
+    anchor = path + CLOSE + "        close(raw);\n"
+    return Edit(SHARED, anchor, anchor.replace("        close(raw);\n", ""))
+
+
+PEEK = Edit(SHARED,
+            "    val peeked: i64 = ls.recvmsg(fd::i32, ?message, ls.MSG_PEEK);\n",
+            "    val peeked: i64 = ls.recvmsg(fd::i32, ?message, 0);\n")
+
+
+def controls(fixture, executable):
+    # the refusal modes only pass against a std whose flag configuration fails, and fail against the honest build
+    fixture.exits(executable, "create-refusal", 110, "create-refusal against the honest build")
+    fixture.exits(executable, "accept-refusal", 44, "accept-refusal against the honest build")
+    refused = fixture.build("socket", fixture.mutate("refuse", REFUSE))
+    fixture.exits(refused, "create-refusal", 0, "create-refusal")
+    fixture.exits(refused, "accept-refusal", 0, "accept-refusal")
+    created = fixture.build("socket", fixture.mutate("leak-create", REFUSE, leak(CREATE)))
+    fixture.exits(created, "create-refusal", 111, "create-refusal without the cleanup close")
+    accepted = fixture.build("socket", fixture.mutate("leak-accept", REFUSE, leak(ACCEPT)))
+    fixture.exits(accepted, "accept-refusal", 45, "accept-refusal without the cleanup close")
+    peekless = fixture.build("socket", fixture.mutate("no-peek", PEEK))
+    fixture.exits(peekless, "local-bytes", 127, "local-bytes without the peek")
 
 
 def checks(fixture):
@@ -61,6 +99,7 @@ def checks(fixture):
         got = line(succeed([executable, mode], f"socket {mode}"), mode)
         check(got == want, f"{mode} printed {got!r}, expected {want!r}")
         results[mode] = got
+    controls(fixture, executable)
     return results
 
 
