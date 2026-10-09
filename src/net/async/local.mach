@@ -169,29 +169,53 @@ fun stream_at(driver: *Driver, index: usize) *StreamEntry {
     ret table.at(?driver.streams, index)::*StreamEntry;
 }
 
-# set up the slot table's newest chunk, every slot free
-fun adopt_slots(driver: *Driver) {
-    val chunk: usize = driver.slots.chunk_count - 1;
-    var index: usize = table.chunk_start(?driver.slots, chunk);
-    for (index < driver.slots.capacity) {
-        val slot: *Slot = slot_at(driver, index);
-        slot.state          = SLOT_FREE;
-        slot.generation     = 0;
-        slot.native_active  = false;
-        slot.listener_index = NONE;
-        slot.stream_index   = NONE;
-        index               = index + 1;
-    }
-    driver.slot_live[chunk] = 0;
-}
-
-# the runtime owns the index space, so the driver grows to whatever it hands out
+# the runtime owns the index space, so the driver grows to whatever it hands
+# out. growth writes no slot: the driver reads a slot only for a token the
+# runtime routed to it, and slot_take writes it before any read
 fun ensure_slot(driver: *Driver, index: usize) *Slot {
     for (driver.slots.capacity <= index) {
         if (!table.grow(?driver.slots)) { ret nil; }
-        adopt_slots(driver);
+        driver.slot_live[driver.slots.chunk_count - 1] = 0;
     }
     ret slot_at(driver, index);
+}
+
+# the slot of a token the runtime just routed to this driver, now active, or
+# nil when the table cannot grow to it. the runtime hands out an index only
+# once the operation it last held, on any source, is released, so the slot is
+# free whatever its bytes hold
+fun slot_take(driver: *Driver, token: io_runtime.Token, kind: io_runtime.Kind, resource: usize) *Slot {
+    val slot: *Slot = ensure_slot(driver, token.index::usize);
+    if (slot == nil) { ret nil; }
+    val chunk: usize = table.chunk_of(?driver.slots, token.index::usize);
+    driver.slot_live[chunk] = driver.slot_live[chunk] + 1;
+    slot.state              = SLOT_ACTIVE;
+    slot.generation         = token.generation;
+    slot.native_active      = false;
+    slot.listener_index     = NONE;
+    slot.stream_index       = NONE;
+    slot.kind               = kind;
+    slot.resource           = resource;
+    ret slot;
+}
+
+# the slot of a released token goes back to free
+fun slot_release(driver: *Driver, slot: *Slot, token: io_runtime.Token) {
+    slot.state          = SLOT_FREE;
+    slot.listener_index = NONE;
+    slot.stream_index   = NONE;
+    val chunk: usize = table.chunk_of(?driver.slots, token.index::usize);
+    driver.slot_live[chunk] = driver.slot_live[chunk] - 1;
+}
+
+# whether any slot is active, from the live counts, so no slot is read
+fun slots_busy(driver: *Driver) bool {
+    var chunk: usize = 0;
+    for (chunk < driver.slots.chunk_count) {
+        if (driver.slot_live[chunk] != 0) { ret true; }
+        chunk = chunk + 1;
+    }
+    ret false;
 }
 
 # give back what a peak grew once the entries in it are free. only free
@@ -237,6 +261,7 @@ fun context_token(context: usize, token: *io_runtime.Token) bool {
     ret token.generation != 0;
 }
 
+# only a token the runtime routed here reaches this, so slot_take wrote the slot and the runtime keeps the frontier
 fun slot_for(driver: *Driver, token: io_runtime.Token) *Slot {
     if (token.index::usize >= driver.slots.capacity) { ret nil; }
     val slot: *Slot = slot_at(driver, token.index::usize);
@@ -759,9 +784,9 @@ pub fun make(driver: *Driver, runtime: *io_runtime.Runtime) err[io_error.Error] 
         table.destroy(?driver.slots);
         ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
     }
-    driver.runtime  = runtime;
-    driver.instance = instance::u64;
-    adopt_slots(driver);
+    driver.runtime      = runtime;
+    driver.instance     = instance::u64;
+    driver.slot_live[0] = 0;
     table.pool_make(?driver.listener_pool, $offset_of(ListenerEntry, next_free));
     table.pool_make(?driver.stream_pool, $offset_of(StreamEntry, next_free));
     table.pool_adopt(?driver.listener_pool, ?driver.listeners);
@@ -820,24 +845,10 @@ fun claim_locked(
         ret res[bool, io_error.Error].err{submitted.err};
     }
     @token = submitted.ok;
-    val slot: *Slot = ensure_slot(driver, token.index::usize);
-    if (slot == nil) {
+    if (slot_take(driver, @token, kind, resource) == nil) {
         io_runtime.fail(driver.runtime, @token, exhausted(io_error.OP_SUBMIT));
         ret res[bool, io_error.Error].ok{false};
     }
-    if (slot.state != SLOT_FREE) {
-        io_runtime.fail(driver.runtime, @token, io_error.make(io_error.BUSY, io_error.OP_SUBMIT));
-        ret res[bool, io_error.Error].ok{false};
-    }
-    val chunk: usize = table.chunk_of(?driver.slots, token.index::usize);
-    driver.slot_live[chunk] = driver.slot_live[chunk] + 1;
-    slot.state              = SLOT_ACTIVE;
-    slot.generation         = token.generation;
-    slot.native_active      = false;
-    slot.listener_index     = NONE;
-    slot.stream_index       = NONE;
-    slot.kind               = kind;
-    slot.resource           = resource;
     ret res[bool, io_error.Error].ok{true};
 }
 
@@ -1351,11 +1362,7 @@ fun cleanup_locked(driver: *Driver, completion: *io_runtime.Completion) {
         held.value.handle = io_handle.INVALID_VALUE;
         stream_free(driver, held);
     }
-    slot.state          = SLOT_FREE;
-    slot.listener_index = NONE;
-    slot.stream_index   = NONE;
-    val chunk: usize = table.chunk_of(?driver.slots, completion.token.index::usize);
-    driver.slot_live[chunk] = driver.slot_live[chunk] - 1;
+    slot_release(driver, slot, completion.token);
     trim_locked(driver);
 }
 
@@ -1580,13 +1587,9 @@ pub fun destroy(driver: *Driver) err[io_error.Error] {
         ret err[io_error.Error].err{invalid(io_error.OP_CLOSE)};
     }
     mutex.lock(?driver.lock);
-    var i: usize = 0;
-    for (i < driver.slots.capacity) {
-        if (slot_at(driver, i).state != SLOT_FREE) {
-            mutex.unlock(?driver.lock);
-            ret err[io_error.Error].err{io_error.make(io_error.BUSY, io_error.OP_CLOSE)};
-        }
-        i = i + 1;
+    if (slots_busy(driver)) {
+        mutex.unlock(?driver.lock);
+        ret err[io_error.Error].err{io_error.make(io_error.BUSY, io_error.OP_CLOSE)};
     }
     mutex.unlock(?driver.lock);
     val retired: res[bool, io_error.Error] = io_runtime.retire_source(driver.runtime, driver.source);
@@ -1796,7 +1799,8 @@ test async_local__stream_claim_cost_stays_flat_after_churn {
     ret 0;
 }
 
-# growth writes no stream or listener entry until it is taken
+# growth writes no stream, listener or slot until it is taken, and a taken
+# slot keeps the driver busy
 test async_local__growth_writes_no_entry_until_it_is_taken {
     # the tracker is too large for the stack, so it lives on the mapper
     val t: *testing.Testing = os.allocate($size_of(testing.Testing))::*testing.Testing;
@@ -1825,6 +1829,29 @@ test async_local__growth_writes_no_entry_until_it_is_taken {
     val paint: u8 = testing.POISON_NEW;
     if (!table.pool_unwritten(?driver.stream_pool, ?driver.streams, paint))     { ret 5; }
     if (!table.pool_unwritten(?driver.listener_pool, ?driver.listeners, paint)) { ret 6; }
+    val low:       io_runtime.Token = io_runtime.Token{index: 1, generation: 1};
+    val high:      io_runtime.Token = io_runtime.Token{index: 5, generation: 1};
+    val low_slot:  *Slot            = slot_take(?driver, low, io_runtime.READ, 0);
+    val high_slot: *Slot            = slot_take(?driver, high, io_runtime.WRITE, 0);
+    if (low_slot == nil || high_slot == nil || driver.slots.chunk_count != 3)       { ret 8; }
+    if (slot_for(?driver, low) != low_slot || slot_for(?driver, high) != high_slot) { ret 8; }
+    i = 0;
+    for (i < driver.slots.capacity) {
+        if (i != low.index::usize && i != high.index::usize) {
+            val bytes: *u8   = slot_at(?driver, i)::*u8;
+            var byte:  usize = 0;
+            for (byte < $size_of(Slot)) {
+                if (bytes[byte] != paint) { ret 9; }
+                byte = byte + 1;
+            }
+        }
+        i = i + 1;
+    }
+    val busy: err[io_error.Error] = destroy(?driver);
+    if (!(sel busy.err && busy.err.kind == io_error.BUSY)) { ret 10; }
+    slot_release(?driver, low_slot, low);
+    slot_release(?driver, high_slot, high);
+    if (slot_for(?driver, low) != nil) { ret 11; }
     i = 0;
     for (i < 3) {
         stream_free(?driver, streams[i]);
