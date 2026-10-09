@@ -87,7 +87,9 @@ A name crosses the contract in one of two forms. The `*u8` primitives take UTF-8
 
 ### process (`HAS_PROCESS`)
 
-`FileLimit`, `LIMIT_UNLIMITED`, `PROCESS_CONTINUED`, `PROCESS_EXITED`, `PROCESS_OP_CLOSE`, `PROCESS_OP_PIPE`, `PROCESS_OP_READ`, `PROCESS_OP_SPAWN`, `PROCESS_OP_STATUS`, `PROCESS_OP_TERMINATE`, `PROCESS_OP_WAIT`, `PROCESS_SIGNALED`, `PROCESS_STOPPED`, `ProcessStatus`, `ProcessWaitError`, `WNOHANG`, `WaitResult`, `environ`, `getenv`, `getpid`, `ignore_sigpipe`, `open_file_limit`, `set_open_file_limit`, `spawn`, `spawn_in`, `spawn_redirected`, `spawn_redirected_in`, `terminate_child`, `wait`, `wait_pid`
+`FileLimit`, `LIMIT_UNLIMITED`, `PROCESS_CONTINUED`, `PROCESS_EXITED`, `PROCESS_OP_CLOSE`, `PROCESS_OP_PIPE`, `PROCESS_OP_READ`, `PROCESS_OP_SPAWN`, `PROCESS_OP_STATUS`, `PROCESS_OP_TERMINATE`, `PROCESS_OP_WAIT`, `PROCESS_SIGNALED`, `PROCESS_STOPPED`, `ProcessStatus`, `ProcessWaitError`, `WNOHANG`, `WaitResult`, `environ`, `getenv`, `getpid`, `ignore_sigpipe`, `open_file_limit`, `set_open_file_limit`, `spawn`, `spawn_in`, `spawn_in_native`, `spawn_native`, `spawn_redirected`, `spawn_redirected_in`, `spawn_redirected_in_native`, `spawn_redirected_native`, `terminate_child`, `wait`, `wait_pid`
+
+The spawns take the executable path, the arguments, the environment entries and the working directory in the same two forms a file name takes. The `*u8` spawns take UTF-8. The `_native` spawns take each as a nul-terminated string of `std.runtime.native.Unit`, and the environment as a nil-terminated array of them, so a program can hand a child an argument it read from `std.runtime.native` exactly as given. linux and darwin take them as bytes, so there each native spawn is its UTF-8 spawn. windows takes UTF-16: each UTF-8 spawn converts the executable, every argument, the directory and every environment entry once, refusing malformed UTF-8 with `EINVAL`, and then runs the native spawn, which joins the arguments unit for unit under the CRT quoting and builds the environment block from the entries as given, sorted by their names.
 
 ### cpu (`HAS_CPU_FEATURES`)
 
