@@ -39,15 +39,19 @@ class IR:
         self.table = dict(re.findall(r'^    (!\d+) = (.*)$', text, re.M))
 
     def signature(self, name):
-        # (parameter types, return type) of a function's header, each as its type table text
-        headers = set(re.findall(r'^  fn @"' + re.escape(name) + r'"\((.*?)\): (!\d+) \[', self.text, re.M))
+        # (parameter types, return type, variadic) of a function's header, each type as its type table reference
+        pattern = r'^  fn @"' + re.escape(name) + r'"\((.*?)\): (!\d+) \[[^\]]*?\bsig=(!\d+)'
+        headers = set(re.findall(pattern, self.text, re.M))
         if len(headers) != 1:
             raise ValueError(name + ' has ' + str(len(headers)) + ' distinct headers in the IR, expected one')
-        params, ret = headers.pop()
+        params, ret, sig = headers.pop()
         types = [re.search(r'ty=(!\d+)', part) or re.match(r'(!\d+)', part) for part in params.split(', ') if part]
         if None in types:
             raise ValueError(name + ': unreadable parameter list ' + params)
-        return [self.table.get(t.group(1)) for t in types], self.table.get(ret)
+        shape = self.table.get(sig, '')
+        if not shape.startswith('fn('):
+            raise ValueError(name + ': its signature ' + sig + ' is not a function type')
+        return [t.group(1) for t in types], ret, bool(re.search(r'(\(|, )\.\.\.\) -> ', shape))
 
     def raw_function(self, name):
         match = re.search(r'^  fn @"' + re.escape(name) + r'"\(.*?^  \}\s*$', self.text, re.M | re.S)
