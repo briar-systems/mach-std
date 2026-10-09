@@ -229,7 +229,8 @@ for target in "${targets[@]}"; do
                 ;;
         esac
         if [ "$profile" = release ]; then
-            python3 "$here/verify-asm.py" "$here/mach.toml" "$target" "$storage_asm" "$main_asm" \
+            python3 "$here/verify-asm.py" "$here/mach.toml" "$target" "$storage_asm" "$storage_ir" \
+                "$main_asm" "$main_ir" \
                 || fail "$target release: secret assembly contract failed"
         fi
 

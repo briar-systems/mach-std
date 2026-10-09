@@ -36,6 +36,18 @@ class IR:
             raise ValueError('expected the current emitted IR format')
         self.text = text
         self.types = dict(re.findall(r'^    (!\d+) = (i8|i64|void|ptr)$', text, re.M))
+        self.table = dict(re.findall(r'^    (!\d+) = (.*)$', text, re.M))
+
+    def signature(self, name):
+        # (parameter types, return type) of a function's header, each as its type table text
+        headers = set(re.findall(r'^  fn @"' + re.escape(name) + r'"\((.*?)\): (!\d+) \[', self.text, re.M))
+        if len(headers) != 1:
+            raise ValueError(name + ' has ' + str(len(headers)) + ' distinct headers in the IR, expected one')
+        params, ret = headers.pop()
+        types = [re.search(r'ty=(!\d+)', part) or re.match(r'(!\d+)', part) for part in params.split(', ') if part]
+        if None in types:
+            raise ValueError(name + ': unreadable parameter list ' + params)
+        return [self.table.get(t.group(1)) for t in types], self.table.get(ret)
 
     def raw_function(self, name):
         match = re.search(r'^  fn @"' + re.escape(name) + r'"\(.*?^  \}\s*$', self.text, re.M | re.S)
