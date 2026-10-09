@@ -22,6 +22,7 @@ use std.types.string.str_len;
 
 use os_shared: std.system.os.shared;
 fwd os_shared.DirectoryEntry;
+fwd os_shared.NativeEntry;
 fwd os_shared.DirectoryInitResult;
 use std.sync.atomic;
 use identities: std.system.file_identity;
@@ -761,6 +762,8 @@ pub rec timespec {
     tv_nsec: i64;
 }
 
+# the current entry's units are kept, terminated, just past the native area,
+# and its UTF-8 spelling past them
 pub rec DirectoryCursor {
     address:         usize;
     fd:              i32;
@@ -771,6 +774,9 @@ pub rec DirectoryCursor {
     capacity:        usize;
     native_capacity: usize;
     procedure:       ptr;
+    entry_units:     usize;
+    entry_type:      u8;
+    refused:         bool;
 }
 
 # path
@@ -3208,11 +3214,17 @@ fun directory_reserve(cursor: *DirectoryCursor, native_capacity: usize, text_cap
     ret 0;
 }
 
-pub fun directory_next(cursor: *DirectoryCursor, out: *DirectoryEntry) i64 {
-    if (cursor == nil || out == nil || cursor.address != cursor::usize || !cursor.active) { ret EINVAL; }
-    if (cursor.error < 0)                                                                 { ret cursor.error; }
-    if (cursor.ended)                                                                     { ret 0; }
-    if (!handle_lock(cursor.fd))                                                          { ret directory_failure(cursor, EBADF); }
+fun directory_entry_units(cursor: *DirectoryCursor) *u16 {
+    ret (cursor.buffer::usize + cursor.native_capacity)::*u16;
+}
+
+# move to the next entry and keep its units, terminated, past the native area
+fun directory_advance(cursor: *DirectoryCursor) i64 {
+    if (cursor == nil || cursor.address != cursor::usize || !cursor.active) { ret EINVAL; }
+    if (cursor.error < 0)                                                   { ret cursor.error; }
+    cursor.refused = false;
+    if (cursor.ended)            { ret 0; }
+    if (!handle_lock(cursor.fd)) { ret directory_failure(cursor, EBADF); }
     fin { handle_unlock(cursor.fd); }
     val entry:  *FdEntry = fd_entry(cursor.fd);
     val handle: isize    = get_handle(cursor.fd);
@@ -3270,24 +3282,78 @@ pub fun directory_next(cursor: *DirectoryCursor, out: *DirectoryEntry) i64 {
             if (input[index] == 0) { ret directory_failure(cursor, EIO); }
             index = index + 1;
         }
-        val measured: i64 = name_conversion(utf16_to_utf8(input, unit_count, nil, 0), ERANGE);
-        if (measured < 0) { ret directory_failure(cursor, measured); }
-        val required:   usize = measured::usize;
-        val attributes: u32   = native.file_attributes;
-        val reserved:   i64   = directory_reserve(cursor, cursor.native_capacity, required + 1);
+        val attributes: u32 = native.file_attributes;
+        val reserved:   i64 = directory_reserve(cursor, cursor.native_capacity, (unit_count + 1) * 2);
         if (reserved < 0) { ret directory_failure(cursor, reserved); }
-        val name:      *u8  = (cursor.buffer::usize + cursor.native_capacity)::*u8;
-        val source:    *u16 = (cursor.buffer::usize + name_offset)::*u16;
-        val converted: i64  = name_conversion(utf16_to_utf8(source, unit_count, name, required), ERANGE);
-        if (converted < 0) { ret directory_failure(cursor, converted); }
-        name[required] = 0;
+        val source: *u16 = (cursor.buffer::usize + name_offset)::*u16;
+        val units:  *u16 = directory_entry_units(cursor);
+        index = 0;
+        for (index < unit_count) {
+            units[index] = source[index];
+            index        = index + 1;
+        }
+        units[unit_count] = 0;
         var type_hint: u8 = 8;
         if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) { type_hint = 10; }
         or ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)     { type_hint = 4; }
-        @out = DirectoryEntry{name: name::str, length: required, type_hint: type_hint};
+        cursor.entry_units = unit_count;
+        cursor.entry_type  = type_hint;
         ret 1;
     }
     ret 0;
+}
+
+fun directory_native_entry(cursor: *DirectoryCursor) NativeEntry {
+    ret NativeEntry{name: directory_entry_units(cursor), length: cursor.entry_units, type_hint: cursor.entry_type};
+}
+
+# the next entry in UTF-16 units as the kernel gives it, so a name holding an
+# unpaired surrogate is yielded like any other
+pub fun directory_next_native(cursor: *DirectoryCursor, out: *NativeEntry) i64 {
+    if (out == nil) { ret EINVAL; }
+    val advanced: i64 = directory_advance(cursor);
+    if (advanced <= 0) { ret advanced; }
+    @out = directory_native_entry(cursor);
+    ret 1;
+}
+
+# the next entry spelled in UTF-8, converted once from the native entry. an
+# entry with no UTF-8 spelling is refused by itself: the converter's EINVAL,
+# out untouched, the native name kept for directory_refused_native, and the
+# next call goes on to the following entry
+pub fun directory_next(cursor: *DirectoryCursor, out: *DirectoryEntry) i64 {
+    if (out == nil) { ret EINVAL; }
+    val advanced: i64 = directory_advance(cursor);
+    if (advanced <= 0) { ret advanced; }
+    val unit_count: usize      = cursor.entry_units;
+    val outcome:    Transcoded = utf16_to_utf8(directory_entry_units(cursor), unit_count, nil, 0);
+    if (sel outcome.malformed) {
+        cursor.refused = true;
+        ret name_conversion(outcome, ERANGE);
+    }
+    val measured: i64 = name_conversion(outcome, ERANGE);
+    if (measured < 0) { ret directory_failure(cursor, measured); }
+    val required: usize = measured::usize;
+    val offset:   usize = (unit_count + 1) * 2;
+    val reserved: i64   = directory_reserve(cursor, cursor.native_capacity, offset + required + 1);
+    if (reserved < 0) { ret directory_failure(cursor, reserved); }
+    val units:     *u16 = directory_entry_units(cursor);
+    val name:      *u8  = (units::usize + offset)::*u8;
+    val converted: i64  = name_conversion(utf16_to_utf8(units, unit_count, name, required), ERANGE);
+    if (converted < 0) { ret directory_failure(cursor, converted); }
+    name[required] = 0;
+    @out           = DirectoryEntry{name: name::str, length: required, type_hint: cursor.entry_type};
+    ret 1;
+}
+
+# the entry the last directory_next refused for having no UTF-8 spelling, in
+# native units and borrowed like an entry: 1 with out filled, or 0 when the
+# last call refused nothing
+pub fun directory_refused_native(cursor: *DirectoryCursor, out: *NativeEntry) i64 {
+    if (cursor == nil || out == nil || cursor.address != cursor::usize || !cursor.active) { ret EINVAL; }
+    if (!cursor.refused)                                                                  { ret 0; }
+    @out = directory_native_entry(cursor);
+    ret 1;
 }
 
 # consumes the owner, including when native release reports failure
@@ -6822,8 +6888,9 @@ fun directory_query_probe(handle: isize, event: isize, apc: ptr, context: ptr,
         native.file_attributes   = FILE_ATTRIBUTE_NORMAL;
         native.next_entry_offset = 0;
         val lone: *u16 = ?native.file_name[0];
-        lone[0]            = 0xd800;
-        status.information = 66;
+        lone[0]                = 0xd800;
+        status.information     = 66;
+        _directory_probe_phase = 4;
         ret 0;
     }
     var units:      usize = 3000;
@@ -6886,12 +6953,18 @@ test directory__capacity_protocol_keeps_long_entries_and_terminal_errors {
     _directory_probe_phase = 0;
     if (directory_next(?cursor, ?entry) != EACCES || _directory_probe_calls != 6) { ret 13; }
     if (directory_close(?cursor) != 0)                                            { ret 14; }
-    # an entry name with no UTF-8 spelling is the converter's refusal
+    # an entry name with no UTF-8 spelling is the converter's refusal of that
+    # entry alone: its native name stays readable and the cursor goes on
     if (seek(fd::i32, 0, SEEK_SET) < 0 || directory_init(?cursor, fd::i32).code != 0) { ret 15; }
     cursor.procedure       = directory_query_probe::usize::ptr;
     _directory_probe_phase = 200;
-    if (directory_next(?cursor, ?entry) != EINVAL || entry.length != 9 || entry.type_hint != 77) { ret 16; }
-    if (directory_close(?cursor) != 0)                                                           { ret 17; }
+    var refused: NativeEntry;
+    if (directory_refused_native(?cursor, ?refused) != 0)                                         { ret 16; }
+    if (directory_next(?cursor, ?entry) != EINVAL || entry.length != 9 || entry.type_hint != 77)  { ret 16; }
+    if (directory_refused_native(?cursor, ?refused) != 1 || refused.length != 1)                  { ret 17; }
+    if (refused.name[0] != 0xd800 || refused.name[1] != 0 || refused.type_hint != 8)              { ret 17; }
+    if (directory_next(?cursor, ?entry) != 0 || directory_refused_native(?cursor, ?refused) != 0) { ret 17; }
+    if (directory_close(?cursor) != 0)                                                            { ret 17; }
     ret 0;
 }
 
