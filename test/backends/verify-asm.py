@@ -901,9 +901,11 @@ class Callees:
                 params, result = self.ir.signature(inst.callee)
             except ValueError as error:
                 raise unreadable(fn.name + ': no signature for ' + fn.where(index) + ': ' + str(error))
-            if not all(SCALAR.fullmatch(t or '') for t in params) or not (result == 'void' or SCALAR.fullmatch(result or '')):
-                raise unreadable(fn.name + ': ' + fn.where(index) + ' passes or returns a value that is not a scalar'
-                                 ' or pointer: (' + ', '.join(map(str, params)) + ') -> ' + str(result))
+            shape = ' (' + ', '.join(map(str, params)) + ') -> ' + str(result)
+            if not all(SCALAR.fullmatch(t or '') for t in params):
+                raise unreadable(fn.name + ': ' + fn.where(index) + ' passes a by-value aggregate:' + shape)
+            if not (result == 'void' or SCALAR.fullmatch(result or '')):
+                raise unreadable(fn.name + ': ' + fn.where(index) + ' returns an aggregate:' + shape)
             count = len(params)
         return abi['home'] + 8 * max(0, count - len(abi['args']))
 
@@ -988,13 +990,12 @@ def bypass(fn, found):
     raise unreadable('control: ' + fn.name + ' has no branch whose taken arm avoids the wipe')
 
 
-def resigned(ir, name, params):
-    # the module IR with name's header taking params, or renamed away when params is None
-    pattern = r'^(  fn @"' + re.escape(name) + r')("\().*?(\): !\d+ \[)'
-    if params is None:
-        edit = lambda m: m.group(1) + '.unknown' + m.group(0)[len(m.group(1)):]
-    else:
-        edit = lambda m: m.group(1) + m.group(2) + ', '.join(params) + m.group(3)
+def resigned(ir, name, params=None, result=None, unknown=False):
+    # the module IR with name's header taking params or returning result, or renamed away
+    pattern = r'^(  fn @"' + re.escape(name) + r')("\()(.*?)(\): )(!\d+)( \[)'
+    edit = lambda m: (m.group(1) + ('.unknown' if unknown else '') + m.group(2)
+                      + (m.group(3) if params is None else ', '.join(params)) + m.group(4)
+                      + (result or m.group(5)) + m.group(6))
     text, n = re.subn(pattern, edit, ir.text, flags=re.M)
     if n == 0:
         raise unreadable('control: no header for ' + name + ' in the module IR')
@@ -1031,7 +1032,7 @@ def clobbered(target, fn, found, releases, states, ir, via):
     lines = list(fn.lines)
     for where, text in sorted(edits, reverse=True):
         lines.insert(where, '  ' + text)
-    return lines, resigned(ir, ZEROIZE, [type_ref(ir, lambda t: t == 'ptr')] * count)
+    return lines, resigned(ir, ZEROIZE, params=[type_ref(ir, lambda t: t == 'ptr')] * count)
 
 
 def reversed_layout(target, fn):
@@ -1065,7 +1066,7 @@ def controls(target, sources):
         except Rejected as error:
             raise unreadable('assembly oracle rejected control ' + name + ': ' + str(error))
         accepted.append(name)
-        aggregate = [type_ref(ir, lambda t: t.startswith('{')), type_ref(ir, lambda t: t == 'i64')]
+        aggregate = type_ref(ir, lambda t: t.startswith('{'))
         rejected = [
             ('deleted wipe', 'order', (deleted(fn, found), ir)),
             ('release on an unwiped path', 'order', (bypass(fn, found), ir)),
@@ -1076,9 +1077,11 @@ def controls(target, sources):
              clobbered(target, fn, found, releases, states, ir, target.abi['sp'])),
             ('release of a pointer read back from an outgoing slot written through the frame pointer', 'unreadable',
              clobbered(target, fn, found, releases, states, ir, target.abi['fp'])),
-            ('wipe through a callee with no signature', 'unreadable', (fn.lines, resigned(ir, ZEROIZE, None))),
+            ('wipe through a callee with no signature', 'unreadable', (fn.lines, resigned(ir, ZEROIZE, unknown=True))),
             ('wipe through a callee taking a by-value aggregate', 'unreadable',
-             (fn.lines, resigned(ir, ZEROIZE, aggregate))),
+             (fn.lines, resigned(ir, ZEROIZE, params=[aggregate, type_ref(ir, lambda t: t == 'i64')]))),
+            ('wipe through a callee returning an aggregate', 'unreadable',
+             (fn.lines, resigned(ir, ZEROIZE, result=aggregate))),
         ]
         for name, reason, changed in rejected:
             name = label + ': ' + name
