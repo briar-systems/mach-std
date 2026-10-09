@@ -27,6 +27,21 @@ prepare_bytes(?t, ?alloc, claim, data, len, 0o644, ?hasher, options);
 sha256.final(?state, ?digest[0]);
 ```
 
+## the environment reads in native units and passes on only by the inherit form (#1065)
+
+A nil envp no longer means inherit. Every spawn and exec, in `std.process.exec` and `std.system.os` alike, refuses a nil envp with `EINVAL`. To hand a child this process's own environment, pass `exec.inherit_environment()`, or `exec.inherit_environment_native()` to a native spawn. It passes the native environment with no conversion: windows gives `CreateProcessW` a NULL environment and linux and darwin the envp the kernel gave the process, so a variable with no UTF-8 spelling reaches the child as it is. Before, a nil envp inherited on windows only, and linux and darwin handed the kernel a nil envp.
+
+`std.process.env.environ()` returning `**u8` becomes `environ(a)` returning `res[Vector[Listed], EnvError]`, the UTF-8 listing for reading and editing variables. `Listed` is `tag Listed: u8 { variable: str; unspellable: NativeName; }`, one per entry in the order the environment holds them. A windows entry with no UTF-8 spelling, which before made the whole listing nil, is listed in place as `unspellable` with its variable name in native units, which `get_native` reads. On linux and darwin every entry is a `variable`. The vector and every entry are the caller's, released with `environ_free(?entries)`. `EnvError` gains `unavailable` for an environment that cannot be read. `environ_native()` is the environment in native units, kept for the life of the process.
+
+`std.system.os.environ` is removed. `os.environ_native()` is the one capture and `os.getenv_native` reads one value in native units. `std.system.os.linux.environ` and `std.system.os.darwin.environ` remain.
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `exec.run(path, argv, nil)` | `exec.run(path, argv, exec.inherit_environment())` |
+| `exec.run(path, argv, env.environ())` to pass the environment on | `exec.run(path, argv, exec.inherit_environment())` |
+| `val e: **u8 = env.environ()` then `e[i]` | `val entries: Vector[env.Listed] = env.environ(a).ok` then `if (sel entries.data[i].variable) { ... }`, with `.unspellable` for an entry with no UTF-8 spelling |
+| `os.environ()` | `os.environ_native()`, or `env.environ(a)` for UTF-8 |
+
 # std 6.x to 7.0.0
 
 std 7.0.0 makes the memory behind `io.runtime` reachable (#677). A runtime takes the allocator every one of its allocations comes from, and every driver registered on it draws from the same allocator.
