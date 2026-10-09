@@ -22,8 +22,14 @@
 # through a pointer the pass cannot place, and every call, clobbers each slot at
 # or above the lowest frame address that escaped (stored to memory, passed in an
 # argument register, or fed to an operation the pass does not model), the
-# caller's memory above the entry stack pointer, and the win64 home area. a
-# callee is assumed to write no stack argument slots beyond that home area.
+# caller's memory above the entry stack pointer, and the call's outgoing area.
+# that area is [sp, sp + n) at the call, whatever register wrote it, where n is
+# the abi's home area plus 8 bytes for each argument past the argument
+# registers (apple arm64 packs narrower ones tighter, which that covers). the
+# argument count comes from the callee's signature: a std function's header in
+# the module IR, the release_fn type for the indirect release, or the native
+# release's entry below. a call whose signature the pass cannot get, or whose
+# parameters or result are not scalars or pointers, fails.
 from pathlib import Path
 import importlib.util
 import re
@@ -58,7 +64,8 @@ def unreadable(message):
 # per abi: integer argument registers, where the hidden result pointer goes
 # ('shift' takes the first argument register), the entry stack offset of the
 # first stack argument, the home area a callee owns above the call's stack
-# pointer, the registers a call preserves, and the frame pointer
+# pointer, below its stack arguments, the registers a call preserves, and the
+# frame pointer
 ABIS = {
     'sysv64': dict(args=['rdi', 'rsi', 'rdx', 'rcx', 'r8', 'r9'], sret='shift', stack=8, home=0,
                    saved={'rbx', 'rbp', 'rsp', 'r12', 'r13', 'r14', 'r15'}, sp='rsp', fp='rbp'),
@@ -78,11 +85,12 @@ SYSCALLS = {
     'riscv64': dict(number='a7', args=['a0', 'a1', 'a2', 'a3', 'a4', 'a5'], clobbers={'a0', 'a1'}, munmap=215),
 }
 
-# per os: the native release, what it calls and which arguments carry the region
+# per os: the native release, what it calls, its argument count and which
+# arguments carry the region
 NATIVE = {
-    'linux': dict(syscall=True, pointer=0, length=1),
-    'darwin': dict(symbol='_free', pointer=0, length=None),
-    'windows': dict(symbol='VirtualFree', pointer=0, length=None),
+    'linux': dict(syscall=True, args=2, pointer=0, length=1),
+    'darwin': dict(symbol='_free', args=1, pointer=0, length=None),
+    'windows': dict(symbol='VirtualFree', args=3, pointer=0, length=None),
 }
 
 
@@ -197,16 +205,17 @@ class State:
         else:
             self.clobber(min(self.floor, 0))
 
-    def call(self, abi, args, clobbers):
-        # the callee reads its argument registers and may write through any escaped address
+    def call(self, abi, args, clobbers, outgoing):
+        # the callee reads its argument registers, may write through any escaped address,
+        # and owns the outgoing bytes above the stack pointer
         for reg in args:
             self.escape(self.regs.get(reg))
         self.clobber(min(self.floor, 0))
         sp = self.regs.get(abi['sp'])
         if not is_frame(sp):
             raise unreadable('the stack pointer is untraced at a call')
-        if abi['home']:
-            self.forget(sp[2], abi['home'])
+        if outgoing:
+            self.forget(sp[2], outgoing)
         self.regs = {reg: v for reg, v in self.regs.items() if not clobbers(reg)}
 
 
@@ -263,6 +272,8 @@ class X86:
     isa = 'x86_64'
     jump = 'jmp {label}'
     adjust = {'add': 'add {reg}, {imm}', 'sub': 'sub {reg}, {imm}'}
+    save = 'mov qword ptr [{base}{off:+d}], {reg}'
+    restore = 'mov {reg}, qword ptr [{base}{off:+d}]'
 
     def mem(self, operand, st):
         # (address, width) of a memory operand, or None when it is not one
@@ -443,6 +454,8 @@ class AArch64:
     isa = 'aarch64'
     jump = 'b {label}'
     adjust = {'add': 'add {reg}, {reg}, #{imm}', 'sub': 'sub {reg}, {reg}, #{imm}'}
+    save = 'str {reg}, [{base}, #{off}]'
+    restore = 'ldr {reg}, [{base}, #{off}]'
     widths = {'ldr': None, 'str': None, 'ldrb': 1, 'strb': 1, 'ldrh': 2, 'strh': 2, 'ldrsw': 4,
               'ldur': None, 'stur': None, 'ldp': None, 'stp': None}
 
@@ -584,6 +597,8 @@ class RiscV64:
     isa = 'riscv64'
     jump = 'jal zero, {label}'
     adjust = {'add': 'addi {reg}, {reg}, {imm}', 'sub': 'addi {reg}, {reg}, -{imm}'}
+    save = 'sd {reg}, {off}({base})'
+    restore = 'ld {reg}, {off}({base})'
 
     def value(self, operand, st):
         if operand == 'zero':
@@ -766,8 +781,9 @@ def entry_state(abi, sret, params):
     return State(regs, mem, 0)
 
 
-def flow(fn, abi, start, syscall):
+def flow(fn, target, start, callees):
     # the state before each instruction, joined over every path from the entry
+    abi, syscall = target.abi, target.syscall
     states, work = {0: start}, [0]
     while work:
         index = work.pop()
@@ -775,9 +791,10 @@ def flow(fn, abi, start, syscall):
         if inst.kind == 'op':
             inst.apply(st)
         elif inst.kind in ('call', 'tail'):
-            st.call(abi, abi['args'], lambda reg: reg not in abi['saved'])
+            st.call(abi, abi['args'], lambda reg: reg not in abi['saved'], callees.outgoing(fn, index, st))
         elif inst.kind == 'syscall':
-            st.call(abi, syscall['args'] + [syscall['number']], lambda reg: reg in syscall['clobbers'])
+            st.call(abi, syscall['args'] + [syscall['number']], lambda reg: reg in syscall['clobbers'],
+                    callees.outgoing(fn, index, st))
         for successor in fn.successors(index):
             old = states.get(successor)
             new = st if old is None else old.join(st)
@@ -836,13 +853,61 @@ def carriers(release, args):
 
 
 # both return err[io_error.Error], which every abi returns through memory. deallocate's
-# release is the os's native one, release_typed's a call through release_fn with data second
+# release is the os's native one, release_typed's a call through release_fn, a
+# fun(ptr, *T, *T, usize) i64 with data second
 CONTRACTS = {
     'storage': lambda os: Contract(IR.PORTABLE + 'deallocate', 2, True, (param(0), param(1)), NATIVE[os]),
     'typed': lambda os: Contract(IR.PORTABLE + 'release_typed' + IR.TYPED, 4, True,
                                  (param(1), mul(const(IR.TYPED_SIZE), param(2))),
-                                 dict(through=3, pointer=1, length=None)),
+                                 dict(through=3, args=4, pointer=1, length=None)),
 }
+
+
+# a parameter or result one argument register or 8 byte stack slot holds
+SCALAR = re.compile(r'i(1|8|16|32|64)|ptr')
+
+
+class Callees:
+    # each callee's signature has one owner: the module IR for a std function, the contract for
+    # the indirect release, and NATIVE for the os's release
+    def __init__(self, target, contract, ir):
+        self.target, self.contract, self.ir = target, contract, ir
+
+    def outgoing(self, fn, index, st):
+        # the bytes above the stack pointer that the call at index owns
+        inst, abi, release, syscall = fn.insts[index], self.target.abi, self.contract.release, self.target.syscall
+        if inst.kind == 'syscall':
+            number = st.get(syscall['number'])
+            if number is None or number[0] is not None:
+                raise unreadable(fn.name + ': syscall with an untraced number at ' + fn.where(index))
+            if not release.get('syscall') or number[2] != syscall['munmap']:
+                raise unreadable(fn.name + ': no signature for syscall ' + str(number[2]) + ' at ' + fn.where(index))
+            if release['args'] > len(syscall['args']):
+                raise unreadable(fn.name + ': the syscall at ' + fn.where(index) + ' takes more arguments than registers')
+            # on every targeted host the kernel takes all arguments in registers and never writes the caller's stack
+            return 0
+        if inst.through is not None:
+            callee = inst.through(st)
+            if callee is None:
+                raise unreadable(fn.name + ': indirect call through an untraced value at ' + fn.where(index))
+            if 'through' not in release or callee != param(release['through']):
+                raise unreadable(fn.name + ': no signature for the indirect call through ' + show(callee)
+                                 + ' at ' + fn.where(index))
+            count = release['args']
+        elif inst.callee == release.get('symbol'):
+            count = release['args']
+        else:
+            try:
+                params, result = self.ir.signature(inst.callee)
+            except ValueError as error:
+                raise unreadable(fn.name + ': no signature for ' + fn.where(index) + ': ' + str(error))
+            shape = ' (' + ', '.join(map(str, params)) + ') -> ' + str(result)
+            if not all(SCALAR.fullmatch(t or '') for t in params):
+                raise unreadable(fn.name + ': ' + fn.where(index) + ' passes a by-value aggregate:' + shape)
+            if not (result == 'void' or SCALAR.fullmatch(result or '')):
+                raise unreadable(fn.name + ': ' + fn.where(index) + ' returns an aggregate:' + shape)
+            count = len(params)
+        return abi['home'] + 8 * max(0, count - len(abi['args']))
 
 
 def wipes(target, fn, states):
@@ -853,10 +918,10 @@ def wipes(target, fn, states):
             if index in states and inst.kind == 'call' and inst.callee == ZEROIZE}
 
 
-def check(target, contract, lines):
+def check(target, contract, ir, lines):
     fn = Function(contract.name, lines, target.isa)
     start = entry_state(target.abi, contract.sret, contract.params)
-    states = flow(fn, target.abi, start, target.syscall)
+    states = flow(fn, target, start, Callees(target, contract, ir))
     releases = contract.releases(target, fn, states)
     if not releases:
         raise unreadable(fn.name + ': no native release found')
@@ -880,7 +945,7 @@ def check(target, contract, lines):
                                for i, r in sorted(found.items()) if r != contract.region)
             raise Rejected('region', fn.name + ': the release ' + fn.where(index) + ' is reachable without a wipe of '
                            + want + ' (' + others + ')')
-    return fn, found, releases
+    return fn, found, releases, states
 
 
 def wipe_site(fn, found):
@@ -925,6 +990,51 @@ def bypass(fn, found):
     raise unreadable('control: ' + fn.name + ' has no branch whose taken arm avoids the wipe')
 
 
+def resigned(ir, name, params=None, result=None, unknown=False):
+    # the module IR with name's header taking params or returning result, or renamed away
+    pattern = r'^(  fn @"' + re.escape(name) + r')("\()(.*?)(\): )(!\d+)( \[)'
+    edit = lambda m: (m.group(1) + ('.unknown' if unknown else '') + m.group(2)
+                      + (m.group(3) if params is None else ', '.join(params)) + m.group(4)
+                      + (result or m.group(5)) + m.group(6))
+    text, n = re.subn(pattern, edit, ir.text, flags=re.M)
+    if n == 0:
+        raise unreadable('control: no header for ' + name + ' in the module IR')
+    return IR.IR(text)
+
+
+def type_ref(ir, test):
+    ref = next((k for k, v in ir.table.items() if test(v)), None)
+    if ref is None:
+        raise unreadable('control: the module IR has no type for the control')
+    return ref
+
+
+def clobbered(target, fn, found, releases, states, ir, via):
+    # zeroize takes stack arguments, the wipe's pointer is stored into one of them through via
+    # before the call, and each release frees what it reads back from that slot after the call
+    abi, isa = target.abi, target.isa
+    line = wipe_site(fn, found)
+    call = next(iter(found))
+    sp, at = states[call].get(abi['sp'])[2], states[call].get(via)
+    if not is_frame(at) or at[1] != 1:
+        return None
+    used = {o for st in states.values() for o in st.mem}
+    slot = sp + abi['home']
+    while slot in used:
+        slot += 8
+    count = len(abi['args']) + (slot - sp - abi['home']) // 8 + 1
+    if ZEROIZE in fn.lines[line - 1]:
+        line -= 1
+    edits = [(line, isa.save.format(reg=abi['args'][0], base=via, off=slot - at[2]))]
+    for index, regs in releases.items():
+        off = slot - states[index].get(abi['sp'])[2]
+        edits.append((fn.insts[index].line, isa.restore.format(reg=regs[0], base=abi['sp'], off=off)))
+    lines = list(fn.lines)
+    for where, text in sorted(edits, reverse=True):
+        lines.insert(where, '  ' + text)
+    return lines, resigned(ir, ZEROIZE, params=[type_ref(ir, lambda t: t == 'ptr')] * count)
+
+
 def reversed_layout(target, fn):
     # the same graph with every labelled block after the first laid out in reverse
     blocks, current = [], []
@@ -947,25 +1057,39 @@ def controls(target, sources):
     accepted, counts = [], {}
     for key, make in CONTRACTS.items():
         contract = make(target.os)
-        fn, found, releases = check(target, contract, function_lines(sources[key], contract.name))
+        asm, ir = sources[key]
+        fn, found, releases, states = check(target, contract, ir, function_lines(asm, contract.name))
         label = contract.name.split('$')[0].rsplit('.', 1)[-1]
         name = label + ': reversed block layout'
         try:
-            check(target, contract, reversed_layout(target, fn))
+            check(target, contract, ir, reversed_layout(target, fn))
         except Rejected as error:
             raise unreadable('assembly oracle rejected control ' + name + ': ' + str(error))
         accepted.append(name)
+        aggregate = type_ref(ir, lambda t: t.startswith('{'))
         rejected = [
-            ('deleted wipe', 'order', deleted(fn, found)),
-            ('release on an unwiped path', 'order', bypass(fn, found)),
-            ('wipe of the wrong pointer', 'region', adjusted(target, fn, found, 0, 'add', 8)),
-            ('wipe of a short length', 'region', adjusted(target, fn, found, 1, 'sub', 1)),
-            ('release of another pointer', 'region', moved(target, fn, releases)),
+            ('deleted wipe', 'order', (deleted(fn, found), ir)),
+            ('release on an unwiped path', 'order', (bypass(fn, found), ir)),
+            ('wipe of the wrong pointer', 'region', (adjusted(target, fn, found, 0, 'add', 8), ir)),
+            ('wipe of a short length', 'region', (adjusted(target, fn, found, 1, 'sub', 1), ir)),
+            ('release of another pointer', 'region', (moved(target, fn, releases), ir)),
+            ('release of a pointer read back from a clobbered outgoing slot', 'unreadable',
+             clobbered(target, fn, found, releases, states, ir, target.abi['sp'])),
+            ('release of a pointer read back from an outgoing slot written through the frame pointer', 'unreadable',
+             clobbered(target, fn, found, releases, states, ir, target.abi['fp'])),
+            ('wipe through a callee with no signature', 'unreadable', (fn.lines, resigned(ir, ZEROIZE, unknown=True))),
+            ('wipe through a callee taking a by-value aggregate', 'unreadable',
+             (fn.lines, resigned(ir, ZEROIZE, params=[aggregate, type_ref(ir, lambda t: t == 'i64')]))),
+            ('wipe through a callee returning an aggregate', 'unreadable',
+             (fn.lines, resigned(ir, ZEROIZE, result=aggregate))),
         ]
         for name, reason, changed in rejected:
             name = label + ': ' + name
+            if changed is None:
+                print('skipped ' + name + ': the frame pointer is not a traced frame address at the wipe')
+                continue
             try:
-                check(target, contract, changed)
+                check(target, contract, changed[1], changed[0])
             except Rejected as error:
                 if error.reason != reason:
                     raise unreadable('control ' + name + ' was rejected for ' + error.reason + ', not ' + reason + ': ' + str(error))
@@ -978,10 +1102,12 @@ def controls(target, sources):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 5:
-        raise SystemExit('usage: verify-asm.py <mach.toml> <target> <storage.s> <main.s>')
-    manifest, name, storage, main = sys.argv[1:5]
+    if len(sys.argv) != 7:
+        raise SystemExit('usage: verify-asm.py <mach.toml> <target> <storage.s> <storage.ir> <main.s> <main.ir>')
+    manifest, name, storage, storage_ir, main, main_ir = sys.argv[1:7]
     try:
-        controls(Target(manifest, name), {'storage': Path(storage).read_text(), 'typed': Path(main).read_text()})
+        sources = {key: (Path(asm).read_text(), IR.IR(Path(ir).read_text()))
+                   for key, asm, ir in (('storage', storage, storage_ir), ('typed', main, main_ir))}
+        controls(Target(manifest, name), sources)
     except Rejected as error:
         raise SystemExit('FAIL: ' + str(error))
