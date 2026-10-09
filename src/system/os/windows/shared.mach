@@ -1242,34 +1242,38 @@ fun filetime_to_unix(ft: FILETIME, sec: *i64, nsec: *i64) {
     @nsec = (unix_ticks % 10000000) * 100;
 }
 
-# append one byte to the command line, reserving the terminator slot
+# the units CreateProcessW takes in a command line, its terminator included
+val COMMAND_LINE_UNITS: usize = 32767;
+
+# append one unit to the command line, reserving the terminator slot
 # ---
-# ret: false when the byte does not fit
-fun cmd_put(buf: *u8, cap: usize, off: *usize, b: u8) bool {
+# ret: false when the unit does not fit
+fun cmd_put(buf: *u16, cap: usize, off: *usize, unit: u16) bool {
     if (@off + 1 >= cap) {
         ret false;
     }
-    buf[@off] = b;
+    buf[@off] = unit;
     @off      = @off + 1;
     ret true;
 }
 
-# build a command line string from a null-terminated argv array
-# escapes per the CommandLineToArgvW convention.
+# build a native command line from a null-terminated wide argv array
+# escapes per the CommandLineToArgvW convention. every unit the convention
+# does not name, an unpaired surrogate included, is copied unchanged
 # ---
-# argv: null-terminated array of null-terminated strings
+# argv: null-terminated array of null-terminated UTF-16 strings
 # buf:  destination buffer
-# cap:  size of buf in bytes
+# cap:  size of buf in units
 # ret:  true on success, false when the joined line exceeds cap
 #       (buffer contents are then unspecified)
-fun build_cmdline(argv: **u8, buf: *u8, cap: usize) bool {
+fun build_cmdline(argv: **u16, buf: *u16, cap: usize) bool {
     var off: usize = 0;
     var i:   usize = 0;
     for (argv[i]::usize != 0) {
         if (i > 0 && !cmd_put(buf, cap, ?off, 32)) {
             ret false;
         }
-        val arg:         *u8   = argv[i];
+        val arg:         *u16  = argv[i];
         var needs_quote: u8    = 0;
         var j:           usize = 0;
         for (arg[j] != 0) {
@@ -3536,41 +3540,83 @@ fun build_env_block(envp: **u8, out_size: *usize, out_error: *i64) ptr {
     ret wide.data::ptr;
 }
 
-# creation owns all native strings until Windows has copied them into the child
-fun create_process_utf8(pathname: *u8, cmdline: *u8, inherit: i32, flags: u32, environment: ptr, cwd: *u8, startup: *u8, process: *u8) i64 {
-    var path: PROCESS_WIDE;
-    val p:    i64 = process_wide(pathname, str_len(pathname), ?path);
-    if (p < 0) { ret p; }
-    var command: PROCESS_WIDE;
-    val c:       i64 = process_wide(cmdline, str_len(cmdline), ?command);
-    if (c < 0) {
-        process_wide_free(?path);
-        ret c;
+# create a process from native strings, which Windows copies into the child.
+# CreateProcessW may write to the command line, so it is the caller's own
+# buffer, never a caller's argument
+fun create_process(pathname: *u16, cmdline: *u16, inherit: i32, flags: u32, environment: ptr, cwd: *u16, startup: *u8, process: *u8) i64 {
+    if (wide_len(cmdline) >= COMMAND_LINE_UNITS) { ret E2BIG; }
+    val ok: i32 = CreateProcessW(pathname, cmdline, nil, nil, inherit, flags | CREATE_UNICODE_ENVIRONMENT,
+        environment, cwd::ptr, startup, process);
+    if (ok == 0) { ret last_error(); }
+    ret 0;
+}
+
+# the native strings of a UTF-8 spawn, each converted once
+# ---
+# path:  the executable
+# args:  each argument's units, count of them
+# argv:  the arguments' units in order and a closing nil
+# count: the number of arguments
+# cwd:   the working directory, nil data when inherited
+rec PROCESS_NAMES {
+    path:  PROCESS_WIDE;
+    args:  *PROCESS_WIDE;
+    argv:  **u16;
+    count: usize;
+    cwd:   PROCESS_WIDE;
+}
+
+# convert the executable, each argument and the working directory of a UTF-8
+# spawn to UTF-16 once, for the native spawn to run
+# ---
+# output: the owned strings, written only on success
+# ret:    0, EINVAL for nil or malformed UTF-8, E2BIG for an oversized string, or ENOMEM
+fun process_names(pathname: *u8, argv: **u8, cwd: *u8, output: *PROCESS_NAMES) i64 {
+    if (pathname == nil || argv == nil) { ret EINVAL; }
+    var names: PROCESS_NAMES;
+    for (argv[names.count] != nil) { names.count = names.count + 1; }
+    val converted: i64 = process_names_convert(pathname, argv, cwd, ?names);
+    if (converted < 0) {
+        process_names_free(?names);
+        ret converted;
     }
-    if (command.units >= 32767) {
-        process_wide_free(?command);
-        process_wide_free(?path);
-        ret E2BIG;
+    @output = names;
+    ret 0;
+}
+
+fun process_names_convert(pathname: *u8, argv: **u8, cwd: *u8, names: *PROCESS_NAMES) i64 {
+    val path: i64 = process_wide(pathname, str_len(pathname), ?names.path);
+    if (path < 0) { ret path; }
+    val args_size: usize = (names.count + 1) * $size_of(PROCESS_WIDE);
+    names.args = allocate(args_size)::*PROCESS_WIDE;
+    if (names.args == nil) { ret ENOMEM; }
+    zero_bytes(names.args::*u8, args_size);
+    names.argv = allocate((names.count + 1) * $size_of(*u16))::**u16;
+    if (names.argv == nil) { ret ENOMEM; }
+    var i: usize = 0;
+    for (i < names.count) {
+        val arg: i64 = process_wide(argv[i], str_len(argv[i]), ?names.args[i]);
+        if (arg < 0) { ret arg; }
+        names.argv[i] = names.args[i].data;
+        i             = i + 1;
     }
-    var directory:      PROCESS_WIDE;
-    var directory_data: *u16 = nil;
-    if (cwd != nil) {
-        val d: i64 = process_wide(cwd, str_len(cwd), ?directory);
-        if (d < 0) {
-            process_wide_free(?command);
-            process_wide_free(?path);
-            ret d;
+    names.argv[names.count] = nil;
+    if (cwd == nil) { ret 0; }
+    ret process_wide(cwd, str_len(cwd), ?names.cwd);
+}
+
+fun process_names_free(names: *PROCESS_NAMES) {
+    if (names.args != nil) {
+        var i: usize = 0;
+        for (i < names.count) {
+            if (names.args[i].data != nil) { process_wide_free(?names.args[i]); }
+            i = i + 1;
         }
-        directory_data = directory.data;
+        deallocate(names.args::ptr, (names.count + 1) * $size_of(PROCESS_WIDE));
     }
-    val ok: i32 = CreateProcessW(path.data, command.data, nil, nil, inherit, flags | CREATE_UNICODE_ENVIRONMENT,
-        environment, directory_data::ptr, startup, process);
-    var result: i64 = 0;
-    if (ok == 0)    { result = last_error(); }
-    if (cwd != nil) { process_wide_free(?directory); }
-    process_wide_free(?command);
-    process_wide_free(?path);
-    ret result;
+    if (names.argv != nil)      { deallocate(names.argv::ptr, (names.count + 1) * $size_of(*u16)); }
+    if (names.cwd.data != nil)  { process_wide_free(?names.cwd); }
+    if (names.path.data != nil) { process_wide_free(?names.path); }
 }
 
 # spawn lock: serializes the inheritance-sensitive span of process
@@ -3693,7 +3739,7 @@ fun restore_inherit(list: *isize, prev: *u32, n: usize) {
 # slot is a reserved process-table entry owned by the caller: success
 # commits it via register_child (or register_child_grouped when grouped != 0,
 # via job_out); on any failure return the caller must release_proc it.
-fun create_redirected(pathname: *u8, cmdline: *u8, env_block: ptr, cwd: *u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32, slot: i32, grouped: i32, job_out: *isize) i64 {
+fun create_redirected(pathname: *u16, cmdline: *u16, env_block: ptr, cwd: *u16, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32, slot: i32, grouped: i32, job_out: *isize) i64 {
     var fds: [3]i32;
     fds[0] = stdin_fd;
     fds[1] = stdout_fd;
@@ -3797,7 +3843,7 @@ fun create_redirected(pathname: *u8, cmdline: *u8, env_block: ptr, cwd: *u8, std
     if (grouped != 0) { flags = flags | CREATE_SUSPENDED; }
 
     var pi:           PROCESS_INFORMATION;
-    val spawn_result: i64 = create_process_utf8(
+    val spawn_result: i64 = create_process(
         pathname, cmdline,
         1, flags,
         env_block, cwd,
@@ -3820,7 +3866,7 @@ fun create_redirected(pathname: *u8, cmdline: *u8, env_block: ptr, cwd: *u8, std
 # slot is a reserved process-table entry owned by the caller: success
 # commits it via register_child (or register_child_grouped when grouped != 0,
 # via job_out); on any failure return the caller must release_proc it.
-fun create_inherit(pathname: *u8, cmdline: *u8, env_block: ptr, cwd: *u8, slot: i32, grouped: i32, job_out: *isize) i64 {
+fun create_inherit(pathname: *u16, cmdline: *u16, env_block: ptr, cwd: *u16, slot: i32, grouped: i32, job_out: *isize) i64 {
     var si: STARTUPINFOW;
     zero_bytes((?si)::*u8, STARTUPINFOW_SIZE);
     si.cb = STARTUPINFOW_SIZE::u32;
@@ -3830,7 +3876,7 @@ fun create_inherit(pathname: *u8, cmdline: *u8, env_block: ptr, cwd: *u8, slot: 
 
     var pi: PROCESS_INFORMATION;
     spawn_spin_lock();
-    val spawn_result: i64 = create_process_utf8(
+    val spawn_result: i64 = create_process(
         pathname, cmdline,
         1, flags,
         env_block, cwd,
@@ -3920,6 +3966,10 @@ pub fun spawn_redirected_grouped(pathname: *u8, argv: **u8, envp: **u8, stdin_fd
 # passing it here rather than prefixing a `cd` onto a shell command keeps the
 # path out of the command line, where it would have to survive a quoting
 # convention the target program may not share (mach#2587).
+#
+# the executable, each argument and the directory are converted to UTF-16
+# once, refusing malformed UTF-8 with EINVAL, and spawned by
+# spawn_redirected_in_native
 # ---
 # pathname:  path to executable
 # argv:      null-terminated argument array
@@ -3930,51 +3980,12 @@ pub fun spawn_redirected_grouped(pathname: *u8, argv: **u8, envp: **u8, stdin_fd
 # stderr_fd: descriptor to install as the child's stderr, or -1 to inherit
 # ret:       child PID on success, or negative errno
 pub fun spawn_redirected_in(pathname: *u8, argv: **u8, envp: **u8, cwd: *u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) i64 {
-    var cmdline: [98304]u8;
-    if (!build_cmdline(argv, ?cmdline[0], 98304)) {
-        ret E2BIG;
-    }
-    ret spawn_line_in(pathname, ?cmdline[0], envp, cwd, stdin_fd, stdout_fd, stderr_fd);
-}
-
-# spawn from a native command line with redirected streams and a working
-# directory. the shared tail of the argv spawns and spawn_command_line
-fun spawn_line_in(pathname: *u8, cmdline: *u8, envp: **u8, cwd: *u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) i64 {
-    var env_size:  usize = 0;
-    var env_error: i64   = 0;
-    var env_block: ptr   = nil;
-    if (envp != nil) {
-        env_block = build_env_block(envp, ?env_size, ?env_error);
-        if (env_block == nil) { ret env_error; }
-    }
-
-    # claim a process-table slot before CreateProcess: a full table fails
-    # here, so a child is never launched only to be left unwaitable. the
-    # create paths commit the slot on success; any failure releases it.
-    # reserve takes the proc lock and the create paths take the spawn lock
-    # disjointly, so the two never nest and cannot invert.
-    val slot: i32 = reserve_proc();
-    if (slot < 0) {
-        if (env_block != nil) {
-            deallocate(env_block, env_size);
-        }
-        ret EAGAIN;
-    }
-
-    var r: i64 = 0;
-    if (stdin_fd == -1 && stdout_fd == -1 && stderr_fd == -1) {
-        r = create_inherit(pathname, cmdline, env_block, cwd, slot, 0, nil);
-    }
-    or {
-        r = create_redirected(pathname, cmdline, env_block, cwd, stdin_fd, stdout_fd, stderr_fd, slot, 0, nil);
-    }
-    if (env_block != nil) {
-        deallocate(env_block, env_size);
-    }
-    if (r < 0) {
-        release_proc(slot);
-    }
-    ret r;
+    var names:     PROCESS_NAMES;
+    val converted: i64 = process_names(pathname, argv, cwd, ?names);
+    if (converted < 0) { ret converted; }
+    val result: i64 = spawn_redirected_in_native(names.path.data, names.argv, envp, names.cwd.data, stdin_fd, stdout_fd, stderr_fd);
+    process_names_free(?names);
+    ret result;
 }
 
 # spawn a child with redirected streams and an explicit working directory,
@@ -3996,11 +4007,62 @@ fun spawn_line_in(pathname: *u8, cmdline: *u8, envp: **u8, cwd: *u8, stdin_fd: i
 # job_out:   receives the tracked child group token on success
 # ret:       child PID on success, or negative errno (job_out untouched)
 pub fun spawn_redirected_in_grouped(pathname: *u8, argv: **u8, envp: **u8, cwd: *u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32, job_out: *isize) i64 {
-    var cmdline: [98304]u8;
-    if (!build_cmdline(argv, ?cmdline[0], 98304)) {
+    var names:     PROCESS_NAMES;
+    val converted: i64 = process_names(pathname, argv, cwd, ?names);
+    if (converted < 0) { ret converted; }
+    val result: i64 = spawn_redirected_in_grouped_native(names.path.data, names.argv, envp, names.cwd.data, stdin_fd, stdout_fd, stderr_fd, job_out);
+    process_names_free(?names);
+    ret result;
+}
+
+# spawn as spawn does, from an executable and arguments in UTF-16
+pub fun spawn_native(pathname: *u16, argv: **u16, envp: **u8) i64 {
+    ret spawn_redirected_in_native(pathname, argv, envp, nil, -1, -1, -1);
+}
+
+# spawn as spawn_in does, from an executable, arguments and directory in UTF-16
+pub fun spawn_in_native(pathname: *u16, argv: **u16, envp: **u8, cwd: *u16) i64 {
+    ret spawn_redirected_in_native(pathname, argv, envp, cwd, -1, -1, -1);
+}
+
+# spawn as spawn_redirected does, from an executable and arguments in UTF-16
+pub fun spawn_redirected_native(pathname: *u16, argv: **u16, envp: **u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) i64 {
+    ret spawn_redirected_in_native(pathname, argv, envp, nil, stdin_fd, stdout_fd, stderr_fd);
+}
+
+# spawn as spawn_redirected_in does, from nul-terminated UTF-16 given as is
+#
+# the executable and the directory reach CreateProcessW unchanged, and each
+# argument enters the command line unit for unit under the CRT quoting, so an
+# unpaired surrogate launches, starts in or reaches the child as it was given
+# ---
+# pathname: path to executable
+# argv:     null-terminated argument array
+# envp:     null-terminated UTF-8 environment array, or nil to inherit
+# cwd:      working directory for the child, or nil to inherit
+# ret:      child PID on success, or negative errno
+pub fun spawn_redirected_in_native(pathname: *u16, argv: **u16, envp: **u8, cwd: *u16, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) i64 {
+    ret spawn_argv_in(pathname, argv, envp, cwd, stdin_fd, stdout_fd, stderr_fd, 0, nil);
+}
+
+# spawn as spawn_redirected_in_grouped does, from nul-terminated UTF-16 given as is
+pub fun spawn_redirected_in_grouped_native(pathname: *u16, argv: **u16, envp: **u8, cwd: *u16, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32, job_out: *isize) i64 {
+    ret spawn_argv_in(pathname, argv, envp, cwd, stdin_fd, stdout_fd, stderr_fd, 1, job_out);
+}
+
+# join a wide argv into the command line every argv spawn runs
+fun spawn_argv_in(pathname: *u16, argv: **u16, envp: **u8, cwd: *u16, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32, grouped: i32, job_out: *isize) i64 {
+    if (pathname == nil || argv == nil) { ret EINVAL; }
+    var cmdline: [COMMAND_LINE_UNITS]u16;
+    if (!build_cmdline(argv, ?cmdline[0], COMMAND_LINE_UNITS)) {
         ret E2BIG;
     }
+    ret spawn_line_in(pathname, ?cmdline[0], envp, cwd, stdin_fd, stdout_fd, stderr_fd, grouped, job_out);
+}
 
+# spawn from a writable native command line with redirected streams and a
+# working directory. the shared tail of the argv spawns and spawn_command_line
+fun spawn_line_in(pathname: *u16, cmdline: *u16, envp: **u8, cwd: *u16, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32, grouped: i32, job_out: *isize) i64 {
     var env_size:  usize = 0;
     var env_error: i64   = 0;
     var env_block: ptr   = nil;
@@ -4009,6 +4071,11 @@ pub fun spawn_redirected_in_grouped(pathname: *u8, argv: **u8, envp: **u8, cwd: 
         if (env_block == nil) { ret env_error; }
     }
 
+    # claim a process-table slot before CreateProcess: a full table fails
+    # here, so a child is never launched only to be left unwaitable. the
+    # create paths commit the slot on success; any failure releases it.
+    # reserve takes the proc lock and the create paths take the spawn lock
+    # disjointly, so the two never nest and cannot invert.
     val slot: i32 = reserve_proc();
     if (slot < 0) {
         if (env_block != nil) {
@@ -4020,10 +4087,10 @@ pub fun spawn_redirected_in_grouped(pathname: *u8, argv: **u8, envp: **u8, cwd: 
     var job: isize = 0;
     var r:   i64   = 0;
     if (stdin_fd == -1 && stdout_fd == -1 && stderr_fd == -1) {
-        r = create_inherit(pathname, ?cmdline[0], env_block, cwd, slot, 1, ?job);
+        r = create_inherit(pathname, cmdline, env_block, cwd, slot, grouped, ?job);
     }
     or {
-        r = create_redirected(pathname, ?cmdline[0], env_block, cwd, stdin_fd, stdout_fd, stderr_fd, slot, 1, ?job);
+        r = create_redirected(pathname, cmdline, env_block, cwd, stdin_fd, stdout_fd, stderr_fd, slot, grouped, ?job);
     }
     if (env_block != nil) {
         deallocate(env_block, env_size);
@@ -4032,7 +4099,7 @@ pub fun spawn_redirected_in_grouped(pathname: *u8, argv: **u8, envp: **u8, cwd: 
         release_proc(slot);
         ret r;
     }
-    @job_out = job;
+    if (grouped != 0) { @job_out = job; }
     ret r;
 }
 
@@ -4047,7 +4114,8 @@ pub fun spawn_redirected_in_grouped(pathname: *u8, argv: **u8, envp: **u8, cwd: 
 # that parses its command line another way, such as cmd.exe, needs the line
 # exactly as it will read it, and this is the only spawn that passes one
 # through untouched. application is the resolved executable, so no PATH or
-# current-directory search happens
+# current-directory search happens. each string is converted to UTF-16 once,
+# as the argv spawns convert theirs
 # ---
 # application:  path to the executable
 # command_line: the complete native command line, program name included
@@ -4055,7 +4123,19 @@ pub fun spawn_redirected_in_grouped(pathname: *u8, argv: **u8, envp: **u8, cwd: 
 # cwd:          working directory for the child, or nil to inherit
 # ret:          child PID on success, or a negative native code
 pub fun spawn_command_line(application: *u8, command_line: *u8, envp: **u8, cwd: *u8) i64 {
-    ret spawn_line_in(application, command_line, envp, cwd, -1, -1, -1);
+    if (application == nil || command_line == nil) { ret EINVAL; }
+    var path:      PROCESS_WIDE;
+    var line:      PROCESS_WIDE;
+    var directory: PROCESS_WIDE;
+    var result:    i64 = process_wide(application, str_len(application), ?path);
+    if (result < 0) { ret result; }
+    result = process_wide(command_line, str_len(command_line), ?line);
+    if (result >= 0 && cwd != nil) { result = process_wide(cwd, str_len(cwd), ?directory); }
+    if (result >= 0)               { result = spawn_line_in(path.data, line.data, envp, directory.data, -1, -1, -1, 0, nil); }
+    if (directory.data != nil)     { process_wide_free(?directory); }
+    if (line.data != nil)          { process_wide_free(?line); }
+    process_wide_free(?path);
+    ret result;
 }
 
 # forcefully stop a spawned child without reaping it
@@ -6166,6 +6246,58 @@ test spawn_in__unicode_executable_and_working_directory_round_trip {
     ret bad;
 }
 
+#[testing]
+fun t_wide_append(buf: *u16, offset: usize, text: *u8) usize {
+    var i: usize = 0;
+    for (text[i] != 0) {
+        buf[offset + i] = text[i]::u16;
+        i               = i + 1;
+    }
+    buf[offset + i] = 0;
+    ret offset + i;
+}
+
+# the child finds its own executable by the argument's name only from the directory it starts in
+test spawn_in_native__an_unpaired_surrogate_reaches_the_executable_the_directory_and_an_argument {
+    var directory: [32]u16;
+    var end:       usize = t_wide_append(?directory[0], 0, ".std1055-");
+    directory[end]     = 0xd800;
+    directory[end + 1] = 0;
+    var executable: [48]u16;
+    end             = t_wide_append(?executable[0], 0, ".std1055-");
+    executable[end] = 0xd800;
+    end             = t_wide_append(?executable[0], end + 1, "\\");
+    executable[end] = 0xd800;
+    t_wide_append(?executable[0], end + 1, ".exe");
+    var command: [64]u16;
+    end          = t_wide_append(?command[0], 0, "if not exist ");
+    command[end] = 0xd800;
+    t_wide_append(?command[0], end + 1, ".exe (exit 9) else (exit 0)");
+    var flag: [3]u16;
+    t_wide_append(?flag[0], 0, "/c");
+    var shell: [32]u16;
+    t_wide_append(?shell[0], 0, "C:\\Windows\\System32\\cmd.exe");
+    if (CreateDirectoryW(?directory[0], nil) == 0) { ret 1; }
+    var bad: i32 = 0;
+    if (CopyFileW(?shell[0], ?executable[0], 1) == 0) { bad = 2; }
+    or {
+        var argv: [4]usize;
+        argv[0] = (?executable[0])::usize;
+        argv[1] = (?flag[0])::usize;
+        argv[2] = (?command[0])::usize;
+        argv[3] = 0;
+        val pid: i64 = spawn_in_native(?executable[0], (?argv[0])::**u16, nil, ?directory[0]);
+        if (pid < 0) { bad = 3; }
+        or {
+            var status: os_shared.ProcessStatus;
+            if (wait(pid, ?status, 0, nil).error.code < 0 || status.kind != os_shared.PROCESS_EXITED || status.code != 0) { bad = 4; }
+        }
+        DeleteFileW(?executable[0]);
+    }
+    RemoveDirectoryW(?directory[0]);
+    ret bad;
+}
+
 test getenv__long_values_report_utf_8_capacity {
     var name: [5]u16;
     name[0] = 'M'::u16;
@@ -6242,7 +6374,8 @@ test temp_dir__capacity_measures_utf_8_bytes {
     ret bad;
 }
 
-test create_process__command_capacity_measures_utf_16_units {
+# the limit is CreateProcessW's, in UTF-16 units, through both UTF-8 entries
+test spawn__command_capacity_measures_utf_16_units {
     val size:  usize = 98305;
     val bytes: *u8   = allocate(size)::*u8;
     if (bytes == nil) { ret 1; }
@@ -6253,24 +6386,32 @@ test create_process__command_capacity_measures_utf_16_units {
         bytes[i * 3 + 2] = 0xb0;
         i                = i + 1;
     }
+    val missing: *u8 = ".std603-does-not-exist.exe";
     bytes[90000] = 0;
-    var si: STARTUPINFOW;
-    zero_bytes((?si)::*u8, STARTUPINFOW_SIZE);
-    si.cb = STARTUPINFOW_SIZE::u32;
-    var pi:      PROCESS_INFORMATION;
-    val shorter: i64 = create_process_utf8(".std603-does-not-exist.exe", bytes, 0, 0, nil, nil, (?si)::*u8, (?pi)::*u8);
+    val shorter: i64 = spawn_command_line(missing, bytes, nil, nil);
     bytes[90000] = 0xe7;
     bytes[98298] = 0;
-    val boundary: i64 = create_process_utf8(".std603-does-not-exist.exe", bytes, 0, 0, nil, nil, (?si)::*u8, (?pi)::*u8);
+    val boundary: i64 = spawn_command_line(missing, bytes, nil, nil);
     bytes[98298] = 0xe7;
     bytes[98301] = 0;
-    val terminated_boundary: i64 = create_process_utf8(".std603-does-not-exist.exe", bytes, 0, 0, nil, nil, (?si)::*u8, (?pi)::*u8);
+    val terminated_boundary: i64 = spawn_command_line(missing, bytes, nil, nil);
     bytes[98301] = 0xe7;
     bytes[98304] = 0;
-    val oversized: i64 = create_process_utf8(".std603-does-not-exist.exe", bytes, 0, 0, nil, nil, (?si)::*u8, (?pi)::*u8);
+    val oversized: i64 = spawn_command_line(missing, bytes, nil, nil);
+    var argv:      [3]usize;
+    argv[0]      = ("x")::usize;
+    argv[1]      = bytes::usize;
+    argv[2]      = 0;
+    bytes[98304] = 0xe7;
+    bytes[98292] = 0;
+    val argv_boundary: i64 = spawn(missing, (?argv[0])::**u8, nil);
+    bytes[98292] = 0xe7;
+    bytes[98295] = 0;
+    val argv_oversized: i64 = spawn(missing, (?argv[0])::**u8, nil);
     deallocate(bytes::ptr, size);
     if (shorter != ENOENT || boundary != ENOENT)            { ret 2; }
     if (terminated_boundary != E2BIG || oversized != E2BIG) { ret 3; }
+    if (argv_boundary != ENOENT || argv_oversized != E2BIG) { ret 4; }
     ret 0;
 }
 
