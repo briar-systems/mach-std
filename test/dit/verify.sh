@@ -5,8 +5,7 @@
 # and runs with the mode off and std.system.timing answering unavailable
 # where it does not. a program without one leaves the mode off and answers
 # unneeded. qemu-aarch64 -cpu cortex-a57 models a processor without the mode
-# wherever qemu is on the path. the refusal under require_timing_mode needs a
-# build that states it, which the toolchain cannot spell yet.
+# wherever qemu is on the path. no case refuses to start.
 #
 # usage: verify.sh <mach> <target> [runner]
 set -euo pipefail
@@ -26,10 +25,9 @@ decode() {
         2) echo "thread spawn failed" ;;
         3) echo "thread join failed" ;;
         4) echo "the spawned thread's PSTATE.DIT is not what std.system.timing reports" ;;
-        10) echo "__mach_dit_wanted or __mach_timing_mode_required does not match the link" ;;
+        10) echo "__mach_dit_required does not match the link" ;;
         11) echo "the secret multiply computed a wrong product" ;;
         12) echo "std.system.timing reports a mode the link contradicts" ;;
-        255) echo "the runtime refused to start" ;;
         *) echo "unexpected exit code $1" ;;
     esac
 }
