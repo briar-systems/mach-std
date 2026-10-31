@@ -1,7 +1,7 @@
 # Freestanding build ratchet
 
 `verify.sh` builds every std module (depth one and two under `src/`, excluding
-`lib/`) for `freestanding-x86_64` (`os = "freestanding"`, `of = "elf"`) from a
+`lib/`) for `freestanding-x86_64` (`sys = "freestanding"`, `of = "elf"`) from a
 probe that only imports it. It then compares the modules that build with
 `expected-pass.txt`, which must match exactly.
 
