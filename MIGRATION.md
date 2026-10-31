@@ -85,6 +85,23 @@ var work: format.F64WriteGWork;
 format.write_float_g(?w, ieee.F64, bits, 17, ?work[0]);
 ```
 
+## secret storage is locked and its allocation reports why it failed (#1115, #907)
+
+Every allocation from `std.memory.secret` is now locked against paging, sits between two inaccessible guard pages and, on linux, is kept out of core dumps. A host that refuses the lock fails the allocation instead of handing out unlocked storage, so `allocate` and `allocate_typed` return an error and write the storage through an out parameter. A lock refusal carries `io_error.OP_LOCK` as its operation, with kind `RESOURCE_EXHAUSTED` (the `RLIMIT_MEMLOCK` or working-set limit) or `PERMISSION`. A zero size or count is still a successful nil.
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `val data: *^u8 = secret.allocate(size)` then `if (data == nil)` | `var data: *^u8 = nil` then `secret.allocate(size, ?data)` returns `err[io_error.Error]` |
+| `val data: *T = secret.allocate_typed[T](count)` | `var data: *T = nil` then `secret.allocate_typed[T](count, ?data)` |
+| `os.allocate_secret(size)` returns `*^u8` | `os.allocate_secret(size, ?data)` returns `os.SecretStatus{code, lock}` |
+| `os.allocate_secret_typed[T](total)` returns `*T` | `os.allocate_secret_typed[T](total, ?data)` returns `os.SecretStatus` |
+
+`filesystem.read_secret` reports a refused allocation as `FsError.io` with that error, where it reported `FsError.alloc` before.
+
+A long-running program that keeps many secrets may need a higher `RLIMIT_MEMLOCK` (linux, darwin) or a larger minimum working set (windows). A host that cannot lock at all (`os.SECRET_LOCKS` false) refuses secret storage until the program calls `secret.accept_unlocked()`. No current host is one.
+
+`buffers` secret classes and requests accept an alignment up to `buffers.SECRET_ALIGN_MAX` (4096, the alignment welded storage guarantees on every host) and `make` refuses a secret class above it. Before, alignments up to 65536 were accepted and not honoured.
+
 # std 6.x to 7.0.0
 
 std 7.0.0 makes the memory behind `io.runtime` reachable (#677). A runtime takes the allocator every one of its allocations comes from, and every driver registered on it draws from the same allocator.
