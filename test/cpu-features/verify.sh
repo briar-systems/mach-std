@@ -125,10 +125,10 @@ if [ "$target" = linux-x86_64 ] && command -v qemu-x86_64 >/dev/null; then
         cat >>"$sel/mach.toml" <<'EOF'
 
 [target.linux-x86_64-aes]
-isa = "x86_64"
-os  = "linux"
-abi = "sysv64"
-extensions = ["aes", "pclmul"]
+arch = "x86_64"
+sys  = "linux"
+abi  = "sysv64"
+ext  = ["aes", "pclmul"]
 EOF
         selected="$(cd "$sel" && build linux-x86_64-aes)"
         selected="$sel/$selected"

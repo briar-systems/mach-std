@@ -34,8 +34,8 @@ src = "src"
 work = "out/{target.name}/{profile.name}"
 
 [target.freestanding-x86_64]
-isa = "x86_64"
-os = "freestanding"
+arch = "x86_64"
+sys = "freestanding"
 abi = "sysv64"
 of = "elf"
 
