@@ -11,7 +11,7 @@
 set -euo pipefail
 
 mach="${1:-mach}"
-target="${2:-linux-arm64}"
+target="${2:-linux-aarch64}"
 runner="${3:-}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$here/../lib/compiler.sh"
@@ -57,7 +57,7 @@ code="$(run "$plain")"
 [ "$code" -eq 0 ] || fail "plain: $(decode "$code")"
 echo "OK: a link without one leaves PSTATE.DIT off"
 
-if [ "$target" = linux-arm64 ] && command -v qemu-aarch64 >/dev/null; then
+if [ "$target" = linux-aarch64 ] && command -v qemu-aarch64 >/dev/null; then
     runner="qemu-aarch64 -cpu cortex-a57"
     code="$(run "$secret")"
     [ "$code" -eq 0 ] || fail "secret under $runner: $(decode "$code")"
