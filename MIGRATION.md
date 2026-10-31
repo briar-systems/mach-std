@@ -1,5 +1,7 @@
 # std 9.x to 10.0.0
 
+std 10.0.0 pairs with mach 7.
+
 ## one command-line engine in std.args (#1113)
 
 `std.args` now carries the engine mach reads its command line with: rows with aliases, arity and an occurrence policy, tables composed into commands and actions, relations between rows, removed spellings, exit notes, examples and generated help. The plain `Flag` table and its `Reader` are gone. A program declares its commands once in a `CommandSet` and reads the whole line with `parse`, which allocates nothing and needs no storage from the caller: every query reads the arguments again.
