@@ -17,7 +17,7 @@ $if (capability.HAS_FILES) {
 
 Every group is present on linux, darwin and windows. None is present on any other target, freestanding included. `HOSTED` is the core group, which every other group implies.
 
-A target that claims a group exports every member listed here. `src/system/capability/conformance.mach` names every member of every group that the per-OS module supplies, so a missing member fails the build on any target that claims the group. Members `std.system.os` defines itself (the secret primitives `allocate_secret`, `allocate_secret_typed`, `release_secret`, `release_secret_typed`, `random_fill_secret`, `read_at_secret` and `write_at_secret`, `stdin`, `stdout`, `stderr`, `working_dir`, `exit`, `panic_sink`, the spawn environment types `EnvironmentOf`, `Environment` and `NativeEnvironment`, and `realtime`, `monotonic`, `error`, `error_message` and `message`) exist wherever the module compiles, so the test doesn't name them. The test also keeps the positioned secret transfers inside the files lane, which `test/secret/verify.sh` enforces.
+A target that claims a group exports every member listed here. `src/system/capability/conformance.mach` names every member of every group that the per-OS module supplies, so a missing member fails the build on any target that claims the group. Members `std.system.os` defines itself (the secret primitives `allocate_secret`, `allocate_secret_typed`, `release_secret`, `release_secret_typed`, `random_fill_secret`, `read_at_secret` and `write_at_secret`, with `SecretStatus`, `SECRET_ALIGN` and `SECRET_LOCKS`, `stdin`, `stdout`, `stderr`, `working_dir`, `exit`, `panic_sink`, the spawn environment types `EnvironmentOf`, `Environment` and `NativeEnvironment`, and `realtime`, `monotonic`, `error`, `error_message` and `message`) exist wherever the module compiles, so the test doesn't name them. The test also keeps the positioned secret transfers inside the files lane, which `test/secret/verify.sh` enforces.
 
 | flag | group | purpose |
 | --- | --- | --- |
@@ -42,7 +42,7 @@ A target that claims a group exports every member listed here. `src/system/capab
 
 ### pages (`HAS_PAGES`)
 
-`ADVISE_DONT_NEED`, `ADVISE_NORMAL`, `ADVISE_RANDOM`, `ADVISE_SEQUENTIAL`, `ADVISE_WILL_NEED`, `PROT_EXEC`, `PROT_NONE`, `PROT_READ`, `PROT_WRITE`, `advise`, `allocate`, `allocate_secret`, `allocate_secret_typed`, `deallocate`, `heap_region_base`, `heap_region_extend`, `lock`, `page_size`, `protect`, `reallocate`, `release_secret`, `release_secret_typed`, `unlock`
+`ADVISE_DONT_NEED`, `ADVISE_NORMAL`, `ADVISE_RANDOM`, `ADVISE_SEQUENTIAL`, `ADVISE_WILL_NEED`, `PROT_EXEC`, `PROT_NONE`, `PROT_READ`, `PROT_WRITE`, `SECRET_ALIGN`, `SECRET_LOCKS`, `SecretStatus`, `advise`, `allocate`, `allocate_secret`, `allocate_secret_typed`, `deallocate`, `heap_region_base`, `heap_region_extend`, `lock`, `page_size`, `protect`, `reallocate`, `release_secret`, `release_secret_typed`, `unlock`
 
 ### clock (`HAS_CLOCK`)
 
@@ -110,7 +110,7 @@ The contract is designed so that a user-supplied implementation, for a kernel or
 - **A1, codes.** A fallible primitive returns `i64`: `>= 0` is success and `< 0` is an opaque native code. Only the implementation interprets a code. The `E*` constants are not on the portable surface, only in the per-OS modules, and `os.error_kind(code)` is the only portable reading of a code.
 - **A2, handles.** Resources are pointer-width opaque values. Descriptors are `usize` handles. A primitive that creates one returns it through an out parameter with an `i64` status, `INVALID_HANDLE` means none, and the standard handles and the working directory are functions (`stdin()`, `stdout()`, `stderr()`, `working_dir()`). The per-OS modules keep their native `i32` descriptors. Above the contract, `io.handle.SocketHandle` pairs the native value with an opening stamped when std creates the socket, so a `net.async` driver can tell a socket closed outside it from the socket that reuses its value (#716).
 - **A3, no ambient process model.** Nothing assumes environment variables, a working directory, signals, standard streams or a process table unless it belongs to the group that provides them (process, files).
-- **A4, secret shape.** Primitives that touch secret-welded storage take `*^u8` and never downgrade it.
+- **A4, secret shape.** Primitives that touch secret-welded storage take `*^u8` and never downgrade it. Secret allocations start on `SECRET_ALIGN`, sit between inaccessible guard pages and are locked against paging, kept out of dumps where the host can. An implementation whose `SECRET_LOCKS` is true reports a refused lock as a failure with `SecretStatus.lock` set and never serves unlocked storage. One that cannot lock sets `SECRET_LOCKS` false, and `std.memory.secret` then serves it only after the program's `accept_unlocked`.
 - **A5, no hidden initialization.** The implementation owns its state. std calls no init hook beyond what `std.runtime` or the embedder already runs.
 - **A6, memory.** Pages come back zeroed and page-aligned. `protect`, `lock` and `advise` may be unsupported, and callers accept that.
 
