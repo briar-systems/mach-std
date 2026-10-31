@@ -1,5 +1,32 @@
 # std 9.x to 10.0.0
 
+## one command-line engine in std.args (#1113)
+
+`std.args` now carries the engine mach reads its command line with: rows with aliases, arity and an occurrence policy, tables composed into commands and actions, relations between rows, removed spellings, exit notes, examples and generated help. The plain `Flag` table and its `Reader` are gone. A program declares its commands once in a `CommandSet` and reads the whole line with `parse`, which allocates nothing and needs no storage from the caller: every query reads the arguments again.
+
+A row has one spelling. A flag that took both `--out` and `-o` becomes a canonical row and an alias row naming it. The spelling rules are unchanged: short spellings are one byte, a short cluster runs `-abc` as three switches, a VALUE or ATTACHED short takes the rest of the token, `--name=value` works for long value rows, a negatable long flag answers to `--no-name`, and `--` ends the options.
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `args.Flag{name: "--out", short: "-o", kind: args.VALUE, negatable: false, occurs: o, value: "path", doc: d}` | `val OUT: args.FlagSpec = args.FlagSpec{name: "--out", value: "path", arity: args.ARITY_VALUE, doc: d, default: "", negatable: false, occurs: o, alias_of: nil}` and `args.FlagSpec{name: "-o", ..., alias_of: ?OUT}` |
+| `args.Kind`, `args.SWITCH`, `args.VALUE`, `args.ATTACHED` | `args.Arity`, `args.ARITY_FLAG`, `args.ARITY_VALUE`, `args.ARITY_ATTACHED` |
+| a `**args.Flag` list and its count | `args.TableRef{rows: ?LIST[0], n: N, accepted: nil, docs: nil}` in an `args.CommandSpec`, the commands in an `args.CommandSet` |
+| `args.reader(a, 2, flags, n, ?settings[0])` then a loop over `args.read` | `var inv: args.Invocation = args.parse(?SET, a, 1);` for a command word at argument 1, or `args.parse_command(?SET, ?COMMAND, a, 2)` once the program has picked the command |
+| `args.Error` from `read` | `inv.refusal`, an `opt[args.Refusal]`. `args.describe(?inv, ?w)` writes its message |
+| `args.Error.malformed{row}` | `args.Refusal.malformed{args.Malformed{command, action, row, why}}`, and `args.check(?SET)` finds it without reading arguments |
+| the `args.Event` stream `read` gave | `var w: args.Walk = args.walk(?inv);` then `args.step(?w)`, the same `done`, `operand` and `hit` events, refused tokens skipped |
+| `args.on(r, ?F)`, `args.value(r, ?F)`, `args.given(r, ?F)`, `args.values(r, ?F)`, `args.next_value(?w)` | the same names over the invocation: `args.on(?inv, ?F)` and so on. `given` also answers true for a row a given row implies |
+| `args.setting(r, ?F)` and `Setting.count` | `args.latest(?inv, ?F)`, a `res[opt[args.Hit], args.Misread]`, and `args.occurrences(?inv, ?F)` |
+| `args.separator(r)` | `args.separator(?inv)` |
+| `Hit.flag` | `Hit.flag` is the canonical row. `Hit.spelled` is the row whose spelling matched and `Hit.at` the cluster offset |
+| help text a program wrote by hand | `args_help.render(?SET, ?w, args_help.page_of(?inv), args_help.terminal_width())`, from `std.args.help` |
+
+`Misread` keeps its cases. `unlisted` now means the row is not in the invocation's schema, the set's common tables joined to the command's and its action's.
+
+A `CommandSet` carries what mach kept in module globals: `common` tables every command accepts (where `--help` and `-h` go), `help_flag` naming the row that asks for a page, shared `relations`, `removed` spellings and the shared `exits`. A `CommandSpec` has an `id` for the program to dispatch on in place of mach's `run` handler.
+
+For mach's own switch: `repeatable: true` becomes `occurs: args.Occurs.collect{}`. The `-vv` row is not a short spelling, so verbosity becomes one collect `-v` row read with `occurrences`, capped at 2, and the `-vv implies -v` relation goes. `-n=x` on a short value row now gives the value `=x` instead of an unknown-flag refusal, and `-ovalue` is read as `-o value`. A command without `truncate_at_sep` reads the arguments after `--` as operands where it refused `--` as an unknown flag. `values` walks every occurrence, so a caller that wants only the values skips a hit whose value is nil. `ParsedInvocation`, `dnit_invocation` and the allocator argument go, since nothing is allocated.
+
 ## a heap over a backing that never reclaims keeps its spans (#883)
 
 `heap.allocator_source` reads the backing's `retains` flag once, when the source is built. Over a backing that does not reclaim, such as `allocator.fixed`, `allocator.arena` or `allocator.bump`, the source can no longer release, so the heap keeps every span it obtained and reuses it. Growing past the `init` budget again takes nothing more from the backing, where before each span handed back was lost to it. Over a reclaiming backing nothing changes.
