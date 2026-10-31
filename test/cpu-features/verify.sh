@@ -72,7 +72,7 @@ os_view() {
             grep -qw aes /proc/cpuinfo && flags+=(1) || flags+=(0)
             grep -qw pclmulqdq /proc/cpuinfo && flags+=(1) || flags+=(0)
             grep -qw sha_ni /proc/cpuinfo && flags+=(1) || flags+=(0) ;;
-        linux-arm64)
+        linux-aarch64)
             grep -qw aes /proc/cpuinfo && flags+=(1) || flags+=(0)
             grep -qw pmull /proc/cpuinfo && flags+=(1) || flags+=(0)
             grep -qw sha2 /proc/cpuinfo && flags+=(1) || flags+=(0) ;;
@@ -140,7 +140,7 @@ EOF
     fi
 fi
 if [ "$target" = linux-x86_64 ] && command -v qemu-aarch64 >/dev/null; then
-    arm="$(build linux-arm64)"
+    arm="$(build linux-aarch64)"
     [ "$(crypto qemu-aarch64 -cpu max "$arm")" = "aes=1 pmull=1|aes=1 pmull=1" ] \
         || fail "qemu-aarch64 -cpu max does not report aes and pmull"
     echo "OK: qemu-aarch64 -cpu max reports aes=1 pmull=1"

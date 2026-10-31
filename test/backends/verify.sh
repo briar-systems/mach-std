@@ -138,7 +138,7 @@ inspect_macho() {
 
 targets=(
     linux-x86_64
-    linux-arm64
+    linux-aarch64
     linux-riscv64
     windows-x86_64
     darwin-x86_64

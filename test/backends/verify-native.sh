@@ -31,7 +31,7 @@ case "$target" in
         readelf -h "$exe" | grep -q 'Machine:[[:space:]]*Advanced Micro Devices X86-64' \
             || fail "$target produced the wrong machine"
         ;;
-    linux-arm64)
+    linux-aarch64)
         readelf -h -l -d "$exe"
         readelf -h "$exe" | grep -q 'Class:[[:space:]]*ELF64' \
             || fail "$target did not produce ELF64"
