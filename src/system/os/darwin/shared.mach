@@ -5,11 +5,11 @@
 # trap, because apple promises none. arch-specific modules provide only
 # page_size and pipe.
 
+use std.crypto.ct;
 use io_error: std.io.error;
 use std.sync.atomic;
 use cpu_features_: std.system.cpu.features;
-use std.system.dit;
-use identities: std.system.file_identity;
+use identities:    std.system.file_identity;
 use std.system.os.shared.Environment;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -1760,6 +1760,74 @@ pub fun stack_bounds(low: *usize, high: *usize) bool {
     ret true;
 }
 
+val MH_MAGIC_64:              u32 = 0xfeedfacf;
+val LC_SEGMENT_64:            u32 = 0x19;
+val S_THREAD_LOCAL_REGULAR:   u32 = 0x11;
+val S_THREAD_LOCAL_ZEROFILL:  u32 = 0x12;
+val S_THREAD_LOCAL_VARIABLES: u32 = 0x13;
+
+# the thread-local block dyld gave the calling thread for the image std is
+# linked into, and its size
+#
+# dyld sets each thread's block up from the image's template on first use and
+# frees it at thread exit without wiping it. the block is the value of the
+# pthread key in the image's first thread-local descriptor (thunk, key,
+# offset), and it spans the image's thread-local data and zero-fill sections
+# ---
+# size: receives the block's size
+# ret:  the block, or 0 where the image has no thread-locals or the thread
+#       never touched them
+fun thread_tls_block(size: *usize) usize {
+    val anchor: fun() = thread_exit_wipe;
+    var info:   ls.DlInfo;
+    if (ls.dladdr(anchor::usize::ptr, ?info) == 0 || info.fbase == 0) { ret 0; }
+    val header: usize = info.fbase;
+    if (@(header::*u32) != MH_MAGIC_64) { ret 0; }
+    val count: u32   = @((header + 16)::*u32);
+    var cmd:   usize = header + 32;
+    var slide: usize = 0;
+    var low:   usize = ~(0::usize);
+    var high:  usize = 0;
+    var vars:  usize = 0;
+    var i:     u32   = 0;
+    for (i < count) {
+        if (@(cmd::*u32) == LC_SEGMENT_64) {
+            if (@((cmd + 40)::*u64) == 0 && @((cmd + 48)::*u64) != 0) { slide = header - @((cmd + 24)::*usize); }
+            val sections: u32   = @((cmd + 64)::*u32);
+            var section:  usize = cmd + 72;
+            var j:        u32   = 0;
+            for (j < sections) {
+                val addr: usize = @((section + 32)::*usize);
+                val span: usize = @((section + 40)::*usize);
+                val kind: u32   = @((section + 64)::*u32) & 0xff;
+                if (kind == S_THREAD_LOCAL_REGULAR || kind == S_THREAD_LOCAL_ZEROFILL) {
+                    if (addr < low)         { low = addr; }
+                    if (addr + span > high) { high = addr + span; }
+                }
+                if (kind == S_THREAD_LOCAL_VARIABLES && span >= 24 && vars == 0) { vars = addr; }
+                section = section + 80;
+                j       = j + 1;
+            }
+        }
+        cmd = cmd + (@((cmd + 4)::*u32))::usize;
+        i   = i + 1;
+    }
+    if (vars == 0 || high <= low) { ret 0; }
+    val key: usize = @((vars + slide + 8)::*usize);
+    @size = high - low;
+    ret ls.pthread_getspecific(key)::usize;
+}
+
+# wipe the calling thread's thread-local block as the thread ends
+#
+# thread-locals may hold secrets, so the whole block is zeroed with stores no
+# pass removes. nothing may read a thread-local after this
+pub fun thread_exit_wipe() {
+    var size:  usize = 0;
+    val block: usize = thread_tls_block(?size);
+    if (block != 0) { ct.zeroize_plain(block::*u8, size); }
+}
+
 rec ThreadStart {
     fn_addr:          usize;
     arg_addr:         usize;
@@ -1795,8 +1863,6 @@ fun abort_thread_start(thread: usize, start: *ThreadStart, failure: i64) i64 {
 
 # pthread entry with a parent-controlled setup gate
 fun thread_entry(arg: ptr) usize {
-    # DIT is per thread and pthread does not promise to copy it
-    dit.enter_thread();
     val start:       *ThreadStart = arg::usize::*ThreadStart;
     var block:       os_shared.ThreadBlock;
     var setup_error: i64          = thread_block_enter(?block);
@@ -1829,6 +1895,7 @@ fun thread_entry(arg: ptr) usize {
     deallocate(start::ptr, THREAD_START_SIZE);
 
     if (run < 0) {
+        thread_exit_wipe();
         thread_block_leave();
         atomic.store(reclaimable_addr::*i64, 1);
         thread_wake(reclaimable_addr::*i64);
@@ -1837,6 +1904,7 @@ fun thread_entry(arg: ptr) usize {
 
     val fn_ptr: fun(*u8) = fn_addr::fun(*u8);
     fn_ptr(arg_addr::*u8);
+    thread_exit_wipe();
     thread_block_leave();
 
     val state:    *i64 = state_addr::*i64;

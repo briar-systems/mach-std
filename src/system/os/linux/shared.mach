@@ -4,6 +4,7 @@
 # are identical across linux architectures. arch-specific modules provide
 # only page_size and thread_spawn.
 
+use std.crypto.ct;
 use io_error:      std.io.error;
 use cpu_features_: std.system.cpu.features;
 use identities:    std.system.file_identity;
@@ -1009,6 +1010,161 @@ pub fun thread_block_prepare(block: *os_shared.ThreadBlock) {
 pub fun thread_block_bound(block: *os_shared.ThreadBlock, low: usize, high: usize) {
     block.stack_low  = low;
     block.stack_high = high;
+}
+
+# where an architecture's psABI puts the thread-local block against the thread
+# pointer, as the linker lays out local-exec offsets
+# ---
+# below: variant II, the block ends at the thread pointer (x86_64)
+# tcb:   variant I, the control block bytes between the thread pointer and the
+#        block, which starts at tcb aligned up to the block's alignment
+pub rec TlsLayout {
+    below: bool;
+    tcb:   usize;
+}
+
+# the executable's thread-local template, read once at entry from its PT_TLS.
+# local-exec offsets are fixed at link time, so every thread lays the block out
+# the same way against its thread pointer, whoever set the thread up
+var tls_image:  usize = 0;
+var tls_filesz: usize = 0;
+var tls_memsz:  usize = 0;
+var tls_align:  usize = 16;
+
+val PT_PHDR: u32 = 6;
+val PT_TLS:  u32 = 7;
+
+# read the executable's thread-local template from its program headers
+#
+# AT_PHDR and AT_PHNUM locate the headers, and PT_PHDR gives the load bias of a
+# position-independent image, which a fixed image without one does not need.
+# runs once at entry, after relocation and before the main thread's block is
+# installed
+pub fun capture_tls() {
+    if (_envp == 0) { ret; }
+    val envp:  *u64  = _envp::*u64;
+    val phdr:  usize = auxv_value(envp, 3)::usize; # AT_PHDR
+    var phent: usize = auxv_value(envp, 4)::usize; # AT_PHENT
+    val phnum: usize = auxv_value(envp, 5)::usize; # AT_PHNUM
+    if (phdr == 0 || phnum == 0) { ret; }
+    val wide: bool = $size_of(usize) == 8;
+    if (phent == 0) {
+        phent = 32;
+        if (wide) { phent = 56; }
+    }
+    var bias:  usize = 0;
+    var found: bool  = false;
+    var at:    usize = 0;
+    var vaddr: usize = 0;
+    var i:     usize = 0;
+    for (i < phnum) {
+        val ph:   usize = phdr + i * phent;
+        val kind: u32   = @(ph::*u32);
+        if (kind == PT_PHDR) { bias = phdr - @((ph + phdr_field(wide, 16, 8))::*usize); }
+        if (kind == PT_TLS) {
+            found      = true;
+            at         = ph;
+            vaddr      = @((ph + phdr_field(wide, 16, 8))::*usize);
+            tls_filesz = @((ph + phdr_field(wide, 32, 16))::*usize);
+            tls_memsz  = @((ph + phdr_field(wide, 40, 20))::*usize);
+            val align: usize = @((ph + phdr_field(wide, 48, 28))::*usize);
+            if (align > tls_align) { tls_align = align; }
+        }
+        i = i + 1;
+    }
+    if (found) { tls_image = vaddr + bias; }
+}
+
+# a program header field's offset in Elf64_Phdr or Elf32_Phdr
+fun phdr_field(wide: bool, offset64: usize, offset32: usize) usize {
+    if (wide) { ret offset64; }
+    ret offset32;
+}
+
+fun align_up(v: usize, a: usize) usize {
+    ret (v + a - 1) & ~(a - 1);
+}
+
+# the distance between the thread pointer and the start of the thread-local block
+fun tls_distance(l: TlsLayout) usize {
+    if (l.below) { ret align_up(tls_memsz, tls_align); }
+    ret align_up(l.tcb, tls_align);
+}
+
+# the bytes a thread's area takes: its block, its thread-local block, the
+# control block and the slack that aligns the thread pointer, a multiple of 16
+pub fun thread_area_size(l: TlsLayout) usize {
+    val slack: usize = tls_align - 16;
+    var tls:   usize = align_up(tls_memsz, tls_align);
+    if (!l.below) { tls = tls + align_up(l.tcb, tls_align); }
+    ret align_up(thread_block_reserve() + slack + tls, 16);
+}
+
+# lay out a thread's area in zeroed memory and fill its thread-local block
+#
+# x86_64 puts the block at the thread pointer and the thread-local block below
+# it. variant I puts the block just below the thread pointer and the control
+# block and the thread-local block above it. the thread pointer is aligned to
+# the template's alignment, so the block's offsets land as the linker laid them
+# out
+# ---
+# base: the area's start, 16-aligned, thread_area_size(l) zeroed bytes
+# ret:  the thread's block, prepared but not installed
+pub fun thread_area_build(base: usize, l: TlsLayout) *os_shared.ThreadBlock {
+    val top:   usize = base + thread_area_size(l);
+    val block: usize = thread_block_reserve();
+    var tp:    usize = 0;
+    if (l.below) { tp = (top - block) & ~(tls_align - 1); }
+    or           { tp = align_up(base + block, tls_align); }
+    val start: usize = thread_tls_of(tp, l);
+    var i:     usize = 0;
+    for (i < tls_filesz) {
+        @((start + i)::*u8) = @((tls_image + i)::*u8);
+        i                   = i + 1;
+    }
+    val made: *os_shared.ThreadBlock = thread_block_at(tp, l);
+    thread_block_prepare(made);
+    ret made;
+}
+
+# the thread pointer that installs a block
+pub fun thread_pointer_of(block: *os_shared.ThreadBlock, l: TlsLayout) usize {
+    if (l.below) { ret block::usize; }
+    ret block::usize + thread_block_reserve();
+}
+
+# the block a thread pointer installs
+pub fun thread_block_at(tp: usize, l: TlsLayout) *os_shared.ThreadBlock {
+    if (l.below) { ret tp::*os_shared.ThreadBlock; }
+    ret (tp - thread_block_reserve())::*os_shared.ThreadBlock;
+}
+
+# the start of the thread-local block a thread pointer reaches
+pub fun thread_tls_of(tp: usize, l: TlsLayout) usize {
+    if (l.below) { ret tp - tls_distance(l); }
+    ret tp + tls_distance(l);
+}
+
+# the main thread's block: one in an area of its own when the executable has
+# thread-locals, else the static fallback
+# ---
+# ret: the block to install, or nil when the area could not be mapped
+pub fun main_thread_block(fallback: *os_shared.ThreadBlock, l: TlsLayout) *os_shared.ThreadBlock {
+    if (tls_memsz == 0) { ret fallback; }
+    val area: ptr = allocate(thread_area_size(l));
+    if (area == nil) { ret nil; }
+    ret thread_area_build(area::usize, l);
+}
+
+# wipe the calling thread's thread-local block before the thread ends
+#
+# thread-locals may hold secrets, so the whole block is zeroed with stores no
+# pass removes. nothing may read a thread-local after this
+# ---
+# tp: the calling thread's thread pointer
+pub fun thread_tls_wipe(tp: usize, l: TlsLayout) {
+    if (tls_memsz == 0 || tp == 0) { ret; }
+    ct.zeroize_plain(thread_tls_of(tp, l)::*u8, tls_memsz);
 }
 
 # set the current thread's native diagnostic name

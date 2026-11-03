@@ -3,7 +3,7 @@
 # passes a wipe whose pointer and length are the released region.
 #
 # a wipe is an out-of-line call to the zeroize kernel. the check requires it to
-# stay a call in release builds, which #[oblivious] holds today, and reads its
+# stay a call in release builds, which #[constant_time("soft")] holds today, and reads its
 # operands from the abi's argument registers at the call. it does not read an
 # inlined kernel: if zeroize ever inlines, the release is reachable without a
 # wipe and the failure says so.
