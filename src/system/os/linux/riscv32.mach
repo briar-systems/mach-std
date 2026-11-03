@@ -1,0 +1,613 @@
+# riscv32-specific linux OS primitives
+#
+# provides page_size and thread_spawn which require arch-specific assembly.
+# everything else is in shared.mach.
+
+use std.sync.atomic;
+use std.system.panic.panic;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.size.isize;
+use std.types.size.usize;
+
+use std.system.os.linux.shared;
+use os_shared: std.system.os.shared;
+
+# imported unaliased so the clone-flag constants bind under their bare names
+# into this module's comptime context; `THREAD_CLONE_FLAGS` then folds at
+# compile time (a module-qualified `shared.CLONE_*` member path is not
+# comptime-evaluable, so the global would otherwise have no constant value).
+use std.system.os.linux.shared.CLONE_VM;
+use std.system.os.linux.shared.CLONE_FILES;
+use std.system.os.linux.shared.CLONE_FS;
+use std.system.os.linux.shared.CLONE_SETTLS;
+use std.system.os.linux.shared.CLONE_SIGHAND;
+use std.system.os.linux.shared.CLONE_SYSVSEM;
+use std.system.os.linux.shared.CLONE_THREAD;
+
+$if ($mach.build.sys != $mach.sys.linux) {
+    $error("std.system.os.linux.riscv32: requires linux target");
+}
+
+$if ($mach.build.arch != $mach.arch.riscv32) {
+    $error("std.system.os.linux.riscv32: requires riscv32 target");
+}
+
+# return the system page size
+#
+# riscv32 linux uses 4 KiB base pages (Sv32's leaf),
+# but it reads the runtime AT_PAGESZ the entrypoint captured
+# (shared.capture_pagesz) for one page-size source of truth. AT_PAGESZ is
+# mandatory on linux, so a 0 here means the auxv lacked it or a caller ran before
+# runtime init; page_size() panics rather than fabricating a default.
+# ---
+# ret: page size in bytes
+pub fun page_size() usize {
+    if (shared._pagesz == 0) {
+        panic("std.system.os.page_size: AT_PAGESZ unavailable (auxv lacks it, or called before runtime init)\n");
+    }
+    ret shared._pagesz;
+}
+
+val THREAD_CLONE_FLAGS: usize = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS;
+
+# entered by a direct branch from the child side of clone, with the stack pointer at
+# the handoff words thread_spawn left on the child's stack, which it hands the
+# thread's body as its argument
+#[naked]
+#[symbol("_std_thread_trampoline")]
+fun thread_trampoline() {
+    asm riscv32 {
+        mv a0, sp
+        call _std_thread_main
+        ebreak
+    }
+}
+
+# the handoff block thread_spawn leaves on the child's stack: nine 4-byte
+# words, then the three i64 words the parent waits on at their 8-byte alignment
+val HANDOFF_SETUP:       usize = 40;
+val HANDOFF_RUN:         usize = 48;
+val HANDOFF_SETUP_ERROR: usize = 56;
+val HANDOFF_SIZE:        usize = 64;
+
+# the thread's body, given the handoff words: the start routine and its
+# argument, the join state, the reclaim word, the owner's block and the stack's
+# extent, the name, then the setup, run and setup error words the parent waits on
+#[symbol("_std_thread_main")]
+fun thread_main(handoff: *usize) {
+    val fn_addr:          usize = @handoff;
+    val arg_addr:         usize = @((handoff::usize + 4)::*usize);
+    val state_addr:       usize = @((handoff::usize + 8)::*usize);
+    var reclaimable_addr: usize = @((handoff::usize + 12)::*usize);
+    var owner_base:       usize = @((handoff::usize + 16)::*usize);
+    var owner_size:       usize = @((handoff::usize + 20)::*usize);
+    var stack_base:       usize = @((handoff::usize + 24)::*usize);
+    var stack_size:       usize = @((handoff::usize + 28)::*usize);
+    val name_addr:        usize = @((handoff::usize + 32)::*usize);
+    val setup_addr:       usize = handoff::usize + HANDOFF_SETUP;
+    val run_addr:         usize = handoff::usize + HANDOFF_RUN;
+    val setup_error_addr: usize = handoff::usize + HANDOFF_SETUP_ERROR;
+
+    val setup: *i64 = setup_addr::*i64;
+    val run:   *i64 = run_addr::*i64;
+    atomic.store(setup_error_addr::*i64, shared.thread_set_name(name_addr::*u8));
+    atomic.store(setup, 1);
+    shared.thread_wake(setup);
+    for (atomic.load(run) == 0) { shared.thread_wait(run, 0); }
+
+    var detached: i64 = 0;
+    if (atomic.load(run) > 0) {
+        val fn_ptr: fun(*u8) = fn_addr::fun(*u8);
+        fn_ptr(arg_addr::*u8);
+        val state:    *i64 = state_addr::*i64;
+        var expected: i64  = 0;
+        if (!atomic.cas(state, ?expected, 1)) { detached = 1; }
+    }
+
+    # the stack and the area above it are unmapped below, so the block goes now
+    thread_exit_wipe();
+
+    # detached is an i64 holding 0 or 1, so its low word is the whole value, and
+    # the reclaim word is an i64 set to 1 as two word stores, the high one zero
+    asm riscv32 {
+        lw s1, {stack_base}
+        lw s2, {stack_size}
+        lw s3, {reclaimable_addr}
+        lw s4, {owner_base}
+        lw s5, {owner_size}
+        lw s6, {detached}
+
+        mv a0, s1
+        mv a1, s2
+        li a7, 215           # SYS_munmap
+        ecall
+
+        bnez s6, 1f
+        fence
+        sw zero, 4(s3)
+        li a0, 1
+        sw a0, 0(s3)
+        fence
+        mv a0, s3
+        li a1, 1            # FUTEX_WAKE
+        li a2, 1
+        li a3, 0
+        li a4, 0
+        li a5, 0
+        li a7, 422          # SYS_futex_time64
+        ecall
+        j 2f
+    1:
+        mv a0, s4
+        mv a1, s5
+        li a7, 215          # SYS_munmap
+        ecall
+    2:
+        li a0, 0
+        li a7, 93            # SYS_exit
+        ecall
+    }
+    asm riscv32 { ebreak }
+}
+
+# create a new thread sharing the current address space
+#
+# uses clone with shared VM, FS, files, and signals. target-owned stack metadata
+# and portable owner pointers ride on the child stack without global handoff.
+# the child's area, its block and its copy of the executable's thread-local
+# template, sits at the top of its stack mapping, above the handoff words, and
+# clone installs its thread pointer before the child's first instruction. the
+# trampoline wipes the thread-local block and unmaps the area with the stack at
+# exit.
+# ---
+# ret: thread ID on success, or negative errno on failure
+pub fun thread_spawn(
+    f: fun(*u8), arg: *u8, state: *i64, reclaimable: *i64,
+    owner: ptr, owner_size: usize, name: *u8,
+    stack_reserve: usize, stack_commit: usize, native: *usize,
+) i64 {
+    # the area rides above the usable stack, in whole pages of its own
+    val area_size: usize = shared.thread_area_size(TLS_LAYOUT);
+    val area_span: usize = (area_size + page_size() - 1) & ~(page_size() - 1);
+    if (stack_reserve > ~(0::usize) - area_span) { ret -12; }
+    val reserve:          usize = stack_reserve + area_span;
+    var stack_base:       usize = 0;
+    val allocation_error: i64   = shared.thread_stack_allocate(reserve, stack_commit, ?stack_base);
+    if (allocation_error < 0) { ret allocation_error; }
+
+    val stack_size: usize                  = shared.thread_stack_size(reserve);
+    val stack_top:  usize                  = stack_base + stack_size;
+    val area:       usize                  = stack_top - area_size;
+    val block:      *os_shared.ThreadBlock = shared.thread_area_build(area, TLS_LAYOUT);
+    val child_sp:   usize                  = area - HANDOFF_SIZE;
+    shared.thread_block_bound(block, stack_base + shared.THREAD_STACK_GUARD, area);
+    @(child_sp::*usize)                       = f::usize;
+    @((child_sp + 4)::*usize)                 = arg::usize;
+    @((child_sp + 8)::*usize)                 = state::usize;
+    @((child_sp + 12)::*usize)                = reclaimable::usize;
+    @((child_sp + 16)::*usize)                = owner::usize;
+    @((child_sp + 20)::*usize)                = owner_size;
+    @((child_sp + 24)::*usize)                = stack_base;
+    @((child_sp + 28)::*usize)                = stack_size;
+    @((child_sp + 32)::*usize)                = name::usize;
+    @((child_sp + HANDOFF_SETUP)::*i64)       = 0;
+    @((child_sp + HANDOFF_RUN)::*i64)         = 0;
+    @((child_sp + HANDOFF_SETUP_ERROR)::*i64) = 0;
+
+    var flags:     usize = THREAD_CLONE_FLAGS;
+    var stack_ptr: usize = child_sp;
+    var tls:       usize = shared.thread_pointer_of(block, TLS_LAYOUT);
+    var result:    i64   = 0;
+
+    # parent/child discrimination must stay in registers: under CLONE_VM the
+    # child's frame pointer still addresses the parent frame, so a shared stack
+    # local would race (both sides writing the same slot, see issue #195). a
+    # conditional branch reaches only a numeric local label on riscv, not a
+    # symbol, so the parent (a0 != 0) skips via bnez to local label 1, and the
+    # child (a0 == 0) falls through to a `tail` to the trampoline symbol (no
+    # return). clone arg order on riscv is (flags, stack, ptid, tls, ctid);
+    # ptid and ctid are zero here.
+    var raw: usize = 0;
+    asm riscv32 { fence }
+    asm riscv32 {
+        lw a0, {flags}
+        lw a1, {stack_ptr}
+        li a2, 0
+        lw a3, {tls}
+        li a4, 0
+        li a7, 220           # SYS_clone
+        ecall
+        bnez a0, 1f          # parent (tid != 0): skip the child dispatch
+        tail _std_thread_trampoline   # child (a0 == 0): jump to trampoline (no return)
+    1:
+        sw a0, {raw}         # parent: tid, or negative errno on failure
+    }
+    # a tid is positive and an error is in the kernel's -4095 to -1 range
+    result = raw::isize::i64;
+
+    if (result < 0) {
+        shared.deallocate(stack_base::ptr, stack_size);
+        ret result;
+    }
+
+    val setup:       *i64 = (child_sp + HANDOFF_SETUP)::*i64;
+    val run:         *i64 = (child_sp + HANDOFF_RUN)::*i64;
+    val setup_error: *i64 = (child_sp + HANDOFF_SETUP_ERROR)::*i64;
+    for (atomic.load(setup) == 0) { shared.thread_wait(setup, 0); }
+    if (atomic.load(setup_error) < 0) {
+        val r: i64 = atomic.load(setup_error);
+        atomic.store(run, -1);
+        shared.thread_wake(run);
+        for (atomic.load(reclaimable) == 0) { shared.thread_wait(reclaimable, 0); }
+        ret r;
+    }
+
+    @native = 0;
+    atomic.store(run, 1);
+    shared.thread_wake(run);
+    ret result;
+}
+
+pub fun thread_join(native: usize, reclaimable: *i64) i64 {
+    for (atomic.load(reclaimable) == 0) {
+        shared.thread_wait(reclaimable, 0);
+    }
+    ret 0;
+}
+
+pub fun thread_detach(native: usize) i64 {
+    ret 0;
+}
+
+# variant I with the thread-local block at tp, the block below it
+val TLS_LAYOUT: shared.TlsLayout = shared.TlsLayout{below: false, tcb: 0};
+
+# install block as the calling thread's, as the tp just above it
+#
+# a block thread_spawn or main_thread_block laid out carries the thread-local
+# block above it. one laid out anywhere else reaches no thread-locals.
+# the compiler reserves tp, so mach code never writes it otherwise. a loader
+# sets it before the entry point, and the runtime then leaves the main thread's
+# alone
+# ---
+# ret: 0, since setting tp cannot fail
+pub fun thread_block_enter(block: *os_shared.ThreadBlock) i64 {
+    shared.thread_block_prepare(block);
+    var addr: usize = shared.thread_pointer_of(block, TLS_LAYOUT);
+    asm riscv32 {
+        lw tp, {addr}
+    }
+    ret 0;
+}
+
+# the calling thread's block, just below tp, without a system call
+#
+# this is found from the thread pointer whoever owns it: std's block where std
+# owns it, and memory of a C runtime's thread on the main thread under a loader
+# or a thread C code created. std reads nothing through that one, and its
+# address still names the thread
+# ---
+# ret: the block below the thread pointer
+pub fun thread_block() *os_shared.ThreadBlock {
+    ret shared.thread_block_at(thread_pointer(), TLS_LAYOUT);
+}
+
+# the calling thread's tp
+fun thread_pointer() usize {
+    var pointer: usize = 0;
+    asm riscv32 {
+        sw tp, {pointer}
+    }
+    ret pointer;
+}
+
+# the main thread's block, in an area with its thread-local block when the
+# executable has thread-locals, else the static fallback
+# ---
+# ret: the block to install, or nil when the area could not be mapped
+pub fun main_thread_block(fallback: *os_shared.ThreadBlock) *os_shared.ThreadBlock {
+    ret shared.main_thread_block(fallback, TLS_LAYOUT);
+}
+
+# wipe the calling thread's thread-local block as the thread ends
+pub fun thread_exit_wipe() {
+    shared.thread_tls_wipe(thread_pointer(), TLS_LAYOUT);
+}
+
+# the calling thread's stack bounds, read without a system call
+# ---
+# ret: whether the bounds are known (see shared.stack_bounds_of)
+pub fun stack_bounds(low: *usize, high: *usize) bool {
+    var block: *os_shared.ThreadBlock = nil;
+    if (shared.thread_pointer_owned()) { block = thread_block(); }
+    ret shared.stack_bounds_of(block, low, high);
+}
+
+# kernel ABI types
+fwd shared.stat_t;
+fwd shared.timespec;
+fwd shared.DirectoryCursor;
+fwd shared.DirectoryEntry;
+fwd shared.DirectoryInitResult;
+
+# path
+fwd shared.separator;
+
+# constants
+fwd shared.STDIN_FD;
+fwd shared.STDOUT_FD;
+fwd shared.STDERR_FD;
+
+fwd shared.O_RDONLY;
+fwd shared.O_WRONLY;
+fwd shared.O_RDWR;
+fwd shared.O_CREAT;
+fwd shared.O_EXCL;
+fwd shared.O_TRUNC;
+fwd shared.O_APPEND;
+fwd shared.O_NONBLOCK;
+fwd shared.O_DIRECTORY;
+fwd shared.O_NOFOLLOW;
+
+fwd shared.AT_FDCWD;
+fwd shared.AT_SYMLINK_NOFOLLOW;
+fwd shared.AT_REMOVEDIR;
+
+# advisory file-lock operations
+fwd shared.LOCK_SH;
+fwd shared.LOCK_EX;
+fwd shared.LOCK_NB;
+fwd shared.LOCK_UN;
+
+fwd shared.S_IFMT;
+fwd shared.S_IFDIR;
+fwd shared.S_IFREG;
+fwd shared.S_IFLNK;
+
+fwd shared.WNOHANG;
+fwd shared.WUNTRACED;
+fwd shared.WCONTINUED;
+
+fwd shared.CLOCK_REALTIME;
+fwd shared.CLOCK_MONOTONIC;
+
+fwd shared.EPERM;
+fwd shared.ENOENT;
+fwd shared.ESRCH;
+fwd shared.EINTR;
+fwd shared.EIO;
+fwd shared.ENXIO;
+fwd shared.E2BIG;
+fwd shared.EBADF;
+fwd shared.ECHILD;
+fwd shared.EAGAIN;
+fwd shared.ENOMEM;
+fwd shared.EACCES;
+fwd shared.EFAULT;
+fwd shared.EBUSY;
+fwd shared.EEXIST;
+fwd shared.ENODEV;
+fwd shared.ENOTDIR;
+fwd shared.EISDIR;
+fwd shared.EINVAL;
+fwd shared.ENFILE;
+fwd shared.EMFILE;
+fwd shared.ETXTBSY;
+fwd shared.ENOSPC;
+fwd shared.EROFS;
+fwd shared.EPIPE;
+fwd shared.ENAMETOOLONG;
+fwd shared.ERANGE;
+fwd shared.ENOTEMPTY;
+fwd shared.ELOOP;
+fwd shared.ENOTSUP;
+
+fwd shared.EINTR_MAX_RETRIES;
+
+# feature detection
+fwd shared.has_numa;
+fwd shared.has_huge_pages;
+
+# syscall wrappers
+fwd shared.syscall0;
+fwd shared.syscall1;
+fwd shared.syscall2;
+fwd shared.syscall3;
+fwd shared.syscall4;
+fwd shared.syscall5;
+fwd shared.syscall6;
+
+# memory
+fwd shared.allocate;
+fwd shared.deallocate;
+fwd shared.reallocate;
+fwd shared.heap_region_base;
+fwd shared.heap_region_extend;
+fwd shared.protect;
+fwd shared.lock;
+fwd shared.unlock;
+fwd shared.advise;
+fwd shared.allocate_huge;
+fwd shared.numa_node_count;
+fwd shared.numa_current_node;
+fwd shared.numa_allocate;
+fwd shared.numa_move;
+fwd shared.map_file;
+fwd shared.sync_file;
+
+# environment
+fwd shared._envp;
+fwd shared.environ;
+fwd shared.capture_pagesz;
+fwd shared.loader_present;
+fwd shared.capture_main_stack;
+fwd shared.capture_tls;
+
+# filesystem
+fwd shared.read;
+fwd shared.write;
+fwd shared.read_at;
+fwd shared.write_at;
+fwd shared.open;
+fwd shared.close;
+fwd shared.sync_fd;
+fwd shared.stat;
+fwd shared.set_mode;
+fwd shared.set_mode_at;
+fwd shared.file_identity;
+fwd shared.identity_at;
+fwd shared.retain_identity_at;
+fwd shared.publication_capabilities;
+fwd shared.stat_path;
+fwd shared.stat_mode;
+fwd shared.unlink;
+fwd shared.rename;
+fwd shared.symlink;
+fwd shared.make_dir;
+fwd shared.directory_init;
+fwd shared.directory_next;
+fwd shared.directory_close;
+fwd shared.access;
+fwd shared.seek;
+fwd shared.lock_fd;
+
+# process
+fwd shared.terminate;
+fwd shared.abort;
+fwd shared.terminate_child;
+fwd shared.setpgid;
+fwd shared.getpgid;
+fwd shared.terminate_group;
+fwd shared.spawn;
+fwd shared.spawn_grouped;
+fwd shared.spawn_in;
+fwd shared.spawn_redirected;
+fwd shared.spawn_redirected_grouped;
+fwd shared.spawn_redirected_in;
+fwd shared.spawn_redirected_in_grouped;
+fwd shared.getpid;
+fwd shared.pipe;
+fwd shared.ignore_sigpipe;
+fwd shared.sleep;
+fwd shared.cpu_count;
+fwd shared.cpu_features;
+fwd shared.cpu_dit;
+fwd shared.thread_affinity;
+fwd shared.set_thread_affinity;
+fwd shared.getcwd;
+fwd shared.getenv;
+fwd shared.fork;
+fwd shared.vfork;
+fwd shared.exec;
+fwd shared.wait;
+fwd shared.wait_pid;
+fwd shared.ProcessStatus;
+fwd shared.FileLimit;
+fwd shared.LIMIT_UNLIMITED;
+fwd shared.open_file_limit;
+fwd shared.set_open_file_limit;
+fwd shared.ProcessWaitError;
+fwd shared.WaitResult;
+fwd shared.PROCESS_OP_WAIT;
+fwd shared.PROCESS_OP_STATUS;
+fwd shared.PROCESS_OP_CLOSE;
+fwd shared.PROCESS_OP_SPAWN;
+fwd shared.PROCESS_OP_READ;
+fwd shared.PROCESS_OP_PIPE;
+fwd shared.PROCESS_OP_TERMINATE;
+fwd shared.PROCESS_EXITED;
+fwd shared.PROCESS_SIGNALED;
+fwd shared.PROCESS_STOPPED;
+fwd shared.PROCESS_CONTINUED;
+
+# sockets
+fwd shared.AF_INET;
+fwd shared.SOCK_STREAM;
+fwd shared.SOCK_DGRAM;
+fwd shared.SOCK_NONBLOCK;
+fwd shared.SOCK_CLOEXEC;
+fwd shared.SOL_SOCKET;
+fwd shared.SO_UNSUPPORTED;
+fwd shared.SO_REUSEADDR;
+fwd shared.SO_REUSEPORT;
+fwd shared.SO_EXCLUSIVEADDRUSE;
+fwd shared.SO_KEEPALIVE;
+fwd shared.SO_SNDBUF;
+fwd shared.SO_RCVBUF;
+fwd shared.SO_LINGER;
+fwd shared.SO_RCVTIMEO;
+fwd shared.IPPROTO_IP;
+fwd shared.IPPROTO_TCP;
+fwd shared.IPPROTO_IPV6;
+fwd shared.IP_TOS;
+fwd shared.IPV6_V6ONLY;
+fwd shared.IPV6_TCLASS;
+fwd shared.TCP_NODELAY;
+fwd shared.TCP_KEEPIDLE;
+fwd shared.TCP_KEEPINTVL;
+fwd shared.TCP_KEEPCNT;
+fwd shared.TCP_FASTOPEN;
+fwd shared.SHUT_RD;
+fwd shared.SHUT_WR;
+fwd shared.SHUT_RDWR;
+fwd shared.SOCKADDR_IN_SIZE;
+fwd shared.sock_send;
+fwd shared.sock_recv;
+fwd shared.IoVector;
+fwd shared.sock_write_vector;
+fwd shared.sock_send_message;
+fwd shared.sock_receive_message;
+fwd shared.sock_connect_status;
+fwd shared.sock_close;
+fwd shared.sock_create;
+fwd shared.sock_create_flags;
+fwd shared.sock_bind;
+fwd shared.sock_listen;
+fwd shared.sock_accept;
+fwd shared.sock_accept_flags;
+fwd shared.sock_connect;
+fwd shared.sock_sendto;
+fwd shared.sock_recvfrom;
+fwd shared.sock_peek_readable;
+fwd shared.sock_shutdown;
+fwd shared.sock_setopt;
+fwd shared.sock_getopt;
+fwd shared.sock_local_addr;
+fwd shared.sock_remote_addr;
+fwd shared.sock_inheritable;
+fwd shared.io_queue_create;
+fwd shared.io_queue_wait;
+fwd shared.IoCompletion;
+fwd shared.IO_EVENT_READ;
+fwd shared.IO_EVENT_WRITE;
+fwd shared.IO_EVENT_ERROR;
+fwd shared.IO_EVENT_HANGUP;
+fwd shared.IO_EVENT_WAKE;
+fwd shared.io_queue_watch;
+fwd shared.io_queue_rearm;
+fwd shared.duplicate_to;
+fwd shared.io_queue_unwatch;
+fwd shared.io_queue_poll;
+fwd shared.io_queue_wake;
+fwd shared.io_queue_close;
+fwd shared.sock_set_rcvtimeo;
+
+# dns
+fwd shared.DNS_HOSTS_PATH;
+
+# random
+fwd shared.random_fill;
+
+# threads
+fwd shared.thread_current_id;
+fwd shared.thread_current_name;
+fwd shared.thread_wait;
+fwd shared.thread_wait_until;
+fwd shared.thread_wake;
+
+# time
+fwd shared.clock_gettime;
+
+# errno
+fwd shared.error_message;
