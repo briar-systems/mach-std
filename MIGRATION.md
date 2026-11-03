@@ -2,6 +2,16 @@
 
 std 10.0.0 pairs with mach 7.
 
+## constant-time functions switch the timing mode themselves (#1137)
+
+std no longer turns PSTATE.DIT on at start or on each thread it spawns, and no longer reads the linker's `__mach_dit_required` cell. A `#[constant_time("soft")]` function now sets the mode on entry and clears it on return where it set it. std publishes `__mach_timing_available` before main, 1 when the processor provides DIT and the process may switch it, and the function runs without the mode where it is 0. Code that relied on DIT being on for a whole thread outside constant-time functions calls `std.crypto.ct.begin` or `std.system.dit.enable` on that thread.
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `timing.mode()` answering `ON`, `UNAVAILABLE` or `UNNEEDED` from the link and start-up | `timing.mode()` answering `AVAILABLE` or `UNAVAILABLE` from the processor alone |
+| `dit.required()`, `dit.decide`, `dit.init`, `dit.decided`, `dit.enter_thread`, `dit.SKIP`, `dit.ENABLE`, `dit.CONTINUE` | removed. `dit.publish` sets the availability byte, `dit.available()` reads it |
+| `dit.enable()`, `dit.read()`, `dit.engage()` | kept, and `dit.disable()` is new |
+
 ## one command-line engine in std.args (#1113)
 
 `std.args` now carries the engine mach reads its command line with: rows with aliases, arity and an occurrence policy, tables composed into commands and actions, relations between rows, removed spellings, exit notes, examples and generated help. The plain `Flag` table and its `Reader` are gone. A program declares its commands once in a `CommandSet` and reads the whole line with `parse`, which allocates nothing and needs no storage from the caller: every query reads the arguments again.

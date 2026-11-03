@@ -1,53 +1,57 @@
 # the processor's data-independent-timing mode (PSTATE.DIT) on aarch64
 #
-# a secret integer multiply in an `#[constant_time("soft")]` function is constant time on
-# aarch64 only with FEAT_DIT on. the linker tags each aarch64-linux and
-# aarch64-darwin link with `__mach_dit_required`, a one-byte read-only cell
-# that is 1 when any input module admits such a multiply and 0 otherwise
-# (briar-systems/mach#3508). the byte states what the code needs and std owns
-# the policy, which is best effort. std owns process start and every thread
-# it spawns, so this module is the half that turns the mode on:
+# a soft constant-time function switches the mode itself: its entry reads
+# PSTATE.DIT and, where it is off, sets it, and its return clears it again
+# where the entry set it. where the build does not select FEAT_DIT, the entry
+# first reads `__mach_timing_available`, a hidden one-byte global std defines
+# here, and runs without the mode where it is 0. std owns the byte:
 #
-# - `_rt_init` calls `init` after envp is published and before main. byte 0
-#   does nothing. otherwise the OS says whether the processor and kernel
-#   provide DIT (linux: HWCAP_DIT in AT_HWCAP, darwin:
-#   hw.optional.arm.FEAT_DIT, both through `os.cpu_dit`). where it does, the
-#   mode goes on, and where it does not, the process continues without it.
-# - DIT is per thread and nothing guarantees a new thread inherits it, so
-#   every trampoline std owns calls `enter_thread` first, which sets the mode
-#   when `init` turned it on.
-# - `init` records its outcome, which std.system.timing reports at run time.
+# - it is defined on every aarch64 target, freestanding included, since every
+#   aarch64 image with soft functions links a definition. it is never exported.
+# - the runtime sets it once before main and before any thread starts: 1 when
+#   the processor provides DIT and the process may switch it, 0 otherwise.
+#   linux reads HWCAP_DIT in AT_HWCAP and darwin hw.optional.arm.FEAT_DIT, both
+#   through `os.cpu_dit`, and freestanding reads ID_AA64PFR0_EL1 at EL1.
 #
-# `decide` is the whole policy as a pure function, so every branch is unit
-# tested on any processor by forcing the availability answer. the enable
-# sequence is `msr dit, 1` then `dsb nsh; isb sy`.
-# the module imports no other std module but bool, so the OS layer's
-# trampolines and crypto.ct can call it without a cycle. the tests that need
-# the OS's answer live in std.system.cpu. the module builds on every target
-# and is empty except on aarch64 linux and darwin, so the entry points can
-# reference it unconditionally.
+# nothing turns the mode on at start or per thread. `enable`, `disable` and
+# `read` are for code that manages the mode itself. the enable sequence is
+# `msr dit, 1` then `dsb nsh; isb sy`.
+#
+# the module imports no other std module but bool, so the runtimes and
+# crypto.ct can call it without a cycle. the tests that need the OS's answer
+# live in std.system.cpu. the module builds on every target, so the entry
+# points can reference it unconditionally.
 
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 
-# what `init` does with the byte and the availability answer
-pub val SKIP:     i64 = 0;
-pub val ENABLE:   i64 = 1;
-pub val CONTINUE: i64 = 2;
+$if ($mach.build.arch == $mach.arch.aarch64) {
+    # the availability byte mirl's soft functions read
+    #[symbol("__mach_timing_available")]
+    var timing_available: u8 = 0;
 
-# the policy: a link that needs the mode gets it where it exists and runs
-# without it where it does not
-# ---
-# required:  the link's `__mach_dit_required` byte, nonzero when a secret
-#            multiply is admitted
-# available: `os.cpu_dit()`: 1 when the processor and kernel provide DIT, 0
-#            when not, negative when the answer could not be read
-# ret:       SKIP, ENABLE or CONTINUE
-pub fun decide(required: bool, available: i64) i64 {
-    if (!required)      { ret SKIP; }
-    if (available == 1) { ret ENABLE; }
-    ret CONTINUE;
+    # publish whether the process may switch the mode, before main and before
+    # any thread starts
+    # ---
+    # available: `os.cpu_dit()`: 1 when the processor and kernel provide DIT, 0
+    #            when not, negative when the answer could not be read
+    pub fun publish(available: i64) {
+        if (available == 1) { timing_available = 1; }
+        or                  { timing_available = 0; }
+    }
+
+    # whether the processor provides the mode and the process may switch it
+    pub fun available() bool {
+        ret timing_available != 0;
+    }
+}
+$or {
+    pub fun publish(available: i64) {}
+
+    pub fun available() bool {
+        ret false;
+    }
 }
 
 $if ($mach.build.arch == $mach.arch.aarch64 && ($mach.build.sys == $mach.sys.linux || $mach.build.sys == $mach.sys.darwin)) {
@@ -62,27 +66,6 @@ $if ($mach.build.arch == $mach.arch.aarch64 && ($mach.build.sys == $mach.sys.lin
     #[symbol("_std_dit_probe")]
     var probe: u64 = 0;
 
-    # what `init` decided, SKIP until it runs
-    var outcome: i64 = SKIP;
-
-    # whether `init` found the mode provided
-    var present: bool = false;
-
-    # whether this link admits a secret multiply
-    #
-    # the linker's `__mach_dit_required` is hidden and one byte, read with the
-    # page plus low-12 idiom rather than an `ext val`, which would go through
-    # the GOT that Mach-O output does not carry
-    pub fun required() bool {
-        asm aarch64 {
-            adrp x11, __mach_dit_required
-            ldrb w0, [x11, :lo12:__mach_dit_required]
-            adrp x11, _std_dit_probe
-            str x0, [x11, :lo12:_std_dit_probe]
-        }
-        ret probe != 0;
-    }
-
     # set PSTATE.DIT for the calling thread
     #
     # `msr dit, 1`, then `dsb nsh` and `isb sy` so nothing after this point
@@ -91,6 +74,16 @@ $if ($mach.build.arch == $mach.arch.aarch64 && ($mach.build.sys == $mach.sys.lin
     pub fun enable() {
         asm aarch64 {
             msr dit, 1
+            dsb nsh
+            isb sy
+        }
+    }
+
+    # clear PSTATE.DIT for the calling thread, synchronized as enable is
+    #[extension("dit")]
+    pub fun disable() {
+        asm aarch64 {
+            msr dit, 0
             dsb nsh
             isb sy
         }
@@ -107,63 +100,20 @@ $if ($mach.build.arch == $mach.arch.aarch64 && ($mach.build.sys == $mach.sys.lin
         ret probe;
     }
 
-    # process start: enable the mode or continue without it
-    # ---
-    # available: `os.cpu_dit()`
-    pub fun init(available: i64) {
-        present = available == 1;
-        outcome = decide(required(), available);
-        if (outcome == ENABLE) { enable(); }
-    }
-
-    # what `init` decided: SKIP, ENABLE or CONTINUE
-    pub fun decided() i64 {
-        ret outcome;
-    }
-
     # set the mode for the calling thread where the processor provides it
     # ---
     # ret: whether the mode is now on for the calling thread
     pub fun engage() bool {
-        if (!present) { ret false; }
+        if (!available()) { ret false; }
         enable();
         ret true;
     }
-
-    # thread start: set the mode when `init` turned it on
-    #
-    # every thread trampoline std owns calls this first
-    pub fun enter_thread() {
-        if (outcome == ENABLE) { enable(); }
-    }
 }
 $or {
-    # no other target has the mode or the cell
+    # no other hosted target has a mode for a process to set
     pub val PROVIDED: bool = false;
-
-    pub fun required() bool {
-        ret false;
-    }
-
-    pub fun init(available: i64) {}
-
-    pub fun decided() i64 {
-        ret SKIP;
-    }
 
     pub fun engage() bool {
         ret false;
     }
-
-    pub fun enter_thread() {}
-}
-
-test decide__fails_closed_without_the_mode {
-    if (decide(false, 0) != SKIP)      { ret 1; }
-    if (decide(false, 1) != SKIP)      { ret 2; }
-    if (decide(false, -38) != SKIP)    { ret 3; }
-    if (decide(true, 1) != ENABLE)     { ret 4; }
-    if (decide(true, 0) != CONTINUE)   { ret 5; }
-    if (decide(true, -38) != CONTINUE) { ret 6; }
-    ret 0;
 }
