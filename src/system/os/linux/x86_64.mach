@@ -6,6 +6,7 @@
 use std.sync.atomic;
 use std.system.panic.panic;
 use std.types.bool.bool;
+use std.types.bool.true;
 use std.types.size.usize;
 
 use std.system.os.linux.shared;
@@ -96,6 +97,9 @@ fun thread_main(handoff: *usize) {
         if (!atomic.cas(state, ?expected, 1)) { detached = 1; }
     }
 
+    # the stack and the area above it are unmapped below, so the block goes now
+    thread_exit_wipe();
+
     asm x86_64 {
         mov r12, {stack_base}
         mov r13, {stack_size}
@@ -138,9 +142,11 @@ fun thread_main(handoff: *usize) {
 #
 # uses clone with shared VM, FS, files, and signals. target-owned stack metadata
 # and portable owner pointers ride on the child stack without global handoff.
-# the child's thread block sits at the top of its stack, above the handoff
-# words, and clone installs it as the fs base before the child's first
-# instruction. the trampoline unmaps it with the stack at exit.
+# the child's area, its block and its copy of the executable's thread-local
+# template, sits at the top of its stack mapping, above the handoff words, and
+# clone installs its thread pointer before the child's first instruction. the
+# trampoline wipes the thread-local block and unmaps the area with the stack at
+# exit.
 # ---
 # ret: thread ID on success, or negative errno on failure
 pub fun thread_spawn(
@@ -148,18 +154,21 @@ pub fun thread_spawn(
     owner: ptr, owner_size: usize, name: *u8,
     stack_reserve: usize, stack_commit: usize, native: *usize,
 ) i64 {
+    # the area rides above the usable stack, in whole pages of its own
+    val area_size: usize = shared.thread_area_size(TLS_LAYOUT);
+    val area_span: usize = (area_size + page_size() - 1) & ~(page_size() - 1);
+    if (stack_reserve > ~(0::usize) - area_span) { ret -12; }
+    val reserve:          usize = stack_reserve + area_span;
     var stack_base:       usize = 0;
-    val allocation_error: i64   = shared.thread_stack_allocate(stack_reserve, stack_commit, ?stack_base);
+    val allocation_error: i64   = shared.thread_stack_allocate(reserve, stack_commit, ?stack_base);
     if (allocation_error < 0) { ret allocation_error; }
 
-    val stack_size: usize = shared.thread_stack_size(stack_reserve);
-    val stack_top:  usize = stack_base + stack_size;
-    val block_addr: usize = stack_top - shared.thread_block_reserve();
-    val child_sp:   usize = block_addr - 96;
-    shared.thread_block_prepare(block_addr::*os_shared.ThreadBlock);
-    shared.thread_block_bound(
-        block_addr::*os_shared.ThreadBlock, stack_base + shared.THREAD_STACK_GUARD, block_addr,
-    );
+    val stack_size: usize                  = shared.thread_stack_size(reserve);
+    val stack_top:  usize                  = stack_base + stack_size;
+    val area:       usize                  = stack_top - area_size;
+    val block:      *os_shared.ThreadBlock = shared.thread_area_build(area, TLS_LAYOUT);
+    val child_sp:   usize                  = area - 96;
+    shared.thread_block_bound(block, stack_base + shared.THREAD_STACK_GUARD, area);
     @(child_sp::*usize)        = f::usize;
     @((child_sp + 8)::*usize)  = arg::usize;
     @((child_sp + 16)::*usize) = state::usize;
@@ -175,7 +184,7 @@ pub fun thread_spawn(
 
     var flags:     usize = THREAD_CLONE_FLAGS;
     var stack_ptr: usize = child_sp;
-    var tls:       usize = block_addr;
+    var tls:       usize = shared.thread_pointer_of(block, TLS_LAYOUT);
     var result:    i64   = 0;
 
     # parent/child discrimination must stay in registers: under CLONE_VM the
@@ -234,12 +243,18 @@ pub fun thread_detach(native: usize) i64 {
 val SYS_ARCH_PRCTL: usize = 158;
 val ARCH_SET_FS:    usize = 0x1002;
 
+# variant II: the thread-local block ends at the fs base, which is the block
+val TLS_LAYOUT: shared.TlsLayout = shared.TlsLayout{below: true, tcb: 0};
+
 # install block as the calling thread's, as its fs base
+#
+# a block thread_spawn or main_thread_block laid out carries the thread-local
+# block below it. one laid out anywhere else reaches no thread-locals
 # ---
 # ret: 0, or the negative errno arch_prctl refused with
 pub fun thread_block_enter(block: *os_shared.ThreadBlock) i64 {
     shared.thread_block_prepare(block);
-    ret shared.syscall2(SYS_ARCH_PRCTL, ARCH_SET_FS, block::usize);
+    ret shared.syscall2(SYS_ARCH_PRCTL, ARCH_SET_FS, shared.thread_pointer_of(block, TLS_LAYOUT));
 }
 
 # the calling thread's block, read through fs:[0] without a system call
@@ -251,12 +266,30 @@ pub fun thread_block_enter(block: *os_shared.ThreadBlock) i64 {
 # nothing through that one. a thread whose fs base is 0 faults here, which only
 # a raw clone that sets it so can make.
 pub fun thread_block() *os_shared.ThreadBlock {
-    var block: usize = 0;
+    ret shared.thread_block_at(thread_pointer(), TLS_LAYOUT);
+}
+
+# the calling thread's fs base, read through fs:[0]
+fun thread_pointer() usize {
+    var tp: usize = 0;
     asm x86_64 {
         mov rax, qword fs:[0]
-        mov {block}, rax
+        mov {tp}, rax
     }
-    ret block::*os_shared.ThreadBlock;
+    ret tp;
+}
+
+# the main thread's block, in an area with its thread-local block when the
+# executable has thread-locals, else the static fallback
+# ---
+# ret: the block to install, or nil when the area could not be mapped
+pub fun main_thread_block(fallback: *os_shared.ThreadBlock) *os_shared.ThreadBlock {
+    ret shared.main_thread_block(fallback, TLS_LAYOUT);
+}
+
+# wipe the calling thread's thread-local block as the thread ends
+pub fun thread_exit_wipe() {
+    shared.thread_tls_wipe(thread_pointer(), TLS_LAYOUT);
 }
 
 # the calling thread's stack bounds, read without a system call
@@ -386,6 +419,7 @@ fwd shared.environ;
 fwd shared.capture_pagesz;
 fwd shared.loader_present;
 fwd shared.capture_main_stack;
+fwd shared.capture_tls;
 
 # filesystem
 fwd shared.read;
