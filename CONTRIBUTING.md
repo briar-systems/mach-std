@@ -16,7 +16,7 @@ A published version's source and tag are immutable, and a release tag must match
 
 ## Compiler and CI
 
-CI installs the mach release named by `MACH_VERSION` in `.github/workflows/ci.yml` and runs `mach fmt --check .` and `mach test . --all` on linux. A release tag runs `.github/workflows/cd.yml`, which tests every host std ships to and publishes the release. The suites under `test/` run locally, not in CI. std and compiler version numbers are independent.
+CI builds the mach commit named by `MACH_REF` in `.github/workflows/ci.yml` and runs `mach fmt --check .` and `mach test . --all` on linux. A release tag runs `.github/workflows/cd.yml`, which tests every host std ships to and publishes the release. The suites under `test/` run locally, not in CI. std and compiler version numbers are independent.
 
 ## Tests
 

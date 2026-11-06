@@ -111,7 +111,7 @@ Every spawn and exec, in `std.process.exec` and `std.system.os` alike, takes the
 
 ## float conversion work storage has published types (#1089)
 
-`std.text.parse.parse_float`, `std.format.write_float` and `std.format.write_float_g` take their bignum work storage from the caller as `work: *u32`. Each row now has a published type for it, a `u32` array derived from std's own bignum counts, line slack and the row's committed limb and digit counts. Declare it on the stack and pass `?work[0]`. Code that hard-coded a size (4 or 5 bignums of `ieee.F64_LIMBS`, a 32-byte line) should declare the type instead, so the storage follows std when a count changes. The runtime functions `parse_float_work`, `write_float_work` and `write_float_g_work` stay for storage sized at runtime.
+`std.text.parse.parse_float`, `std.format.write_float` and `std.format.write_float_g` take their bignum work storage from the caller as `work: *u32`. Each row now has a published type for it, a `u32` array derived from std's own bignum counts, line slack and the row's limb and digit counts. Declare it on the stack and pass `?work[0]`. Code that hard-coded a size (4 or 5 bignums of `ieee.F64_LIMBS`, a 32-byte line) should declare the type instead, so the storage follows std when a count changes. The runtime functions `parse_float_work`, `write_float_work` and `write_float_g_work` stay for storage sized at runtime.
 
 | conversion | f16 | f32 | f64 |
 | --- | --- | --- | --- |
