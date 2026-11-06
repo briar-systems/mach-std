@@ -1,6 +1,6 @@
 # The std.system.os contract
 
-`std.system.os` is a small, explicit contract of OS primitives with one implementation per operating system (`std.system.os.linux`, `.darwin`, `.windows`). Everything else in std is built on top of it. This page describes the contract as it stands in std **4.0.0** (epic #697).
+`std.system.os` is a small, explicit contract of OS primitives with one implementation per operating system (`std.system.os.linux`, `.darwin`, `.windows`, `.wasi`). Everything else in std is built on top of it. This page describes the contract as it stands in std **4.0.0** (epic #697).
 
 ## Capability groups
 
@@ -15,7 +15,9 @@ $if (capability.HAS_FILES) {
 }
 ```
 
-Every group is present on linux, darwin and windows. None is present on any other target, freestanding included. `HOSTED` is the core group, which every other group implies.
+Every group is present on linux, darwin and windows. wasi claims core, pages, clock, entropy, files and process (see [wasi](#wasi)). None is present on any other target, freestanding included. `HOSTED` is the core group, which every other group implies.
+
+A group a target does not claim has no members in `std.system.os` at all, so naming one is a build error. A module built on such a group refuses the target with `$error`, and `src/lib/libstd.mach` leaves it out of the aggregate there. A member of a claimed group the host cannot perform returns a code `error_kind` classifies as `UNSUPPORTED`.
 
 A target that claims a group exports every member listed here. `src/system/capability/conformance.mach` names every member of every group that the per-OS module supplies, so a missing member fails the build on any target that claims the group. Members `std.system.os` defines itself (the secret primitives `allocate_secret`, `allocate_secret_typed`, `release_secret`, `release_secret_typed`, `random_fill_secret`, `read_at_secret` and `write_at_secret`, with `SecretStatus`, `SECRET_ALIGN` and `SECRET_LOCKS`, `stdin`, `stdout`, `stderr`, `working_dir`, `exit`, `panic_sink`, the spawn environment types `EnvironmentOf`, `Environment` and `NativeEnvironment`, and `realtime`, `monotonic`, `error`, `error_message` and `message`) exist wherever the module compiles, so the test doesn't name them. The test also keeps the positioned secret transfers inside the files lane, which `test/secret/verify.sh` enforces.
 
@@ -109,6 +111,18 @@ The environment reads in the same two forms. `environ_native()` is the one captu
 `cpu_features(out: *std.system.cpu.features.Features) i64` fills the per-isa record with the extensions the running processor has. The record's fields are the compiler's extension names for the isa (`sha`, `ssse3`, `sse41`, `aes`, `pclmul` on x86_64, `sha2`, `aes`, `pmull` on aarch64, the isa string's letters on riscv), declared in `std.system.cpu.features`, which imports nothing OS-bound so the per-OS modules can name it. On x86_64 every implementation reads cpuid, which needs no OS. On aarch64 the id registers are not readable from user mode, so linux reads `AT_HWCAP` from the auxv (`HWCAP_AES` bit 3, `HWCAP_PMULL` bit 4, `HWCAP_SHA2` bit 6) and darwin asks sysctl (`hw.optional.arm.FEAT_AES`, `FEAT_PMULL`, `FEAT_SHA256`). An extension the processor lacks, or one the OS does not report, reads false and is not an error. `std.system.cpu.features()` is the consumer: it merges this with what the build target selects and caches the answer. A user-supplied implementation for a kernel may read the id registers directly.
 
 `cpu_dit() i64` says whether the processor and kernel provide the aarch64 data-independent-timing mode (FEAT_DIT, PSTATE.DIT): 1 when present, 0 when absent, negative when the answer cannot be read (linux before the runtime captured envp). linux reads HWCAP_DIT (bit 24) from `AT_HWCAP` with the reader `cpu_features` uses, darwin asks sysctl for `hw.optional.arm.FEAT_DIT`, and every other isa returns `UNSUPPORTED`. `std.system.dit` is the consumer: at process start it turns the mode on when the link admits a secret multiply and refuses to start when this returns anything but 1, so an implementation must not report 1 without the mode. A user-supplied implementation for a kernel may read ID_AA64PFR0_EL1.DIT directly.
+
+## wasi
+
+`std.system.os.wasi` selects one row per preview, and `std.system.capability` holds each row's groups, so a later preview is a module beside `std.system.os.wasi.preview1` with the same exports, selected in `std.system.os.wasi`, plus its row. What every preview shares (the constants, the native codes and the pages of linear memory) sits in `std.system.os.wasi.shared`.
+
+Preview 1 is threadless, so threads, the io queue, sockets and cpu features are not claimed. std.sync.atomic is the plain access on wasm32, and a mutex never contends. Everything built on threads (`std.sync.thread`, `condition`, `semaphore`, `channel`, `cancel`, `worker_pool`, `std.log`, `std.process.exec`, `std.io.runtime`, `std.io.lifecycle`) refuses the target, and so does `std.terminal`, which has no terminal control to run on.
+
+- **Paths.** The preview has no working directory and no absolute paths. An absolute path, or a relative one against `working_dir()`, lands on the preopen that holds its longest leading part, and a preopen named `.` or `/` holds whatever no longer one does. A path under no preopen is `ENOENT`. `getcwd` answers `/`.
+- **Unsupported members.** `getpid`, the spawns, `wait`, `wait_pid`, `terminate_child`, the open-file limit, `pipe`, `lock_fd`, `set_mode`, `set_mode_at`, `protect`, `lock`, `unlock`, `advise`, `sync_file` and metadata-only `retain_identity_at` return `ENOTSUP`, and `map_file` returns nil. `publication_capabilities` returns 0.
+- **Codes.** A native code is the host's errno negated. `nosys` reads as `ENOTSUP` and `notcapable` as `EACCES`.
+- **Memory.** A page is 64 KiB. Linear memory only grows, so `deallocate` keeps pages in address order, merged, and `allocate` takes kept pages first, zeroed. One heap core serves it through `native_source` as it does every host. All new pages come from `extend` in `std.system.os.wasi.shared`, and at this compiler that is a reserve of `HEAP_RESERVE` bytes of linear memory, since nothing the language spells reaches `memory.grow`.
+- **Secrets.** `SECRET_LOCKS` is false. Linear memory cannot be locked or guarded, so `std.memory.secret` serves storage only after the program's `accept_unlocked`. wasm has no inline assembly to weld a mapping with, so the storage is one region of `^u8` declared in `std.system.os.wasi.welded`, 16 MiB of it, and a `T` with public bytes is refused at compile time in the typed forms.
 
 ## Assumptions
 
