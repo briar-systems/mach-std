@@ -2,6 +2,25 @@
 
 std 10.0.0 pairs with mach 7.
 
+## bool is u1 (#1005)
+
+`std.types.bool.bool` is now `def bool: u1`, and `true` and `false` are `u1`. A `u1` is one byte holding 0 or 1, which comparisons, `&&`, `||`, `!` and `sel` produce and a condition requires. It has `&`, `|`, `^`, `==` and ordering, and no arithmetic. std builds with mach b039331 or later. `mach migrate` rewrites the alias and every `asm` head, and the compiler warns of the two forms below while the family moves. `[project] mach` stays `^6` until a 7.x release exists.
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `if (flags & 1)` | `if ((flags & 1) != 0)`, or hold the value in a `bool` |
+| `val n: u8 = a == b;` | `val n: u8 = (a == b)::u8;`, or declare `n` as a `bool` |
+| `total + ok` with `ok: bool` | `total + ok::usize` |
+| `v::bool` keeps the low byte of `v` | `v::bool` asks whether `v` is non-zero |
+| a `bool` field in a record an OS reads or writes | the platform's width: `i32` for windows `BOOL`, `u8` for NT `BOOLEAN` |
+| `asm x86_64`, `asm aarch64`, `asm riscv64`, `asm riscv32` | `asm x86-64`, `asm armv8-a`, `asm rv64i`, `asm rv32i` |
+
+`std.format` renders a `u1` as `0` or `1`, as it rendered a `bool` before, and `std.derive` takes a `u1` field. `std.crypto.ct`'s flags stay `^u8`: `eq`, `lt`, `gt`, `is_zero` and the `mask_*` and `select_*` over them read and write the same values. A comparison of secrets written directly is a `^u1`, so a flag taken from one is cast, as `(a == b)::^u8`.
+
+## one wipe path, $zeroize (#1019)
+
+`memory.zero[T]` wipes every `T` with a secret byte through `$zeroize`, so a wipe of a type mixing public and secret bytes now survives optimization as a wipe of a wholly secret type does. `ct.zeroize`, `ct.zeroize_plain` and the typed release in `std.memory.secret` sit on the same intrinsic, in place of the per-architecture assembly kernel. Their signatures do not change. Code holding a `*T` of any `T` can call `$zeroize(p, count)` itself, with no cast.
+
 ## constant-time functions switch the timing mode themselves (#1137)
 
 std no longer turns PSTATE.DIT on at start or on each thread it spawns, and no longer reads the linker's `__mach_dit_required` cell. A `#[constant_time("soft")]` function now sets the mode on entry and clears it on return where it set it. std publishes `__mach_timing_available` before main, 1 when the processor provides DIT and the process may switch it, and the function runs without the mode where it is 0. Code that relied on DIT being on for a whole thread outside constant-time functions calls `std.crypto.ct.begin` or `std.system.dit.enable` on that thread.
