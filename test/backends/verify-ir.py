@@ -8,7 +8,7 @@
 # the entry to a native release passes a wipe first, whatever the block layout.
 # a wipe counts only when its pointer and length are the released region, read
 # from the call's arguments or the asm node's binds and traced through the
-# copies the IR emits (stack slots with one writer, and wipe_typed's byte view).
+# copies the IR emits (stack slots with one writer).
 # a value the tracer cannot follow fails the check.
 from pathlib import Path
 import re
@@ -21,12 +21,6 @@ TYPED = '$backends.main.SecretRecord'
 WIPE_TYPED = '@"' + PORTABLE + 'wipe_typed' + TYPED + '"'
 # $size_of(SecretRecord): an 8192-aligned record of two u64 fields in src/main.mach
 TYPED_SIZE = 8192
-# the pointer copy wipe_typed takes its secret byte view through, per isa
-VIEWS = {
-    'x86_64': ('mov rax, {src}', 'mov {dst}, rax'),
-    'aarch64': ('ldr x0, {src}', 'str x0, {dst}'),
-    'riscv64': ('ld t0, {src}', 'sd t0, {dst}'),
-}
 TERMINATORS = ('br', 'cbr', 'ret', 'unreachable')
 
 
@@ -165,30 +159,6 @@ class Function:
         return self.reaches({a}, {b}) is None
 
 
-def asm_lines(body):
-    return [line.strip() for line in body.replace('\\n', '\n').split('\n') if line.strip()]
-
-
-def view_binds(asm):
-    # (source bind, destination bind) when the node is a plain pointer copy
-    isa, body, binds = asm
-    template, lines = VIEWS.get(isa), asm_lines(body)
-    if template is None or len(lines) != len(template):
-        return None
-    names = {}
-    for pattern, line in zip(template, lines):
-        regex = re.escape(pattern).replace(r'\{src\}', r'\{(?P<src>\w+)\}').replace(r'\{dst\}', r'\{(?P<dst>\w+)\}')
-        match = re.fullmatch(regex, line)
-        if match is None:
-            return None
-        for role, name in match.groupdict().items():
-            if names.setdefault(role, name) != name:
-                return None
-    if set(names) != {'src', 'dst'} or names['src'] == names['dst'] or not set(names.values()) <= set(binds):
-        return None
-    return names['src'], names['dst']
-
-
 def show(value):
     kind, *rest = value
     if kind == 'param':
@@ -247,13 +217,6 @@ class Tracer:
                 writers.append((pos, lambda pos=pos, inst=inst: self.value(fn, inst.operands[0], pos)))
                 continue
             if self.is_kernel(inst):
-                continue
-            view = inst.asm is not None and view_binds(inst.asm)
-            if view and inst.asm[2][view[0]] == slot and inst.asm[2][view[1]] != slot:
-                continue
-            if view and inst.asm[2][view[1]] == slot:
-                source = inst.asm[2][view[0]]
-                writers.append((pos, lambda pos=pos, source=source: self.slot(fn, source, pos)))
                 continue
             raise ValueError(fn.name + ': cannot trace ' + slot + ', ' + inst.op + ' in ' + pos[0] + ' may write it')
         # the writers whose store reaches the read, no other writer between
