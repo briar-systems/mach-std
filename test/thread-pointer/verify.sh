@@ -26,7 +26,7 @@ mkdir -p c/out
 # the fixture is C, so it is built by a C compiler and linked by pthread_create's owner
 $cc -shared -fPIC -O1 -Wl,-soname,libprobe.so -o c/out/libprobe.so c/probe.c -lpthread
 
-mach_run build . -a static --target "$target" --profile debug
+mach_run build . -a static --target "$target-bare" --profile debug
 mach_run build . -a dynamic --target "$target" --profile debug
 static="$(find out -name static -type f -print -quit)"
 dynamic="$(find out -name dynamic -type f -print -quit)"
