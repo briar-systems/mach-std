@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # who owns the thread pointer (#915): a static image, where std owns it, and a
-# dynamic image, where the loader owns the main thread's and C code creates
-# threads that call back into mach. every cell checks current_token on each
-# thread it runs: direct, stable, and distinct among the threads live at once.
+# dynamic image, where the loader owns the main thread's, std refuses a thread
+# with no backend installed, and C code creates threads that call back into
+# mach. every other cell checks current_token on each thread it runs: direct,
+# stable, and distinct among the threads live at once.
 #
 # usage: verify.sh [path-to-mach] [target] [runner]
 #   CC builds the C fixture for the target (default cc). under a qemu runner,
@@ -47,7 +48,7 @@ cell() {
 }
 
 cell static            "$static"
-cell dynamic-std-threads "$dynamic" spawn
+cell spawn-refused     "$dynamic" refused
 cell loader-main       "$dynamic" main
 cell c-thread-callback "$dynamic" cthread
 exit "$failed"
