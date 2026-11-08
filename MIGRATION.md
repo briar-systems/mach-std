@@ -62,6 +62,37 @@ A `CommandSet` carries what mach kept in module globals: `common` tables every c
 
 For mach's own switch: `repeatable: true` becomes `occurs: args.Occurs.collect{}`. The `-vv` row is not a short spelling, so verbosity becomes one collect `-v` row read with `occurrences`, capped at 2, and the `-vv implies -v` relation goes. `-n=x` on a short value row now gives the value `=x` instead of an unknown-flag refusal, and `-ovalue` is read as `-o value`. A command without `truncate_at_sep` reads the arguments after `--` as operands where it refused `--` as an unknown flag. `values` walks every occurrence, so a caller that wants only the values skips a hit whose value is nil. `ParsedInvocation`, `dnit_invocation` and the allocator argument go, since nothing is allocated.
 
+## std.args owns help, the version, the reserved shorts and the exit codes (#1150)
+
+Every program read through `std.args` now answers `--version`, `-h`, `--help` and `help [<command> [<action>]]` the same way, and std.args provides them. `args.HELP`, `args.HELP_SHORT` and `args.VERSION` are in every schema ahead of the set's own tables, and `args.HELP_COMMAND` is in every set, listed last in the overview. A program declares none of them, and `check` refuses a set that spells `--help`, `-h`, `--version` or the command word `help` itself.
+
+The short spellings `-o`, `-v`, `-q`, `-t` and `-h` have one meaning everywhere, listed in `args.RESERVED`. A short row of one of them must be an alias of a canonical row spelled `--output`, `--verbose`, `--quiet`, `--target` or `--help`, with that row's arity (VALUE for `-o` and `-t`, FLAG for the rest), and `-v` must collect so `-vv` reads as two occurrences. `check`, and so every `parse`, refuses a set that breaks this.
+
+The exit codes are `args.EXIT_OK` 0, `args.EXIT_USER` 1, `args.EXIT_INTERNAL` 2 and `args.EXIT_ENVIRONMENT` 3, documented on every page from `args.EXITS`. A refused command line is `EXIT_USER`, and a malformed set `EXIT_INTERNAL`, as `args.exit_of(refusal)` gives them. A command's own `Exit` notes still refine a shared code or add one, as a forwarded code or `124` for a timeout.
+
+| 10.0.0 before #1150 | 10.0.0 |
+| --- | --- |
+| a `--help` row, its `-h` alias and a common `TableRef` holding them | nothing. Drop the rows, and `common` when it held nothing else |
+| `CommandSet.help`, `help_flag`, `globals`, `global_n`, `exits`, `exit_n` | removed. `CommandSet.version` is new and must not be empty |
+| a program's own `help` command and its handler | nothing. `help` is `args.HELP_COMMAND`, and parse refuses an operand that names no command, or no action of it |
+| `args.Global` and an `args.Global{row: ?VERSION, ...}` for `--version` | removed. `prog --help`, `prog -h` and `prog --version` work in the command word's place, and `--help` or `--version` anywhere after a command too |
+| a program's own exit table of 0 to 3 | `args.EXIT_OK`, `args.EXIT_USER`, `args.EXIT_INTERNAL`, `args.EXIT_ENVIRONMENT` |
+| `args.help_requested(?inv)` and the `inv.command == nil` test | `args.request(?inv)`, an `args.Request`: `run`, `refused`, `help` with the `args.Page`, `version` or `usage` for a missing command word |
+| `args_help.Page`, `args_help.page_of(?inv)` | `args.Page`, carried by `Request.help` |
+| refusal, page and version handling written by each program | `args_help.answer(?inv, ?out, ?diag)`: `none` when the program runs `inv.command`, otherwise the exit code after it wrote the refusal, page or version |
+| `-o` with no long row, `-v` with no long row | `-o` an alias of an `--output` row, `-v` an alias of a collecting `--verbose` row |
+
+A program's dispatch reduces to this:
+
+```mach
+var inv:  args.Invocation = args.parse(?SET, args.of(argc, argv), 1);
+val done: opt[i64]        = args_help.answer(?inv, ?out, ?diag);
+if (sel done.some) { ret done.some; }
+# run inv.command
+```
+
+A program that reports refusals its own way, as in JSON diagnostics, reads `args.request(?inv)` first, reports a `refused` request itself with `args.exit_of`, and hands the rest to `answer`.
+
 ## a heap over a backing that never reclaims keeps its spans (#883)
 
 `heap.allocator_source` reads the backing's `retains` flag once, when the source is built. Over a backing that does not reclaim, such as `allocator.fixed`, `allocator.arena` or `allocator.bump`, the source can no longer release, so the heap keeps every span it obtained and reuses it. Growing past the `init` budget again takes nothing more from the backing, where before each span handed back was lost to it. Over a reclaiming backing nothing changes.
