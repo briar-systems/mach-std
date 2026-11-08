@@ -308,9 +308,14 @@ pub fun writer(f: File) m_writer.Writer {
 
 # read an entire file into an allocated byte buffer
 #
-# composes io.read_all over the file's Reader: grows as it reads, so it needs
-# no size assumption. the caller owns the returned vector; on failure nothing
-# is owned.
+# a regular file with a nonzero size is stat'ed and read through io.read_exact
+# into one buffer of exactly that size, keeping embedded NUL bytes and the
+# length. a file that shrinks between the stat and the read is reported as
+# read{eof} with the bytes that were delivered, and nothing stays allocated.
+# anything else (pipes, special files, files that report no size) composes
+# io.read_all, which grows as it reads. a refused allocation is read{alloc}
+# on either path. the caller owns the returned vector; on failure nothing is
+# owned.
 # ---
 # a:   allocator for the result
 # p:   file path
@@ -329,6 +334,25 @@ pub fun read_bytes_native(a: *A.Allocator, name: *Unit) res[Vector[u8], FsError]
 fun read_bytes_of(a: *A.Allocator, ro: res[File, io_error.Error]) res[Vector[u8], FsError] {
     if (sel ro.err) { ret res[Vector[u8], FsError].err{FsError.io{ro.err}}; }
     var f: File = ro.ok;
+
+    var size:    usize        = 0;
+    var regular: bool         = false;
+    val sized:   err[FsError] = stat_size_of(?f, ?size, ?regular);
+    if (sel sized.err) { ret res[Vector[u8], FsError].err{sized.err}; }
+
+    if (regular && size != 0) {
+        val exact: res[*u8, FsError] = read_exact_of(a, ?f, size, 0);
+        if (sel exact.err) {
+            # read_bytes reports a refused allocation as read{alloc}, on either path
+            if (sel exact.err.alloc) { ret res[Vector[u8], FsError].err{FsError.read{ReadError.alloc{exact.err.alloc}}}; }
+            ret res[Vector[u8], FsError].err{exact.err};
+        }
+        var v: Vector[u8] = vector.init[u8](a);
+        v.data = exact.ok;
+        v.len  = size;
+        v.cap  = size;
+        ret res[Vector[u8], FsError].ok{v};
+    }
 
     var rd:      m_reader.Reader            = reader(f);
     val content: res[Vector[u8], ReadError] = m_reader.read_all(a, ?rd);
@@ -369,40 +393,68 @@ fun read_string_of(a: *A.Allocator, ro: res[File, io_error.Error]) res[str, FsEr
     if (sel ro.err) { ret res[str, FsError].err{FsError.io{ro.err}}; }
     var f: File = ro.ok;
 
-    # size the buffer from the open handle
+    var size:    usize        = 0;
+    var regular: bool         = false;
+    val sized:   err[FsError] = stat_size_of(?f, ?size, ?regular);
+    if (sel sized.err) { ret res[str, FsError].err{sized.err}; }
+
+    val exact: res[*u8, FsError] = read_exact_of(a, ?f, size, 1);
+    if (sel exact.err) { ret res[str, FsError].err{exact.err}; }
+    val buf: *u8 = exact.ok;
+    buf[size] = 0;
+    ret res[str, FsError].ok{buf::str};
+}
+
+# size an open file from its handle
+# ---
+# f:       the open file, closed when the stat fails
+# size:    the file's byte size
+# regular: whether f is a regular file, whose size is its content's length
+# ret:     ok, io for a failed stat or RANGE for a size no buffer can hold
+fun stat_size_of(f: *File, size: *usize, regular: *bool) err[FsError] {
     var st: os.stat_t;
     val sr: i64 = os.stat(f.handle.value, ?st);
     if (sr < 0) {
-        val closed: err[io_error.Error] = close(?f);
-        ret res[str, FsError].err{FsError.io{with_cleanup(os.error(sr, io_error.OP_OPTION), cleanup_code(closed))}};
+        val closed: err[io_error.Error] = close(f);
+        ret err[FsError].err{FsError.io{with_cleanup(os.error(sr, io_error.OP_OPTION), cleanup_code(closed))}};
     }
     if (st.st_size < 0 || st.st_size::u64 >= (-1)::usize::u64) {
-        val closed: err[io_error.Error] = close(?f);
-        ret res[str, FsError].err{FsError.io{with_cleanup(io_error.make(io_error.RANGE, io_error.OP_READ), cleanup_code(closed))}};
+        val closed: err[io_error.Error] = close(f);
+        ret err[FsError].err{FsError.io{with_cleanup(io_error.make(io_error.RANGE, io_error.OP_READ), cleanup_code(closed))}};
     }
-    val size: usize = st.st_size::usize;
+    @size    = st.st_size::usize;
+    @regular = (fsnative.stat_mode(?st) & os.S_IFMT) == os.S_IFREG;
+    ret err[FsError].ok{};
+}
 
-    val ar: res[*u8, A.Error] = A.allocate[u8](a, size + 1);
+# read exactly size bytes of an open file into one buffer of size + extra
+# bytes, and close the file
+# ---
+# f:     the open file, closed on every outcome
+# size:  bytes to read
+# extra: spare bytes after the content, left for the caller to fill
+# ret:   the buffer of size + extra bytes, or why it could not be filled, with
+#        nothing allocated
+fun read_exact_of(a: *A.Allocator, f: *File, size: usize, extra: usize) res[*u8, FsError] {
+    val ar: res[*u8, A.Error] = A.allocate[u8](a, size + extra);
     if (sel ar.err) {
-        close(?f);
-        ret res[str, FsError].err{FsError.alloc{ar.err}};
+        close(f);
+        ret res[*u8, FsError].err{FsError.alloc{ar.err}};
     }
     val buf: *u8 = ar.ok;
 
-    var rd:     m_reader.Reader     = reader(f);
+    var rd:     m_reader.Reader     = reader(@f);
     val e:      err[ReadError]      = m_reader.read_exact(?rd, buf, size);
-    val closed: err[io_error.Error] = close(?f);
+    val closed: err[io_error.Error] = close(f);
     if (sel e.err) {
-        A.deallocate[u8](a, buf, size + 1);
-        ret res[str, FsError].err{FsError.read{e.err}};
+        A.deallocate[u8](a, buf, size + extra);
+        ret res[*u8, FsError].err{FsError.read{e.err}};
     }
     if (sel closed.err) {
-        A.deallocate[u8](a, buf, size + 1);
-        ret res[str, FsError].err{FsError.io{closed.err}};
+        A.deallocate[u8](a, buf, size + extra);
+        ret res[*u8, FsError].err{FsError.io{closed.err}};
     }
-
-    buf[size] = 0;
-    ret res[str, FsError].ok{buf::str};
+    ret res[*u8, FsError].ok{buf};
 }
 
 # welded storage from std.memory.secret needs entropy and pages beside files
