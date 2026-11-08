@@ -62,36 +62,47 @@ A `CommandSet` carries what mach kept in module globals: `common` tables every c
 
 For mach's own switch: `repeatable: true` becomes `occurs: args.Occurs.collect{}`. The `-vv` row is not a short spelling, so verbosity becomes one collect `-v` row read with `occurrences`, capped at 2, and the `-vv implies -v` relation goes. `-n=x` on a short value row now gives the value `=x` instead of an unknown-flag refusal, and `-ovalue` is read as `-o value`. A command without `truncate_at_sep` reads the arguments after `--` as operands where it refused `--` as an unknown flag. `values` walks every occurrence, so a caller that wants only the values skips a hit whose value is nil. `ParsedInvocation`, `dnit_invocation` and the allocator argument go, since nothing is allocated.
 
-## std.args owns help, the version, the reserved shorts and the exit codes (#1150)
+## std.args is a plain argument parser (#1150)
 
-Every program read through `std.args` now answers `--version`, `-h`, `--help` and `help [<command> [<action>]]` the same way, and std.args provides them. `args.HELP`, `args.HELP_SHORT` and `args.VERSION` are in every schema ahead of the set's own tables, and `args.HELP_COMMAND` is in every set, listed last in the overview. A program declares none of them, and `check` refuses a set that spells `--help`, `-h`, `--version` or the command word `help` itself.
+`std.args` no longer shapes a program's command line. It parses arguments against a description and judges only the user's input. The `CommandSet`, `CommandSpec`, `ActionSpec`, `FlagSpec` and `TableRef` records give way to a root `args.Command` with `args.Command`s nested under it to any depth, each with a slice of `*args.Flag`. A nested command replaces an action, so `mach dep add` is `dep` with `add` nested under it. Nothing validates the description: `check`, `schema_valid` and `Malformed` are gone, and a wrong description is the program's bug. std.args injects no `--help`, `-h`, `--version` or `help` command, reserves no short spelling and defines no exit codes. A program declares its own.
 
-The short spellings `-o`, `-v`, `-q`, `-t` and `-h` have one meaning everywhere, listed in `args.RESERVED`. A short row of one of them must be an alias of a canonical row spelled `--output`, `--verbose`, `--quiet`, `--target` or `--help`, with that row's arity (VALUE for `-o` and `-t`, FLAG for the rest), and `-v` must collect so `-vv` reads as two occurrences. `check`, and so every `parse`, refuses a set that breaks this.
-
-The exit codes are `args.EXIT_OK` 0, `args.EXIT_USER` 1, `args.EXIT_INTERNAL` 2 and `args.EXIT_ENVIRONMENT` 3, documented on every page from `args.EXITS`. A refused command line is `EXIT_USER`, and a malformed set `EXIT_INTERNAL`, as `args.exit_of(refusal)` gives them. A command's own `Exit` notes still refine a shared code or add one, as a forwarded code or `124` for a timeout.
+A flag has a long spelling without its dashes, an optional short byte, a value placeholder when it takes a value, `repeat`, `negatable` for `--no-name`, and optional help text. Every flag may occur any number of times. A single read answers the last occurrence and `values` walks them all. A flag is read while a command that lists it is the one matched, so a flag shared by several commands is listed by each, by the same address. `parse(?ROOT, args.of(argc, argv))` reads from argument 1. While the command matched so far has nested commands, a word in the operand place names one of them. It refuses only an unknown flag, a missing value, an unknown command and an operand count outside the matched command's bounds, and `args.describe` writes the message.
 
 | 10.0.0 before #1150 | 10.0.0 |
 | --- | --- |
-| a `--help` row, its `-h` alias and a common `TableRef` holding them | nothing. Drop the rows, and `common` when it held nothing else |
-| `CommandSet.help`, `help_flag`, `globals`, `global_n`, `exits`, `exit_n` | removed. `CommandSet.version` is new and must not be empty |
-| a program's own `help` command and its handler | nothing. `help` is `args.HELP_COMMAND`, and parse refuses an operand that names no command, or no action of it |
-| `args.Global` and an `args.Global{row: ?VERSION, ...}` for `--version` | removed. `prog --help`, `prog -h` and `prog --version` work in the command word's place, and `--help` or `--version` anywhere after a command too |
-| a program's own exit table of 0 to 3 | `args.EXIT_OK`, `args.EXIT_USER`, `args.EXIT_INTERNAL`, `args.EXIT_ENVIRONMENT` |
-| `args.help_requested(?inv)` and the `inv.command == nil` test | `args.request(?inv)`, an `args.Request`: `run`, `refused`, `help` with the `args.Page`, `version` or `usage` for a missing command word |
-| `args_help.Page`, `args_help.page_of(?inv)` | `args.Page`, carried by `Request.help` |
-| refusal, page and version handling written by each program | `args_help.answer(?inv, ?out, ?diag)`: `none` when the program runs `inv.command`, otherwise the exit code after it wrote the refusal, page or version |
-| `-o` with no long row, `-v` with no long row | `-o` an alias of an `--output` row, `-v` an alias of a collecting `--verbose` row |
+| `args.FlagSpec{name: "--out", value: "path", arity: args.ARITY_VALUE, doc: d, ...}` and an alias row `-o` | `args.Flag{long: "out", short: 'o', value: "path", repeat: false, negatable: false, help: d}` |
+| `args.ARITY_FLAG`, `args.ARITY_VALUE`, `args.ARITY_ATTACHED` | a nil or empty `value` takes no value, any other takes one. An optional attached value has no form |
+| `args.Occurs.once`, `collect`, `override` | `repeat`, which help marks. No occurrence is refused, and a single read answers the last |
+| `args.TableRef` lists, `accepted` and `docs` | `flags`, a `Slice[*args.Flag]` from `std.collections.slice`, on each command |
+| `args.CommandSet` with `program`, `version`, `title`, `footer`, `common`, `relations`, `removed` | the root `args.Command`, its `name` the program name. Shared flags are listed on each command that reads them |
+| `args.CommandSpec` and `args.ActionSpec` | `args.Command{name, aliases, help, usage, flags, commands, operand_min, operand_max, passthrough}`. `id` is gone, so dispatch on the command's address |
+| `summary`, `effect`, `grammar`, `exits`, `terminator`, `refused`, `refusal`, `constraints`, `examples` | `help` and `usage`, both optional. The rest is the program's own text |
+| `truncate_at_sep` | `passthrough`, with the arguments after `--` read by `args.rest(?p)` as a `Slice[str]` |
+| `args.Relation`, `args.Removed`, `args.Exit`, `args.PASSTHROUGH` | removed. The program checks its own combinations and names its removed spellings in its own refusal |
+| `args.HELP`, `HELP_SHORT`, `VERSION`, `BUILTIN`, `HELP_COMMAND`, `RESERVED` | removed. Declare `--help` and `--version` flags, or a `help` command, and test them after `parse` |
+| `args.EXIT_OK`, `EXIT_USER`, `EXIT_INTERNAL`, `EXIT_ENVIRONMENT`, `EXITS`, `exit_of` | removed. A program defines its own codes |
+| `args.request`, `args.Request`, `args.Page`, `args_help.answer` | removed. Read `p.refusal`, then the program's own help and version flags, then dispatch on `p.command` |
+| `args.parse(?SET, a, 1)`, `args.parse_command(?SET, ?C, a, 2)` | `args.parse(?ROOT, a)`. For a page of another command, parse the operands that name it, as `args.parse(?ROOT, args.of(argc - 1, ?argv[1]))` for `prog help <command>...` |
+| `args.Invocation`, `inv.command`, `inv.action` | `args.Parsed`, `p.command` the last command matched, `p.depth`, and `args.command_at(?p, d)` for the path |
+| `args.Refusal` cases `malformed`, `unknown_action`, `missing_action`, `unknown`, `inapplicable`, `removed`, `repeated`, `relation` | `unknown_flag`, `missing_value`, `unknown_command`, `operands`. A missing nested command is an operand count the program bounds |
+| `args.on`, `value`, `latest` as `res[_, args.Misread]` | `args.on(?p, ?F)` a `bool`, `args.value(?p, ?F)` a `str`, `args.latest(?p, ?F)` an `opt[args.Hit]`. `Misread` is gone |
+| `args.given` with implications, `args.values` as a `res` | `args.given(?p, ?F)` for an occurrence, `args.values(?p, ?F)` the walk itself |
+| `args.operand(?inv, n)` as an index | `args.operand(?p, n)` as the `opt[str]` given |
+| `Hit.flag` the canonical row and `Hit.spelled` | `Hit.flag`, the one flag either spelling names |
+| `args_help.render(?SET, ?w, page, width)` and `args_help.HelpError` | `args_help.render(?p, ?w, width)`: the usage line, help text, nested commands and flag table of the matched command, failing only on the write |
 
 A program's dispatch reduces to this:
 
 ```mach
-var inv:  args.Invocation = args.parse(?SET, args.of(argc, argv), 1);
-val done: opt[i64]        = args_help.answer(?inv, ?out, ?diag);
-if (sel done.some) { ret done.some; }
-# run inv.command
+var p: args.Parsed = args.parse(?ROOT, args.of(argc, argv));
+if (sel p.refusal.some) {
+    # write args.describe(?p, ?diag) and exit with the program's own code
+}
+if (args.given(?p, ?HELP)) {
+    # write args_help.render(?p, ?out, args_help.terminal_width())
+}
+# run p.command
 ```
-
-A program that reports refusals its own way, as in JSON diagnostics, reads `args.request(?inv)` first, reports a `refused` request itself with `args.exit_of`, and hands the rest to `answer`.
 
 ## a heap over a backing that never reclaims keeps its spans (#883)
 
