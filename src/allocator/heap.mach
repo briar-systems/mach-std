@@ -43,6 +43,15 @@
 #   var r: heap.Region;
 #   heap.region_source(?src, ?r, base, len);
 #
+# a program that makes one heap after another, each torn down whole, gives
+# them a Pool to share: pool_source draws spans from it and gives them back to
+# it, so the next heap is handed the spans the last one used:
+#
+#   var pool: heap.Pool;
+#   heap.pool_init(?pool, ?src, 0);
+#   heap.pool_source(?pooled, ?pool);
+#   heap.init(?h, ?pooled, 0);
+#
 # native_source is only on a target with the pages capability. init's budget bounds the retained empty spans. a heap
 # over a source that cannot release keeps them past the budget, because there
 # is nowhere else for them to go. allocator_source makes that choice once: over
@@ -85,9 +94,10 @@ $if (capability.HAS_PAGES && capability.HAS_THREADS) {
 
 # where a heap's backing memory comes from
 #
-# fn_obtain(ctx, size) returns a span of exactly `size` bytes, zero-filled,
-# at an address that is a multiple of SPAN_ALIGN. `size` is always a multiple
-# of the host page size, or of PAGE_FLOOR on a target with no pages.
+# fn_obtain(ctx, size) returns a span of at least `size` bytes at an address
+# that is a multiple of SPAN_ALIGN, zero-filled unless the source is `stale`.
+# `size` is always a multiple of the host page size, or of PAGE_FLOOR on a
+# target with no pages.
 #
 # fn_release(ctx, span, size) returns a span obtained earlier, 0 on success or
 # a negative backend native code. it is nil for a source that cannot return memory; the core
@@ -96,10 +106,12 @@ $if (capability.HAS_PAGES && capability.HAS_THREADS) {
 # ctx:        opaque context passed to both callbacks
 # fn_obtain:  acquire a span, or none when the source is exhausted
 # fn_release: return a span, or nil when the source cannot reclaim
+# stale:      a span it gives may hold what was written to it before
 pub rec Source {
     ctx:        ptr;
     fn_obtain:  fun(ptr, usize) opt[ptr];
     fn_release: fun(ptr, ptr, usize) i64;
+    stale:      bool;
 }
 
 # number of small size classes
@@ -315,7 +327,8 @@ fun obtain(h: *Heap, size: usize) *Span {
     s.owner  = h::ptr;
     s.size   = size;
     s.zeroed = 1;
-    s.free   = nil;
+    if (h.src.stale) { s.zeroed = 0; }
+    s.free = nil;
     s.used   = 0;
     s.next   = nil;
     s.prev   = nil;
@@ -470,7 +483,7 @@ fun take_large(h: *Heap, size: usize, align: usize, zeroed: *bool) ptr {
     if (s == nil) {
         s = obtain(h, total);
         if (s == nil) { ret nil; }
-        @zeroed = true;
+        @zeroed = !h.src.stale;
     }
     or {
         @zeroed = false;
@@ -990,6 +1003,7 @@ $if (capability.HAS_PAGES) {
         s.ctx        = nil;
         s.fn_obtain  = native_obtain;
         s.fn_release = native_release;
+        s.stale      = false;
     }
 
     fun native_obtain(ctx: ptr, size: usize) opt[ptr] {
@@ -1050,6 +1064,7 @@ pub fun allocator_source(s: *Source, backing: *allocator.Allocator) {
     s.ctx        = backing::ptr;
     s.fn_obtain  = backed_obtain;
     s.fn_release = nil;
+    s.stale      = false;
     if (allocator.reclaims(backing)) { s.fn_release = backed_release; }
 }
 
@@ -1103,6 +1118,7 @@ pub fun region_source(s: *Source, r: *Region, base: ptr, len: usize) {
     s.ctx        = r::ptr;
     s.fn_obtain  = region_obtain;
     s.fn_release = nil;
+    s.stale      = false;
 }
 
 fun region_obtain(ctx: ptr, size: usize) opt[ptr] {
@@ -1114,6 +1130,158 @@ fun region_obtain(ctx: ptr, size: usize) opt[ptr] {
     r.next = start + size;
     memory.raw_zero(start::ptr, size);
     ret opt[ptr].some{start::ptr};
+}
+
+# how many span sizes a pool holds: SPAN_SIZE doubled this many times less one
+val POOL_BINS: usize = 24;
+
+# a span a pool holds, linked through its own first bytes
+rec Held {
+    next: *Held;
+}
+
+# spans kept between heaps
+#
+# a heap gives its spans back to its source when it is torn down or runs past
+# its budget. over the host mapper that unmaps them, and the next heap maps and
+# faults the same memory in again. a pool stands between heaps and their real
+# source: a span given back is held, by size, and handed to the next request
+# for that size. spans come in sizes of SPAN_SIZE doubled, a request rounded up
+# to the next, so a span is found without a search and one given back is known
+# by its size alone. a request past the largest goes to the source as it is.
+# a held span keeps what was written to it, so a pool's source is stale.
+# ---
+# src:    where spans come from and go back to
+# lock:   covers every field below
+# bins:   held spans by size, bins[k] of SPAN_SIZE << k bytes each
+# held:   bytes in the bins
+# budget: byte ceiling for `held` before a span goes back to the source
+pub rec Pool {
+    src:    Source;
+    lock:   mutex.Mutex;
+    bins:   [POOL_BINS]*Held;
+    held:   usize;
+    budget: usize;
+}
+
+# initialize a Pool over a span source
+#
+# the source is copied into the pool, and whatever its ctx points at must
+# outlive the pool. a pool over a source that cannot release holds every span
+# given back to it, whatever the budget.
+# ---
+# p:      Pool to initialize
+# src:    span source the pool draws from
+# budget: byte ceiling for held spans, 0 for no ceiling
+# ret:    ok, or `invalid` for a nil pool, a nil source, or a source with no
+#         obtain callback
+pub fun pool_init(p: *Pool, src: *Source, budget: usize) err[allocator.Error] {
+    if (p == nil)             { ret err[allocator.Error].err{allocator.Error.invalid{}}; }
+    if (src == nil)           { ret err[allocator.Error].err{allocator.Error.invalid{}}; }
+    if (src.fn_obtain == nil) { ret err[allocator.Error].err{allocator.Error.invalid{}}; }
+
+    p.src  = @src;
+    p.lock = mutex.make();
+    var k: usize = 0;
+    for (k < POOL_BINS) {
+        p.bins[k] = nil;
+        k         = k + 1;
+    }
+    p.held   = 0;
+    p.budget = budget;
+    if (p.budget == 0) { p.budget = ~(0::usize); }
+    ret err[allocator.Error].ok{};
+}
+
+# give every held span back to the source. every heap drawing from the pool
+# must be torn down first
+# ---
+# p:   Pool to tear down
+# ret: ok, or the first status the source refused a span with
+pub fun pool_dnit(p: *Pool) err[allocator.Error] {
+    if (p == nil) { ret err[allocator.Error].ok{}; }
+
+    mutex.lock(?p.lock);
+    fin { mutex.unlock(?p.lock); }
+
+    var first: i64   = 0;
+    var k:     usize = 0;
+    for (k < POOL_BINS) {
+        var s: *Held = p.bins[k];
+        for (s != nil) {
+            val next: *Held = s.next;
+            if (p.src.fn_release != nil) {
+                val code: i64 = p.src.fn_release(p.src.ctx, s::ptr, SPAN_SIZE << k);
+                if (code != 0 && first == 0) { first = code; }
+            }
+            s = next;
+        }
+        p.bins[k] = nil;
+        k         = k + 1;
+    }
+    p.held = 0;
+
+    if (first != 0) { ret err[allocator.Error].err{allocator.Error.release{first}}; }
+    ret err[allocator.Error].ok{};
+}
+
+# fill in a Source that draws spans from a pool and gives them back to it
+# ---
+# s: Source to initialize
+# p: pool the spans are drawn from (must outlive the heap)
+pub fun pool_source(s: *Source, p: *Pool) {
+    if (s == nil) { ret; }
+    s.ctx        = p::ptr;
+    s.fn_obtain  = pooled_obtain;
+    s.fn_release = pooled_release;
+    s.stale      = true;
+}
+
+# the bin of the smallest pooled size that holds `size`, POOL_BINS when none does
+fun pool_bin(size: usize) usize {
+    var k: usize = 0;
+    for (k < POOL_BINS && (SPAN_SIZE << k) < size) { k = k + 1; }
+    ret k;
+}
+
+fun pooled_obtain(ctx: ptr, size: usize) opt[ptr] {
+    val p: *Pool = ctx::*Pool;
+    val k: usize = pool_bin(size);
+    if (k == POOL_BINS) { ret p.src.fn_obtain(p.src.ctx, size); }
+
+    mutex.lock(?p.lock);
+    val got: *Held = p.bins[k];
+    if (got != nil) {
+        p.bins[k] = got.next;
+        p.held    = p.held - (SPAN_SIZE << k);
+    }
+    mutex.unlock(?p.lock);
+
+    if (got != nil) { ret opt[ptr].some{got::ptr}; }
+    ret p.src.fn_obtain(p.src.ctx, SPAN_SIZE << k);
+}
+
+fun pooled_release(ctx: ptr, span: ptr, size: usize) i64 {
+    val p: *Pool = ctx::*Pool;
+    val k: usize = pool_bin(size);
+    if (k == POOL_BINS) {
+        if (p.src.fn_release == nil) { ret 0; }
+        ret p.src.fn_release(p.src.ctx, span, size);
+    }
+
+    val whole: usize = SPAN_SIZE << k;
+    mutex.lock(?p.lock);
+    val keeps: bool = p.src.fn_release == nil || (p.held <= p.budget && whole <= p.budget - p.held);
+    if (keeps) {
+        val s: *Held = span::*Held;
+        s.next    = p.bins[k];
+        p.bins[k] = s;
+        p.held    = p.held + whole;
+    }
+    mutex.unlock(?p.lock);
+
+    if (keeps) { ret 0; }
+    ret p.src.fn_release(p.src.ctx, span, whole);
 }
 
 $if (capability.HAS_PAGES && capability.HAS_THREADS) {
