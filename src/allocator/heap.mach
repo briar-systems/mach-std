@@ -12,7 +12,9 @@
 # cannot take memory back leaves `fn_release` nil and the core retains spans
 # instead of returning them. the core never assumes memory can come back.
 #
-# a Heap is safe to share between threads: one lock covers the core.
+# a Heap is safe to share between threads: one lock covers the core. a heap
+# one thread owns, as one per unit of work, takes the allocator `make_owned`
+# wires, which takes no lock.
 #
 # it satisfies the std.allocator interface, so it drops in wherever an Allocator
 # is taken:
@@ -579,12 +581,20 @@ fun give_back(h: *Heap, s: *Span, p: ptr, size: usize) i64 {
 
 fun do_allocate(ctx: ptr, size: usize, align: usize) opt[ptr] {
     if (ctx == nil) { ret opt[ptr].none{}; }
-    if (size == 0)  { ret opt[ptr].some{nil}; }
-
     val h: *Heap = ctx::*Heap;
     mutex.lock(?h.lock);
     fin { mutex.unlock(?h.lock); }
+    ret acquire(h, size, align);
+}
 
+fun owned_allocate(ctx: ptr, size: usize, align: usize) opt[ptr] {
+    if (ctx == nil) { ret opt[ptr].none{}; }
+    ret acquire(ctx::*Heap, size, align);
+}
+
+# acquire a block of `size` bytes at `align`, the lock held or the heap owned
+fun acquire(h: *Heap, size: usize, align: usize) opt[ptr] {
+    if (size == 0) { ret opt[ptr].some{nil}; }
     var zeroed: bool = false;
     val p:      ptr  = take(h, size, align, ?zeroed);
     if (p == nil) { ret opt[ptr].none{}; }
@@ -600,12 +610,20 @@ fun take(h: *Heap, size: usize, align: usize, zeroed: *bool) ptr {
 
 fun do_deallocate(ctx: ptr, p: ptr, size: usize, align: usize) i64 {
     if (ctx == nil) { ret EINVAL; }
-    if (p == nil)   { ret 0; }
-
     val h: *Heap = ctx::*Heap;
     mutex.lock(?h.lock);
     fin { mutex.unlock(?h.lock); }
+    ret drop_block(h, p, size, align);
+}
 
+fun owned_deallocate(ctx: ptr, p: ptr, size: usize, align: usize) i64 {
+    if (ctx == nil) { ret EINVAL; }
+    ret drop_block(ctx::*Heap, p, size, align);
+}
+
+# release a block, the lock held or the heap owned
+fun drop_block(h: *Heap, p: ptr, size: usize, align: usize) i64 {
+    if (p == nil) { ret 0; }
     val s: *Span = find_span(h, p, align);
     if (s == nil) { ret EINVAL; }
     ret give_back(h, s, p, size);
@@ -613,23 +631,29 @@ fun do_deallocate(ctx: ptr, p: ptr, size: usize, align: usize) i64 {
 
 fun do_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) opt[ptr] {
     if (ctx == nil) { ret opt[ptr].none{}; }
-    if (p == nil)   { ret do_allocate(ctx, new_size, align); }
-
     val h: *Heap = ctx::*Heap;
+    mutex.lock(?h.lock);
+    fin { mutex.unlock(?h.lock); }
+    ret resize(h, p, old_size, new_size, align);
+}
+
+fun owned_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) opt[ptr] {
+    if (ctx == nil) { ret opt[ptr].none{}; }
+    ret resize(ctx::*Heap, p, old_size, new_size, align);
+}
+
+# resize a block, the lock held or the heap owned
+fun resize(h: *Heap, p: ptr, old_size: usize, new_size: usize, align: usize) opt[ptr] {
+    if (p == nil) { ret acquire(h, new_size, align); }
 
     if (new_size == 0) {
-        val code: i64 = do_deallocate(ctx, p, old_size, align);
+        val code: i64 = drop_block(h, p, old_size, align);
         if (code != 0) { ret opt[ptr].none{}; }
         ret opt[ptr].some{nil};
     }
 
-    mutex.lock(?h.lock);
-
     val s: *Span = find_span(h, p, align);
-    if (s == nil) {
-        mutex.unlock(?h.lock);
-        ret opt[ptr].none{};
-    }
+    if (s == nil) { ret opt[ptr].none{}; }
 
     # capacity of the block as its span sees it, which outranks old_size
     var room: usize = s.cap;
@@ -641,18 +665,12 @@ fun do_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usi
     val want: usize = class_of(h, new_size, align);
     if (new_size <= room) {
         val keeps: bool = s.class != CLASS_LARGE && want == s.class;
-        if (keeps || new_size * 2 > room) {
-            mutex.unlock(?h.lock);
-            ret opt[ptr].some{p};
-        }
+        if (keeps || new_size * 2 > room) { ret opt[ptr].some{p}; }
     }
 
     var zeroed: bool = false;
     val fresh:  ptr  = take(h, new_size, align, ?zeroed);
-    if (fresh == nil) {
-        mutex.unlock(?h.lock);
-        ret opt[ptr].none{};
-    }
+    if (fresh == nil) { ret opt[ptr].none{}; }
 
     var copy: usize = old_size;
     if (copy > room)     { copy = room; }
@@ -660,7 +678,6 @@ fun do_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usi
     memory.raw_copy(fresh, p, copy);
 
     val code: i64 = give_back(h, s, p, old_size);
-    mutex.unlock(?h.lock);
     if (code != 0) { ret opt[ptr].none{}; }
 
     ret opt[ptr].some{fresh};
@@ -742,6 +759,25 @@ pub fun make(a: *allocator.Allocator, h: *Heap) err[allocator.Error] {
     a.fn_allocate   = do_allocate;
     a.fn_reallocate = do_reallocate;
     a.fn_deallocate = do_deallocate;
+    a.retains       = false;
+
+    ret err[allocator.Error].ok{};
+}
+
+# wire up an Allocator backed by this Heap for one owner, taking no lock, so
+# only one thread at a time may call it or anything else on the heap
+# ---
+# a:   Allocator to initialize
+# h:   initialized Heap (must outlive the Allocator)
+# ret: ok, or `invalid` when either pointer is nil
+pub fun make_owned(a: *allocator.Allocator, h: *Heap) err[allocator.Error] {
+    if (a == nil) { ret err[allocator.Error].err{allocator.Error.invalid{}}; }
+    if (h == nil) { ret err[allocator.Error].err{allocator.Error.invalid{}}; }
+
+    a.ctx           = h::ptr;
+    a.fn_allocate   = owned_allocate;
+    a.fn_reallocate = owned_reallocate;
+    a.fn_deallocate = owned_deallocate;
     a.retains       = false;
 
     ret err[allocator.Error].ok{};
