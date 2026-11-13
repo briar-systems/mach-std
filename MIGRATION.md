@@ -191,6 +191,31 @@ ref = "branch/dev"
 | `use std.data.toml;`, `toml.parse`, `toml.get_str`, `toml.Table` | `use toml;`, with the same names |
 | `use std.data.toml.TomlError;` and any other member | `use toml.TomlError;` |
 
+## the cryptographic hashes, checksums and compression move to packages (#1004)
+
+The SHA-2 and Keccak hashes leave std for the mach-crypto package, and the checksums and compression leave for the mach-deflate package. Each package module has the same public names, types and behaviour the std module had (mach-crypto's `sha512` also holds the public `State384` the std module had). Declare the package under the key its library binds and import the module by its source path in the package.
+
+```toml
+[dep.crypto]
+git = "https://github.com/briar-systems/mach-crypto"
+ref = "branch/dev"
+
+[dep.deflate]
+git = "https://github.com/briar-systems/mach-deflate"
+ref = "branch/dev"
+```
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `use std.crypto.hash.sha256;` | `use crypto.hash.sha256;` |
+| `use std.crypto.hash.sha512;` | `use crypto.hash.sha512;` |
+| `use std.crypto.hash.keccak;`, `sha3_256`, `sha3_512`, `shake128`, `shake256` | `use crypto.hash.keccak;` and the same module names under `crypto.hash` |
+| `use std.crypto.hash.crc32;`, `use std.crypto.hash.adler32;` | `use deflate.crc32;`, `use deflate.adler32;` |
+| `use std.compress.inflate;`, `deflate`, `zlib`, `gzip` | `use deflate.inflate;` and the same module names under `deflate` |
+| `use std.compress.format;`, or the `compress_format` re-export | `use deflate.format;` |
+
+`std.crypto.ct`, `std.crypto.rand`, `std.crypto.hash.hasher`, `std.crypto.hash.fnv1a`, `std.crypto.hash.siphash` and `std.memory.secret` stay in std.
+
 ## float conversion work storage has published types (#1089)
 
 `std.text.parse.parse_float`, `std.format.write_float` and `std.format.write_float_g` take their bignum work storage from the caller as `work: *u32`. Each row now has a published type for it, a `u32` array derived from std's own bignum counts, line slack and the row's limb and digit counts. Declare it on the stack and pass `?work[0]`. Code that hard-coded a size (4 or 5 bignums of `ieee.F64_LIMBS`, a 32-byte line) should declare the type instead, so the storage follows std when a count changes. The runtime functions `parse_float_work`, `write_float_work` and `write_float_g_work` stay for storage sized at runtime.

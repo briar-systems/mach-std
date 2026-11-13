@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # std.system.cpu's aes, carry-less multiply and sha fields against the host.
-# sha256 picks its backend from the sha field (a unit test pins that), so this
-# is also the check that the backend choice matches the processor.
+# mach-crypto's sha256 picks its backend from the sha field (a unit test there pins
+# that), so this is also the check that the backend choice matches the processor.
 #
 # the probe program prints what std.system.cpu.features() reports and what
 # os.cpu_features reads. both must match the OS's own view of the processor:
