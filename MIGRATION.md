@@ -170,6 +170,27 @@ Every spawn and exec, in `std.process.exec` and `std.system.os` alike, takes the
 | `use std.types.semver.semver_parse;`, `semver_parse(s, a)` | removed; version handling lives in mach |
 | `use std.types.semver.semver_compare;`, `semver_is_stable`, `semver_is_prerelease`, `semver_has_build` | removed; version handling lives in mach |
 
+## `data.json` and `data.toml` move to packages (#1004)
+
+`std.data.json` and `std.data.toml` are removed. JSON reading and writing is the mach-json package and TOML reading is the mach-toml package, each with the same public names, types and behaviour the std module had. Declare the package under the key its library binds, then import from that root instead of `std.data`.
+
+```toml
+[dep.json]
+git = "https://github.com/briar-systems/mach-json"
+ref = "branch/dev"
+
+[dep.toml]
+git = "https://github.com/briar-systems/mach-toml"
+ref = "branch/dev"
+```
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `use std.data.json;`, `json.parse`, `json.Object`, `json.field_str` | `use json;`, with the same names |
+| `use std.data.json.JsonError;` and any other member | `use json.JsonError;` |
+| `use std.data.toml;`, `toml.parse`, `toml.get_str`, `toml.Table` | `use toml;`, with the same names |
+| `use std.data.toml.TomlError;` and any other member | `use toml.TomlError;` |
+
 ## float conversion work storage has published types (#1089)
 
 `std.text.parse.parse_float`, `std.format.write_float` and `std.format.write_float_g` take their bignum work storage from the caller as `work: *u32`. Each row now has a published type for it, a `u32` array derived from std's own bignum counts, line slack and the row's limb and digit counts. Declare it on the stack and pass `?work[0]`. Code that hard-coded a size (4 or 5 bignums of `ieee.F64_LIMBS`, a 32-byte line) should declare the type instead, so the storage follows std when a count changes. The runtime functions `parse_float_work`, `write_float_work` and `write_float_g_work` stay for storage sized at runtime.
