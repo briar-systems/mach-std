@@ -252,6 +252,86 @@ A long-running program that keeps many secrets may need a higher `RLIMIT_MEMLOCK
 
 `buffers` secret classes and requests accept an alignment up to `buffers.SECRET_ALIGN_MAX` (4096, the alignment welded storage guarantees on every host) and `make` refuses a secret class above it. Before, alignments up to 65536 were accepted and not honoured.
 
+## lifecycle names (mach#4484)
+
+`init` and `dnit` now name only the creation and teardown of a value that owns memory, and `make` the creation of one that owns nothing. A teardown that frees a whole owning value is `dnit`, one that frees a part of it is `<part>_dnit`, and a predicate that shares its word with a constructor is `is_<word>`. Signatures do not change. Every public rename:
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `std.allocator.arena.make` | `std.allocator.arena.allocator` |
+| `std.allocator.heap.make_owned` | `std.allocator.heap.allocator_owned` |
+| `std.allocator.heap.make` | `std.allocator.heap.allocator` |
+| `std.allocator.testing.make` | `std.allocator.testing.init` |
+| `std.compat.sha1.init` | `std.compat.sha1.make` |
+| `std.crypto.hash.siphash.init` | `std.crypto.hash.siphash.make` |
+| `std.filesystem.listed_free` | `std.filesystem.listed_dnit` |
+| `std.filesystem.native_names_free` | `std.filesystem.native_names_dnit` |
+| `std.filesystem.transaction.ownership.root_destroy` | `std.filesystem.transaction.ownership.root_dnit` |
+| `std.filesystem.transaction.release_claim` | `std.filesystem.transaction.claim_dnit` |
+| `std.io.file.adapter.destroy` | `std.io.file.adapter.dnit` |
+| `std.io.file.adapter.make` | `std.io.file.adapter.init` |
+| `std.io.file.destroy` | `std.io.file.dnit` |
+| `std.io.file.make` | `std.io.file.init` |
+| `std.io.file.watch_close` | `std.io.file.watch_dnit` |
+| `std.io.file.watch_open_native` | `std.io.file.watch_init_native` |
+| `std.io.file.watch_open` | `std.io.file.watch_init` |
+| `std.io.runtime.destroy` | `std.io.runtime.dnit` |
+| `std.io.runtime.make` | `std.io.runtime.init` |
+| `std.log.queued_destroy` | `std.log.queued_dnit` |
+| `std.log.sink.queued_destroy` | `std.log.sink.queued_dnit` |
+| `std.memory.buffers.close_account` | `std.memory.buffers.account_dnit` |
+| `std.memory.buffers.destroy` | `std.memory.buffers.dnit` |
+| `std.memory.buffers.make` | `std.memory.buffers.init` |
+| `std.memory.buffers.open_account` | `std.memory.buffers.account_init` |
+| `std.memory.buffers.secret_source_close_account` | `std.memory.buffers.secret_source_account_dnit` |
+| `std.memory.buffers.secret_source_open_account` | `std.memory.buffers.secret_source_account_init` |
+| `std.memory.buffers.source_close_account` | `std.memory.buffers.source_account_dnit` |
+| `std.memory.buffers.source_open_account` | `std.memory.buffers.source_account_init` |
+| `std.memory.secret.borrow_close` | `std.memory.secret.borrow_release` |
+| `std.memory.secret.borrow_open` | `std.memory.secret.borrow_acquire` |
+| `std.memory.table.destroy` | `std.memory.table.dnit` |
+| `std.memory.table.make` | `std.memory.table.init` |
+| `std.net.async.destroy` | `std.net.async.dnit` |
+| `std.net.async.iocp.destroy` | `std.net.async.iocp.dnit` |
+| `std.net.async.iocp.make` | `std.net.async.iocp.init` |
+| `std.net.async.iocp.port.destroy` | `std.net.async.iocp.port.dnit` |
+| `std.net.async.iocp.port.make` | `std.net.async.iocp.port.init` |
+| `std.net.async.local.destroy` | `std.net.async.local.dnit` |
+| `std.net.async.local.make` | `std.net.async.local.init` |
+| `std.net.async.local.unix.make` | `std.net.async.local.unix.init` |
+| `std.net.async.local.windows.make` | `std.net.async.local.windows.init` |
+| `std.net.async.make` | `std.net.async.init` |
+| `std.net.async.readiness.destroy` | `std.net.async.readiness.dnit` |
+| `std.net.async.readiness.make` | `std.net.async.readiness.init` |
+| `std.net.async.unix.make` | `std.net.async.unix.init` |
+| `std.net.async.windows.make` | `std.net.async.windows.init` |
+| `std.net.resolve.destroy` | `std.net.resolve.dnit` |
+| `std.net.resolve.make_runtime_with_adapter` | `std.net.resolve.init_runtime_with_adapter` |
+| `std.net.resolve.make_runtime` | `std.net.resolve.init_runtime` |
+| `std.net.resolve.make_with_adapter` | `std.net.resolve.init_with_adapter` |
+| `std.net.resolve.make` | `std.net.resolve.init` |
+| `std.net.resolve.resolution_destroy` | `std.net.resolve.resolution_dnit` |
+| `std.net.resolve.shared.destroy` | `std.net.resolve.shared.dnit` |
+| `std.process.env.environ_free` | `std.process.env.environ_dnit` |
+| `std.rand.init` | `std.rand.make` |
+| `std.sync.cancel.destroy` | `std.sync.cancel.dnit` |
+| `std.sync.cancel.init_registration` | `std.sync.cancel.registration_make` |
+| `std.sync.channel.destroy` | `std.sync.channel.dnit` |
+| `std.sync.semaphore.init` | `std.sync.semaphore.make` |
+| `std.sync.worker_pool.destroy` | `std.sync.worker_pool.dnit` |
+| `std.system.os.darwin.shared.directory_close` | `std.system.os.darwin.shared.directory_dnit` |
+| `std.system.os.directory_close` | `std.system.os.directory_dnit` |
+| `std.system.os.linux.shared.directory_close` | `std.system.os.linux.shared.directory_dnit` |
+| `std.system.os.native_path_release` | `std.system.os.native_path_dnit` |
+| `std.system.os.release_secret_typed` | `std.system.os.free_secret_typed` |
+| `std.system.os.release_secret` | `std.system.os.free_secret` |
+| `std.system.os.secret.release_typed` | `std.system.os.secret.free_typed` |
+| `std.system.os.secret.release` | `std.system.os.secret.free` |
+| `std.system.os.wasi.preview1.directory_close` | `std.system.os.wasi.preview1.directory_dnit` |
+| `std.system.os.windows.shared.directory_close` | `std.system.os.windows.shared.directory_dnit` |
+| `std.types.string.owned_release` | `std.types.string.owned_dnit` |
+| `std.types.string.str_empty` | `std.types.string.str_is_empty` |
+
 # std 6.x to 7.0.0
 
 std 7.0.0 makes the memory behind `io.runtime` reachable (#677). A runtime takes the allocator every one of its allocations comes from, and every driver registered on it draws from the same allocator.
