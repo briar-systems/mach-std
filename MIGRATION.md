@@ -163,7 +163,7 @@ Every spawn and exec, in `std.process.exec` and `std.system.os` alike, takes the
 
 ## `types.semver` is removed (#1085)
 
-`std.types.semver` is removed, with `SemverError`, `semver_parse`, the predicates and `semver_compare`. Version handling is owned by mach, in its manifest version contract (`src/lang/manifest/version.mach`), which parses build metadata, refuses empty identifiers and leading zeros per SemVer 2.0.0, and compares numeric prerelease identifiers by length. std keeps no replacement, so code that parsed or compared versions through std should use mach's version handling or carry its own parser.
+`std.types.semver` is removed, with `SemverError`, `semver_parse`, the predicates and `semver_compare`. Version handling is owned by mach, in its manifest version contract (`src/manifest/version.mach`), which parses build metadata, refuses empty identifiers and leading zeros per SemVer 2.0.0, and compares numeric prerelease identifiers by length. std keeps no replacement, so code that parsed or compared versions through std should use mach's version handling or carry its own parser.
 
 | 9.x | 10.0.0 |
 | --- | --- |
