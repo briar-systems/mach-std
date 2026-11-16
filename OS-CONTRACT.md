@@ -15,7 +15,7 @@ $if (capability.HAS_FILES) {
 }
 ```
 
-Every group is present on linux, darwin and windows. wasi claims core, pages, clock, entropy, files and process (see [wasi](#wasi)). None is present on any other target, freestanding included. `HOSTED` is the core group, which every other group implies.
+Every group is present on linux, darwin and windows. wasi claims core, pages, clock, entropy, files and process (see [wasi](#wasi)). None is present on any other target, freestanding and uefi included. `HOSTED` is the core group, which every other group implies.
 
 A group a target does not claim has no members in `std.system.os` at all, so naming one is a build error. A module built on such a group refuses the target with `$error`, and `src/lib/libstd.mach` leaves it out of the aggregate there. A member of a claimed group the host cannot perform returns a code `error_kind` classifies as `UNSUPPORTED`.
 
