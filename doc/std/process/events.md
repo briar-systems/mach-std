@@ -1,0 +1,165 @@
+[std](../README.md) / [process](README.md) / **events**
+
+# std.process.events
+
+portable process lifecycle events
+
+Source: [`src/process/events.mach`](../../../src/process/events.mach)
+
+Uses types from [`std.io.error`](../io/error.md), [`std.io.lifecycle`](../io/lifecycle.md), [`std.io.runtime`](../io/runtime.md).
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`Kind`](#kind) | `def` |  |
+| [`Event`](#event) | `rec` |  |
+| [`Capabilities`](#capabilities) | `rec` |  |
+| [`Source`](#source) | `rec` |  |
+
+| On `Kind` | |
+| :--- | :--- |
+| [`SERVICE_STOP`](#kind), [`CONSOLE_CLOSE`](#kind), [`TERMINATE`](#kind), [`INTERRUPT`](#kind), [`RELOAD`](#kind) | |
+
+| On `Capabilities` | |
+| :--- | :--- |
+| [`capabilities`](#capabilities-1) | |
+
+| On `Source` | |
+| :--- | :--- |
+| [`make`](#make) | claim the process's event source with its own wait queue |
+| [`make_runtime`](#make_runtime) | the source must close before the runtime whose queue it borrows |
+| [`notify_service_stop`](#notify_service_stop) | windows service handlers call this for stop, shutdown, or preshutdown control |
+| [`next`](#next) | events are coalesced by kind and drained in service-to-reload priority order |
+| [`begin_runtime_drain`](#begin_runtime_drain) | |
+| [`wait`](#wait) | standalone sources may wait directly, runtime-attached sources use runtime wait |
+| [`close`](#close) | release the process's event source: the native handlers are restored, the owned queue closed and the runtime registration released; the first refusal is reported after every step has run |
+
+---
+
+## Kind
+
+```mach
+pub def Kind: u8
+```
+
+| Name | Value | |
+| :--- | :--- | :--- |
+| `SERVICE_STOP` | `0` |  |
+| `CONSOLE_CLOSE` | `1` |  |
+| `TERMINATE` | `2` |  |
+| `INTERRUPT` | `3` |  |
+| `RELOAD` | `4` |  |
+
+## Event
+
+```mach
+pub rec Event {
+    kind: Kind;
+}
+```
+
+## Capabilities
+
+```mach
+pub rec Capabilities {
+    terminate:     bool;
+    interrupt:     bool;
+    reload:        bool;
+    console_close: bool;
+    service_stop:  bool;
+}
+```
+
+### capabilities
+
+```mach
+pub fun capabilities() Capabilities
+```
+
+## Source
+
+```mach
+pub rec Source {
+    generation:   usize;
+    owns_queue:   bool;
+    runtime:      *std.io.runtime.Runtime;
+    registration: std.io.runtime.SourceToken;
+    registered:   bool;
+}
+```
+
+### make
+
+```mach
+pub fun make(source: *Source) err[std.io.error.Error]
+```
+
+claim the process's event source with its own wait queue
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | BUSY when another source owns the process, or the native failure |
+
+### make_runtime
+
+```mach
+pub fun make_runtime(source: *Source, runtime: *std.io.runtime.Runtime) err[std.io.error.Error]
+```
+
+the source must close before the runtime whose queue it borrows
+
+an event that becomes pending ends the runtime's wait with zero completions,
+as a caller wake does: the caller drains with next after every wait return,
+the same as after the standalone wait
+
+### notify_service_stop
+
+```mach
+pub fun notify_service_stop(source: *Source) err[std.io.error.Error]
+```
+
+windows service handlers call this for stop, shutdown, or preshutdown control
+
+### next
+
+```mach
+pub fun next(source: *Source) res[opt[Event], std.io.error.Error]
+```
+
+events are coalesced by kind and drained in service-to-reload priority order
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the next pending event, absent when none is pending, or CLOSED for a source that is not the open owner |
+
+### begin_runtime_drain
+
+```mach
+pub fun begin_runtime_drain(
+    source: *Source,
+    runtime: *std.io.runtime.Runtime,
+    event: Event,
+) res[std.io.lifecycle.CloseResult, std.io.error.Error]
+```
+
+### wait
+
+```mach
+pub fun wait(source: *Source, timeout_ms: i32) res[bool, std.io.error.Error]
+```
+
+standalone sources may wait directly, runtime-attached sources use runtime wait
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | whether an event is pending after the wait, or the failure |
+
+### close
+
+```mach
+pub fun close(source: *Source) err[std.io.error.Error]
+```
+
+release the process's event source: the native handlers are restored, the
+owned queue closed and the runtime registration released; the first
+refusal is reported after every step has run
+

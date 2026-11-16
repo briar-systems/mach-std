@@ -1,0 +1,2327 @@
+[std](../../../README.md) / [system](../../README.md) / [os](../README.md) / [darwin](README.md) / **aarch64**
+
+# std.system.os.darwin.aarch64
+
+aarch64-specific darwin OS primitives
+
+provides page_size and pipe which require arch-specific assembly.
+everything else is in shared.mach.
+
+Source: [`src/system/os/darwin/aarch64.mach`](../../../../../src/system/os/darwin/aarch64.mach)
+
+| Functions | |
+| :--- | :--- |
+| [`page_size`](#page_size) | |
+| [`pipe`](#pipe) | create a unidirectional pipe |
+
+| Forwards | |
+| :--- | :--- |
+| [`stat_t`](#stat_t) | kernel ABI types |
+| [`timespec`](#timespec), [`DirectoryCursor`](#directorycursor), [`DirectoryEntry`](#directoryentry), [`DirectoryInitResult`](#directoryinitresult) | |
+| [`separator`](#separator) | path |
+| [`STDIN_FD`](#stdin_fd) | constants |
+| [`STDOUT_FD`](#stdout_fd), [`STDERR_FD`](#stderr_fd), [`O_RDONLY`](#o_rdonly), [`O_WRONLY`](#o_wronly), [`O_RDWR`](#o_rdwr), [`O_CREAT`](#o_creat), [`O_EXCL`](#o_excl), [`O_TRUNC`](#o_trunc), [`O_APPEND`](#o_append), [`O_NONBLOCK`](#o_nonblock), [`O_DIRECTORY`](#o_directory), [`O_NOFOLLOW`](#o_nofollow), [`AT_FDCWD`](#at_fdcwd), [`AT_SYMLINK_NOFOLLOW`](#at_symlink_nofollow), [`AT_REMOVEDIR`](#at_removedir) | |
+| [`LOCK_SH`](#lock_sh) | advisory file-lock operations |
+| [`LOCK_EX`](#lock_ex), [`LOCK_NB`](#lock_nb), [`LOCK_UN`](#lock_un), [`S_IFMT`](#s_ifmt), [`S_IFDIR`](#s_ifdir), [`S_IFREG`](#s_ifreg), [`S_IFLNK`](#s_iflnk), [`WNOHANG`](#wnohang), [`WUNTRACED`](#wuntraced), [`WCONTINUED`](#wcontinued), [`CLOCK_REALTIME`](#clock_realtime), [`CLOCK_MONOTONIC`](#clock_monotonic), [`EPERM`](#eperm), [`ENOENT`](#enoent), [`ESRCH`](#esrch), [`EINTR`](#eintr), [`EIO`](#eio), [`ENXIO`](#enxio), [`E2BIG`](#e2big), [`EBADF`](#ebadf), [`ECHILD`](#echild), [`EAGAIN`](#eagain), [`ENOMEM`](#enomem), [`EACCES`](#eacces), [`EFAULT`](#efault), [`EBUSY`](#ebusy), [`EEXIST`](#eexist), [`ENODEV`](#enodev), [`ENOTDIR`](#enotdir), [`EISDIR`](#eisdir), [`EINVAL`](#einval), [`ENFILE`](#enfile), [`EMFILE`](#emfile), [`ETXTBSY`](#etxtbsy), [`ENOSPC`](#enospc), [`EROFS`](#erofs), [`EPIPE`](#epipe), [`ELOOP`](#eloop), [`ENAMETOOLONG`](#enametoolong), [`ERANGE`](#erange), [`ENOTEMPTY`](#enotempty), [`ENOTSUP`](#enotsup), [`EINTR_MAX_RETRIES`](#eintr_max_retries) | |
+| [`terminate`](#terminate) | process |
+| [`abort`](#abort), [`terminate_child`](#terminate_child), [`setpgid`](#setpgid), [`getpgid`](#getpgid), [`terminate_group`](#terminate_group), [`spawn`](#spawn), [`spawn_grouped`](#spawn_grouped), [`spawn_in`](#spawn_in), [`spawn_redirected`](#spawn_redirected), [`spawn_redirected_grouped`](#spawn_redirected_grouped), [`spawn_redirected_in`](#spawn_redirected_in), [`spawn_redirected_in_grouped`](#spawn_redirected_in_grouped), [`getpid`](#getpid), [`ignore_sigpipe`](#ignore_sigpipe), [`sleep`](#sleep), [`cpu_count`](#cpu_count), [`cpu_features`](#cpu_features), [`cpu_dit`](#cpu_dit), [`thread_affinity`](#thread_affinity), [`set_thread_affinity`](#set_thread_affinity), [`getcwd`](#getcwd), [`getenv`](#getenv), [`fork`](#fork), [`vfork`](#vfork), [`exec`](#exec), [`wait`](#wait), [`wait_pid`](#wait_pid), [`ProcessStatus`](#processstatus), [`FileLimit`](#filelimit), [`LIMIT_UNLIMITED`](#limit_unlimited), [`open_file_limit`](#open_file_limit), [`set_open_file_limit`](#set_open_file_limit), [`ProcessWaitError`](#processwaiterror), [`WaitResult`](#waitresult), [`PROCESS_OP_WAIT`](#process_op_wait), [`PROCESS_OP_STATUS`](#process_op_status), [`PROCESS_OP_CLOSE`](#process_op_close), [`PROCESS_OP_SPAWN`](#process_op_spawn), [`PROCESS_OP_READ`](#process_op_read), [`PROCESS_OP_PIPE`](#process_op_pipe), [`PROCESS_OP_TERMINATE`](#process_op_terminate), [`PROCESS_EXITED`](#process_exited), [`PROCESS_SIGNALED`](#process_signaled), [`PROCESS_STOPPED`](#process_stopped), [`PROCESS_CONTINUED`](#process_continued) | |
+| [`allocate`](#allocate) | memory |
+| [`deallocate`](#deallocate), [`reallocate`](#reallocate), [`heap_region_base`](#heap_region_base), [`heap_region_extend`](#heap_region_extend), [`protect`](#protect), [`lock`](#lock), [`unlock`](#unlock), [`advise`](#advise), [`map_file`](#map_file), [`sync_file`](#sync_file) | |
+| [`_envp`](#_envp) | environment |
+| [`environ`](#environ) | |
+| [`read`](#read) | filesystem |
+| [`write`](#write), [`read_at`](#read_at), [`write_at`](#write_at), [`open`](#open), [`close`](#close), [`sync_fd`](#sync_fd), [`stat`](#stat), [`set_mode`](#set_mode), [`set_mode_at`](#set_mode_at), [`file_identity`](#file_identity), [`identity_at`](#identity_at), [`retain_identity_at`](#retain_identity_at), [`publication_capabilities`](#publication_capabilities), [`stat_path`](#stat_path), [`stat_mode`](#stat_mode), [`unlink`](#unlink), [`rename`](#rename), [`symlink`](#symlink), [`make_dir`](#make_dir), [`directory_init`](#directory_init), [`directory_next`](#directory_next), [`directory_dnit`](#directory_dnit), [`access`](#access), [`seek`](#seek), [`lock_fd`](#lock_fd) | |
+| [`AF_INET`](#af_inet) | sockets |
+| [`SOCK_STREAM`](#sock_stream), [`SOCK_DGRAM`](#sock_dgram), [`SOL_SOCKET`](#sol_socket), [`SO_UNSUPPORTED`](#so_unsupported), [`SO_REUSEADDR`](#so_reuseaddr), [`SO_REUSEPORT`](#so_reuseport), [`SO_EXCLUSIVEADDRUSE`](#so_exclusiveaddruse), [`SO_KEEPALIVE`](#so_keepalive), [`SO_SNDBUF`](#so_sndbuf), [`SO_RCVBUF`](#so_rcvbuf), [`SO_LINGER`](#so_linger), [`SO_RCVTIMEO`](#so_rcvtimeo), [`IPPROTO_IP`](#ipproto_ip), [`IPPROTO_TCP`](#ipproto_tcp), [`IPPROTO_IPV6`](#ipproto_ipv6), [`IP_TOS`](#ip_tos), [`IPV6_V6ONLY`](#ipv6_v6only), [`IPV6_TCLASS`](#ipv6_tclass), [`TCP_NODELAY`](#tcp_nodelay), [`TCP_KEEPIDLE`](#tcp_keepidle), [`TCP_KEEPINTVL`](#tcp_keepintvl), [`TCP_KEEPCNT`](#tcp_keepcnt), [`TCP_FASTOPEN`](#tcp_fastopen), [`SHUT_RD`](#shut_rd), [`SHUT_WR`](#shut_wr), [`SHUT_RDWR`](#shut_rdwr), [`SOCKADDR_IN_SIZE`](#sockaddr_in_size), [`sock_send`](#sock_send), [`sock_recv`](#sock_recv), [`IoVector`](#iovector), [`sock_write_vector`](#sock_write_vector), [`sock_send_message`](#sock_send_message), [`sock_receive_message`](#sock_receive_message), [`sock_connect_status`](#sock_connect_status), [`sock_close`](#sock_close), [`sock_create`](#sock_create), [`sock_create_flags`](#sock_create_flags), [`sock_bind`](#sock_bind), [`sock_listen`](#sock_listen), [`sock_accept`](#sock_accept), [`sock_accept_flags`](#sock_accept_flags), [`sock_connect`](#sock_connect), [`sock_sendto`](#sock_sendto), [`sock_recvfrom`](#sock_recvfrom), [`sock_peek_readable`](#sock_peek_readable), [`sock_shutdown`](#sock_shutdown), [`sock_setopt`](#sock_setopt), [`sock_getopt`](#sock_getopt), [`sock_local_addr`](#sock_local_addr), [`sock_remote_addr`](#sock_remote_addr), [`sock_inheritable`](#sock_inheritable), [`io_queue_create`](#io_queue_create), [`io_queue_wait`](#io_queue_wait), [`IoCompletion`](#iocompletion), [`IO_EVENT_READ`](#io_event_read), [`IO_EVENT_WRITE`](#io_event_write), [`IO_EVENT_ERROR`](#io_event_error), [`IO_EVENT_HANGUP`](#io_event_hangup), [`IO_EVENT_WAKE`](#io_event_wake), [`io_queue_watch`](#io_queue_watch), [`io_queue_rearm`](#io_queue_rearm), [`duplicate_to`](#duplicate_to), [`io_queue_unwatch`](#io_queue_unwatch), [`io_queue_poll`](#io_queue_poll), [`io_queue_wake`](#io_queue_wake), [`io_queue_close`](#io_queue_close), [`sock_set_rcvtimeo`](#sock_set_rcvtimeo) | |
+| [`DNS_HOSTS_PATH`](#dns_hosts_path) | dns |
+| [`random_fill`](#random_fill) | random |
+| [`thread_spawn`](#thread_spawn) | threads |
+| [`thread_join`](#thread_join), [`thread_detach`](#thread_detach), [`thread_current_id`](#thread_current_id), [`thread_current_name`](#thread_current_name), [`thread_wait`](#thread_wait), [`thread_wait_until`](#thread_wait_until), [`thread_wake`](#thread_wake), [`thread_block`](#thread_block), [`thread_block_enter`](#thread_block_enter), [`thread_exit_wipe`](#thread_exit_wipe), [`stack_bounds`](#stack_bounds) | |
+| [`clock_gettime`](#clock_gettime) | time |
+| [`error_message`](#error_message) | errno |
+
+---
+
+## Functions
+
+### page_size
+
+```mach
+pub fun page_size() usize
+```
+
+### pipe
+
+```mach
+pub fun pipe(fds: *i32) i64
+```
+
+create a unidirectional pipe
+
+this was hand-written asm for one reason: the raw XNU pipe trap returns the
+two descriptors in x0/x1 and signals failure through the carry flag, and the
+syscall DSL captures neither. libSystem's pipe(2) is an ordinary C function
+that writes both descriptors through the caller's array and reports failure
+as -1, so the arch-specific asm has nothing left to do and the wrapper is now
+identical on both darwin architectures - it lives here only because `pipe` is
+part of the per-arch module's published surface.
+
+| Parameter | |
+| :--- | :--- |
+| `fds` | pointer to two i32s; fds[0] = read end, fds[1] = write end |
+| **returns** | 0 on success, or negative errno |
+
+## Forwards
+
+### stat_t
+
+Forwards [`std.system.os.darwin.shared.stat_t`](shared.md#stat_t).
+
+```mach
+pub rec stat_t {
+    st_dev:            i32;
+    st_mode:           u16;
+    st_nlink:          u16;
+    st_ino:            u64;
+    st_uid:            u32;
+    st_gid:            u32;
+    st_rdev:           i32;
+    st_atime:          i64;
+    st_atime_nsec:     i64;
+    st_mtime:          i64;
+    st_mtime_nsec:     i64;
+    st_ctime:          i64;
+    st_ctime_nsec:     i64;
+    st_birthtime:      i64;
+    st_birthtime_nsec: i64;
+    st_size:           i64;
+    st_blocks:         i64;
+    st_blksize:        i32;
+    st_flags:          u32;
+    st_gen:            u32;
+    _reserved0:        i32;
+    _reserved1:        i64;
+    _reserved2:        i64;
+}
+```
+
+kernel ABI types
+
+### timespec
+
+Forwards [`std.system.os.darwin.shared.timespec`](shared.md#timespec).
+
+```mach
+pub rec timespec {
+    tv_sec:  i64;
+    tv_nsec: i64;
+}
+```
+
+time specification with seconds and nanoseconds
+
+### DirectoryCursor
+
+Forwards [`std.system.os.darwin.shared.DirectoryCursor`](shared.md#directorycursor).
+
+```mach
+pub rec DirectoryCursor {
+    address: usize;
+    active:  bool;
+    ended:   bool;
+    error:   i64;
+    stream:  std.system.os.darwin.libsystem.DirectoryStream;
+}
+```
+
+### DirectoryEntry
+
+Forwards [`std.system.os.darwin.shared.DirectoryEntry`](shared.md#directoryentry).
+
+```mach
+pub rec DirectoryEntry {
+    name:      str;
+    length:    usize;
+    type_hint: u8;
+}
+```
+
+the name is borrowed until the next cursor operation, including eof or failure
+
+### DirectoryInitResult
+
+Forwards [`std.system.os.darwin.shared.DirectoryInitResult`](shared.md#directoryinitresult).
+
+```mach
+pub rec DirectoryInitResult {
+    code:         i64;
+    cleanup_code: i64;
+}
+```
+
+initialization failure and failed duplicate cleanup remain independent
+
+### separator
+
+Forwards [`std.system.os.darwin.shared.separator`](shared.md#constants).
+
+```mach
+pub val separator: u8 = '/'
+```
+
+path
+
+### STDIN_FD
+
+Forwards [`std.system.os.darwin.shared.STDIN_FD`](shared.md#constants).
+
+```mach
+pub val STDIN_FD:  i32 = 0
+```
+
+constants
+
+### STDOUT_FD
+
+Forwards [`std.system.os.darwin.shared.STDOUT_FD`](shared.md#constants).
+
+```mach
+pub val STDOUT_FD: i32 = 1
+```
+
+### STDERR_FD
+
+Forwards [`std.system.os.darwin.shared.STDERR_FD`](shared.md#constants).
+
+```mach
+pub val STDERR_FD: i32 = 2
+```
+
+### O_RDONLY
+
+Forwards [`std.system.os.darwin.shared.O_RDONLY`](shared.md#constants).
+
+```mach
+pub val O_RDONLY:    i32 = 0
+```
+
+### O_WRONLY
+
+Forwards [`std.system.os.darwin.shared.O_WRONLY`](shared.md#constants).
+
+```mach
+pub val O_WRONLY:    i32 = 1
+```
+
+### O_RDWR
+
+Forwards [`std.system.os.darwin.shared.O_RDWR`](shared.md#constants).
+
+```mach
+pub val O_RDWR:      i32 = 2
+```
+
+### O_CREAT
+
+Forwards [`std.system.os.darwin.shared.O_CREAT`](shared.md#constants).
+
+```mach
+pub val O_CREAT:     i32 = 0x200
+```
+
+### O_EXCL
+
+Forwards [`std.system.os.darwin.shared.O_EXCL`](shared.md#constants).
+
+```mach
+pub val O_EXCL:      i32 = 0x800
+```
+
+### O_TRUNC
+
+Forwards [`std.system.os.darwin.shared.O_TRUNC`](shared.md#constants).
+
+```mach
+pub val O_TRUNC:     i32 = 0x400
+```
+
+### O_APPEND
+
+Forwards [`std.system.os.darwin.shared.O_APPEND`](shared.md#constants).
+
+```mach
+pub val O_APPEND:    i32 = 8
+```
+
+### O_NONBLOCK
+
+Forwards [`std.system.os.darwin.shared.O_NONBLOCK`](shared.md#constants).
+
+```mach
+pub val O_NONBLOCK: i32 = 4
+```
+
+### O_DIRECTORY
+
+Forwards [`std.system.os.darwin.shared.O_DIRECTORY`](shared.md#constants).
+
+```mach
+pub val O_DIRECTORY: i32 = 0x100000
+```
+
+### O_NOFOLLOW
+
+Forwards [`std.system.os.darwin.shared.O_NOFOLLOW`](shared.md#constants).
+
+```mach
+pub val O_NOFOLLOW:  i32 = 0x00000100
+```
+
+### AT_FDCWD
+
+Forwards [`std.system.os.darwin.shared.AT_FDCWD`](shared.md#constants).
+
+```mach
+pub val AT_FDCWD:            i32 = -2
+```
+
+### AT_SYMLINK_NOFOLLOW
+
+Forwards [`std.system.os.darwin.shared.AT_SYMLINK_NOFOLLOW`](shared.md#constants).
+
+```mach
+pub val AT_SYMLINK_NOFOLLOW: i32 = 0x0020
+```
+
+### AT_REMOVEDIR
+
+Forwards [`std.system.os.darwin.shared.AT_REMOVEDIR`](shared.md#constants).
+
+```mach
+pub val AT_REMOVEDIR:        i32 = 0x0080
+```
+
+### LOCK_SH
+
+Forwards [`std.system.os.darwin.shared.LOCK_SH`](shared.md#constants).
+
+```mach
+pub val LOCK_SH: i32 = 1
+```
+
+advisory file-lock operations
+
+### LOCK_EX
+
+Forwards [`std.system.os.darwin.shared.LOCK_EX`](shared.md#constants).
+
+```mach
+pub val LOCK_EX: i32 = 2
+```
+
+### LOCK_NB
+
+Forwards [`std.system.os.darwin.shared.LOCK_NB`](shared.md#constants).
+
+```mach
+pub val LOCK_NB: i32 = 4
+```
+
+### LOCK_UN
+
+Forwards [`std.system.os.darwin.shared.LOCK_UN`](shared.md#constants).
+
+```mach
+pub val LOCK_UN: i32 = 8
+```
+
+### S_IFMT
+
+Forwards [`std.system.os.darwin.shared.S_IFMT`](shared.md#constants).
+
+```mach
+pub val S_IFMT:  u32 = 0o170000
+```
+
+### S_IFDIR
+
+Forwards [`std.system.os.darwin.shared.S_IFDIR`](shared.md#constants).
+
+```mach
+pub val S_IFDIR: u32 = 0o040000
+```
+
+### S_IFREG
+
+Forwards [`std.system.os.darwin.shared.S_IFREG`](shared.md#constants).
+
+```mach
+pub val S_IFREG: u32 = 0o100000
+```
+
+### S_IFLNK
+
+Forwards [`std.system.os.darwin.shared.S_IFLNK`](shared.md#constants).
+
+```mach
+pub val S_IFLNK: u32 = 0o120000
+```
+
+### WNOHANG
+
+Forwards [`std.system.os.darwin.shared.WNOHANG`](shared.md#constants).
+
+```mach
+pub val WNOHANG:    i32 = 1
+```
+
+### WUNTRACED
+
+Forwards [`std.system.os.darwin.shared.WUNTRACED`](shared.md#constants).
+
+```mach
+pub val WUNTRACED:  i32 = 2
+```
+
+### WCONTINUED
+
+Forwards [`std.system.os.darwin.shared.WCONTINUED`](shared.md#constants).
+
+```mach
+pub val WCONTINUED: i32 = 0x10
+```
+
+### CLOCK_REALTIME
+
+Forwards [`std.system.os.darwin.shared.CLOCK_REALTIME`](shared.md#constants).
+
+```mach
+pub val CLOCK_REALTIME:  i32 = 0
+```
+
+### CLOCK_MONOTONIC
+
+Forwards [`std.system.os.darwin.shared.CLOCK_MONOTONIC`](shared.md#constants).
+
+```mach
+pub val CLOCK_MONOTONIC: i32 = 6
+```
+
+### EPERM
+
+Forwards [`std.system.os.darwin.shared.EPERM`](shared.md#constants).
+
+```mach
+pub val EPERM:        i64 = -1
+```
+
+### ENOENT
+
+Forwards [`std.system.os.darwin.shared.ENOENT`](shared.md#constants).
+
+```mach
+pub val ENOENT:       i64 = -2
+```
+
+### ESRCH
+
+Forwards [`std.system.os.darwin.shared.ESRCH`](shared.md#constants).
+
+```mach
+pub val ESRCH:        i64 = -3
+```
+
+### EINTR
+
+Forwards [`std.system.os.darwin.shared.EINTR`](shared.md#constants).
+
+```mach
+pub val EINTR:        i64 = -4
+```
+
+### EIO
+
+Forwards [`std.system.os.darwin.shared.EIO`](shared.md#constants).
+
+```mach
+pub val EIO:          i64 = -5
+```
+
+### ENXIO
+
+Forwards [`std.system.os.darwin.shared.ENXIO`](shared.md#constants).
+
+```mach
+pub val ENXIO:        i64 = -6
+```
+
+### E2BIG
+
+Forwards [`std.system.os.darwin.shared.E2BIG`](shared.md#constants).
+
+```mach
+pub val E2BIG:        i64 = -7
+```
+
+### EBADF
+
+Forwards [`std.system.os.darwin.shared.EBADF`](shared.md#constants).
+
+```mach
+pub val EBADF:        i64 = -9
+```
+
+### ECHILD
+
+Forwards [`std.system.os.darwin.shared.ECHILD`](shared.md#constants).
+
+```mach
+pub val ECHILD:       i64 = -10
+```
+
+### EAGAIN
+
+Forwards [`std.system.os.darwin.shared.EAGAIN`](shared.md#constants).
+
+```mach
+pub val EAGAIN:       i64 = -35
+```
+
+### ENOMEM
+
+Forwards [`std.system.os.darwin.shared.ENOMEM`](shared.md#constants).
+
+```mach
+pub val ENOMEM:       i64 = -12
+```
+
+### EACCES
+
+Forwards [`std.system.os.darwin.shared.EACCES`](shared.md#constants).
+
+```mach
+pub val EACCES:       i64 = -13
+```
+
+### EFAULT
+
+Forwards [`std.system.os.darwin.shared.EFAULT`](shared.md#constants).
+
+```mach
+pub val EFAULT:       i64 = -14
+```
+
+### EBUSY
+
+Forwards [`std.system.os.darwin.shared.EBUSY`](shared.md#constants).
+
+```mach
+pub val EBUSY:        i64 = -16
+```
+
+### EEXIST
+
+Forwards [`std.system.os.darwin.shared.EEXIST`](shared.md#constants).
+
+```mach
+pub val EEXIST:       i64 = -17
+```
+
+### ENODEV
+
+Forwards [`std.system.os.darwin.shared.ENODEV`](shared.md#constants).
+
+```mach
+pub val ENODEV:       i64 = -19
+```
+
+### ENOTDIR
+
+Forwards [`std.system.os.darwin.shared.ENOTDIR`](shared.md#constants).
+
+```mach
+pub val ENOTDIR:      i64 = -20
+```
+
+### EISDIR
+
+Forwards [`std.system.os.darwin.shared.EISDIR`](shared.md#constants).
+
+```mach
+pub val EISDIR:       i64 = -21
+```
+
+### EINVAL
+
+Forwards [`std.system.os.darwin.shared.EINVAL`](shared.md#constants).
+
+```mach
+pub val EINVAL:       i64 = -22
+```
+
+### ENFILE
+
+Forwards [`std.system.os.darwin.shared.ENFILE`](shared.md#constants).
+
+```mach
+pub val ENFILE:       i64 = -23
+```
+
+### EMFILE
+
+Forwards [`std.system.os.darwin.shared.EMFILE`](shared.md#constants).
+
+```mach
+pub val EMFILE:       i64 = -24
+```
+
+### ETXTBSY
+
+Forwards [`std.system.os.darwin.shared.ETXTBSY`](shared.md#constants).
+
+```mach
+pub val ETXTBSY:      i64 = -26
+```
+
+### ENOSPC
+
+Forwards [`std.system.os.darwin.shared.ENOSPC`](shared.md#constants).
+
+```mach
+pub val ENOSPC:       i64 = -28
+```
+
+### EROFS
+
+Forwards [`std.system.os.darwin.shared.EROFS`](shared.md#constants).
+
+```mach
+pub val EROFS:        i64 = -30
+```
+
+### EPIPE
+
+Forwards [`std.system.os.darwin.shared.EPIPE`](shared.md#constants).
+
+```mach
+pub val EPIPE:        i64 = -32
+```
+
+### ELOOP
+
+Forwards [`std.system.os.darwin.shared.ELOOP`](shared.md#constants).
+
+```mach
+pub val ELOOP:        i64 = -62
+```
+
+### ENAMETOOLONG
+
+Forwards [`std.system.os.darwin.shared.ENAMETOOLONG`](shared.md#constants).
+
+```mach
+pub val ENAMETOOLONG: i64 = -63
+```
+
+### ERANGE
+
+Forwards [`std.system.os.darwin.shared.ERANGE`](shared.md#constants).
+
+```mach
+pub val ERANGE:       i64 = -34
+```
+
+### ENOTEMPTY
+
+Forwards [`std.system.os.darwin.shared.ENOTEMPTY`](shared.md#constants).
+
+```mach
+pub val ENOTEMPTY:    i64 = -66
+```
+
+### ENOTSUP
+
+Forwards [`std.system.os.darwin.shared.ENOTSUP`](shared.md#constants).
+
+```mach
+pub val ENOTSUP:      i64 = -45
+```
+
+### EINTR_MAX_RETRIES
+
+Forwards [`std.system.os.darwin.shared.EINTR_MAX_RETRIES`](shared.md#constants).
+
+```mach
+pub val EINTR_MAX_RETRIES: usize = 8
+```
+
+### terminate
+
+Forwards [`std.system.os.darwin.shared.terminate`](shared.md#terminate).
+
+```mach
+pub fun terminate(code: i64)
+```
+
+process
+
+### abort
+
+Forwards [`std.system.os.darwin.shared.abort`](shared.md#abort).
+
+```mach
+pub fun abort()
+```
+
+abort the process immediately with exit code 255
+
+the process-wide SIGABRT is what a debugger or crash reporter sees; if it
+is ignored or handled, the exit below still ends the process.
+
+### terminate_child
+
+Forwards [`std.system.os.darwin.shared.terminate_child`](shared.md#terminate_child).
+
+```mach
+pub fun terminate_child(pid: i64) i64
+```
+
+forcefully stop a spawned child without reaping it
+
+waitid with WNOWAIT first asks the kernel to verify that `pid` is still a
+child of this process. this rejects unknown and already-reaped PIDs before
+kill can affect them, while preserving an exited child's wait status.
+callers must not concurrently reap this child through wait or wait_pid: a
+reaper could release the numeric PID between the ownership check and kill.
+
+### setpgid
+
+Forwards [`std.system.os.darwin.shared.setpgid`](shared.md#setpgid).
+
+```mach
+pub fun setpgid(pid: i64, pgid: i64) i64
+```
+
+setpgid: set (or join) the process group ID of a process
+
+### getpgid
+
+Forwards [`std.system.os.darwin.shared.getpgid`](shared.md#getpgid).
+
+```mach
+pub fun getpgid(pid: i64) i64
+```
+
+getpgid: read the process group ID of a process
+
+### terminate_group
+
+Forwards [`std.system.os.darwin.shared.terminate_group`](shared.md#terminate_group).
+
+```mach
+pub fun terminate_group(pgid: i64) i64
+```
+
+signal every process in a group without reaping any of them
+
+unlike terminate_child, there is no waitid ownership probe first: a process
+group is not tracked as a child of this process, so kill(-pgid, SIGTERM) is
+the only available primitive. surviving members stay individually waitable
+through wait/wait_any exactly as before.
+
+### spawn
+
+Forwards [`std.system.os.darwin.shared.spawn`](shared.md#spawn).
+
+```mach
+pub fun spawn(pathname: *u8, argv: **u8, envp: Environment) i64
+```
+
+create a child process running the given program
+
+closes inherited file descriptors >= 3 in the child before exec to
+prevent leaking parent FDs (pipes, sockets, etc.) to the child.
+
+### spawn_grouped
+
+Forwards [`std.system.os.darwin.shared.spawn_grouped`](shared.md#spawn_grouped).
+
+```mach
+pub fun spawn_grouped(pathname: *u8, argv: **u8, envp: Environment) i64
+```
+
+create a child process running the given program, placed as the leader of
+its own new process group (see spawn_redirected_in_grouped)
+
+### spawn_in
+
+Forwards [`std.system.os.darwin.shared.spawn_in`](shared.md#spawn_in).
+
+```mach
+pub fun spawn_in(pathname: *u8, argv: **u8, envp: Environment, cwd: *u8) i64
+```
+
+create a child process running the given program from `cwd`
+
+### spawn_redirected
+
+Forwards [`std.system.os.darwin.shared.spawn_redirected`](shared.md#spawn_redirected).
+
+```mach
+pub fun spawn_redirected(pathname: *u8, argv: **u8, envp: Environment, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) i64
+```
+
+spawn a child with its standard streams bound to
+caller-supplied descriptors.
+
+forks, duplicates each non-negative descriptor onto the matching
+standard stream (-1 inherits the parent's stream), closes inherited
+descriptors >= 3 (including both ends of a capture pipe), and execs.
+the parent keeps ownership of the passed descriptors; pairing one with
+a pipe end lets the parent stream the child's stdio. the child exits
+126 when a redirect fails and 127 when exec fails.
+
+### spawn_redirected_grouped
+
+Forwards [`std.system.os.darwin.shared.spawn_redirected_grouped`](shared.md#spawn_redirected_grouped).
+
+```mach
+pub fun spawn_redirected_grouped(pathname: *u8, argv: **u8, envp: Environment, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) i64
+```
+
+spawn a child with its standard streams bound to caller-supplied
+descriptors, placed as the leader of its own new process group (see
+spawn_redirected_in_grouped)
+
+### spawn_redirected_in
+
+Forwards [`std.system.os.darwin.shared.spawn_redirected_in`](shared.md#spawn_redirected_in).
+
+```mach
+pub fun spawn_redirected_in(pathname: *u8, argv: **u8, envp: Environment, cwd: *u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) i64
+```
+
+spawn a child with redirected streams and an explicit working directory
+
+`cwd` is the directory the child starts in, or nil to inherit the parent's.
+the chdir happens in the child, after the fork/clone, so the parent's own
+working directory is untouched. passing it here rather than prefixing a `cd`
+onto a shell command keeps the path out of the command line, where it would
+have to survive a quoting convention the target program may not share
+(mach#2587).
+
+### spawn_redirected_in_grouped
+
+Forwards [`std.system.os.darwin.shared.spawn_redirected_in_grouped`](shared.md#spawn_redirected_in_grouped).
+
+```mach
+pub fun spawn_redirected_in_grouped(pathname: *u8, argv: **u8, envp: Environment, cwd: *u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) i64
+```
+
+spawn a child with redirected streams and an explicit working directory,
+placed as the leader of its own new process group
+
+the child alone creates the group and acknowledges it through a private pipe.
+the parent returns only after receiving readiness, so immediate group signals
+cannot race establishment. failed handshakes close their pipes and reap the
+unexposed child before returning the native error.
+
+### getpid
+
+Forwards [`std.system.os.darwin.shared.getpid`](shared.md#getpid).
+
+```mach
+pub fun getpid() i64
+```
+
+return the current process ID
+
+### ignore_sigpipe
+
+Forwards [`std.system.os.darwin.shared.ignore_sigpipe`](shared.md#ignore_sigpipe).
+
+```mach
+pub fun ignore_sigpipe() i64
+```
+
+ignore SIGPIPE for this process
+
+signal(3) installs the disposition through public libSystem. it is
+process-wide, so subsequent writes from every thread return EPIPE when their
+pipe has no reader instead of terminating the process.
+
+### sleep
+
+Forwards [`std.system.os.darwin.shared.sleep`](shared.md#sleep).
+
+```mach
+pub fun sleep(nsec: i64)
+```
+
+suspend execution for the given number of nanoseconds
+
+uses nanosleep(3). the previous note here - "darwin has no nanosleep
+syscall" - was true of the trap table and false of libSystem, so this went
+through `select` with a timeout and lost the sub-microsecond resolution to
+`timeval` on the way.
+
+a signal that cuts the sleep short leaves the unslept remainder in `rem`, and
+the retry resumes with THAT rather than restarting the full interval, so an
+interrupted sleep still ends at about the requested time instead of
+stretching towards double it.
+
+### cpu_count
+
+Forwards [`std.system.os.darwin.shared.cpu_count`](shared.md#cpu_count).
+
+```mach
+pub fun cpu_count() i64
+```
+
+the currently active processor count
+reads hw.activecpu, with a minimum of one if the query fails
+
+### cpu_features
+
+Forwards [`std.system.os.darwin.shared.cpu_features`](shared.md#cpu_features).
+
+```mach
+pub fun cpu_features(out: *std.system.cpu.features.Features) i64
+```
+
+the running processor's instruction-set extensions
+
+x86_64 reads cpuid, which needs no OS. aarch64 asks sysctl for
+hw.optional.arm.FEAT_SHA256, FEAT_AES and FEAT_PMULL, each an int that is 0
+or absent when the processor lacks it, as hw.activecpu is read above
+
+### cpu_dit
+
+Forwards [`std.system.os.darwin.shared.cpu_dit`](shared.md#cpu_dit).
+
+```mach
+pub fun cpu_dit() i64
+```
+
+whether the processor provides the data-independent-timing mode
+
+aarch64 asks sysctl for hw.optional.arm.FEAT_DIT, as `cpu_features` asks for
+FEAT_SHA256. a failed read counts as absent, since the caller fails closed
+
+### thread_affinity
+
+Forwards [`std.system.os.darwin.shared.thread_affinity`](shared.md#thread_affinity).
+
+```mach
+pub fun thread_affinity(words: *u64, capacity: usize, out_count: *usize) i64
+```
+
+darwin has no hard CPU affinity: THREAD_AFFINITY_POLICY is a scheduling hint
+over tags, not a CPU set, so neither affinity primitive is offered
+
+### set_thread_affinity
+
+Forwards [`std.system.os.darwin.shared.set_thread_affinity`](shared.md#set_thread_affinity).
+
+```mach
+pub fun set_thread_affinity(words: *u64, count: usize) i64
+```
+
+darwin has no hard CPU affinity, so a thread cannot be pinned
+
+### getcwd
+
+Forwards [`std.system.os.darwin.shared.getcwd`](shared.md#getcwd).
+
+```mach
+pub fun getcwd(buf: *u8, size: usize) i64
+```
+
+get the current working directory
+
+this used to be an open(".") + fcntl(F_GETPATH) dance with a MAXPATHLEN
+bounce buffer, because F_GETPATH carries no capacity: XNU writes up to
+MAXPATHLEN bytes into the destination whatever the caller sized it, so the
+result had to be caught in a large scratch and copied out only when it fit.
+
+getcwd(3) TAKES the capacity, so the callee honours `size` itself and a path
+that does not fit comes back as ERANGE from libSystem rather than as an
+overrun this function has to defend against afterwards. the scratch buffer,
+the copy loop, and the F_GETPATH constant all go away with it (#409, #413).
+
+### getenv
+
+Forwards [`std.system.os.darwin.shared.getenv`](shared.md#getenv).
+
+```mach
+pub fun getenv(name: *u8, buf: *u8, cap: usize) i64
+```
+
+look up an environment variable by name
+
+when the value fits (ret \< cap) it is copied and null-terminated.
+always returns the full value length, so ret >= cap signals truncation
+(buffer contents unspecified) and ret + 1 is the capacity to retry with.
+
+### fork
+
+Forwards [`std.system.os.darwin.shared.fork`](shared.md#fork).
+
+```mach
+pub fun fork() i64
+```
+
+create a child process by duplicating the caller
+
+### vfork
+
+Forwards [`std.system.os.darwin.shared.vfork`](shared.md#vfork).
+
+```mach
+pub fun vfork() i64
+```
+
+create a child process through vfork(2)
+
+the wrapper promises the fork contract only; see the libsystem module.
+
+### exec
+
+Forwards [`std.system.os.darwin.shared.exec`](shared.md#exec).
+
+```mach
+pub fun exec(pathname: *u8, argv: **u8, envp: Environment) i64
+```
+
+replace the calling process image; returns only on failure
+
+### wait
+
+Forwards [`std.system.os.darwin.shared.wait`](shared.md#wait).
+
+```mach
+pub fun wait(pid: i64, status: *std.system.os.shared.ProcessStatus, options: i32, rusage: *u8) std.system.os.shared.WaitResult
+```
+
+failures and no-event results leave the caller's status unchanged
+
+### wait_pid
+
+Forwards [`std.system.os.darwin.shared.wait_pid`](shared.md#wait_pid).
+
+```mach
+pub fun wait_pid(pid: i64, status: *std.system.os.shared.ProcessStatus, options: i32) std.system.os.shared.WaitResult
+```
+
+### ProcessStatus
+
+Forwards [`std.system.os.darwin.shared.ProcessStatus`](shared.md#processstatus).
+
+```mach
+pub rec ProcessStatus {
+    kind:        u8;
+    code:        u32;
+    signal:      i32;
+    core_dumped: bool;
+}
+```
+
+### FileLimit
+
+Forwards [`std.system.os.darwin.shared.FileLimit`](shared.md#filelimit).
+
+```mach
+pub rec FileLimit {
+    soft:    u64;
+    hard:    u64;
+    ceiling: u64;
+}
+```
+
+the open-file limit. soft is the limit in force, hard its ceiling for an
+unprivileged raise, and ceiling the highest soft value this process may set,
+which the implementation fills and a set ignores
+
+### LIMIT_UNLIMITED
+
+Forwards [`std.system.os.darwin.shared.LIMIT_UNLIMITED`](shared.md#limit_unlimited).
+
+```mach
+pub val LIMIT_UNLIMITED: u64 = 0xffffffffffffffff
+```
+
+a limit with no bound
+
+### open_file_limit
+
+Forwards [`std.system.os.darwin.shared.open_file_limit`](shared.md#open_file_limit).
+
+```mach
+pub fun open_file_limit(out: *std.system.os.shared.FileLimit) i64
+```
+
+read this process's open-file limit.
+
+darwin refuses a soft limit above kern.maxfilesperproc even when the hard
+limit is RLIM_INFINITY (setrlimit(2) COMPATIBILITY), so the ceiling is the
+smaller of the two. this is the rule Go's runtime applies before raising the
+limit (os/rlimit_darwin.go)
+
+### set_open_file_limit
+
+Forwards [`std.system.os.darwin.shared.set_open_file_limit`](shared.md#set_open_file_limit).
+
+```mach
+pub fun set_open_file_limit(limit: std.system.os.shared.FileLimit) i64
+```
+
+set this process's open-file limit. ceiling is ignored, and darwin's own
+refusal of a soft limit above its per-process maximum passes through
+
+### ProcessWaitError
+
+Forwards [`std.system.os.darwin.shared.ProcessWaitError`](shared.md#processwaiterror).
+
+```mach
+pub rec ProcessWaitError {
+    code:        i64;
+    native_code: u32;
+    operation:   u8;
+}
+```
+
+### WaitResult
+
+Forwards [`std.system.os.darwin.shared.WaitResult`](shared.md#waitresult).
+
+```mach
+pub rec WaitResult {
+    pid:   i64;
+    error: ProcessWaitError;
+}
+```
+
+pid is positive for an observation, zero for no event or an error
+
+### PROCESS_OP_WAIT
+
+Forwards [`std.system.os.darwin.shared.PROCESS_OP_WAIT`](shared.md#process_op_wait).
+
+```mach
+pub val PROCESS_OP_WAIT:      u8 = 1
+```
+
+### PROCESS_OP_STATUS
+
+Forwards [`std.system.os.darwin.shared.PROCESS_OP_STATUS`](shared.md#process_op_status).
+
+```mach
+pub val PROCESS_OP_STATUS:    u8 = 2
+```
+
+### PROCESS_OP_CLOSE
+
+Forwards [`std.system.os.darwin.shared.PROCESS_OP_CLOSE`](shared.md#process_op_close).
+
+```mach
+pub val PROCESS_OP_CLOSE:     u8 = 3
+```
+
+### PROCESS_OP_SPAWN
+
+Forwards [`std.system.os.darwin.shared.PROCESS_OP_SPAWN`](shared.md#process_op_spawn).
+
+```mach
+pub val PROCESS_OP_SPAWN:     u8 = 4
+```
+
+### PROCESS_OP_READ
+
+Forwards [`std.system.os.darwin.shared.PROCESS_OP_READ`](shared.md#process_op_read).
+
+```mach
+pub val PROCESS_OP_READ:      u8 = 5
+```
+
+### PROCESS_OP_PIPE
+
+Forwards [`std.system.os.darwin.shared.PROCESS_OP_PIPE`](shared.md#process_op_pipe).
+
+```mach
+pub val PROCESS_OP_PIPE:      u8 = 6
+```
+
+### PROCESS_OP_TERMINATE
+
+Forwards [`std.system.os.darwin.shared.PROCESS_OP_TERMINATE`](shared.md#process_op_terminate).
+
+```mach
+pub val PROCESS_OP_TERMINATE: u8 = 7
+```
+
+### PROCESS_EXITED
+
+Forwards [`std.system.os.darwin.shared.PROCESS_EXITED`](shared.md#process_exited).
+
+```mach
+pub val PROCESS_EXITED:    u8 = 1
+```
+
+a process state observation, with a full native windows exit code
+
+### PROCESS_SIGNALED
+
+Forwards [`std.system.os.darwin.shared.PROCESS_SIGNALED`](shared.md#process_signaled).
+
+```mach
+pub val PROCESS_SIGNALED:  u8 = 2
+```
+
+### PROCESS_STOPPED
+
+Forwards [`std.system.os.darwin.shared.PROCESS_STOPPED`](shared.md#process_stopped).
+
+```mach
+pub val PROCESS_STOPPED:   u8 = 3
+```
+
+### PROCESS_CONTINUED
+
+Forwards [`std.system.os.darwin.shared.PROCESS_CONTINUED`](shared.md#process_continued).
+
+```mach
+pub val PROCESS_CONTINUED: u8 = 4
+```
+
+### allocate
+
+Forwards [`std.system.os.darwin.shared.allocate`](shared.md#allocate).
+
+```mach
+pub fun allocate(size: usize) ptr
+```
+
+memory
+
+### deallocate
+
+Forwards [`std.system.os.darwin.shared.deallocate`](shared.md#deallocate).
+
+```mach
+pub fun deallocate(p: ptr, size: usize) i64
+```
+
+### reallocate
+
+Forwards [`std.system.os.darwin.shared.reallocate`](shared.md#reallocate).
+
+```mach
+pub fun reallocate(p: ptr, old_size: usize, new_size: usize) ptr
+```
+
+darwin has no mremap, allocate new, copy, free old
+
+### heap_region_base
+
+Forwards [`std.system.os.darwin.shared.heap_region_base`](shared.md#heap_region_base).
+
+```mach
+pub fun heap_region_base() usize
+```
+
+### heap_region_extend
+
+Forwards [`std.system.os.darwin.shared.heap_region_extend`](shared.md#heap_region_extend).
+
+```mach
+pub fun heap_region_extend(addr: usize) usize
+```
+
+### protect
+
+Forwards [`std.system.os.darwin.shared.protect`](shared.md#protect).
+
+```mach
+pub fun protect(p: ptr, size: usize, prot: u32) i64
+```
+
+### lock
+
+Forwards [`std.system.os.darwin.shared.lock`](shared.md#lock).
+
+```mach
+pub fun lock(p: ptr, size: usize) i64
+```
+
+### unlock
+
+Forwards [`std.system.os.darwin.shared.unlock`](shared.md#unlock).
+
+```mach
+pub fun unlock(p: ptr, size: usize) i64
+```
+
+### advise
+
+Forwards [`std.system.os.darwin.shared.advise`](shared.md#advise).
+
+```mach
+pub fun advise(p: ptr, size: usize, advice: u32) i64
+```
+
+### map_file
+
+Forwards [`std.system.os.darwin.shared.map_file`](shared.md#map_file).
+
+```mach
+pub fun map_file(fd: i32, offset: usize, size: usize, prot: u32) ptr
+```
+
+### sync_file
+
+Forwards [`std.system.os.darwin.shared.sync_file`](shared.md#sync_file).
+
+```mach
+pub fun sync_file(p: ptr, size: usize) i64
+```
+
+### _envp
+
+Forwards [`std.system.os.darwin.shared._envp`](shared.md#variables).
+
+```mach
+pub var _envp: usize = 0
+```
+
+environment
+
+### environ
+
+Forwards [`std.system.os.darwin.shared.environ`](shared.md#environ).
+
+```mach
+pub fun environ() **u8
+```
+
+pointer to the environment captured by the runtime at program
+start (null-terminated array of "NAME=value" strings). nil before
+runtime init.
+
+### read
+
+Forwards [`std.system.os.darwin.shared.read`](shared.md#read).
+
+```mach
+pub fun read(fd: i32, buf: *u8, count: usize) i64
+```
+
+filesystem
+
+### write
+
+Forwards [`std.system.os.darwin.shared.write`](shared.md#write).
+
+```mach
+pub fun write(fd: i32, buf: *u8, count: usize) i64
+```
+
+### read_at
+
+Forwards [`std.system.os.darwin.shared.read_at`](shared.md#read_at).
+
+```mach
+pub fun read_at(fd: i32, buf: *u8, count: usize, offset: u64) i64
+```
+
+positioned file access does not mutate the descriptor offset
+
+### write_at
+
+Forwards [`std.system.os.darwin.shared.write_at`](shared.md#write_at).
+
+```mach
+pub fun write_at(fd: i32, buf: *u8, count: usize, offset: u64) i64
+```
+
+### open
+
+Forwards [`std.system.os.darwin.shared.open`](shared.md#open).
+
+```mach
+pub fun open(dirfd: i32, path: *u8, flags: i32, mode: i32) i64
+```
+
+open a path relative to a directory descriptor
+
+`mode` is only consulted by the kernel when `flags` carries O_CREAT, so it is
+passed in the variadic tail only in that case. the two forms are not
+interchangeable spellings of one call: apple arm64 passes the whole variadic
+tail on the stack, so the no-O_CREAT form genuinely passes nothing rather
+than passing an ignored register.
+
+### close
+
+Forwards [`std.system.os.darwin.shared.close`](shared.md#close).
+
+```mach
+pub fun close(fd: i32) i64
+```
+
+close a descriptor
+
+a failed close does NOT mean the descriptor is still open: darwin has already
+released it by the time an error is reported. callers must not retry, and
+none do - the return exists to surface a deferred write error.
+
+### sync_fd
+
+Forwards [`std.system.os.darwin.shared.sync_fd`](shared.md#sync_fd).
+
+```mach
+pub fun sync_fd(fd: i32) i64
+```
+
+flush an open file's data and metadata to its backing storage
+
+### stat
+
+Forwards [`std.system.os.darwin.shared.stat`](shared.md#stat).
+
+```mach
+pub fun stat(fd: i32, st: *stat_t) i64
+```
+
+### set_mode
+
+Forwards [`std.system.os.darwin.shared.set_mode`](shared.md#set_mode).
+
+```mach
+pub fun set_mode(fd: i32, mode: i32) i64
+```
+
+### set_mode_at
+
+Forwards [`std.system.os.darwin.shared.set_mode_at`](shared.md#set_mode_at).
+
+```mach
+pub fun set_mode_at(dirfd: i32, name: *u8, mode: i32) i64
+```
+
+### file_identity
+
+Forwards [`std.system.os.darwin.shared.file_identity`](shared.md#file_identity).
+
+```mach
+pub fun file_identity(fd: i32, out: *std.system.file_identity.Identity) i64
+```
+
+observational ids do not retain an object after this call
+
+### identity_at
+
+Forwards [`std.system.os.darwin.shared.identity_at`](shared.md#identity_at).
+
+```mach
+pub fun identity_at(dirfd: i32, path: *u8, out: *std.system.file_identity.Identity) i64
+```
+
+### retain_identity_at
+
+Forwards [`std.system.os.darwin.shared.retain_identity_at`](shared.md#retain_identity_at).
+
+```mach
+pub fun retain_identity_at(dirfd: i32, path: *u8, access: std.system.file_identity.Access, out: *std.system.file_identity.Identity) i64
+```
+
+o_evtonly retains identity without data i/o after explicit read authorization
+
+### publication_capabilities
+
+Forwards [`std.system.os.darwin.shared.publication_capabilities`](shared.md#publication_capabilities).
+
+```mach
+pub fun publication_capabilities(fd: i32) i64
+```
+
+### stat_path
+
+Forwards [`std.system.os.darwin.shared.stat_path`](shared.md#stat_path).
+
+```mach
+pub fun stat_path(dirfd: i32, path: *u8, st: *stat_t, flags: i32) i64
+```
+
+### stat_mode
+
+Forwards [`std.system.os.darwin.shared.stat_mode`](shared.md#stat_mode).
+
+```mach
+pub fun stat_mode(st: *stat_t) u32
+```
+
+read the type/permission bits from a filled stat buffer as a 32-bit word
+
+st_mode is 16-bit in the darwin stat64 ABI (mode_t is __uint16_t); widen it
+so portable callers read the mode uniformly with the 32-bit platforms.
+
+### unlink
+
+Forwards [`std.system.os.darwin.shared.unlink`](shared.md#unlink).
+
+```mach
+pub fun unlink(dirfd: i32, path: *u8, flags: i32) i64
+```
+
+### rename
+
+Forwards [`std.system.os.darwin.shared.rename`](shared.md#rename).
+
+```mach
+pub fun rename(olddir: i32, oldpath: *u8, newdir: i32, newpath: *u8) i64
+```
+
+### symlink
+
+Forwards [`std.system.os.darwin.shared.symlink`](shared.md#symlink).
+
+```mach
+pub fun symlink(target: *u8, linkpath: *u8) i64
+```
+
+create a symbolic link at linkpath pointing to target
+
+target is stored verbatim: a relative target stays relative, so the link
+keeps resolving correctly after the containing tree is moved.
+
+### make_dir
+
+Forwards [`std.system.os.darwin.shared.make_dir`](shared.md#make_dir).
+
+```mach
+pub fun make_dir(dirfd: i32, path: *u8, mode: i32) i64
+```
+
+### directory_init
+
+Forwards [`std.system.os.darwin.shared.directory_init`](shared.md#directory_init).
+
+```mach
+pub fun directory_init(out: *DirectoryCursor, fd: i32) DirectoryInitResult
+```
+
+fd and its aliases lend exclusive enumeration and seek access until close
+
+### directory_next
+
+Forwards [`std.system.os.darwin.shared.directory_next`](shared.md#directory_next).
+
+```mach
+pub fun directory_next(cursor: *DirectoryCursor, out: *DirectoryEntry) i64
+```
+
+### directory_dnit
+
+Forwards [`std.system.os.darwin.shared.directory_dnit`](shared.md#directory_dnit).
+
+```mach
+pub fun directory_dnit(cursor: *DirectoryCursor) i64
+```
+
+closedir consumes its stream even when the underlying close fails
+
+### access
+
+Forwards [`std.system.os.darwin.shared.access`](shared.md#access).
+
+```mach
+pub fun access(dirfd: i32, path: *u8, mode: i32, flags: i32) i64
+```
+
+### seek
+
+Forwards [`std.system.os.darwin.shared.seek`](shared.md#seek).
+
+```mach
+pub fun seek(fd: i32, offset: i64, whence: i32) i64
+```
+
+reposition a descriptor's offset
+
+lseek's failure sentinel is exactly -1, not "negative": the success value is
+a file offset, which is never negative but IS returned as a signed 64-bit
+number that a caller may legitimately compare against. testing for the
+documented sentinel rather than for a sign keeps that distinction.
+
+### lock_fd
+
+Forwards [`std.system.os.darwin.shared.lock_fd`](shared.md#lock_fd).
+
+```mach
+pub fun lock_fd(fd: i32, op: i32) i64
+```
+
+flock: take or release an advisory whole-file lock on an open descriptor
+
+the lock lives on the open file description, not on the directory entry, so
+darwin drops it when the last descriptor referring to that description is
+closed -- including the implicit close every exiting process performs, however
+it exits. a holder that crashes therefore leaves no lock behind, which is what
+makes a live holder distinguishable from a dead one's residue.
+
+a directory descriptor is lockable on darwin, but windows cannot lock one, so
+portable callers that want to exclude writers from a directory lock a regular
+file inside it rather than the directory itself.
+
+### AF_INET
+
+Forwards [`std.system.os.darwin.shared.AF_INET`](shared.md#constants).
+
+```mach
+pub val AF_INET:             i32 = 2
+```
+
+sockets
+
+### SOCK_STREAM
+
+Forwards [`std.system.os.darwin.shared.SOCK_STREAM`](shared.md#constants).
+
+```mach
+pub val SOCK_STREAM:         i32 = 1
+```
+
+### SOCK_DGRAM
+
+Forwards [`std.system.os.darwin.shared.SOCK_DGRAM`](shared.md#constants).
+
+```mach
+pub val SOCK_DGRAM:          i32 = 2
+```
+
+### SOL_SOCKET
+
+Forwards [`std.system.os.darwin.shared.SOL_SOCKET`](shared.md#constants).
+
+```mach
+pub val SOL_SOCKET:          i32 = 0xFFFF
+```
+
+### SO_UNSUPPORTED
+
+Forwards [`std.system.os.darwin.shared.SO_UNSUPPORTED`](shared.md#constants).
+
+```mach
+pub val SO_UNSUPPORTED:      i32 = -2147483648
+```
+
+### SO_REUSEADDR
+
+Forwards [`std.system.os.darwin.shared.SO_REUSEADDR`](shared.md#constants).
+
+```mach
+pub val SO_REUSEADDR:        i32 = 4
+```
+
+### SO_REUSEPORT
+
+Forwards [`std.system.os.darwin.shared.SO_REUSEPORT`](shared.md#constants).
+
+```mach
+pub val SO_REUSEPORT:        i32 = 0x0200
+```
+
+### SO_EXCLUSIVEADDRUSE
+
+Forwards [`std.system.os.darwin.shared.SO_EXCLUSIVEADDRUSE`](shared.md#constants).
+
+```mach
+pub val SO_EXCLUSIVEADDRUSE: i32 = SO_UNSUPPORTED
+```
+
+### SO_KEEPALIVE
+
+Forwards [`std.system.os.darwin.shared.SO_KEEPALIVE`](shared.md#constants).
+
+```mach
+pub val SO_KEEPALIVE:        i32 = 0x0008
+```
+
+### SO_SNDBUF
+
+Forwards [`std.system.os.darwin.shared.SO_SNDBUF`](shared.md#constants).
+
+```mach
+pub val SO_SNDBUF:           i32 = 0x1001
+```
+
+### SO_RCVBUF
+
+Forwards [`std.system.os.darwin.shared.SO_RCVBUF`](shared.md#constants).
+
+```mach
+pub val SO_RCVBUF:           i32 = 0x1002
+```
+
+### SO_LINGER
+
+Forwards [`std.system.os.darwin.shared.SO_LINGER`](shared.md#constants).
+
+```mach
+pub val SO_LINGER:           i32 = 0x0080
+```
+
+### SO_RCVTIMEO
+
+Forwards [`std.system.os.darwin.shared.SO_RCVTIMEO`](shared.md#constants).
+
+```mach
+pub val SO_RCVTIMEO:         i32 = 0x1006
+```
+
+### IPPROTO_IP
+
+Forwards [`std.system.os.darwin.shared.IPPROTO_IP`](shared.md#constants).
+
+```mach
+pub val IPPROTO_IP:          i32 = 0
+```
+
+### IPPROTO_TCP
+
+Forwards [`std.system.os.darwin.shared.IPPROTO_TCP`](shared.md#constants).
+
+```mach
+pub val IPPROTO_TCP:         i32 = 6
+```
+
+### IPPROTO_IPV6
+
+Forwards [`std.system.os.darwin.shared.IPPROTO_IPV6`](shared.md#constants).
+
+```mach
+pub val IPPROTO_IPV6:        i32 = 41
+```
+
+### IP_TOS
+
+Forwards [`std.system.os.darwin.shared.IP_TOS`](shared.md#constants).
+
+```mach
+pub val IP_TOS:              i32 = 1
+```
+
+### IPV6_V6ONLY
+
+Forwards [`std.system.os.darwin.shared.IPV6_V6ONLY`](shared.md#constants).
+
+```mach
+pub val IPV6_V6ONLY:         i32 = 27
+```
+
+### IPV6_TCLASS
+
+Forwards [`std.system.os.darwin.shared.IPV6_TCLASS`](shared.md#constants).
+
+```mach
+pub val IPV6_TCLASS:         i32 = 36
+```
+
+### TCP_NODELAY
+
+Forwards [`std.system.os.darwin.shared.TCP_NODELAY`](shared.md#constants).
+
+```mach
+pub val TCP_NODELAY:         i32 = 1
+```
+
+### TCP_KEEPIDLE
+
+Forwards [`std.system.os.darwin.shared.TCP_KEEPIDLE`](shared.md#constants).
+
+```mach
+pub val TCP_KEEPIDLE:        i32 = 0x10
+```
+
+### TCP_KEEPINTVL
+
+Forwards [`std.system.os.darwin.shared.TCP_KEEPINTVL`](shared.md#constants).
+
+```mach
+pub val TCP_KEEPINTVL:       i32 = 0x101
+```
+
+### TCP_KEEPCNT
+
+Forwards [`std.system.os.darwin.shared.TCP_KEEPCNT`](shared.md#constants).
+
+```mach
+pub val TCP_KEEPCNT:         i32 = 0x102
+```
+
+### TCP_FASTOPEN
+
+Forwards [`std.system.os.darwin.shared.TCP_FASTOPEN`](shared.md#constants).
+
+```mach
+pub val TCP_FASTOPEN:        i32 = 0x105
+```
+
+### SHUT_RD
+
+Forwards [`std.system.os.darwin.shared.SHUT_RD`](shared.md#constants).
+
+```mach
+pub val SHUT_RD:             i32 = 0
+```
+
+### SHUT_WR
+
+Forwards [`std.system.os.darwin.shared.SHUT_WR`](shared.md#constants).
+
+```mach
+pub val SHUT_WR:             i32 = 1
+```
+
+### SHUT_RDWR
+
+Forwards [`std.system.os.darwin.shared.SHUT_RDWR`](shared.md#constants).
+
+```mach
+pub val SHUT_RDWR:           i32 = 2
+```
+
+### SOCKADDR_IN_SIZE
+
+Forwards [`std.system.os.darwin.shared.SOCKADDR_IN_SIZE`](shared.md#constants).
+
+```mach
+pub val SOCKADDR_IN_SIZE:      usize = 16
+```
+
+### sock_send
+
+Forwards [`std.system.os.darwin.shared.sock_send`](shared.md#sock_send).
+
+```mach
+pub fun sock_send(fd: usize, buf: *u8, len: usize) i64
+```
+
+### sock_recv
+
+Forwards [`std.system.os.darwin.shared.sock_recv`](shared.md#sock_recv).
+
+```mach
+pub fun sock_recv(fd: usize, buf: *u8, len: usize) i64
+```
+
+raw native read semantics do not safely discard ancillary descriptor rights.
+a darwin peer can send scm_rights that install descriptors without returning them.
+
+### IoVector
+
+Forwards [`std.system.os.darwin.shared.IoVector`](shared.md#iovector).
+
+```mach
+pub rec IoVector {
+    data:   *u8;
+    length: usize;
+}
+```
+
+### sock_write_vector
+
+Forwards [`std.system.os.darwin.shared.sock_write_vector`](shared.md#sock_write_vector).
+
+```mach
+pub fun sock_write_vector(fd: usize, vectors: *IoVector, count: usize) i64
+```
+
+### sock_send_message
+
+Forwards [`std.system.os.darwin.shared.sock_send_message`](shared.md#sock_send_message).
+
+```mach
+pub fun sock_send_message(fd: usize, vectors: *IoVector, vector_count: usize, address: *u8, address_length: u32, control: *u8, control_length: usize) i64
+```
+
+### sock_receive_message
+
+Forwards [`std.system.os.darwin.shared.sock_receive_message`](shared.md#sock_receive_message).
+
+```mach
+pub fun sock_receive_message(fd: usize, vectors: *IoVector, vector_count: usize, address: *u8, address_length: *u32, control: *u8, control_length: *usize, flags: *i32) i64
+```
+
+raw recvmsg preserves native ancillary ownership and truncation behavior.
+darwin can install unreported scm_rights descriptors with nil or undersized control.
+callers receiving rights must provide adequate control storage and close each result.
+
+### sock_connect_status
+
+Forwards [`std.system.os.darwin.shared.sock_connect_status`](shared.md#sock_connect_status).
+
+```mach
+pub fun sock_connect_status(fd: usize) i64
+```
+
+### sock_close
+
+Forwards [`std.system.os.darwin.shared.sock_close`](shared.md#sock_close).
+
+```mach
+pub fun sock_close(fd: usize) i64
+```
+
+### sock_create
+
+Forwards [`std.system.os.darwin.shared.sock_create`](shared.md#sock_create).
+
+```mach
+pub fun sock_create(domain: i32, typ: i32, protocol: i32, out: *usize) i64
+```
+
+### sock_create_flags
+
+Forwards [`std.system.os.darwin.shared.sock_create_flags`](shared.md#sock_create_flags).
+
+```mach
+pub fun sock_create_flags(domain: i32, typ: i32, protocol: i32, nonblocking: bool, non_inheritable: bool, out: *usize) i64
+```
+
+### sock_bind
+
+Forwards [`std.system.os.darwin.shared.sock_bind`](shared.md#sock_bind).
+
+```mach
+pub fun sock_bind(fd: usize, addr: *u8, addrlen: usize) i64
+```
+
+### sock_listen
+
+Forwards [`std.system.os.darwin.shared.sock_listen`](shared.md#sock_listen).
+
+```mach
+pub fun sock_listen(fd: usize, backlog: i32) i64
+```
+
+### sock_accept
+
+Forwards [`std.system.os.darwin.shared.sock_accept`](shared.md#sock_accept).
+
+```mach
+pub fun sock_accept(fd: usize, addr: *u8, addrlen: *u32, out: *usize) i64
+```
+
+### sock_accept_flags
+
+Forwards [`std.system.os.darwin.shared.sock_accept_flags`](shared.md#sock_accept_flags).
+
+```mach
+pub fun sock_accept_flags(fd: usize, addr: *u8, addrlen: *u32, nonblocking: bool, non_inheritable: bool, out: *usize) i64
+```
+
+### sock_connect
+
+Forwards [`std.system.os.darwin.shared.sock_connect`](shared.md#sock_connect).
+
+```mach
+pub fun sock_connect(fd: usize, addr: *u8, addrlen: usize) i64
+```
+
+### sock_sendto
+
+Forwards [`std.system.os.darwin.shared.sock_sendto`](shared.md#sock_sendto).
+
+```mach
+pub fun sock_sendto(fd: usize, buf: *u8, len: usize, flags: i32, addr: *u8, addrlen: usize) i64
+```
+
+### sock_recvfrom
+
+Forwards [`std.system.os.darwin.shared.sock_recvfrom`](shared.md#sock_recvfrom).
+
+```mach
+pub fun sock_recvfrom(fd: usize, buf: *u8, len: usize, flags: i32, addr: *u8, addrlen: *u32) i64
+```
+
+### sock_peek_readable
+
+Forwards [`std.system.os.darwin.shared.sock_peek_readable`](shared.md#sock_peek_readable).
+
+```mach
+pub fun sock_peek_readable(fd: usize) i64
+```
+
+peek at a stream socket without consuming or blocking
+
+### sock_shutdown
+
+Forwards [`std.system.os.darwin.shared.sock_shutdown`](shared.md#sock_shutdown).
+
+```mach
+pub fun sock_shutdown(fd: usize, how: i32) i64
+```
+
+### sock_setopt
+
+Forwards [`std.system.os.darwin.shared.sock_setopt`](shared.md#sock_setopt).
+
+```mach
+pub fun sock_setopt(fd: usize, level: i32, opt: i32, value: *u8, vallen: usize) i64
+```
+
+### sock_getopt
+
+Forwards [`std.system.os.darwin.shared.sock_getopt`](shared.md#sock_getopt).
+
+```mach
+pub fun sock_getopt(fd: usize, level: i32, opt: i32, value: *u8, vallen: *u32) i64
+```
+
+### sock_local_addr
+
+Forwards [`std.system.os.darwin.shared.sock_local_addr`](shared.md#sock_local_addr).
+
+```mach
+pub fun sock_local_addr(fd: usize, addr: *u8, addrlen: *u32) i64
+```
+
+### sock_remote_addr
+
+Forwards [`std.system.os.darwin.shared.sock_remote_addr`](shared.md#sock_remote_addr).
+
+```mach
+pub fun sock_remote_addr(fd: usize, addr: *u8, addrlen: *u32) i64
+```
+
+### sock_inheritable
+
+Forwards [`std.system.os.darwin.shared.sock_inheritable`](shared.md#sock_inheritable).
+
+```mach
+pub fun sock_inheritable(fd: usize, out: *bool) i64
+```
+
+### io_queue_create
+
+Forwards [`std.system.os.darwin.shared.io_queue_create`](shared.md#io_queue_create).
+
+```mach
+pub fun io_queue_create(queue: *std.system.os.shared.IoQueue) i64
+```
+
+### io_queue_wait
+
+Forwards [`std.system.os.darwin.shared.io_queue_wait`](shared.md#io_queue_wait).
+
+```mach
+pub fun io_queue_wait(queue: *std.system.os.shared.IoQueue, timeout_ms: i32) i64
+```
+
+### IoCompletion
+
+Forwards [`std.system.os.darwin.shared.IoCompletion`](shared.md#iocompletion).
+
+```mach
+pub rec IoCompletion {
+    context: usize;
+    events:  u32;
+    source:  u16;
+    status:  i64;
+    flags:   u64;
+}
+```
+
+context is opaque to the OS and zero is reserved for the runtime wake source
+source: the id of the source that registered the context, 0 for a wake. it
+        sits in the padding after events, so the record stays 32 bytes
+
+### IO_EVENT_READ
+
+Forwards [`std.system.os.darwin.shared.IO_EVENT_READ`](shared.md#constants).
+
+```mach
+pub val IO_EVENT_READ:   u32 = 0x01
+```
+
+### IO_EVENT_WRITE
+
+Forwards [`std.system.os.darwin.shared.IO_EVENT_WRITE`](shared.md#constants).
+
+```mach
+pub val IO_EVENT_WRITE:  u32 = 0x02
+```
+
+### IO_EVENT_ERROR
+
+Forwards [`std.system.os.darwin.shared.IO_EVENT_ERROR`](shared.md#constants).
+
+```mach
+pub val IO_EVENT_ERROR:  u32 = 0x04
+```
+
+### IO_EVENT_HANGUP
+
+Forwards [`std.system.os.darwin.shared.IO_EVENT_HANGUP`](shared.md#constants).
+
+```mach
+pub val IO_EVENT_HANGUP: u32 = 0x08
+```
+
+### IO_EVENT_WAKE
+
+Forwards [`std.system.os.darwin.shared.IO_EVENT_WAKE`](shared.md#constants).
+
+```mach
+pub val IO_EVENT_WAKE:   u32 = 0x10
+```
+
+### io_queue_watch
+
+Forwards [`std.system.os.darwin.shared.io_queue_watch`](shared.md#io_queue_watch).
+
+```mach
+pub fun io_queue_watch(queue: *std.system.os.shared.IoQueue, resource: usize, context: usize, events: u32) i64
+```
+
+### io_queue_rearm
+
+Forwards [`std.system.os.darwin.shared.io_queue_rearm`](shared.md#io_queue_rearm).
+
+```mach
+pub fun io_queue_rearm(queue: *std.system.os.shared.IoQueue, resource: usize, context: usize, events: u32) i64
+```
+
+arms again a registration the caller made with io_queue_watch. kqueue's
+EV_ADD updates an existing filter, and the kernel drops every filter when the
+descriptor closes, so re-arming and registering are the same change
+
+### duplicate_to
+
+Forwards [`std.system.os.darwin.shared.duplicate_to`](shared.md#duplicate_to).
+
+```mach
+pub fun duplicate_to(from: usize, to: usize) i64
+```
+
+makes the descriptor to name what from names, closing whatever to named
+before, in one step
+
+### io_queue_unwatch
+
+Forwards [`std.system.os.darwin.shared.io_queue_unwatch`](shared.md#io_queue_unwatch).
+
+```mach
+pub fun io_queue_unwatch(queue: *std.system.os.shared.IoQueue, resource: usize) i64
+```
+
+### io_queue_poll
+
+Forwards [`std.system.os.darwin.shared.io_queue_poll`](shared.md#io_queue_poll).
+
+```mach
+pub fun io_queue_poll(queue: *std.system.os.shared.IoQueue, completions: *IoCompletion, capacity: usize, timeout_ms: i32) i64
+```
+
+### io_queue_wake
+
+Forwards [`std.system.os.darwin.shared.io_queue_wake`](shared.md#io_queue_wake).
+
+```mach
+pub fun io_queue_wake(queue: *std.system.os.shared.IoQueue) i64
+```
+
+### io_queue_close
+
+Forwards [`std.system.os.darwin.shared.io_queue_close`](shared.md#io_queue_close).
+
+```mach
+pub fun io_queue_close(queue: *std.system.os.shared.IoQueue) i64
+```
+
+### sock_set_rcvtimeo
+
+Forwards [`std.system.os.darwin.shared.sock_set_rcvtimeo`](shared.md#sock_set_rcvtimeo).
+
+```mach
+pub fun sock_set_rcvtimeo(fd: usize, ms: u64) i64
+```
+
+set the receive timeout on a socket
+
+writes a struct timeval (tv_sec, tv_usec) derived from ms as the SO_RCVTIMEO
+option value. ms == 0 clears the timeout, restoring indefinite blocking. once
+set, a recv with no data pending fails with EAGAIN after the interval elapses.
+darwin's tv_usec is 32-bit with 4 trailing pad bytes; a sub-second usec fits
+the low word and the padding stays zero, so the byte image matches the linux
+64-bit-tv_usec layout.
+
+### DNS_HOSTS_PATH
+
+Forwards [`std.system.os.darwin.shared.DNS_HOSTS_PATH`](shared.md#constants).
+
+```mach
+pub val DNS_HOSTS_PATH: str = "/etc/hosts"
+```
+
+dns
+
+### random_fill
+
+Forwards [`std.system.os.darwin.shared.random_fill`](shared.md#random_fill).
+
+```mach
+pub fun random_fill(buf: *u8, len: usize) i64
+```
+
+random
+
+### thread_spawn
+
+Forwards [`std.system.os.darwin.shared.thread_spawn`](shared.md#thread_spawn).
+
+```mach
+pub fun thread_spawn(
+    f: fun(*u8), arg: *u8, state: *i64, reclaimable: *i64,
+    owner: ptr, owner_size: usize, name: *u8,
+    stack_reserve: usize, stack_commit: usize, native: *usize,
+) i64
+```
+
+threads
+
+### thread_join
+
+Forwards [`std.system.os.darwin.shared.thread_join`](shared.md#thread_join).
+
+```mach
+pub fun thread_join(native: usize, reclaimable: *i64) i64
+```
+
+### thread_detach
+
+Forwards [`std.system.os.darwin.shared.thread_detach`](shared.md#thread_detach).
+
+```mach
+pub fun thread_detach(native: usize) i64
+```
+
+### thread_current_id
+
+Forwards [`std.system.os.darwin.shared.thread_current_id`](shared.md#thread_current_id).
+
+```mach
+pub fun thread_current_id() i64
+```
+
+### thread_current_name
+
+Forwards [`std.system.os.darwin.shared.thread_current_name`](shared.md#thread_current_name).
+
+```mach
+pub fun thread_current_name(name: *u8, cap: usize) i64
+```
+
+### thread_wait
+
+Forwards [`std.system.os.darwin.shared.thread_wait`](shared.md#thread_wait).
+
+```mach
+pub fun thread_wait(addr: *i64, expected: i64) i64
+```
+
+block until the value at addr changes from expected
+
+returns immediately if *addr does not equal expected. spurious wakeups are
+possible and are expected: bucket sharing means a wake for a different
+address can land here (see the bucket-table note above), so every caller must
+re-test its own condition in a loop.
+
+### thread_wait_until
+
+Forwards [`std.system.os.darwin.shared.thread_wait_until`](shared.md#thread_wait_until).
+
+```mach
+pub fun thread_wait_until(addr: *i64, expected: i64, deadline: *std.system.os.shared.Timespec) i64
+```
+
+block until the word changes or an absolute monotonic deadline is reached
+
+### thread_wake
+
+Forwards [`std.system.os.darwin.shared.thread_wake`](shared.md#thread_wake).
+
+```mach
+pub fun thread_wake(addr: *i64) i64
+```
+
+wake threads blocked in thread_wait on addr
+
+broadcasts rather than signals: buckets are shared by address hash, so a
+signal could be delivered to a waiter on an unrelated address and the wake
+this call was meant to deliver would be lost.
+
+### thread_block
+
+Forwards [`std.system.os.darwin.shared.thread_block`](shared.md#thread_block).
+
+```mach
+pub fun thread_block() *std.system.os.shared.ThreadBlock
+```
+
+the calling thread's block, read from its pthread TSD without a system call
+
+### thread_block_enter
+
+Forwards [`std.system.os.darwin.shared.thread_block_enter`](shared.md#thread_block_enter).
+
+```mach
+pub fun thread_block_enter(block: *std.system.os.shared.ThreadBlock) i64
+```
+
+install block as the calling thread's
+
+### thread_exit_wipe
+
+Forwards [`std.system.os.darwin.shared.thread_exit_wipe`](shared.md#thread_exit_wipe).
+
+```mach
+pub fun thread_exit_wipe()
+```
+
+wipe the calling thread's thread-local block as the thread ends
+
+thread-locals may hold secrets, so the whole block is zeroed with stores no
+pass removes. nothing may read a thread-local after this
+
+### stack_bounds
+
+Forwards [`std.system.os.darwin.shared.stack_bounds`](shared.md#stack_bounds).
+
+```mach
+pub fun stack_bounds(low: *usize, high: *usize) bool
+```
+
+the calling thread's stack bounds, recorded in its block when it was
+installed, or asked of libpthread on a thread std did not create
+
+### clock_gettime
+
+Forwards [`std.system.os.darwin.shared.clock_gettime`](shared.md#clock_gettime).
+
+```mach
+pub fun clock_gettime(clock_id: i32, ts: *timespec) i64
+```
+
+time
+
+### error_message
+
+Forwards [`std.system.os.darwin.shared.error_message`](shared.md#error_message).
+
+```mach
+pub fun error_message(code: i64) str
+```
+
+errno
+

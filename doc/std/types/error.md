@@ -1,0 +1,44 @@
+[std](../README.md) / [types](README.md) / **error**
+
+# std.types.error
+
+the canonical error tag: err[E]
+
+a fallible operation with no value, the payloadless success form, is
+spelled `err[E]`. it is an ordinary std declaration (mach
+doc/design/tagged-values.md fixes the language contract; the compiler seeds
+nothing and treats it like any other tag). a consuming module gains
+`use std.types.error.err;` and spells the bare name. the sibling tags live
+in `std.types.result` (`res[T, E]`) and `std.types.option` (`opt[T]`).
+
+err[E]: `err: E` is case 0 and `ok` is case 1; `E` is the producing
+module's closed domain tag, never a string. the zero value reads as `err`
+with a zero error, so uninitialized storage never reads as success.
+
+the discriminator is a u8 at offset zero and the payload follows at its
+natural alignment. the three canonical tags nest freely (`res[err[E], E]`,
+`err[Tag]`) and instantiate user generics like any declared type.
+
+reading: `sel place.case` is the test, and the guarded payload place is the
+read. an `if (!sel e.ok) { ret ...; }` chain guards `e.err` for the rest of
+the block; `||` opens no guard, so one term per `if`. construction is
+`Type.case{...}` only. no helper functions are provided on purpose: a
+by-value `unwrap` would copy owning payloads out of the ownership rules,
+and a constructor function would be a second spelling of a form the
+language already has. the test below pins the shape: case order, case
+codes, zero defaults, layout and reflection.
+
+Source: [`src/types/error.mach`](../../../src/types/error.mach)
+
+| Type | | |
+| :--- | :--- | :--- |
+| [`err`](#err) | `tag` |  |
+
+---
+
+## err
+
+```mach
+pub tag err[E]: u8 { err: E; ok; }
+```
+
