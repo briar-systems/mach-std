@@ -9,7 +9,7 @@ lane-to-lane combine is inherently scalar (comptime-constant lane reads), so
 these read each lane and fold. the batch win lives in the caller: accumulate
 many vectors with the lane-wise vector operators (one SSE2/NEON instruction
 per step on a capable target) and call a horizontal reduction once at the end.
-`dot_f32x4` shows the shape — a vector multiply then a single horizontal sum.
+`dot_f32x4` shows the shape: a vector multiply then a single horizontal sum.
 
 Source: [`src/simd/reduce.mach`](../../../src/simd/reduce.mach)
 

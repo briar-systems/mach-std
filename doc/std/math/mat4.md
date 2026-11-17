@@ -164,7 +164,7 @@ pub fun mat4_determinant(m: Mat4) f32
 determinant of a matrix
 
 expanded over the six 2x2 minors of the top two rows against the six of the
-bottom two — the Laplace complementary-minor form, shared with the inverse.
+bottom two: the Laplace complementary-minor form, shared with the inverse.
 
 | Parameter | |
 | :--- | :--- |

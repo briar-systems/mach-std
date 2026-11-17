@@ -2,11 +2,11 @@
 
 # std.math.float
 
-scalar floating-point math — roots and transcendentals in plain Mach
+scalar floating-point math: roots and transcendentals in plain Mach
 
 every routine is a portable algorithm over the scalar float operators: no
 hardware sqrt or transcendental instruction, since the compiler has no
-SIMD-capable inline-asm encoders yet (a flagged gap — briar-systems/mach#2021).
+SIMD-capable inline-asm encoders yet (a flagged gap, briar-systems/mach#2021).
 the shared home for the reciprocal square root quat.mach once kept private, and
 the sin/cos/asin/acos slerp needs.
 

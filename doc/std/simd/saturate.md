@@ -5,7 +5,7 @@
 saturating (clamping) arithmetic over the seeded vector types
 
 there is no lane-wise saturating operator, so each is built from the wrapping
-lane-wise op plus an overflow mask — the `paddus`/`psubs`-class behavior
+lane-wise op plus an overflow mask: the `paddus`/`psubs`-class behavior
 expressed in portable Mach.
 
 unsigned add saturates to all-ones on carry-out; unsigned subtract saturates
@@ -13,8 +13,8 @@ to zero on borrow. these need no bit reinterpret: the overflow mask is an
 unsigned comparison in the operand's own type.
 
 signed add/sub saturate to the type's [MIN, MAX]. overflow is detected in the
-mask domain from the operand and result sign bits — a signed compare against
-zero yields the sign mask — and the saturated lanes are chosen with the
+mask domain from the operand and result sign bits. a signed compare against
+zero yields the sign mask, and the saturated lanes are chosen with the
 `select` blend (whose `:~` reinterpret is the only bitwise touch a signed
 vector allows). overflow on add needs equal operand signs; on subtract,
 opposite signs; either way the result sign must differ from the minuend's.

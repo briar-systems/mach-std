@@ -202,7 +202,7 @@ pub fun stem(a: *std.allocator.Allocator, p: Path) res[Path, std.allocator.Error
 
 return the filename without its extension
 
-"foo/bar.txt" → "bar", "foo/.hidden" → ".hidden", "foo/bar" → "bar"
+"foo/bar.txt" gives "bar", "foo/.hidden" gives ".hidden", "foo/bar" gives "bar"
 
 | Parameter | |
 | :--- | :--- |

@@ -14,7 +14,7 @@ operand. `zeroize` holds the wipe that no pass deletes.
 TWO KINDS OF PRIMITIVE, FOR TWO DIFFERENT REASONS.
 
 the comparisons are the language's own `==` / `<` / `>` on secret operands.
-a comparison is not a branch — mach lowers one to a flag-setting compare and a
+a comparison is not a branch: mach lowers one to a flag-setting compare and a
 materialize (`cmp`/`setb` on x86_64, `cmp`/`cset` on aarch64, `sltu` on
 riscv64), all branch-free, and each lowering zero-extends a narrow operand
 before comparing. what keeps it that way is `#[constant_time("soft")]`: inside it the
@@ -23,7 +23,7 @@ validator re-checks the lowered MIR. writing the bit-twiddling equivalent by
 hand would buy nothing the contract does not already give, and would cost the
 operand cleanup the compare gets for free.
 
-the merges are masked arithmetic — and/or/xor/not over an all-ones mask —
+the merges are masked arithmetic, and/or/xor/not over an all-ones mask,
 because there is no operator that selects without branching. that set is
 branch-free on every architecture mach targets, including base RISC-V, which
 has no conditional move at all, and it needs no per-arch assembly. multiply is
@@ -51,7 +51,7 @@ it. `mask_*`, `select_*` and `lookup_*` are still spelled out per width
 because their bodies differ by the cast they widen through.
 
 > **Experimental preview.** mach's constant-time support is unaudited and has
-> known open holes — see the compiler's `doc/language/secrecy.md`. do not build
+> known open holes. see the compiler's `doc/language/secrecy.md`. do not build
 > production cryptography on this version.
 
 Source: [`src/crypto/ct.mach`](../../../src/crypto/ct.mach)
@@ -121,7 +121,7 @@ THE WIDENING CAST AND THE `& 1` DO DIFFERENT JOBS, stated once for the four
 
 `::^uN` zero-extends: it takes the low 8 bits of the flag and nothing else, so a
 caller's stray high bits cannot reach the subtraction. that is worth naming
-because it was NOT true until briar-systems/mach#2373 — a secret-to-secret `::`
+because it was NOT true until briar-systems/mach#2373: a secret-to-secret `::`
 used to lower to a width-changing `bitcast`, a reinterpret that cleaned nothing,
 and these four were correct only because the `& 1` happened to be emitted at
 machine-register width. they are now correct because the cast converts.
@@ -133,8 +133,8 @@ dropping it is caught by `ct__mask_lifts_the_flag_low_bit_at_every_width`.
 
 `ct__mask_answers_for_the_value_under_a_dirty_flag` pins the pair: the masks must
 answer for the 8-bit VALUE of the flag whatever the register around it holds. a
-caller can still hand over stray high bits — a narrow `0 - x` is not truncated,
-#2357 canonicalized the shift consumers rather than the producers — so this stays
+caller can still hand over stray high bits: a narrow `0 - x` is not truncated,
+as #2357 canonicalized the shift consumers rather than the producers, so this stays
 a live property to guard, not a historical one.
 
 | Parameter | |
@@ -152,7 +152,7 @@ pub fun mask_u32(c: ^u8) ^u32
 
 lift a secret 0/1 flag to an all-ones 32-bit mask
 
-the cast zero-extends; the `& 1` normalizes the flag — see `mask_u16`.
+the cast zero-extends; the `& 1` normalizes the flag, as `mask_u16` explains.
 
 | Parameter | |
 | :--- | :--- |
@@ -169,7 +169,7 @@ pub fun mask_u64(c: ^u8) ^u64
 
 lift a secret 0/1 flag to an all-ones 64-bit mask
 
-the cast zero-extends; the `& 1` normalizes the flag — see `mask_u16`.
+the cast zero-extends; the `& 1` normalizes the flag, as `mask_u16` explains.
 
 | Parameter | |
 | :--- | :--- |
@@ -186,7 +186,7 @@ pub fun mask_usize(c: ^u8) ^usize
 
 lift a secret 0/1 flag to an all-ones usize mask
 
-the cast zero-extends; the `& 1` normalizes the flag — see `mask_u16`.
+the cast zero-extends; the `& 1` normalizes the flag, as `mask_u16` explains.
 
 | Parameter | |
 | :--- | :--- |
@@ -383,7 +383,7 @@ pub fun lookup_u8(table: *^u8, len: usize, idx: ^usize) ^u8
 read a secret-indexed byte without a secret memory address
 
 scans the whole table and merges the element whose public position matches the
-secret index, so the address trace is the same for every index — that is what
+secret index, so the address trace is the same for every index. that is what
 replaces `table[idx]`, which sema rejects. cost is linear in `len`.
 
 an index at or beyond `len` matches nothing and yields 0. that is the defined
