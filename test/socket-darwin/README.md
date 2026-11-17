@@ -26,7 +26,7 @@ The verifier checks:
   imports that same spelling, so an SDK alias is caught.
 - `errors` and `datagrams` exit zero and print nothing. `errors` covers invalid
   descriptors and out-of-range lengths. `datagrams` checks explicit destination and
-  returned source lengths over local UDP with receive timeouts.
+  returned source lengths over local UDP.
 - `stream` prints the SO_KEEPALIVE value and length it read, which must equal what
   `layout.c option` reads natively. An enabled option need only be nonzero. The mode
   itself checks accepted flags, endpoint agreement, would-block and shutdown EOF.

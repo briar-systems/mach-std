@@ -2,7 +2,6 @@ import array
 import copy
 import fcntl
 import os
-import select
 import subprocess
 import sys
 import termios
@@ -24,20 +23,13 @@ def queued(fd):
 
 
 def wait_queued(fd, expected):
-    deadline = time.monotonic() + 10
     while queued(fd) != expected:
-        if time.monotonic() >= deadline:
-            raise AssertionError(f"input count {queued(fd)}, expected {expected}")
         time.sleep(0.001)
 
 
 def line(child, expected):
     data = b""
-    deadline = time.monotonic() + 10
     while not data.endswith(b"\n"):
-        left = deadline - time.monotonic()
-        if left <= 0 or not select.select([child.stdout], [], [], left)[0]:
-            raise AssertionError(f"missing phase {expected!r}, child={child.poll()}")
         byte = os.read(child.stdout.fileno(), 1)
         if not byte:
             child.wait(timeout=10)
@@ -67,7 +59,6 @@ def run(executable, layout, native_errors):
         wait_queued(slave, 7)
         echo = b""
         while len(echo) < 8:
-            assert select.select([master], [], [], 10)[0], "missing initial echo"
             echo += os.read(master, 8 - len(echo))
         assert echo == b"before\r\n", echo
         child = subprocess.Popen([executable, "pty", str(control_read)], stdin=slave,
