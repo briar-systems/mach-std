@@ -24,8 +24,8 @@ of the block; `||` opens no guard, so one term per `if`. construction is
 `Type.case{...}` only. no helper functions are provided on purpose: a
 by-value `unwrap` would copy owning payloads out of the ownership rules,
 and a constructor function would be a second spelling of a form the
-language already has. the test below pins the shape: case order, case
-codes, zero defaults, layout and reflection.
+language already has. the test in std.types.result pins the case order,
+case codes and zero default of all three canonical tags.
 
 Source: [`src/types/option.mach`](../../../src/types/option.mach)
 

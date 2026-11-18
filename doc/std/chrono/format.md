@@ -36,7 +36,7 @@ or with fractional seconds when nsec != 0.
 | `dt` | datetime to format |
 | `buf` | output buffer (at least 36 bytes) |
 | `len` | buffer length |
-| **returns** | bytes written (excluding null terminator), 0 if buffer too small |
+| **returns** | bytes written (excluding null terminator), 0 if buffer too small or the offset is a day or more either way |
 
 ### rfc3339_date
 
@@ -70,7 +70,7 @@ output: Fri, 13 Feb 2009 23:31:30 +0000
 | `dt` | datetime to format |
 | `buf` | output buffer (at least 32 bytes) |
 | `len` | buffer length |
-| **returns** | bytes written (excluding null terminator), 0 if buffer too small |
+| **returns** | bytes written (excluding null terminator), 0 if buffer too small or the offset's hours do not fit two digits |
 
 ### unix_sec
 

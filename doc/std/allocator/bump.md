@@ -5,9 +5,10 @@
 brk-based bump allocator
 
 monotonically advances a brk pointer for small allocations (\< 128KB),
-falls back to mmap for large allocations. deallocate is a no-op for
-brk-backed memory, individual small allocations cannot be freed, only
-reclaimed on program exit. use an arena allocator for bulk-freeable
+falls back to mmap for large allocations. a mapping is only page aligned, so
+a large request aligned past the page size is bumped from the brk region
+like a small one. deallocate is a no-op for brk-backed memory, individual
+brk allocations cannot be freed, only reclaimed on program exit. use an arena allocator for bulk-freeable
 allocation patterns, or a real heap allocator for general-purpose use.
 the Allocator it makes sets retains, since freed brk memory is never reused.
 

@@ -101,7 +101,7 @@ lend welded storage to a handle
 | `data` | the storage, which stays owned by and valid for the caller until close |
 | `size` | nonzero span length |
 | `out` | the handle |
-| **returns** | ok, INVALID for nil or empty storage or a nil out, RESOURCE_EXHAUSTED when the table cannot grow |
+| **returns** | ok, INVALID for nil or empty storage or a nil out, RESOURCE_EXHAUSTED when the table cannot grow, at the latest once every u32 index is live |
 
 ### borrow_release
 

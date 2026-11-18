@@ -15,7 +15,6 @@
 
 | Directory | |
 | :--- | :--- |
-| [`capability/`](capability/README.md) | which operating system capabilities the build target provides |
 | [`cpu/`](cpu/README.md) | the running processor's instruction-set extensions |
 | [`os/`](os/README.md) | the OS contract: a small set of primitives, one implementation per OS |
 
