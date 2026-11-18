@@ -14,8 +14,7 @@ resolution:
 
 this module imports nothing OS-bound and builds on every target, freestanding
 included. the members and assumptions behind each group are the contract
-itself: std.system.os, described in OS-CONTRACT.md and checked by
-std.system.capability.conformance.
+itself: std.system.os, described in OS-CONTRACT.md.
 
 groups:
 
@@ -39,6 +38,5 @@ The directory's root module is [`std.system.capability`](../capability.md).
 
 | Module | |
 | :--- | :--- |
-| [`conformance`](conformance.md) | the capability groups are a promise: a target that claims a group exports every member of it through std.system.os |
 | [`tests`](tests.md) | a gate in another module selects on the capability constants at comptime |
 

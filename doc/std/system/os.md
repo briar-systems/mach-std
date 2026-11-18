@@ -7,10 +7,9 @@ the OS contract: a small set of primitives, one implementation per OS
 the primitives fall into capability groups (core, pages, clock, entropy,
 threads, files, io queue, sockets, process). std.system.capability says which
 groups a target provides, and a target that claims a group exports every
-member of it (see src/system/capability/conformance.mach). OS-CONTRACT.md
-lists the members and the assumptions the contract holds. for
-platform-specific functionality, import the target module directly
-(e.g. std.system.os.linux).
+member of it. OS-CONTRACT.md lists the members and the assumptions the
+contract holds. for platform-specific functionality, import the target module
+directly (e.g. std.system.os.linux).
 
 Source: [`src/system/os.mach`](../../../src/system/os.mach)
 
