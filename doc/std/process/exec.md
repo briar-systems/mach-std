@@ -33,6 +33,8 @@ Uses types from [`std.allocator`](../allocator.md), [`std.io.error`](../io/error
 | [`spawn_redirected_in_grouped`](#spawn_redirected_in_grouped) | start a process in a given working directory, with redirected streams, as the leader of its own group (see SpawnOptions) |
 | [`terminate_child`](#terminate_child) | forcefully stop a child without reaping it |
 | [`terminate_group`](#terminate_group) | signal every process in a child's group, reaching descendants that spawned their own children in turn |
+| [`kill_group`](#kill_group) | forcefully stop every process in a child's group without reaping any of them |
+| [`group_alive`](#group_alive) | whether any process is left in a child's group, the child itself included until it is reaped |
 | [`wait`](#wait) | wait for a child process to exit |
 | [`try_wait`](#try_wait) | reap a child if it has already exited, without blocking |
 | [`wait_within`](#wait_within) | run a child to completion under a cancellation scope, terminating its whole group if the scope ends first |
@@ -289,6 +291,44 @@ terminate_child leaves a single child waitable.
 | :--- | :--- |
 | `child` | child handle from a grouped spawn |
 | **returns** | the native failure, which keeps the child with the caller |
+
+### kill_group
+
+```mach
+pub fun kill_group(child: Child) err[Error]
+```
+
+forcefully stop every process in a child's group without reaping any of them
+
+what terminate_group asks of the group, this forces: SIGKILL on linux and
+darwin. on windows the job object's termination terminate_group performs is
+already forceful, so this terminates the job the same way. a group with no
+process left has nothing to stop, which is no failure.
+`ungrouped` when `child` was not spawned grouped (child.pgid == 0).
+member processes remain individually waitable afterward.
+
+| Parameter | |
+| :--- | :--- |
+| `child` | child handle from a grouped spawn |
+| **returns** | the native failure, which keeps the child with the caller |
+
+### group_alive
+
+```mach
+pub fun group_alive(child: Child) res[bool, Error]
+```
+
+whether any process is left in a child's group, the child itself included
+until it is reaped
+
+nothing is signalled. on windows reaping the child closes its job, which
+ends every process left in it.
+`ungrouped` when `child` was not spawned grouped (child.pgid == 0).
+
+| Parameter | |
+| :--- | :--- |
+| `child` | child handle from a grouped spawn |
+| **returns** | true while a process is left, or the native failure |
 
 ### wait
 

@@ -32,7 +32,7 @@ Source: [`src/system/os/linux.mach`](../../../../src/system/os/linux.mach)
 | [`set_mode_at_native`](#set_mode_at_native) | every name below reaches the kernel as bytes, so each native form is the UTF-8 primitive itself |
 | [`file_identity`](#file_identity), [`identity_at`](#identity_at), [`identity_at_native`](#identity_at_native), [`retain_identity_at`](#retain_identity_at), [`retain_identity_at_native`](#retain_identity_at_native), [`publication_capabilities`](#publication_capabilities), [`stat_path`](#stat_path), [`stat_path_native`](#stat_path_native), [`stat_mode`](#stat_mode), [`unlink`](#unlink), [`unlink_native`](#unlink_native), [`rename`](#rename), [`rename_native`](#rename_native), [`symlink`](#symlink), [`symlink_native`](#symlink_native), [`make_dir`](#make_dir), [`make_dir_native`](#make_dir_native), [`directory_init`](#directory_init), [`directory_next`](#directory_next), [`directory_dnit`](#directory_dnit), [`access`](#access), [`access_native`](#access_native), [`seek`](#seek), [`lock_fd`](#lock_fd) | |
 | [`terminate`](#terminate) | process |
-| [`abort`](#abort), [`terminate_child`](#terminate_child), [`setpgid`](#setpgid), [`getpgid`](#getpgid), [`terminate_group`](#terminate_group), [`spawn`](#spawn), [`spawn_grouped`](#spawn_grouped), [`spawn_in`](#spawn_in), [`spawn_redirected`](#spawn_redirected), [`spawn_redirected_grouped`](#spawn_redirected_grouped), [`spawn_redirected_in`](#spawn_redirected_in), [`spawn_redirected_in_grouped`](#spawn_redirected_in_grouped) | |
+| [`abort`](#abort), [`terminate_child`](#terminate_child), [`setpgid`](#setpgid), [`getpgid`](#getpgid), [`terminate_group`](#terminate_group), [`kill_group`](#kill_group), [`probe_group`](#probe_group), [`spawn`](#spawn), [`spawn_grouped`](#spawn_grouped), [`spawn_in`](#spawn_in), [`spawn_redirected`](#spawn_redirected), [`spawn_redirected_grouped`](#spawn_redirected_grouped), [`spawn_redirected_in`](#spawn_redirected_in), [`spawn_redirected_in_grouped`](#spawn_redirected_in_grouped) | |
 | [`spawn_native`](#spawn_native) | the kernel takes paths and arguments as bytes, so the native-unit spawns are the spawns themselves |
 | [`spawn_in_native`](#spawn_in_native), [`spawn_redirected_native`](#spawn_redirected_native), [`spawn_redirected_in_native`](#spawn_redirected_in_native), [`spawn_redirected_in_grouped_native`](#spawn_redirected_in_grouped_native), [`getpid`](#getpid), [`running_under_user_emulation`](#running_under_user_emulation), [`pipe`](#pipe), [`ignore_sigpipe`](#ignore_sigpipe), [`sleep`](#sleep), [`cpu_count`](#cpu_count), [`cpu_features`](#cpu_features), [`cpu_dit`](#cpu_dit), [`thread_affinity`](#thread_affinity), [`set_thread_affinity`](#set_thread_affinity), [`getcwd`](#getcwd), [`getcwd_native`](#getcwd_native), [`getenv`](#getenv), [`environ`](#environ) | |
 | [`getenv_native`](#getenv_native) | the environment is the bytes the kernel passed, so its native reads are the reads themselves |
@@ -2187,6 +2187,43 @@ unlike terminate_child, there is no waitid ownership probe first: a process
 group is not tracked as a child of this process, so kill(-pgid, SIGTERM) is
 the only available primitive. surviving members stay individually waitable
 through wait/wait_any exactly as before.
+
+### kill_group
+
+Forwards the first of these whose condition holds:
+
+- [`std.system.os.linux.x86_64.kill_group`](linux/x86_64.md#kill_group), where `$mach.build.arch == $mach.arch.x86_64`
+- [`std.system.os.linux.aarch64.kill_group`](linux/aarch64.md#kill_group), where `$mach.build.arch == $mach.arch.aarch64`
+- [`std.system.os.linux.riscv64.kill_group`](linux/riscv64.md#kill_group), where `$mach.build.arch == $mach.arch.riscv64`
+- [`std.system.os.linux.riscv32.kill_group`](linux/riscv32.md#kill_group), where `$mach.build.arch == $mach.arch.riscv32`
+
+```mach
+pub fun kill_group(pgid: i64) i64
+```
+
+forcefully stop every process in a group without reaping any of them
+
+the group's members get SIGKILL, which none of them can catch or ignore.
+as with terminate_group there is no ownership probe, and members stay
+individually waitable.
+
+### probe_group
+
+Forwards the first of these whose condition holds:
+
+- [`std.system.os.linux.x86_64.probe_group`](linux/x86_64.md#probe_group), where `$mach.build.arch == $mach.arch.x86_64`
+- [`std.system.os.linux.aarch64.probe_group`](linux/aarch64.md#probe_group), where `$mach.build.arch == $mach.arch.aarch64`
+- [`std.system.os.linux.riscv64.probe_group`](linux/riscv64.md#probe_group), where `$mach.build.arch == $mach.arch.riscv64`
+- [`std.system.os.linux.riscv32.probe_group`](linux/riscv32.md#probe_group), where `$mach.build.arch == $mach.arch.riscv32`
+
+```mach
+pub fun probe_group(pgid: i64) i64
+```
+
+whether any process is left in a group, without signalling it
+
+kill(-pgid, 0) checks for members and delivers nothing. a member this
+process may not signal still counts, so EPERM reads as present.
 
 ### spawn
 

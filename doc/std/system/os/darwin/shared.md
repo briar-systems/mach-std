@@ -76,6 +76,8 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`setpgid`](#setpgid) | setpgid: set (or join) the process group ID of a process |
 | [`getpgid`](#getpgid) | getpgid: read the process group ID of a process |
 | [`terminate_group`](#terminate_group) | signal every process in a group without reaping any of them |
+| [`kill_group`](#kill_group) | forcefully stop every process in a group without reaping any of them |
+| [`probe_group`](#probe_group) | whether any process is left in a group, without signalling it |
 | [`spawn`](#spawn) | create a child process running the given program |
 | [`spawn_grouped`](#spawn_grouped) | create a child process running the given program, placed as the leader of its own new process group (see spawn_redirected_in_grouped) |
 | [`spawn_in`](#spawn_in) | create a child process running the given program from `cwd` |
@@ -777,6 +779,39 @@ through wait/wait_any exactly as before.
 | :--- | :--- |
 | `pgid` | process group ID (must be > 0; a negated pgid targets the whole group) |
 | **returns** | 0 on success, or negative errno |
+
+### kill_group
+
+```mach
+pub fun kill_group(pgid: i64) i64
+```
+
+forcefully stop every process in a group without reaping any of them
+
+the group's members get SIGKILL, which none of them can catch or ignore.
+as with terminate_group there is no ownership probe, and members stay
+individually waitable.
+
+| Parameter | |
+| :--- | :--- |
+| `pgid` | process group ID (must be > 0) |
+| **returns** | 0 on success, or negative errno |
+
+### probe_group
+
+```mach
+pub fun probe_group(pgid: i64) i64
+```
+
+whether any process is left in a group, without signalling it
+
+kill(-pgid, 0) checks for members and delivers nothing. a member this
+process may not signal still counts, so EPERM reads as present.
+
+| Parameter | |
+| :--- | :--- |
+| `pgid` | process group ID (must be > 0) |
+| **returns** | 0 while a member is left, ESRCH once none is, or another negative errno |
 
 ### spawn
 

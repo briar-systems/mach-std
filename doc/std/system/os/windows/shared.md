@@ -111,6 +111,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`spawn_command_line`](#spawn_command_line) | spawn a program from a verbatim native command line, inheriting the streams |
 | [`terminate_child`](#terminate_child) | forcefully stop a spawned child without reaping it |
 | [`terminate_group`](#terminate_group) | the group token is the child pid, pinned until its retained process handle closes |
+| [`probe_group`](#probe_group) | whether any process is left in a group's job |
 | [`getpid`](#getpid) | return the current process ID |
 | [`open_file_limit`](#open_file_limit) | windows has no settable per-process descriptor limit: handles are bounded by kernel memory, so neither query nor set has a faithful answer |
 | [`set_open_file_limit`](#set_open_file_limit) | |
@@ -1152,6 +1153,22 @@ pub fun terminate_group(group: i64) i64
 ```
 
 the group token is the child pid, pinned until its retained process handle closes
+
+### probe_group
+
+```mach
+pub fun probe_group(group: i64) i64
+```
+
+whether any process is left in a group's job
+
+reaping the group's child closes its job, and the job's kill-on-close limit
+ends every process left in it, so a group whose child is gone has none left.
+
+| Parameter | |
+| :--- | :--- |
+| `group` | the group token from a grouped spawn |
+| **returns** | 0 while a process is left, ESRCH once none is, or another negative errno |
 
 ### getpid
 
