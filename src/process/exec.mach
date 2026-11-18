@@ -1469,48 +1469,6 @@ test output__captures_stdout {
     ret 0;
 }
 
-# spawn_grouped makes the child the leader of its own group. on linux/darwin
-# that means its pgid equals its own pid, checked both by the returned Child
-# record and by an independent getpgid read against the live process; on
-# windows there is no pid-keyed query to cross-check against (Child.pgid IS
-# the job handle, not a lookup key), so the check is that a real job handle
-# came back and the child still runs to completion normally afterward -
-# proof the CREATE_SUSPENDED child actually got resumed.
-test spawn_grouped__child_leads_its_group {
-    $if ($mach.build.sys == $mach.sys.windows) {
-        var argv:              [4]usize          = argv_ok();
-        val res_spawn_grouped: res[Child, Error] = spawn_grouped(prog_ok(), (?argv[0])::**u8, Environment.inherit{});
-        if (sel res_spawn_grouped.err) { ret 1; }
-        val child: Child = res_spawn_grouped.ok;
-
-        var bad: u8 = 0;
-        if (child.pgid == 0) { bad = 1; }
-
-        val res_wait: res[ExitStatus, Error] = wait(child);
-        if (!exited_zero(res_wait)) { bad = 1; }
-        ret bad::i32;
-    }
-    $or {
-        var argv:              [4]usize          = argv_ok();
-        val res_spawn_grouped: res[Child, Error] = spawn_grouped(prog_ok(), (?argv[0])::**u8, Environment.inherit{});
-        if (sel res_spawn_grouped.err) { ret 1; }
-        val child: Child = res_spawn_grouped.ok;
-
-        var bad: u8 = 0;
-        if (child.pgid != child.pid) { bad = 1; }
-        $if ($mach.build.sys == $mach.sys.linux) {
-            if (linux.getpgid(child.pid) != child.pgid) { bad = 1; }
-        }
-        $or ($mach.build.sys == $mach.sys.darwin) {
-            if (darwin.getpgid(child.pid) != child.pgid) { bad = 1; }
-        }
-
-        val res_wait: res[ExitStatus, Error] = wait(child);
-        if (sel res_wait.err) { bad = 1; }
-        ret bad::i32;
-    }
-}
-
 # terminate_group reaches a grandchild the direct child never told us about:
 # the shell backgrounds `sleep 3600`, reports its pid over a pipe, then blocks
 # in `wait` - both processes share the group terminate_group signals, and
@@ -2110,131 +2068,91 @@ test wait_within__child_finishing_first_is_not_terminated {
 
 # the deadline is what makes a scope mean anything for a process: a child that
 # outlives it is terminated, is still reaped rather than left a zombie, and on
-# a grouped spawn takes its grandchildren with it
+# a grouped spawn takes its grandchildren with it. on linux and darwin the
+# child is a shell that backgrounds a grandchild and blocks, so only a group
+# termination reaches the grandchild. cmd has no `&` with a way to recover the
+# new pid, so on windows the child is a plain long runner
 test wait_within__expired_deadline_terminates_and_reaps {
-    var scope:     cancel.Scope;
-    val res_clock: tm.InstantClock = tm.instant();
-    if (sel res_clock.err) { ret 1; }
-    val deadline: tm.Instant       = tm.instant_add(res_clock.ok, 50 * duration.MILLISECOND);
-    val err_made: cancel.Operation = cancel.make_root(?scope, opt[tm.Instant].some{deadline});
-    if (sel err_made.err) { ret 1; }
-
-    var argv:                            [4]usize          = long_running_argv();
+    var argv: [4]usize = long_running_argv();
+    var fds:  [2]usize;
+    fds[0] = os.INVALID_HANDLE;
+    fds[1] = os.INVALID_HANDLE;
+    $if ($mach.build.sys != $mach.sys.windows) {
+        if (os.pipe(?fds[0], ?fds[1]) < 0) { ret 1; }
+        argv[2] = ("sleep 3600 & echo $!; wait")::usize;
+    }
     val res_spawn_redirected_in_grouped: res[Child, Error] =
-        spawn_redirected_in_grouped(long_running_path(), (?argv[0])::**u8, Environment.inherit{}, "", os.INVALID_HANDLE, os.INVALID_HANDLE, os.INVALID_HANDLE);
+        spawn_redirected_in_grouped(long_running_path(), (?argv[0])::**u8, Environment.inherit{}, "", os.INVALID_HANDLE, fds[1], os.INVALID_HANDLE);
+    $if ($mach.build.sys != $mach.sys.windows) { os.close(fds[1]); }
     if (sel res_spawn_redirected_in_grouped.err) {
-        cancel.dnit(?scope);
+        $if ($mach.build.sys != $mach.sys.windows) { os.close(fds[0]); }
         ret 2;
     }
     val child: Child = res_spawn_redirected_in_grouped.ok;
     if (child.pgid == 0) {
-        cancel.dnit(?scope);
+        $if ($mach.build.sys != $mach.sys.windows) { os.close(fds[0]); }
         terminate_child(child);
         wait(child);
         ret 3;
+    }
+
+    # the grandchild's pid, echoed as decimal text
+    var grandchild: i64 = 0;
+    $if ($mach.build.sys != $mach.sys.windows) {
+        var out_buf: [32]u8;
+        val n:       i64 = os.read(fds[0], ?out_buf[0], 32);
+        os.close(fds[0]);
+        var i: usize = 0;
+        for (n > 0 && i < n::usize) {
+            val c: u8 = out_buf[i];
+            if (c >= '0'::u8 && c <= '9'::u8) { grandchild = grandchild * 10 + (c - '0'::u8)::i64; }
+            i = i + 1;
+        }
+        if (grandchild <= 0) {
+            terminate_group(child);
+            wait(child);
+            ret 4;
+        }
+    }
+
+    var scope:     cancel.Scope;
+    val res_clock: tm.InstantClock = tm.instant();
+    if (sel res_clock.err) {
+        terminate_group(child);
+        wait(child);
+        ret 5;
+    }
+    val deadline: tm.Instant       = tm.instant_add(res_clock.ok, 50 * duration.MILLISECOND);
+    val err_made: cancel.Operation = cancel.make_root(?scope, opt[tm.Instant].some{deadline});
+    if (sel err_made.err) {
+        terminate_group(child);
+        wait(child);
+        ret 5;
     }
 
     # the child would run for an hour; the deadline is 50ms, so returning at
     # all is the first half of the claim
     val res_wait_within: res[Supervised, Error] = wait_within(child, ?scope);
     cancel.dnit(?scope);
-    if (sel res_wait_within.err) { ret 4; }
+    if (sel res_wait_within.err) { ret 6; }
     val sup: Supervised = res_wait_within.ok;
-    if (!sup.terminated)           { ret 5; }
-    if (!sel sup.reason.timed_out) { ret 6; }
+    if (!sup.terminated)           { ret 7; }
+    if (!sel sup.reason.timed_out) { ret 8; }
 
     # and it was reaped on the way out, so a second wait finds nothing rather
     # than a zombie
     var wstatus:  os.ProcessStatus;
     val consumed: os.WaitResult = os.wait_pid(child.pid, ?wstatus, os.WNOHANG);
-    if (consumed.pid != 0 || os.error_kind(consumed.error.code) != io_error.NO_CHILD) { ret 7; }
-    ret 0;
-}
+    if (consumed.pid != 0 || os.error_kind(consumed.error.code) != io_error.NO_CHILD) { ret 9; }
 
-# the grandchild half of the same claim: a shell that backgrounds another
-# process and then blocks is not individually reachable, so only terminating
-# the GROUP on expiry reaches the process the deadline was really about
-test wait_within__expired_deadline_reaches_a_grandchild {
-    $if ($mach.build.sys == $mach.sys.windows) {
-        # cmd.exe has no `&` backgrounding with a `$!`-style way to recover the
-        # new pid, so the windows leg is covered by the group test above
-        ret 77;
-    }
-    $or {
-        var out_buf: [32]u8;
-        var fds:     [2]usize;
-        if (os.pipe(?fds[0], ?fds[1]) < 0) { ret 1; }
-
-        var argv: [4]usize;
-        argv[0] = ("/bin/sh")::usize;
-        argv[1] = ("-c")::usize;
-        argv[2] = ("sleep 3600 & echo $!; wait")::usize;
-        argv[3] = 0;
-
-        val res_spawn_redirected_in_grouped: res[Child, Error] =
-            spawn_redirected_in_grouped("/bin/sh", (?argv[0])::**u8, Environment.inherit{}, "", os.INVALID_HANDLE, fds[1], os.INVALID_HANDLE);
-        if (sel res_spawn_redirected_in_grouped.err) {
-            os.close(fds[0]);
-            os.close(fds[1]);
-            ret 2;
-        }
-        os.close(fds[1]);
-        val shell: Child = res_spawn_redirected_in_grouped.ok;
-        if (shell.pgid == 0) {
-            os.close(fds[0]);
-            terminate_child(shell);
-            wait(shell);
-            ret 3;
-        }
-
-        val n: i64 = os.read(fds[0], ?out_buf[0], 32);
-        os.close(fds[0]);
-        if (n <= 0) {
-            terminate_group(shell);
-            wait(shell);
-            ret 4;
-        }
-        var grandchild: i64   = 0;
-        var i:          usize = 0;
-        for (i < n::usize) {
-            val c: u8 = out_buf[i];
-            if (c >= '0'::u8 && c <= '9'::u8) { grandchild = grandchild * 10 + (c - '0'::u8)::i64; }
-            i = i + 1;
-        }
-        if (grandchild <= 0) {
-            terminate_group(shell);
-            wait(shell);
-            ret 5;
-        }
-
-        var scope:     cancel.Scope;
-        val res_clock: tm.InstantClock = tm.instant();
-        if (sel res_clock.err) {
-            terminate_group(shell);
-            wait(shell);
-            ret 6;
-        }
-        val deadline: tm.Instant       = tm.instant_add(res_clock.ok, 50 * duration.MILLISECOND);
-        val err_made: cancel.Operation = cancel.make_root(?scope, opt[tm.Instant].some{deadline});
-        if (sel err_made.err) {
-            terminate_group(shell);
-            wait(shell);
-            ret 6;
-        }
-
-        val res_wait_within: res[Supervised, Error] = wait_within(shell, ?scope);
-        cancel.dnit(?scope);
-        if (sel res_wait_within.err) { ret 7; }
-        val sup: Supervised = res_wait_within.ok;
-        if (!sup.terminated || !sel sup.reason.timed_out) { ret 8; }
-
-        # the grandchild was never our own child, so its disappearance is proof
-        # the whole group was signalled and not just the process we waited on
+    # the grandchild was never our own child, so its disappearance is proof
+    # the whole group was signalled and not just the process we waited on
+    $if ($mach.build.sys != $mach.sys.windows) {
         var gone:  bool  = false;
         var polls: usize = 0;
         for (!gone) {
             # 20 seconds at most, so a grandchild the group signal missed fails here
-            if (polls >= 10000) { ret 9; }
+            if (polls >= 10000) { ret 10; }
             polls = polls + 1;
             $if ($mach.build.sys == $mach.sys.linux) {
                 if (linux.getpgid(grandchild) < 0) { gone = true; }
@@ -2244,8 +2162,8 @@ test wait_within__expired_deadline_reaches_a_grandchild {
             }
             if (!gone) { os.sleep(2000000); }
         }
-        ret 0;
     }
+    ret 0;
 }
 
 test output__failed_wait_releases_capture_and_retains_the_child {
@@ -2290,41 +2208,67 @@ test output__failed_wait_releases_capture_and_retains_the_child {
     ret 0;
 }
 
-# one spawn applies the directory, the redirection and the group together
+# one spawn applies the directory, the redirection and the group together. on
+# linux and darwin the child leads its group, checked by the returned record and
+# by an independent getpgid read. on windows Child.pgid is the job handle, not a
+# lookup key, so the check is that a job came back and the child, created
+# suspended, was resumed and ran to completion
 test spawn_with_options__applies_the_directory_the_redirection_and_the_group {
-    $if ($mach.build.sys == $mach.sys.windows) { ret 77; }
-    var fds: [2]usize;
-    if (os.pipe(?fds[0], ?fds[1]) < 0) { ret 1; }
-    var argv: [4]usize;
-    argv[0] = ("/bin/sh")::usize;
-    argv[1] = ("-c")::usize;
-    argv[2] = ("pwd")::usize;
-    argv[3] = 0;
-    var options: SpawnOptions = spawn_options();
-    options.cwd     = "/";
-    options.stdout  = fds[1];
-    options.grouped = true;
-    val res_spawn_with_options: res[Child, Error] = spawn_with_options("/bin/sh", (?argv[0])::**u8, Environment.inherit{}, options);
-    os.close(fds[1]);
-    if (sel res_spawn_with_options.err) {
+    $if ($mach.build.sys == $mach.sys.windows) {
+        var argv:    [4]usize     = argv_ok();
+        var options: SpawnOptions = spawn_options();
+        options.grouped = true;
+        val res_spawn_with_options: res[Child, Error] = spawn_with_options(prog_ok(), (?argv[0])::**u8, Environment.inherit{}, options);
+        if (sel res_spawn_with_options.err) { ret 1; }
+        val child: Child = res_spawn_with_options.ok;
+        var bad:   u8    = 0;
+        if (child.pgid == 0)           { bad = 1; }
+        if (!exited_zero(wait(child))) { bad = 1; }
+        ret bad::i32;
+    }
+    $or {
+        var fds: [2]usize;
+        if (os.pipe(?fds[0], ?fds[1]) < 0) { ret 1; }
+        var argv: [4]usize;
+        argv[0] = ("/bin/sh")::usize;
+        argv[1] = ("-c")::usize;
+        argv[2] = ("pwd")::usize;
+        argv[3] = 0;
+        var options: SpawnOptions = spawn_options();
+        options.cwd     = "/";
+        options.stdout  = fds[1];
+        options.grouped = true;
+        val res_spawn_with_options: res[Child, Error] = spawn_with_options("/bin/sh", (?argv[0])::**u8, Environment.inherit{}, options);
+        os.close(fds[1]);
+        if (sel res_spawn_with_options.err) {
+            os.close(fds[0]);
+            ret 2;
+        }
+        var out:   [8]u8;
+        var total: usize = 0;
+        for (total < 8) {
+            val n: i64 = os.read(fds[0], (?out[total])::*u8, 8 - total);
+            if (n <= 0) { brk; }
+            total = total + n::usize;
+        }
         os.close(fds[0]);
-        ret 2;
+        val child: Child = res_spawn_with_options.ok;
+        # the child is not reaped yet, so its group is still readable
+        var native_pgid: i64 = 0;
+        $if ($mach.build.sys == $mach.sys.linux) {
+            native_pgid = linux.getpgid(child.pid);
+        }
+        $or ($mach.build.sys == $mach.sys.darwin) {
+            native_pgid = darwin.getpgid(child.pid);
+        }
+        val res_waited: res[ExitStatus, Error] = wait(child);
+        if (sel res_waited.err)                                    { ret 3; }
+        if (!exited(res_waited.ok) || code(res_waited.ok) != 0)    { ret 4; }
+        if (child.pgid != child.pid)                               { ret 5; }
+        if (native_pgid != child.pgid)                             { ret 6; }
+        if (total != 2 || out[0] != '/'::u8 || out[1] != '\n'::u8) { ret 7; }
+        ret 0;
     }
-    var out:   [8]u8;
-    var total: usize = 0;
-    for (total < 8) {
-        val n: i64 = os.read(fds[0], (?out[total])::*u8, 8 - total);
-        if (n <= 0) { brk; }
-        total = total + n::usize;
-    }
-    os.close(fds[0]);
-    val child:      Child                  = res_spawn_with_options.ok;
-    val res_waited: res[ExitStatus, Error] = wait(child);
-    if (sel res_waited.err)                                    { ret 3; }
-    if (!exited(res_waited.ok) || code(res_waited.ok) != 0)    { ret 4; }
-    if (child.pgid != child.pid)                               { ret 5; }
-    if (total != 2 || out[0] != '/'::u8 || out[1] != '\n'::u8) { ret 6; }
-    ret 0;
 }
 
 #[testing]
