@@ -16,7 +16,10 @@
 # of the page, so reading or writing even one byte past it faults at the exact
 # moment it happens; any other request leaves fewer than `align` bytes of
 # slack before the guard. the cost is one guard page per live allocation,
-# which is why this belongs in tests and not in production.
+# which is why this belongs in tests and not in production. a host that cannot
+# protect a page (wasi's linear memory) places blocks the same way with the
+# guard page left readable, so an overrun there is not caught, and poison,
+# failure injection and accounting are unchanged.
 #
 # ## poison
 #
@@ -70,6 +73,8 @@ use std.types.size.usize;
 use std.allocator;
 use std.system.capability;
 
+use io_error: std.io.error;
+
 $if (capability.HAS_PAGES) {
     use std.allocator.page;
     use std.system.os;
@@ -86,7 +91,8 @@ pub val POISON_FREE: u8 = 0xDE;
 # how many live allocations one instance can track at once
 pub val MAX_TRACKED: usize = 4096;
 # the open-addressed table holding them, twice the cap so a lookup stays short
-val SLOTS: usize = 8192;
+val SLOTS:       usize = 8192;
+val TABLE_BYTES: usize = SLOTS * $size_of(Block);
 
 # the attempt made no request at ordinal zero
 pub val WALK_NONALLOCATING: i32 = -1;
@@ -161,7 +167,8 @@ pub rec Testing {
     # `fail_at`; a test that trips this needs a bigger `MAX_TRACKED`
     exhausted: usize;
 
-    blocks: [8192]Block;
+    # the table of SLOTS blocks, on pages of its own so the instance fits any stack
+    blocks: *Block;
 }
 
 fun page_span(size: usize) usize {
@@ -201,7 +208,8 @@ fun map_guarded(size: usize, align: usize, out_map: *ptr, out_span: *usize) ptr 
     if (map == nil) { ret nil; }
 
     # the trailing page is the guard: unreadable, so a one-byte overrun faults
-    if (os.protect((map::usize + payload)::ptr, ps, os.PROT_NONE::u32) < 0) {
+    val protected: i64 = os.protect((map::usize + payload)::ptr, ps, os.PROT_NONE::u32);
+    if (protected < 0 && os.error_kind(protected) != io_error.UNSUPPORTED) {
         os.deallocate(map, span);
         ret nil;
     }
@@ -352,14 +360,17 @@ fun do_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usi
 
 # initialize a testing allocator
 #
-# the instance owns the mappings it hands out, so it must outlive every
-# allocation made through it, and `dnit` must run while those are still
-# reachable.
+# the instance owns its tracking table and the mappings it hands out, so it
+# must outlive every allocation made through it, and `dnit` must run while
+# those are still reachable.
 # ---
 # t:   the instance to initialize
-# ret: ok, or `invalid` when t is nil
+# ret: ok, `invalid` when t is nil, or `exhausted` when the table cannot be mapped
 pub fun init(t: *Testing) err[allocator.Error] {
     if (t == nil) { ret err[allocator.Error].err{allocator.Error.invalid{}}; }
+    # pages come back zeroed, so every slot starts empty
+    t.blocks = os.allocate(TABLE_BYTES)::*Block;
+    if (t.blocks == nil) { ret err[allocator.Error].err{allocator.Error.exhausted{}}; }
 
     t.fail_at            = 0;
     t.sticky             = false;
@@ -379,11 +390,6 @@ pub fun init(t: *Testing) err[allocator.Error] {
     t.double_frees       = 0;
     t.size_mismatches    = 0;
     t.exhausted          = 0;
-    var i: usize = 0;
-    for (i < SLOTS) {
-        t.blocks[i].state = 0;
-        i                 = i + 1;
-    }
 
     t.a.ctx           = (t)::ptr;
     t.a.fn_allocate   = do_allocate;
@@ -534,14 +540,15 @@ pub fun clean(t: *Testing) bool {
     ret t.live == 0 && t.double_frees == 0 && t.size_mismatches == 0 && t.exhausted == 0;
 }
 
-# release everything still outstanding and reset the counters
+# release everything still outstanding, the tracking table with it, and reset
+# the live counters
 #
-# leaks are reported by `leaked` before this runs; afterwards the instance is
-# clean and can be reused.
+# leaks are reported by `leaked` before this runs. afterwards the instance
+# holds nothing, a second dnit reclaims nothing, and `init` makes it usable again.
 # ---
 # ret: how many live allocations had to be reclaimed, which is the leak count
 pub fun dnit(t: *Testing) usize {
-    if (t == nil) { ret 0; }
+    if (t == nil || t.blocks == nil) { ret 0; }
     var reclaimed: usize = 0;
     var i:         usize = 0;
     for (i < SLOTS) {
@@ -549,9 +556,10 @@ pub fun dnit(t: *Testing) usize {
             os.deallocate(t.blocks[i].map, t.blocks[i].span);
             reclaimed = reclaimed + 1;
         }
-        t.blocks[i].state = 0;
-        i                 = i + 1;
+        i = i + 1;
     }
+    os.deallocate(t.blocks::ptr, TABLE_BYTES);
+    t.blocks     = nil;
     t.live       = 0;
     t.live_bytes = 0;
     ret reclaimed;
