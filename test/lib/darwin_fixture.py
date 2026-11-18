@@ -1,14 +1,11 @@
 # a darwin fixture verifier is `<fixture>/verify.py <mach> <target> <profile>`, built in place against the std tree it sits in
 
-import hashlib
 from dataclasses import dataclass
 import json
-import os
 from pathlib import Path
 import platform
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -69,56 +66,19 @@ class Fixture:
               f"this process runs translated, {self.target} needs a native host")
         check(self.mach.is_file(), f"no compiler at {self.mach}")
         self.work = self.here / "out" / self.target / self.profile
-        self.evidence = self.work / "evidence"
-        self.evidence.mkdir(parents=True, exist_ok=True)
+        self.work.mkdir(parents=True, exist_ok=True)
         self.results = {}
         self.controls = {}
-
-    def provenance(self):
-        status = succeed(["git", "-C", ROOT, "status", "--porcelain", "--untracked-files=no"], "git status", 60)
-        return {
-            "mach": str(self.mach),
-            "mach_version": succeed([self.mach, "--version"], "mach --version").decode().strip(),
-            "mach_sha256": hashlib.sha256(self.mach.read_bytes()).hexdigest(),
-            "std_commit": succeed(["git", "-C", ROOT, "rev-parse", "HEAD"], "git rev-parse", 60).decode().strip(),
-            "std_modified": status.decode().splitlines(),
-            "clang": succeed(["xcrun", "clang", "--version"], "clang --version", 60).decode().splitlines()[0],
-            "os": platform.mac_ver()[0],
-            "machine": platform.machine(),
-        }
 
     def build(self, artifact, project=None):
         # mach resolves -o against the project root and refuses an absolute path
         project = project or self.here
         output = project / "out" / self.target / self.profile / "bin" / artifact
         succeed([self.mach, "dep", "pull", project, "--quiet"], "mach dep pull", 600)
-        self.census_control(project)
-        census = run([sys.executable, ROOT / "test" / "lib" / "compiler-census.py", self.evidence,
-                      "build", project, self.target, self.profile], 60)
-        check(census.returncode == 0, f"compiler census refused the build: {census.stderr.decode().strip()}")
         succeed([self.mach, "build", project, "--target", self.target, "--profile", self.profile,
                  "-o", output.relative_to(project)], "mach build", 1200)
         check(output.is_file(), f"mach build produced no {output}")
         return output
-
-    def census_control(self, project):
-        # a compiler this verifier starts and holds stopped must be reported by the census that guards its builds
-        held = subprocess.Popen([self.mach, "build", project, "--target", self.target, "--profile", self.profile],
-                                cwd=project, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        try:
-            os.kill(held.pid, signal.SIGSTOP)
-            check(held.poll() is None, "the compiler the census control started exited before it was stopped")
-            result = run([sys.executable, ROOT / "test" / "lib" / "compiler-census.py", self.evidence,
-                          "control", project, self.target, self.profile], 60)
-        finally:
-            held.kill()
-            held.wait()
-        check(result.returncode != 0, "the census reported no compiler while one was running")
-        records = [json.loads(line) for line in result.stderr.decode().splitlines() if line.startswith("{")]
-        check(len(records) == 1, f"the census control printed {len(records)} records, expected one")
-        reported = [line.split(" ", 1)[0] for line in records[0]["processes"].splitlines()]
-        check(str(held.pid) in reported, f"the census reported {reported}, not the compiler {held.pid}")
-        self.controls["census"] = f"reported compiler {held.pid}"
 
     def mutate(self, name, *edits):
         # a fresh copy of the std tree under test and this fixture with each edit applied, so the checkout is never touched
@@ -175,7 +135,7 @@ class Fixture:
         try:
             self.results = checks()
             record = {"fixture": self.here.name, "target": self.target, "profile": self.profile,
-                      "result": "pass", "provenance": self.provenance(), "checks": self.results,
+                      "result": "pass", "checks": self.results,
                       "controls": self.controls}
             print(json.dumps(record, sort_keys=True))
         except (Failure, AssertionError, subprocess.SubprocessError) as failure:

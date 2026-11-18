@@ -10,7 +10,6 @@ profile=debug
 case "$target" in windows-*) profile=windows-opt0 ;; esac
 runner="${3:-}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$here/../lib/compiler.sh"
 cd "$here"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
@@ -39,7 +38,7 @@ decode() {
 
 echo "building the terminate-child probe with $mach (target $target)"
 rm -rf out
-mach_run build . --target "$target" --profile "$profile"
+"$mach" build . --target "$target" --profile "$profile"
 exe="$(find out -name 'terminate_child_probe*' -type f -print -quit)"
 [ -n "$exe" ] || fail "no terminate_child_probe binary produced"
 exe="$(cd "$(dirname "$exe")" && pwd)/$(basename "$exe")"

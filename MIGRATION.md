@@ -2104,9 +2104,10 @@ syscall argument on Linux (inline asm, `{data}` operand), the libSystem
 fun` declared `*^u8`, the descriptor's handle and file pointer pinned by
 `windows.shared.positioned_begin`/`positioned_end`, the discipline the public
 `read_at` and `write_at` now share). Nothing in the boundary yields a `*u8`,
-`ptr` or integer view of a borrow, and `test/backends/verify-ir.py` keeps
-pinning that the boundary's IR materializes no `ptrtoint`/`inttoptr` and that
-the wipe precedes the native release. The table is process-wide and typed
+`ptr` or integer view of a borrow, `test/secret/verify.sh` pins that the
+compiler refuses one, and `std.memory.secret`'s
+`release__wipes_before_success_or_failure` test pins that the wipe precedes the
+native release. The table is process-wide and typed
 (its entries hold `*^u8`, so it lives in a `secret_allocate_typed` region and
 grows by doubling under a spinlock), the way a kernel keeps the descriptor
 table and user code keeps integers.

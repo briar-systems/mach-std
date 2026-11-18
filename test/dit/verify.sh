@@ -15,7 +15,6 @@ mach="${1:-mach}"
 target="${2:-linux-aarch64}"
 runner="${3:-}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$here/../lib/compiler.sh"
 cd "$here"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
@@ -37,7 +36,7 @@ decode() {
 
 echo "building the dit probes with $mach (target $target)"
 rm -rf out
-mach_run build . --target "$target"
+"$mach" build . --target "$target"
 secret="$(find out -name 'secret' -type f -print -quit)"
 plain="$(find out -name 'plain' -type f -print -quit)"
 [ -n "$secret" ] && [ -n "$plain" ] || fail "no probe binaries produced"

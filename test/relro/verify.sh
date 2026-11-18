@@ -24,7 +24,6 @@ mach="${1:-mach}"
 target="${2:-linux}"
 runner="${3:-}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$here/../lib/compiler.sh"
 cd "$here"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
@@ -37,8 +36,8 @@ echo "building the RELRO probes with $mach (target $target)"
 rm -rf out
 # the manifest declares two bins; a plain build is intentionally ambiguous, so
 # select each probe explicitly.
-mach_run build . -a relro_happy --target "$target" --profile debug
-mach_run build . -a relro_fault --target "$target" --profile debug
+"$mach" build . -a relro_happy --target "$target" --profile debug
+"$mach" build . -a relro_fault --target "$target" --profile debug
 happy="$(find out -name relro_happy -type f -print -quit)"
 fault="$(find out -name relro_fault -type f -print -quit)"
 [ -n "$happy" ] || fail "no relro_happy binary produced"

@@ -10,10 +10,8 @@ python3 test/socket-darwin/verify.py <mach> darwin-aarch64 release
 
 `test/lib/darwin_fixture.py` owns how a darwin fixture is built and run: std
 resolves from the tree under test through `../..`, the C oracles build with the host
-SDK, and a pass prints one JSON record with the compiler, the std commit and every
-check result. Any failure or timeout exits nonzero with the failing check.
-Before each build it starts a compiler, holds it stopped and requires the compiler
-census to report that process by PID, then stops it by that PID.
+SDK, and a pass prints one JSON record with every check result. Any failure or
+timeout exits nonzero with the failing check.
 `test/lib/darwin-fixtures.py <mach> <target> <profile>` runs every fixture that owns
 a `verify.py` and declares the target in its `mach.toml`.
 
@@ -64,5 +62,5 @@ verifier. Production source carries no injection hooks.
   The receive consumes the queued rights with the clean prefix, so the prefix read is
   refused and the descriptors are no longer owned by the queue.
 
-std's own socket, TCP, UDP and async tests run through `test/native/verify.sh` and
-`mach test . --all` on darwin.
+std's own socket, TCP, UDP and async tests run through `mach test . --all` on
+darwin.

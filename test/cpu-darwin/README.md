@@ -1,11 +1,21 @@
 # Darwin active CPU query probe
 
-The native verifier uses checksum-verified mach release pinned for the family in briar-systems/.github on both Darwin architectures in debug and release. SDK C checks the exact sysctlbyname signature and LP64 widths. Native object imports and Mach's single libSystem dependency are retained.
+`verify.py` checks `os.cpu_count` and its `sysctlbyname` binding against the host
+SDK. Run it on a native darwin host whose architecture matches the target, once per
+profile, or run every darwin fixture with `test/lib/darwin-fixtures.py`:
 
-Native C and Mach observe hw.activecpu around the ordinary wrapper and also record hw.ncpu. Those samples are observations, not an equality or mathematical bound on changes between calls. Each direct query must return a complete positive int. An invalid-name native C call establishes the actual failure value required from the direct Mach binding.
+```sh
+python3 test/cpu-darwin/verify.py <mach> darwin-aarch64 debug
+python3 test/cpu-darwin/verify.py <mach> darwin-aarch64 release
+```
 
-The verifier appends provider.mach only to its owned std snapshot and copies scripted.mach into the fixture only for instrumentation. It checks the exact hw.activecpu selector, pointer shape, int capacity and read-only request. It returns7 for the exact selector, tests zero/negative counts, short/long lengths and the largest positive int. Its failed-query case invokes the real native invalid-name query, then deliberately publishes a positive output with that failure result so the wrapper must honor the result guard independently. No scripted state is part of production.
+- `native.c` statically checks the SDK's `sysctlbyname` signature and the LP64
+  widths, and prints the host's `hw.activecpu` and `hw.ncpu` around a third read.
+- `cpu observe` reads `hw.activecpu` directly around the wrapper and `hw.ncpu`,
+  and requires every answer to be a positive count.
+- `cpu errors` queries a name that does not exist through the direct binding and
+  must print exactly what `native.c errors` prints: the failing result, the errno
+  and the untouched output.
 
-Six source mutations produce eight runtime controls per profile. They alter selector, capacity, failed-result handling, output-length handling, nonpositive handling and result width. Every control must reach its exact child assertion. Native and scripted baselines are restored and rerun. Timeouts and compile failures never count as semantic evidence.
-
-The production API reports the currently active processor count with its existing minimum-one policy. It does not promise per-process affinity limits, cache topology, a stable value over time or an error-reporting API.
+The wrapper's minimum-one policy is the production contract. It does not promise
+affinity limits, topology or a value stable over time.

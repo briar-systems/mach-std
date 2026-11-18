@@ -10,8 +10,7 @@ that spawned the probe through the OS layer with `wait4`, a `dup2`-redirected
 stdout pipe, an `execve` of a missing program (127), a `chdir` into a missing
 directory (126) and a wait on a foreign pid (ECHILD).
 
-It executes natively only, so CI's macos jobs run it on both architectures.
-From linux, `verify.sh <mach> <darwin-target> --build-only` cross-builds both
-profiles without running anything. The old known-failure gate that lived here
-is gone: the native suite has no known failures and `test/native/verify.sh`
-carries the empty per-target policy files.
+It executes natively only: on a macos host, `verify.sh <mach> darwin-aarch64`
+or `verify.sh <mach> darwin-x86_64` on the matching architecture. From any
+other host, `verify.sh <mach> <darwin-target> --build-only` cross-builds both
+profiles without running anything.

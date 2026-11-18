@@ -12,7 +12,6 @@ set -euo pipefail
 
 mach="${1:-mach}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$here/../lib/compiler.sh"
 root="$(cd "$here/../.." && pwd)"
 work="$here/out/probe"
 
@@ -60,7 +59,7 @@ EOF
 build() {
     rm -rf out
     set +e
-    log="$(mach_run build . --profile debug 2>&1)"
+    log="$("$mach" build . --profile debug 2>&1)"
     code=$?
     set -e
 }

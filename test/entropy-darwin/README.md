@@ -1,11 +1,19 @@
-# Darwin ordinary entropy boundary probe
+# Darwin entropy boundary probe
 
-The native verifier uses the checksum-verified mach release pinned for the family in briar-systems/.github on both Darwin architectures in debug and release. SDK C signature, minimum-platform annotation and actual import spelling are checked before Mach execution. Native C errors establish the exact producer values required from the ordinary wrapper. Oversized native failure must leave its owned buffer unchanged.
+`verify.py` checks `os.random_fill` and its `getentropy` binding against the host
+SDK. Run it on a native darwin host whose architecture matches the target, once per
+profile, or run every darwin fixture with `test/lib/darwin-fixtures.py`:
 
-Baseline smoke probes cover zero length and spans of 1,255,256,257,512 and1025 bytes with exact surrounding guards. They check actual native completion without treating random output as a deterministic oracle or asserting statistical quality. Existing crypto/rand tests run separately.
+```sh
+python3 test/entropy-darwin/verify.py <mach> darwin-aarch64 debug
+python3 test/entropy-darwin/verify.py <mach> darwin-aarch64 release
+```
 
-The verifier appends provider.mach only to its owned std snapshot and copies scripted.mach into the fixture source only for instrumentation. The public production declaration and loop have no scripted-provider state. The provider records exact destination addresses, chunk lengths and call counts while filling a known pattern. On its selected second call it invokes the real native getentropy with an oversized request. The test requires the actual native error, the completed256-byte prefix and an unchanged suffix. This proves the existing partial-prefix contract rather than adding rollback or secret-storage wiping.
-
-Six independent mutations break the chunk limit, destination advancement, progress, last-byte completion, stop-on-failure and errno sign. Every mutation must reach its named runtime assertion. Source and fixture are restored exactly, and both restored native and scripted baselines run again. No timeout or compilation failure counts as a passing mutation.
-
-The secret-shaped getentropy declaration and its stronger wipe-on-failure owner remain separate. This migration does not erase secret pointer types, change Linux/Windows, add a random generator or change the ordinary entropy source.
+- `native.c` statically checks the SDK's `getentropy` signature and the LP64 widths.
+- `entropy smoke` fills spans of 0, 1, 255, 256, 257, 512 and 1025 bytes between
+  guard bytes through `std.crypto.rand`, which crosses `getentropy`'s 256-byte limit
+  in the wrapper's chunk loop, and requires both guards intact. It does not judge the
+  randomness.
+- `entropy errors` makes an oversized and an invalid request through the binding
+  and the wrapper. Its line must equal `native.c errors`: the errnos the SDK
+  reports, and an oversized failure leaves its buffer untouched.

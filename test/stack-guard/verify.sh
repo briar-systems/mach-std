@@ -16,7 +16,6 @@ profile=debug
 case "$target" in windows-*) profile=windows-opt0 ;; esac
 runner="${3:-}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$here/../lib/compiler.sh"
 cd "$here"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
@@ -25,7 +24,7 @@ fail() { echo "FAIL: $1" >&2; exit 1; }
 
 echo "building the stack guard probe with $mach (target $target)"
 rm -rf out
-mach_run build . --target "$target" --profile "$profile"
+"$mach" build . --target "$target" --profile "$profile"
 exe="$(find out -name 'stack_guard_probe*' -type f -print -quit)"
 [ -n "$exe" ] || fail "no stack_guard_probe binary produced"
 exe="$(cd "$(dirname "$exe")" && pwd)/$(basename "$exe")"

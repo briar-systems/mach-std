@@ -7,11 +7,10 @@ profile=debug
 case "$target" in windows-*) profile=windows-opt0 ;; esac
 runner="${3:-}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$here/../lib/compiler.sh"
 root="$(cd "$here/../.." && pwd)"
 
 "$mach" dep pull "$here" --quiet
 
 args=(test "$here" --target "$target" --profile "$profile")
 if [ -n "$runner" ]; then args+=(--runner "$runner"); fi
-mach_run "${args[@]}"
+"$mach" "${args[@]}"

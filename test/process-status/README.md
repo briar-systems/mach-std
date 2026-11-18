@@ -105,8 +105,7 @@ the slot and invalidates its group token.
 
 `verify.sh [mach] [target] [runner]` builds the C child with `$CC` (default
 `cc`), realizes this checkout with `mach dep pull`, builds the probe and runs
-it against the child; CI runs it on every native leg beside the tracked child
-termination probe. The `std.system.os.process_status` and `std.process.exec`
+it against the child. The `std.system.os.process_status` and `std.process.exec`
 inline tests cover the decoders and the result boundary.
 
 References:
