@@ -4,7 +4,7 @@ std 10.0.0 pairs with mach 7.
 
 ## bool is u1 (#1005)
 
-`std.types.bool.bool` is now `def bool: u1`, and `true` and `false` are `u1`. A `u1` is one byte holding 0 or 1, which comparisons, `&&`, `||`, `!` and `sel` produce and a condition requires. It has `&`, `|`, `^`, `==` and ordering, and no arithmetic. std builds with mach b039331 or later. `mach migrate` rewrites the alias and every `asm` head, and the compiler warns of the two forms below while the family moves. `[project] mach` stays `^6` until a 7.x release exists.
+`std.types.bool.bool` is now `def bool: u1`, and `true` and `false` are `u1`. A `u1` is one byte holding 0 or 1, which comparisons, `&&`, `||`, `!` and `sel` produce and a condition requires. It has `&`, `|`, `^`, `==` and ordering, and no arithmetic. std builds with mach b039331 or later. `mach migrate` rewrites the alias and every `asm` head, and the compiler warns of the two forms below while the family moves. `[project] mach` is `^7`.
 
 | 9.x | 10.0.0 |
 | --- | --- |

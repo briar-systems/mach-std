@@ -29,7 +29,7 @@ cat > "$work/mach.toml" <<'TOML'
 [project]
 id = "freestanding_probe"
 version = "0.0.0"
-mach = ">=6, <8"
+mach = "^7"
 src = "src"
 work = "out/{target.name}/{profile.name}"
 
