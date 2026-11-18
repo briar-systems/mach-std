@@ -18,7 +18,7 @@ system, and from the OS on aarch64 (linux auxv AT_HWCAP, darwin sysctl),
 where the id registers are not readable from user mode, and on riscv64 linux
 (riscv_hwprobe, else auxv AT_HWCAP). a freestanding aarch64 or riscv build
 without the cpu group reports only what it selects, so the portable path
-runs.
+runs, and so does every wasm32 build, which has no query at all.
 
 selecting an extension admits its instructions and nothing more. selecting
 `dit`, when it exists, will say the instructions may be emitted, never that
@@ -99,6 +99,14 @@ pub rec Features {
     zicsr:    bool;
     zifencei: bool;
     zkt:      bool;
+}
+```
+
+Where `$mach.build.arch == $mach.arch.wasm32`:
+
+```mach
+pub rec Features {
+    simd128: bool;
 }
 ```
 

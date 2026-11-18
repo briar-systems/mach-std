@@ -639,8 +639,9 @@ pub fun heap_region_extend(addr: usize) usize
 
 move the region's end up to addr
 
-the region is contiguous, so it stops growing once pages from `allocate` lie
-past it
+the region is contiguous: it takes kept pages that start where it ends, then
+new memory once it reaches the end of linear memory, so it stops growing
+while pages `allocate` handed out lie past it
 
 ### protect
 
@@ -769,6 +770,9 @@ Forwards [`std.system.os.wasi.preview1.sync_fd`](wasi/preview1.md#sync_fd), only
 ```mach
 pub fun sync_fd(fd: i32) i64
 ```
+
+the preview syncs files, and a host may refuse a directory, which is the host
+not supporting it rather than a bad descriptor
 
 ### stat
 
@@ -991,6 +995,9 @@ Forwards [`std.system.os.wasi.preview1.seek`](wasi/preview1.md#seek), only where
 ```mach
 pub fun seek(fd: i32, offset: i64, whence: i32) i64
 ```
+
+a directory has no position here: each cursor reads from cookie zero, so
+rewinding one moves nothing and any other seek on it is unsupported
 
 ### lock_fd
 

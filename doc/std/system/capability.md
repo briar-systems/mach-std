@@ -41,6 +41,7 @@ Source: [`src/system/capability.mach`](../../../src/system/capability.mach)
 | [`HOSTED`](#constants) | std.system.os resolves on this target: its core group is present |
 | [`HAS_PAGES`](#constants), [`HAS_CLOCK`](#constants), [`HAS_ENTROPY`](#constants), [`HAS_THREADS`](#constants), [`HAS_FILES`](#constants), [`HAS_IO_QUEUE`](#constants), [`HAS_SOCKETS`](#constants), [`HAS_PROCESS`](#constants) | |
 | [`REUSE_PORT_BALANCES`](#constants) | SO_REUSEPORT spreads a port's connections and datagrams across the sockets bound to it |
+| [`HAS_FILE_MODES`](#constants) | the files group's stat reports permission bits and set_mode changes them |
 | [`HAS_CPU_FEATURES`](#constants) | std.system.os fills std.system.cpu.features.Features on this target |
 
 ---
@@ -59,5 +60,6 @@ Source: [`src/system/capability.mach`](../../../src/system/capability.mach)
 | `HAS_SOCKETS` | `bool` | `(GROUPS & SOCKETS) != 0` |  |
 | `HAS_PROCESS` | `bool` | `(GROUPS & PROCESS) != 0` |  |
 | `REUSE_PORT_BALANCES` | `bool` | `$mach.build.sys == $mach.sys.linux` | SO_REUSEPORT spreads a port's connections and datagrams across the sockets bound to it |
+| `HAS_FILE_MODES` | `bool` | `HAS_FILES && $mach.build.sys != $mach.sys.wasi` | the files group's stat reports permission bits and set_mode changes them |
 | `HAS_CPU_FEATURES` | `bool` | `(GROUPS & CPU) != 0` | std.system.os fills std.system.cpu.features.Features on this target |
 

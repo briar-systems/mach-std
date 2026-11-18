@@ -18,7 +18,7 @@ no longer one does. a path under no preopen is ENOENT.
 threads, the io queue, sockets and cpu features are groups this row does not
 claim, so nothing here names them. everything the process group claims and
 the preview cannot do answers ENOTSUP: there is no spawn, wait, pid or
-open-file limit, and symlinks, locks, modes and file mappings stop there too.
+open-file limit, and locks, modes and file mappings stop there too.
 
 Source: [`src/system/os/wasi/preview1.mach`](../../../../../src/system/os/wasi/preview1.mach)
 
@@ -46,10 +46,14 @@ Uses types from [`std.system.file_identity`](../../file_identity.md).
 | :--- | :--- |
 | [`read`](#read), [`write`](#write), [`read_at`](#read_at), [`write_at`](#write_at) | |
 | [`open`](#open) | open a path, the rights asked for cut to what its directory may pass on |
-| [`close`](#close), [`sync_fd`](#sync_fd), [`access`](#access), [`set_mode`](#set_mode), [`set_mode_at`](#set_mode_at), [`file_identity`](#file_identity), [`identity_at`](#identity_at) | |
+| [`close`](#close) | |
+| [`sync_fd`](#sync_fd) | the preview syncs files, and a host may refuse a directory, which is the host not supporting it rather than a bad descriptor |
+| [`access`](#access), [`set_mode`](#set_mode), [`set_mode_at`](#set_mode_at), [`file_identity`](#file_identity), [`identity_at`](#identity_at) | |
 | [`retain_identity_at`](#retain_identity_at) | a handle that only names a file does not exist here, so metadata alone is ENOTSUP |
 | [`publication_capabilities`](#publication_capabilities) | no file claims without advisory locks |
-| [`unlink`](#unlink), [`rename`](#rename), [`symlink`](#symlink), [`make_dir`](#make_dir), [`seek`](#seek), [`lock_fd`](#lock_fd), [`pipe`](#pipe), [`map_file`](#map_file), [`sync_file`](#sync_file) | |
+| [`unlink`](#unlink), [`rename`](#rename), [`symlink`](#symlink), [`make_dir`](#make_dir) | |
+| [`seek`](#seek) | a directory has no position here: each cursor reads from cookie zero, so rewinding one moves nothing and any other seek on it is unsupported |
+| [`lock_fd`](#lock_fd), [`pipe`](#pipe), [`map_file`](#map_file), [`sync_file`](#sync_file) | |
 | [`getcwd`](#getcwd) | the preview has one directory the program starts in, the root |
 | [`capture_process`](#capture_process) | take the arguments and the environment from the host, before main |
 | [`arguments`](#arguments), [`argument_total`](#argument_total), [`environ`](#environ), [`getenv`](#getenv), [`terminate`](#terminate), [`abort`](#abort) | |
@@ -197,6 +201,9 @@ pub fun close(fd: i32) i64
 pub fun sync_fd(fd: i32) i64
 ```
 
+the preview syncs files, and a host may refuse a directory, which is the host
+not supporting it rather than a bad descriptor
+
 ### access
 
 ```mach
@@ -272,6 +279,9 @@ pub fun make_dir(dirfd: i32, path: *u8, mode: i32) i64
 ```mach
 pub fun seek(fd: i32, offset: i64, whence: i32) i64
 ```
+
+a directory has no position here: each cursor reads from cookie zero, so
+rewinding one moves nothing and any other seek on it is unsupported
 
 ### lock_fd
 

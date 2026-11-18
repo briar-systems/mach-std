@@ -1779,7 +1779,12 @@ Forwards the first of these whose condition holds:
 pub fun terminate_group(group: i64) i64
 ```
 
-the group token is the child pid, pinned until its retained process handle closes
+terminate every process in a group's job without reaping its child
+
+the group token is the child pid, pinned until its retained process handle
+closes. reaping the child closes its job and ends every process left in it,
+so a group whose child is gone has no process left: ESRCH, as kill gives for
+an empty group on posix.
 
 ### probe_group
 

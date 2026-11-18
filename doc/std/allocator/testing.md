@@ -20,7 +20,10 @@ a request whose size is a multiple of its alignment ends on the last byte
 of the page, so reading or writing even one byte past it faults at the exact
 moment it happens; any other request leaves fewer than `align` bytes of
 slack before the guard. the cost is one guard page per live allocation,
-which is why this belongs in tests and not in production.
+which is why this belongs in tests and not in production. a host that cannot
+protect a page (wasi's linear memory) places blocks the same way with the
+guard page left readable, so an overrun there is not caught, and poison,
+failure injection and accounting are unchanged.
 
 ## poison
 
@@ -98,7 +101,7 @@ Uses types from [`std.allocator`](../allocator.md).
 | [`size_mismatch_count`](#size_mismatch_count) | how many frees and reallocates named an owned block with another size |
 | [`tracking_exhausted`](#tracking_exhausted) | true when tracking filled up, which makes the other counters unreliable |
 | [`clean`](#clean) | nothing outstanding, nothing released wrongly, and tracking never filled |
-| [`dnit`](#dnit) | release everything still outstanding and reset the counters |
+| [`dnit`](#dnit) | release everything still outstanding, the tracking table with it, and reset the live counters |
 
 | On `Outcome` | |
 | :--- | :--- |
@@ -165,7 +168,8 @@ pub rec Testing {
     # `fail_at`; a test that trips this needs a bigger `MAX_TRACKED`
     exhausted: usize;
 
-    blocks: [8192]Block;
+    # the table of SLOTS blocks, on pages of its own so the instance fits any stack
+    blocks: *Block;
 }
 ```
 
@@ -182,14 +186,14 @@ pub fun init(t: *Testing) err[std.allocator.Error]
 
 initialize a testing allocator
 
-the instance owns the mappings it hands out, so it must outlive every
-allocation made through it, and `dnit` must run while those are still
-reachable.
+the instance owns its tracking table and the mappings it hands out, so it
+must outlive every allocation made through it, and `dnit` must run while
+those are still reachable.
 
 | Parameter | |
 | :--- | :--- |
 | `t` | the instance to initialize |
-| **returns** | ok, or `invalid` when t is nil |
+| **returns** | ok, `invalid` when t is nil, or `exhausted` when the table cannot be mapped |
 
 ### allocator_of
 
@@ -401,10 +405,11 @@ nothing outstanding, nothing released wrongly, and tracking never filled
 pub fun dnit(t: *Testing) usize
 ```
 
-release everything still outstanding and reset the counters
+release everything still outstanding, the tracking table with it, and reset
+the live counters
 
-leaks are reported by `leaked` before this runs; afterwards the instance is
-clean and can be reused.
+leaks are reported by `leaked` before this runs. afterwards the instance
+holds nothing, a second dnit reclaims nothing, and `init` makes it usable again.
 
 | Parameter | |
 | :--- | :--- |

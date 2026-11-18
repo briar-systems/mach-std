@@ -110,7 +110,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`spawn_redirected_in_grouped_native`](#spawn_redirected_in_grouped_native) | spawn as spawn_redirected_in_grouped does, from nul-terminated UTF-16 given as is |
 | [`spawn_command_line`](#spawn_command_line) | spawn a program from a verbatim native command line, inheriting the streams |
 | [`terminate_child`](#terminate_child) | forcefully stop a spawned child without reaping it |
-| [`terminate_group`](#terminate_group) | the group token is the child pid, pinned until its retained process handle closes |
+| [`terminate_group`](#terminate_group) | terminate every process in a group's job without reaping its child |
 | [`probe_group`](#probe_group) | whether any process is left in a group's job |
 | [`getpid`](#getpid) | return the current process ID |
 | [`open_file_limit`](#open_file_limit) | windows has no settable per-process descriptor limit: handles are bounded by kernel memory, so neither query nor set has a faithful answer |
@@ -1152,7 +1152,17 @@ same child; concurrent waits on one child are not supported.
 pub fun terminate_group(group: i64) i64
 ```
 
-the group token is the child pid, pinned until its retained process handle closes
+terminate every process in a group's job without reaping its child
+
+the group token is the child pid, pinned until its retained process handle
+closes. reaping the child closes its job and ends every process left in it,
+so a group whose child is gone has no process left: ESRCH, as kill gives for
+an empty group on posix.
+
+| Parameter | |
+| :--- | :--- |
+| `group` | the group token from a grouped spawn |
+| **returns** | 0 on success, ESRCH once no process is left, or another negative errno |
 
 ### probe_group
 

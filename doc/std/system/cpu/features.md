@@ -19,11 +19,6 @@ an extension. the SELECTED_* values say what the build target selects: a
 selected extension is required by the binary, so it is reported present
 without a probe.
 
-a row the compiler added after std's floor sits behind CRYPTO_ROWS, the
-version gate for that release. an older compiler never reads the untaken
-branch, and since it cannot require the extension, its SELECTED_* value is
-false and the field is whatever the probe finds.
-
 Source: [`src/system/cpu/features.mach`](../../../../src/system/cpu/features.mach)
 
 | Type | | |
@@ -42,7 +37,7 @@ Source: [`src/system/cpu/features.mach`](../../../../src/system/cpu/features.mac
 | :--- | :--- |
 | [`SELECTED_SHA`](#constants), [`SELECTED_SSSE3`](#constants), [`SELECTED_SSE41`](#constants), [`SELECTED_AES`](#constants), [`SELECTED_PCLMUL`](#constants), [`SELECTED_SHA2`](#constants), [`SELECTED_PMULL`](#constants), [`SELECTED_I`](#constants), [`SELECTED_M`](#constants), [`SELECTED_A`](#constants), [`SELECTED_F`](#constants), [`SELECTED_D`](#constants), [`SELECTED_C`](#constants), [`SELECTED_ZICSR`](#constants), [`SELECTED_ZIFENCEI`](#constants), [`SELECTED_ZKT`](#constants) | |
 | [`HWPROBE_BASE_BEHAVIOR`](#constants) | riscv_hwprobe keys, and the bits of the two values std reads |
-| [`HWPROBE_IMA_EXT_0`](#constants) | |
+| [`HWPROBE_IMA_EXT_0`](#constants), [`SELECTED_SIMD128`](#constants) | |
 
 ---
 
@@ -88,6 +83,14 @@ pub rec Features {
 }
 ```
 
+Where `$mach.build.arch == $mach.arch.wasm32`:
+
+```mach
+pub rec Features {
+    simd128: bool;
+}
+```
+
 x86_64 extensions std detects
 
 | Field | Type | |
@@ -115,6 +118,12 @@ pub fun selected() Features
 ```
 
 Where `$mach.build.arch == $mach.arch.riscv64 || $mach.build.arch == $mach.arch.riscv32`:
+
+```mach
+pub fun selected() Features
+```
+
+Where `$mach.build.arch == $mach.arch.wasm32`:
 
 ```mach
 pub fun selected() Features
@@ -194,10 +203,10 @@ decode AT_HWCAP, which names single-letter extensions only
 | `SELECTED_SHA` | `bool` | `$mach.build.ext.sha == 1` where `$mach.build.arch == $mach.arch.x86_64` |  |
 | `SELECTED_SSSE3` | `bool` | `$mach.build.ext.ssse3 == 1` where `$mach.build.arch == $mach.arch.x86_64` |  |
 | `SELECTED_SSE41` | `bool` | `$mach.build.ext.sse41 == 1` where `$mach.build.arch == $mach.arch.x86_64` |  |
-| `SELECTED_AES` | `bool` | `$mach.build.ext.aes == 1` where `$mach.build.arch == $mach.arch.x86_64` and `CRYPTO_ROWS`; `false` where `$mach.build.arch == $mach.arch.x86_64`; `$mach.build.ext.aes == 1` where `$mach.build.arch == $mach.arch.aarch64` and `CRYPTO_ROWS`; `false` where `$mach.build.arch == $mach.arch.aarch64` |  |
-| `SELECTED_PCLMUL` | `bool` | `$mach.build.ext.pclmul == 1` where `$mach.build.arch == $mach.arch.x86_64` and `CRYPTO_ROWS`; `false` where `$mach.build.arch == $mach.arch.x86_64` |  |
+| `SELECTED_AES` | `bool` | `$mach.build.ext.aes == 1` where `$mach.build.arch == $mach.arch.x86_64`; `$mach.build.ext.aes == 1` where `$mach.build.arch == $mach.arch.aarch64` |  |
+| `SELECTED_PCLMUL` | `bool` | `$mach.build.ext.pclmul == 1` where `$mach.build.arch == $mach.arch.x86_64` |  |
 | `SELECTED_SHA2` | `bool` | `$mach.build.ext.sha2 == 1` where `$mach.build.arch == $mach.arch.aarch64` and not `$mach.build.arch == $mach.arch.x86_64` |  |
-| `SELECTED_PMULL` | `bool` | `$mach.build.ext.pmull == 1` where `$mach.build.arch == $mach.arch.aarch64` and not `$mach.build.arch == $mach.arch.x86_64` and `CRYPTO_ROWS`; `false` where `$mach.build.arch == $mach.arch.aarch64` and not `$mach.build.arch == $mach.arch.x86_64` |  |
+| `SELECTED_PMULL` | `bool` | `$mach.build.ext.pmull == 1` where `$mach.build.arch == $mach.arch.aarch64` and not `$mach.build.arch == $mach.arch.x86_64` |  |
 | `SELECTED_I` | `bool` | `$mach.build.ext.i == 1` where `$mach.build.arch == $mach.arch.riscv64 \|\| $mach.build.arch == $mach.arch.riscv32` and not `$mach.build.arch == $mach.arch.x86_64` nor `$mach.build.arch == $mach.arch.aarch64` |  |
 | `SELECTED_M` | `bool` | `$mach.build.ext.m == 1` where `$mach.build.arch == $mach.arch.riscv64 \|\| $mach.build.arch == $mach.arch.riscv32` and not `$mach.build.arch == $mach.arch.x86_64` nor `$mach.build.arch == $mach.arch.aarch64` |  |
 | `SELECTED_A` | `bool` | `$mach.build.ext.a == 1` where `$mach.build.arch == $mach.arch.riscv64 \|\| $mach.build.arch == $mach.arch.riscv32` and not `$mach.build.arch == $mach.arch.x86_64` nor `$mach.build.arch == $mach.arch.aarch64` |  |
@@ -209,4 +218,5 @@ decode AT_HWCAP, which names single-letter extensions only
 | `SELECTED_ZKT` | `bool` | `$mach.build.ext.zkt == 1` where `$mach.build.arch == $mach.arch.riscv64 \|\| $mach.build.arch == $mach.arch.riscv32` and not `$mach.build.arch == $mach.arch.x86_64` nor `$mach.build.arch == $mach.arch.aarch64` |  |
 | `HWPROBE_BASE_BEHAVIOR` | `i64` | `3` where `$mach.build.arch == $mach.arch.riscv64 \|\| $mach.build.arch == $mach.arch.riscv32` and not `$mach.build.arch == $mach.arch.x86_64` nor `$mach.build.arch == $mach.arch.aarch64` | riscv_hwprobe keys, and the bits of the two values std reads |
 | `HWPROBE_IMA_EXT_0` | `i64` | `4` where `$mach.build.arch == $mach.arch.riscv64 \|\| $mach.build.arch == $mach.arch.riscv32` and not `$mach.build.arch == $mach.arch.x86_64` nor `$mach.build.arch == $mach.arch.aarch64` |  |
+| `SELECTED_SIMD128` | `bool` | `$mach.build.ext.simd128 == 1` where `$mach.build.arch == $mach.arch.wasm32` and not `$mach.build.arch == $mach.arch.x86_64`, `$mach.build.arch == $mach.arch.aarch64` nor `$mach.build.arch == $mach.arch.riscv64 \|\| $mach.build.arch == $mach.arch.riscv32` |  |
 

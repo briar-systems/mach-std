@@ -117,8 +117,9 @@ pub fun heap_region_extend(addr: usize) usize
 
 move the region's end up to addr
 
-the region is contiguous, so it stops growing once pages from `allocate` lie
-past it
+the region is contiguous: it takes kept pages that start where it ends, then
+new memory once it reaches the end of linear memory, so it stops growing
+while pages `allocate` handed out lie past it
 
 | Parameter | |
 | :--- | :--- |

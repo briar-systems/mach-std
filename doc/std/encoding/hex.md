@@ -21,7 +21,7 @@ Source: [`src/encoding/hex.mach`](../../../src/encoding/hex.mach)
 ### encoded_len
 
 ```mach
-pub fun encoded_len(src_len: usize) usize
+pub fun encoded_len(src_len: usize) opt[usize]
 ```
 
 return the buffer size required to encode src_len bytes (including null terminator)
@@ -29,7 +29,7 @@ return the buffer size required to encode src_len bytes (including null terminat
 | Parameter | |
 | :--- | :--- |
 | `src_len` | number of source bytes |
-| **returns** | required destination buffer size |
+| **returns** | required destination buffer size, none when it does not fit usize |
 
 ### decoded_len
 

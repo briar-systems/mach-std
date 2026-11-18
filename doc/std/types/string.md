@@ -380,7 +380,7 @@ must be a str, enforced at compile time.
 | :--- | :--- |
 | `a` | allocator for the result |
 | `va` | strings to concatenate, in order |
-| **returns** | the joined string, or the allocator's refusal |
+| **returns** | the joined string, the allocator's refusal, or overflow when the total length does not fit usize |
 
 ### str_trim
 

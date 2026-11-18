@@ -28,9 +28,9 @@ nothing turns the mode on at start or per thread. `enable`, `disable` and
 `msr dit, 1` then `dsb nsh; isb sy`.
 
 the module imports no other std module but bool, so the runtimes and
-crypto.ct can call it without a cycle. the tests that need the OS's answer
-live in std.system.cpu. the module builds on every target, so the entry
-points can reference it unconditionally.
+crypto.ct can call it without a cycle. the test of `enable`, which needs the
+OS's answer through `os.cpu_dit`, lives in std.system.cpu. the module builds
+on every target, so the entry points can reference it unconditionally.
 
 Source: [`src/system/dit.mach`](../../../src/system/dit.mach)
 
