@@ -15,7 +15,9 @@ Uses types from [`std.allocator`](../../allocator.md), [`std.net.ip`](../ip.md),
 | [`allocate_endpoints`](#allocate_endpoints), [`valid`](#valid), [`within_limits`](#within_limits) | |
 | [`deduplicate`](#deduplicate) | compaction preserves the target resolver's first occurrence order |
 | [`append_unique`](#append_unique) | first occurrence wins, preserving the target resolver's policy order; a duplicate is a success that stores nothing, a full result is OVERLOADED |
-| [`set_canonical`](#set_canonical), [`canonical_fits`](#canonical_fits) | |
+| [`set_canonical`](#set_canonical) | |
+| [`is_localhost`](#is_localhost) | an RFC 6761 localhost name: `localhost` or any name under `.localhost`, case-insensitively, with an optional trailing dot |
+| [`canonical_fits`](#canonical_fits) | |
 
 ---
 
@@ -83,6 +85,15 @@ duplicate is a success that stores nothing, a full result is OVERLOADED
 ```mach
 pub fun set_canonical(output: *std.net.resolve.types.Resolution, name: str) err[std.net.resolve.types.Error]
 ```
+
+### is_localhost
+
+```mach
+pub fun is_localhost(hostname: str) bool
+```
+
+an RFC 6761 localhost name: `localhost` or any name under `.localhost`,
+case-insensitively, with an optional trailing dot
 
 ### canonical_fits
 
