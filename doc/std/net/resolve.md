@@ -62,11 +62,9 @@ pub rec Resolver {
     tail:           usize;
     count:          usize;
     live:           usize;
-    # slots examined by lookups and publication, for the scaling tests
-    steps: u64;
-    state: u8;
-    lock:  std.sync.mutex.Mutex;
-    ready: std.sync.condition.Condition;
+    state:          u8;
+    lock:           std.sync.mutex.Mutex;
+    ready:          std.sync.condition.Condition;
 }
 ```
 

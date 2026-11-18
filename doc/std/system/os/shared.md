@@ -28,7 +28,6 @@ Source: [`src/system/os/shared.mach`](../../../../src/system/os/shared.mach)
 | On `IoQueue` | |
 | :--- | :--- |
 | [`io_wake_claim`](#io_wake_claim) | whether this request must post the native wake: only the first since the last harvest does |
-| [`io_wake_posted`](#io_wake_posted) | the claimed wake was posted |
 | [`io_wake_harvested`](#io_wake_harvested) | the posted wake was taken, or a claimed one could not be posted |
 
 | On `ProcessStatus` | |
@@ -83,7 +82,6 @@ pub rec IoQueue {
     handle:       usize;
     wake:         usize;
     wake_pending: usize;
-    wakes_posted: usize;
 }
 ```
 
@@ -91,8 +89,7 @@ native wait queue state owned by the portable completion runtime
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `wake_pending` | `usize` | 1 from the first wake request until a poll harvests the posted wake, so later requests in that window post nothing |
-| `wakes_posted` | `usize` | native wakes actually posted, for the scaling tests  the two counters are words because a signal handler can wake the queue, and word atomics take no lock on any target |
+| `wake_pending` | `usize` | 1 from the first wake request until a poll harvests the posted wake, so later requests in that window post nothing  wake_pending is a word because a signal handler can wake the queue, and word atomics take no lock on any target |
 
 ### io_wake_claim
 
@@ -104,14 +101,6 @@ whether this request must post the native wake: only the first since the
 last harvest does. a later request finds its work done by the collector that
 harvests the posted wake, because the collector clears the flag after taking
 the wake and before it looks for work
-
-### io_wake_posted
-
-```mach
-pub fun io_wake_posted(queue: *IoQueue)
-```
-
-the claimed wake was posted
 
 ### io_wake_harvested
 

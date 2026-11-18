@@ -105,9 +105,7 @@ pub rec Driver {
     backend_destroyed: bool;
     cleanup_code:      i64;
     instance:          u64;
-    # entries examined by stream and listener claims, for the scaling tests
-    claim_steps: u64;
-    lock:        std.sync.mutex.Mutex;
+    lock:              std.sync.mutex.Mutex;
 }
 ```
 

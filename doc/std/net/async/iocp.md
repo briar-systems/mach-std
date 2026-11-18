@@ -140,7 +140,6 @@ pub rec Core {
     ready_tail:   u32;
     pending_head: u32;
     pending_tail: u32;
-    steps:        u64;
 }
 ```
 
@@ -154,7 +153,6 @@ pub rec Core {
 | `live_count` | `usize` | records in use, mapped or still draining |
 | `ready_head` | `u32` | oldest operation in the control-ready state |
 | `pending_head` | `u32` | an operation in the control-pending state |
-| `steps` | `u64` | map probes and list iterations, for the scaling tests |
 
 ### link
 

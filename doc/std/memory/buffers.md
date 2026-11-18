@@ -683,8 +683,6 @@ pub rec Snapshot {
     budget_refusals:     u64;
     backing_allocations: u64;
     release_failures:    u64;
-    # slot operations run so far, the trims and retained-chunk moves included
-    steps: u64;
 }
 ```
 
@@ -733,7 +731,6 @@ pub rec Pool {
     backing_allocations: u64;
     # backing releases the backing refused
     release_failures: u64;
-    steps:            u64;
 }
 ```
 

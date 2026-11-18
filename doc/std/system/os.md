@@ -746,7 +746,6 @@ pub rec IoQueue {
     handle:       usize;
     wake:         usize;
     wake_pending: usize;
-    wakes_posted: usize;
 }
 ```
 

@@ -150,13 +150,8 @@ pub rec Backend {
     queued_count:   usize;
     ready_count:    usize;
     sequence:       u64;
-    # native registration and address calls, counted for the scaling tests
-    watches:   u64;
-    rearms:    u64;
-    unwatches: u64;
     # registrations held, zero once destroy returns
     registered: usize;
-    locates:    u64;
     lock:       std.sync.mutex.Mutex;
 }
 ```
