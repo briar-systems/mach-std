@@ -2536,14 +2536,59 @@ test thread__threads_receive_distinct_userdata {
     ret 0;
 }
 
+# a waiter on its own word, which it reports entering and leaving
+#[testing]
+rec WordWaiter {
+    word:    *i64;
+    entered: i64;
+    result:  i64;
+    done:    i64;
+}
+
+#[testing]
+fun tw_wait_word(arg: *u8) {
+    val w: *WordWaiter = arg::*WordWaiter;
+    atomic.store(?w.entered, 1);
+    for (atomic.load(w.word) == 0) { w.result = thread_wait(w.word, 0); }
+    atomic.store(?w.done, 1);
+}
+
+#[testing]
+fun tw_wait_once(arg: *u8) {
+    val w: *WordWaiter = arg::*WordWaiter;
+    w.result = thread_wait(w.word, 0);
+    atomic.store(?w.done, 1);
+}
+
+# polls done for 20 seconds at most, so a lost wake fails rather than hangs
+#[testing]
+fun tw_finished(done: *i64) bool {
+    var polls: usize = 0;
+    for (atomic.load(done) == 0) {
+        if (polls >= 20000) { ret false; }
+        sleep(1000000);
+        polls = polls + 1;
+    }
+    ret true;
+}
+
 # thread_wait does not block when the word already differs from `expected`
 #
-# the guard that keeps `join` from sleeping on an already-finished thread. a
-# wait that ignored the comparison would hang here rather than fail.
+# the guard that keeps `join` from sleeping on an already-finished thread. the
+# wait runs on its own thread, so one that ignored the comparison fails here
 test thread_wait__returns_when_value_differs {
-    var word: i64 = 5;
-    if (thread_wait(?word, 0) != 0) { ret 1; }
-    if (word != 5)                  { ret 1; }
+    var word:   i64        = 5;
+    var waiter: WordWaiter = WordWaiter{word: ?word, entered: 0, result: -1, done: 0};
+    var t:      Thread;
+    if (tt_spawn(tw_wait_once, (?waiter)::*u8, ?t) < 0) { ret 1; }
+    if (!tw_finished(?waiter.done)) {
+        thread_wake(?word);
+        tt_join(?t);
+        ret 2;
+    }
+    tt_join(?t);
+    if (waiter.result != 0) { ret 1; }
+    if (word != 5)          { ret 1; }
     ret 0;
 }
 
@@ -2552,7 +2597,7 @@ test thread_wait__returns_when_value_differs {
 # the buckets are a hash table over addresses, so distinct words collide. this
 # builds a genuine collision rather than assuming one, and drives both to
 # completion. a `signal` in thread_wake instead of a `broadcast` can hand the
-# single wakeup to the wrong waiter here and stall.
+# single wakeup to the wrong waiter here, which fails the test.
 test thread_wake__colliding_wait_addresses_are_both_woken {
     var slots: [256]i64;
     var i:     usize = 0;
@@ -2580,16 +2625,36 @@ test thread_wake__colliding_wait_addresses_are_both_woken {
     }
     if (!found) { ret 1; }
 
+    # both threads sleep on their colliding words, both words change, and only
+    # a's is woken: a single signal would leave one of them asleep
+    var wa: WordWaiter = WordWaiter{word: ?slots[a], entered: 0, result: 0, done: 0};
+    var wb: WordWaiter = WordWaiter{word: ?slots[b], entered: 0, result: 0, done: 0};
     var ta: Thread;
     var tb: Thread;
-    if (tt_spawn(tw_add100, (?slots[a])::*u8, ?ta) < 0) { ret 1; }
-    if (tt_spawn(tw_add100, (?slots[b])::*u8, ?tb) < 0) { ret 1; }
+    if (tt_spawn(tw_wait_word, (?wa)::*u8, ?ta) < 0) { ret 1; }
+    if (tt_spawn(tw_wait_word, (?wb)::*u8, ?tb) < 0) {
+        atomic.store(?slots[a], 1);
+        thread_wake(?slots[a]);
+        tt_join(?ta);
+        ret 1;
+    }
+    for (atomic.load(?wa.entered) == 0 || atomic.load(?wb.entered) == 0) { sleep(1000000); }
+    # give both a moment to reach the sleep; a waiter not yet asleep only weakens the check
+    sleep(50000000);
+    atomic.store(?slots[a], 1);
+    atomic.store(?slots[b], 1);
+    thread_wake(?slots[a]);
 
+    var bad: i32 = 0;
+    if (!tw_finished(?wa.done) || !tw_finished(?wb.done)) {
+        bad = 2;
+        thread_wake(?slots[b]);
+        thread_wake(?slots[a]);
+    }
     tt_join(?ta);
     tt_join(?tb);
-
-    if (slots[a] != 100) { ret 1; }
-    if (slots[b] != 100) { ret 1; }
+    if (bad != 0)                         { ret bad; }
+    if (wa.result != 0 || wb.result != 0) { ret 3; }
     ret 0;
 }
 
@@ -3211,7 +3276,7 @@ test process__foreign_and_absent_pids_are_refused {
 # the child sweep closes every inherited descriptor above the standard three:
 # a pipe end the parent holds open is not held by the child, so the parent's
 # read sees EOF once the child has exec'd rather than blocking on it. the child
-# outlives the test, so a leaked pipe end hangs the read for the runner to catch
+# outlives the test, so the read is polled and a leaked pipe end fails it
 test spawn__child_does_not_inherit_a_parent_pipe {
     var fds: [2]i32;
     if (ls.pipe(?fds[0]) < 0) { ret 1; }
@@ -3228,8 +3293,21 @@ test spawn__child_does_not_inherit_a_parent_pipe {
         ret 2;
     }
     close(fds[1]);
-    var byte: u8;
-    val n:    i64 = read(fds[0], ?byte, 1);
+    val flags: i64 = file_flags(fds[0]);
+    if (flags < 0 || set_file_flags(fds[0], flags::i32 | O_NONBLOCK) < 0) {
+        close(fds[0]);
+        terminate_child(pid);
+        reap_exit_code(pid);
+        ret 5;
+    }
+    var byte:  u8;
+    var n:     i64   = read(fds[0], ?byte, 1);
+    var polls: usize = 0;
+    for (n == EAGAIN && polls < 20000) {
+        sleep(1000000);
+        n     = read(fds[0], ?byte, 1);
+        polls = polls + 1;
+    }
     close(fds[0]);
     val stopped: i64 = terminate_child(pid);
     reap_exit_code(pid);
