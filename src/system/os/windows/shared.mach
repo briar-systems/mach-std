@@ -1800,9 +1800,51 @@ fun wide_separator(unit: u16) bool {
     ret unit == '/'::u16 || unit == '\\'::u16;
 }
 
-# walk a relative wide path to the directory holding its final component
+# a drive-rooted path such as C:\dir names its directory without the working
+# directory, as an absolute path does on posix
+fun wide_drive_rooted(path: *u16) bool {
+    val letter: u16 = path[0] | 0x20;
+    ret letter >= 'a'::u16 && letter <= 'z'::u16 && path[1] == ':'::u16 && wide_separator(path[2]);
+}
+
+# open the directory a drive-rooted path's final component sits in, by the W API
+fun native_rooted_parent(path: *u16, parent: *NativeParent) i64 {
+    val length: usize = wide_len(path);
+    var last:   usize = length;
+    var at:     usize = 0;
+    for (at < length) {
+        if (wide_separator(path[at])) { last = at; }
+        at = at + 1;
+    }
+    if (last + 1 >= length) { ret EINVAL; }
+    # the drive's own root keeps its separator
+    var keep: usize = last;
+    if (keep == 2) { keep = 3; }
+    var prefix: WIDE_PATH;
+    prefix.size = (keep + 1) * 2;
+    prefix.data = allocate(prefix.size)::*u16;
+    if (prefix.data == nil) { ret ENOMEM; }
+    var i: usize = 0;
+    for (i < keep) {
+        prefix.data[i] = path[i];
+        i              = i + 1;
+    }
+    prefix.data[keep] = 0;
+    val opened: i64 = open_root_native(prefix.data);
+    wide_path_dnit(?prefix);
+    if (opened < 0) { ret opened; }
+    parent.fd     = opened::i32;
+    parent.owned  = true;
+    parent.leaf   = ?path[last + 1];
+    parent.length = length - last - 1;
+    ret 0;
+}
+
+# walk a relative wide path to the directory holding its final component. a
+# drive-rooted path against AT_FDCWD opens its parent directly
 fun native_parent(dirfd: i32, path: *u16, parent: *NativeParent) i64 {
     if (path == nil || path[0] == 0 || wide_separator(path[0])) { ret EINVAL; }
+    if (dirfd == AT_FDCWD && wide_drive_rooted(path))           { ret native_rooted_parent(path, parent); }
     var current: i32  = dirfd;
     var owned:   bool = false;
     if (dirfd == AT_FDCWD) {
@@ -4886,6 +4928,15 @@ pub fun temp_dir_native(buf: *u16, cap: usize) i64 {
     ret directory_read_native(true, buf, cap);
 }
 
+# make a test process's own directory under temp_dir. a mode with group and
+# other bits keeps the inherited dacl, as a directory a test makes elsewhere does
+#[testing]
+pub fun scratch_make(scratch: *os_shared.Scratch) i64 {
+    ret os_shared.scratch_create(scratch, os_shared.ScratchHost{
+        temp_dir: temp_dir, random_fill: random_fill, make_dir: make_dir, mode: 0o755, here: AT_FDCWD, exists: EEXIST, too_long: ENAMETOOLONG
+    });
+}
+
 # the native environment, captured once from the win32 environment block
 var _environ_vec:  **u16 = nil;
 var _environ_init: u8    = 0;
@@ -6054,7 +6105,7 @@ pub fun sock_remote_addr(fd: usize, addr: *u8, addrlen: *u32) i64 {
 val SO_ERROR: i32 = 0x1007;
 
 # a connect's own failure, read from SO_ERROR, or 0 when none is recorded
-pub fun sock_connect_status(fd: usize) i64 {
+fun sock_connect_status(fd: usize) i64 {
     var code:   i32 = 0;
     var length: u32 = 4;
     val result: i64 = sock_getopt(fd, SOL_SOCKET, SO_ERROR, (?code)::*u8, ?length);
@@ -6066,36 +6117,31 @@ pub fun sock_connect_status(fd: usize) i64 {
 # what sock_connect_begin and sock_connect_poll return while the connect is in flight
 pub val CONNECT_PENDING: i64 = 1;
 
-fun sock_set_nonblocking(fd: usize, enabled: bool) i64 {
+# switch a socket between blocking and nonblocking
+# ---
+# fd:      socket handle
+# enabled: true for nonblocking
+# ret:     0, or the native failure
+pub fun sock_set_nonblocking(fd: usize, enabled: bool) i64 {
     var mode: u32 = 0;
     if (enabled)                                                { mode = 1; }
     if (ws2_ioctlsocket(fd, 0x8004667e, ?mode) == SOCKET_ERROR) { ret wsa_last_error(); }
     ret 0;
 }
 
-# the end of a connect that is no longer in flight: the socket blocks again
-fun connect_settled(fd: usize, code: i64) i64 {
-    val restored: i64 = sock_set_nonblocking(fd, false);
-    if (code < 0)     { ret code; }
-    if (restored < 0) { ret restored; }
-    ret 0;
-}
-
-# start a connect on a blocking socket without blocking on it
+# start a connect on a nonblocking socket
 # ---
-# fd:      a blocking stream socket, nonblocking until the connect settles
+# fd:      a nonblocking stream socket
 # addr:    pointer to the peer's sockaddr
 # addrlen: size of the sockaddr
 # ret:     0 once connected, CONNECT_PENDING while in flight, or the negated
-#          errno winsock's failure maps to. a settled connect leaves the socket
-#          blocking again
+#          errno winsock's failure maps to
 pub fun sock_connect_begin(fd: usize, addr: *u8, addrlen: usize) i64 {
-    val made: i64 = sock_set_nonblocking(fd, true);
-    if (made < 0) { ret made; }
     val code: i64 = sock_connect(fd, addr, addrlen);
     # winsock reports a nonblocking connect in flight as WSAEWOULDBLOCK
     if (code == EAGAIN || code == EINPROGRESS) { ret CONNECT_PENDING; }
-    ret connect_settled(fd, code);
+    if (code < 0)                              { ret code; }
+    ret 0;
 }
 
 val SO_CONNECT_TIME: i32 = 0x700C;
@@ -6108,16 +6154,16 @@ val SO_CONNECT_TIME: i32 = 0x700C;
 # ---
 # fd:  the socket sock_connect_begin returned CONNECT_PENDING for
 # ret: 0 once connected, CONNECT_PENDING while in flight, or the connect's
-#      failure. a settled connect leaves the socket blocking again
+#      failure
 pub fun sock_connect_poll(fd: usize) i64 {
     val status: i64 = sock_connect_status(fd);
-    if (status < 0) { ret connect_settled(fd, status); }
+    if (status < 0) { ret status; }
     var seconds: u32 = 0;
     var length:  u32 = 4;
     val read:    i64 = sock_getopt(fd, SOL_SOCKET, SO_CONNECT_TIME, (?seconds)::*u8, ?length);
-    if (read < 0)              { ret connect_settled(fd, read); }
+    if (read < 0)              { ret read; }
     if (seconds == 0xFFFFFFFF) { ret CONNECT_PENDING; }
-    ret connect_settled(fd, 0);
+    ret 0;
 }
 
 pub fun sock_inheritable(fd: usize, out: *bool) i64 {
@@ -6288,16 +6334,28 @@ test symlink__long_unicode_relative_file_and_directory_targets {
         absolute_file[540 + i] = suffix[i];
         i                      = i + 1;
     }
-    val parent:         str = "mach_std_sl_unicode_parent";
-    val directory_link: str = "mach_std_sl_unicode_parent/link-\xe7\x95\x8c";
-    val file_link:      str = "mach_std_sl_unicode_parent/file-\xe7\x95\x8c";
+    var scratch: os_shared.Scratch;
+    if (scratch_make(?scratch) < 0) { ret 10; }
+    fin { remove_dir_utf8(os_shared.scratch_dir(?scratch)); }
+    var parent_path:    os_shared.ScratchPath;
+    var directory_path: os_shared.ScratchPath;
+    var file_path:      os_shared.ScratchPath;
+    var through_path:   os_shared.ScratchPath;
+    var target_path:    os_shared.ScratchPath;
+    var payload_path:   os_shared.ScratchPath;
+    val parent:         str = os_shared.scratch_path(?scratch, "parent", ?parent_path);
+    val directory_link: str = os_shared.scratch_path(?scratch, "parent/link-\xe7\x95\x8c", ?directory_path);
+    val file_link:      str = os_shared.scratch_path(?scratch, "parent/file-\xe7\x95\x8c", ?file_path);
+    val through:        str = os_shared.scratch_path(?scratch, "parent/link-\xe7\x95\x8c/payload", ?through_path);
+    val target_dir:     str = os_shared.scratch_path(?scratch, ?target[0], ?target_path);
+    val payload:        str = os_shared.scratch_path(?scratch, ?absolute_file[0], ?payload_path);
     if (make_dir_utf8(parent) < 0) { ret 1; }
-    if (make_dir_utf8(?target[0]) < 0) {
+    if (make_dir_utf8(target_dir) < 0) {
         remove_dir_utf8(parent);
         ret 2;
     }
     var bad:  i32 = 0;
-    val root: i64 = open_root_utf8(?target[0]);
+    val root: i64 = open_root_utf8(target_dir);
     if (root < 0) { bad = 3; }
     or {
         val file: i64 = open_relative_utf8(root::i32, "payload", 7, O_CREAT | O_EXCL | O_WRONLY, 0o644);
@@ -6308,14 +6366,14 @@ test symlink__long_unicode_relative_file_and_directory_targets {
         }
         close(root::i32);
     }
-    if (bad == 0 && symlink(?relative[0], directory_link) < 0)                                       { bad = 6; }
-    if (bad == 0 && !symlink_test_read_utf8("mach_std_sl_unicode_parent/link-\xe7\x95\x8c/payload")) { bad = 7; }
-    if (bad == 0 && symlink(?relative_file[0], file_link) < 0)                                       { bad = 8; }
-    if (bad == 0 && !symlink_test_read_utf8(file_link))                                              { bad = 9; }
+    if (bad == 0 && symlink(?relative[0], directory_link) < 0) { bad = 6; }
+    if (bad == 0 && !symlink_test_read_utf8(through))          { bad = 7; }
+    if (bad == 0 && symlink(?relative_file[0], file_link) < 0) { bad = 8; }
+    if (bad == 0 && !symlink_test_read_utf8(file_link))        { bad = 9; }
     remove_file_utf8(file_link);
     remove_dir_utf8(directory_link);
-    remove_file_utf8(?absolute_file[0]);
-    remove_dir_utf8(?target[0]);
+    remove_file_utf8(payload);
+    remove_dir_utf8(target_dir);
     remove_dir_utf8(parent);
     ret bad;
 }
@@ -6346,32 +6404,13 @@ test sync_fd__refuses_unsupported_filesystems_and_keeps_native_failures {
 }
 
 test sync_fd__flushes_the_pinned_ntfs_directory_and_releases_handles {
-    var root:  [40]u8;
-    var moved: [40]u8;
-    var nonce: [8]u8;
-    if (random_fill(?nonce[0], 8) < 0) { ret 1; }
-    val prefix: str   = "mach-sync-";
-    val hex:    str   = "0123456789abcdef";
-    var i:      usize = 0;
-    for (i < 10) {
-        root[i] = prefix[i];
-        i       = i + 1;
-    }
-    i = 0;
-    for (i < 8) {
-        root[10 + i * 2] = hex[(nonce[i] >> 4)::usize];
-        root[11 + i * 2] = hex[(nonce[i] & 15)::usize];
-        i                = i + 1;
-    }
-    root[26] = 0;
-    i        = 0;
-    for (i < 26) {
-        moved[i] = root[i];
-        i        = i + 1;
-    }
-    moved[26] = '-';
-    moved[27] = 'm';
-    moved[28] = 0;
+    var scratch: os_shared.Scratch;
+    if (scratch_make(?scratch) < 0) { ret 1; }
+    fin { remove_dir_utf8(os_shared.scratch_dir(?scratch)); }
+    var root:  os_shared.ScratchPath;
+    var moved: os_shared.ScratchPath;
+    os_shared.scratch_path(?scratch, "root", ?root);
+    os_shared.scratch_path(?scratch, "moved", ?moved);
     if (make_dir_utf8(?root[0]) < 0) { ret 2; }
     val opened: i64 = open_root_utf8(?root[0]);
     if (opened < 0) {
@@ -6387,7 +6426,7 @@ test sync_fd__flushes_the_pinned_ntfs_directory_and_releases_handles {
     var count_before: u32 = 0;
     var count_after:  u32 = 0;
     if (GetProcessHandleCount(-1, ?count_before) == 0) { bad = 5; }
-    i = 0;
+    var i: usize = 0;
     for (bad == 0 && i < 300) {
         if (sync_fd(fd) != 0) { bad = 6; }
         i = i + 1;
@@ -6746,8 +6785,11 @@ test spawn_in__unicode_executable_and_working_directory_round_trip {
     var original:        [8192]u8;
     val original_length: i64 = getcwd(?original[0], 8192);
     if (original_length <= 0 || original_length >= 8000) { ret 1; }
+    var scratch: os_shared.Scratch;
+    if (scratch_make(?scratch) < 0) { ret 16; }
+    fin { remove_dir_utf8(os_shared.scratch_dir(?scratch)); }
     var directory: [8192]u8;
-    val offset:    usize = process_append(?directory[0], 0, ?original[0]);
+    val offset:    usize = process_append(?directory[0], 0, os_shared.scratch_dir(?scratch));
     process_append(?directory[0], offset, "\\.std603-環😀");
     if (make_dir_utf8(?directory[0]) < 0) { ret 2; }
     var executable: [8192]u8;
@@ -6824,12 +6866,23 @@ fun wide_append(buf: *u16, offset: usize, text: *u8) usize {
 
 # the child finds its own executable by the argument's name only from the directory it starts in
 test spawn_in_native__an_unpaired_surrogate_reaches_the_executable_the_directory_and_an_argument {
-    var directory: [32]u16;
-    var end:       usize = wide_append(?directory[0], 0, ".std1055-");
+    var scratch: os_shared.Scratch;
+    if (scratch_make(?scratch) < 0) { ret 5; }
+    fin { remove_dir_utf8(os_shared.scratch_dir(?scratch)); }
+    var directory: [1100]u16;
+    var end:       usize      = 0;
+    val converted: Transcoded = utf8_to_utf16(?scratch.path[0], scratch.length, ?directory[0], 1024);
+    if (sel converted.done) { end = converted.done; }
+    if (end == 0)           { ret 6; }
+    end                = wide_append(?directory[0], end, "\\.std1055-");
     directory[end]     = 0xd800;
     directory[end + 1] = 0;
-    var executable: [48]u16;
-    end             = wide_append(?executable[0], 0, ".std1055-");
+    var executable: [1120]u16;
+    var i:          usize = 0;
+    for (i < end) {
+        executable[i] = directory[i];
+        i             = i + 1;
+    }
     executable[end] = 0xd800;
     end             = wide_append(?executable[0], end + 1, "\\");
     executable[end] = 0xd800;
@@ -7283,8 +7336,9 @@ fun directory_query_probe(handle: isize, event: isize, apc: ptr, context: ptr,
 
 test directory__capacity_protocol_keeps_long_entries_and_terminal_errors {
     if ($offset_of(FILE_DIRECTORY_INFORMATION, file_name) != 64) { ret 1; }
-    val base: str = "mach_directory_windows_capacity";
-    if (make_dir(AT_FDCWD, base, 0o700) < 0) { ret 2; }
+    var scratch: os_shared.Scratch;
+    if (scratch_make(?scratch) < 0) { ret 2; }
+    val base: str = os_shared.scratch_dir(?scratch);
     fin { unlink(AT_FDCWD, base, AT_REMOVEDIR); }
     val fd: i64 = open(AT_FDCWD, base, O_RDONLY | O_DIRECTORY, 0);
     if (fd < 0) { ret 3; }
@@ -7404,27 +7458,27 @@ test directory_reads__native_forms_report_a_path_with_no_utf_8_spelling {
     n           = n + 1;
     var here:   [4096]u16;
     val before: i64 = getcwd_native(?here[0], 4096);
-    if (before < 1)                                     { ret 1; }
-    if (make_dir_native(AT_FDCWD, ?name[0], 0o777) < 0) { ret 2; }
-    fin { unlink_native(AT_FDCWD, ?name[0], AT_REMOVEDIR); }
-    var full: [4096]u16;
-    var at:   usize = 0;
-    for (at < before::usize) {
-        full[at] = here[at];
-        at       = at + 1;
-    }
-    if (full[at - 1] != '\\'::u16) {
-        full[at] = '\\'::u16;
-        at       = at + 1;
-    }
+    if (before < 1) { ret 1; }
+    var scratch: os_shared.Scratch;
+    if (scratch_make(?scratch) < 0) { ret 13; }
+    fin { remove_dir_utf8(os_shared.scratch_dir(?scratch)); }
+    var full:      [4096]u16;
+    var at:        usize      = 0;
+    val converted: Transcoded = utf8_to_utf16(?scratch.path[0], scratch.length, ?full[0], 4000);
+    if (sel converted.done) { at = converted.done; }
+    if (at == 0)            { ret 14; }
+    full[at] = '\\'::u16;
+    at       = at + 1;
     var k: usize = 0;
     for (k <= n) {
         full[at + k] = name[k];
         k            = k + 1;
     }
     val full_length: usize = at + n;
-    var units:       [4096]u16;
-    var bytes:       [4096]u8;
+    if (make_dir_native(AT_FDCWD, ?full[0], 0o777) < 0) { ret 2; }
+    fin { unlink_native(AT_FDCWD, ?full[0], AT_REMOVEDIR); }
+    var units: [4096]u16;
+    var bytes: [4096]u8;
 
     var bad: i32 = 0;
     if (SetCurrentDirectoryW(?full[0]) == 0) { bad = 3; }
@@ -7452,28 +7506,6 @@ test directory_reads__native_forms_report_a_path_with_no_utf_8_spelling {
     if (unset)                                                                                                     { SetEnvironmentVariableW(?variable[0], nil); }
     or                                                                                                             { SetEnvironmentVariableW(?variable[0], ?previous[0]); }
     ret bad;
-}
-
-# a unique name in the working directory for one mode test
-#[testing]
-fun mode_test_name(prefix: str, out: *u8) bool {
-    var nonce: [8]u8;
-    if (random_fill(?nonce[0], 8) < 0) { ret false; }
-    val hex:    str   = "0123456789abcdef";
-    val length: usize = str_len(prefix);
-    var i:      usize = 0;
-    for (i < length) {
-        out[i] = prefix[i];
-        i      = i + 1;
-    }
-    i = 0;
-    for (i < 8) {
-        out[length + i * 2]     = hex[(nonce[i] >> 4)::usize];
-        out[length + i * 2 + 1] = hex[(nonce[i] & 15)::usize];
-        i                       = i + 1;
-    }
-    out[length + 16] = 0;
-    ret true;
 }
 
 # 0 when the handle's object is owned by the current user and its dacl is
@@ -7506,9 +7538,13 @@ fun owner_only_dacl(handle: isize) i32 {
 }
 
 test mode__owner_only_creation_gets_a_protected_owner_dacl {
-    var file: [48]u8;
-    var root: [48]u8;
-    if (!mode_test_name("mach-mode-file-", ?file[0]) || !mode_test_name("mach-mode-dir-", ?root[0])) { ret 1; }
+    var scratch: os_shared.Scratch;
+    if (scratch_make(?scratch) < 0) { ret 1; }
+    fin { remove_dir_utf8(os_shared.scratch_dir(?scratch)); }
+    var file: os_shared.ScratchPath;
+    var root: os_shared.ScratchPath;
+    os_shared.scratch_path(?scratch, "file", ?file);
+    os_shared.scratch_path(?scratch, "dir", ?root);
     val created: i64 = open(AT_FDCWD, ?file[0], O_WRONLY | O_CREAT | O_EXCL, 0o600);
     if (created < 0) { ret 2; }
     var bad: i32 = owner_only_dacl(get_handle(created::i32));
@@ -7554,8 +7590,11 @@ test mode__owner_only_creation_gets_a_protected_owner_dacl {
 
 test mode__set_mode_enforces_owner_only_modes_and_refuses_the_rest {
     if (set_mode(-1, 0o600) != EBADF) { ret 1; }
-    var file: [48]u8;
-    if (!mode_test_name("mach-mode-set-", ?file[0])) { ret 2; }
+    var scratch: os_shared.Scratch;
+    if (scratch_make(?scratch) < 0) { ret 2; }
+    fin { remove_dir_utf8(os_shared.scratch_dir(?scratch)); }
+    var file: os_shared.ScratchPath;
+    os_shared.scratch_path(?scratch, "file", ?file);
     val created: i64 = open(AT_FDCWD, ?file[0], O_RDWR | O_CREAT | O_EXCL, 0o644);
     if (created < 0) { ret 3; }
     val fd:     i32   = created::i32;
@@ -7581,12 +7620,17 @@ test mode__set_mode_enforces_owner_only_modes_and_refuses_the_rest {
 }
 
 test mode__stat_reports_the_enforced_owner_mode {
-    var file:  [48]u8;
-    var tool:  [48]u8;
-    var plain: [48]u8;
-    var root:  [48]u8;
-    if (!mode_test_name("mach-mode-rw-", ?file[0]) || !mode_test_name("mach-mode-rwx-", ?tool[0]))  { ret 1; }
-    if (!mode_test_name("mach-mode-def-", ?plain[0]) || !mode_test_name("mach-mode-sd-", ?root[0])) { ret 2; }
+    var scratch: os_shared.Scratch;
+    if (scratch_make(?scratch) < 0) { ret 1; }
+    fin { remove_dir_utf8(os_shared.scratch_dir(?scratch)); }
+    var file:  os_shared.ScratchPath;
+    var tool:  os_shared.ScratchPath;
+    var plain: os_shared.ScratchPath;
+    var root:  os_shared.ScratchPath;
+    os_shared.scratch_path(?scratch, "rw", ?file);
+    os_shared.scratch_path(?scratch, "rwx", ?tool);
+    os_shared.scratch_path(?scratch, "default", ?plain);
+    os_shared.scratch_path(?scratch, "dir", ?root);
     var bad: i32 = 0;
     var st:  stat_t;
     val rw:  i64 = open(AT_FDCWD, ?file[0], O_WRONLY | O_CREAT | O_EXCL, 0o600);

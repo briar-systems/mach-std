@@ -342,7 +342,7 @@ Every entry that performs a lookup takes a `*std.sync.cancel.Scope`, as `process
 
 `conf.Config.timeout_ms` stays: it is the resolver's own policy (`options timeout:` in resolv.conf), how long one request waits before the next server is tried, and it never outlasts the scope. A lookup the scope ends reports why: `lookup.Outcome` gains `ended: cancel.Reason`, which the adapters and `std.net.dns` report as `CANCELLED`, `TIMED_OUT`, or `INVALID` (native code 3 for a destroyed scope, 4 for a nil one). The asynchronous resolver hands its adapter a scope of the operation's own, which ends when the caller's scope, a token cancellation, the runtime or the deadline ends the operation, so its workers are held to the same bound. `std.net.dns` now needs the threads and clock capabilities as well as sockets.
 
-`std.net.tcp.connect_within(ep, scope)` is new: a connect that never blocks, whose wait the scope ends within about a millisecond, on the OS contract's new `sock_connect_begin` and `sock_connect_poll`.
+`std.net.tcp.connect_within(ep, scope)` is new: a connect that never blocks, whose wait the scope ends within about a millisecond, on the OS contract's new `sock_connect_begin`, `sock_connect_poll` and `sock_set_nonblocking`. The readiness backends start and settle their connects on the same pair, and `std.system.os.<os>.sock_connect_status` is no longer exported.
 
 | 9.x | 10.0.0 |
 | --- | --- |
