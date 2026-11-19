@@ -332,6 +332,27 @@ A long-running program that keeps many secrets may need a higher `RLIMIT_MEMLOCK
 | `std.types.string.owned_release` | `std.types.string.owned_dnit` |
 | `std.types.string.str_empty` | `std.types.string.str_is_empty` |
 
+## name lookups run under a cancellation scope
+
+Every entry that performs a lookup takes a `*std.sync.cancel.Scope`, as `process.exec.wait_within` does, and holds one contract on every platform: when the scope ends, the call returns within 10 ms (`shared.POLL_MSEC`) with the scope's reason, and holds nothing of the caller's afterwards. What the system is still doing for an abandoned lookup is the implementation's business and never reaches the caller.
+
+- linux asks its nameservers itself. Every wait, the UDP receives and the TCP retry's connect, send and receive alike, blocks for at most 10 ms before it asks the scope again. The TCP retry connects with the new `tcp.connect_within`.
+- windows calls `GetAddrInfoExW` asynchronously into a request the library owns, waits for its completion under the scope, and on the scope's end asks `GetAddrInfoExCancel` to end it and returns. The completion frees the request whenever the system delivers it.
+- darwin's `getaddrinfo` cannot be interrupted, so it runs on a helper thread that owns the request, strings and result included. The caller returns when the scope ends, and the helper frees everything when the system lets it finish. A lookup costs a thread, which may outlive the call by the system's own timeout.
+
+`conf.Config.timeout_ms` stays: it is the resolver's own policy (`options timeout:` in resolv.conf), how long one request waits before the next server is tried, and it never outlasts the scope. A lookup the scope ends reports why: `lookup.Outcome` gains `ended: cancel.Reason`, which the adapters and `std.net.dns` report as `CANCELLED`, `TIMED_OUT`, or `INVALID` (native code 3 for a destroyed scope, 4 for a nil one). The asynchronous resolver hands its adapter a scope of the operation's own, which ends when the caller's scope, a token cancellation, the runtime or the deadline ends the operation, so its workers are held to the same bound. `std.net.dns` now needs the threads and clock capabilities as well as sockets.
+
+`std.net.tcp.connect_within(ep, scope)` is new: a connect that never blocks, whose wait the scope ends within about a millisecond, on the OS contract's new `sock_connect_begin` and `sock_connect_poll`.
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `dns.query(hostname, addr)`, `dns.resolve(hostname, addr)` | `dns.query(scope, hostname, addr)`, `dns.resolve(scope, hostname, addr)` |
+| `lookup.query_name(config, hostname, domain, v4, v6, answer)` | `lookup.query_name(config, scope, hostname, domain, v4, v6, answer)` |
+| `lookup.resolve_name(config, hostname, v4, v6, answer)` | `lookup.resolve_name(config, scope, hostname, v4, v6, answer)` |
+| `types.AdapterFun`: `fun(ptr, *Query, *Allocator, ResultLimits, *Resolution) Error` | `fun(ptr, *cancel.Scope, *Query, *Allocator, ResultLimits, *Resolution) Error` |
+| `linux.resolve(query, ...)`, `darwin.resolve(query, ...)`, `windows.resolve(query, ...)` | `resolve(scope, query, ...)` |
+| `linux.resolve_with_config(query, ..., config)` | `linux.resolve_with_config(scope, query, ..., config)` |
+
 # std 6.x to 7.0.0
 
 std 7.0.0 makes the memory behind `io.runtime` reachable (#677). A runtime takes the allocator every one of its allocations comes from, and every driver registered on it draws from the same allocator.

@@ -1,4 +1,11 @@
 # DNS lookup over the target's configured nameservers
+#
+# a lookup runs under the caller's cancellation scope: when the scope ends, it
+# returns within shared.POLL_MSEC with the scope's reason and holds no socket.
+# every wait blocks for at most that long before it asks the scope again, the
+# TCP retry's connect included. the configuration's timeout_ms is the
+# resolver's own policy, how long one request waits before the next server is
+# tried, and never outlasts the scope
 
 use std.chrono.duration;
 use std.chrono.time;
@@ -6,14 +13,18 @@ use std.crypto.rand;
 use io_error: std.io.error;
 use std.net.ip;
 use std.net.resolve.conf;
+use std.net.resolve.shared;
 use std.net.resolve.wire;
 use std.net.tcp;
 use std.net.udp;
+use std.sync.atomic;
+use std.sync.cancel;
 use std.sync.thread;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
@@ -27,7 +38,9 @@ pub val MAX_ADDRS: usize = 32;
 # no_name:   every nameserver answered and none knows the name
 # temporary: a nameserver did not answer in time; retrying may succeed
 # failed:    no nameserver is configured or no family was requested
-pub tag Outcome: u8 { found; no_name; temporary; failed; }
+# ended:     the scope ended the lookup first, with its reason (invalid for a
+#            nil scope)
+pub tag Outcome: u8 { found; no_name; temporary; failed; ended: cancel.Reason; }
 
 # a completed lookup: addresses in response order, A before AAAA merge order
 # preserved per query, and the final CNAME target when a chain was followed
@@ -45,6 +58,35 @@ rec Pending {
     message_length: usize;
     answered:       bool;
     found_name:     bool;
+}
+
+# what the next receive of a server visit may do
+# ---
+# lapsed: the visit's own deadline passed, or the clock cannot bound it
+# ended:  the scope ended, with its reason
+# slice:  block for at most this many milliseconds, then ask again
+tag Wait: u8 { lapsed; ended: cancel.Reason; slice: u64; }
+
+fun next_wait(scope: *cancel.Scope, deadline: time.Instant) Wait {
+    val why: cancel.Reason = shared.scope_reason(scope);
+    if (!sel why.active) { ret Wait.ended{why}; }
+    val res_now: time.InstantClock = time.instant();
+    if (sel res_now.err) { ret Wait.lapsed{}; }
+    val remaining: i64 = duration.duration_msec(time.instant_sub(deadline, res_now.ok));
+    if (remaining <= 0)               { ret Wait.lapsed{}; }
+    if (remaining > shared.POLL_MSEC) { ret Wait.slice{shared.POLL_MSEC::u64}; }
+    ret Wait.slice{remaining::u64};
+}
+
+# a receive that ran out its slice or was interrupted, to be asked again
+fun waited_out(failure: io_error.Error) bool {
+    ret failure.kind == io_error.TIMEOUT || io_error.retryable(failure);
+}
+
+fun visit_deadline(timeout_ms: u64) opt[time.Instant] {
+    val res_started: time.InstantClock = time.instant();
+    if (sel res_started.err) { ret opt[time.Instant].none{}; }
+    ret opt[time.Instant].some{time.instant_add(res_started.ok, (timeout_ms::i64) * duration.MILLISECOND)};
 }
 
 fun endpoint_matches(a: ip.Endpoint, b: ip.Endpoint) bool {
@@ -92,12 +134,24 @@ fun absorb(pending: *Pending, parsed: *wire.Parsed, addrs: *ip.Addr, answer: *An
     ret false;
 }
 
-# retry one truncated query over TCP against the same server
-fun exchange_tcp(server: ip.Endpoint, pending: *Pending, timeout_ms: u64, answer: *Answer) bool {
-    val res_connected: res[tcp.Stream, io_error.Error] = tcp.connect(server);
-    if (sel res_connected.err) { ret false; }
+# retry one truncated query over TCP against the same server, waiting at most
+# timeout_ms for its answer
+# ---
+# ret: active when the retry ran to its end, whether or not it answered the
+#      query, or the reason the scope ended it
+fun exchange_tcp(server: ip.Endpoint, pending: *Pending, timeout_ms: u64, scope: *cancel.Scope, answer: *Answer) cancel.Reason {
+    val opt_deadline: opt[time.Instant] = visit_deadline(timeout_ms);
+    # an unreadable clock cannot bound the wait, so the retry ends as if it lapsed
+    if (sel opt_deadline.none) { ret cancel.Reason.active{}; }
+    # the connect waits under the lookup's scope narrowed to this visit's deadline
+    var visit:    cancel.Scope;
+    val err_made: cancel.Operation = cancel.make_child(?visit, scope, opt_deadline);
+    if (sel err_made.err) { ret shared.scope_reason(scope); }
+    val res_connected: res[tcp.Stream, io_error.Error] = tcp.connect_within(server, ?visit);
+    cancel.dnit(?visit);
+    if (sel res_connected.err) { ret shared.scope_reason(scope); }
     var stream: tcp.Stream = res_connected.ok;
-    tcp.stream_set_read_timeout(?stream, timeout_ms);
+    fin { tcp.stream_close(?stream); }
 
     var framed: [322]u8;
     framed[0] = (pending.message_length >> 8)::u8;
@@ -110,15 +164,9 @@ fun exchange_tcp(server: ip.Endpoint, pending: *Pending, timeout_ms: u64, answer
     var sent: usize = 0;
     for (sent < pending.message_length + 2) {
         val res_wrote: res[usize, io_error.Error] = tcp.stream_write(?stream, ?framed[sent], pending.message_length + 2 - sent);
-        if (sel res_wrote.err) {
-            tcp.stream_close(?stream);
-            ret false;
-        }
+        if (sel res_wrote.err) { ret cancel.Reason.active{}; }
         val n: usize = res_wrote.ok;
-        if (n == 0) {
-            tcp.stream_close(?stream);
-            ret false;
-        }
+        if (n == 0) { ret cancel.Reason.active{}; }
         sent = sent + n;
     }
 
@@ -126,39 +174,41 @@ fun exchange_tcp(server: ip.Endpoint, pending: *Pending, timeout_ms: u64, answer
     var received: usize = 0;
     var expected: usize = 2;
     for (received < expected) {
+        val wait: Wait = next_wait(scope, opt_deadline.some);
+        if (sel wait.ended)  { ret wait.ended; }
+        if (!sel wait.slice) { ret cancel.Reason.active{}; }
+        tcp.stream_set_read_timeout(?stream, wait.slice);
         val res_stream_read: res[usize, io_error.Error] = tcp.stream_read(?stream, ?response[received], expected - received);
         if (sel res_stream_read.err) {
-            tcp.stream_close(?stream);
-            ret false;
+            if (waited_out(res_stream_read.err)) { cnt; }
+            ret cancel.Reason.active{};
         }
         val n: usize = res_stream_read.ok;
-        if (n == 0) {
-            tcp.stream_close(?stream);
-            ret false;
-        }
+        if (n == 0) { ret cancel.Reason.active{}; }
         received = received + n;
         if (received == 2 && expected == 2) {
             val body: usize = (response[0]::usize << 8) | response[1]::usize;
-            if (body < wire.HEADER_LENGTH || body > wire.MAX_MESSAGE - 2) {
-                tcp.stream_close(?stream);
-                ret false;
-            }
+            if (body < wire.HEADER_LENGTH || body > wire.MAX_MESSAGE - 2) { ret cancel.Reason.active{}; }
             expected = body + 2;
         }
     }
-    tcp.stream_close(?stream);
 
     var addrs:  [32]ip.Addr;
     var parsed: wire.Parsed;
     if (!wire.parse(?response[2], received - 2, pending.id, pending.qtype, ?addrs[0], 32,
-        ?answer.canonical[0], 254, ?parsed)) { ret false; }
-    if (parsed.truncated) { ret false; }
-    ret absorb(pending, ?parsed, ?addrs[0], answer);
+        ?answer.canonical[0], 254, ?parsed)) { ret cancel.Reason.active{}; }
+    if (parsed.truncated) { ret cancel.Reason.active{}; }
+    absorb(pending, ?parsed, ?addrs[0], answer);
+    ret cancel.Reason.active{};
 }
 
 # one UDP visit to a server: send the unanswered queries, then absorb
-# matching responses until all are answered or the timeout lapses
-fun exchange(server: ip.Endpoint, pending: *Pending, pending_count: usize, timeout_ms: u64, answer: *Answer) {
+# matching responses until all are answered or timeout_ms lapses
+# ---
+# ret: active when the visit ran to its end, or the reason the scope ended it
+fun exchange(server: ip.Endpoint, pending: *Pending, pending_count: usize, timeout_ms: u64, scope: *cancel.Scope, answer: *Answer) cancel.Reason {
+    val why: cancel.Reason = shared.scope_reason(scope);
+    if (!sel why.active) { ret why; }
     var res_created: res[udp.Socket, io_error.Error];
     if (server.addr.is_v6 != 0) {
         res_created = udp.create_v6();
@@ -166,8 +216,9 @@ fun exchange(server: ip.Endpoint, pending: *Pending, pending_count: usize, timeo
     or {
         res_created = udp.create();
     }
-    if (sel res_created.err) { ret; }
+    if (sel res_created.err) { ret why; }
     var socket: udp.Socket = res_created.ok;
+    fin { udp.socket_close(?socket); }
 
     var outstanding: usize = 0;
     var i:           usize = 0;
@@ -175,37 +226,29 @@ fun exchange(server: ip.Endpoint, pending: *Pending, pending_count: usize, timeo
         if (!pending[i].answered) {
             val res_sent: res[usize, io_error.Error] = udp.send_to(?socket,
                 ?pending[i].message[0], pending[i].message_length, server);
-            if (sel res_sent.err) {
-                udp.socket_close(?socket);
-                ret;
-            }
+            if (sel res_sent.err) { ret why; }
             outstanding = outstanding + 1;
         }
         i = i + 1;
     }
-    if (outstanding == 0) {
-        udp.socket_close(?socket);
-        ret;
-    }
+    if (outstanding == 0) { ret why; }
 
+    val opt_deadline: opt[time.Instant] = visit_deadline(timeout_ms);
     # an unreadable clock cannot bound the wait, so the visit ends as if it lapsed
-    val res_started: time.InstantClock = time.instant();
-    if (sel res_started.err) {
-        udp.socket_close(?socket);
-        ret;
-    }
-    val deadline: time.Instant = time.instant_add(res_started.ok, (timeout_ms::i64) * duration.MILLISECOND);
+    if (sel opt_deadline.none) { ret why; }
     for (outstanding != 0) {
-        val res_now: time.InstantClock = time.instant();
-        if (sel res_now.err) { brk; }
-        val remaining: i64 = duration.duration_msec(time.instant_sub(deadline, res_now.ok));
-        if (remaining <= 0) { brk; }
-        udp.socket_set_recv_timeout(?socket, remaining::u64);
+        val wait: Wait = next_wait(scope, opt_deadline.some);
+        if (sel wait.ended)  { ret wait.ended; }
+        if (!sel wait.slice) { brk; }
+        udp.socket_set_recv_timeout(?socket, wait.slice);
 
         var response:      [4096]u8;
         var source:        ip.Endpoint;
         val res_recv_from: res[usize, io_error.Error] = udp.recv_from(?socket, ?response[0], 4096, ?source);
-        if (sel res_recv_from.err) { brk; }
+        if (sel res_recv_from.err) {
+            if (waited_out(res_recv_from.err)) { cnt; }
+            brk;
+        }
         val length: usize = res_recv_from.ok;
         if (!endpoint_matches(source, server)) { cnt; }
 
@@ -223,19 +266,30 @@ fun exchange(server: ip.Endpoint, pending: *Pending, pending_count: usize, timeo
                 cnt;
             }
             if (parsed.truncated && parsed.rcode == wire.RCODE_OK) {
-                if (exchange_tcp(server, ?pending[i], timeout_ms, answer)) { outstanding = outstanding - 1; }
+                val retried: cancel.Reason = exchange_tcp(server, ?pending[i], timeout_ms, scope, answer);
+                if (!sel retried.active) { ret retried; }
+                if (pending[i].answered) { outstanding = outstanding - 1; }
                 brk;
             }
             if (absorb(?pending[i], ?parsed, ?addrs[0], answer)) { outstanding = outstanding - 1; }
             brk;
         }
     }
-    udp.socket_close(?socket);
+    ret why;
 }
 
 # query one fully-composed name (hostname, optionally suffixed by a search
 # domain) for the requested families across the configured nameservers
-pub fun query_name(config: *conf.Config, hostname: str, domain: *u8,
+# ---
+# config:   the resolver policy
+# scope:    bounds and cancels the lookup
+# hostname: the name to ask for
+# domain:   a search domain to append, or nil
+# want_v4:  ask for A records
+# want_v6:  ask for AAAA records
+# answer:   filled with what was found, meaningful when the outcome is found
+# ret:      how the lookup ended
+pub fun query_name(config: *conf.Config, scope: *cancel.Scope, hostname: str, domain: *u8,
     want_v4: bool, want_v6: bool, answer: *Answer) Outcome {
     answer.count            = 0;
     answer.canonical[0]     = 0;
@@ -279,8 +333,10 @@ pub fun query_name(config: *conf.Config, hostname: str, domain: *u8,
                 i = i + 1;
             }
             if (!outstanding) { brk; }
-            val index: usize = (start + server) % config.nameserver_count;
-            exchange(config.nameservers[index], ?pending[0], pending_count, config.timeout_ms, answer);
+            val index: usize         = (start + server) % config.nameserver_count;
+            val why:   cancel.Reason = exchange(config.nameservers[index], ?pending[0], pending_count,
+                config.timeout_ms, scope, answer);
+            if (!sel why.active) { ret Outcome.ended{why}; }
             server = server + 1;
         }
         attempt = attempt + 1;
@@ -339,8 +395,17 @@ fun compose_canonical(answer: *Answer, hostname: str, domain: *u8) {
 # resolve a hostname applying the search-domain and ndots policy: a name at
 # or above the dot threshold (or fully qualified) tries the literal name
 # first, otherwise the search list is tried first. the first name that
-# resolves wins; a temporary or system failure aborts the search.
-pub fun resolve_name(config: *conf.Config, hostname: str, want_v4: bool, want_v6: bool, answer: *Answer) Outcome {
+# resolves wins; a temporary or system failure, or the scope ending, aborts
+# the search.
+# ---
+# config:   the resolver policy
+# scope:    bounds and cancels the whole search
+# hostname: the name to resolve
+# want_v4:  ask for A records
+# want_v6:  ask for AAAA records
+# answer:   filled with what was found, meaningful when the outcome is found
+# ret:      how the lookup ended
+pub fun resolve_name(config: *conf.Config, scope: *cancel.Scope, hostname: str, want_v4: bool, want_v6: bool, answer: *Answer) Outcome {
     val length: usize = str_len(hostname);
     if (length == 0) { ret Outcome.no_name{}; }
     val qualified:     bool = hostname[length - 1] == '.';
@@ -348,7 +413,7 @@ pub fun resolve_name(config: *conf.Config, hostname: str, want_v4: bool, want_v6
         || config.search_count == 0;
 
     if (literal_first) {
-        val literal: Outcome = query_name(config, hostname, nil, want_v4, want_v6, answer);
+        val literal: Outcome = query_name(config, scope, hostname, nil, want_v4, want_v6, answer);
         if (sel literal.found)                 { compose_canonical(answer, hostname, nil); }
         if (!sel literal.no_name || qualified) { ret literal; }
     }
@@ -356,14 +421,14 @@ pub fun resolve_name(config: *conf.Config, hostname: str, want_v4: bool, want_v6
     for (i < config.search_count) {
         val domain: *u8 = conf.search_domain(config, i);
         if (length + 1 + str_len(domain) <= 253) {
-            val searched: Outcome = query_name(config, hostname, domain, want_v4, want_v6, answer);
+            val searched: Outcome = query_name(config, scope, hostname, domain, want_v4, want_v6, answer);
             if (sel searched.found)    { compose_canonical(answer, hostname, domain); }
             if (!sel searched.no_name) { ret searched; }
         }
         i = i + 1;
     }
     if (!literal_first) {
-        val last: Outcome = query_name(config, hostname, nil, want_v4, want_v6, answer);
+        val last: Outcome = query_name(config, scope, hostname, nil, want_v4, want_v6, answer);
         if (sel last.found) { compose_canonical(answer, hostname, nil); }
         ret last;
     }
@@ -377,6 +442,47 @@ rec Stub {
     requests: usize;
     rcode:    u8;
     truncate: bool;
+}
+
+# a root scope whose deadline bounds one test's lookups, far inside the
+# harness's own limit
+#[testing]
+fun bounded(scope: *cancel.Scope, msec: i64) bool {
+    val res_now: time.InstantClock = time.instant();
+    if (sel res_now.err) { ret false; }
+    val deadline: time.Instant     = time.instant_add(res_now.ok, msec * duration.MILLISECOND);
+    val err_made: cancel.Operation = cancel.make_root(scope, opt[time.Instant].some{deadline});
+    ret sel err_made.ok;
+}
+
+# end a stub's wait for a request the resolver will not send: a datagram
+# shorter than a header ends every stub's loop
+#[testing]
+fun wake(target: *udp.Socket) {
+    val res_local: res[ip.Endpoint, io_error.Error] = udp.local_endpoint(target);
+    if (sel res_local.err) { ret; }
+    val res_created: res[udp.Socket, io_error.Error] = udp.create();
+    if (sel res_created.err) { ret; }
+    var socket: udp.Socket = res_created.ok;
+    var byte:   u8         = 0;
+    udp.send_to(?socket, ?byte, 1, res_local.ok);
+    udp.socket_close(?socket);
+}
+
+# count the queries waiting at a nameserver that never answers
+#[testing]
+fun drained(silent: *udp.Socket) usize {
+    val err_bounded: err[io_error.Error] = udp.socket_set_recv_timeout(silent, 1);
+    if (sel err_bounded.err) { ret 0xffff; }
+    var queries: usize = 0;
+    for (queries < 4) {
+        var request:       [512]u8;
+        var source:        ip.Endpoint;
+        val res_recv_from: res[usize, io_error.Error] = udp.recv_from(silent, ?request[0], 512, ?source);
+        if (sel res_recv_from.err) { brk; }
+        queries = queries + 1;
+    }
+    ret queries;
 }
 
 #[testing]
@@ -466,26 +572,36 @@ fun stub_start(stub: *Stub, requests: usize, rcode: u8, truncate: bool, worker: 
     config.nameservers[0]   = res_local.ok;
     config.nameserver_count = 1;
     config.attempts         = 1;
-    config.timeout_ms       = 5000;
     thread.spawn_with(stub_run, stub::*u8, worker);
     ret res[conf.Config, io_error.Error].ok{config};
 }
 
+#[testing]
+fun stub_stop(stub: *Stub, worker: *thread.Thread) {
+    wake(?stub.socket);
+    thread.join(worker);
+    udp.socket_close(?stub.socket);
+}
+
 test resolve_lookup__stub_nameserver_nxdomain {
+    var scope: cancel.Scope;
+    if (!bounded(?scope, 2000)) { ret 1; }
     var stub:        Stub;
     var worker:      thread.Thread;
     val res_started: res[conf.Config, io_error.Error] = stub_start(?stub, 2, wire.RCODE_NXDOMAIN, false, ?worker);
     if (sel res_started.err) { ret 1; }
     var config:  conf.Config = res_started.ok;
     var answer:  Answer;
-    val outcome: Outcome     = query_name(?config, "missing.example", nil, true, true, ?answer);
-    thread.join(?worker);
-    udp.socket_close(?stub.socket);
+    val outcome: Outcome     = query_name(?config, ?scope, "missing.example", nil, true, true, ?answer);
+    stub_stop(?stub, ?worker);
+    cancel.dnit(?scope);
     if (!sel outcome.no_name) { ret 1; }
     ret 0;
 }
 
 test resolve_lookup__search_domain_applies_before_literal_for_bare_names {
+    var scope: cancel.Scope;
+    if (!bounded(?scope, 2000)) { ret 1; }
     var stub:        Stub;
     var worker:      thread.Thread;
     val res_started: res[conf.Config, io_error.Error] = stub_start(?stub, 2, 0, false, ?worker);
@@ -499,9 +615,9 @@ test resolve_lookup__search_domain_applies_before_literal_for_bare_names {
     slot[4]             = 0;
     config.search_count = 1;
     var answer:  Answer;
-    val outcome: Outcome = resolve_name(?config, "bare", true, true, ?answer);
-    thread.join(?worker);
-    udp.socket_close(?stub.socket);
+    val outcome: Outcome = resolve_name(?config, ?scope, "bare", true, true, ?answer);
+    stub_stop(?stub, ?worker);
+    cancel.dnit(?scope);
     if (!sel outcome.found) { ret 1; }
     # the canonical name reflects the search domain that resolved
     if (answer.canonical_length != 9)                             { ret 1; }
@@ -513,6 +629,7 @@ test resolve_lookup__search_domain_applies_before_literal_for_bare_names {
 rec TcpStub {
     udp_socket: udp.Socket;
     listener:   tcp.Listener;
+    stop:       i64;
 }
 
 #[testing]
@@ -525,7 +642,8 @@ fun tcp_stub_run(argument: *u8) {
         var source:        ip.Endpoint;
         val res_recv_from: res[usize, io_error.Error] = udp.recv_from(?stub.udp_socket, ?request[0], 512, ?source);
         if (sel res_recv_from.err) { ret; }
-        val length:          usize = res_recv_from.ok;
+        val length: usize = res_recv_from.ok;
+        if (length < wire.HEADER_LENGTH) { ret; }
         var response:        [512]u8;
         val response_length: usize = stub_answer(?request[0], length, ?response[0], 0, true);
         udp.send_to(?stub.udp_socket, ?response[0], response_length, source);
@@ -535,10 +653,14 @@ fun tcp_stub_run(argument: *u8) {
     for (served < 2) {
         val res_accepted: res[tcp.Stream, io_error.Error] = tcp.accept(?stub.listener);
         if (sel res_accepted.err) { ret; }
-        var stream:   tcp.Stream = res_accepted.ok;
+        var stream: tcp.Stream = res_accepted.ok;
+        if (atomic.load(?stub.stop) != 0) {
+            tcp.stream_close(?stream);
+            ret;
+        }
         var framed:   [512]u8;
-        var received: usize      = 0;
-        var expected: usize      = 2;
+        var received: usize = 0;
+        var expected: usize = 2;
         for (received < expected) {
             val res_stream_read: res[usize, io_error.Error] = tcp.stream_read(?stream, ?framed[received], expected - received);
             if (sel res_stream_read.err) { brk; }
@@ -566,31 +688,84 @@ fun tcp_stub_run(argument: *u8) {
     }
 }
 
-test resolve_lookup__truncation_falls_back_to_tcp {
-    # the resolver connects to the same port over TCP, so the UDP socket must
-    # share the listener's port number; retry a few ephemeral ports
-    var stub:      TcpStub;
-    var have_pair: bool  = false;
-    var tries:     usize = 0;
-    var port:      u16   = 0;
-    for (!have_pair && tries < 8) {
-        val res_listening: res[tcp.Listener, io_error.Error] = tcp.listen(ip.endpoint(127, 0, 0, 1, 0), 4);
+# end the stub in whichever phase it waits: a short datagram ends the UDP one,
+# and a connection it accepts after the stop flag ends the TCP one
+#[testing]
+fun tcp_stub_stop(stub: *TcpStub, port: u16, worker: *thread.Thread) {
+    atomic.store(?stub.stop, 1);
+    wake(?stub.udp_socket);
+    val res_connected: res[tcp.Stream, io_error.Error] = tcp.connect(ip.endpoint(127, 0, 0, 1, port));
+    if (sel res_connected.ok) {
+        var stream: tcp.Stream = res_connected.ok;
+        tcp.stream_close(?stream);
+    }
+    thread.join(worker);
+    udp.socket_close(?stub.udp_socket);
+    tcp.listener_close(?stub.listener);
+}
+
+# a TCP listener and a UDP socket on one loopback port, since the resolver
+# retries over TCP at the port it asked over UDP; a few ephemeral ports are tried
+# ---
+# ret: 0 with both bound, 1 when no listener could be made, 77 when no port
+#      had both free
+#[testing]
+fun paired(backlog: i32, listener: *tcp.Listener, socket: *udp.Socket, port: *u16) i32 {
+    var tries: usize = 0;
+    for (tries < 8) {
+        val res_listening: res[tcp.Listener, io_error.Error] = tcp.listen(ip.endpoint(127, 0, 0, 1, 0), backlog);
         if (sel res_listening.err) { ret 1; }
-        stub.listener = res_listening.ok;
-        val res_local: res[ip.Endpoint, io_error.Error] = tcp.listener_local_endpoint(?stub.listener);
-        if (sel res_local.err) { ret 1; }
-        port = res_local.ok.port;
-        val res_bound: res[udp.Socket, io_error.Error] = udp.bind(ip.endpoint(127, 0, 0, 1, port));
-        if (sel res_bound.err) {
-            tcp.listener_close(?stub.listener);
-            tries = tries + 1;
+        @listener = res_listening.ok;
+        val res_local: res[ip.Endpoint, io_error.Error] = tcp.listener_local_endpoint(listener);
+        if (sel res_local.err) {
+            tcp.listener_close(listener);
+            ret 1;
+        }
+        @port = res_local.ok.port;
+        val res_bound: res[udp.Socket, io_error.Error] = udp.bind(ip.endpoint(127, 0, 0, 1, @port));
+        if (sel res_bound.ok) {
+            @socket = res_bound.ok;
+            ret 0;
+        }
+        tcp.listener_close(listener);
+        tries = tries + 1;
+    }
+    ret 77;
+}
+
+# fill a listener's accept queue with connections nobody accepts, until a
+# connect is neither accepted nor refused but left waiting on its SYN
+# ---
+# ret: 0 once a connect waited out its own 100 ms scope, 1 when the target
+#      refuses a connect at a full queue instead, 2 when the queue outlasted
+#      capacity connections, 3 when no scope could be made
+#[testing]
+fun fill_backlog(port: u16, held: *tcp.Stream, capacity: usize, count: *usize) i32 {
+    @count = 0;
+    for (@count < capacity) {
+        var scope: cancel.Scope;
+        if (!bounded(?scope, 100)) { ret 3; }
+        val res_connected: res[tcp.Stream, io_error.Error] = tcp.connect_within(ip.endpoint(127, 0, 0, 1, port), ?scope);
+        cancel.dnit(?scope);
+        if (sel res_connected.ok) {
+            held[@count] = res_connected.ok;
+            @count       = @count + 1;
             cnt;
         }
-        stub.udp_socket = res_bound.ok;
-        have_pair       = true;
+        if (res_connected.err.kind == io_error.TIMEOUT) { ret 0; }
+        ret 1;
     }
-    if (!have_pair) { ret 77; }
+    ret 2;
+}
 
+test resolve_lookup__truncation_falls_back_to_tcp {
+    var stub:        TcpStub;
+    var port:        u16 = 0;
+    val paired_stub: i32 = paired(4, ?stub.listener, ?stub.udp_socket, ?port);
+    if (paired_stub != 0) { ret paired_stub; }
+
+    var scope: cancel.Scope;
+    if (!bounded(?scope, 2000)) { ret 1; }
     var worker: thread.Thread;
     thread.spawn_with(tcp_stub_run, (?stub)::*u8, ?worker);
 
@@ -599,15 +774,61 @@ test resolve_lookup__truncation_falls_back_to_tcp {
     config.nameservers[0]   = ip.endpoint(127, 0, 0, 1, port);
     config.nameserver_count = 1;
     config.attempts         = 1;
-    config.timeout_ms       = 5000;
     var answer:  Answer;
-    val outcome: Outcome = query_name(?config, "large.example", nil, true, true, ?answer);
-    thread.join(?worker);
-    udp.socket_close(?stub.udp_socket);
-    tcp.listener_close(?stub.listener);
+    val outcome: Outcome = query_name(?config, ?scope, "large.example", nil, true, true, ?answer);
+    tcp_stub_stop(?stub, port, ?worker);
+    cancel.dnit(?scope);
     if (!sel outcome.found) { ret 1; }
     if (answer.count != 2)  { ret 1; }
-    ret 0;
+
+    # a server that truncates over UDP and whose TCP port takes no connection:
+    # a full accept queue drops the SYN on loopback, deterministically, where a
+    # port nobody listens on refuses at once and nothing on loopback drops by
+    # address. only the scope can end that retry, long before timeout_ms
+    var full:        Stub;
+    var full_ln:     tcp.Listener;
+    var full_port:   u16 = 0;
+    val paired_full: i32 = paired(0, ?full_ln, ?full.socket, ?full_port);
+    if (paired_full != 0) { ret paired_full; }
+    var held:    [4]tcp.Stream;
+    var holding: usize = 0;
+    val filled:  i32   = fill_backlog(full_port, ?held[0], 4, ?holding);
+    var bad:     i32   = 0;
+    # a target that refuses at a full queue leaves no wait to bound
+    if (filled == 0) {
+        full.requests = 2;
+        full.rcode    = 0;
+        full.truncate = true;
+        var full_worker: thread.Thread;
+        thread.spawn_with(stub_run, (?full)::*u8, ?full_worker);
+        config.nameservers[0] = ip.endpoint(127, 0, 0, 1, full_port);
+        config.timeout_ms     = 60000;
+        var short: cancel.Scope;
+        if (!bounded(?short, 200)) { bad = 20; }
+        or {
+            val res_started: time.InstantClock = time.instant();
+            val ended:       Outcome           = query_name(?config, ?short, "large.example", nil, true, true, ?answer);
+            val res_now:     time.InstantClock = time.instant();
+            cancel.dnit(?short);
+            if (!(sel ended.ended && sel ended.ended.timed_out)) { bad = 21; }
+            if (sel res_started.ok) {
+                if (sel res_now.ok && duration.duration_msec(time.instant_sub(res_now.ok, res_started.ok)) > 1000) { bad = 22; }
+            }
+        }
+        stub_stop(?full, ?full_worker);
+    }
+    or (filled == 1) { udp.socket_close(?full.socket); }
+    or {
+        udp.socket_close(?full.socket);
+        bad = 10 + filled;
+    }
+    var k: usize = 0;
+    for (k < holding) {
+        tcp.stream_close(?held[k]);
+        k = k + 1;
+    }
+    tcp.listener_close(?full_ln);
+    ret bad;
 }
 
 test resolve_lookup__canonical_composition {
@@ -625,8 +846,12 @@ test resolve_lookup__canonical_composition {
 
 # a name with at least ndots dots is asked for as written before the search
 # list, and a search query that times out ends the search: the literal name is
-# not asked for after it
+# not asked for after it. a scope that ends first ends the lookup whatever the
+# configured wait, and an ended scope sends nothing
 test resolve_lookup__dotted_names_go_literal_first_and_a_timeout_ends_the_search {
+    var scope: cancel.Scope;
+    if (!bounded(?scope, 2000)) { ret 1; }
+    fin { cancel.dnit(?scope); }
     var stub:        Stub;
     var worker:      thread.Thread;
     val res_started: res[conf.Config, io_error.Error] = stub_start(?stub, 1, 0, false, ?worker);
@@ -641,9 +866,8 @@ test resolve_lookup__dotted_names_go_literal_first_and_a_timeout_ends_the_search
     config.search_count = 1;
     config.ndots        = 1;
     var answer:  Answer;
-    val outcome: Outcome = resolve_name(?config, "web.example", true, false, ?answer);
-    thread.join(?worker);
-    udp.socket_close(?stub.socket);
+    val outcome: Outcome = resolve_name(?config, ?scope, "web.example", true, false, ?answer);
+    stub_stop(?stub, ?worker);
     if (!sel outcome.found)            { ret 2; }
     if (answer.canonical_length != 11) { ret 3; }
 
@@ -656,19 +880,27 @@ test resolve_lookup__dotted_names_go_literal_first_and_a_timeout_ends_the_search
     if (sel res_local.err) { ret 5; }
     config.nameservers[0] = res_local.ok;
     config.timeout_ms     = 200;
-    val timed_out: Outcome = resolve_name(?config, "bare", true, false, ?answer);
+    val timed_out: Outcome = resolve_name(?config, ?scope, "bare", true, false, ?answer);
     if (!sel timed_out.temporary) { ret 6; }
-    val err_bounded: err[io_error.Error] = udp.socket_set_recv_timeout(?silent, 1);
-    if (sel err_bounded.err) { ret 7; }
-    var queries: usize = 0;
-    for (queries < 4) {
-        var request:       [512]u8;
-        var source:        ip.Endpoint;
-        val res_recv_from: res[usize, io_error.Error] = udp.recv_from(?silent, ?request[0], 512, ?source);
-        if (sel res_recv_from.err) { brk; }
-        queries = queries + 1;
-    }
-    if (queries != 1) { ret 8; }
+    if (drained(?silent) != 1)    { ret 8; }
+
+    config.timeout_ms = 60000;
+    var short: cancel.Scope;
+    if (!bounded(?short, 100)) { ret 9; }
+    fin { cancel.dnit(?short); }
+    val bounded_out: Outcome = resolve_name(?config, ?short, "bare", true, false, ?answer);
+    if (!sel bounded_out.ended)           { ret 10; }
+    if (!sel bounded_out.ended.timed_out) { ret 11; }
+    if (drained(?silent) != 1)            { ret 12; }
+
+    var ended: cancel.Scope;
+    cancel.make_root(?ended, opt[time.Instant].none{});
+    fin { cancel.dnit(?ended); }
+    cancel.cancel(?ended);
+    val refused: Outcome = resolve_name(?config, ?ended, "bare", true, false, ?answer);
+    if (!sel refused.ended)           { ret 13; }
+    if (!sel refused.ended.cancelled) { ret 14; }
+    if (drained(?silent) != 0)        { ret 15; }
     ret 0;
 }
 
@@ -711,16 +943,19 @@ test resolve_lookup__a_response_from_another_endpoint_is_ignored {
     fin { udp.socket_close(?spoofer.other); }
     val res_local: res[ip.Endpoint, io_error.Error] = udp.local_endpoint(?spoofer.server);
     if (sel res_local.err) { ret 3; }
+    var scope: cancel.Scope;
+    if (!bounded(?scope, 2000)) { ret 3; }
+    fin { cancel.dnit(?scope); }
     var config: conf.Config;
     conf.defaults(?config);
     config.nameservers[0]   = res_local.ok;
     config.nameserver_count = 1;
     config.attempts         = 1;
-    config.timeout_ms       = 5000;
     var worker: thread.Thread;
     thread.spawn_with(spoofer_run, (?spoofer)::*u8, ?worker);
     var answer:  Answer;
-    val outcome: Outcome = query_name(?config, "spoofed.example", nil, true, false, ?answer);
+    val outcome: Outcome = query_name(?config, ?scope, "spoofed.example", nil, true, false, ?answer);
+    wake(?spoofer.server);
     thread.join(?worker);
     if (!sel outcome.found) { ret 4; }
     if (answer.count != 1)  { ret 5; }

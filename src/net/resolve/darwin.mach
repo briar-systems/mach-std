@@ -8,12 +8,17 @@ use std.allocator;
 use std.net.ip;
 use std.net.resolve.shared;
 use std.net.resolve.types;
+use std.sync.cancel;
+use std.sync.thread;
 use std.system.os;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
 
 rec AddrInfo {
     flags:          i32;
@@ -80,37 +85,98 @@ fun flags(query: *types.Query) i32 {
     ret output;
 }
 
-pub fun resolve(query: *types.Query, owner: *allocator.Allocator, limits: types.ResultLimits, output: *types.Resolution) types.Error {
-    if (query == nil || owner == nil || output == nil) { ret shared.error(types.INVALID, 0); }
-    shared.clear(output, owner);
-    var hints: AddrInfo;
-    hints.flags          = flags(query);
-    hints.family         = family(query);
-    hints.socket_kind    = socket_kind(query);
-    hints.protocol       = query.protocol;
-    hints.address_length = 0;
-    hints.canonical_name = nil;
-    hints.address        = nil;
-    hints.next           = nil;
-    var first: *AddrInfo = nil;
-    val code:  i32       = getaddrinfo(query.host, query.service, ?hints, ?first);
-    if (code != 0)    { ret failure(code); }
+# one getaddrinfo call, owned by the helper thread that makes it and the
+# caller that waits for it, and freed with its result by the last to let go
+# ---
+# pending: the two references and the word the caller waits on
+# size:    the bytes the request was allocated with, its strings included
+# hints:   the call's hints
+# first:   the call's result list, owned by the request
+# code:    the call's return
+# host:    the request's copy of the query's host, or nil
+# service: the request's copy of the query's service, or nil
+rec Request {
+    pending: shared.Pending;
+    size:    usize;
+    hints:   AddrInfo;
+    first:   *AddrInfo;
+    code:    i32;
+    host:    *u8;
+    service: *u8;
+}
+
+fun text_bytes(text: str) usize {
+    if (text == nil) { ret 0; }
+    ret str_len(text) + 1;
+}
+
+fun copy_text(text: str, at: *u8) *u8 {
+    if (text == nil) { ret nil; }
+    val n: usize = str_len(text);
+    var i: usize = 0;
+    for (i <= n) {
+        at[i] = text[i];
+        i     = i + 1;
+    }
+    ret at;
+}
+
+# a request holding its own copies of everything the call reads
+fun request_make(query: *types.Query) opt[*Request] {
+    val head: usize = $size_of(Request);
+    val size: usize = head + text_bytes(query.host) + text_bytes(query.service);
+    val base: ptr   = os.allocate(size);
+    if (base == nil) { ret opt[*Request].none{}; }
+    val request: *Request = base::usize::*Request;
+    shared.pending_make(?request.pending);
+    request.size                 = size;
+    request.hints.flags          = flags(query);
+    request.hints.family         = family(query);
+    request.hints.socket_kind    = socket_kind(query);
+    request.hints.protocol       = query.protocol;
+    request.hints.address_length = 0;
+    request.hints.canonical_name = nil;
+    request.hints.address        = nil;
+    request.hints.next           = nil;
+    request.first                = nil;
+    request.code                 = 0;
+    val strings: *u8 = (base::usize + head)::*u8;
+    request.host    = copy_text(query.host, strings);
+    request.service = copy_text(query.service, (strings::usize + text_bytes(query.host))::*u8);
+    ret opt[*Request].some{request};
+}
+
+# let go of one reference, freeing the request and its result after the last
+fun request_release(request: *Request) {
+    if (!shared.pending_release(?request.pending)) { ret; }
+    if (request.first != nil)                      { freeaddrinfo(request.first); }
+    os.deallocate(request::ptr, request.size);
+}
+
+fun helper_run(argument: *u8) {
+    val request: *Request = argument::*Request;
+    request.code = getaddrinfo(request.host, request.service, ?request.hints, ?request.first);
+    shared.pending_done(?request.pending);
+}
+
+fun helper_release(argument: *u8) {
+    request_release(argument::*Request);
+}
+
+# the endpoints and canonical name of a completed call
+fun collected(request: *Request, limits: types.ResultLimits, output: *types.Resolution) types.Error {
+    if (request.code != 0) { ret failure(request.code); }
+    val first: *AddrInfo = request.first;
     if (first == nil) { ret shared.error(types.NO_NAME, EAI_NONAME::i64); }
     var count:   usize     = 0;
     var current: *AddrInfo = first;
     for (current != nil) {
-        if (count == limits.max_endpoints) {
-            freeaddrinfo(first);
-            ret shared.error(types.OVERLOADED, 0);
-        }
+        if (count == limits.max_endpoints) { ret shared.error(types.OVERLOADED, 0); }
         count   = count + 1;
         current = current.next;
     }
     val err_allocated: err[types.Error] = shared.allocate_endpoints(output, count);
-    if (sel err_allocated.err) {
-        freeaddrinfo(first);
-        ret err_allocated.err;
-    }
+    if (sel err_allocated.err) { ret err_allocated.err; }
     current = first;
     var malformed: bool = false;
     for (current != nil) {
@@ -124,25 +190,58 @@ pub fun resolve(query: *types.Query, owner: *allocator.Allocator, limits: types.
         }
         if (output.canonical_name == nil && current.canonical_name != nil
             && !shared.canonical_fits(current.canonical_name, limits.max_canonical_name_bytes)) {
-            freeaddrinfo(first);
             shared.dnit(output);
             ret shared.error(types.OVERLOADED, 0);
         }
         if (output.canonical_name == nil && current.canonical_name != nil) {
             val err_named: err[types.Error] = shared.set_canonical(output, current.canonical_name);
             if (sel err_named.err) {
-                freeaddrinfo(first);
                 shared.dnit(output);
                 ret err_named.err;
             }
         }
         current = current.next;
     }
-    freeaddrinfo(first);
     if (output.len == 0) {
         shared.dnit(output);
         if (malformed) { ret shared.error(types.MALFORMED, EAI_FAIL::i64); }
         ret shared.error(types.NO_NAME, EAI_NONAME::i64);
     }
     ret shared.error(types.NO_ERROR, 0);
+}
+
+# resolve through the system's getaddrinfo, under the scope
+#
+# getaddrinfo cannot be interrupted, so it runs on a helper thread that owns
+# the request: copies of the query's strings, the hints and the result. the
+# caller waits for it under the scope and returns within shared.POLL_MSEC of
+# the scope ending, with the scope's reason. the helper then finishes when the
+# system lets it and frees the request and its result itself, so nothing of the
+# caller's is touched after the return. each lookup costs a thread, which may
+# outlive the call by the system's own timeout, and a process that exits while
+# one runs ends it with every other thread
+pub fun resolve(scope: *cancel.Scope, query: *types.Query, owner: *allocator.Allocator, limits: types.ResultLimits, output: *types.Resolution) types.Error {
+    if (query == nil || owner == nil || output == nil) { ret shared.error(types.INVALID, 0); }
+    shared.clear(output, owner);
+    val why: cancel.Reason = shared.scope_reason(scope);
+    if (!sel why.active) { ret shared.ended(why); }
+    val opt_request: opt[*Request] = request_make(query);
+    if (sel opt_request.none) { ret shared.error(types.OUT_OF_MEMORY, 0); }
+    val request: *Request = opt_request.some;
+    var helper:  thread.Thread;
+    # a refused spawn has already let go of the helper's reference
+    val err_spawned: thread.Operation = thread.spawn_owned(helper_run, request::*u8, helper_release, ?helper);
+    if (sel err_spawned.err) {
+        request_release(request);
+        ret shared.error(types.SYSTEM_FAILURE, thread.code(err_spawned.err));
+    }
+    thread.detach(?helper);
+    val waited: cancel.Reason = shared.pending_wait(?request.pending, scope);
+    if (!sel waited.active) {
+        request_release(request);
+        ret shared.ended(waited);
+    }
+    val outcome: types.Error = collected(request, limits, output);
+    request_release(request);
+    ret outcome;
 }

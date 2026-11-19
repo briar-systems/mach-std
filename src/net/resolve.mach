@@ -1,4 +1,17 @@
 # bounded asynchronous system name resolution
+#
+# every lookup runs under a cancellation scope and keeps one contract on every
+# platform: when the scope ends, the lookup returns within shared.POLL_MSEC
+# (10 ms) with the scope's reason, and holds nothing of the caller's
+# afterwards. what the system is still doing for it is the backend's business
+# and never reaches the caller. linux asks its nameservers itself and bounds
+# every wait by the poll, the TCP retry's connect included. windows runs
+# GetAddrInfoExW asynchronously into a request the library owns and asks
+# GetAddrInfoExCancel to end it. darwin runs getaddrinfo, which nothing can
+# interrupt, on a helper thread that owns the request and frees it when the
+# system lets it finish. an operation here hands its backend a scope of its
+# own, which the caller's scope, a token cancellation, the runtime and the
+# deadline all end
 
 use std.allocator;
 use std.chrono.time;
@@ -141,6 +154,8 @@ rec Operation {
     routed: bool;
     # where the completion sits in the ring while queued
     completion_slot: usize;
+    # the scope the adapter runs under, ended by whatever ends the operation
+    run_scope: cancellation.Scope;
 }
 
 # operation and completion storage is fixed after construction
@@ -175,8 +190,8 @@ pub rec Resolver {
     ready:          condition.Condition;
 }
 
-fun system_adapter(context: ptr, query: *types.Query, owner: *allocator.Allocator, limits: types.ResultLimits, output: *types.Resolution) types.Error {
-    ret target.resolve(query, owner, limits, output);
+fun system_adapter(context: ptr, scope: *cancellation.Scope, query: *types.Query, owner: *allocator.Allocator, limits: types.ResultLimits, output: *types.Resolution) types.Error {
+    ret target.resolve(scope, query, owner, limits, output);
 }
 
 fun reason_code(reason: cancellation.Reason) i64 {
@@ -198,12 +213,6 @@ fun reason_of(code: i64) cancellation.Reason {
 fun transition_changed(transition: cancellation.Transition) bool {
     if (sel transition.ok) { ret transition.ok; }
     ret false;
-}
-
-fun cancellation_error(reason: cancellation.Reason) types.Error {
-    if (sel reason.cancelled) { ret shared.error(types.CANCELLED, 0); }
-    if (sel reason.timed_out) { ret shared.error(types.TIMED_OUT, 0); }
-    ret shared.error(types.INVALID, reason_code(reason));
 }
 
 # error detail for a pool status: accepted 0, queue_full 1, pool_closed 2, timed_out 3,
@@ -381,7 +390,9 @@ fun valid_query(query: *types.Query) bool {
     ret true;
 }
 
-fun claim_locked(resolver: *Resolver) *Operation {
+# the run scope takes the deadline the operation is bound by, none where the
+# runtime enforces it
+fun claim_locked(resolver: *Resolver, deadline: opt[time.Instant]) *Operation {
     if (resolver.free_head == NO_OPERATION) { ret nil; }
     val operation: *Operation = ?resolver.operations[resolver.free_head::usize];
     resolver.free_head = operation.next;
@@ -404,6 +415,7 @@ fun claim_locked(resolver: *Resolver) *Operation {
     operation.runtime_terminal_claimed     = false;
     operation.runtime_terminal_failure     = io_error.make(io_error.OTHER, io_error.OP_UNKNOWN);
     operation.terminal_failure             = shared.error(types.NO_ERROR, 0);
+    cancellation.make_root(?operation.run_scope, deadline);
     cancellation.registration_make(?operation.registration);
     shared.clear(?operation.resolution, resolver.allocator);
     resolver.live = resolver.live + 1;
@@ -492,6 +504,7 @@ fun release_locked(resolver: *Resolver, operation: *Operation) {
     operation.runtime_terminal_claimed     = false;
     operation.runtime_terminal_failure     = io_error.make(io_error.OTHER, io_error.OP_UNKNOWN);
     operation.terminal_failure             = shared.error(types.NO_ERROR, 0);
+    cancellation.dnit(?operation.run_scope);
     cancellation.registration_make(?operation.registration);
     shared.clear(?operation.resolution, resolver.allocator);
     resolver.live  = resolver.live - 1;
@@ -571,8 +584,11 @@ fun enqueue_locked(resolver: *Resolver, operation: *Operation, failure: types.Er
 fun claim_reason(operation: *Operation, reason: cancellation.Reason) bool {
     var expected: i64  = REASON_ACTIVE;
     val changed:  bool = atomic.cas(?operation.cancellation_reason, ?expected, reason_code(reason));
-    if (changed) { os.thread_wake(?operation.cancellation_reason); }
-    ret changed;
+    if (!changed) { ret false; }
+    os.thread_wake(?operation.cancellation_reason);
+    if (sel reason.timed_out) { cancellation.timeout(?operation.run_scope); }
+    or                        { cancellation.cancel(?operation.run_scope); }
+    ret true;
 }
 
 fun runtime_token_equal(a: io_runtime.Token, b: io_runtime.Token) bool {
@@ -733,12 +749,10 @@ fun read_deadline(scope: *cancellation.Scope) opt[time.Instant] {
     ret opt[time.Instant].none{};
 }
 
-# an unreadable clock leaves the deadline to the scope owner's own expiry
-fun deadline_reached(deadline: opt[time.Instant]) bool {
-    if (sel deadline.none) { ret false; }
-    val res_now: time.InstantClock = time.instant();
-    if (sel res_now.err) { ret false; }
-    ret !time.instant_before(res_now.ok, deadline.some);
+# a deadline the run scope reached becomes the operation's reason
+fun claim_expiry(operation: *Operation) {
+    val why: cancellation.Reason = shared.scope_reason(?operation.run_scope);
+    if (sel why.timed_out) { claim_reason(operation, why); }
 }
 
 fun settle_registration(operation: *Operation) cancellation.Reason {
@@ -760,21 +774,15 @@ fun failed_result_dnit(operation: *Operation) {
 }
 
 fun run_operation(context: ptr) bool {
-    val operation:    *Operation        = context::*Operation;
-    val resolver:     *Resolver         = operation.resolver;
-    var failure:      types.Error       = shared.error(types.NO_ERROR, 0);
-    var opt_deadline: opt[time.Instant] = opt[time.Instant].none{};
-    if (!operation.runtime_owned) { opt_deadline = read_deadline(operation.scope); }
-    if (deadline_reached(opt_deadline)) {
-        claim_reason(operation, cancellation.Reason.timed_out{});
-    }
+    val operation: *Operation  = context::*Operation;
+    val resolver:  *Resolver   = operation.resolver;
+    var failure:   types.Error = shared.error(types.NO_ERROR, 0);
+    claim_expiry(operation);
     if (atomic.load(?operation.cancellation_reason) == REASON_ACTIVE) {
-        failure = resolver.adapter(resolver.adapter_context, ?operation.query, resolver.allocator,
-            resolver.result_limits, ?operation.resolution);
+        failure = resolver.adapter(resolver.adapter_context, ?operation.run_scope, ?operation.query,
+            resolver.allocator, resolver.result_limits, ?operation.resolution);
     }
-    if (deadline_reached(opt_deadline)) {
-        claim_reason(operation, cancellation.Reason.timed_out{});
-    }
+    claim_expiry(operation);
     if (!operation.runtime_owned) { finish_scope_use(operation); }
 
     mutex.lock(?resolver.lock);
@@ -787,7 +795,7 @@ fun run_operation(context: ptr) bool {
     }
     or (!sel reason.active) {
         failed_result_dnit(operation);
-        failure = cancellation_error(reason);
+        failure = shared.ended(reason);
     }
     or (failure.kind != types.NO_ERROR) {
         failed_result_dnit(operation);
@@ -843,7 +851,7 @@ fun complete_immediate_locked(resolver: *Resolver, operation: *Operation, failur
     }
     if (!sel reason.active) {
         failed_result_dnit(operation);
-        final_error = cancellation_error(reason);
+        final_error = shared.ended(reason);
     }
     enqueue_locked(resolver, operation, final_error);
 }
@@ -862,15 +870,16 @@ pub fun submit(resolver: *Resolver, scope: *cancellation.Scope, query: *types.Qu
     cancellation.expire(scope, res_now.ok);
     val prior_reason: cancellation.Reason = cancellation.reason(scope);
     if (!sel prior_reason.active) {
-        ret res[types.Token, types.Error].err{cancellation_error(prior_reason)};
+        ret res[types.Token, types.Error].err{shared.ended(prior_reason)};
     }
+    val opt_deadline: opt[time.Instant] = read_deadline(scope);
 
     mutex.lock(?resolver.lock);
     if (resolver.state != OPEN) {
         mutex.unlock(?resolver.lock);
         ret res[types.Token, types.Error].err{shared.error(types.CLOSED, 0)};
     }
-    val operation: *Operation = claim_locked(resolver);
+    val operation: *Operation = claim_locked(resolver, opt_deadline);
     if (operation == nil) {
         mutex.unlock(?resolver.lock);
         ret res[types.Token, types.Error].err{shared.error(types.OVERLOADED, 0)};
@@ -885,7 +894,7 @@ pub fun submit(resolver: *Resolver, scope: *cancellation.Scope, query: *types.Qu
     if (!sel attached.active) {
         release_locked(resolver, operation);
         mutex.unlock(?resolver.lock);
-        ret res[types.Token, types.Error].err{cancellation_error(attached)};
+        ret res[types.Token, types.Error].err{shared.ended(attached)};
     }
 
     val res_numeric_addr: res[ip.Addr, ip.ParseError] = ip.addr_parse(operation.query.host);
@@ -917,7 +926,7 @@ pub fun submit(resolver: *Resolver, scope: *cancellation.Scope, query: *types.Qu
         }
         val reason: cancellation.Reason = wait_for_cancellation(operation);
         failed_result_dnit(operation);
-        enqueue_locked(resolver, operation, cancellation_error(reason));
+        enqueue_locked(resolver, operation, shared.ended(reason));
     }
     mutex.unlock(?resolver.lock);
     ret res[types.Token, types.Error].ok{token};
@@ -933,7 +942,7 @@ pub fun submit_runtime(resolver: *Resolver, scope: *cancellation.Scope,
         mutex.unlock(?resolver.lock);
         ret res[io_runtime.Token, types.Error].err{shared.error(types.CLOSED, 0)};
     }
-    val operation: *Operation = claim_locked(resolver);
+    val operation: *Operation = claim_locked(resolver, opt[time.Instant].none{});
     if (operation == nil) {
         mutex.unlock(?resolver.lock);
         ret res[io_runtime.Token, types.Error].err{shared.error(types.OVERLOADED, 0)};
@@ -1221,6 +1230,8 @@ rec Pool {
 rec Gate {
     entered: i64;
     release: i64;
+    # the reason code of the adapter's scope once released
+    seen: i64;
 }
 
 #[testing]
@@ -1336,7 +1347,7 @@ fun limits() types.ResultLimits {
     ret types.ResultLimits{max_endpoints: 8, max_canonical_name_bytes: 256};
 }
 
-fun fake_adapter(context: ptr, query: *types.Query, owner: *allocator.Allocator,
+fun fake_adapter(context: ptr, scope: *cancellation.Scope, query: *types.Query, owner: *allocator.Allocator,
     limits: types.ResultLimits, output: *types.Resolution) types.Error {
     shared.clear(output, owner);
     if (query.protocol == 1)      { ret shared.error(types.TEMPORARY, 71); }
@@ -1366,10 +1377,12 @@ fun fake_adapter(context: ptr, query: *types.Query, owner: *allocator.Allocator,
 }
 
 #[testing]
-fun gated_adapter(context: ptr, query: *types.Query, owner: *allocator.Allocator,
+fun gated_adapter(context: ptr, scope: *cancellation.Scope, query: *types.Query, owner: *allocator.Allocator,
     limits: types.ResultLimits, output: *types.Resolution) types.Error {
     gate_run(context);
-    ret fake_adapter(nil, query, owner, limits, output);
+    val gate: *Gate = context::*Gate;
+    atomic.store(?gate.seen, reason_code(cancellation.reason(scope)));
+    ret fake_adapter(nil, scope, query, owner, limits, output);
 }
 
 #[testing]
@@ -1594,6 +1607,8 @@ test resolver__token_cancellation_retains_the_scope_through_a_running_adapter {
     var completion: types.Completion;
     if (wait(?resolver, ?completion, 1) != 1 || !completion.has_error
         || completion.error.kind != types.CANCELLED || completion.context != 31) { ret 6; }
+    # the running adapter's scope ended with the operation
+    if (atomic.load(?gate.seen) != REASON_CANCELLED)                                 { ret 8; }
     if (!scope_ok(cancellation.dnit(?scope)) || !resolver_cleanup(?resolver, ?pool)) { ret 7; }
     ret 0;
 }
@@ -1650,12 +1665,18 @@ test resolver__token_cancellation_and_deadline_preserve_the_first_reason {
     thread.spawn_with(transition_run, (?transition)::*u8, ?transition_thread);
     if (transition_thread.tid < 0) { ret 13; }
     transition_wait_entered(?transition);
-    val deadline_reason: cancellation.Reason = operation_wait_reason(?resolver.operations[deadline_token.index::usize]);
+    val deadline_operation: *Operation          = ?resolver.operations[deadline_token.index::usize];
+    val deadline_reason:    cancellation.Reason = operation_wait_reason(deadline_operation);
     if (!sel deadline_reason.timed_out || cancelled(?resolver, deadline_token)) { ret 14; }
+    # the transition thread claims the reason before it ends the run scope, so
+    # the adapter is let go only once the run scope it reads has ended
+    val run_reason: cancellation.Reason = cancellation.wait(?deadline_operation.run_scope);
+    if (!sel run_reason.timed_out) { ret 14; }
     gate_release(?gate);
     if (!thread_joined(?transition_thread) || atomic.load(?transition.result) == 0) { ret 15; }
     if (wait(?resolver, ?completion, 1) != 1 || !completion.has_error
         || completion.error.kind != types.TIMED_OUT || completion.context != 42) { ret 16; }
+    if (atomic.load(?gate.seen) != REASON_TIMED_OUT)                                 { ret 18; }
     if (!scope_ok(cancellation.dnit(?scope)) || !resolver_cleanup(?resolver, ?pool)) { ret 17; }
     ret 0;
 }
