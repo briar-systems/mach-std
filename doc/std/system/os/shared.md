@@ -38,6 +38,7 @@ Source: [`src/system/os/shared.mach`](../../../../src/system/os/shared.mach)
 | :--- | :--- |
 | [`io_context_source`](#io_context_source) | the source id a registered readiness context carries |
 | [`io_source_context`](#io_source_context) | a readiness context for source from the source's own 48 low bits |
+| [`posix_temp_dir`](#posix_temp_dir) | the posix temp directory: $TMPDIR as getenv found it, else "/tmp", under getenv's truncation contract |
 
 | Constants | |
 | :--- | :--- |
@@ -297,6 +298,22 @@ pub fun io_source_context(source: u16, low: u64) usize
 ```
 
 a readiness context for source from the source's own 48 low bits
+
+### posix_temp_dir
+
+```mach
+pub fun posix_temp_dir(found: i64, buf: *u8, cap: usize) i64
+```
+
+the posix temp directory: $TMPDIR as getenv found it, else "/tmp", under
+getenv's truncation contract
+
+| Parameter | |
+| :--- | :--- |
+| `found` | getenv's result for TMPDIR, already copied into buf when it fit |
+| `buf` | destination buffer for the path |
+| `cap` | buffer capacity in bytes |
+| **returns** | full length of the path |
 
 ## Constants
 

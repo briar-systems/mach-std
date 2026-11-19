@@ -23,7 +23,7 @@ Source: [`src/system/os/wasi.mach`](../../../../src/system/os/wasi.mach)
 | [`read`](#read) | files |
 | [`write`](#write), [`read_at`](#read_at), [`write_at`](#write_at), [`open`](#open), [`open_native`](#open_native), [`close`](#close), [`sync_fd`](#sync_fd), [`stat`](#stat), [`set_mode`](#set_mode), [`set_mode_at`](#set_mode_at), [`set_mode_at_native`](#set_mode_at_native), [`file_identity`](#file_identity), [`identity_at`](#identity_at), [`identity_at_native`](#identity_at_native), [`retain_identity_at`](#retain_identity_at), [`retain_identity_at_native`](#retain_identity_at_native), [`publication_capabilities`](#publication_capabilities), [`stat_path`](#stat_path), [`stat_path_native`](#stat_path_native), [`stat_mode`](#stat_mode), [`unlink`](#unlink), [`unlink_native`](#unlink_native), [`rename`](#rename), [`rename_native`](#rename_native), [`symlink`](#symlink), [`symlink_native`](#symlink_native), [`make_dir`](#make_dir), [`make_dir_native`](#make_dir_native), [`directory_init`](#directory_init), [`directory_next`](#directory_next), [`directory_dnit`](#directory_dnit), [`access`](#access), [`access_native`](#access_native), [`seek`](#seek), [`lock_fd`](#lock_fd), [`pipe`](#pipe), [`getcwd`](#getcwd), [`getcwd_native`](#getcwd_native) | |
 | [`capture_process`](#capture_process) | process |
-| [`arguments`](#arguments), [`argument_total`](#argument_total), [`terminate`](#terminate), [`abort`](#abort), [`terminate_child`](#terminate_child), [`spawn`](#spawn), [`spawn_in`](#spawn_in), [`spawn_redirected`](#spawn_redirected), [`spawn_redirected_in`](#spawn_redirected_in), [`spawn_native`](#spawn_native), [`spawn_in_native`](#spawn_in_native), [`spawn_redirected_native`](#spawn_redirected_native), [`spawn_redirected_in_native`](#spawn_redirected_in_native), [`getpid`](#getpid), [`ignore_sigpipe`](#ignore_sigpipe), [`getenv`](#getenv), [`environ`](#environ), [`getenv_native`](#getenv_native), [`environ_native`](#environ_native), [`wait`](#wait), [`wait_pid`](#wait_pid), [`ProcessStatus`](#processstatus), [`FileLimit`](#filelimit), [`LIMIT_UNLIMITED`](#limit_unlimited), [`open_file_limit`](#open_file_limit), [`set_open_file_limit`](#set_open_file_limit), [`ProcessWaitError`](#processwaiterror), [`WaitResult`](#waitresult), [`PROCESS_OP_WAIT`](#process_op_wait), [`PROCESS_OP_STATUS`](#process_op_status), [`PROCESS_OP_CLOSE`](#process_op_close), [`PROCESS_OP_SPAWN`](#process_op_spawn), [`PROCESS_OP_READ`](#process_op_read), [`PROCESS_OP_PIPE`](#process_op_pipe), [`PROCESS_OP_TERMINATE`](#process_op_terminate), [`PROCESS_EXITED`](#process_exited), [`PROCESS_SIGNALED`](#process_signaled), [`PROCESS_STOPPED`](#process_stopped), [`PROCESS_CONTINUED`](#process_continued) | |
+| [`arguments`](#arguments), [`argument_total`](#argument_total), [`terminate`](#terminate), [`abort`](#abort), [`terminate_child`](#terminate_child), [`spawn`](#spawn), [`spawn_in`](#spawn_in), [`spawn_redirected`](#spawn_redirected), [`spawn_redirected_in`](#spawn_redirected_in), [`spawn_native`](#spawn_native), [`spawn_in_native`](#spawn_in_native), [`spawn_redirected_native`](#spawn_redirected_native), [`spawn_redirected_in_native`](#spawn_redirected_in_native), [`getpid`](#getpid), [`ignore_sigpipe`](#ignore_sigpipe), [`getenv`](#getenv), [`environ`](#environ), [`getenv_native`](#getenv_native), [`environ_native`](#environ_native), [`temp_dir`](#temp_dir), [`wait`](#wait), [`wait_pid`](#wait_pid), [`ProcessStatus`](#processstatus), [`FileLimit`](#filelimit), [`LIMIT_UNLIMITED`](#limit_unlimited), [`open_file_limit`](#open_file_limit), [`set_open_file_limit`](#set_open_file_limit), [`ProcessWaitError`](#processwaiterror), [`WaitResult`](#waitresult), [`PROCESS_OP_WAIT`](#process_op_wait), [`PROCESS_OP_STATUS`](#process_op_status), [`PROCESS_OP_CLOSE`](#process_op_close), [`PROCESS_OP_SPAWN`](#process_op_spawn), [`PROCESS_OP_READ`](#process_op_read), [`PROCESS_OP_PIPE`](#process_op_pipe), [`PROCESS_OP_TERMINATE`](#process_op_terminate), [`PROCESS_EXITED`](#process_exited), [`PROCESS_SIGNALED`](#process_signaled), [`PROCESS_STOPPED`](#process_stopped), [`PROCESS_CONTINUED`](#process_continued) | |
 | [`sleep`](#sleep) | time and entropy |
 | [`clock_gettime`](#clock_gettime), [`random_fill`](#random_fill) | |
 | [`stack_bounds`](#stack_bounds) | core |
@@ -1198,6 +1198,16 @@ Forwards [`std.system.os.wasi.preview1.environ`](wasi/preview1.md#environ), only
 ```mach
 pub fun environ() **u8
 ```
+
+### temp_dir
+
+Forwards [`std.system.os.wasi.preview1.temp_dir`](wasi/preview1.md#temp_dir), only where `$mach.build.sys == $mach.sys.wasi`.
+
+```mach
+pub fun temp_dir(buf: *u8, cap: usize) i64
+```
+
+the directory designated for temporary files: $TMPDIR, else "/tmp"
 
 ### wait
 

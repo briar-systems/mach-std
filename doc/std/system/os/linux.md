@@ -36,9 +36,9 @@ Source: [`src/system/os/linux.mach`](../../../../src/system/os/linux.mach)
 | [`spawn_native`](#spawn_native) | the kernel takes paths and arguments as bytes, so the native-unit spawns are the spawns themselves |
 | [`spawn_in_native`](#spawn_in_native), [`spawn_redirected_native`](#spawn_redirected_native), [`spawn_redirected_in_native`](#spawn_redirected_in_native), [`spawn_redirected_in_grouped_native`](#spawn_redirected_in_grouped_native), [`getpid`](#getpid), [`running_under_user_emulation`](#running_under_user_emulation), [`pipe`](#pipe), [`ignore_sigpipe`](#ignore_sigpipe), [`sleep`](#sleep), [`cpu_count`](#cpu_count), [`cpu_features`](#cpu_features), [`cpu_dit`](#cpu_dit), [`thread_affinity`](#thread_affinity), [`set_thread_affinity`](#set_thread_affinity), [`getcwd`](#getcwd), [`getcwd_native`](#getcwd_native), [`getenv`](#getenv), [`environ`](#environ) | |
 | [`getenv_native`](#getenv_native) | the environment is the bytes the kernel passed, so its native reads are the reads themselves |
-| [`environ_native`](#environ_native), [`fork`](#fork), [`vfork`](#vfork), [`exec`](#exec), [`wait`](#wait), [`wait_pid`](#wait_pid), [`ProcessStatus`](#processstatus), [`FileLimit`](#filelimit), [`LIMIT_UNLIMITED`](#limit_unlimited), [`open_file_limit`](#open_file_limit), [`set_open_file_limit`](#set_open_file_limit), [`ProcessWaitError`](#processwaiterror), [`WaitResult`](#waitresult), [`PROCESS_OP_WAIT`](#process_op_wait), [`PROCESS_OP_STATUS`](#process_op_status), [`PROCESS_OP_CLOSE`](#process_op_close), [`PROCESS_OP_SPAWN`](#process_op_spawn), [`PROCESS_OP_READ`](#process_op_read), [`PROCESS_OP_PIPE`](#process_op_pipe), [`PROCESS_OP_TERMINATE`](#process_op_terminate), [`PROCESS_EXITED`](#process_exited), [`PROCESS_SIGNALED`](#process_signaled), [`PROCESS_STOPPED`](#process_stopped), [`PROCESS_CONTINUED`](#process_continued) | |
+| [`environ_native`](#environ_native), [`temp_dir`](#temp_dir), [`fork`](#fork), [`vfork`](#vfork), [`exec`](#exec), [`wait`](#wait), [`wait_pid`](#wait_pid), [`ProcessStatus`](#processstatus), [`FileLimit`](#filelimit), [`LIMIT_UNLIMITED`](#limit_unlimited), [`open_file_limit`](#open_file_limit), [`set_open_file_limit`](#set_open_file_limit), [`ProcessWaitError`](#processwaiterror), [`WaitResult`](#waitresult), [`PROCESS_OP_WAIT`](#process_op_wait), [`PROCESS_OP_STATUS`](#process_op_status), [`PROCESS_OP_CLOSE`](#process_op_close), [`PROCESS_OP_SPAWN`](#process_op_spawn), [`PROCESS_OP_READ`](#process_op_read), [`PROCESS_OP_PIPE`](#process_op_pipe), [`PROCESS_OP_TERMINATE`](#process_op_terminate), [`PROCESS_EXITED`](#process_exited), [`PROCESS_SIGNALED`](#process_signaled), [`PROCESS_STOPPED`](#process_stopped), [`PROCESS_CONTINUED`](#process_continued) | |
 | [`AF_INET`](#af_inet) | sockets |
-| [`AF_INET6`](#af_inet6), [`SOCK_STREAM`](#sock_stream), [`SOCK_DGRAM`](#sock_dgram), [`SOCK_NONBLOCK`](#sock_nonblock), [`SOCK_CLOEXEC`](#sock_cloexec), [`SOL_SOCKET`](#sol_socket), [`SO_UNSUPPORTED`](#so_unsupported), [`SO_REUSEADDR`](#so_reuseaddr), [`SO_REUSEPORT`](#so_reuseport), [`SO_EXCLUSIVEADDRUSE`](#so_exclusiveaddruse), [`SO_KEEPALIVE`](#so_keepalive), [`SO_SNDBUF`](#so_sndbuf), [`SO_RCVBUF`](#so_rcvbuf), [`SO_LINGER`](#so_linger), [`SO_RCVTIMEO`](#so_rcvtimeo), [`IPPROTO_IP`](#ipproto_ip), [`IPPROTO_TCP`](#ipproto_tcp), [`IPPROTO_IPV6`](#ipproto_ipv6), [`IP_TOS`](#ip_tos), [`IPV6_V6ONLY`](#ipv6_v6only), [`IPV6_TCLASS`](#ipv6_tclass), [`TCP_NODELAY`](#tcp_nodelay), [`TCP_KEEPIDLE`](#tcp_keepidle), [`TCP_KEEPINTVL`](#tcp_keepintvl), [`TCP_KEEPCNT`](#tcp_keepcnt), [`TCP_FASTOPEN`](#tcp_fastopen), [`SHUT_RD`](#shut_rd), [`SHUT_WR`](#shut_wr), [`SHUT_RDWR`](#shut_rdwr), [`SOCKADDR_IN_SIZE`](#sockaddr_in_size), [`SOCKADDR_IN6_SIZE`](#sockaddr_in6_size), [`SOCKADDR_STORAGE_SIZE`](#sockaddr_storage_size), [`sock_send`](#sock_send), [`sock_recv`](#sock_recv), [`IoVector`](#iovector), [`sock_write_vector`](#sock_write_vector), [`sock_send_message`](#sock_send_message), [`sock_receive_message`](#sock_receive_message), [`MSG_CTRUNC`](#msg_ctrunc), [`MSG_CMSG_CLOEXEC`](#msg_cmsg_cloexec), [`SCM_RIGHTS`](#scm_rights), [`SCM_CREDENTIALS`](#scm_credentials), [`SCM_PIDFD`](#scm_pidfd), [`SCM_MAX_FD`](#scm_max_fd), [`LOCAL_CONTROL_CAPACITY`](#local_control_capacity), [`sock_recv_close_rights`](#sock_recv_close_rights), [`local_stream_recv`](#local_stream_recv), [`sock_connect_status`](#sock_connect_status), [`sock_connect_begin`](#sock_connect_begin), [`sock_connect_poll`](#sock_connect_poll), [`CONNECT_PENDING`](#connect_pending), [`sock_close`](#sock_close), [`sock_create`](#sock_create), [`sock_create_flags`](#sock_create_flags), [`sock_bind`](#sock_bind), [`sock_listen`](#sock_listen), [`sock_accept`](#sock_accept), [`sock_accept_flags`](#sock_accept_flags), [`sock_connect`](#sock_connect), [`sock_sendto`](#sock_sendto), [`sock_recvfrom`](#sock_recvfrom), [`sock_peek_readable`](#sock_peek_readable), [`sock_shutdown`](#sock_shutdown), [`sock_setopt`](#sock_setopt), [`sock_getopt`](#sock_getopt), [`sock_local_addr`](#sock_local_addr), [`sock_remote_addr`](#sock_remote_addr), [`sock_inheritable`](#sock_inheritable), [`IoCompletion`](#iocompletion), [`IO_EVENT_READ`](#io_event_read), [`IO_EVENT_WRITE`](#io_event_write), [`IO_EVENT_ERROR`](#io_event_error), [`IO_EVENT_HANGUP`](#io_event_hangup), [`IO_EVENT_WAKE`](#io_event_wake), [`io_queue_create`](#io_queue_create), [`io_queue_wait`](#io_queue_wait), [`io_queue_watch`](#io_queue_watch), [`io_queue_rearm`](#io_queue_rearm), [`duplicate_to`](#duplicate_to), [`io_queue_unwatch`](#io_queue_unwatch), [`io_queue_poll`](#io_queue_poll), [`io_queue_wake`](#io_queue_wake), [`io_queue_close`](#io_queue_close), [`sock_set_rcvtimeo`](#sock_set_rcvtimeo) | |
+| [`AF_INET6`](#af_inet6), [`SOCK_STREAM`](#sock_stream), [`SOCK_DGRAM`](#sock_dgram), [`SOCK_NONBLOCK`](#sock_nonblock), [`SOCK_CLOEXEC`](#sock_cloexec), [`SOL_SOCKET`](#sol_socket), [`SO_UNSUPPORTED`](#so_unsupported), [`SO_REUSEADDR`](#so_reuseaddr), [`SO_REUSEPORT`](#so_reuseport), [`SO_EXCLUSIVEADDRUSE`](#so_exclusiveaddruse), [`SO_KEEPALIVE`](#so_keepalive), [`SO_SNDBUF`](#so_sndbuf), [`SO_RCVBUF`](#so_rcvbuf), [`SO_LINGER`](#so_linger), [`SO_RCVTIMEO`](#so_rcvtimeo), [`IPPROTO_IP`](#ipproto_ip), [`IPPROTO_TCP`](#ipproto_tcp), [`IPPROTO_IPV6`](#ipproto_ipv6), [`IP_TOS`](#ip_tos), [`IPV6_V6ONLY`](#ipv6_v6only), [`IPV6_TCLASS`](#ipv6_tclass), [`TCP_NODELAY`](#tcp_nodelay), [`TCP_KEEPIDLE`](#tcp_keepidle), [`TCP_KEEPINTVL`](#tcp_keepintvl), [`TCP_KEEPCNT`](#tcp_keepcnt), [`TCP_FASTOPEN`](#tcp_fastopen), [`SHUT_RD`](#shut_rd), [`SHUT_WR`](#shut_wr), [`SHUT_RDWR`](#shut_rdwr), [`SOCKADDR_IN_SIZE`](#sockaddr_in_size), [`SOCKADDR_IN6_SIZE`](#sockaddr_in6_size), [`SOCKADDR_STORAGE_SIZE`](#sockaddr_storage_size), [`sock_send`](#sock_send), [`sock_recv`](#sock_recv), [`IoVector`](#iovector), [`sock_write_vector`](#sock_write_vector), [`sock_send_message`](#sock_send_message), [`sock_receive_message`](#sock_receive_message), [`MSG_CTRUNC`](#msg_ctrunc), [`MSG_CMSG_CLOEXEC`](#msg_cmsg_cloexec), [`SCM_RIGHTS`](#scm_rights), [`SCM_CREDENTIALS`](#scm_credentials), [`SCM_PIDFD`](#scm_pidfd), [`SCM_MAX_FD`](#scm_max_fd), [`LOCAL_CONTROL_CAPACITY`](#local_control_capacity), [`sock_recv_close_rights`](#sock_recv_close_rights), [`local_stream_recv`](#local_stream_recv), [`sock_set_nonblocking`](#sock_set_nonblocking), [`sock_connect_begin`](#sock_connect_begin), [`sock_connect_poll`](#sock_connect_poll), [`CONNECT_PENDING`](#connect_pending), [`sock_close`](#sock_close), [`sock_create`](#sock_create), [`sock_create_flags`](#sock_create_flags), [`sock_bind`](#sock_bind), [`sock_listen`](#sock_listen), [`sock_accept`](#sock_accept), [`sock_accept_flags`](#sock_accept_flags), [`sock_connect`](#sock_connect), [`sock_sendto`](#sock_sendto), [`sock_recvfrom`](#sock_recvfrom), [`sock_peek_readable`](#sock_peek_readable), [`sock_shutdown`](#sock_shutdown), [`sock_setopt`](#sock_setopt), [`sock_getopt`](#sock_getopt), [`sock_local_addr`](#sock_local_addr), [`sock_remote_addr`](#sock_remote_addr), [`sock_inheritable`](#sock_inheritable), [`IoCompletion`](#iocompletion), [`IO_EVENT_READ`](#io_event_read), [`IO_EVENT_WRITE`](#io_event_write), [`IO_EVENT_ERROR`](#io_event_error), [`IO_EVENT_HANGUP`](#io_event_hangup), [`IO_EVENT_WAKE`](#io_event_wake), [`io_queue_create`](#io_queue_create), [`io_queue_wait`](#io_queue_wait), [`io_queue_watch`](#io_queue_watch), [`io_queue_rearm`](#io_queue_rearm), [`duplicate_to`](#duplicate_to), [`io_queue_unwatch`](#io_queue_unwatch), [`io_queue_poll`](#io_queue_poll), [`io_queue_wake`](#io_queue_wake), [`io_queue_close`](#io_queue_close), [`sock_set_rcvtimeo`](#sock_set_rcvtimeo) | |
 | [`DNS_HOSTS_PATH`](#dns_hosts_path) | dns |
 | [`random_fill`](#random_fill) | random |
 | [`thread_spawn`](#thread_spawn) | threads |
@@ -2760,6 +2760,16 @@ pointer to the environment captured by the runtime at program
 start (null-terminated array of "NAME=value" strings). nil before
 runtime init.
 
+### temp_dir
+
+Forwards [`std.system.os.linux.shared.temp_dir`](linux/shared.md#temp_dir).
+
+```mach
+pub fun temp_dir(buf: *u8, cap: usize) i64
+```
+
+the directory designated for temporary files: $TMPDIR, else "/tmp"
+
 ### fork
 
 Forwards the first of these whose condition holds:
@@ -3708,18 +3718,20 @@ pub fun local_stream_recv(fd: usize, buffer: *u8, length: usize) i64
 
 byte reception for local streams: rights a peer attaches are observed and closed
 
-### sock_connect_status
+### sock_set_nonblocking
 
 Forwards the first of these whose condition holds:
 
-- [`std.system.os.linux.x86_64.sock_connect_status`](linux/x86_64.md#sock_connect_status), where `$mach.build.arch == $mach.arch.x86_64`
-- [`std.system.os.linux.aarch64.sock_connect_status`](linux/aarch64.md#sock_connect_status), where `$mach.build.arch == $mach.arch.aarch64`
-- [`std.system.os.linux.riscv64.sock_connect_status`](linux/riscv64.md#sock_connect_status), where `$mach.build.arch == $mach.arch.riscv64`
-- [`std.system.os.linux.riscv32.sock_connect_status`](linux/riscv32.md#sock_connect_status), where `$mach.build.arch == $mach.arch.riscv32`
+- [`std.system.os.linux.x86_64.sock_set_nonblocking`](linux/x86_64.md#sock_set_nonblocking), where `$mach.build.arch == $mach.arch.x86_64`
+- [`std.system.os.linux.aarch64.sock_set_nonblocking`](linux/aarch64.md#sock_set_nonblocking), where `$mach.build.arch == $mach.arch.aarch64`
+- [`std.system.os.linux.riscv64.sock_set_nonblocking`](linux/riscv64.md#sock_set_nonblocking), where `$mach.build.arch == $mach.arch.riscv64`
+- [`std.system.os.linux.riscv32.sock_set_nonblocking`](linux/riscv32.md#sock_set_nonblocking), where `$mach.build.arch == $mach.arch.riscv32`
 
 ```mach
-pub fun sock_connect_status(fd: usize) i64
+pub fun sock_set_nonblocking(fd: usize, enabled: bool) i64
 ```
+
+switch a socket between blocking and nonblocking
 
 ### sock_connect_begin
 
@@ -3734,7 +3746,7 @@ Forwards the first of these whose condition holds:
 pub fun sock_connect_begin(fd: usize, addr: *u8, addrlen: usize) i64
 ```
 
-start a connect on a blocking socket without blocking on it
+start a connect on a nonblocking socket
 
 ### sock_connect_poll
 

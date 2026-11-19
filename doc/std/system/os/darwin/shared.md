@@ -97,6 +97,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`set_thread_affinity`](#set_thread_affinity) | darwin has no hard CPU affinity, so a thread cannot be pinned |
 | [`getcwd`](#getcwd) | get the current working directory |
 | [`getenv`](#getenv) | look up an environment variable by name |
+| [`temp_dir`](#temp_dir) | the directory designated for temporary files: $TMPDIR, else "/tmp" |
 | [`thread_block_enter`](#thread_block_enter) | install block as the calling thread's |
 | [`thread_block`](#thread_block) | the calling thread's block, read from its pthread TSD without a system call |
 | [`stack_bounds`](#stack_bounds) | the calling thread's stack bounds, recorded in its block when it was installed, or asked of libpthread on a thread std did not create |
@@ -114,8 +115,8 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`local_stream_recv`](#local_stream_recv) | exclusively borrow the receive queue through peek and consume, including all aliases |
 | [`sock_write_vector`](#sock_write_vector), [`sock_send_message`](#sock_send_message) | |
 | [`sock_receive_message`](#sock_receive_message) | raw recvmsg preserves native ancillary ownership and truncation behavior |
-| [`sock_connect_status`](#sock_connect_status) | |
-| [`sock_connect_begin`](#sock_connect_begin) | start a connect on a blocking socket without blocking on it |
+| [`sock_set_nonblocking`](#sock_set_nonblocking) | switch a socket between blocking and nonblocking |
+| [`sock_connect_begin`](#sock_connect_begin) | start a connect on a nonblocking socket |
 | [`sock_connect_poll`](#sock_connect_poll) | ask whether a connect sock_connect_begin started has settled, without waiting |
 | [`sock_close`](#sock_close), [`sock_create`](#sock_create), [`sock_create_flags`](#sock_create_flags), [`sock_bind`](#sock_bind), [`sock_listen`](#sock_listen), [`sock_accept`](#sock_accept), [`sock_accept_flags`](#sock_accept_flags), [`sock_connect`](#sock_connect), [`sock_sendto`](#sock_sendto) | |
 | [`sock_peek_readable`](#sock_peek_readable) | peek at a stream socket without consuming or blocking |
@@ -1156,6 +1157,20 @@ always returns the full value length, so ret >= cap signals truncation
 | `cap` | buffer capacity in bytes |
 | **returns** | full length of the value, or ENOENT when the variable is unset |
 
+### temp_dir
+
+```mach
+pub fun temp_dir(buf: *u8, cap: usize) i64
+```
+
+the directory designated for temporary files: $TMPDIR, else "/tmp"
+
+| Parameter | |
+| :--- | :--- |
+| `buf` | destination buffer for the path |
+| `cap` | buffer capacity in bytes |
+| **returns** | full length of the path, so ret >= cap signals truncation |
+
 ### thread_block_enter
 
 ```mach
@@ -1391,11 +1406,19 @@ raw recvmsg preserves native ancillary ownership and truncation behavior.
 darwin can install unreported scm_rights descriptors with nil or undersized control.
 callers receiving rights must provide adequate control storage and close each result.
 
-### sock_connect_status
+### sock_set_nonblocking
 
 ```mach
-pub fun sock_connect_status(fd: usize) i64
+pub fun sock_set_nonblocking(fd: usize, enabled: bool) i64
 ```
+
+switch a socket between blocking and nonblocking
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket handle |
+| `enabled` | true for nonblocking |
+| **returns** | 0, or the native failure |
 
 ### sock_connect_begin
 
@@ -1403,14 +1426,14 @@ pub fun sock_connect_status(fd: usize) i64
 pub fun sock_connect_begin(fd: usize, addr: *u8, addrlen: usize) i64
 ```
 
-start a connect on a blocking socket without blocking on it
+start a connect on a nonblocking socket
 
 | Parameter | |
 | :--- | :--- |
-| `fd` | a blocking stream socket, nonblocking until the connect settles |
+| `fd` | a nonblocking stream socket |
 | `addr` | pointer to the peer's sockaddr |
 | `addrlen` | size of the sockaddr |
-| **returns** | 0 once connected, CONNECT_PENDING while in flight, or negative errno. a settled connect leaves the socket blocking again |
+| **returns** | 0 once connected, CONNECT_PENDING while in flight, or negative errno |
 
 ### sock_connect_poll
 
@@ -1423,7 +1446,7 @@ ask whether a connect sock_connect_begin started has settled, without waiting
 | Parameter | |
 | :--- | :--- |
 | `fd` | the socket sock_connect_begin returned CONNECT_PENDING for |
-| **returns** | 0 once connected, CONNECT_PENDING while in flight, or the connect's negative errno. a settled connect leaves the socket blocking again |
+| **returns** | 0 once connected, CONNECT_PENDING while in flight, or the connect's negative errno |
 
 ### sock_close
 

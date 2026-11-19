@@ -10,7 +10,9 @@ Uses types from [`std.net.local.endpoint`](endpoint.md), [`std.net.local.types`]
 
 | Functions | |
 | :--- | :--- |
-| [`cleanup_listener`](#cleanup_listener), [`create_stream`](#create_stream), [`connect_start`](#connect_start), [`bind`](#bind), [`start_listener`](#start_listener), [`listen`](#listen), [`connect`](#connect), [`accept`](#accept) | |
+| [`cleanup_listener`](#cleanup_listener), [`create_stream`](#create_stream), [`connect_start`](#connect_start) | |
+| [`connect_begin`](#connect_begin) | connect_start on a nonblocking socket, under the contract's sock_connect_begin |
+| [`bind`](#bind), [`start_listener`](#start_listener), [`listen`](#listen), [`connect`](#connect), [`accept`](#accept) | |
 | [`read`](#read) | bytes only: linux closes every right the peer attached, darwin refuses before installing any |
 | [`write`](#write), [`shutdown_write`](#shutdown_write), [`peer_identity`](#peer_identity), [`rename`](#rename), [`close_stream`](#close_stream), [`close_listener`](#close_listener) | |
 
@@ -35,6 +37,14 @@ pub fun create_stream(value: std.net.local.endpoint.Endpoint, asynchronous: bool
 ```mach
 pub fun connect_start(handle: usize, value: std.net.local.endpoint.Endpoint) i64
 ```
+
+### connect_begin
+
+```mach
+pub fun connect_begin(handle: usize, value: std.net.local.endpoint.Endpoint) i64
+```
+
+connect_start on a nonblocking socket, under the contract's sock_connect_begin
 
 ### bind
 

@@ -174,6 +174,7 @@ Uses types from [`std.io.error`](../io/error.md), [`std.system.file_identity`](f
 | [`sock_local_addr`](#sock_local_addr) | sockets |
 | [`sock_remote_addr`](#sock_remote_addr) | sockets |
 | [`sock_inheritable`](#sock_inheritable) | sockets |
+| [`sock_set_nonblocking`](#sock_set_nonblocking) | sockets |
 | [`sock_connect_begin`](#sock_connect_begin) | sockets |
 | [`sock_connect_poll`](#sock_connect_poll) | sockets |
 | [`CONNECT_PENDING`](#connect_pending) | sockets |
@@ -4188,6 +4189,32 @@ pub fun sock_inheritable(fd: usize, out: *bool) i64
 ```
 
 Where `capability.HAS_SOCKETS` and `$mach.build.sys == $mach.sys.wasi`: [`std.system.os.wasi.sock_inheritable`](os/wasi.md).
+
+sockets
+
+### sock_set_nonblocking
+
+Forwards the first of these whose condition holds, and they differ.
+
+Where `capability.HAS_SOCKETS` and `$mach.build.sys == $mach.sys.linux`: [`std.system.os.linux.sock_set_nonblocking`](os/linux.md#sock_set_nonblocking).
+
+```mach
+pub fun sock_set_nonblocking(fd: usize, enabled: bool) i64
+```
+
+Where `capability.HAS_SOCKETS` and `$mach.build.sys == $mach.sys.darwin`: [`std.system.os.darwin.sock_set_nonblocking`](os/darwin.md#sock_set_nonblocking).
+
+```mach
+pub fun sock_set_nonblocking(fd: usize, enabled: bool) i64
+```
+
+Where `capability.HAS_SOCKETS` and `$mach.build.sys == $mach.sys.windows`: [`std.system.os.windows.sock_set_nonblocking`](os/windows.md#sock_set_nonblocking).
+
+```mach
+pub fun sock_set_nonblocking(fd: usize, enabled: bool) i64
+```
+
+Where `capability.HAS_SOCKETS` and `$mach.build.sys == $mach.sys.wasi`: [`std.system.os.wasi.sock_set_nonblocking`](os/wasi.md).
 
 sockets
 

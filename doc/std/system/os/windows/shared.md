@@ -152,8 +152,8 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`sock_async_receive_message`](#sock_async_receive_message) | |
 | [`sock_receive_message_ready`](#sock_receive_message_ready) | receive one message now, without an overlapped operation |
 | [`sock_async_send_message`](#sock_async_send_message), [`sock_async_result`](#sock_async_result), [`sock_accept_context`](#sock_accept_context), [`sock_connect_context`](#sock_connect_context), [`sock_create`](#sock_create), [`sock_create_flags`](#sock_create_flags), [`sock_bind`](#sock_bind), [`sock_listen`](#sock_listen), [`sock_accept`](#sock_accept), [`sock_accept_flags`](#sock_accept_flags), [`sock_connect`](#sock_connect), [`sock_sendto`](#sock_sendto), [`sock_recvfrom`](#sock_recvfrom), [`sock_shutdown`](#sock_shutdown), [`sock_setopt`](#sock_setopt), [`sock_getopt`](#sock_getopt), [`sock_local_addr`](#sock_local_addr), [`sock_remote_addr`](#sock_remote_addr) | |
-| [`sock_connect_status`](#sock_connect_status) | a connect's own failure, read from SO_ERROR, or 0 when none is recorded |
-| [`sock_connect_begin`](#sock_connect_begin) | start a connect on a blocking socket without blocking on it |
+| [`sock_set_nonblocking`](#sock_set_nonblocking) | switch a socket between blocking and nonblocking |
+| [`sock_connect_begin`](#sock_connect_begin) | start a connect on a nonblocking socket |
 | [`sock_connect_poll`](#sock_connect_poll) | ask whether a connect sock_connect_begin started has settled, without waiting |
 | [`sock_inheritable`](#sock_inheritable) | |
 | [`sock_set_rcvtimeo`](#sock_set_rcvtimeo) | set the receive timeout on a socket |
@@ -1829,13 +1829,19 @@ pub fun sock_local_addr(fd: usize, addr: *u8, addrlen: *u32) i64
 pub fun sock_remote_addr(fd: usize, addr: *u8, addrlen: *u32) i64
 ```
 
-### sock_connect_status
+### sock_set_nonblocking
 
 ```mach
-pub fun sock_connect_status(fd: usize) i64
+pub fun sock_set_nonblocking(fd: usize, enabled: bool) i64
 ```
 
-a connect's own failure, read from SO_ERROR, or 0 when none is recorded
+switch a socket between blocking and nonblocking
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket handle |
+| `enabled` | true for nonblocking |
+| **returns** | 0, or the native failure |
 
 ### sock_connect_begin
 
@@ -1843,14 +1849,14 @@ a connect's own failure, read from SO_ERROR, or 0 when none is recorded
 pub fun sock_connect_begin(fd: usize, addr: *u8, addrlen: usize) i64
 ```
 
-start a connect on a blocking socket without blocking on it
+start a connect on a nonblocking socket
 
 | Parameter | |
 | :--- | :--- |
-| `fd` | a blocking stream socket, nonblocking until the connect settles |
+| `fd` | a nonblocking stream socket |
 | `addr` | pointer to the peer's sockaddr |
 | `addrlen` | size of the sockaddr |
-| **returns** | 0 once connected, CONNECT_PENDING while in flight, or the negated errno winsock's failure maps to. a settled connect leaves the socket blocking again |
+| **returns** | 0 once connected, CONNECT_PENDING while in flight, or the negated errno winsock's failure maps to |
 
 ### sock_connect_poll
 
@@ -1867,7 +1873,7 @@ before the connect completes
 | Parameter | |
 | :--- | :--- |
 | `fd` | the socket sock_connect_begin returned CONNECT_PENDING for |
-| **returns** | 0 once connected, CONNECT_PENDING while in flight, or the connect's failure. a settled connect leaves the socket blocking again |
+| **returns** | 0 once connected, CONNECT_PENDING while in flight, or the connect's failure |
 
 ### sock_inheritable
 

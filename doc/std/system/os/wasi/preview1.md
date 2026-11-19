@@ -56,7 +56,9 @@ Uses types from [`std.system.file_identity`](../../file_identity.md).
 | [`lock_fd`](#lock_fd), [`pipe`](#pipe), [`map_file`](#map_file), [`sync_file`](#sync_file) | |
 | [`getcwd`](#getcwd) | the preview has one directory the program starts in, the root |
 | [`capture_process`](#capture_process) | take the arguments and the environment from the host, before main |
-| [`arguments`](#arguments), [`argument_total`](#argument_total), [`environ`](#environ), [`getenv`](#getenv), [`terminate`](#terminate), [`abort`](#abort) | |
+| [`arguments`](#arguments), [`argument_total`](#argument_total), [`environ`](#environ), [`getenv`](#getenv) | |
+| [`temp_dir`](#temp_dir) | the directory designated for temporary files: $TMPDIR, else "/tmp" |
+| [`terminate`](#terminate), [`abort`](#abort) | |
 | [`getpid`](#getpid) | the preview runs one process and knows no other |
 | [`terminate_child`](#terminate_child), [`spawn`](#spawn), [`spawn_in`](#spawn_in), [`spawn_redirected`](#spawn_redirected), [`spawn_redirected_in`](#spawn_redirected_in), [`wait`](#wait), [`wait_pid`](#wait_pid), [`ignore_sigpipe`](#ignore_sigpipe), [`open_file_limit`](#open_file_limit), [`set_open_file_limit`](#set_open_file_limit), [`random_fill`](#random_fill) | |
 | [`sleep`](#sleep) | block the one thread for nsec nanoseconds |
@@ -350,6 +352,20 @@ pub fun environ() **u8
 ```mach
 pub fun getenv(name: *u8, buf: *u8, cap: usize) i64
 ```
+
+### temp_dir
+
+```mach
+pub fun temp_dir(buf: *u8, cap: usize) i64
+```
+
+the directory designated for temporary files: $TMPDIR, else "/tmp"
+
+| Parameter | |
+| :--- | :--- |
+| `buf` | destination buffer for the path |
+| `cap` | buffer capacity in bytes |
+| **returns** | full length of the path, so ret >= cap signals truncation |
 
 ### terminate
 

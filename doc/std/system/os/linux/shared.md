@@ -152,6 +152,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`set_thread_affinity`](#set_thread_affinity) | pin the calling thread to the CPUs set in words |
 | [`getcwd`](#getcwd) | get the current working directory |
 | [`getenv`](#getenv) | look up an environment variable by name |
+| [`temp_dir`](#temp_dir) | the directory designated for temporary files: $TMPDIR, else "/tmp" |
 | [`thread_wait`](#thread_wait) | block until the value at addr changes from expected |
 | [`thread_wait_until`](#thread_wait_until) | block until the word changes or an absolute monotonic deadline is reached |
 | [`thread_wake`](#thread_wake) | wake one thread blocked on a futex wait at addr |
@@ -167,8 +168,8 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`sock_peek_readable`](#sock_peek_readable) | peek at a stream socket without consuming or blocking |
 | [`sock_recv_close_rights`](#sock_recv_close_rights) | receives bytes and closes every descriptor the kernel installed for them |
 | [`local_stream_recv`](#local_stream_recv) | byte reception for local streams: rights a peer attaches are observed and closed |
-| [`sock_connect_status`](#sock_connect_status) | |
-| [`sock_connect_begin`](#sock_connect_begin) | start a connect on a blocking socket without blocking on it |
+| [`sock_set_nonblocking`](#sock_set_nonblocking) | switch a socket between blocking and nonblocking |
+| [`sock_connect_begin`](#sock_connect_begin) | start a connect on a nonblocking socket |
 | [`sock_connect_poll`](#sock_connect_poll) | ask whether a connect sock_connect_begin started has settled, without waiting |
 | [`sock_close`](#sock_close) | close a socket file descriptor |
 | [`sock_create`](#sock_create) | create a socket file descriptor |
@@ -1943,6 +1944,20 @@ always returns the full value length, so ret >= cap signals truncation
 | `cap` | buffer capacity in bytes |
 | **returns** | full length of the value, or ENOENT when the variable is unset |
 
+### temp_dir
+
+```mach
+pub fun temp_dir(buf: *u8, cap: usize) i64
+```
+
+the directory designated for temporary files: $TMPDIR, else "/tmp"
+
+| Parameter | |
+| :--- | :--- |
+| `buf` | destination buffer for the path |
+| `cap` | buffer capacity in bytes |
+| **returns** | full length of the path, so ret >= cap signals truncation |
+
 ### thread_wait
 
 ```mach
@@ -2108,11 +2123,19 @@ pub fun local_stream_recv(fd: usize, buffer: *u8, length: usize) i64
 
 byte reception for local streams: rights a peer attaches are observed and closed
 
-### sock_connect_status
+### sock_set_nonblocking
 
 ```mach
-pub fun sock_connect_status(fd: usize) i64
+pub fun sock_set_nonblocking(fd: usize, enabled: bool) i64
 ```
+
+switch a socket between blocking and nonblocking
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket handle |
+| `enabled` | true for nonblocking |
+| **returns** | 0, or the native failure |
 
 ### sock_connect_begin
 
@@ -2120,14 +2143,14 @@ pub fun sock_connect_status(fd: usize) i64
 pub fun sock_connect_begin(fd: usize, addr: *u8, addrlen: usize) i64
 ```
 
-start a connect on a blocking socket without blocking on it
+start a connect on a nonblocking socket
 
 | Parameter | |
 | :--- | :--- |
-| `fd` | a blocking stream socket, nonblocking until the connect settles |
+| `fd` | a nonblocking stream socket |
 | `addr` | pointer to the peer's sockaddr |
 | `addrlen` | size of the sockaddr |
-| **returns** | 0 once connected, CONNECT_PENDING while in flight, or negative errno. a settled connect leaves the socket blocking again |
+| **returns** | 0 once connected, CONNECT_PENDING while in flight, or negative errno |
 
 ### sock_connect_poll
 
@@ -2140,7 +2163,7 @@ ask whether a connect sock_connect_begin started has settled, without waiting
 | Parameter | |
 | :--- | :--- |
 | `fd` | the socket sock_connect_begin returned CONNECT_PENDING for |
-| **returns** | 0 once connected, CONNECT_PENDING while in flight, or the connect's negative errno. a settled connect leaves the socket blocking again |
+| **returns** | 0 once connected, CONNECT_PENDING while in flight, or the connect's negative errno |
 
 ### sock_close
 

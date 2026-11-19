@@ -42,7 +42,9 @@ Uses types from [`std.allocator`](../../allocator.md), [`std.io.runtime`](../../
 
 | Functions | |
 | :--- | :--- |
-| [`invalid`](#invalid), [`would_block`](#would_block), [`socket_close`](#socket_close) | |
+| [`invalid`](#invalid) | |
+| [`would_block`](#would_block) | a connect in flight is the contract's CONNECT_PENDING, never this |
+| [`socket_close`](#socket_close) | |
 
 | Constants | |
 | :--- | :--- |
@@ -403,6 +405,8 @@ pub fun invalid() i64
 ```mach
 pub fun would_block(status: i64) bool
 ```
+
+a connect in flight is the contract's CONNECT_PENDING, never this
 
 ### socket_close
 
