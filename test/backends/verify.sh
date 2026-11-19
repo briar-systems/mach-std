@@ -21,14 +21,12 @@ command -v llvm-readobj >/dev/null || fail "llvm-readobj is required"
 # copy the dependency inside the fixture project
 "$mach" dep pull . --quiet
 
-# the supported-boundary shape of a cross-built darwin image (#415)
-#
-# this reads the linked Mach-O the way dyld and the kernel will. exactly one dylib dependency, spelled by its
-# install path; the dynamic linker; the entry convention each architecture's
-# runtime is written against; the segments the writer lays out; every
-# libSystem import the migrated domains bind, by its exact spelling; none of
-# the symbols the migration refuses; and no trap instruction anywhere in the
-# text, which is the property the whole boundary exists to guarantee.
+# what std binds in a cross-built darwin image (#415): exactly one dylib
+# dependency, spelled by its install path; every libSystem import the migrated
+# domains bind, by its exact spelling; none of the symbols the migration
+# refuses; and no trap instruction anywhere in the text, which is the property
+# the whole boundary exists to guarantee. the image's Mach-O layout is the
+# linker's, and the compiler's test corpus checks it.
 inspect_macho() {
     local target="$1" profile="$2" exe="$3"
     command -v llvm-objdump >/dev/null || fail "llvm-objdump is required"
@@ -38,56 +36,8 @@ inspect_macho() {
         | grep -v 'NeededLibraries\|^\]' | sed 's/^[[:space:]]*//')"
     [ "$needed" = "/usr/lib/libSystem.B.dylib" ] \
         || fail "$target $profile: expected exactly one dependency, /usr/lib/libSystem.B.dylib, got: $(echo "$needed" | tr '\n' ' ')"
-
-    local headers
-    headers="$(llvm-objdump --macho --private-headers "$exe")"
-    [ "$(echo "$headers" | grep -c 'cmd LC_LOAD_DYLIB$')" = 1 ] \
+    [ "$(llvm-objdump --macho --private-headers "$exe" | grep -c 'cmd LC_LOAD_DYLIB$')" = 1 ] \
         || fail "$target $profile: expected one LC_LOAD_DYLIB command"
-    grep -q 'cmd LC_LOAD_DYLINKER$' <<< "$headers" \
-        || fail "$target $profile: no LC_LOAD_DYLINKER"
-    grep -q 'name /usr/lib/dyld' <<< "$headers" \
-        || fail "$target $profile: the dynamic linker is not /usr/lib/dyld"
-    local fileheader
-    fileheader="$(llvm-readobj --file-header "$exe")"
-    grep -q 'FileType: Executable' <<< "$fileheader" \
-        || fail "$target $profile: not an MH_EXECUTE image"
-    grep -q 'MH_DYLDLINK' <<< "$fileheader" \
-        || fail "$target $profile: not a dyld-linked image"
-    grep -q 'MH_TWOLEVEL' <<< "$fileheader" \
-        || fail "$target $profile: not a two-level-namespace image"
-    # the runtime enters by the load command the image kind selects: a PIE is an
-    # LC_MAIN image dyld calls, anything else an LC_UNIXTHREAD image the kernel enters
-    if grep -q 'MH_PIE' <<< "$fileheader"; then
-        grep -q 'cmd LC_MAIN$' <<< "$headers" \
-            || fail "$target $profile: a PIE image has no LC_MAIN entry"
-    else
-        [ "$target" = darwin-x86_64 ] || fail "$target $profile: arm64 image is not MH_PIE"
-        grep -q 'cmd LC_UNIXTHREAD$' <<< "$headers" \
-            || fail "$target $profile: a non-PIE image has no LC_UNIXTHREAD entry"
-    fi
-    if [ "$target" = darwin-aarch64 ]; then
-        grep -q 'cmd LC_BUILD_VERSION$' <<< "$headers" \
-            || fail "$target $profile: arm64 image has no LC_BUILD_VERSION"
-    fi
-
-    local segments seg
-    segments="$(llvm-readobj --macho-segment "$exe")"
-    for seg in __PAGEZERO __TEXT __DATA_CONST __DATA __LINKEDIT; do
-        grep -q "Name: $seg\$" <<< "$segments" \
-            || fail "$target $profile: segment $seg is missing"
-    done
-    # call stubs sit at the end of the code, in reach of every call (mach #3888)
-    ! grep -q 'Name: __STUBS$' <<< "$segments" \
-        || fail "$target $profile: call stubs sit in a __STUBS segment past the data"
-    # the import GOT sits ahead of the zero-fill, in __DATA_CONST (mach #3903)
-    ! grep -q 'Name: __GOT$' <<< "$segments" \
-        || fail "$target $profile: the import GOT sits in a __GOT segment"
-    local sections
-    sections="$(llvm-readobj --sections "$exe" | awk '$1 == "Name:" { name = $2 } $1 == "Segment:" { print name, $2 }')"
-    grep -qx '__stubs __TEXT' <<< "$sections" \
-        || fail "$target $profile: no __TEXT,__stubs section"
-    grep -qx '__got __DATA_CONST' <<< "$sections" \
-        || fail "$target $profile: no __DATA_CONST,__got section"
 
     local imports sym
     imports="$(llvm-nm -u "$exe" | awk '{print $NF}')"
@@ -122,17 +72,13 @@ inspect_macho() {
         ! grep -Fxq "$sym" <<< "$imports" \
             || fail "$target $profile: refused symbol $sym is bound"
     done
-    # dyld's lazy binder is the one import spelled without the C prefix
-    if grep -v '^dyld_stub_binder$' <<< "$imports" | grep -Eq '^[^_]'; then
-        fail "$target $profile: an import without the Mach-O underscore prefix remains"
-    fi
 
     local traps
     traps="$(llvm-objdump --macho -d "$exe" | grep -cE '^[[:space:]]*[0-9a-f]+:.*[[:space:]](svc|syscall)([[:space:]]|$)' || true)"
     [ "$traps" = 0 ] \
         || fail "$target $profile: $traps trap instruction(s) remain in the text"
 
-    echo "OK: $target $profile Mach-O binds libSystem alone, enters as expected and traps nowhere"
+    echo "OK: $target $profile Mach-O binds libSystem alone and traps nowhere"
 }
 
 targets=(

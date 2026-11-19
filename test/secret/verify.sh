@@ -1,33 +1,14 @@
 #!/usr/bin/env bash
+# read std's secret boundary for a public view of a welded borrow. it builds nothing: the
+# compiler's refusals of such views are checked by the compiler's own test corpus.
+#
+# usage: verify.sh
 set -euo pipefail
 
-mach="${1:-mach}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
-
-"$mach" dep pull "$here" --quiet
-
-cd "$here"
-set +e
-log="$("$mach" build . 2>&1)"
-code=$?
-set -e
-[ "$code" -ne 0 ] || fail "refusals unexpectedly erased secret-welded pointers"
-grep -q 'expected ptr, found \*\^u8' <<< "$log" \
-    || { echo "$log" >&2; fail "pointer erasure failed for the wrong reason"; }
-grep -q 'cannot add or drop the secret qualifier' <<< "$log" \
-    || { echo "$log" >&2; fail "integer erasure failed for the wrong reason"; }
-grep -q 'expected ptr, found \*SecretRecord' <<< "$log" \
-    || { echo "$log" >&2; fail "typed pointer erasure failed for the wrong reason"; }
-[ "$(echo "$log" | grep -c 'cannot add or drop the secret qualifier')" = 2 ] \
-    || { echo "$log" >&2; fail "borrow aliasing was not refused as a qualifier drop"; }
-grep -q 'ret key::\*u8' <<< "$log" \
-    || { echo "$log" >&2; fail "borrow aliasing was not refused"; }
-grep -q 'a secret-welded pointer cannot be erased to the untyped `ptr`' <<< "$log" \
-    || { echo "$log" >&2; fail "borrow holder erasure failed for the wrong reason"; }
-echo "OK: byte and typed pointer erasures preserve secret storage boundaries"
 
 # negative alias census (std #550): the secret primitives, the welded storage
 # module and the file lane offer no function that returns a public view of a

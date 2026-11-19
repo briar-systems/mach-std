@@ -2104,8 +2104,9 @@ syscall argument on Linux (inline asm, `{data}` operand), the libSystem
 fun` declared `*^u8`, the descriptor's handle and file pointer pinned by
 `windows.shared.positioned_begin`/`positioned_end`, the discipline the public
 `read_at` and `write_at` now share). Nothing in the boundary yields a `*u8`,
-`ptr` or integer view of a borrow, `test/secret/verify.sh` pins that the
-compiler refuses one, and `std.memory.secret`'s
+`ptr` or integer view of a borrow, the compiler's test corpus pins that the
+compiler refuses one (`test/refuse/secret/` in the mach repository), and
+`std.memory.secret`'s
 `release__wipes_before_success_or_failure` test pins that the wipe precedes the
 native release. The table is process-wide and typed
 (its entries hold `*^u8`, so it lives in a `secret_allocate_typed` region and
@@ -2213,9 +2214,9 @@ fault after submission (descriptor 1000000, `EBADF`) on a write and on a read
 with the storage intact and the error precise; secret and public requests in
 one adapter with no crossing; the runtime closed under a queued secret read,
 which settles `CLOSED` with the borrow alive until the dequeue and the
-destination untouched. Negative alias: `test/secret/verify.sh` refuses
-`*^u8` to `*u8` at compile time and censuses the borrow API for any `pub fun`
-returning `*u8` or `ptr`.
+destination untouched. Negative alias: the compiler's test corpus refuses
+`*^u8` to `*u8` at compile time, and `test/secret/verify.sh` censuses the
+borrow API for any `pub fun` returning `*u8` or `ptr`.
 
 Controls (each run under the v5 compiler, source restored after): the wipe
 removed from `retire_secret_request` fails six of the eight lane tests at
