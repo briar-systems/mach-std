@@ -78,6 +78,8 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`terminate_group`](#terminate_group) | signal every process in a group without reaping any of them |
 | [`kill_group`](#kill_group) | forcefully stop every process in a group without reaping any of them |
 | [`probe_group`](#probe_group) | whether any process is left in a group, without signalling it |
+| [`process_watch`](#process_watch) | make the end of the child `pid` a readiness event on `queue`, so the queue's wait returns once the child ends: a one-shot EVFILT_PROC NOTE_EXIT filter |
+| [`process_unwatch`](#process_unwatch) | release a watch process_watch made, whether or not it fired |
 | [`spawn`](#spawn) | create a child process running the given program |
 | [`spawn_grouped`](#spawn_grouped) | create a child process running the given program, placed as the leader of its own new process group (see spawn_redirected_in_grouped) |
 | [`spawn_in`](#spawn_in) | create a child process running the given program from `cwd` |
@@ -133,7 +135,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`STDIN_FD`](#constants) | portable constants |
 | [`STDOUT_FD`](#constants), [`STDERR_FD`](#constants), [`O_RDONLY`](#constants), [`O_WRONLY`](#constants), [`O_RDWR`](#constants), [`O_CREAT`](#constants), [`O_EXCL`](#constants), [`O_TRUNC`](#constants), [`O_APPEND`](#constants), [`O_DIRECTORY`](#constants), [`O_NOFOLLOW`](#constants), [`AT_FDCWD`](#constants), [`AT_SYMLINK_NOFOLLOW`](#constants), [`AT_REMOVEDIR`](#constants) | |
 | [`LOCK_SH`](#constants) | advisory whole-file lock operations, passed to lock_fd |
-| [`LOCK_EX`](#constants), [`LOCK_NB`](#constants), [`LOCK_UN`](#constants), [`S_IFMT`](#constants), [`S_IFDIR`](#constants), [`S_IFREG`](#constants), [`S_IFLNK`](#constants), [`WNOHANG`](#constants), [`WUNTRACED`](#constants), [`WCONTINUED`](#constants), [`CLOCK_REALTIME`](#constants), [`CLOCK_MONOTONIC`](#constants), [`EPERM`](#constants), [`ENOENT`](#constants), [`ESRCH`](#constants), [`EINTR`](#constants), [`EIO`](#constants), [`ENXIO`](#constants), [`E2BIG`](#constants), [`EBADF`](#constants), [`ECHILD`](#constants), [`EAGAIN`](#constants), [`ENOMEM`](#constants), [`EACCES`](#constants), [`EFAULT`](#constants), [`EBUSY`](#constants), [`EEXIST`](#constants), [`ENODEV`](#constants), [`ENOTDIR`](#constants), [`EISDIR`](#constants), [`EINVAL`](#constants), [`ENFILE`](#constants), [`EMFILE`](#constants), [`ETXTBSY`](#constants), [`ENOSPC`](#constants), [`EROFS`](#constants), [`EPIPE`](#constants), [`ELOOP`](#constants), [`ENAMETOOLONG`](#constants), [`ENOTEMPTY`](#constants), [`ENOTSUP`](#constants), [`ERANGE`](#constants), [`EADDRINUSE`](#constants), [`ENETUNREACH`](#constants), [`ECONNABORTED`](#constants), [`ECONNRESET`](#constants), [`ENOTCONN`](#constants), [`ETIMEDOUT`](#constants), [`ECONNREFUSED`](#constants), [`EHOSTUNREACH`](#constants), [`ECANCELED`](#constants), [`EINTR_MAX_RETRIES`](#constants), [`IO_EVENT_READ`](#constants), [`IO_EVENT_WRITE`](#constants), [`IO_EVENT_ERROR`](#constants), [`IO_EVENT_HANGUP`](#constants), [`IO_EVENT_WAKE`](#constants), [`AF_INET`](#constants), [`AF_INET6`](#constants), [`SOCK_STREAM`](#constants), [`SOCK_DGRAM`](#constants), [`SOL_SOCKET`](#constants), [`SO_UNSUPPORTED`](#constants), [`SO_REUSEADDR`](#constants), [`SO_REUSEPORT`](#constants), [`SO_EXCLUSIVEADDRUSE`](#constants), [`SO_KEEPALIVE`](#constants), [`SO_SNDBUF`](#constants), [`SO_RCVBUF`](#constants), [`SO_LINGER`](#constants), [`SO_RCVTIMEO`](#constants), [`IPPROTO_IP`](#constants), [`IPPROTO_TCP`](#constants), [`IPPROTO_IPV6`](#constants), [`IP_TOS`](#constants), [`IPV6_V6ONLY`](#constants), [`IPV6_TCLASS`](#constants), [`TCP_NODELAY`](#constants), [`TCP_KEEPIDLE`](#constants), [`TCP_KEEPINTVL`](#constants), [`TCP_KEEPCNT`](#constants), [`TCP_FASTOPEN`](#constants), [`SHUT_RD`](#constants), [`SHUT_WR`](#constants), [`SHUT_RDWR`](#constants), [`SOCKADDR_IN_SIZE`](#constants), [`SOCKADDR_IN6_SIZE`](#constants), [`SOCKADDR_STORAGE_SIZE`](#constants) | |
+| [`LOCK_EX`](#constants), [`LOCK_NB`](#constants), [`LOCK_UN`](#constants), [`S_IFMT`](#constants), [`S_IFDIR`](#constants), [`S_IFREG`](#constants), [`S_IFLNK`](#constants), [`WNOHANG`](#constants), [`WUNTRACED`](#constants), [`WCONTINUED`](#constants), [`CLOCK_REALTIME`](#constants), [`CLOCK_MONOTONIC`](#constants), [`EPERM`](#constants), [`ENOENT`](#constants), [`ESRCH`](#constants), [`EINTR`](#constants), [`EIO`](#constants), [`ENXIO`](#constants), [`E2BIG`](#constants), [`EBADF`](#constants), [`ECHILD`](#constants), [`EAGAIN`](#constants), [`ENOMEM`](#constants), [`EACCES`](#constants), [`EFAULT`](#constants), [`EBUSY`](#constants), [`EEXIST`](#constants), [`ENODEV`](#constants), [`ENOTDIR`](#constants), [`EISDIR`](#constants), [`EINVAL`](#constants), [`ENFILE`](#constants), [`EMFILE`](#constants), [`ETXTBSY`](#constants), [`ENOSPC`](#constants), [`EROFS`](#constants), [`EPIPE`](#constants), [`ELOOP`](#constants), [`ENAMETOOLONG`](#constants), [`ENOTEMPTY`](#constants), [`ENOTSUP`](#constants), [`ENOSYS`](#constants), [`ERANGE`](#constants), [`EADDRINUSE`](#constants), [`ENETUNREACH`](#constants), [`ECONNABORTED`](#constants), [`ECONNRESET`](#constants), [`ENOTCONN`](#constants), [`ETIMEDOUT`](#constants), [`ECONNREFUSED`](#constants), [`EHOSTUNREACH`](#constants), [`ECANCELED`](#constants), [`EINTR_MAX_RETRIES`](#constants), [`IO_EVENT_READ`](#constants), [`IO_EVENT_WRITE`](#constants), [`IO_EVENT_ERROR`](#constants), [`IO_EVENT_HANGUP`](#constants), [`IO_EVENT_WAKE`](#constants), [`AF_INET`](#constants), [`AF_INET6`](#constants), [`SOCK_STREAM`](#constants), [`SOCK_DGRAM`](#constants), [`SOL_SOCKET`](#constants), [`SO_UNSUPPORTED`](#constants), [`SO_REUSEADDR`](#constants), [`SO_REUSEPORT`](#constants), [`SO_EXCLUSIVEADDRUSE`](#constants), [`SO_KEEPALIVE`](#constants), [`SO_SNDBUF`](#constants), [`SO_RCVBUF`](#constants), [`SO_LINGER`](#constants), [`SO_RCVTIMEO`](#constants), [`IPPROTO_IP`](#constants), [`IPPROTO_TCP`](#constants), [`IPPROTO_IPV6`](#constants), [`IP_TOS`](#constants), [`IPV6_V6ONLY`](#constants), [`IPV6_TCLASS`](#constants), [`TCP_NODELAY`](#constants), [`TCP_KEEPIDLE`](#constants), [`TCP_KEEPINTVL`](#constants), [`TCP_KEEPCNT`](#constants), [`TCP_FASTOPEN`](#constants), [`SHUT_RD`](#constants), [`SHUT_WR`](#constants), [`SHUT_RDWR`](#constants), [`SOCKADDR_IN_SIZE`](#constants), [`SOCKADDR_IN6_SIZE`](#constants), [`SOCKADDR_STORAGE_SIZE`](#constants) | |
 | [`CONNECT_PENDING`](#constants) | what sock_connect_begin and sock_connect_poll return while the connect is in flight |
 | [`DNS_HOSTS_PATH`](#constants) | |
 
@@ -818,6 +820,32 @@ process may not signal still counts, so EPERM reads as present.
 | :--- | :--- |
 | `pgid` | process group ID (must be > 0) |
 | **returns** | 0 while a member is left, ESRCH once none is, or another negative errno |
+
+### process_watch
+
+```mach
+pub fun process_watch(queue: *std.system.os.shared.IoQueue, pid: i64, context: usize) i64
+```
+
+make the end of the child `pid` a readiness event on `queue`, so the queue's
+wait returns once the child ends: a one-shot EVFILT_PROC NOTE_EXIT filter
+
+| Parameter | |
+| :--- | :--- |
+| `context` | the nonzero context the event carries |
+| **returns** | the watch, which process_unwatch releases, or negative errno (ESRCH when the child has already ended) |
+
+### process_unwatch
+
+```mach
+pub fun process_unwatch(queue: *std.system.os.shared.IoQueue, watch: i64) i64
+```
+
+release a watch process_watch made, whether or not it fired
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, or the negative errno |
 
 ### spawn
 
@@ -1668,6 +1696,7 @@ pub fun error_message(code: i64) str
 | `ENAMETOOLONG` | `i64` | `-63` |  |
 | `ENOTEMPTY` | `i64` | `-66` |  |
 | `ENOTSUP` | `i64` | `-45` |  |
+| `ENOSYS` | `i64` | `-78` |  |
 | `ERANGE` | `i64` | `-34` |  |
 | `EADDRINUSE` | `i64` | `-48` |  |
 | `ENETUNREACH` | `i64` | `-51` |  |

@@ -6,7 +6,7 @@ portable process lifecycle events
 
 Source: [`src/process/events.mach`](../../../src/process/events.mach)
 
-Uses types from [`std.io.error`](../io/error.md), [`std.io.lifecycle`](../io/lifecycle.md), [`std.io.runtime`](../io/runtime.md).
+Uses types from [`std.io.error`](../io/error.md), [`std.io.lifecycle`](../io/lifecycle.md), [`std.io.runtime`](../io/runtime.md), [`std.system.os`](../system/os.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -31,6 +31,7 @@ Uses types from [`std.io.error`](../io/error.md), [`std.io.lifecycle`](../io/lif
 | [`next`](#next) | events are coalesced by kind and drained in service-to-reload priority order |
 | [`begin_runtime_drain`](#begin_runtime_drain) | |
 | [`wait`](#wait) | standalone sources may wait directly, runtime-attached sources use runtime wait |
+| [`queue`](#queue) | the wait queue a standalone source waits on and every event wakes, so a caller can watch more on it (a child's end, std.process.exec.watch_exit) and have `wait` return for either |
 | [`close`](#close) | release the process's event source: the native handlers are restored, the owned queue closed and the runtime registration released; the first refusal is reported after every step has run |
 
 ---
@@ -147,11 +148,26 @@ pub fun begin_runtime_drain(
 pub fun wait(source: *Source, timeout_ms: i32) res[bool, std.io.error.Error]
 ```
 
-standalone sources may wait directly, runtime-attached sources use runtime wait
+standalone sources may wait directly, runtime-attached sources use runtime wait.
+the wait also returns when anything else watched on the source's queue is ready
 
 | Parameter | |
 | :--- | :--- |
 | **returns** | whether an event is pending after the wait, or the failure |
+
+### queue
+
+```mach
+pub fun queue(source: *Source) *std.system.os.IoQueue
+```
+
+the wait queue a standalone source waits on and every event wakes, so a caller
+can watch more on it (a child's end, std.process.exec.watch_exit) and have
+`wait` return for either
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the queue, borrowed until close, or nil for a source that is not the open owner or is attached to a runtime |
 
 ### close
 

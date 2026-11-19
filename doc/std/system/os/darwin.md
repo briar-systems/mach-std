@@ -28,7 +28,7 @@ Source: [`src/system/os/darwin.mach`](../../../../src/system/os/darwin.mach)
 | [`set_mode_at_native`](#set_mode_at_native) | every name below reaches the kernel as bytes, so each native form is the UTF-8 primitive itself |
 | [`file_identity`](#file_identity), [`identity_at`](#identity_at), [`identity_at_native`](#identity_at_native), [`retain_identity_at`](#retain_identity_at), [`retain_identity_at_native`](#retain_identity_at_native), [`publication_capabilities`](#publication_capabilities), [`stat_path`](#stat_path), [`stat_path_native`](#stat_path_native), [`stat_mode`](#stat_mode), [`unlink`](#unlink), [`unlink_native`](#unlink_native), [`rename`](#rename), [`rename_native`](#rename_native), [`symlink`](#symlink), [`symlink_native`](#symlink_native), [`make_dir`](#make_dir), [`make_dir_native`](#make_dir_native), [`directory_init`](#directory_init), [`directory_next`](#directory_next), [`directory_dnit`](#directory_dnit), [`access`](#access), [`access_native`](#access_native), [`seek`](#seek), [`lock_fd`](#lock_fd) | |
 | [`terminate`](#terminate) | process |
-| [`abort`](#abort), [`terminate_child`](#terminate_child), [`setpgid`](#setpgid), [`getpgid`](#getpgid), [`terminate_group`](#terminate_group), [`kill_group`](#kill_group), [`probe_group`](#probe_group), [`spawn`](#spawn), [`spawn_grouped`](#spawn_grouped), [`spawn_in`](#spawn_in), [`spawn_redirected`](#spawn_redirected), [`spawn_redirected_grouped`](#spawn_redirected_grouped), [`spawn_redirected_in`](#spawn_redirected_in), [`spawn_redirected_in_grouped`](#spawn_redirected_in_grouped) | |
+| [`abort`](#abort), [`terminate_child`](#terminate_child), [`setpgid`](#setpgid), [`getpgid`](#getpgid), [`terminate_group`](#terminate_group), [`kill_group`](#kill_group), [`probe_group`](#probe_group), [`process_watch`](#process_watch), [`process_unwatch`](#process_unwatch), [`spawn`](#spawn), [`spawn_grouped`](#spawn_grouped), [`spawn_in`](#spawn_in), [`spawn_redirected`](#spawn_redirected), [`spawn_redirected_grouped`](#spawn_redirected_grouped), [`spawn_redirected_in`](#spawn_redirected_in), [`spawn_redirected_in_grouped`](#spawn_redirected_in_grouped) | |
 | [`spawn_native`](#spawn_native) | the kernel takes paths and arguments as bytes, so the native-unit spawns are the spawns themselves |
 | [`spawn_in_native`](#spawn_in_native), [`spawn_redirected_native`](#spawn_redirected_native), [`spawn_redirected_in_native`](#spawn_redirected_in_native), [`spawn_redirected_in_grouped_native`](#spawn_redirected_in_grouped_native), [`getpid`](#getpid), [`pipe`](#pipe), [`ignore_sigpipe`](#ignore_sigpipe), [`sleep`](#sleep), [`cpu_count`](#cpu_count), [`cpu_features`](#cpu_features), [`cpu_dit`](#cpu_dit), [`thread_affinity`](#thread_affinity), [`set_thread_affinity`](#set_thread_affinity), [`getcwd`](#getcwd), [`getcwd_native`](#getcwd_native), [`getenv`](#getenv), [`environ`](#environ) | |
 | [`getenv_native`](#getenv_native) | the environment is the bytes the kernel passed, so its native reads are the reads themselves |
@@ -1624,6 +1624,33 @@ whether any process is left in a group, without signalling it
 
 kill(-pgid, 0) checks for members and delivers nothing. a member this
 process may not signal still counts, so EPERM reads as present.
+
+### process_watch
+
+Forwards the first of these whose condition holds:
+
+- [`std.system.os.darwin.aarch64.process_watch`](darwin/aarch64.md#process_watch), where `$mach.build.arch == $mach.arch.aarch64`
+- [`std.system.os.darwin.x86_64.process_watch`](darwin/x86_64.md#process_watch), where `$mach.build.arch == $mach.arch.x86_64`
+
+```mach
+pub fun process_watch(queue: *std.system.os.shared.IoQueue, pid: i64, context: usize) i64
+```
+
+make the end of the child `pid` a readiness event on `queue`, so the queue's
+wait returns once the child ends: a one-shot EVFILT_PROC NOTE_EXIT filter
+
+### process_unwatch
+
+Forwards the first of these whose condition holds:
+
+- [`std.system.os.darwin.aarch64.process_unwatch`](darwin/aarch64.md#process_unwatch), where `$mach.build.arch == $mach.arch.aarch64`
+- [`std.system.os.darwin.x86_64.process_unwatch`](darwin/x86_64.md#process_unwatch), where `$mach.build.arch == $mach.arch.x86_64`
+
+```mach
+pub fun process_unwatch(queue: *std.system.os.shared.IoQueue, watch: i64) i64
+```
+
+release a watch process_watch made, whether or not it fired
 
 ### spawn
 

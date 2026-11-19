@@ -131,6 +131,8 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`terminate_group`](#terminate_group) | signal every process in a group without reaping any of them |
 | [`kill_group`](#kill_group) | forcefully stop every process in a group without reaping any of them |
 | [`probe_group`](#probe_group) | whether any process is left in a group, without signalling it |
+| [`process_watch`](#process_watch) | make the end of the child `pid` a readiness event on `queue`, so the queue's wait returns once the child ends |
+| [`process_unwatch`](#process_unwatch) | release a watch process_watch made, whether or not it fired |
 | [`spawn`](#spawn) | create a child process running the given program |
 | [`spawn_grouped`](#spawn_grouped) | create a child process running the given program, placed as the leader of its own new process group (see spawn_redirected_in_grouped) |
 | [`spawn_in`](#spawn_in) | create a child process running the given program from `cwd` |
@@ -194,6 +196,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`FUTEX_WAIT`](#constants) | constants identical across linux architectures (asm-generic matches x86_64 for these), declared once at module scope |
 | [`FUTEX_WAKE`](#constants), [`FUTEX_WAIT_BITSET`](#constants), [`FUTEX_BITSET_MATCH_ANY`](#constants), [`CLONE_VM`](#constants), [`CLONE_FS`](#constants), [`CLONE_FILES`](#constants), [`CLONE_SIGHAND`](#constants), [`CLONE_THREAD`](#constants), [`CLONE_SYSVSEM`](#constants), [`CLONE_SETTLS`](#constants) | |
 | [`PROT_READ`](#constants) | the read-only protection, exported for the static-PIE RELRO re-protection in std.runtime.linux.reloc |
+| [`ENOSYS`](#constants) | |
 | [`separator`](#constants) | path |
 | [`STDIN_FD`](#constants) | portable constants |
 | [`STDOUT_FD`](#constants), [`STDERR_FD`](#constants), [`O_RDONLY`](#constants), [`O_WRONLY`](#constants), [`O_RDWR`](#constants), [`O_CREAT`](#constants), [`O_EXCL`](#constants), [`O_TRUNC`](#constants), [`O_APPEND`](#constants), [`O_NONBLOCK`](#constants) | |
@@ -1559,6 +1562,33 @@ process may not signal still counts, so EPERM reads as present.
 | `pgid` | process group ID (must be > 0) |
 | **returns** | 0 while a member is left, ESRCH once none is, or another negative errno |
 
+### process_watch
+
+```mach
+pub fun process_watch(queue: *std.system.os.shared.IoQueue, pid: i64, context: usize) i64
+```
+
+make the end of the child `pid` a readiness event on `queue`, so the queue's
+wait returns once the child ends. a pidfd names the child: it reads ready
+from the moment the child ends, reaped or not, and is not inherited across exec
+
+| Parameter | |
+| :--- | :--- |
+| `context` | the nonzero context the event carries |
+| **returns** | the watch, which process_unwatch releases, or negative errno (ESRCH when no such process is left) |
+
+### process_unwatch
+
+```mach
+pub fun process_unwatch(queue: *std.system.os.shared.IoQueue, watch: i64) i64
+```
+
+release a watch process_watch made, whether or not it fired
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, or the first negative errno |
+
 ### spawn
 
 ```mach
@@ -2419,6 +2449,7 @@ return a human-readable message for a negated errno code
 | `CLONE_SYSVSEM` | `usize` | `0x00040000` |  |
 | `CLONE_SETTLS` | `usize` | `0x00080000` |  |
 | `PROT_READ` | `i32` | `1` | the read-only protection, exported for the static-PIE RELRO re-protection in std.runtime.linux.reloc |
+| `ENOSYS` | `i64` | `-38` |  |
 | `separator` | `u8` | `'/'` | path |
 | `STDIN_FD` | `i32` | `0` | portable constants |
 | `STDOUT_FD` | `i32` | `1` |  |

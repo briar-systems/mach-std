@@ -18,6 +18,7 @@ Uses types from [`std.allocator`](../allocator.md), [`std.io.error`](../io/error
 | [`Output`](#output) | `rec` | result of running a child process and collecting its stdout |
 | [`SpawnOptions`](#spawnoptions) | `rec` | how spawn_with_options starts a child, spawn_options giving the defaults |
 | [`NativeSpawnOptions`](#nativespawnoptions) | `rec` | how spawn_native_with_options starts a child: SpawnOptions with the working directory in native units |
+| [`ExitWatch`](#exitwatch) | `rec` | a child's end watched on a wait queue: the queue's wait returns once the child ends, with no polling, alongside whatever else the queue watches (the process's events, std.process.events.queue, wake it too) |
 | [`Supervised`](#supervised) | `rec` | how a supervised child ended |
 
 | On `Child` | |
@@ -37,6 +38,7 @@ Uses types from [`std.allocator`](../allocator.md), [`std.io.error`](../io/error
 | [`group_alive`](#group_alive) | whether any process is left in a child's group, the child itself included until it is reaped |
 | [`wait`](#wait) | wait for a child process to exit |
 | [`try_wait`](#try_wait) | reap a child if it has already exited, without blocking |
+| [`watch_exit`](#watch_exit) | watch the end of `child` on `queue` |
 | [`wait_within`](#wait_within) | run a child to completion under a cancellation scope, terminating its whole group if the scope ends first |
 
 | On `Error` | |
@@ -67,6 +69,10 @@ Uses types from [`std.allocator`](../allocator.md), [`std.io.error`](../io/error
 | :--- | :--- |
 | [`native_spawn_options`](#native_spawn_options) | the native options of a plain spawn, as spawn_options gives them |
 | [`spawn_native_with_options`](#spawn_native_with_options) | start a process without waiting, from an executable, arguments, environment and working directory in std.runtime.native units, as `options` describes |
+
+| On `ExitWatch` | |
+| :--- | :--- |
+| [`unwatch_exit`](#unwatch_exit) | release a watch watch_exit made, whether or not it fired; a second call releases nothing |
 
 | Functions | |
 | :--- | :--- |
@@ -369,6 +375,27 @@ always means still running and never means interrupted.
 | :--- | :--- |
 | `child` | child handle from any spawn |
 | **returns** | the exit status if it has terminated, absent if it is still running, or a typed error retaining any unreaped child |
+
+### watch_exit
+
+```mach
+pub fun watch_exit(queue: *std.system.os.IoQueue, child: Child, context: usize) res[ExitWatch, Error]
+```
+
+watch the end of `child` on `queue`
+
+a watch is armed once: after the queue reports it, probe the child with
+try_wait, and release the watch with unwatch_exit either way. a child that
+had already ended is not refused: its watch registers nothing, and try_wait
+finds it ended. watch first and probe after, and a child that ends between
+the two still wakes the queue
+
+| Parameter | |
+| :--- | :--- |
+| `queue` | the queue to wake |
+| `child` | child handle from spawn, not yet reaped |
+| `context` | the nonzero context the queue's event carries |
+| **returns** | the watch, or the native refusal, which keeps the child with the caller |
 
 ### wait_within
 
@@ -800,6 +827,37 @@ windows it converts each string once and runs this
 | `envp` | the child's environment, given native entries or inherited |
 | `options` | directory, stream redirections and grouping |
 | **returns** | child handle, whose pgid names the group when grouped, or the spawn failure |
+
+## ExitWatch
+
+```mach
+pub rec ExitWatch {
+    child:    Child;
+    resource: i64;
+}
+```
+
+a child's end watched on a wait queue: the queue's wait returns once the
+child ends, with no polling, alongside whatever else the queue watches (the
+process's events, std.process.events.queue, wake it too)
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `child` | `Child` | the watched child |
+| `resource` | `i64` | the native registration unwatch_exit releases, -1 when the child had already ended and there was nothing to register |
+
+### unwatch_exit
+
+```mach
+pub fun unwatch_exit(queue: *std.system.os.IoQueue, watch: *ExitWatch) err[Error]
+```
+
+release a watch watch_exit made, whether or not it fired; a second call
+releases nothing
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the native refusal, which leaves the child with the caller |
 
 ## Supervised
 
