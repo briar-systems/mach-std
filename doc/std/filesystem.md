@@ -312,7 +312,7 @@ adapt a file to an io.Writer (the file must outlive the writer)
 
 ### read_secret_of
 
-Only where `capability.HAS_ENTROPY && capability.HAS_PAGES`.
+Only where `capability.HAS_PAGES`.
 
 ```mach
 pub fun read_secret_of(f: File) res[SecretBytes, FsError]
@@ -321,7 +321,7 @@ pub fun read_secret_of(f: File) res[SecretBytes, FsError]
 read an entire open file straight into secret-welded storage
 
 stats the handle for its size, allocates welded storage once, and has the
-kernel read into it through std.memory.secret.read_at, so the bytes never
+kernel read into it through std.io.file.secret.read_at, so the bytes never
 pass through public memory. reads are positioned from offset zero, so the
 handle's position neither matters nor moves, and the handle stays open
 for the caller to close. a caller that checks the file before trusting it
@@ -712,7 +712,7 @@ check whether metadata describes a symbolic link
 
 ## SecretBytes
 
-Only where `capability.HAS_ENTROPY && capability.HAS_PAGES`.
+Only where `capability.HAS_PAGES`.
 
 ```mach
 pub rec SecretBytes {
@@ -730,7 +730,7 @@ a file's bytes in secret-welded storage
 
 ### read_secret
 
-Only where `capability.HAS_ENTROPY && capability.HAS_PAGES`.
+Only where `capability.HAS_PAGES`.
 
 ```mach
 pub fun read_secret(p: Path) res[SecretBytes, FsError]
@@ -749,7 +749,7 @@ complete read releases the storage and is reported as io.
 
 ### read_secret_native
 
-Only where `capability.HAS_ENTROPY && capability.HAS_PAGES`.
+Only where `capability.HAS_PAGES`.
 
 ```mach
 pub fun read_secret_native(name: *Unit) res[SecretBytes, FsError]

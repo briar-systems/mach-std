@@ -2,6 +2,20 @@
 
 std 10.0.0 pairs with mach 7.
 
+## secret storage split by capability
+
+`std.memory.secret` held allocation, the entropy fill and positioned file transfers in one module, so importing it for an allocator demanded the entropy, files and pages capabilities. Each part now sits where its capability lives, and a caller needs only the capabilities of what it calls. The old names are gone, with no forwarding.
+
+| 9.x | 10.0.0 | needs |
+| --- | --- | --- |
+| `std.memory.secret.allocate`, `deallocate`, `allocate_typed`, `deallocate_typed`, `typed_aligned`, `accept_unlocked`, `ALIGN`, `Borrow` and `borrow_*` | unchanged, in `std.memory.secret` | pages |
+| `std.memory.secret.random_fill(data, len)` | `std.crypto.rand.fill_secret(data, len)` | entropy |
+| `std.memory.secret.read_at(file: usize, data, len, file_offset)` | `std.io.file.secret.read_at(file: io.handle.FileHandle, data, len, file_offset)` | files |
+| none | `std.io.file.secret.write_at`, the direct write the read never had | files |
+| `std.memory.secret.borrow_read_at(file: usize, borrow, ...)`, `borrow_write_at` | `std.io.file.secret.borrow_read_at(file: io.handle.FileHandle, borrow, ...)`, `borrow_write_at` | files and pages |
+
+The file transfers take the `FileHandle` (`f.handle` of a `filesystem.File`) where they took its raw value, and refuse an invalid handle as `INVALID` before the kernel is called. `std.memory.secret.borrow_span`, which resolves a span of a live borrow, is public. `filesystem.read_secret`, `read_secret_of` and `read_secret_native` need pages beside files, no longer entropy. On wasi the typed forms take a `T` with public bytes: secret storage there is fresh heap pages welded to its type, as on every other host, in place of a 16 MiB `^u8` region, and `std.system.os.wasi.welded` is gone.
+
 ## bool is u1 (#1005)
 
 `std.types.bool.bool` is now `def bool: u1`, and `true` and `false` are `u1`. A `u1` is one byte holding 0 or 1, which comparisons, `&&`, `||`, `!` and `sel` produce and a condition requires. It has `&`, `|`, `^`, `==` and ordering, and no arithmetic. std builds with mach b039331 or later. `mach migrate` rewrites the alias and every `asm` head, and the compiler warns of the two forms below while the family moves. `[project] mach` is `^7`.

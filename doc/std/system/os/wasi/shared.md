@@ -21,6 +21,7 @@ Source: [`src/system/os/wasi/shared.mach`](../../../../../src/system/os/wasi/sha
 | [`code`](#code) | the contract's code for what the host returned |
 | [`error_message`](#error_message) | the native text for a negative code |
 | [`page_size`](#page_size) | |
+| [`map_secret`](#map_secret) | storage for span bytes between two pages, which cannot be guarded or locked here |
 | [`allocate`](#allocate) | whole zero-filled pages, kept ones first |
 | [`deallocate`](#deallocate) | keep pages for the next allocate, merged with their neighbours |
 | [`reallocate`](#reallocate) | resize a page allocation, in place when its pages still hold it |
@@ -65,6 +66,24 @@ the native text for a negative code
 ```mach
 pub fun page_size() usize
 ```
+
+### map_secret
+
+```mach
+pub fun map_secret(span: usize, page: usize, data: *ptr, locking: *bool) i64
+```
+
+storage for span bytes between two pages, which cannot be guarded or locked
+here. the storage comes from allocate, so it is zero filled and has no typed
+alias: std.system.os.secret welds it to its type as every host's mapping is
+
+| Parameter | |
+| :--- | :--- |
+| `span` | usable bytes, whole pages of the caller's |
+| `page` | the caller's page, which divides PAGE |
+| `data` | receives the usable bytes, one page past the start |
+| `locking` | left false, since no step here locks |
+| **returns** | 0, or ENOMEM |
 
 ### allocate
 

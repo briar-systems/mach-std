@@ -25,24 +25,25 @@ census_file() {
 }
 census_file "$root/src/system/os/secret.mach"
 census_file "$root/src/memory/secret.mach"
+census_file "$root/src/io/file/secret.mach"
 census_file "$root/src/io/file/adapter.mach"
 census_file "$root/src/io/file.mach"
 grep -qE '^pub fun submit_secret_read\(.*buffer: \*\^u8' "$root/src/io/file/adapter.mach" \
     || fail "the secret read lane does not take a welded borrow"
 grep -qE '^pub fun submit_secret_write\(.*buffer: \*\^u8' "$root/src/io/file/adapter.mach" \
     || fail "the secret write lane does not take a welded borrow"
-grep -qE '^pub fun borrow_(read|write)_at\(' "$root/src/memory/secret.mach" \
-    || fail "the positioned borrow transfers left std.memory.secret"
+grep -qE '^    pub fun borrow_(read|write)_at\(' "$root/src/io/file/secret.mach" \
+    || fail "the positioned borrow transfers left std.io.file.secret"
 grep -qE '^pub fun (read|write)_at_secret\(' "$root/src/system/os.mach" \
     || fail "the positioned secret primitives left the os contract"
-allowed='src/memory/secret\.mach|src/io/file/adapter\.mach'
+allowed='src/io/file/secret\.mach|src/io/file/adapter\.mach'
 if grep -nE 'borrow_(read|write)_at' "$root/src" -r | grep -vE "$allowed" | grep -q .; then
     grep -nE 'borrow_(read|write)_at' "$root/src" -r | grep -vE "$allowed" >&2
     fail "a positioned secret transfer is issued outside the adapter"
 fi
-native='src/system/os\.mach|src/memory/secret\.mach'
+native='src/system/os\.mach|src/io/file/secret\.mach'
 if grep -nE '(read|write)_at_secret' "$root/src" -r | grep -vE "$native" | grep -q .; then
     grep -nE '(read|write)_at_secret' "$root/src" -r | grep -vE "$native" >&2
-    fail "a native secret transfer is issued outside std.memory.secret"
+    fail "a native secret transfer is issued outside std.io.file.secret"
 fi
 echo "OK: no public view of a welded borrow exists in the secret OS boundary or the file lane"

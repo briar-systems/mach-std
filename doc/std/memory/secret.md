@@ -2,18 +2,19 @@
 
 # std.memory.secret
 
-secret-welded storage: allocation, csprng fill and borrows
+secret-welded storage: allocation and borrows
 
 every pointer here keeps its welded shape. the native work is the os
 contract's secret primitives: this module adds the wipe before release,
-complete fills with a bounded interruption budget, typed geometry, the
-borrow table, and the policy for a host that cannot lock pages.
+typed geometry, the borrow table, and the policy for a host that cannot lock
+pages. it needs the pages capability alone. filling welded storage from the
+system's entropy is std.crypto.rand.fill_secret, and positioned file
+transfers into and out of it are std.io.file.secret.
 
 storage stays typed *^u8 (or the exact *T for typed regions) across the whole
 native boundary, with no public pointer or integer alias to the bytes. linux
-uses direct syscalls, darwin libSystem, and windows the virtual-memory and
-system-entropy apis (BCRYPT_USE_SYSTEM_PREFERRED_RNG needs vista sp2 or
-later).
+uses direct syscalls, darwin libSystem, windows the virtual-memory apis, and
+wasi fresh pages of linear memory.
 
 every allocation is locked against paging, sits between two inaccessible
 guard pages, and is kept out of core dumps where the host can say so (linux
@@ -28,9 +29,7 @@ wipes the whole logical span before the native release and reports success
 only once the original allocation is gone. (nil, 0) is a successful no-op,
 and a failed release leaves zeroed storage owned by the caller. a refused
 release writes nothing, since the span it was given is exactly what failed
-validation, and the caller keeps live, unwiped storage. a fill succeeds only
-after the whole range is initialized, and wipes the whole range before
-returning any error.
+validation, and the caller keeps live, unwiped storage.
 
 typed allocation checks the complete count * $size_of(T) geometry and honours
 $align_of(T), over-aligned records included. typed release needs the original
@@ -51,6 +50,7 @@ Uses types from [`std.io.error`](../io/error.md).
 
 | On `Borrow` | |
 | :--- | :--- |
+| [`borrow_span`](#borrow_span) | resolve a span inside a live borrow |
 | [`borrow_acquire`](#borrow_acquire) | lend welded storage to a handle |
 | [`borrow_release`](#borrow_release) | return a borrow; the storage is neither wiped nor released, it was never owned |
 | [`borrow_size`](#borrow_size) | the span length of a live borrow, or zero |
@@ -59,8 +59,6 @@ Uses types from [`std.io.error`](../io/error.md).
 | [`borrow_fill`](#borrow_fill) | copy welded bytes into a span of a borrow |
 | [`borrow_drain`](#borrow_drain) | copy welded bytes out of a span of a borrow |
 | [`borrow_copy`](#borrow_copy) | copy between two borrows without either pointer leaving the boundary |
-| [`borrow_read_at`](#borrow_read_at) | read from a file into a span of a borrow: the kernel writes the welded storage through this call and nothing else |
-| [`borrow_write_at`](#borrow_write_at) | write a span of a borrow to a file: the kernel reads the welded storage through this call and nothing else |
 
 | Functions | |
 | :--- | :--- |
@@ -70,8 +68,6 @@ Uses types from [`std.io.error`](../io/error.md).
 | [`deallocate`](#deallocate) | wipe and release one secret-welded byte region |
 | [`allocate_typed`](#allocate_typed) | allocate a zero-initialized typed region without changing T's secrecy shape |
 | [`deallocate_typed`](#deallocate_typed) | wipe and release a typed region without changing T's secrecy shape |
-| [`random_fill`](#random_fill) | initialize every requested byte from the operating-system csprng |
-| [`read_at`](#read_at) | read from a file straight into welded storage the caller owns: the kernel writes the storage through this call and nothing else |
 
 | Constants | |
 | :--- | :--- |
@@ -87,6 +83,23 @@ pub rec Borrow {
     generation: u32;
 }
 ```
+
+### borrow_span
+
+```mach
+pub fun borrow_span(borrow: Borrow, offset: usize, len: usize, data: **^u8, operation: std.io.error.Operation) err[std.io.error.Error]
+```
+
+resolve a span inside a live borrow
+
+the pointer stays valid until the owner closes the borrow, the same lifetime
+borrow_data has
+
+| Parameter | |
+| :--- | :--- |
+| `data` | receives the span's first byte, untouched on failure |
+| `operation` | the operation an error names |
+| **returns** | ok, CLOSED for a handle that is not live, INVALID for a span outside the borrow |
 
 ### borrow_acquire
 
@@ -184,32 +197,6 @@ copy between two borrows without either pointer leaving the boundary
 | :--- | :--- |
 | **returns** | ok, CLOSED for a dead handle, INVALID for a span outside either borrow |
 
-### borrow_read_at
-
-```mach
-pub fun borrow_read_at(file: usize, borrow: Borrow, offset: usize, len: usize, file_offset: u64) res[usize, std.io.error.Error]
-```
-
-read from a file into a span of a borrow: the kernel writes the welded
-storage through this call and nothing else
-
-| Parameter | |
-| :--- | :--- |
-| **returns** | bytes delivered (zero at end of file), or the error with the span unspecified |
-
-### borrow_write_at
-
-```mach
-pub fun borrow_write_at(file: usize, borrow: Borrow, offset: usize, len: usize, file_offset: u64) res[usize, std.io.error.Error]
-```
-
-write a span of a borrow to a file: the kernel reads the welded storage
-through this call and nothing else
-
-| Parameter | |
-| :--- | :--- |
-| **returns** | bytes persisted, or the error with nothing about the span changed |
-
 ## Functions
 
 ### typed_aligned
@@ -292,37 +279,6 @@ wipe and release a typed region without changing T's secrecy shape
 | `data` | allocation returned by allocate_typed[T] |
 | `count` | original element count |
 | **returns** | ok after the wipe and release. INVALID for a nil data or zero count (not both), a zero-sized T, an overflowing count, a misaligned data, or a header that does not match count, with nothing written and the caller still owning live, unwiped storage to release with the correct count. otherwise the native error, with every element wiped and the storage still owned by the caller |
-
-### random_fill
-
-```mach
-pub fun random_fill(data: *^u8, len: usize) err[std.io.error.Error]
-```
-
-initialize every requested byte from the operating-system csprng
-
-| Parameter | |
-| :--- | :--- |
-| `data` | destination secret storage |
-| `len` | number of bytes to initialize |
-| **returns** | ok after complete initialization, or the error after a complete wipe |
-
-### read_at
-
-```mach
-pub fun read_at(file: usize, data: *^u8, len: usize, file_offset: u64) res[usize, std.io.error.Error]
-```
-
-read from a file straight into welded storage the caller owns: the kernel
-writes the storage through this call and nothing else
-
-| Parameter | |
-| :--- | :--- |
-| `file` | native file handle |
-| `data` | destination secret storage |
-| `len` | maximum bytes to read |
-| `file_offset` | file position to read from |
-| **returns** | bytes delivered (zero at end of file), or the error with the span unspecified |
 
 ## Constants
 

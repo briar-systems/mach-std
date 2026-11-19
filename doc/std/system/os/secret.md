@@ -19,6 +19,8 @@ core dumps:
   darwin   mmap and mlock. xnu has no per-mapping dump exclusion
   windows  VirtualAlloc and VirtualLock, the guards reserved and never
            committed. windows has no per-allocation dump exclusion
+  wasi     fresh zeroed pages from the linear-memory heap, which can be
+           neither guarded nor locked (LOCKS is false)
 
 a host that refuses the lock (RLIMIT_MEMLOCK, the windows minimum working
 set) fails the allocation with Status.lock set. nothing is ever handed out
