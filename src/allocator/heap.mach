@@ -47,10 +47,11 @@
 #
 # a program that makes one heap after another, each torn down whole, gives
 # them a Pool to share: pool_source draws spans from it and gives them back to
-# it, so the next heap is handed the spans the last one used:
+# it, so the next heap is handed the spans the last one used. the program states
+# how many bytes the pool may hold:
 #
 #   var pool: heap.Pool;
-#   heap.pool_init(?pool, ?src, 0);
+#   heap.pool_init(?pool, ?src, budget);
 #   heap.pool_source(?pooled, ?pool);
 #   heap.init(?h, ?pooled, 0);
 #
@@ -96,14 +97,16 @@ $if (capability.HAS_PAGES && capability.HAS_THREADS) {
 
 # where a heap's backing memory comes from
 #
-# fn_obtain(ctx, size) returns a span of at least `size` bytes at an address
-# that is a multiple of SPAN_ALIGN, zero-filled unless the source is `stale`.
-# `size` is always a multiple of the host page size, or of PAGE_FLOOR on a
-# target with no pages.
+# fn_obtain(ctx, least, most) returns a span of `least` to `most` bytes at an
+# address that is a multiple of SPAN_ALIGN, zero-filled unless the source is
+# `stale`, and the size it granted. every granted byte is the holder's to use.
+# `least` and `most` are always multiples of the host page size, or of
+# PAGE_FLOOR on a target with no pages, and `least` is never above `most`.
 #
-# fn_release(ctx, span, size) returns a span obtained earlier, 0 on success or
-# a negative backend native code. it is nil for a source that cannot return memory; the core
-# then retains every span for reuse and never calls it.
+# fn_release(ctx, span, size) returns a span obtained earlier, at the size it
+# was granted, 0 on success or a negative backend native code. it is nil for a
+# source that cannot return memory; the core then retains every span for reuse
+# and never calls it.
 # ---
 # ctx:        opaque context passed to both callbacks
 # fn_obtain:  acquire a span, or none when the source is exhausted
@@ -111,9 +114,18 @@ $if (capability.HAS_PAGES && capability.HAS_THREADS) {
 # stale:      a span it gives may hold what was written to it before
 pub rec Source {
     ctx:        ptr;
-    fn_obtain:  fun(ptr, usize) opt[ptr];
+    fn_obtain:  fun(ptr, usize, usize) opt[Grant];
     fn_release: fun(ptr, ptr, usize) i64;
     stale:      bool;
+}
+
+# a span a source granted
+# ---
+# base: its first byte, a multiple of SPAN_ALIGN
+# size: the bytes it holds, from the least to the most asked for
+pub rec Grant {
+    base: ptr;
+    size: usize;
 }
 
 # number of small size classes
@@ -134,6 +146,10 @@ pub val PAGE_FLOOR: usize = 4096;
 
 # class index reserved for a block that owns its span
 val CLASS_LARGE: usize = 32;
+
+# a block that owns its span asks the source for one up to an eighth larger
+# than it needs, and every byte it is granted is the block's capacity
+val LARGE_SPARE_SHIFT: usize = 3;
 
 # alignment every size class satisfies without being widened
 val MIN_ALIGN: usize = 16;
@@ -311,20 +327,24 @@ fun class_of(h: *Heap, size: usize, align: usize) usize {
     ret c;
 }
 
-fun obtain(h: *Heap, size: usize) *Span {
+# a span of `least` to `most` bytes, its header written for the size granted
+fun obtain(h: *Heap, least: usize, most: usize) *Span {
     if (h.src.fn_obtain == nil) { ret nil; }
 
-    val opt_fn_obtain: opt[ptr] = h.src.fn_obtain(h.src.ctx, size);
-    if (!sel opt_fn_obtain.some) { ret nil; }
+    val opt_granted: opt[Grant] = h.src.fn_obtain(h.src.ctx, least, most);
+    if (!sel opt_granted.some) { ret nil; }
 
-    # the base is the contract the small-block lookup is built on, so a
-    # span that breaks it is handed straight back and the request refused
-    if ((opt_fn_obtain.some::usize & (SPAN_ALIGN - 1)) != 0) {
-        if (h.src.fn_release != nil) { h.src.fn_release(h.src.ctx, opt_fn_obtain.some, size); }
+    # the base is the contract the small-block lookup is built on, and the size
+    # the one a class span's geometry is, so a span that breaks either is
+    # handed straight back and the request refused
+    val g:    Grant = opt_granted.some;
+    val size: usize = g.size;
+    if ((g.base::usize & (SPAN_ALIGN - 1)) != 0 || size < least || size > most) {
+        if (h.src.fn_release != nil) { h.src.fn_release(h.src.ctx, g.base, size); }
         ret nil;
     }
 
-    val s: *Span = opt_fn_obtain.some::*Span;
+    val s: *Span = g.base::*Span;
     s.magic  = SPAN_MAGIC;
     s.owner  = h::ptr;
     s.size   = size;
@@ -397,7 +417,7 @@ fun span_for_class(h: *Heap, c: usize) *Span {
         h.held = h.held - s.size;
     }
     or {
-        s = obtain(h, SPAN_SIZE);
+        s = obtain(h, SPAN_SIZE, SPAN_SIZE);
         if (s == nil) { ret nil; }
     }
 
@@ -466,6 +486,10 @@ fun take_large(h: *Heap, size: usize, align: usize, zeroed: *bool) ptr {
     val total: usize = align_up(head + size, page);
     var data:  usize = head;
 
+    var spare: usize = (total >> LARGE_SPARE_SHIFT) & ~(page - 1);
+    if (spare > ~(0::usize) - total) { spare = 0; }
+    val most: usize = total + spare;
+
     var s: *Span = nil;
 
     # reuse a cached span when the block fits and does not waste half of it
@@ -483,7 +507,7 @@ fun take_large(h: *Heap, size: usize, align: usize, zeroed: *bool) ptr {
     }
 
     if (s == nil) {
-        s = obtain(h, total);
+        s = obtain(h, total, most);
         if (s == nil) { ret nil; }
         @zeroed = !h.src.stale;
     }
@@ -1042,21 +1066,23 @@ $if (capability.HAS_PAGES) {
         s.stale      = false;
     }
 
-    fun native_obtain(ctx: ptr, size: usize) opt[ptr] {
-        if (size > ~(0::usize) - SPAN_ALIGN) { ret opt[ptr].none{}; }
+    # a span of exactly `least` bytes, since the mapper grants any page multiple
+    fun native_obtain(ctx: ptr, least: usize, most: usize) opt[Grant] {
+        val size: usize = least;
+        if (size > ~(0::usize) - SPAN_ALIGN) { ret opt[Grant].none{}; }
         $if ($mach.build.sys == $mach.sys.windows) {
             # a windows reservation is released whole from its own base, so the
             # padding cannot be trimmed and the base is stashed ahead of the span
             val raw: ptr = os.allocate(size + SPAN_ALIGN);
-            if (raw == nil) { ret opt[ptr].none{}; }
+            if (raw == nil) { ret opt[Grant].none{}; }
 
             val base: usize = align_up(raw::usize + 1, SPAN_ALIGN);
             @((base - 8)::*usize) = base - raw::usize;
-            ret opt[ptr].some{base::ptr};
+            ret opt[Grant].some{Grant{base: base::ptr, size: size}};
         }
         $or {
             val raw: ptr = os.allocate(size + SPAN_ALIGN);
-            if (raw == nil) { ret opt[ptr].none{}; }
+            if (raw == nil) { ret opt[Grant].none{}; }
 
             val base: usize = align_up(raw::usize, SPAN_ALIGN);
             val head: usize = base - raw::usize;
@@ -1065,7 +1091,7 @@ $if (capability.HAS_PAGES) {
             if (head != 0) { os.deallocate(raw, head); }
             if (tail != 0) { os.deallocate((base + size)::ptr, tail); }
 
-            ret opt[ptr].some{base::ptr};
+            ret opt[Grant].some{Grant{base: base::ptr, size: size}};
         }
     }
 
@@ -1105,14 +1131,14 @@ pub fun allocator_source(s: *Source, backing: *A.Allocator) {
     if (A.reclaims(backing)) { s.fn_release = backed_release; }
 }
 
-fun backed_obtain(ctx: ptr, size: usize) opt[ptr] {
+fun backed_obtain(ctx: ptr, least: usize, most: usize) opt[Grant] {
     val a:                *A.Allocator      = ctx::*A.Allocator;
-    val res_allocate_raw: res[ptr, A.Error] = A.allocate_raw(a, size, SPAN_ALIGN);
-    if (sel res_allocate_raw.err)   { ret opt[ptr].none{}; }
-    if (res_allocate_raw.ok == nil) { ret opt[ptr].none{}; }
+    val res_allocate_raw: res[ptr, A.Error] = A.allocate_raw(a, least, SPAN_ALIGN);
+    if (sel res_allocate_raw.err)   { ret opt[Grant].none{}; }
+    if (res_allocate_raw.ok == nil) { ret opt[Grant].none{}; }
 
-    memory.raw_zero(res_allocate_raw.ok, size);
-    ret opt[ptr].some{res_allocate_raw.ok};
+    memory.raw_zero(res_allocate_raw.ok, least);
+    ret opt[Grant].some{Grant{base: res_allocate_raw.ok, size: least}};
 }
 
 fun backed_release(ctx: ptr, span: ptr, size: usize) i64 {
@@ -1158,23 +1184,38 @@ pub fun region_source(s: *Source, r: *Region, base: ptr, len: usize) {
     s.stale      = false;
 }
 
-fun region_obtain(ctx: ptr, size: usize) opt[ptr] {
+fun region_obtain(ctx: ptr, least: usize, most: usize) opt[Grant] {
     val r:     *Region = ctx::*Region;
     val start: usize   = align_up(r.next, SPAN_ALIGN);
-    if (start < r.next || start > r.stop) { ret opt[ptr].none{}; }
-    if (size > r.stop - start)            { ret opt[ptr].none{}; }
+    if (start < r.next || start > r.stop) { ret opt[Grant].none{}; }
+    if (least > r.stop - start)           { ret opt[Grant].none{}; }
 
-    r.next = start + size;
-    memory.raw_zero(start::ptr, size);
-    ret opt[ptr].some{start::ptr};
+    r.next = start + least;
+    memory.raw_zero(start::ptr, least);
+    ret opt[Grant].some{Grant{base: start::ptr, size: least}};
 }
 
-# how many span sizes a pool holds: SPAN_SIZE doubled this many times less one
-val POOL_BINS: usize = 24;
+# a pool keeps each page count below 1 << EXACT_SHIFT pages in a bin of its
+# own, and each doubling of the size above it in 1 << STEP_SHIFT bins
+val EXACT_SHIFT: usize = 6;
+val STEP_SHIFT:  usize = 3;
 
-# a span a pool holds, linked through its own first bytes
+# bins for sizes up to 1 << 31 pages: the exact ones, then eight to a doubling
+val POOL_BINS: usize = 264;
+
+# a span a pool holds, its record in its own first bytes
+# ---
+# size:  bytes the span holds
+# next:  the span after it in its bin, given back before it
+# prev:  the span before it in its bin
+# newer: the span given back after it
+# older: the span given back before it
 rec Held {
-    next: *Held;
+    size:  usize;
+    next:  *Held;
+    prev:  *Held;
+    newer: *Held;
+    older: *Held;
 }
 
 # spans kept between heaps
@@ -1182,21 +1223,29 @@ rec Held {
 # a heap gives its spans back to its source when it is torn down or runs past
 # its budget. over the host mapper that unmaps them, and the next heap maps and
 # faults the same memory in again. a pool stands between heaps and their real
-# source: a span given back is held, by size, and handed to the next request
-# for that size. spans come in sizes of SPAN_SIZE doubled, a request rounded up
-# to the next, so a span is found without a search and one given back is known
-# by its size alone. a request past the largest goes to the source as it is.
-# a held span keeps what was written to it, so a pool's source is stale.
+# source: a span given back is held at the size it was granted and granted
+# again, whole, to the next request whose range takes it, the smallest such
+# span and of those the last given back. nothing is rounded, so no byte of a
+# span lies past what its holder was granted. when a span given back would
+# take the held bytes past the budget, the spans held longest go back to the
+# source first, since the next requests take the last given back. a request no
+# held span fits goes to the source as it is, and so does a span past the
+# largest bin. a held span keeps what was written to it, so a pool's source is
+# stale.
 # ---
 # src:    where spans come from and go back to
 # lock:   covers every field below
-# bins:   held spans by size, bins[k] of SPAN_SIZE << k bytes each
+# bins:   held spans by size, latest given back first
+# newest: the span given back last
+# oldest: the span held longest
 # held:   bytes in the bins
-# budget: byte ceiling for `held` before a span goes back to the source
+# budget: byte ceiling for `held`, past which the oldest spans go back to the source
 pub rec Pool {
     src:    Source;
     lock:   mutex.Mutex;
     bins:   [POOL_BINS]*Held;
+    newest: *Held;
+    oldest: *Held;
     held:   usize;
     budget: usize;
 }
@@ -1224,6 +1273,8 @@ pub fun pool_init(p: *Pool, src: *Source, budget: usize) err[A.Error] {
         p.bins[k] = nil;
         k         = k + 1;
     }
+    p.newest = nil;
+    p.oldest = nil;
     p.held   = 0;
     p.budget = budget;
     if (p.budget == 0) { p.budget = ~(0::usize); }
@@ -1242,21 +1293,23 @@ pub fun pool_dnit(p: *Pool) err[A.Error] {
     fin { mutex.unlock(?p.lock); }
 
     var first: i64   = 0;
-    var k:     usize = 0;
-    for (k < POOL_BINS) {
-        var s: *Held = p.bins[k];
-        for (s != nil) {
-            val next: *Held = s.next;
-            if (p.src.fn_release != nil) {
-                val code: i64 = p.src.fn_release(p.src.ctx, s::ptr, SPAN_SIZE << k);
-                if (code != 0 && first == 0) { first = code; }
-            }
-            s = next;
+    var s:     *Held = p.oldest;
+    for (s != nil) {
+        val newer: *Held = s.newer;
+        if (p.src.fn_release != nil) {
+            val code: i64 = p.src.fn_release(p.src.ctx, s::ptr, s.size);
+            if (code != 0 && first == 0) { first = code; }
         }
+        s = newer;
+    }
+    var k: usize = 0;
+    for (k < POOL_BINS) {
         p.bins[k] = nil;
         k         = k + 1;
     }
-    p.held = 0;
+    p.newest = nil;
+    p.oldest = nil;
+    p.held   = 0;
 
     if (first != 0) { ret err[A.Error].err{A.Error.release{first}}; }
     ret err[A.Error].ok{};
@@ -1274,51 +1327,108 @@ pub fun pool_source(s: *Source, p: *Pool) {
     s.stale      = true;
 }
 
-# the bin of the smallest pooled size that holds `size`, POOL_BINS when none does
+# the bin a span of `size` bytes is held in, POOL_BINS for one past the largest
 fun pool_bin(size: usize) usize {
-    var k: usize = 0;
-    for (k < POOL_BINS && (SPAN_SIZE << k) < size) { k = k + 1; }
+    val pages: usize = size / PAGE_FLOOR;
+    if (pages < (1 << EXACT_SHIFT)) { ret pages; }
+    var top: usize = EXACT_SHIFT;
+    for ((pages >> (top + 1)) != 0) { top = top + 1; }
+    val k: usize = (1 << EXACT_SHIFT) + ((top - EXACT_SHIFT) << STEP_SHIFT) + ((pages >> (top - STEP_SHIFT)) & ((1 << STEP_SHIFT) - 1));
+    if (k >= POOL_BINS) { ret POOL_BINS; }
     ret k;
 }
 
-fun pooled_obtain(ctx: ptr, size: usize) opt[ptr] {
-    val p: *Pool = ctx::*Pool;
+# hold a span as the one given back last
+fun held_link(p: *Pool, s: *Held, size: usize) {
     val k: usize = pool_bin(size);
-    if (k == POOL_BINS) { ret p.src.fn_obtain(p.src.ctx, size); }
+    s.size = size;
+    s.prev = nil;
+    s.next = p.bins[k];
+    if (s.next != nil) { s.next.prev = s; }
+    p.bins[k] = s;
+    s.newer   = nil;
+    s.older   = p.newest;
+    if (s.older != nil) { s.older.newer = s; }
+    or                  { p.oldest = s; }
+    p.newest = s;
+    p.held   = p.held + size;
+}
 
+# stop holding a span
+fun held_unlink(p: *Pool, s: *Held) {
+    if (s.prev != nil)  { s.prev.next = s.next; }
+    or                  { p.bins[pool_bin(s.size)] = s.next; }
+    if (s.next != nil)  { s.next.prev = s.prev; }
+    if (s.newer != nil) { s.newer.older = s.older; }
+    or                  { p.newest = s.older; }
+    if (s.older != nil) { s.older.newer = s.newer; }
+    or                  { p.oldest = s.newer; }
+    p.held = p.held - s.size;
+}
+
+fun pooled_obtain(ctx: ptr, least: usize, most: usize) opt[Grant] {
+    val p:     *Pool = ctx::*Pool;
+    val first: usize = pool_bin(least);
+    if (first == POOL_BINS) { ret p.src.fn_obtain(p.src.ctx, least, most); }
+    var last: usize = pool_bin(most);
+    if (last == POOL_BINS) { last = POOL_BINS - 1; }
+
+    # the bins hold disjoint ranges in order, so the first bin with a span in
+    # range holds the smallest
     mutex.lock(?p.lock);
-    val got: *Held = p.bins[k];
-    if (got != nil) {
-        p.bins[k] = got.next;
-        p.held    = p.held - (SPAN_SIZE << k);
+    var best: *Held = nil;
+    var k:    usize = first;
+    for (k <= last && best == nil) {
+        var s: *Held = p.bins[k];
+        for (s != nil) {
+            if (s.size >= least && s.size <= most && (best == nil || s.size < best.size)) {
+                best = s;
+                if (s.size == least) { brk; }
+            }
+            s = s.next;
+        }
+        k = k + 1;
     }
+    if (best != nil) { held_unlink(p, best); }
     mutex.unlock(?p.lock);
 
-    if (got != nil) { ret opt[ptr].some{got::ptr}; }
-    ret p.src.fn_obtain(p.src.ctx, SPAN_SIZE << k);
+    if (best != nil) { ret opt[Grant].some{Grant{base: best::ptr, size: best.size}}; }
+    ret p.src.fn_obtain(p.src.ctx, least, most);
 }
 
 fun pooled_release(ctx: ptr, span: ptr, size: usize) i64 {
-    val p: *Pool = ctx::*Pool;
-    val k: usize = pool_bin(size);
-    if (k == POOL_BINS) {
-        if (p.src.fn_release == nil) { ret 0; }
+    val p:        *Pool = ctx::*Pool;
+    val reclaims: bool  = p.src.fn_release != nil;
+    if (pool_bin(size) == POOL_BINS || (reclaims && size > p.budget)) {
+        if (!reclaims) { ret 0; }
         ret p.src.fn_release(p.src.ctx, span, size);
     }
 
-    val whole: usize = SPAN_SIZE << k;
+    # the spans held longest make room, and go back to the source once the lock is let go
+    var gone: *Held = nil;
     mutex.lock(?p.lock);
-    val keeps: bool = p.src.fn_release == nil || (p.held <= p.budget && whole <= p.budget - p.held);
-    if (keeps) {
-        val s: *Held = span::*Held;
-        s.next    = p.bins[k];
-        p.bins[k] = s;
-        p.held    = p.held + whole;
+    if (reclaims) {
+        for (p.held > p.budget - size) {
+            val old: *Held = p.oldest;
+            held_unlink(p, old);
+            old.next = gone;
+            gone     = old;
+        }
     }
+    held_link(p, span::*Held, size);
     mutex.unlock(?p.lock);
 
-    if (keeps) { ret 0; }
-    ret p.src.fn_release(p.src.ctx, span, whole);
+    # a span the source refuses stays held
+    for (gone != nil) {
+        val next: *Held = gone.next;
+        if (p.src.fn_release(p.src.ctx, gone::ptr, gone.size) != 0) {
+            mutex.lock(?p.lock);
+            held_link(p, gone, gone.size);
+            mutex.unlock(?p.lock);
+        }
+        gone = next;
+    }
+    ret 0;
 }
 
 $if (capability.HAS_PAGES && capability.HAS_THREADS) {
@@ -1351,15 +1461,15 @@ $if (capability.HAS_PAGES && capability.HAS_THREADS) {
     # has to come from the heap and cannot be inherited from the mapper. the raw
     # base is stashed ahead of the span, the shape native_obtain uses on windows.
     #[testing]
-    fun weak_obtain(ctx: ptr, size: usize) opt[ptr] {
-        if (size > ~(0::usize) - 2 * SPAN_ALIGN) { ret opt[ptr].none{}; }
-        val raw: ptr = os.allocate(size + 2 * SPAN_ALIGN);
-        if (raw == nil) { ret opt[ptr].none{}; }
+    fun weak_obtain(ctx: ptr, least: usize, most: usize) opt[Grant] {
+        if (least > ~(0::usize) - 2 * SPAN_ALIGN) { ret opt[Grant].none{}; }
+        val raw: ptr = os.allocate(least + 2 * SPAN_ALIGN);
+        if (raw == nil) { ret opt[Grant].none{}; }
 
         var base: usize = align_up(raw::usize + 1, SPAN_ALIGN);
         if (base % (2 * SPAN_ALIGN) == 0) { base = base + SPAN_ALIGN; }
         @((base - 8)::*usize) = base - raw::usize;
-        ret opt[ptr].some{base::ptr};
+        ret opt[Grant].some{Grant{base: base::ptr, size: least}};
     }
 
     #[testing]
@@ -1983,12 +2093,12 @@ $if (capability.HAS_PAGES && capability.HAS_THREADS) {
     }
 
     #[testing]
-    fun grow_obtain(ctx: ptr, size: usize) opt[ptr] {
+    fun grow_obtain(ctx: ptr, least: usize, most: usize) opt[Grant] {
         val g:  *Grow = ctx::*Grow;
         val at: usize = align_up(g.next, SPAN_ALIGN);
-        if (at + size > g.end) { ret opt[ptr].none{}; }
-        g.next = at + size;
-        ret opt[ptr].some{at::ptr};
+        if (at + least > g.end) { ret opt[Grant].none{}; }
+        g.next = at + least;
+        ret opt[Grant].some{Grant{base: at::ptr, size: least}};
     }
 
     #[testing]
@@ -2066,11 +2176,11 @@ $if (capability.HAS_PAGES && capability.HAS_THREADS) {
     }
 
     #[testing]
-    fun skewed_obtain(ctx: ptr, size: usize) opt[ptr] {
+    fun skewed_obtain(ctx: ptr, least: usize, most: usize) opt[Grant] {
         val k: *Skewed = ctx::*Skewed;
-        if (size + os.page_size() > k.bytes) { ret opt[ptr].none{}; }
+        if (least + os.page_size() > k.bytes) { ret opt[Grant].none{}; }
         k.obtained = k.obtained + 1;
-        ret opt[ptr].some{(align_up(k.region::usize, SPAN_ALIGN) + os.page_size())::ptr};
+        ret opt[Grant].some{Grant{base: (align_up(k.region::usize, SPAN_ALIGN) + os.page_size())::ptr, size: least}};
     }
 
     #[testing]
@@ -2199,70 +2309,93 @@ $if (capability.HAS_PAGES && capability.HAS_THREADS) {
         region_source(?s, ?r, base::ptr, SPAN_ALIGN * 3);
         if (s.fn_release != nil) { ret 2; }
 
-        val opt_whole: opt[ptr] = s.fn_obtain(s.ctx, SPAN_ALIGN * 3);
+        val opt_whole: opt[Grant] = s.fn_obtain(s.ctx, SPAN_ALIGN * 3, SPAN_ALIGN * 3);
         if (sel opt_whole.some) { ret 3; }
-        val opt_first: opt[ptr] = s.fn_obtain(s.ctx, SPAN_ALIGN);
+        val opt_first: opt[Grant] = s.fn_obtain(s.ctx, SPAN_ALIGN, SPAN_ALIGN * 2);
         if (sel opt_first.none) { ret 4; }
-        val first: usize = opt_first.some::usize;
-        if (first < base || first % SPAN_ALIGN != 0) { ret 4; }
+        val first: usize = opt_first.some.base::usize;
+        if (first < base || first % SPAN_ALIGN != 0 || opt_first.some.size != SPAN_ALIGN) { ret 4; }
         var i: usize = 0;
         for (i < SPAN_ALIGN) {
             if ((first::*u8)[i] != 0) { ret 5; }
             i = i + 1;
         }
-        val opt_second: opt[ptr] = s.fn_obtain(s.ctx, SPAN_ALIGN);
-        if (sel opt_second.none)                          { ret 6; }
-        if (opt_second.some::usize != first + SPAN_ALIGN) { ret 6; }
+        val opt_second: opt[Grant] = s.fn_obtain(s.ctx, SPAN_ALIGN, SPAN_ALIGN);
+        if (sel opt_second.none)                               { ret 6; }
+        if (opt_second.some.base::usize != first + SPAN_ALIGN) { ret 6; }
 
         # less than a span is left past the next grid point, and one byte taken
         # there leaves the grid point after it outside the region
-        val opt_third: opt[ptr] = s.fn_obtain(s.ctx, SPAN_ALIGN);
+        val opt_third: opt[Grant] = s.fn_obtain(s.ctx, SPAN_ALIGN, SPAN_ALIGN);
         if (sel opt_third.some) { ret 7; }
-        val opt_byte: opt[ptr] = s.fn_obtain(s.ctx, 1);
+        val opt_byte: opt[Grant] = s.fn_obtain(s.ctx, 1, 1);
         if (sel opt_byte.none) { ret 8; }
-        val opt_past: opt[ptr] = s.fn_obtain(s.ctx, 1);
+        val opt_past: opt[Grant] = s.fn_obtain(s.ctx, 1, 1);
         if (sel opt_past.some) { ret 9; }
         ret 0;
     }
 
-    # a span given back to a pool is held in the bin of its rounded size and handed
-    # to the next request of that size, one past the budget goes back to the source,
-    # and a pooled span is stale, so zallocate_raw zeroes what was written to it
-    test heap__a_pool_holds_spans_by_size_within_its_budget_and_hands_them_out_stale {
+    # a span given back to a pool is held at its size and granted whole to the next
+    # request whose range takes it, the smallest that fits. a span given back past
+    # the budget sends the spans held longest back to the source, and a pooled span
+    # is stale, so zallocate_raw zeroes what was written to it
+    test heap__a_pool_grants_the_smallest_held_span_in_range_within_its_budget_and_stale {
+        val one:    usize = SPAN_SIZE;
+        val two:    usize = SPAN_SIZE * 2;
         var native: Source;
         native_source(?native);
         var pool:          Pool;
-        val err_pool_made: err[A.Error] = pool_init(?pool, ?native, SPAN_SIZE * 2);
+        val err_pool_made: err[A.Error] = pool_init(?pool, ?native, one * 3);
         if (sel err_pool_made.err) { ret 1; }
         fin { pool_dnit(?pool); }
         var ps: Source;
         pool_source(?ps, ?pool);
         if (!ps.stale) { ret 2; }
 
-        val opt_first: opt[ptr] = ps.fn_obtain(ps.ctx, SPAN_SIZE + 1);
-        if (sel opt_first.none) { ret 3; }
-        val opt_second: opt[ptr] = ps.fn_obtain(ps.ctx, SPAN_SIZE * 2);
-        if (sel opt_second.none)                                                                      { ret 3; }
-        if (ps.fn_release(ps.ctx, opt_first.some, SPAN_SIZE + 1) != 0 || pool.held != SPAN_SIZE * 2)  { ret 4; }
-        if (ps.fn_release(ps.ctx, opt_second.some, SPAN_SIZE * 2) != 0 || pool.held != SPAN_SIZE * 2) { ret 5; }
-        val opt_again: opt[ptr] = ps.fn_obtain(ps.ctx, SPAN_SIZE * 2);
-        if (sel opt_again.none)                                 { ret 6; }
-        if (opt_again.some != opt_first.some || pool.held != 0) { ret 6; }
-        paint(opt_again.some, SPAN_SIZE * 2, 0x5A);
-        if (ps.fn_release(ps.ctx, opt_again.some, SPAN_SIZE * 2) != 0) { ret 7; }
+        val opt_wide: opt[Grant] = ps.fn_obtain(ps.ctx, two, two);
+        if (sel opt_wide.none)         { ret 3; }
+        if (opt_wide.some.size != two) { ret 3; }
+        val opt_narrow: opt[Grant] = ps.fn_obtain(ps.ctx, one, one);
+        if (sel opt_narrow.none)                                                           { ret 3; }
+        if (opt_narrow.some.size != one)                                                   { ret 3; }
+        if (ps.fn_release(ps.ctx, opt_wide.some.base, two) != 0 || pool.held != two)       { ret 4; }
+        if (ps.fn_release(ps.ctx, opt_narrow.some.base, one) != 0 || pool.held != one * 3) { ret 4; }
 
+        # the narrow span is under the range and the wide one in it, granted at its size
+        val opt_ranged: opt[Grant] = ps.fn_obtain(ps.ctx, one + PAGE_FLOOR, two);
+        if (sel opt_ranged.none)                                                       { ret 5; }
+        if (opt_ranged.some.base != opt_wide.some.base || opt_ranged.some.size != two) { ret 5; }
+        if (pool.held != one)                                                          { ret 5; }
+
+        # no held span is in range, so the source grants a fresh one
+        val opt_fresh: opt[Grant] = ps.fn_obtain(ps.ctx, two, two);
+        if (sel opt_fresh.none) { ret 6; }
+        if (pool.held != one)   { ret 6; }
+
+        # the second wide span given back passes the budget, so the narrow span and
+        # the first wide one, held longest, go back to the source
+        if (ps.fn_release(ps.ctx, opt_ranged.some.base, two) != 0 || pool.held != one * 3) { ret 7; }
+        if (ps.fn_release(ps.ctx, opt_fresh.some.base, two) != 0 || pool.held != two)      { ret 8; }
+        val opt_again: opt[Grant] = ps.fn_obtain(ps.ctx, two, two);
+        if (sel opt_again.none)                                           { ret 9; }
+        if (opt_again.some.base != opt_fresh.some.base || pool.held != 0) { ret 9; }
+        paint(opt_again.some.base, two, 0x5A);
+        if (ps.fn_release(ps.ctx, opt_again.some.base, two) != 0) { ret 10; }
+
+        # a block that spares up to an eighth of its span takes the painted one
         var h:             Heap;
         val err_heap_made: err[A.Error] = init(?h, ?ps, 0);
-        if (sel err_heap_made.err) { ret 8; }
+        if (sel err_heap_made.err) { ret 11; }
         fin { dnit(?h); }
-        val size:       usize             = MAX_SMALL * 9 + 17;
+        val size:       usize             = two - two / 8;
         val res_zeroed: res[ptr, A.Error] = zallocate_raw(?h, size, 16);
-        if (sel res_zeroed.err) { ret 9; }
+        if (sel res_zeroed.err) { ret 12; }
         val at: usize = res_zeroed.ok::usize;
-        if (at < opt_first.some::usize || at >= opt_first.some::usize + SPAN_SIZE * 2) { ret 10; }
+        if (at < opt_again.some.base::usize || at >= opt_again.some.base::usize + two) { ret 13; }
+        if (mapped_bytes(?h) != two)                                                   { ret 14; }
         var i: usize = 0;
         for (i < size) {
-            if ((res_zeroed.ok::*u8)[i] != 0) { ret 11; }
+            if ((res_zeroed.ok::*u8)[i] != 0) { ret 15; }
             i = i + 1;
         }
         ret 0;

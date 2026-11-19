@@ -51,10 +51,11 @@ program states, which is the source on a target with no page mapper:
 
 a program that makes one heap after another, each torn down whole, gives
 them a Pool to share: pool_source draws spans from it and gives them back to
-it, so the next heap is handed the spans the last one used:
+it, so the next heap is handed the spans the last one used. the program states
+how many bytes the pool may hold:
 
   var pool: heap.Pool;
-  heap.pool_init(?pool, ?src, 0);
+  heap.pool_init(?pool, ?src, budget);
   heap.pool_source(?pooled, ?pool);
   heap.init(?h, ?pooled, 0);
 
@@ -81,6 +82,7 @@ Uses types from [`std.allocator`](../allocator.md), [`std.sync.mutex`](../sync/m
 | Type | | |
 | :--- | :--- | :--- |
 | [`Source`](#source) | `rec` | where a heap's backing memory comes from |
+| [`Grant`](#grant) | `rec` | a span a source granted |
 | [`Heap`](#heap) | `rec` | size-class heap state |
 | [`Region`](#region) | `rec` | the state of a region source: the part of the region not yet handed out |
 | [`Pool`](#pool) | `rec` | spans kept between heaps |
@@ -128,7 +130,7 @@ Uses types from [`std.allocator`](../allocator.md), [`std.sync.mutex`](../sync/m
 ```mach
 pub rec Source {
     ctx:        ptr;
-    fn_obtain:  fun(ptr, usize) opt[ptr];
+    fn_obtain:  fun(ptr, usize, usize) opt[Grant];
     fn_release: fun(ptr, ptr, usize) i64;
     stale:      bool;
 }
@@ -136,19 +138,21 @@ pub rec Source {
 
 where a heap's backing memory comes from
 
-fn_obtain(ctx, size) returns a span of at least `size` bytes at an address
-that is a multiple of SPAN_ALIGN, zero-filled unless the source is `stale`.
-`size` is always a multiple of the host page size, or of PAGE_FLOOR on a
-target with no pages.
+fn_obtain(ctx, least, most) returns a span of `least` to `most` bytes at an
+address that is a multiple of SPAN_ALIGN, zero-filled unless the source is
+`stale`, and the size it granted. every granted byte is the holder's to use.
+`least` and `most` are always multiples of the host page size, or of
+PAGE_FLOOR on a target with no pages, and `least` is never above `most`.
 
-fn_release(ctx, span, size) returns a span obtained earlier, 0 on success or
-a negative backend native code. it is nil for a source that cannot return memory; the core
-then retains every span for reuse and never calls it.
+fn_release(ctx, span, size) returns a span obtained earlier, at the size it
+was granted, 0 on success or a negative backend native code. it is nil for a
+source that cannot return memory; the core then retains every span for reuse
+and never calls it.
 
 | Field | Type | |
 | :--- | :--- | :--- |
 | `ctx` | `ptr` | opaque context passed to both callbacks |
-| `fn_obtain` | `fun(ptr, usize) opt[ptr]` | acquire a span, or none when the source is exhausted |
+| `fn_obtain` | `fun(ptr, usize, usize) opt[Grant]` | acquire a span, or none when the source is exhausted |
 | `fn_release` | `fun(ptr, ptr, usize) i64` | return a span, or nil when the source cannot reclaim |
 | `stale` | `bool` | a span it gives may hold what was written to it before |
 
@@ -229,6 +233,22 @@ fill in a Source that draws spans from a pool and gives them back to it
 | :--- | :--- |
 | `s` | Source to initialize |
 | `p` | pool the spans are drawn from (must outlive the heap) |
+
+## Grant
+
+```mach
+pub rec Grant {
+    base: ptr;
+    size: usize;
+}
+```
+
+a span a source granted
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `base` | `ptr` | its first byte, a multiple of SPAN_ALIGN |
+| `size` | `usize` | the bytes it holds, from the least to the most asked for |
 
 ## Heap
 
@@ -459,6 +479,8 @@ pub rec Pool {
     src:    Source;
     lock:   std.sync.mutex.Mutex;
     bins:   [POOL_BINS]*Held;
+    newest: *Held;
+    oldest: *Held;
     held:   usize;
     budget: usize;
 }
@@ -469,19 +491,25 @@ spans kept between heaps
 a heap gives its spans back to its source when it is torn down or runs past
 its budget. over the host mapper that unmaps them, and the next heap maps and
 faults the same memory in again. a pool stands between heaps and their real
-source: a span given back is held, by size, and handed to the next request
-for that size. spans come in sizes of SPAN_SIZE doubled, a request rounded up
-to the next, so a span is found without a search and one given back is known
-by its size alone. a request past the largest goes to the source as it is.
-a held span keeps what was written to it, so a pool's source is stale.
+source: a span given back is held at the size it was granted and granted
+again, whole, to the next request whose range takes it, the smallest such
+span and of those the last given back. nothing is rounded, so no byte of a
+span lies past what its holder was granted. when a span given back would
+take the held bytes past the budget, the spans held longest go back to the
+source first, since the next requests take the last given back. a request no
+held span fits goes to the source as it is, and so does a span past the
+largest bin. a held span keeps what was written to it, so a pool's source is
+stale.
 
 | Field | Type | |
 | :--- | :--- | :--- |
 | `src` | `Source` | where spans come from and go back to |
 | `lock` | `std.sync.mutex.Mutex` | covers every field below |
-| `bins` | `[POOL_BINS]*Held` | held spans by size, bins[k] of SPAN_SIZE \<\< k bytes each |
+| `bins` | `[POOL_BINS]*Held` | held spans by size, latest given back first |
+| `newest` | `*Held` | the span given back last |
+| `oldest` | `*Held` | the span held longest |
 | `held` | `usize` | bytes in the bins |
-| `budget` | `usize` | byte ceiling for `held` before a span goes back to the source |
+| `budget` | `usize` | byte ceiling for `held`, past which the oldest spans go back to the source |
 
 ### pool_init
 
