@@ -6,7 +6,7 @@ TCP socket operations
 
 Source: [`src/net/tcp.mach`](../../../src/net/tcp.mach)
 
-Uses types from [`std.io.error`](../io/error.md), [`std.io.handle`](../io/handle.md), [`std.net.ip`](ip.md), [`std.net.socket`](socket.md).
+Uses types from [`std.io.error`](../io/error.md), [`std.io.handle`](../io/handle.md), [`std.net.ip`](ip.md), [`std.net.socket`](socket.md), [`std.sync.cancel`](../sync/cancel.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -27,7 +27,9 @@ Uses types from [`std.io.error`](../io/error.md), [`std.io.handle`](../io/handle
 | On `Stream` | |
 | :--- | :--- |
 | [`connect`](#connect) | establish a TCP connection to a remote endpoint |
-| [`connect_with_flags`](#connect_with_flags), [`stream_local_endpoint`](#stream_local_endpoint), [`stream_remote_endpoint`](#stream_remote_endpoint) | |
+| [`connect_with_flags`](#connect_with_flags) | |
+| [`connect_within`](#connect_within) | establish a TCP connection to a remote endpoint within a cancellation scope |
+| [`stream_local_endpoint`](#stream_local_endpoint), [`stream_remote_endpoint`](#stream_remote_endpoint) | |
 | [`stream_read`](#stream_read) | read bytes from a TCP stream |
 | [`stream_set_read_timeout`](#stream_set_read_timeout) | bound blocking reads on a TCP stream to a timeout |
 | [`stream_write`](#stream_write) | write bytes to a TCP stream |
@@ -168,6 +170,28 @@ establish a TCP connection to a remote endpoint
 ```mach
 pub fun connect_with_flags(ep: std.net.ip.Endpoint, flags: std.net.socket.Flags) res[Stream, std.io.error.Error]
 ```
+
+### connect_within
+
+Only where `capability.HAS_THREADS && capability.HAS_CLOCK`.
+
+```mach
+pub fun connect_within(ep: std.net.ip.Endpoint, scope: *std.sync.cancel.Scope) res[Stream, std.io.error.Error]
+```
+
+establish a TCP connection to a remote endpoint within a cancellation scope
+
+the connect itself never blocks. while it is in flight the call asks
+whether it settled, applies the scope's deadline and reads its reason
+every millisecond, the way process.exec.wait_within supervises a child, so
+a scope that ends returns the call within about a millisecond with no
+socket left open. the stream it returns blocks, like connect's
+
+| Parameter | |
+| :--- | :--- |
+| `ep` | endpoint to connect to |
+| `scope` | bounds and cancels the connect |
+| **returns** | a connected Stream, the connect's failure, or the end of the scope: CANCELLED for a cancel, TIMEOUT for its deadline, INVALID for a nil or destroyed scope |
 
 ### stream_local_endpoint
 

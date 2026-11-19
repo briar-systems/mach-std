@@ -6,7 +6,7 @@ portable asynchronous resolver types
 
 Source: [`src/net/resolve/types.mach`](../../../../src/net/resolve/types.mach)
 
-Uses types from [`std.allocator`](../../allocator.md), [`std.net.ip`](../ip.md).
+Uses types from [`std.allocator`](../../allocator.md), [`std.net.ip`](../ip.md), [`std.sync.cancel`](../../sync/cancel.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -19,7 +19,7 @@ Uses types from [`std.allocator`](../../allocator.md), [`std.net.ip`](../ip.md).
 | [`ResultLimits`](#resultlimits) | `rec` |  |
 | [`Resolution`](#resolution) | `rec` | result storage belongs to the caller after completion is dequeued |
 | [`Completion`](#completion) | `rec` |  |
-| [`AdapterFun`](#adapterfun) | `def` |  |
+| [`AdapterFun`](#adapterfun) | `def` | a resolver backend: context, the scope that bounds and cancels the lookup, the query, the result's allocator, its limits and the result to fill |
 
 | On `Family` | |
 | :--- | :--- |
@@ -154,8 +154,14 @@ pub rec Completion {
 ## AdapterFun
 
 ```mach
-pub def AdapterFun: fun(ptr, *Query, *std.allocator.Allocator, ResultLimits, *Resolution) Error
+pub def AdapterFun: fun(ptr, *std.sync.cancel.Scope, *Query, *std.allocator.Allocator, ResultLimits, *Resolution) Error
 ```
+
+a resolver backend: context, the scope that bounds and cancels the lookup,
+the query, the result's allocator, its limits and the result to fill. when
+the scope ends, a backend returns within shared.POLL_MSEC with the scope's
+reason (shared.ended) and holds nothing of the caller's afterwards: whatever
+the system still does for the lookup is the backend's to own and free
 
 ## Constants
 

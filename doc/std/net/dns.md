@@ -6,11 +6,13 @@ DNS hostname resolution
 
 a convenience IPv4 surface over the native resolver modules. richer needs
 (dual stack, canonical names, services, asynchrony) belong to
-std.net.resolve.
+std.net.resolve. a lookup runs under the caller's cancellation scope and keeps
+std.net.resolve's contract: when the scope ends, it returns within 10 ms with
+the scope's reason and holds nothing of the caller's afterwards.
 
 Source: [`src/net/dns.mach`](../../../src/net/dns.mach)
 
-Uses types from [`std.net.ip`](ip.md), [`std.net.resolve.types`](resolve/types.md).
+Uses types from [`std.net.ip`](ip.md), [`std.net.resolve.types`](resolve/types.md), [`std.sync.cancel`](../sync/cancel.md).
 
 | Functions | |
 | :--- | :--- |
@@ -42,7 +44,7 @@ the first IPv4 address found into addr.
 ### query
 
 ```mach
-pub fun query(hostname: str, addr: *std.net.ip.IPv4) res[bool, std.net.resolve.types.Error]
+pub fun query(scope: *std.sync.cancel.Scope, hostname: str, addr: *std.net.ip.IPv4) res[bool, std.net.resolve.types.Error]
 ```
 
 resolve a hostname via a DNS A record query
@@ -54,6 +56,7 @@ of resolv.conf, so this is not found there; use std.net.resolve.
 
 | Parameter | |
 | :--- | :--- |
+| `scope` | bounds and cancels the lookup |
 | `hostname` | null-terminated hostname to resolve |
 | `addr` | pointer to an IPv4 to fill on success |
 | **returns** | whether the name resolved, or the configuration or lookup failure |
@@ -61,7 +64,7 @@ of resolv.conf, so this is not found there; use std.net.resolve.
 ### resolve
 
 ```mach
-pub fun resolve(hostname: str, addr: *std.net.ip.IPv4) res[bool, std.net.resolve.types.Error]
+pub fun resolve(scope: *std.sync.cancel.Scope, hostname: str, addr: *std.net.ip.IPv4) res[bool, std.net.resolve.types.Error]
 ```
 
 resolve a hostname to an IPv4 address
@@ -75,6 +78,7 @@ search-domain policy applied.
 
 | Parameter | |
 | :--- | :--- |
+| `scope` | bounds and cancels the DNS lookup |
 | `hostname` | null-terminated hostname to resolve |
 | `addr` | pointer to an IPv4 to fill on success |
 | **returns** | whether the name resolved, or the hosts, configuration or lookup failure |

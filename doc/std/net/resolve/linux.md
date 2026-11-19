@@ -14,7 +14,7 @@ the nameserver interface.
 
 Source: [`src/net/resolve/linux.mach`](../../../../src/net/resolve/linux.mach)
 
-Uses types from [`std.allocator`](../../allocator.md), [`std.net.resolve.conf`](conf.md), [`std.net.resolve.types`](types.md).
+Uses types from [`std.allocator`](../../allocator.md), [`std.net.resolve.conf`](conf.md), [`std.net.resolve.types`](types.md), [`std.sync.cancel`](../../sync/cancel.md).
 
 | Functions | |
 | :--- | :--- |
@@ -28,7 +28,7 @@ Uses types from [`std.allocator`](../../allocator.md), [`std.net.resolve.conf`](
 ### resolve_with_config
 
 ```mach
-pub fun resolve_with_config(query: *std.net.resolve.types.Query, owner: *std.allocator.Allocator,
+pub fun resolve_with_config(scope: *std.sync.cancel.Scope, query: *std.net.resolve.types.Query, owner: *std.allocator.Allocator,
     limits: std.net.resolve.types.ResultLimits, output: *std.net.resolve.types.Resolution, config: *std.net.resolve.conf.Config) std.net.resolve.types.Error
 ```
 
@@ -38,7 +38,7 @@ aim the lookup at a deterministic local nameserver
 ### resolve
 
 ```mach
-pub fun resolve(query: *std.net.resolve.types.Query, owner: *std.allocator.Allocator, limits: std.net.resolve.types.ResultLimits,
+pub fun resolve(scope: *std.sync.cancel.Scope, query: *std.net.resolve.types.Query, owner: *std.allocator.Allocator, limits: std.net.resolve.types.ResultLimits,
     output: *std.net.resolve.types.Resolution) std.net.resolve.types.Error
 ```
 

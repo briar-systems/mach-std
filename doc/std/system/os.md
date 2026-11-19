@@ -174,6 +174,9 @@ Uses types from [`std.io.error`](../io/error.md), [`std.system.file_identity`](f
 | [`sock_local_addr`](#sock_local_addr) | sockets |
 | [`sock_remote_addr`](#sock_remote_addr) | sockets |
 | [`sock_inheritable`](#sock_inheritable) | sockets |
+| [`sock_connect_begin`](#sock_connect_begin) | sockets |
+| [`sock_connect_poll`](#sock_connect_poll) | sockets |
+| [`CONNECT_PENDING`](#connect_pending) | sockets |
 | [`sock_set_rcvtimeo`](#sock_set_rcvtimeo) | sockets |
 | [`DNS_HOSTS_PATH`](#dns_hosts_path) | sockets |
 | [`random_fill`](#random_fill) | random |
@@ -4185,6 +4188,84 @@ pub fun sock_inheritable(fd: usize, out: *bool) i64
 ```
 
 Where `capability.HAS_SOCKETS` and `$mach.build.sys == $mach.sys.wasi`: [`std.system.os.wasi.sock_inheritable`](os/wasi.md).
+
+sockets
+
+### sock_connect_begin
+
+Forwards the first of these whose condition holds, and they differ.
+
+Where `capability.HAS_SOCKETS` and `$mach.build.sys == $mach.sys.linux`: [`std.system.os.linux.sock_connect_begin`](os/linux.md#sock_connect_begin).
+
+```mach
+pub fun sock_connect_begin(fd: usize, addr: *u8, addrlen: usize) i64
+```
+
+Where `capability.HAS_SOCKETS` and `$mach.build.sys == $mach.sys.darwin`: [`std.system.os.darwin.sock_connect_begin`](os/darwin.md#sock_connect_begin).
+
+```mach
+pub fun sock_connect_begin(fd: usize, addr: *u8, addrlen: usize) i64
+```
+
+Where `capability.HAS_SOCKETS` and `$mach.build.sys == $mach.sys.windows`: [`std.system.os.windows.sock_connect_begin`](os/windows.md#sock_connect_begin).
+
+```mach
+pub fun sock_connect_begin(fd: usize, addr: *u8, addrlen: usize) i64
+```
+
+Where `capability.HAS_SOCKETS` and `$mach.build.sys == $mach.sys.wasi`: [`std.system.os.wasi.sock_connect_begin`](os/wasi.md).
+
+sockets
+
+### sock_connect_poll
+
+Forwards the first of these whose condition holds, and they differ.
+
+Where `capability.HAS_SOCKETS` and `$mach.build.sys == $mach.sys.linux`: [`std.system.os.linux.sock_connect_poll`](os/linux.md#sock_connect_poll).
+
+```mach
+pub fun sock_connect_poll(fd: usize) i64
+```
+
+Where `capability.HAS_SOCKETS` and `$mach.build.sys == $mach.sys.darwin`: [`std.system.os.darwin.sock_connect_poll`](os/darwin.md#sock_connect_poll).
+
+```mach
+pub fun sock_connect_poll(fd: usize) i64
+```
+
+Where `capability.HAS_SOCKETS` and `$mach.build.sys == $mach.sys.windows`: [`std.system.os.windows.sock_connect_poll`](os/windows.md#sock_connect_poll).
+
+```mach
+pub fun sock_connect_poll(fd: usize) i64
+```
+
+Where `capability.HAS_SOCKETS` and `$mach.build.sys == $mach.sys.wasi`: [`std.system.os.wasi.sock_connect_poll`](os/wasi.md).
+
+sockets
+
+### CONNECT_PENDING
+
+Forwards the first of these whose condition holds, and they differ.
+
+Where `capability.HAS_SOCKETS` and `$mach.build.sys == $mach.sys.linux`: [`std.system.os.linux.CONNECT_PENDING`](os/linux.md#connect_pending).
+
+```mach
+pub val CONNECT_PENDING: i64 = 1
+```
+
+Where `capability.HAS_SOCKETS` and `$mach.build.sys == $mach.sys.darwin`: [`std.system.os.darwin.CONNECT_PENDING`](os/darwin.md#connect_pending).
+
+```mach
+pub val CONNECT_PENDING: i64 = 1
+```
+
+Where `capability.HAS_SOCKETS` and `$mach.build.sys == $mach.sys.windows`: [`std.system.os.windows.CONNECT_PENDING`](os/windows.md#connect_pending).
+
+```mach
+pub val CONNECT_PENDING: i64 = 1
+```
+
+Where `capability.HAS_SOCKETS` and `$mach.build.sys == $mach.sys.wasi`: [`std.system.os.wasi.CONNECT_PENDING`](os/wasi.md).
 
 sockets
 

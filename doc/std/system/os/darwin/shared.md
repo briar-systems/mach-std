@@ -114,7 +114,10 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`local_stream_recv`](#local_stream_recv) | exclusively borrow the receive queue through peek and consume, including all aliases |
 | [`sock_write_vector`](#sock_write_vector), [`sock_send_message`](#sock_send_message) | |
 | [`sock_receive_message`](#sock_receive_message) | raw recvmsg preserves native ancillary ownership and truncation behavior |
-| [`sock_connect_status`](#sock_connect_status), [`sock_close`](#sock_close), [`sock_create`](#sock_create), [`sock_create_flags`](#sock_create_flags), [`sock_bind`](#sock_bind), [`sock_listen`](#sock_listen), [`sock_accept`](#sock_accept), [`sock_accept_flags`](#sock_accept_flags), [`sock_connect`](#sock_connect), [`sock_sendto`](#sock_sendto) | |
+| [`sock_connect_status`](#sock_connect_status) | |
+| [`sock_connect_begin`](#sock_connect_begin) | start a connect on a blocking socket without blocking on it |
+| [`sock_connect_poll`](#sock_connect_poll) | ask whether a connect sock_connect_begin started has settled, without waiting |
+| [`sock_close`](#sock_close), [`sock_create`](#sock_create), [`sock_create_flags`](#sock_create_flags), [`sock_bind`](#sock_bind), [`sock_listen`](#sock_listen), [`sock_accept`](#sock_accept), [`sock_accept_flags`](#sock_accept_flags), [`sock_connect`](#sock_connect), [`sock_sendto`](#sock_sendto) | |
 | [`sock_peek_readable`](#sock_peek_readable) | peek at a stream socket without consuming or blocking |
 | [`sock_recvfrom`](#sock_recvfrom), [`sock_shutdown`](#sock_shutdown), [`sock_setopt`](#sock_setopt), [`sock_getopt`](#sock_getopt), [`sock_local_addr`](#sock_local_addr), [`sock_remote_addr`](#sock_remote_addr), [`sock_inheritable`](#sock_inheritable) | |
 | [`sock_set_rcvtimeo`](#sock_set_rcvtimeo) | set the receive timeout on a socket |
@@ -129,7 +132,9 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`STDIN_FD`](#constants) | portable constants |
 | [`STDOUT_FD`](#constants), [`STDERR_FD`](#constants), [`O_RDONLY`](#constants), [`O_WRONLY`](#constants), [`O_RDWR`](#constants), [`O_CREAT`](#constants), [`O_EXCL`](#constants), [`O_TRUNC`](#constants), [`O_APPEND`](#constants), [`O_DIRECTORY`](#constants), [`O_NOFOLLOW`](#constants), [`AT_FDCWD`](#constants), [`AT_SYMLINK_NOFOLLOW`](#constants), [`AT_REMOVEDIR`](#constants) | |
 | [`LOCK_SH`](#constants) | advisory whole-file lock operations, passed to lock_fd |
-| [`LOCK_EX`](#constants), [`LOCK_NB`](#constants), [`LOCK_UN`](#constants), [`S_IFMT`](#constants), [`S_IFDIR`](#constants), [`S_IFREG`](#constants), [`S_IFLNK`](#constants), [`WNOHANG`](#constants), [`WUNTRACED`](#constants), [`WCONTINUED`](#constants), [`CLOCK_REALTIME`](#constants), [`CLOCK_MONOTONIC`](#constants), [`EPERM`](#constants), [`ENOENT`](#constants), [`ESRCH`](#constants), [`EINTR`](#constants), [`EIO`](#constants), [`ENXIO`](#constants), [`E2BIG`](#constants), [`EBADF`](#constants), [`ECHILD`](#constants), [`EAGAIN`](#constants), [`ENOMEM`](#constants), [`EACCES`](#constants), [`EFAULT`](#constants), [`EBUSY`](#constants), [`EEXIST`](#constants), [`ENODEV`](#constants), [`ENOTDIR`](#constants), [`EISDIR`](#constants), [`EINVAL`](#constants), [`ENFILE`](#constants), [`EMFILE`](#constants), [`ETXTBSY`](#constants), [`ENOSPC`](#constants), [`EROFS`](#constants), [`EPIPE`](#constants), [`ELOOP`](#constants), [`ENAMETOOLONG`](#constants), [`ENOTEMPTY`](#constants), [`ENOTSUP`](#constants), [`ERANGE`](#constants), [`EADDRINUSE`](#constants), [`ENETUNREACH`](#constants), [`ECONNABORTED`](#constants), [`ECONNRESET`](#constants), [`ENOTCONN`](#constants), [`ETIMEDOUT`](#constants), [`ECONNREFUSED`](#constants), [`EHOSTUNREACH`](#constants), [`ECANCELED`](#constants), [`EINTR_MAX_RETRIES`](#constants), [`IO_EVENT_READ`](#constants), [`IO_EVENT_WRITE`](#constants), [`IO_EVENT_ERROR`](#constants), [`IO_EVENT_HANGUP`](#constants), [`IO_EVENT_WAKE`](#constants), [`AF_INET`](#constants), [`AF_INET6`](#constants), [`SOCK_STREAM`](#constants), [`SOCK_DGRAM`](#constants), [`SOL_SOCKET`](#constants), [`SO_UNSUPPORTED`](#constants), [`SO_REUSEADDR`](#constants), [`SO_REUSEPORT`](#constants), [`SO_EXCLUSIVEADDRUSE`](#constants), [`SO_KEEPALIVE`](#constants), [`SO_SNDBUF`](#constants), [`SO_RCVBUF`](#constants), [`SO_LINGER`](#constants), [`SO_RCVTIMEO`](#constants), [`IPPROTO_IP`](#constants), [`IPPROTO_TCP`](#constants), [`IPPROTO_IPV6`](#constants), [`IP_TOS`](#constants), [`IPV6_V6ONLY`](#constants), [`IPV6_TCLASS`](#constants), [`TCP_NODELAY`](#constants), [`TCP_KEEPIDLE`](#constants), [`TCP_KEEPINTVL`](#constants), [`TCP_KEEPCNT`](#constants), [`TCP_FASTOPEN`](#constants), [`SHUT_RD`](#constants), [`SHUT_WR`](#constants), [`SHUT_RDWR`](#constants), [`SOCKADDR_IN_SIZE`](#constants), [`SOCKADDR_IN6_SIZE`](#constants), [`SOCKADDR_STORAGE_SIZE`](#constants), [`DNS_HOSTS_PATH`](#constants) | |
+| [`LOCK_EX`](#constants), [`LOCK_NB`](#constants), [`LOCK_UN`](#constants), [`S_IFMT`](#constants), [`S_IFDIR`](#constants), [`S_IFREG`](#constants), [`S_IFLNK`](#constants), [`WNOHANG`](#constants), [`WUNTRACED`](#constants), [`WCONTINUED`](#constants), [`CLOCK_REALTIME`](#constants), [`CLOCK_MONOTONIC`](#constants), [`EPERM`](#constants), [`ENOENT`](#constants), [`ESRCH`](#constants), [`EINTR`](#constants), [`EIO`](#constants), [`ENXIO`](#constants), [`E2BIG`](#constants), [`EBADF`](#constants), [`ECHILD`](#constants), [`EAGAIN`](#constants), [`ENOMEM`](#constants), [`EACCES`](#constants), [`EFAULT`](#constants), [`EBUSY`](#constants), [`EEXIST`](#constants), [`ENODEV`](#constants), [`ENOTDIR`](#constants), [`EISDIR`](#constants), [`EINVAL`](#constants), [`ENFILE`](#constants), [`EMFILE`](#constants), [`ETXTBSY`](#constants), [`ENOSPC`](#constants), [`EROFS`](#constants), [`EPIPE`](#constants), [`ELOOP`](#constants), [`ENAMETOOLONG`](#constants), [`ENOTEMPTY`](#constants), [`ENOTSUP`](#constants), [`ERANGE`](#constants), [`EADDRINUSE`](#constants), [`ENETUNREACH`](#constants), [`ECONNABORTED`](#constants), [`ECONNRESET`](#constants), [`ENOTCONN`](#constants), [`ETIMEDOUT`](#constants), [`ECONNREFUSED`](#constants), [`EHOSTUNREACH`](#constants), [`ECANCELED`](#constants), [`EINTR_MAX_RETRIES`](#constants), [`IO_EVENT_READ`](#constants), [`IO_EVENT_WRITE`](#constants), [`IO_EVENT_ERROR`](#constants), [`IO_EVENT_HANGUP`](#constants), [`IO_EVENT_WAKE`](#constants), [`AF_INET`](#constants), [`AF_INET6`](#constants), [`SOCK_STREAM`](#constants), [`SOCK_DGRAM`](#constants), [`SOL_SOCKET`](#constants), [`SO_UNSUPPORTED`](#constants), [`SO_REUSEADDR`](#constants), [`SO_REUSEPORT`](#constants), [`SO_EXCLUSIVEADDRUSE`](#constants), [`SO_KEEPALIVE`](#constants), [`SO_SNDBUF`](#constants), [`SO_RCVBUF`](#constants), [`SO_LINGER`](#constants), [`SO_RCVTIMEO`](#constants), [`IPPROTO_IP`](#constants), [`IPPROTO_TCP`](#constants), [`IPPROTO_IPV6`](#constants), [`IP_TOS`](#constants), [`IPV6_V6ONLY`](#constants), [`IPV6_TCLASS`](#constants), [`TCP_NODELAY`](#constants), [`TCP_KEEPIDLE`](#constants), [`TCP_KEEPINTVL`](#constants), [`TCP_KEEPCNT`](#constants), [`TCP_FASTOPEN`](#constants), [`SHUT_RD`](#constants), [`SHUT_WR`](#constants), [`SHUT_RDWR`](#constants), [`SOCKADDR_IN_SIZE`](#constants), [`SOCKADDR_IN6_SIZE`](#constants), [`SOCKADDR_STORAGE_SIZE`](#constants) | |
+| [`CONNECT_PENDING`](#constants) | what sock_connect_begin and sock_connect_poll return while the connect is in flight |
+| [`DNS_HOSTS_PATH`](#constants) | |
 
 | Variables | |
 | :--- | :--- |
@@ -1392,6 +1397,34 @@ callers receiving rights must provide adequate control storage and close each re
 pub fun sock_connect_status(fd: usize) i64
 ```
 
+### sock_connect_begin
+
+```mach
+pub fun sock_connect_begin(fd: usize, addr: *u8, addrlen: usize) i64
+```
+
+start a connect on a blocking socket without blocking on it
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | a blocking stream socket, nonblocking until the connect settles |
+| `addr` | pointer to the peer's sockaddr |
+| `addrlen` | size of the sockaddr |
+| **returns** | 0 once connected, CONNECT_PENDING while in flight, or negative errno. a settled connect leaves the socket blocking again |
+
+### sock_connect_poll
+
+```mach
+pub fun sock_connect_poll(fd: usize) i64
+```
+
+ask whether a connect sock_connect_begin started has settled, without waiting
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the socket sock_connect_begin returned CONNECT_PENDING for |
+| **returns** | 0 once connected, CONNECT_PENDING while in flight, or the connect's negative errno. a settled connect leaves the socket blocking again |
+
 ### sock_close
 
 ```mach
@@ -1659,6 +1692,7 @@ pub fun error_message(code: i64) str
 | `SOCKADDR_IN_SIZE` | `usize` | `16` |  |
 | `SOCKADDR_IN6_SIZE` | `usize` | `28` |  |
 | `SOCKADDR_STORAGE_SIZE` | `usize` | `128` |  |
+| `CONNECT_PENDING` | `i64` | `1` | what sock_connect_begin and sock_connect_poll return while the connect is in flight |
 | `DNS_HOSTS_PATH` | `str` | `"/etc/hosts"` |  |
 
 ## Variables

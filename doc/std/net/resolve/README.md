@@ -4,6 +4,19 @@
 
 bounded asynchronous system name resolution
 
+every lookup runs under a cancellation scope and keeps one contract on every
+platform: when the scope ends, the lookup returns within shared.POLL_MSEC
+(10 ms) with the scope's reason, and holds nothing of the caller's
+afterwards. what the system is still doing for it is the backend's business
+and never reaches the caller. linux asks its nameservers itself and bounds
+every wait by the poll, the TCP retry's connect included. windows runs
+GetAddrInfoExW asynchronously into a request the library owns and asks
+GetAddrInfoExCancel to end it. darwin runs getaddrinfo, which nothing can
+interrupt, on a helper thread that owns the request and frees it when the
+system lets it finish. an operation here hands its backend a scope of its
+own, which the caller's scope, a token cancellation, the runtime and the
+deadline all end
+
 The directory's root module is [`std.net.resolve`](../resolve.md).
 
 | Module | |

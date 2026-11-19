@@ -49,7 +49,7 @@ parsed resolver policy with glibc-compatible defaults and caps
 | `search` | `[1524]u8` | MAX_SEARCH nul-terminated slots of MAX_NAME bytes each |
 | `search_count` | `usize` | valid slots in search |
 | `ndots` | `u32` | dot threshold selecting literal-first lookup order |
-| `timeout_ms` | `u64` | per-request wait before the next server is tried |
+| `timeout_ms` | `u64` | per-request wait before the next server is tried, within the lookup's scope |
 | `attempts` | `u32` | full passes over the nameserver list |
 | `rotate` | `bool` | start each lookup at a different server |
 

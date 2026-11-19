@@ -168,6 +168,8 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`sock_recv_close_rights`](#sock_recv_close_rights) | receives bytes and closes every descriptor the kernel installed for them |
 | [`local_stream_recv`](#local_stream_recv) | byte reception for local streams: rights a peer attaches are observed and closed |
 | [`sock_connect_status`](#sock_connect_status) | |
+| [`sock_connect_begin`](#sock_connect_begin) | start a connect on a blocking socket without blocking on it |
+| [`sock_connect_poll`](#sock_connect_poll) | ask whether a connect sock_connect_begin started has settled, without waiting |
 | [`sock_close`](#sock_close) | close a socket file descriptor |
 | [`sock_create`](#sock_create) | create a socket file descriptor |
 | [`sock_create_flags`](#sock_create_flags) | |
@@ -206,6 +208,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`IPPROTO_IP`](#constants), [`IPPROTO_TCP`](#constants), [`IPPROTO_IPV6`](#constants), [`IP_TOS`](#constants), [`IPV6_V6ONLY`](#constants), [`IPV6_TCLASS`](#constants), [`TCP_NODELAY`](#constants), [`TCP_KEEPIDLE`](#constants), [`TCP_KEEPINTVL`](#constants), [`TCP_KEEPCNT`](#constants), [`TCP_FASTOPEN`](#constants), [`SHUT_RD`](#constants), [`SHUT_WR`](#constants), [`SHUT_RDWR`](#constants), [`SOCKADDR_IN_SIZE`](#constants), [`SOCKADDR_IN6_SIZE`](#constants), [`SOCKADDR_STORAGE_SIZE`](#constants), [`MSG_CTRUNC`](#constants), [`MSG_CMSG_CLOEXEC`](#constants), [`SCM_RIGHTS`](#constants), [`SCM_CREDENTIALS`](#constants), [`SCM_PIDFD`](#constants) | |
 | [`SCM_MAX_FD`](#constants) | net/scm.h SCM_MAX_FD: sendmsg refuses a larger descriptor set, and a stream receive returns at most one set (unix_stream_read_generic stops after the record that carries it) |
 | [`LOCAL_CONTROL_CAPACITY`](#constants) | CMSG_SPACE(253 descriptors) + CMSG_SPACE(ucred) + CMSG_SPACE(pidfd): the largest descriptor set together with the fixed-size records SO_PASSCRED and SO_PASSPIDFD prepend to it |
+| [`CONNECT_PENDING`](#constants) | what sock_connect_begin and sock_connect_poll return while the connect is in flight |
 | [`DNS_HOSTS_PATH`](#constants) | |
 
 | Variables | |
@@ -2111,6 +2114,34 @@ byte reception for local streams: rights a peer attaches are observed and closed
 pub fun sock_connect_status(fd: usize) i64
 ```
 
+### sock_connect_begin
+
+```mach
+pub fun sock_connect_begin(fd: usize, addr: *u8, addrlen: usize) i64
+```
+
+start a connect on a blocking socket without blocking on it
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | a blocking stream socket, nonblocking until the connect settles |
+| `addr` | pointer to the peer's sockaddr |
+| `addrlen` | size of the sockaddr |
+| **returns** | 0 once connected, CONNECT_PENDING while in flight, or negative errno. a settled connect leaves the socket blocking again |
+
+### sock_connect_poll
+
+```mach
+pub fun sock_connect_poll(fd: usize) i64
+```
+
+ask whether a connect sock_connect_begin started has settled, without waiting
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the socket sock_connect_begin returned CONNECT_PENDING for |
+| **returns** | 0 once connected, CONNECT_PENDING while in flight, or the connect's negative errno. a settled connect leaves the socket blocking again |
+
 ### sock_close
 
 ```mach
@@ -2482,6 +2513,7 @@ return a human-readable message for a negated errno code
 | `SCM_PIDFD` | `i32` | `4` |  |
 | `SCM_MAX_FD` | `usize` | `253` | net/scm.h SCM_MAX_FD: sendmsg refuses a larger descriptor set, and a stream receive returns at most one set (unix_stream_read_generic stops after the record that carries it) |
 | `LOCAL_CONTROL_CAPACITY` | `usize` | `1088` where `$mach.build.pointer_width == 8`; `1064` otherwise | CMSG_SPACE(253 descriptors) + CMSG_SPACE(ucred) + CMSG_SPACE(pidfd): the largest descriptor set together with the fixed-size records SO_PASSCRED and SO_PASSPIDFD prepend to it |
+| `CONNECT_PENDING` | `i64` | `1` | what sock_connect_begin and sock_connect_poll return while the connect is in flight |
 | `DNS_HOSTS_PATH` | `str` | `"/etc/hosts"` |  |
 
 ## Variables
