@@ -2,13 +2,13 @@
 
 # std.runtime.linux.reloc
 
-static-PIE self-relocation
+self-relocation and RELRO for an image no loader started
 
 Source: [`src/runtime/linux/reloc.mach`](../../../../src/runtime/linux/reloc.mach)
 
 | Functions | |
 | :--- | :--- |
-| [`_rt_relocate`](#_rt_relocate) | apply the image's ELF RELATIVE relocations, sliding each by the load bias recovered from the kernel auxiliary vector |
+| [`_rt_relocate`](#_rt_relocate) | apply a PIE's ELF RELATIVE relocations, sliding each by the load bias recovered from the kernel auxiliary vector, then protect the image's RELRO region, PIE or not |
 | [`relro_reprotect`](#relro_reprotect) | re-protect the RELRO region read-only, or abort naming the violated invariant |
 
 ---
@@ -22,8 +22,8 @@ Source: [`src/runtime/linux/reloc.mach`](../../../../src/runtime/linux/reloc.mac
 pub fun _rt_relocate(envp: *usize)
 ```
 
-apply the image's ELF RELATIVE relocations, sliding each by the load bias recovered
-from the kernel auxiliary vector
+apply a PIE's ELF RELATIVE relocations, sliding each by the load bias recovered
+from the kernel auxiliary vector, then protect the image's RELRO region, PIE or not
 
 `envp` points at the program's environment vector: envp[0..] then a NULL, immediately
 after which the kernel placed the auxv (type/value word pairs terminated by AT_NULL).
