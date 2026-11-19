@@ -101,10 +101,10 @@ done < "$work/actual.txt"
 while read -r module; do
     grep -qxF "$module" "$work/actual.txt" && continue
     log="$work/logs/$module.log"
-    count="$(grep -cE '^error(\[[a-z._]+\])?:' "$log" || true)"
-    if [ "$count" != 1 ] || ! grep -qE '^error(\[[a-z._]+\])?: .* needs ' "$log"; then
+    count="$(grep -cE '^error(\[[a-z._]+\])? ' "$log" || true)"
+    if [ "$count" != 1 ] || ! grep -qE '^error(\[[a-z._]+\])? .* needs ' "$log"; then
         echo "FAIL: $module refuses freestanding with $count diagnostics, not one naming what it needs:" >&2
-        grep -m 5 -E '^error(\[[a-z._]+\])?:' "$log" | sed 's/^/    /' >&2 || true
+        grep -m 5 -E '^error(\[[a-z._]+\])? ' "$log" | sed 's/^/    /' >&2 || true
         status=1
     fi
 done < "$work/modules.txt"
