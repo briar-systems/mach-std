@@ -107,6 +107,7 @@ $if ($mach.build.arch == $mach.arch.x86_64) {
     val     SYS_GETRANDOM:         usize = 318;
     val     SYS_GETCPU:            usize = 309;
     val     SYS_CLOSE_RANGE:       usize = 436;
+    val     SYS_PIDFD_OPEN:        usize = 434;
     val     SYS_DUP3:              usize = 292;
     val     SYS_SETPGID:           usize = 109;
     val     SYS_GETPGID:           usize = 121;
@@ -188,6 +189,7 @@ $or ($mach.build.arch == $mach.arch.aarch64) {
     val     SYS_GETRANDOM:         usize = 278;
     val     SYS_GETCPU:            usize = 168;
     val     SYS_CLOSE_RANGE:       usize = 436;
+    val     SYS_PIDFD_OPEN:        usize = 434;
     val     SYS_DUP3:              usize = 24;
     val     SYS_SETPGID:           usize = 154;
     val     SYS_GETPGID:           usize = 155;
@@ -271,6 +273,7 @@ $or ($mach.build.arch == $mach.arch.riscv64) {
     val     SYS_GETRANDOM:   usize = 278;
     val     SYS_GETCPU:      usize = 168;
     val     SYS_CLOSE_RANGE: usize = 436;
+    val     SYS_PIDFD_OPEN:  usize = 434;
     val     SYS_DUP3:        usize = 24;
     val     SYS_SETPGID:     usize = 154;
     val     SYS_GETPGID:     usize = 155;
@@ -357,6 +360,7 @@ $or ($mach.build.arch == $mach.arch.riscv32) {
     val     SYS_GETRANDOM:   usize = 278;
     val     SYS_GETCPU:      usize = 168;
     val     SYS_CLOSE_RANGE: usize = 436;
+    val     SYS_PIDFD_OPEN:  usize = 434;
     val     SYS_DUP3:        usize = 24;
     val     SYS_SETPGID:     usize = 154;
     val     SYS_GETPGID:     usize = 155;
@@ -436,10 +440,10 @@ val SEEK_SET: i32 = 0;
 val SEEK_CUR: i32 = 1;
 val SEEK_END: i32 = 2;
 
-val ENOSYS:           i64   = -38;
-val SYS_FCHMODAT2:    usize = 452;
-val SYS_MEMFD_SECRET: usize = 447;
-val SECRET_CLOEXEC:   usize = 0x80000;
+pub val ENOSYS:           i64   = -38;
+val     SYS_FCHMODAT2:    usize = 452;
+val     SYS_MEMFD_SECRET: usize = 447;
+val     SECRET_CLOEXEC:   usize = 0x80000;
 
 use os_shared: std.system.os.shared;
 fwd os_shared.DirectoryEntry;
@@ -2581,6 +2585,36 @@ pub fun probe_group(pgid: i64) i64 {
     ret sent;
 }
 
+# make the end of the child `pid` a readiness event on `queue`, so the queue's
+# wait returns once the child ends. a pidfd names the child: it reads ready
+# from the moment the child ends, reaped or not, and is not inherited across exec
+# ---
+# context: the nonzero context the event carries
+# ret:     the watch, which process_unwatch releases, or negative errno (ESRCH
+#          when no such process is left)
+pub fun process_watch(queue: *os_shared.IoQueue, pid: i64, context: usize) i64 {
+    if (queue == nil || pid <= 0 || context == 0) { ret EINVAL; }
+    val pidfd: i64 = syscall2(SYS_PIDFD_OPEN, pid::usize, 0);
+    if (pidfd < 0) { ret pidfd; }
+    val watched: i64 = io_queue_watch(queue, pidfd::usize, context, IO_EVENT_READ);
+    if (watched < 0) {
+        close(pidfd::i32);
+        ret watched;
+    }
+    ret pidfd;
+}
+
+# release a watch process_watch made, whether or not it fired
+# ---
+# ret: 0, or the first negative errno
+pub fun process_unwatch(queue: *os_shared.IoQueue, watch: i64) i64 {
+    if (queue == nil || watch < 0) { ret EINVAL; }
+    val removed: i64 = io_queue_unwatch(queue, watch::usize);
+    val closed:  i64 = close(watch::i32);
+    if (removed < 0) { ret removed; }
+    ret closed;
+}
+
 # canonical process observations
 fwd os_shared.ProcessStatus;
 fwd os_shared.FileLimit;
@@ -2599,20 +2633,22 @@ fwd os_shared.PROCESS_SIGNALED;
 fwd os_shared.PROCESS_STOPPED;
 fwd os_shared.PROCESS_CONTINUED;
 
-# close every file descriptor >= 3 in the caller
-#
-# used by the child between fork and exec to avoid leaking parent FDs
-# (pipes, sockets, etc.); falls back to a bounded loop when close_range
-# is unavailable.
-fun close_inherited_fds() {
-    val r: i64 = syscall3(SYS_CLOSE_RANGE, 3, ~(0::usize), 0);
-    if (r < 0) {
-        var fd: i32 = 3;
-        for (fd < 1024) {
-            syscall1(SYS_CLOSE, fd::isize::usize);
-            fd = fd + 1;
-        }
-    }
+# close every file descriptor >= 3 in the caller, so a child keeps none of its
+# parent's (pipes, sockets, etc.) across exec
+# ---
+# ret: 0, or the negative errno
+fun close_inherited_fds() i64 {
+    ret syscall3(SYS_CLOSE_RANGE, 3, 0xffffffff, 0);
+}
+
+# whether the kernel has close_range (5.9), asked before a child is made so a spawn
+# on an older kernel refuses with ENOSYS rather than starting a child that keeps its
+# parent's descriptors. the range names one descriptor past any open one, so it
+# closes nothing
+# ---
+# ret: 0, or the negative errno
+fun close_range_present() i64 {
+    ret syscall3(SYS_CLOSE_RANGE, 0xffffffff, 0xffffffff, 0);
 }
 
 # spawn child stack: a private, page-multiple stack handed to the clone child
@@ -2696,8 +2732,8 @@ fun spawn_trampoline() {
 # the child's body, on its private stack and never touching the parent's
 # frame. it only redirects fds, closes inherited fds, and execs, all
 # stack-safe under CLONE_VM, and never returns: a successful exec replaces the
-# image, any failure exits the child (126 on a failed redirect, 127 on a
-# failed exec).
+# image, any failure exits the child (126 on a failed redirect or close, 127
+# on a failed exec).
 #[symbol("_std_spawn_main")]
 fun spawn_main(ctx: *SpawnCtx) {
     # setpgid(0, 0) makes the child the leader of a new group carrying its own
@@ -2710,7 +2746,7 @@ fun spawn_main(ctx: *SpawnCtx) {
     if (spawn_redirect(ctx.stdin_fd, STDIN_FD) < 0)   { syscall1(SYS_EXIT_GROUP, 126); }
     if (spawn_redirect(ctx.stdout_fd, STDOUT_FD) < 0) { syscall1(SYS_EXIT_GROUP, 126); }
     if (spawn_redirect(ctx.stderr_fd, STDERR_FD) < 0) { syscall1(SYS_EXIT_GROUP, 126); }
-    close_inherited_fds();
+    if (close_inherited_fds() < 0)                    { syscall1(SYS_EXIT_GROUP, 126); }
     # SPAWN_CLONE_FLAGS deliberately omits CLONE_FS, so the child owns its own
     # filesystem context and this chdir cannot move the parent's cwd.
     if (ctx.cwd != nil && syscall1(SYS_CHDIR, ctx.cwd::usize) < 0) {
@@ -2859,6 +2895,8 @@ pub fun spawn_redirected_in_grouped(pathname: *u8, argv: **u8, envp: Environment
 fun spawn_redirected_in_impl(pathname: *u8, argv: **u8, envp: Environment, cwd: *u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32, grouped: i32) i64 {
     val environment: **u8 = exec_environment(envp);
     if (environment == nil) { ret EINVAL; }
+    val present: i64 = close_range_present();
+    if (present < 0) { ret present; }
     var ctx: SpawnCtx;
     ctx.cwd       = cwd;
     ctx.pathname  = pathname;
@@ -4088,6 +4126,7 @@ pub fun error_message(code: i64) str {
     or (code == ENOTEMPTY)    { ret "directory not empty"; }
     or (code == ELOOP)        { ret "too many levels of symbolic links"; }
     or (code == ENOTSUP)      { ret "operation not supported"; }
+    or (code == ENOSYS)       { ret "function not implemented"; }
     or                        { ret "unknown error"; }
 }
 

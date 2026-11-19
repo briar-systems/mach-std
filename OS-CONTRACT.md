@@ -140,6 +140,24 @@ The environment reads in the same two forms. `environ_native()` is the one captu
 
 `cpu_dit() i64` says whether the processor and kernel provide the aarch64 data-independent-timing mode (FEAT_DIT, PSTATE.DIT): 1 when present, 0 when absent, negative when the answer cannot be read (linux before the runtime captured envp). linux reads HWCAP_DIT (bit 24) from `AT_HWCAP` with the reader `cpu_features` uses, darwin asks sysctl for `hw.optional.arm.FEAT_DIT`, and every other isa returns `UNSUPPORTED`. `std.system.dit` is the consumer: at process start it turns the mode on when the link admits a secret multiply and refuses to start when this returns anything but 1, so an implementation must not report 1 without the mode. A user-supplied implementation for a kernel may read ID_AA64PFR0_EL1.DIT directly.
 
+## linux
+
+The linux layer makes system calls directly and links no C runtime, so the kernel is its platform: std requires Linux 5.10 or later on every architecture. The floor is std's alone, checked where std makes each call: nothing at startup, in the runtime entry or in the compiler asks for a kernel version. What every program reaches (startup, the page allocator, a panic: `mmap`, `munmap`, `mremap`, `madvise`, `mprotect`, `prlimit64`, `write`, `exit_group`, and `arch_prctl` on x86_64) is far older, so a program that uses none of the features below starts on an older kernel too. Below the floor a feature's call returns `ENOSYS`, which `error_kind` reads as `UNSUPPORTED`, the same as `ENOTSUP`, and nothing falls back. The calls newer than an architecture's own port, by the release that added them:
+
+- `close_range` (5.9): every spawn closes the descriptors the child inherited with it, and asks for the call before it makes the child, so a spawn below 5.9 refuses with `ENOSYS` and starts nothing.
+- `pidfd_open` (5.3): `std.process.exec.watch_exit`, a child's end on a wait queue.
+- `getrandom` (3.17): `random_fill`, the entropy every secret and `std.crypto.rand` draws on.
+- riscv32 only: `clock_gettime64`, `clock_nanosleep_time64` and `futex_time64` (5.1), the only clock, sleep and futex calls of its table, and `statx` (4.11), its only stat.
+- riscv64 and riscv32: `renameat2` (3.15) for `rename`, since their table has no `renameat`.
+- `SO_REUSEPORT` (3.9), `TCP_FASTOPEN` (3.7) and `MADV_DONTDUMP` (3.4): socket options and the secret span's dump exclusion.
+
+Calls whose presence depends on the kernel's configuration or the hardware, or that need a kernel above the floor, are detected where they are made, each with its stated behaviour when absent:
+
+- `memfd_secret` (5.14, and only when the kernel is built with it and `secretmem` is enabled): secret storage; on `ENOSYS` the span is anonymous memory locked with `mlock` and marked `MADV_DONTDUMP`, and a refused lock is reported, never served unlocked.
+- `riscv_hwprobe` (6.4, riscv): `cpu_features`; on `ENOSYS` the features come from `AT_HWCAP`, which names the single-letter extensions only.
+- `fchmodat2` (6.6): `set_mode_at`; on `ENOSYS` it returns `ENOTSUP`, and it never follows a link instead.
+- `get_mempolicy` (NUMA kernels only): `has_numa` answers false on `ENOSYS`.
+
 ## wasi
 
 `std.system.os.wasi` selects one row per preview, and `std.system.capability` holds each row's groups, so a later preview is a module beside `std.system.os.wasi.preview1` with the same exports, selected in `std.system.os.wasi`, plus its row. What every preview shares (the constants, the native codes and the pages of linear memory) sits in `std.system.os.wasi.shared`.
