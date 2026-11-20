@@ -332,8 +332,8 @@ pub rec MapBy[K, V] {
     tombstones: usize;
     cap:        usize;
     policy:     Custom;
-    hash_fn:    fun(*K) u64;
-    eq_fn:      fun(*K, *K) bool;
+    fn_hash:    fun(*K) u64;
+    fn_eq:      fun(*K, *K) bool;
 }
 ```
 
@@ -349,8 +349,8 @@ a map keyed by caller-supplied hash and equality functions
 | `tombstones` | `usize` | number of deleted slots |
 | `cap` | `usize` | total slot count, a power of two or zero |
 | `policy` | `Custom` | the policy, a zero-size marker |
-| `hash_fn` | `fun(*K) u64` | hash function over a key |
-| `eq_fn` | `fun(*K, *K) bool` | equality function over two keys |
+| `fn_hash` | `fun(*K) u64` | hash function over a key |
+| `fn_eq` | `fun(*K, *K) bool` | equality function over two keys |
 
 ### init_by
 

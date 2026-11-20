@@ -71,7 +71,7 @@ Uses types from [`std.allocator`](../allocator.md), [`std.chrono.time`](../chron
 
 | Constants | |
 | :--- | :--- |
-| [`CANCELLATION_PENDING`](#constants), [`OPEN`](#constants), [`CLOSING`](#constants), [`CLOSED`](#constants), [`DESTROYED`](#constants) | |
+| [`CANCELLATION_PENDING`](#constants), [`OPEN`](#constants), [`CLOSING`](#constants), [`CLOSED`](#constants) | |
 
 ---
 
@@ -791,5 +791,4 @@ the runtime's lifecycle state
 | `OPEN` | `u8` | `lifecycle.OPEN` |  |
 | `CLOSING` | `u8` | `lifecycle.CLOSING` |  |
 | `CLOSED` | `u8` | `lifecycle.CLOSED` |  |
-| `DESTROYED` | `u8` | `3` |  |
 

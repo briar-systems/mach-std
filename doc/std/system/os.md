@@ -29,7 +29,7 @@ Uses types from [`std.io.error`](../io/error.md), [`std.system.file_identity`](f
 | [`random_fill_secret`](#random_fill_secret) | fill up to RANDOM_FILL_SECRET_MAX welded bytes from the csprng in one call |
 | [`read_at_secret`](#read_at_secret) | one positioned read into welded storage |
 | [`write_at_secret`](#write_at_secret) | one positioned write from welded storage |
-| [`map_file`](#map_file) | map a file's pages |
+| [`map_file`](#map_file) | map a file's pages, at an offset that is a multiple of map_alignment() |
 | [`read`](#read) | read up to count bytes |
 | [`write`](#write) | write up to count bytes |
 | [`open`](#open) | open a UTF-8 path relative to dir |
@@ -107,7 +107,7 @@ Uses types from [`std.io.error`](../io/error.md), [`std.system.file_identity`](f
 | [`SECRET_ALIGN`](#secret_align) | the alignment every secret allocation starts on |
 | [`SECRET_LOCKS`](#secret_locks) | whether this host locks secret pages |
 | [`SecretStatus`](#secretstatus) | how a secret allocation ended: a native code, and whether the host refused the lock |
-| [`heap_region_base`](#heap_region_base), [`heap_region_extend`](#heap_region_extend), [`protect`](#protect), [`lock`](#lock), [`unlock`](#unlock), [`advise`](#advise), [`page_size`](#page_size), [`sync_file`](#sync_file), [`PUBLICATION_CLAIMS`](#publication_claims), [`PUBLICATION_RETAIN_REPLACE`](#publication_retain_replace), [`PUBLICATION_READ_RETAIN_REPLACE`](#publication_read_retain_replace), [`symlink`](#symlink) | |
+| [`heap_region_base`](#heap_region_base), [`heap_region_extend`](#heap_region_extend), [`protect`](#protect), [`lock`](#lock), [`unlock`](#unlock), [`advise`](#advise), [`page_size`](#page_size), [`map_alignment`](#map_alignment), [`sync_file`](#sync_file), [`PUBLICATION_CLAIMS`](#publication_claims), [`PUBLICATION_RETAIN_REPLACE`](#publication_retain_replace), [`PUBLICATION_READ_RETAIN_REPLACE`](#publication_read_retain_replace), [`symlink`](#symlink) | |
 | [`symlink_native`](#symlink_native) | symlink(target, linkpath) for names in the host's native units |
 | [`directory_next`](#directory_next) | next returns one borrowed entry, zero eof or a negative error |
 | [`directory_dnit`](#directory_dnit) | directory_dnit consumes the cursor and reports cleanup independently of iteration |
@@ -310,7 +310,7 @@ one positioned write from welded storage
 pub fun map_file(handle: usize, offset: usize, size: usize, prot: u32) ptr
 ```
 
-map a file's pages
+map a file's pages, at an offset that is a multiple of map_alignment()
 
 ### read
 
@@ -906,86 +906,27 @@ Forwards the first of these whose condition holds, and they differ.
 
 Where `$mach.build.sys == $mach.sys.linux`: [`std.system.os.linux.stat_t`](os/linux.md#stat_t).
 
-Declared by the first of these arms whose condition holds.
-
-Where `$mach.build.arch == $mach.arch.x86_64`:
-
 ```mach
 pub rec stat_t {
-    st_dev:        u64;
-    st_ino:        u64;
-    st_nlink:      u64;
-    st_mode:       u32;
-    st_uid:        u32;
-    st_gid:        u32;
-    pad0:          i32;
-    st_rdev:       u64;
-    st_size:       i64;
-    st_blksize:    i64;
-    st_blocks:     i64;
-    st_atime:      i64;
-    st_atime_nsec: i64;
-    st_mtime:      i64;
-    st_mtime_nsec: i64;
-    st_ctime:      i64;
-    st_ctime_nsec: i64;
-    _reserved0:    i64;
-    _reserved1:    i64;
-    _reserved2:    i64;
-}
-```
-
-Where `$mach.build.arch == $mach.arch.aarch64`:
-
-```mach
-pub rec stat_t {
-    st_dev:        u64;
-    st_ino:        u64;
-    st_mode:       u32;
-    st_nlink:      u32;
-    st_uid:        u32;
-    st_gid:        u32;
-    st_rdev:       u64;
-    _pad1:         u64;
-    st_size:       i64;
-    st_blksize:    i32;
-    _pad2:         i32;
-    st_blocks:     i64;
-    st_atime:      i64;
-    st_atime_nsec: i64;
-    st_mtime:      i64;
-    st_mtime_nsec: i64;
-    st_ctime:      i64;
-    st_ctime_nsec: i64;
-    _unused4:      u32;
-    _unused5:      u32;
-}
-```
-
-Where `$mach.build.arch == $mach.arch.riscv64 || $mach.build.arch == $mach.arch.riscv32`:
-
-```mach
-pub rec stat_t {
-    st_dev:        u64;
-    st_ino:        u64;
-    st_mode:       u32;
-    st_nlink:      u32;
-    st_uid:        u32;
-    st_gid:        u32;
-    st_rdev:       u64;
-    _pad1:         u64;
-    st_size:       i64;
-    st_blksize:    i32;
-    _pad2:         i32;
-    st_blocks:     i64;
-    st_atime:      i64;
-    st_atime_nsec: i64;
-    st_mtime:      i64;
-    st_mtime_nsec: i64;
-    st_ctime:      i64;
-    st_ctime_nsec: i64;
-    _unused4:      u32;
-    _unused5:      u32;
+    st_dev:             u64;
+    st_ino:             u64;
+    st_mode:            u32;
+    st_nlink:           u32;
+    st_uid:             u32;
+    st_gid:             u32;
+    st_rdev:            u64;
+    st_size:            i64;
+    st_blksize:         i32;
+    st_blocks:          i64;
+    st_atime:           i64;
+    st_atime_nsec:      i64;
+    st_mtime:           i64;
+    st_mtime_nsec:      i64;
+    st_ctime:           i64;
+    st_ctime_nsec:      i64;
+    st_birthtime:       i64;
+    st_birthtime_nsec:  i64;
+    st_birthtime_known: bool;
 }
 ```
 
@@ -1921,6 +1862,21 @@ but it reads the runtime AT_PAGESZ the entrypoint captured
 mandatory on linux, so a 0 here means the auxv lacked it or a caller ran before
 runtime init; page_size() panics rather than fabricating a default.
 
+### map_alignment
+
+Forwards the first of these whose condition holds:
+
+- [`std.system.os.linux.map_alignment`](os/linux.md#map_alignment), where `$mach.build.sys == $mach.sys.linux`
+- [`std.system.os.darwin.map_alignment`](os/darwin.md#map_alignment), where `$mach.build.sys == $mach.sys.darwin`
+- [`std.system.os.windows.map_alignment`](os/windows.md#map_alignment), where `$mach.build.sys == $mach.sys.windows`
+- [`std.system.os.wasi.map_alignment`](os/wasi.md#map_alignment), where `$mach.build.sys == $mach.sys.wasi`
+
+```mach
+pub fun map_alignment() usize
+```
+
+the alignment map_file requires of an offset, the page size
+
 ### sync_file
 
 Forwards the first of these whose condition holds:
@@ -2099,6 +2055,12 @@ pub fun panic_sink(msg: *u8, len: usize)
 ```
 
 Where `$mach.build.sys == $mach.sys.windows`:
+
+```mach
+pub fun panic_sink(msg: *u8, len: usize)
+```
+
+Where `$mach.build.sys == $mach.sys.uefi`:
 
 ```mach
 pub fun panic_sink(msg: *u8, len: usize)

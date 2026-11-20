@@ -35,6 +35,7 @@ Uses types from [`std.system.file_identity`](../../file_identity.md).
 | [`stat`](#stat) | get file status by file descriptor |
 | [`stat_path`](#stat_path) | get file status of a path, an absolute or AT_FDCWD path resolved onto a preopen |
 | [`stat_mode`](#stat_mode) | read the mode word from a filled stat buffer, the file type alone here |
+| [`stat_birth`](#stat_birth) | the birth time of a stat record, which preview1 filestat does not carry |
 
 | On `timespec` | |
 | :--- | :--- |
@@ -163,6 +164,21 @@ read the mode word from a filled stat buffer, the file type alone here
 | :--- | :--- |
 | `st` | pointer to a filled stat_t |
 | **returns** | the mode bits |
+
+### stat_birth
+
+```mach
+pub fun stat_birth(st: *stat_t, sec: *i64, nsec: *i64) bool
+```
+
+the birth time of a stat record, which preview1 filestat does not carry
+
+| Parameter | |
+| :--- | :--- |
+| `st` | pointer to a filled stat_t |
+| `sec` | left unwritten |
+| `nsec` | left unwritten |
+| **returns** | false |
 
 ## timespec
 

@@ -14,6 +14,7 @@ Uses types from [`std.system.os`](../system/os.md).
 | Functions | |
 | :--- | :--- |
 | [`stat_mode`](#stat_mode) | the mode word of a stat record: file type and permission bits |
+| [`stat_birth`](#stat_birth) | the birth time of a stat record, when the platform records one |
 | [`unlink_force`](#unlink_force) | remove a rooted entry without changing read-only attributes on surviving aliases |
 | [`unlink_force_native`](#unlink_force_native) | unlink_force for a name in native units, which reach the kernel unchanged |
 | [`temp_dir`](#temp_dir) | resolve the directory designated for temporary files |
@@ -30,6 +31,21 @@ pub fun stat_mode(st: *std.system.os.stat_t) u32
 ```
 
 the mode word of a stat record: file type and permission bits
+
+### stat_birth
+
+```mach
+pub fun stat_birth(st: *std.system.os.stat_t, sec: *i64, nsec: *i64) bool
+```
+
+the birth time of a stat record, when the platform records one
+
+| Parameter | |
+| :--- | :--- |
+| `st` | pointer to a filled stat_t |
+| `sec` | receives unix seconds |
+| `nsec` | receives nanoseconds past sec |
+| **returns** | true when a birth time was written |
 
 ### unlink_force
 

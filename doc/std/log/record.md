@@ -174,15 +174,15 @@ a clock source samples the current time or reports why it could not
 ### clock
 
 ```mach
-pub fun clock(ctx: ptr, f_now: NowFun, precision: Precision) Clock
+pub fun clock(ctx: ptr, fn_now: NowFun, precision: Precision) Clock
 ```
 
 a clock over a caller's source, borrowing its context
 
 | Parameter | |
 | :--- | :--- |
-| `ctx` | the context passed to f_now, which must outlive every logger using the clock |
-| `f_now` | the source sampled for the current time |
+| `ctx` | the context passed to fn_now, which must outlive every logger using the clock |
+| `fn_now` | the source sampled for the current time |
 | `precision` | the resolution samples are truncated to |
 | **returns** | the clock, not checked here (see clock_valid) |
 
@@ -215,7 +215,7 @@ the outcome of one sample, normalized to the clock's precision
 ```mach
 pub rec Clock {
     ctx:       ptr;
-    f_now:     NowFun;
+    fn_now:    NowFun;
     precision: Precision;
     ownership: ClockOwnership;
 }

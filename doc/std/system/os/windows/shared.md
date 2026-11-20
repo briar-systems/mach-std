@@ -28,6 +28,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | :--- | :--- |
 | [`stat`](#stat) | read the metadata of the object fd holds |
 | [`stat_mode`](#stat_mode) | read the type/permission bits from a filled stat buffer as a 32-bit word |
+| [`stat_birth`](#stat_birth) | the birth time of a stat record, which stat fills from ftCreationTime |
 | [`stat_path`](#stat_path) | stat_path_native for a UTF-8 path, converted once |
 | [`stat_path_native`](#stat_path_native) | stat_path for a nul-terminated UTF-16 name, the units unchanged |
 
@@ -62,6 +63,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`unlock`](#unlock) | release a range lock took |
 | [`advise`](#advise) | accept a memory usage hint, which windows does not act on |
 | [`page_size`](#page_size) | the page size, a fixed 4096 |
+| [`map_alignment`](#map_alignment) | the alignment map_file requires of an offset, the 64 KiB allocation granularity MapViewOfFile demands |
 | [`map_file`](#map_file) | map a file descriptor into memory via CreateFileMapping + MapViewOfFile |
 | [`sync_file`](#sync_file) | flush a memory-mapped region to its backing file via FlushViewOfFile |
 | [`unmap_file`](#unmap_file) | unmap a view map_file returned |
@@ -309,6 +311,21 @@ portable callers read the mode uniformly across platforms (darwin's is 16-bit).
 | :--- | :--- |
 | `st` | pointer to a filled stat_t |
 | **returns** | the raw mode bits, widened to 32 bits |
+
+### stat_birth
+
+```mach
+pub fun stat_birth(st: *stat_t, sec: *i64, nsec: *i64) bool
+```
+
+the birth time of a stat record, which stat fills from ftCreationTime
+
+| Parameter | |
+| :--- | :--- |
+| `st` | pointer to a filled stat_t |
+| `sec` | receives unix seconds |
+| `nsec` | receives nanoseconds past sec |
+| **returns** | true, windows records a creation time for every file |
 
 ### stat_path
 
@@ -622,6 +639,15 @@ pub fun page_size() usize
 
 the page size, a fixed 4096
 
+### map_alignment
+
+```mach
+pub fun map_alignment() usize
+```
+
+the alignment map_file requires of an offset, the 64 KiB allocation granularity
+MapViewOfFile demands
+
 ### map_file
 
 ```mach
@@ -633,7 +659,7 @@ map a file descriptor into memory via CreateFileMapping + MapViewOfFile
 | Parameter | |
 | :--- | :--- |
 | `fd` | file descriptor to map |
-| `offset` | offset into the file (must be page-aligned) |
+| `offset` | offset into the file, a multiple of map_alignment() |
 | `size` | number of bytes to map; if 0, returns nil |
 | `prot` | protection flags (PROT_READ, PROT_WRITE, PROT_EXEC) |
 | **returns** | pointer to mapped region, or nil on failure |

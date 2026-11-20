@@ -142,8 +142,8 @@ write callback type
 
 ```mach
 pub rec Writer {
-    ctx:     ptr;
-    f_write: WriteFun;
+    ctx:      ptr;
+    fn_write: WriteFun;
 }
 ```
 
@@ -152,7 +152,7 @@ generic write interface
 | Field | Type | |
 | :--- | :--- | :--- |
 | `ctx` | `ptr` | opaque context passed to the write callback |
-| `f_write` | `WriteFun` | write callback (ctx, buf, len) -> res[usize, WriteError] |
+| `fn_write` | `WriteFun` | write callback (ctx, buf, len) -> res[usize, WriteError] |
 
 ### write
 

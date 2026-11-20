@@ -76,7 +76,7 @@ when the peak returns
 | :--- | :--- | :--- |
 | `ctx` | `ptr` | opaque context passed to callbacks. |
 | `fn_allocate` | `fun(ptr, usize, usize) opt[ptr]` | allocate (ctx, size, align) -> some(ptr), or none when refused. |
-| `fn_reallocate` | `fun(ptr, ptr, usize, usize, usize) opt[ptr]` | reallocate (ctx, p, old_size, new_size, align) -> some(ptr), or none when refused. |
+| `fn_reallocate` | `fun(ptr, ptr, usize, usize, usize) opt[ptr]` | reallocate (ctx, p, old_size, new_size, align) -> some(ptr), or none when refused. new_size is never 0, since reallocate_raw frees that case through fn_deallocate. |
 | `fn_deallocate` | `fun(ptr, ptr, usize, usize) i64` | deallocate (ctx, p, size, align) -> i64 (0 on success, negative backend native code on failure). |
 | `retains` | `bool` | memory given back is never reused, zero for an allocator that reclaims |
 

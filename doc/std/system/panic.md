@@ -24,15 +24,15 @@ scope breaks every linux and darwin link. Gating the declarations solves both.
 The property this buys is that an OS with no arm has no `panic_sink` and therefore CANNOT
 BUILD, rather than inheriting another platform's syscalls. Deleting the windows arm and
 building for windows demonstrates it. The trailing `$error` names that case explicitly
-when comptime reaches it first; either way the failure is at compile time. It is
-prospective, not currently reachable - linux, darwin, windows and freestanding all have
-arms - and it exists so the NEXT operating system trips it.
+when comptime reaches it first; either way the failure is at compile time. linux,
+darwin, wasi, windows, uefi and freestanding have arms. spirv reaches the `$error`, as a
+shader has no write target and no process to end.
 
 THE FREESTANDING ARM HAS NO WRITE TARGET of its own, so the program installs one with
 `install` and the arm parks the core after it, or parks at once when none is installed.
-The hook is set at run time rather than overridden at link time: mach has no weak
-definitions, so a link-time override would need an `ext` symbol every program must
-define, and a program with no sink would not link.
+The hook is set at run time rather than overridden at link time because a sink usually
+drives a device the program brings up itself, so a panic before that point must park
+rather than call into a device that is not ready yet.
 
 THE WRITE AND THE TERMINATOR MOVE TOGETHER, in one `panic_sink` per platform. Splitting
 them is what made the windows breakage look survivable: fixing only the terminator would
@@ -82,6 +82,12 @@ Where `$mach.build.sys == $mach.sys.windows`:
 pub fun panic_sink(msg: *u8, len: usize)
 ```
 
+Where `$mach.build.sys == $mach.sys.uefi`:
+
+```mach
+pub fun panic_sink(msg: *u8, len: usize)
+```
+
 Where `$mach.build.sys == $mach.sys.freestanding`:
 
 ```mach
@@ -101,7 +107,7 @@ only as a guard, matching `std.system.os.exit`; it is NOT the terminator.
 
 ### install
 
-Only where `$mach.build.sys == $mach.sys.freestanding` and not `$mach.build.sys == $mach.sys.linux`, `$mach.build.sys == $mach.sys.darwin`, `$mach.build.sys == $mach.sys.wasi` nor `$mach.build.sys == $mach.sys.windows`.
+Only where `$mach.build.sys == $mach.sys.freestanding` and not `$mach.build.sys == $mach.sys.linux`, `$mach.build.sys == $mach.sys.darwin`, `$mach.build.sys == $mach.sys.wasi`, `$mach.build.sys == $mach.sys.windows` nor `$mach.build.sys == $mach.sys.uefi`.
 
 ```mach
 pub fun install(sink: fun(*u8, usize))

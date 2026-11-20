@@ -14,7 +14,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`stat_t`](#stat_t) | `rec` | riscv32 has no stat call: stat and stat_path fill this layout from statx |
+| [`stat_t`](#stat_t) | `rec` | stat_t: file metadata, filled from statx on every architecture |
 | [`timespec`](#timespec) | `rec` | time specification with seconds and nanoseconds |
 | [`DirectoryCursor`](#directorycursor) | `rec` | an open enumeration of one directory descriptor's entries |
 | [`TlsLayout`](#tlslayout) | `rec` | where an architecture's psABI puts the thread-local block against the thread pointer, as the linker lays out local-exec offsets |
@@ -23,9 +23,10 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 
 | On `stat_t` | |
 | :--- | :--- |
-| [`stat`](#stat) | fstat: get file status by file descriptor |
-| [`stat_path`](#stat_path) | newfstatat: get file status relative to a directory fd |
+| [`stat`](#stat) | get file status by file descriptor |
+| [`stat_path`](#stat_path) | get file status relative to a directory fd |
 | [`stat_mode`](#stat_mode) | read the type/permission bits from a filled stat buffer as a 32-bit word |
+| [`stat_birth`](#stat_birth) | the birth time of a stat record, when the filesystem recorded one |
 
 | On `timespec` | |
 | :--- | :--- |
@@ -237,90 +238,35 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 
 ## stat_t
 
-Declared by the first of these arms whose condition holds.
-
-Where `$mach.build.arch == $mach.arch.x86_64`:
-
 ```mach
 pub rec stat_t {
-    st_dev:        u64;
-    st_ino:        u64;
-    st_nlink:      u64;
-    st_mode:       u32;
-    st_uid:        u32;
-    st_gid:        u32;
-    pad0:          i32;
-    st_rdev:       u64;
-    st_size:       i64;
-    st_blksize:    i64;
-    st_blocks:     i64;
-    st_atime:      i64;
-    st_atime_nsec: i64;
-    st_mtime:      i64;
-    st_mtime_nsec: i64;
-    st_ctime:      i64;
-    st_ctime_nsec: i64;
-    _reserved0:    i64;
-    _reserved1:    i64;
-    _reserved2:    i64;
+    st_dev:             u64;
+    st_ino:             u64;
+    st_mode:            u32;
+    st_nlink:           u32;
+    st_uid:             u32;
+    st_gid:             u32;
+    st_rdev:            u64;
+    st_size:            i64;
+    st_blksize:         i32;
+    st_blocks:          i64;
+    st_atime:           i64;
+    st_atime_nsec:      i64;
+    st_mtime:           i64;
+    st_mtime_nsec:      i64;
+    st_ctime:           i64;
+    st_ctime_nsec:      i64;
+    st_birthtime:       i64;
+    st_birthtime_nsec:  i64;
+    st_birthtime_known: bool;
 }
 ```
 
-Where `$mach.build.arch == $mach.arch.aarch64`:
+stat_t: file metadata, filled from statx on every architecture
 
-```mach
-pub rec stat_t {
-    st_dev:        u64;
-    st_ino:        u64;
-    st_mode:       u32;
-    st_nlink:      u32;
-    st_uid:        u32;
-    st_gid:        u32;
-    st_rdev:       u64;
-    _pad1:         u64;
-    st_size:       i64;
-    st_blksize:    i32;
-    _pad2:         i32;
-    st_blocks:     i64;
-    st_atime:      i64;
-    st_atime_nsec: i64;
-    st_mtime:      i64;
-    st_mtime_nsec: i64;
-    st_ctime:      i64;
-    st_ctime_nsec: i64;
-    _unused4:      u32;
-    _unused5:      u32;
-}
-```
-
-Where `$mach.build.arch == $mach.arch.riscv64 || $mach.build.arch == $mach.arch.riscv32`:
-
-```mach
-pub rec stat_t {
-    st_dev:        u64;
-    st_ino:        u64;
-    st_mode:       u32;
-    st_nlink:      u32;
-    st_uid:        u32;
-    st_gid:        u32;
-    st_rdev:       u64;
-    _pad1:         u64;
-    st_size:       i64;
-    st_blksize:    i32;
-    _pad2:         i32;
-    st_blocks:     i64;
-    st_atime:      i64;
-    st_atime_nsec: i64;
-    st_mtime:      i64;
-    st_mtime_nsec: i64;
-    st_ctime:      i64;
-    st_ctime_nsec: i64;
-    _unused4:      u32;
-    _unused5:      u32;
-}
-```
-
-riscv32 has no stat call: stat and stat_path fill this layout from statx
+| Field | Type | |
+| :--- | :--- | :--- |
+| `st_birthtime_known` | `bool` | whether the filesystem recorded st_birthtime |
 
 ### stat
 
@@ -328,7 +274,7 @@ riscv32 has no stat call: stat and stat_path fill this layout from statx
 pub fun stat(fd: i32, st: *stat_t) i64
 ```
 
-fstat: get file status by file descriptor
+get file status by file descriptor
 
 | Parameter | |
 | :--- | :--- |
@@ -342,7 +288,7 @@ fstat: get file status by file descriptor
 pub fun stat_path(dirfd: i32, path: *u8, st: *stat_t, flags: i32) i64
 ```
 
-newfstatat: get file status relative to a directory fd
+get file status relative to a directory fd
 
 | Parameter | |
 | :--- | :--- |
@@ -367,6 +313,21 @@ callers read the mode uniformly across platforms (darwin's mode is 16-bit).
 | :--- | :--- |
 | `st` | pointer to a filled stat_t |
 | **returns** | the raw mode bits, widened to 32 bits |
+
+### stat_birth
+
+```mach
+pub fun stat_birth(st: *stat_t, sec: *i64, nsec: *i64) bool
+```
+
+the birth time of a stat record, when the filesystem recorded one
+
+| Parameter | |
+| :--- | :--- |
+| `st` | pointer to a filled stat_t |
+| `sec` | receives the seconds since the epoch, untouched when there is none |
+| `nsec` | receives the nanoseconds, untouched when there is none |
+| **returns** | true when a birth time was written |
 
 ## timespec
 
@@ -1084,7 +1045,7 @@ map a file descriptor into memory via mmap
 | Parameter | |
 | :--- | :--- |
 | `fd` | file descriptor to map |
-| `offset` | offset into the file (must be page-aligned) |
+| `offset` | offset into the file, a multiple of map_alignment() |
 | `size` | number of bytes to map; if 0, returns nil |
 | `prot` | protection flags |
 | **returns** | pointer to mapped region, or nil on failure |

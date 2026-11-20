@@ -411,7 +411,7 @@ pub def PublishFun: fun(ptr, *u8, usize) WriteReport
 ### make
 
 ```mach
-pub fun make(ctx: ptr, f_publish: PublishFun, contract: Contract) Created
+pub fun make(ctx: ptr, fn_publish: PublishFun, contract: Contract) Created
 ```
 
 construct a sink from an implementation and a validated contract
@@ -420,9 +420,9 @@ construct a sink from an implementation and a validated contract
 
 ```mach
 pub rec Sink {
-    ctx:       ptr;
-    f_publish: PublishFun;
-    contract:  Contract;
+    ctx:        ptr;
+    fn_publish: PublishFun;
+    contract:   Contract;
 }
 ```
 
@@ -450,7 +450,7 @@ publish one encoded record through a sink and check the adapter kept its contrac
 pub rec Direct {
     lock:        std.sync.mutex.Mutex;
     adapter_ctx: ptr;
-    f_write:     PublishFun;
+    fn_write:    PublishFun;
     writer:      std.io.writer.Writer;
     initialized: bool;
 }
@@ -464,7 +464,7 @@ direct owns no resources and requires no destruction
 ### custom
 
 ```mach
-pub fun custom(direct: *Direct, ctx: ptr, f_write: PublishFun, max_record: usize, oversize: std.log.record.OversizePolicy, target_atomic_limit: usize) Created
+pub fun custom(direct: *Direct, ctx: ptr, fn_write: PublishFun, max_record: usize, oversize: std.log.record.OversizePolicy, target_atomic_limit: usize) Created
 ```
 
 ctx is borrowed and must outlive direct and every sink created from it

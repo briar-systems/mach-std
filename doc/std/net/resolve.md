@@ -60,7 +60,7 @@ Uses types from [`std.allocator`](../allocator.md), [`std.chrono.time`](../chron
 pub rec Resolver {
     pool:               *std.sync.worker_pool.Pool;
     allocator:          *std.allocator.Allocator;
-    adapter:            std.net.resolve.types.AdapterFun;
+    fn_adapter:         std.net.resolve.types.AdapterFun;
     adapter_context:    ptr;
     result_limits:      std.net.resolve.types.ResultLimits;
     runtime:            *std.io.runtime.Runtime;

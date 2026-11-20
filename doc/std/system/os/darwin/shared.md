@@ -25,6 +25,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`stat`](#stat) | read an open file's metadata |
 | [`stat_path`](#stat_path) | read a path's metadata relative to a directory |
 | [`stat_mode`](#stat_mode) | read the type/permission bits from a filled stat buffer as a 32-bit word |
+| [`stat_birth`](#stat_birth) | the birth time of a stat record |
 
 | On `timespec` | |
 | :--- | :--- |
@@ -49,6 +50,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`map_secret`](#map_secret) | map storage for secret-welded data: span locked bytes between two inaccessible guard pages, page aligned and zero-filled |
 | [`reallocate`](#reallocate) | darwin has no mremap, allocate new, copy, free old |
 | [`page_size`](#page_size) | |
+| [`map_alignment`](#map_alignment) | the alignment map_file requires of an offset, the page size |
 | [`heap_region_base`](#heap_region_base) | the current end of the simulated program break |
 | [`heap_region_extend`](#heap_region_extend) | move the simulated program break up to addr |
 | [`protect`](#protect) | change the protection of a memory region |
@@ -266,6 +268,21 @@ so portable callers read the mode uniformly with the 32-bit platforms.
 | :--- | :--- |
 | `st` | pointer to a filled stat_t |
 | **returns** | the raw mode bits, widened to 32 bits |
+
+### stat_birth
+
+```mach
+pub fun stat_birth(st: *stat_t, sec: *i64, nsec: *i64) bool
+```
+
+the birth time of a stat record
+
+| Parameter | |
+| :--- | :--- |
+| `st` | pointer to a filled stat_t |
+| `sec` | receives unix seconds |
+| `nsec` | receives nanoseconds past sec |
+| **returns** | true, darwin records a birth time for every file |
 
 ## timespec
 
@@ -488,6 +505,14 @@ Where `$mach.build.arch == $mach.arch.x86_64`:
 pub fun page_size() usize
 ```
 
+### map_alignment
+
+```mach
+pub fun map_alignment() usize
+```
+
+the alignment map_file requires of an offset, the page size
+
 ### heap_region_base
 
 ```mach
@@ -588,7 +613,7 @@ map part of a file into memory, shared with the file
 | Parameter | |
 | :--- | :--- |
 | `fd` | file descriptor to map |
-| `offset` | page-aligned byte offset into the file |
+| `offset` | byte offset into the file, a multiple of map_alignment() |
 | `size` | bytes to map |
 | `prot` | PROT_* bits |
 | **returns** | the mapping, or nil when size is 0, offset is above i64 range or mmap fails |

@@ -27,6 +27,7 @@ Source: [`src/system/uefi.mach`](../../../src/system/uefi.mach)
 | :--- | :--- |
 | [`SUCCESS`](#status) | |
 | [`ERROR`](#status) | the bit every error status carries |
+| [`ABORTED`](#status) | EFI_ABORTED, the operation was aborted |
 
 | Constants | |
 | :--- | :--- |
@@ -47,6 +48,7 @@ a service's result: zero is success, and an error has the high bit set
 | :--- | :--- | :--- |
 | `SUCCESS` | `0` |  |
 | `ERROR` | `0x8000_0000_0000_0000` | the bit every error status carries |
+| `ABORTED` | `ERROR \| 21` | EFI_ABORTED, the operation was aborted |
 
 ## TableHeader
 

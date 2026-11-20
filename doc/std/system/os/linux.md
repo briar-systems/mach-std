@@ -24,13 +24,13 @@ Source: [`src/system/os/linux.mach`](../../../../src/system/os/linux.mach)
 | [`syscall0`](#syscall0) | syscall wrappers |
 | [`syscall1`](#syscall1), [`syscall2`](#syscall2), [`syscall3`](#syscall3), [`syscall4`](#syscall4), [`syscall5`](#syscall5), [`syscall6`](#syscall6) | |
 | [`allocate`](#allocate) | memory |
-| [`deallocate`](#deallocate), [`reallocate`](#reallocate), [`heap_region_base`](#heap_region_base), [`heap_region_extend`](#heap_region_extend), [`protect`](#protect), [`lock`](#lock), [`unlock`](#unlock), [`advise`](#advise), [`page_size`](#page_size), [`allocate_huge`](#allocate_huge), [`numa_node_count`](#numa_node_count), [`numa_current_node`](#numa_current_node), [`numa_allocate`](#numa_allocate), [`numa_move`](#numa_move), [`map_file`](#map_file), [`sync_file`](#sync_file) | |
+| [`deallocate`](#deallocate), [`reallocate`](#reallocate), [`heap_region_base`](#heap_region_base), [`heap_region_extend`](#heap_region_extend), [`protect`](#protect), [`lock`](#lock), [`unlock`](#unlock), [`advise`](#advise), [`page_size`](#page_size), [`map_alignment`](#map_alignment), [`allocate_huge`](#allocate_huge), [`numa_node_count`](#numa_node_count), [`numa_current_node`](#numa_current_node), [`numa_allocate`](#numa_allocate), [`numa_move`](#numa_move), [`map_file`](#map_file), [`sync_file`](#sync_file) | |
 | [`read`](#read) | filesystem |
 | [`write`](#write), [`read_at`](#read_at), [`write_at`](#write_at), [`open`](#open) | |
 | [`open_native`](#open_native) | the kernel takes a name as bytes, so the native-unit open is open itself |
 | [`close`](#close), [`sync_fd`](#sync_fd), [`stat`](#stat), [`set_mode`](#set_mode), [`set_mode_at`](#set_mode_at) | |
 | [`set_mode_at_native`](#set_mode_at_native) | every name below reaches the kernel as bytes, so each native form is the UTF-8 primitive itself |
-| [`file_identity`](#file_identity), [`identity_at`](#identity_at), [`identity_at_native`](#identity_at_native), [`retain_identity_at`](#retain_identity_at), [`retain_identity_at_native`](#retain_identity_at_native), [`publication_capabilities`](#publication_capabilities), [`stat_path`](#stat_path), [`stat_path_native`](#stat_path_native), [`stat_mode`](#stat_mode), [`unlink`](#unlink), [`unlink_native`](#unlink_native), [`rename`](#rename), [`rename_native`](#rename_native), [`symlink`](#symlink), [`symlink_native`](#symlink_native), [`make_dir`](#make_dir), [`make_dir_native`](#make_dir_native), [`directory_init`](#directory_init), [`directory_next`](#directory_next), [`directory_dnit`](#directory_dnit), [`access`](#access), [`access_native`](#access_native), [`seek`](#seek), [`lock_fd`](#lock_fd) | |
+| [`file_identity`](#file_identity), [`identity_at`](#identity_at), [`identity_at_native`](#identity_at_native), [`retain_identity_at`](#retain_identity_at), [`retain_identity_at_native`](#retain_identity_at_native), [`publication_capabilities`](#publication_capabilities), [`stat_path`](#stat_path), [`stat_path_native`](#stat_path_native), [`stat_mode`](#stat_mode), [`stat_birth`](#stat_birth), [`unlink`](#unlink), [`unlink_native`](#unlink_native), [`rename`](#rename), [`rename_native`](#rename_native), [`symlink`](#symlink), [`symlink_native`](#symlink_native), [`make_dir`](#make_dir), [`make_dir_native`](#make_dir_native), [`directory_init`](#directory_init), [`directory_next`](#directory_next), [`directory_dnit`](#directory_dnit), [`access`](#access), [`access_native`](#access_native), [`seek`](#seek), [`lock_fd`](#lock_fd) | |
 | [`terminate`](#terminate) | process |
 | [`abort`](#abort), [`terminate_child`](#terminate_child), [`setpgid`](#setpgid), [`getpgid`](#getpgid), [`terminate_group`](#terminate_group), [`kill_group`](#kill_group), [`probe_group`](#probe_group), [`process_watch`](#process_watch), [`process_unwatch`](#process_unwatch), [`spawn`](#spawn), [`spawn_grouped`](#spawn_grouped), [`spawn_in`](#spawn_in), [`spawn_redirected`](#spawn_redirected), [`spawn_redirected_grouped`](#spawn_redirected_grouped), [`spawn_redirected_in`](#spawn_redirected_in), [`spawn_redirected_in_grouped`](#spawn_redirected_in_grouped) | |
 | [`spawn_native`](#spawn_native) | the kernel takes paths and arguments as bytes, so the native-unit spawns are the spawns themselves |
@@ -60,86 +60,27 @@ Forwards the first of these whose condition holds:
 - [`std.system.os.linux.riscv64.stat_t`](linux/riscv64.md#stat_t), where `$mach.build.arch == $mach.arch.riscv64`
 - [`std.system.os.linux.riscv32.stat_t`](linux/riscv32.md#stat_t), where `$mach.build.arch == $mach.arch.riscv32`
 
-Declared by the first of these arms whose condition holds.
-
-Where `$mach.build.arch == $mach.arch.x86_64`:
-
 ```mach
 pub rec stat_t {
-    st_dev:        u64;
-    st_ino:        u64;
-    st_nlink:      u64;
-    st_mode:       u32;
-    st_uid:        u32;
-    st_gid:        u32;
-    pad0:          i32;
-    st_rdev:       u64;
-    st_size:       i64;
-    st_blksize:    i64;
-    st_blocks:     i64;
-    st_atime:      i64;
-    st_atime_nsec: i64;
-    st_mtime:      i64;
-    st_mtime_nsec: i64;
-    st_ctime:      i64;
-    st_ctime_nsec: i64;
-    _reserved0:    i64;
-    _reserved1:    i64;
-    _reserved2:    i64;
-}
-```
-
-Where `$mach.build.arch == $mach.arch.aarch64`:
-
-```mach
-pub rec stat_t {
-    st_dev:        u64;
-    st_ino:        u64;
-    st_mode:       u32;
-    st_nlink:      u32;
-    st_uid:        u32;
-    st_gid:        u32;
-    st_rdev:       u64;
-    _pad1:         u64;
-    st_size:       i64;
-    st_blksize:    i32;
-    _pad2:         i32;
-    st_blocks:     i64;
-    st_atime:      i64;
-    st_atime_nsec: i64;
-    st_mtime:      i64;
-    st_mtime_nsec: i64;
-    st_ctime:      i64;
-    st_ctime_nsec: i64;
-    _unused4:      u32;
-    _unused5:      u32;
-}
-```
-
-Where `$mach.build.arch == $mach.arch.riscv64 || $mach.build.arch == $mach.arch.riscv32`:
-
-```mach
-pub rec stat_t {
-    st_dev:        u64;
-    st_ino:        u64;
-    st_mode:       u32;
-    st_nlink:      u32;
-    st_uid:        u32;
-    st_gid:        u32;
-    st_rdev:       u64;
-    _pad1:         u64;
-    st_size:       i64;
-    st_blksize:    i32;
-    _pad2:         i32;
-    st_blocks:     i64;
-    st_atime:      i64;
-    st_atime_nsec: i64;
-    st_mtime:      i64;
-    st_mtime_nsec: i64;
-    st_ctime:      i64;
-    st_ctime_nsec: i64;
-    _unused4:      u32;
-    _unused5:      u32;
+    st_dev:             u64;
+    st_ino:             u64;
+    st_mode:            u32;
+    st_nlink:           u32;
+    st_uid:             u32;
+    st_gid:             u32;
+    st_rdev:            u64;
+    st_size:            i64;
+    st_blksize:         i32;
+    st_blocks:          i64;
+    st_atime:           i64;
+    st_atime_nsec:      i64;
+    st_mtime:           i64;
+    st_mtime_nsec:      i64;
+    st_ctime:           i64;
+    st_ctime_nsec:      i64;
+    st_birthtime:       i64;
+    st_birthtime_nsec:  i64;
+    st_birthtime_known: bool;
 }
 ```
 
@@ -1430,6 +1371,21 @@ source of truth across the linux arches. AT_PAGESZ is mandatory on linux, so a
 0 here means the auxv lacked it or a caller ran before runtime init;
 page_size() panics rather than fabricating a default.
 
+### map_alignment
+
+Forwards the first of these whose condition holds:
+
+- [`std.system.os.linux.x86_64.map_alignment`](linux/x86_64.md#map_alignment), where `$mach.build.arch == $mach.arch.x86_64`
+- [`std.system.os.linux.aarch64.map_alignment`](linux/aarch64.md#map_alignment), where `$mach.build.arch == $mach.arch.aarch64`
+- [`std.system.os.linux.riscv64.map_alignment`](linux/riscv64.md#map_alignment), where `$mach.build.arch == $mach.arch.riscv64`
+- [`std.system.os.linux.riscv32.map_alignment`](linux/riscv32.md#map_alignment), where `$mach.build.arch == $mach.arch.riscv32`
+
+```mach
+pub fun map_alignment() usize
+```
+
+the alignment map_file requires of an offset, the page size
+
 ### allocate_huge
 
 Forwards the first of these whose condition holds:
@@ -1674,7 +1630,7 @@ Forwards the first of these whose condition holds:
 pub fun stat(fd: i32, st: *stat_t) i64
 ```
 
-fstat: get file status by file descriptor
+get file status by file descriptor
 
 ### set_mode
 
@@ -1828,7 +1784,7 @@ Forwards the first of these whose condition holds:
 pub fun stat_path(dirfd: i32, path: *u8, st: *stat_t, flags: i32) i64
 ```
 
-newfstatat: get file status relative to a directory fd
+get file status relative to a directory fd
 
 ### stat_path_native
 
@@ -1843,7 +1799,7 @@ Forwards the first of these whose condition holds:
 pub fun stat_path(dirfd: i32, path: *u8, st: *stat_t, flags: i32) i64
 ```
 
-newfstatat: get file status relative to a directory fd
+get file status relative to a directory fd
 
 ### stat_mode
 
@@ -1862,6 +1818,21 @@ read the type/permission bits from a filled stat buffer as a 32-bit word
 
 st_mode is 32-bit in the linux stat ABI; the accessor exists so portable
 callers read the mode uniformly across platforms (darwin's mode is 16-bit).
+
+### stat_birth
+
+Forwards the first of these whose condition holds:
+
+- [`std.system.os.linux.x86_64.stat_birth`](linux/x86_64.md#stat_birth), where `$mach.build.arch == $mach.arch.x86_64`
+- [`std.system.os.linux.aarch64.stat_birth`](linux/aarch64.md#stat_birth), where `$mach.build.arch == $mach.arch.aarch64`
+- [`std.system.os.linux.riscv64.stat_birth`](linux/riscv64.md#stat_birth), where `$mach.build.arch == $mach.arch.riscv64`
+- [`std.system.os.linux.riscv32.stat_birth`](linux/riscv32.md#stat_birth), where `$mach.build.arch == $mach.arch.riscv32`
+
+```mach
+pub fun stat_birth(st: *stat_t, sec: *i64, nsec: *i64) bool
+```
+
+the birth time of a stat record, when the filesystem recorded one
 
 ### unlink
 

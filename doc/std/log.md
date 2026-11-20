@@ -411,7 +411,7 @@ Forwards [`std.log.record.Clock`](log/record.md#clock-1).
 ```mach
 pub rec Clock {
     ctx:       ptr;
-    f_now:     NowFun;
+    fn_now:    NowFun;
     precision: Precision;
     ownership: ClockOwnership;
 }
@@ -612,7 +612,7 @@ a clock reading the system time, with no context
 Forwards [`std.log.record.clock`](log/record.md#clock).
 
 ```mach
-pub fun clock(ctx: ptr, f_now: NowFun, precision: Precision) Clock
+pub fun clock(ctx: ptr, fn_now: NowFun, precision: Precision) Clock
 ```
 
 a clock over a caller's source, borrowing its context
@@ -948,9 +948,9 @@ Forwards [`std.log.sink.Sink`](log/sink.md#sink), only where `capability.HAS_CLO
 
 ```mach
 pub rec Sink {
-    ctx:       ptr;
-    f_publish: PublishFun;
-    contract:  Contract;
+    ctx:        ptr;
+    fn_publish: PublishFun;
+    contract:   Contract;
 }
 ```
 
@@ -965,7 +965,7 @@ Forwards [`std.log.sink.Direct`](log/sink.md#direct), only where `capability.HAS
 pub rec Direct {
     lock:        std.sync.mutex.Mutex;
     adapter_ctx: ptr;
-    f_write:     PublishFun;
+    fn_write:    PublishFun;
     writer:      std.io.writer.Writer;
     initialized: bool;
 }
@@ -1163,7 +1163,7 @@ describe a bounded queued delivery contract
 Forwards [`std.log.sink.make`](log/sink.md#make), only where `capability.HAS_CLOCK && capability.HAS_FILES && capability.HAS_THREADS`.
 
 ```mach
-pub fun make(ctx: ptr, f_publish: PublishFun, contract: Contract) Created
+pub fun make(ctx: ptr, fn_publish: PublishFun, contract: Contract) Created
 ```
 
 construct a sink from an implementation and a validated contract
@@ -1183,7 +1183,7 @@ publish one encoded record through a sink and check the adapter kept its contrac
 Forwards [`std.log.sink.custom`](log/sink.md#custom), only where `capability.HAS_CLOCK && capability.HAS_FILES && capability.HAS_THREADS`.
 
 ```mach
-pub fun custom(direct: *Direct, ctx: ptr, f_write: PublishFun, max_record: usize, oversize: std.log.record.OversizePolicy, target_atomic_limit: usize) Created
+pub fun custom(direct: *Direct, ctx: ptr, fn_write: PublishFun, max_record: usize, oversize: std.log.record.OversizePolicy, target_atomic_limit: usize) Created
 ```
 
 ctx is borrowed and must outlive direct and every sink created from it

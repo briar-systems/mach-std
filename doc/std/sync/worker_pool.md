@@ -50,7 +50,7 @@ pub def TaskFun: fun(ptr) bool
 ```mach
 pub rec Task {
     context: ptr;
-    run:     TaskFun;
+    fn_run:  TaskFun;
 }
 ```
 
@@ -58,8 +58,8 @@ context is borrowed after acceptance and returned by completion or abort
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `context` | `ptr` | caller pointer passed to run |
-| `run` | `TaskFun` | task body, never nil for a submitted task |
+| `context` | `ptr` | caller pointer passed to fn_run |
+| `fn_run` | `TaskFun` | task body, never nil for a submitted task |
 
 ## Status
 
@@ -84,7 +84,7 @@ the outcome of a pool operation, and the pool's lifecycle state
 
 | Case | Payload | |
 | :--- | :--- | :--- |
-| `invalid` |  | nil operands, an unmade pool, a task without a run function, an abort output too small, or an operation the state refuses |
+| `invalid` |  | nil operands, an unmade pool, a task without an fn_run, an abort output too small, or an operation the state refuses |
 | `accepted` |  | the task is queued (submit) or the pool is open (make, state) |
 | `queue_full` |  | no slot was free (try_submit) |
 | `pool_closed` |  | the queue no longer accepts work |
@@ -225,7 +225,7 @@ rejected tasks and their contexts remain submitter-owned
 | :--- | :--- |
 | `pool` | open pool |
 | `task` | task to queue |
-| **returns** | accepted, queue_full, pool_closed, or invalid for a nil or unmade pool or a task without a run function |
+| **returns** | accepted, queue_full, pool_closed, or invalid for a nil or unmade pool or a task without an fn_run |
 
 ### submit
 

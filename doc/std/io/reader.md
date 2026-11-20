@@ -112,8 +112,8 @@ read callback type
 
 ```mach
 pub rec Reader {
-    ctx:    ptr;
-    f_read: ReadFun;
+    ctx:     ptr;
+    fn_read: ReadFun;
 }
 ```
 
@@ -122,7 +122,7 @@ generic read interface
 | Field | Type | |
 | :--- | :--- | :--- |
 | `ctx` | `ptr` | opaque context passed to the read callback |
-| `f_read` | `ReadFun` | read callback (ctx, buf, len) -> res[usize, ReadError] |
+| `fn_read` | `ReadFun` | read callback (ctx, buf, len) -> res[usize, ReadError] |
 
 ### read
 

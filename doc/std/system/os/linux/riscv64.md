@@ -15,6 +15,7 @@ Uses types from [`std.system.os.shared`](../shared.md).
 | Functions | |
 | :--- | :--- |
 | [`page_size`](#page_size) | return the system page size |
+| [`map_alignment`](#map_alignment) | the alignment map_file requires of an offset, the page size |
 | [`thread_spawn`](#thread_spawn) | create a new thread sharing the current address space |
 | [`thread_join`](#thread_join) | wait for a thread thread_spawn made to end and its stack to be released |
 | [`thread_detach`](#thread_detach) | give up joining a thread thread_spawn made |
@@ -42,7 +43,7 @@ Uses types from [`std.system.os.shared`](../shared.md).
 | [`_envp`](#_envp) | environment |
 | [`environ`](#environ), [`capture_pagesz`](#capture_pagesz), [`loader_present`](#loader_present), [`capture_main_stack`](#capture_main_stack), [`capture_tls`](#capture_tls) | |
 | [`read`](#read) | filesystem |
-| [`write`](#write), [`read_at`](#read_at), [`write_at`](#write_at), [`open`](#open), [`close`](#close), [`sync_fd`](#sync_fd), [`stat`](#stat), [`set_mode`](#set_mode), [`set_mode_at`](#set_mode_at), [`file_identity`](#file_identity), [`identity_at`](#identity_at), [`retain_identity_at`](#retain_identity_at), [`publication_capabilities`](#publication_capabilities), [`stat_path`](#stat_path), [`stat_mode`](#stat_mode), [`unlink`](#unlink), [`rename`](#rename), [`symlink`](#symlink), [`make_dir`](#make_dir), [`directory_init`](#directory_init), [`directory_next`](#directory_next), [`directory_dnit`](#directory_dnit), [`access`](#access), [`seek`](#seek), [`lock_fd`](#lock_fd) | |
+| [`write`](#write), [`read_at`](#read_at), [`write_at`](#write_at), [`open`](#open), [`close`](#close), [`sync_fd`](#sync_fd), [`stat`](#stat), [`set_mode`](#set_mode), [`set_mode_at`](#set_mode_at), [`file_identity`](#file_identity), [`identity_at`](#identity_at), [`retain_identity_at`](#retain_identity_at), [`publication_capabilities`](#publication_capabilities), [`stat_path`](#stat_path), [`stat_mode`](#stat_mode), [`stat_birth`](#stat_birth), [`unlink`](#unlink), [`rename`](#rename), [`symlink`](#symlink), [`make_dir`](#make_dir), [`directory_init`](#directory_init), [`directory_next`](#directory_next), [`directory_dnit`](#directory_dnit), [`access`](#access), [`seek`](#seek), [`lock_fd`](#lock_fd) | |
 | [`terminate`](#terminate) | process |
 | [`abort`](#abort), [`terminate_child`](#terminate_child), [`setpgid`](#setpgid), [`getpgid`](#getpgid), [`terminate_group`](#terminate_group), [`kill_group`](#kill_group), [`probe_group`](#probe_group), [`process_watch`](#process_watch), [`process_unwatch`](#process_unwatch), [`spawn`](#spawn), [`spawn_grouped`](#spawn_grouped), [`spawn_in`](#spawn_in), [`spawn_redirected`](#spawn_redirected), [`spawn_redirected_grouped`](#spawn_redirected_grouped), [`spawn_redirected_in`](#spawn_redirected_in), [`spawn_redirected_in_grouped`](#spawn_redirected_in_grouped), [`getpid`](#getpid), [`pipe`](#pipe), [`ignore_sigpipe`](#ignore_sigpipe), [`sleep`](#sleep), [`cpu_count`](#cpu_count), [`cpu_features`](#cpu_features), [`cpu_dit`](#cpu_dit), [`thread_affinity`](#thread_affinity), [`set_thread_affinity`](#set_thread_affinity), [`getcwd`](#getcwd), [`getenv`](#getenv), [`fork`](#fork), [`vfork`](#vfork), [`exec`](#exec), [`wait`](#wait), [`wait_pid`](#wait_pid), [`ProcessStatus`](#processstatus), [`FileLimit`](#filelimit), [`LIMIT_UNLIMITED`](#limit_unlimited), [`open_file_limit`](#open_file_limit), [`set_open_file_limit`](#set_open_file_limit), [`ProcessWaitError`](#processwaiterror), [`WaitResult`](#waitresult), [`PROCESS_OP_WAIT`](#process_op_wait), [`PROCESS_OP_STATUS`](#process_op_status), [`PROCESS_OP_CLOSE`](#process_op_close), [`PROCESS_OP_SPAWN`](#process_op_spawn), [`PROCESS_OP_READ`](#process_op_read), [`PROCESS_OP_PIPE`](#process_op_pipe), [`PROCESS_OP_TERMINATE`](#process_op_terminate), [`PROCESS_EXITED`](#process_exited), [`PROCESS_SIGNALED`](#process_signaled), [`PROCESS_STOPPED`](#process_stopped), [`PROCESS_CONTINUED`](#process_continued) | |
 | [`AF_INET`](#af_inet) | sockets |
@@ -75,6 +76,14 @@ runtime init; page_size() panics rather than fabricating a default.
 | Parameter | |
 | :--- | :--- |
 | **returns** | page size in bytes |
+
+### map_alignment
+
+```mach
+pub fun map_alignment() usize
+```
+
+the alignment map_file requires of an offset, the page size
 
 ### thread_spawn
 
@@ -205,86 +214,27 @@ the calling thread's stack bounds, read without a system call
 
 Forwards [`std.system.os.linux.shared.stat_t`](shared.md#stat_t).
 
-Declared by the first of these arms whose condition holds.
-
-Where `$mach.build.arch == $mach.arch.x86_64`:
-
 ```mach
 pub rec stat_t {
-    st_dev:        u64;
-    st_ino:        u64;
-    st_nlink:      u64;
-    st_mode:       u32;
-    st_uid:        u32;
-    st_gid:        u32;
-    pad0:          i32;
-    st_rdev:       u64;
-    st_size:       i64;
-    st_blksize:    i64;
-    st_blocks:     i64;
-    st_atime:      i64;
-    st_atime_nsec: i64;
-    st_mtime:      i64;
-    st_mtime_nsec: i64;
-    st_ctime:      i64;
-    st_ctime_nsec: i64;
-    _reserved0:    i64;
-    _reserved1:    i64;
-    _reserved2:    i64;
-}
-```
-
-Where `$mach.build.arch == $mach.arch.aarch64`:
-
-```mach
-pub rec stat_t {
-    st_dev:        u64;
-    st_ino:        u64;
-    st_mode:       u32;
-    st_nlink:      u32;
-    st_uid:        u32;
-    st_gid:        u32;
-    st_rdev:       u64;
-    _pad1:         u64;
-    st_size:       i64;
-    st_blksize:    i32;
-    _pad2:         i32;
-    st_blocks:     i64;
-    st_atime:      i64;
-    st_atime_nsec: i64;
-    st_mtime:      i64;
-    st_mtime_nsec: i64;
-    st_ctime:      i64;
-    st_ctime_nsec: i64;
-    _unused4:      u32;
-    _unused5:      u32;
-}
-```
-
-Where `$mach.build.arch == $mach.arch.riscv64 || $mach.build.arch == $mach.arch.riscv32`:
-
-```mach
-pub rec stat_t {
-    st_dev:        u64;
-    st_ino:        u64;
-    st_mode:       u32;
-    st_nlink:      u32;
-    st_uid:        u32;
-    st_gid:        u32;
-    st_rdev:       u64;
-    _pad1:         u64;
-    st_size:       i64;
-    st_blksize:    i32;
-    _pad2:         i32;
-    st_blocks:     i64;
-    st_atime:      i64;
-    st_atime_nsec: i64;
-    st_mtime:      i64;
-    st_mtime_nsec: i64;
-    st_ctime:      i64;
-    st_ctime_nsec: i64;
-    _unused4:      u32;
-    _unused5:      u32;
+    st_dev:             u64;
+    st_ino:             u64;
+    st_mode:            u32;
+    st_nlink:           u32;
+    st_uid:             u32;
+    st_gid:             u32;
+    st_rdev:            u64;
+    st_size:            i64;
+    st_blksize:         i32;
+    st_blocks:          i64;
+    st_atime:           i64;
+    st_atime_nsec:      i64;
+    st_mtime:           i64;
+    st_mtime_nsec:      i64;
+    st_ctime:           i64;
+    st_ctime_nsec:      i64;
+    st_birthtime:       i64;
+    st_birthtime_nsec:  i64;
+    st_birthtime_known: bool;
 }
 ```
 
@@ -1305,7 +1255,7 @@ Forwards [`std.system.os.linux.shared.stat`](shared.md#stat).
 pub fun stat(fd: i32, st: *stat_t) i64
 ```
 
-fstat: get file status by file descriptor
+get file status by file descriptor
 
 ### set_mode
 
@@ -1378,7 +1328,7 @@ Forwards [`std.system.os.linux.shared.stat_path`](shared.md#stat_path).
 pub fun stat_path(dirfd: i32, path: *u8, st: *stat_t, flags: i32) i64
 ```
 
-newfstatat: get file status relative to a directory fd
+get file status relative to a directory fd
 
 ### stat_mode
 
@@ -1392,6 +1342,16 @@ read the type/permission bits from a filled stat buffer as a 32-bit word
 
 st_mode is 32-bit in the linux stat ABI; the accessor exists so portable
 callers read the mode uniformly across platforms (darwin's mode is 16-bit).
+
+### stat_birth
+
+Forwards [`std.system.os.linux.shared.stat_birth`](shared.md#stat_birth).
+
+```mach
+pub fun stat_birth(st: *stat_t, sec: *i64, nsec: *i64) bool
+```
+
+the birth time of a stat record, when the filesystem recorded one
 
 ### unlink
 

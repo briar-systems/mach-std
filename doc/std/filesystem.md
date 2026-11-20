@@ -645,7 +645,7 @@ portable file metadata
 | `mode` | `u32` | raw type and permission bits (POSIX, synthesized on windows), the type alone where capability.HAS_FILE_MODES is false |
 | `modified` | `Time` | last modification time |
 | `accessed` | `Time` | last access time |
-| `created` | `opt[Time]` | birth time when the platform provides it, else none |
+| `created` | `opt[Time]` | birth time when the platform and filesystem record one, else none |
 
 ### metadata
 

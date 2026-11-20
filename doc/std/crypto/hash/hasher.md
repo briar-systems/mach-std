@@ -25,8 +25,8 @@ Source: [`src/crypto/hash/hasher.mach`](../../../../src/crypto/hash/hasher.mach)
 
 ```mach
 pub rec Hasher {
-    ctx:      ptr;
-    f_update: fun(ptr, *u8, usize);
+    ctx:       ptr;
+    fn_update: fun(ptr, *u8, usize);
 }
 ```
 
@@ -35,7 +35,7 @@ a running digest fed by someone else's bytes
 | Field | Type | |
 | :--- | :--- | :--- |
 | `ctx` | `ptr` | opaque hash state owned by the caller |
-| `f_update` | `fun(ptr, *u8, usize)` | folds len bytes at data into the state |
+| `fn_update` | `fun(ptr, *u8, usize)` | folds len bytes at data into the state |
 
 ### update
 

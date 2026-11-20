@@ -21,6 +21,7 @@ Source: [`src/system/os/wasi/shared.mach`](../../../../../src/system/os/wasi/sha
 | [`code`](#code) | the contract's code for what the host returned |
 | [`error_message`](#error_message) | the native text for a negative code |
 | [`page_size`](#page_size) | the wasm page size, 64 KiB, which every allocation here is counted in |
+| [`map_alignment`](#map_alignment) | the alignment map_file requires of an offset, the wasm page size |
 | [`map_secret`](#map_secret) | storage for span bytes between two pages, which cannot be guarded or locked here |
 | [`allocate`](#allocate) | whole zero-filled pages, kept ones first |
 | [`deallocate`](#deallocate) | keep pages for the next allocate, merged with their neighbours |
@@ -74,6 +75,14 @@ the wasm page size, 64 KiB, which every allocation here is counted in
 | Parameter | |
 | :--- | :--- |
 | **returns** | page size in bytes |
+
+### map_alignment
+
+```mach
+pub fun map_alignment() usize
+```
+
+the alignment map_file requires of an offset, the wasm page size
 
 ### map_secret
 
