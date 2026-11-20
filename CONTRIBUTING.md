@@ -14,6 +14,10 @@ The public API is every public declaration in the shipped modules under `src`. T
 
 A published version's source and tag are immutable, and a release tag must match `mach.toml`. Each release documents the compiler and targets it supports. A change that invalidates an existing supported combination needs a major release. Version compatibility never silently moves an application's dependency pin.
 
+## Naming
+
+A record field that holds a function for callers to invoke is named `fn_<action>`: `Allocator.fn_allocate`, `Writer.fn_write`, `Hasher.fn_update`, `MapBy.fn_hash`. When the record also carries the context those functions take, that field is `ctx`, and a caller reaches the function as `w.fn_write(w.ctx, ...)`.
+
 ## Compiler and CI
 
 CI builds the mach commit named by `MACH_REF` in `.github/workflows/ci.yml` and runs `mach fmt --check .` and `mach test . --all` on linux. A release tag runs `.github/workflows/cd.yml`, which tests every host std ships to and publishes the release. The suites under `test/` run locally, not in CI. std and compiler version numbers are independent.

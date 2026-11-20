@@ -147,7 +147,8 @@ The linux layer makes system calls directly and links no C runtime, so the kerne
 - `close_range` (5.9): every spawn closes the descriptors the child inherited with it, and asks for the call before it makes the child, so a spawn below 5.9 refuses with `ENOSYS` and starts nothing.
 - `pidfd_open` (5.3): `std.process.exec.watch_exit`, a child's end on a wait queue.
 - `getrandom` (3.17): `random_fill`, the entropy every secret and `std.crypto.rand` draws on.
-- riscv32 only: `clock_gettime64`, `clock_nanosleep_time64` and `futex_time64` (5.1), the only clock, sleep and futex calls of its table, and `statx` (4.11), its only stat.
+- `statx` (4.11): `stat` and `stat_path` on every architecture, the only status call std makes, since it alone carries a file's birth time (`stat_birth`).
+- riscv32 only: `clock_gettime64`, `clock_nanosleep_time64` and `futex_time64` (5.1), the only clock, sleep and futex calls of its table.
 - riscv64 and riscv32: `renameat2` (3.15) for `rename`, since their table has no `renameat`.
 - `SO_REUSEPORT` (3.9), `TCP_FASTOPEN` (3.7) and `MADV_DONTDUMP` (3.4): socket options and the secret span's dump exclusion.
 

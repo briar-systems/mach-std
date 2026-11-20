@@ -48,7 +48,7 @@ fun main(argc: i64, argv: **u8) i64 {
     var slot: i64 = 0;
     var w: writer.Writer;
     w.ctx = (?slot)::ptr;
-    w.f_write = sink;
+    w.fn_write = sink;
 $2
     ret 0;
 }

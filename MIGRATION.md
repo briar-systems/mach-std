@@ -41,48 +41,23 @@ std no longer turns PSTATE.DIT on at start or on each thread it spawns, and no l
 
 | 9.x | 10.0.0 |
 | --- | --- |
-| `timing.mode()` answering `ON`, `UNAVAILABLE` or `UNNEEDED` from the link and start-up | `timing.mode()` answering `AVAILABLE` or `UNAVAILABLE` from the processor alone |
-| `dit.required()`, `dit.decide`, `dit.init`, `dit.decided`, `dit.enter_thread`, `dit.SKIP`, `dit.ENABLE`, `dit.CONTINUE` | removed. `dit.publish` sets the availability byte, `dit.available()` reads it |
-| `dit.enable()`, `dit.read()`, `dit.engage()` | kept, and `dit.disable()` is new |
+| none | `std.system.timing.mode()`, answering `AVAILABLE` or `UNAVAILABLE` from the processor alone |
+| `dit.required()`, `dit.decide`, `dit.init`, `dit.enter_thread`, `dit.SKIP`, `dit.ENABLE`, `dit.REFUSE`, `dit.REFUSAL` | removed. `dit.publish` sets the availability byte, `dit.available()` reads it |
+| `dit.enable()`, `dit.read()`, `dit.DIT_BIT` | kept, and `dit.disable()`, `dit.engage()` and `dit.PROVIDED` are new |
 
 ## thread-locals and wide integers (#1109, #1110)
 
 `#[thread] var` works on every host: each thread gets its own copy of the template, and the whole block is wiped when a thread std runs ends. On aarch64 and riscv64 linux the thread's block now sits just below the thread pointer, so `thread_block()` there no longer returns the raw thread pointer. `vformat` renders `u256`, `i256`, `u512` and `i512`, and `std.text.parse` gains `parse_u128` through `parse_i512` with `_exact` forms. std builds with mach 9fc6a4ad or later, which reads the v7 decorator spellings.
 
-## one command-line engine in std.args (#1113)
+## std.args, a plain argument parser (#1021, #1150)
 
-`std.args` now carries the engine mach reads its command line with: rows with aliases, arity and an occurrence policy, tables composed into commands and actions, relations between rows, removed spellings, exit notes, examples and generated help. The plain `Flag` table and its `Reader` are gone. A program declares its commands once in a `CommandSet` and reads the whole line with `parse`, which allocates nothing and needs no storage from the caller: every query reads the arguments again.
-
-A row has one spelling. A flag that took both `--out` and `-o` becomes a canonical row and an alias row naming it. The spelling rules are unchanged: short spellings are one byte, a short cluster runs `-abc` as three switches, a VALUE or ATTACHED short takes the rest of the token, `--name=value` works for long value rows, a negatable long flag answers to `--no-name`, and `--` ends the options.
-
-| 9.x | 10.0.0 |
-| --- | --- |
-| `args.Flag{name: "--out", short: "-o", kind: args.VALUE, negatable: false, occurs: o, value: "path", doc: d}` | `val OUT: args.FlagSpec = args.FlagSpec{name: "--out", value: "path", arity: args.ARITY_VALUE, doc: d, default: "", negatable: false, occurs: o, alias_of: nil}` and `args.FlagSpec{name: "-o", ..., alias_of: ?OUT}` |
-| `args.Kind`, `args.SWITCH`, `args.VALUE`, `args.ATTACHED` | `args.Arity`, `args.ARITY_FLAG`, `args.ARITY_VALUE`, `args.ARITY_ATTACHED` |
-| a `**args.Flag` list and its count | `args.TableRef{rows: ?LIST[0], n: N, accepted: nil, docs: nil}` in an `args.CommandSpec`, the commands in an `args.CommandSet` |
-| `args.reader(a, 2, flags, n, ?settings[0])` then a loop over `args.read` | `var inv: args.Invocation = args.parse(?SET, a, 1);` for a command word at argument 1, or `args.parse_command(?SET, ?COMMAND, a, 2)` once the program has picked the command |
-| `args.Error` from `read` | `inv.refusal`, an `opt[args.Refusal]`. `args.describe(?inv, ?w)` writes its message |
-| `args.Error.malformed{row}` | `args.Refusal.malformed{args.Malformed{command, action, row, why}}`, and `args.check(?SET)` finds it without reading arguments |
-| the `args.Event` stream `read` gave | `var w: args.Walk = args.walk(?inv);` then `args.step(?w)`, the same `done`, `operand` and `hit` events, refused tokens skipped |
-| `args.on(r, ?F)`, `args.value(r, ?F)`, `args.given(r, ?F)`, `args.values(r, ?F)`, `args.next_value(?w)` | the same names over the invocation: `args.on(?inv, ?F)` and so on. `given` also answers true for a row a given row implies |
-| `args.setting(r, ?F)` and `Setting.count` | `args.latest(?inv, ?F)`, a `res[opt[args.Hit], args.Misread]`, and `args.occurrences(?inv, ?F)` |
-| `args.separator(r)` | `args.separator(?inv)` |
-| `Hit.flag` | `Hit.flag` is the canonical row. `Hit.spelled` is the row whose spelling matched and `Hit.at` the cluster offset |
-| help text a program wrote by hand | `args_help.render(?SET, ?w, args_help.page_of(?inv), args_help.terminal_width())`, from `std.args.help` |
-
-`Misread` keeps its cases. `unlisted` now means the row is not in the invocation's schema, the set's common tables joined to the command's and its action's.
-
-A `CommandSet` carries what mach kept in module globals: `common` tables every command accepts (where `--help` and `-h` go), `help_flag` naming the row that asks for a page, shared `relations`, `removed` spellings and the shared `exits`. A `CommandSpec` has an `id` for the program to dispatch on in place of mach's `run` handler.
-
-For mach's own switch: `repeatable: true` becomes `occurs: args.Occurs.collect{}`. The `-vv` row is not a short spelling, so verbosity becomes one collect `-v` row read with `occurrences`, capped at 2, and the `-vv implies -v` relation goes. `-n=x` on a short value row now gives the value `=x` instead of an unknown-flag refusal, and `-ovalue` is read as `-o value`. A command without `truncate_at_sep` reads the arguments after `--` as operands where it refused `--` as an unknown flag. `values` walks every occurrence, so a caller that wants only the values skips a hit whose value is nil. `ParsedInvocation`, `dnit_invocation` and the allocator argument go, since nothing is allocated.
-
-## std.args is a plain argument parser (#1150)
-
-`std.args` no longer shapes a program's command line. It parses arguments against a description and judges only the user's input. The `CommandSet`, `CommandSpec`, `ActionSpec`, `FlagSpec` and `TableRef` records give way to a root `args.Command` with `args.Command`s nested under it to any depth, each with a slice of `*args.Flag`. A nested command replaces an action, so `mach dep add` is `dep` with `add` nested under it. Nothing validates the description: `check`, `schema_valid` and `Malformed` are gone, and a wrong description is the program's bug. std.args injects no `--help`, `-h`, `--version` or `help` command, reserves no short spelling and defines no exit codes. A program declares its own.
+`std.args` is new in 10.0.0: 9.x has no argument parser. It parses arguments against a description and judges only the user's input. A root `args.Command` has `args.Command`s nested under it to any depth, each with a slice of `*args.Flag`, so `mach dep add` is `dep` with `add` nested under it. Nothing validates the description, and a wrong description is the program's bug. std.args injects no `--help`, `-h`, `--version` or `help` command, reserves no short spelling and defines no exit codes. A program declares its own.
 
 A flag has a long spelling without its dashes, an optional short byte, a value placeholder when it takes a value, `repeat`, `negatable` for `--no-name`, and optional help text. Every flag may occur any number of times. A single read answers the last occurrence and `values` walks them all. A flag is read while a command that lists it is the one matched, so a flag shared by several commands is listed by each, by the same address. `parse(?ROOT, args.of(argc, argv))` reads from argument 1. While the command matched so far has nested commands, a word in the operand place names one of them. It refuses only an unknown flag, a missing value, an unknown command and an operand count outside the matched command's bounds, and `args.describe` writes the message.
 
-| 10.0.0 before #1150 | 10.0.0 |
+The development branch carried an earlier engine (#1113) with a `CommandSet` of `CommandSpec`s and `ActionSpec`s, `FlagSpec` rows, relations, removed spellings, exit notes and generated help. It was never released. For code written against it:
+
+| development branch before #1150 | 10.0.0 |
 | --- | --- |
 | `args.FlagSpec{name: "--out", value: "path", arity: args.ARITY_VALUE, doc: d, ...}` and an alias row `-o` | `args.Flag{long: "out", short: 'o', value: "path", repeat: false, negatable: false, help: d}` |
 | `args.ARITY_FLAG`, `args.ARITY_VALUE`, `args.ARITY_ATTACHED` | a nil or empty `value` takes no value, any other takes one. An optional attached value has no form |
@@ -126,9 +101,9 @@ The visible difference is teardown. `dnit` on such a heap leaves `mapped_bytes` 
 
 ## filesystem.transaction takes its digest from the caller (#1003)
 
-`prepare` and `prepare_bytes` no longer compute a sha-256. Their `want_digest: bool` parameter becomes `digest: *hasher.Hasher`, a caller-owned running digest the transaction feeds every byte written, or `nil` for none. `transaction_has_digest` and `transaction_digest` are removed. The transaction never finishes or stores a digest, so any hash fits, whatever its output size.
+`prepare` and `prepare_bytes` no longer compute a sha-256. Their `want_digest: bool` parameter becomes `digest: *hasher.Hasher`, a caller-owned running digest the transaction feeds every byte written, or `nil` for none. `transaction_has_digest`, `transaction_digest` and the `Transaction` fields `digest` and `has_digest` are removed. The transaction never finishes or stores a digest, so any hash fits, whatever its output size.
 
-`std.crypto.hash.hasher.Hasher` is `{ctx: ptr, f_update: fun(ptr, *u8, usize)}`. The caller creates the hash state, passes a `Hasher` over it, and finishes it after `prepare` returns ok.
+`std.crypto.hash.hasher.Hasher` is `{ctx: ptr, fn_update: fun(ptr, *u8, usize)}`. The caller creates the hash state, passes a `Hasher` over it, and finishes it after `prepare` returns ok.
 
 | 9.x | 10.0.0 |
 | --- | --- |
@@ -140,7 +115,7 @@ The visible difference is teardown. `dnit` on such a heap leaves `mapped_bytes` 
 fun feed(ctx: ptr, data: *u8, len: usize) { sha256.update(ctx::*sha256.State, data, len); }
 
 var state:  sha256.State = sha256.make();
-var hasher: hasher.Hasher = hasher.Hasher{ctx: (?state)::ptr, f_update: feed};
+var hasher: hasher.Hasher = hasher.Hasher{ctx: (?state)::ptr, fn_update: feed};
 prepare_bytes(?t, ?alloc, claim, data, len, 0o644, ?hasher, options);
 sha256.final(?state, ?digest[0]);
 ```
@@ -149,28 +124,28 @@ sha256.final(?state, ?digest[0]);
 
 `read_dir` returns `res[Vector[Listed], FsError]` in place of `res[Vector[str], FsError]`. `Listed` is `tag Listed: u8 { name: str; unspellable: NativeName; }`, with `NativeName` from `std.runtime.native.view`, one per entry, in directory order. A windows directory can hold a name with an unpaired surrogate, which has no UTF-8 spelling. Before, such a name failed the whole listing with EINVAL. Now it is listed in sequence as `unspellable`, with its name in native units, so the native forms can reach it, and the listing goes on. Only a fault of the directory itself fails the listing. On linux and darwin every entry is a `name`.
 
-Release a listing with `listed_free(?entries)`, which frees every name of either kind and then the vector, in place of freeing each `str` and then `vector.dnit`. `read_dir_native(a, p)` lists a directory named in native units as `Vector[NativeName]`, released with `native_names_free`.
+Release a listing with `listed_dnit(?entries)`, which frees every name of either kind and then the vector, in place of freeing each `str` and then `vector.dnit`. `read_dir_native(a, p)` lists a directory named in native units as `Vector[NativeName]`, released with `native_names_dnit`.
 
 | 9.x | 10.0.0 |
 | --- | --- |
 | `val names: Vector[str] = read_dir(a, p).ok` | `val entries: Vector[Listed] = read_dir(a, p).ok` |
 | `names.data[i]` | `val entry: Listed = entries.data[i]` then `if (sel entry.name) { ... entry.name ... }`, with `entry.unspellable` for a name with no UTF-8 spelling |
-| `str_free(a, names.data[i])` for each, then `vector.dnit[str](?names)` | `listed_free(?entries)` |
+| `str_free(a, names.data[i])` for each, then `vector.dnit[str](?names)` | `listed_dnit(?entries)` |
 
 ## the environment reads in native units and passes on only by the inherit form (#1065)
 
 Every spawn and exec, in `std.process.exec` and `std.system.os` alike, takes the child's environment as a tag in place of `envp: **u8`: `Environment` for the UTF-8 spawns and `NativeEnvironment` for the native ones. `Environment.inherit{}` hands the child this process's own environment, the native environment with no conversion: windows gives `CreateProcessW` a NULL environment and linux and darwin the envp the kernel gave the process, so a variable with no UTF-8 spelling reaches the child as it is. `Environment.given{envp}` hands it exactly the entries of a nil-terminated array, and a nil array is refused with `EINVAL`. A nil envp used to inherit on windows only, while linux and darwin handed the kernel a nil envp.
 
-`std.process.env.environ()` returning `**u8` becomes `environ(a)` returning `res[Vector[Listed], EnvError]`, the UTF-8 listing for reading and editing variables. `Listed` is `tag Listed: u8 { variable: str; unspellable: NativeName; }`, one per entry in the order the environment holds them. A windows entry with no UTF-8 spelling, which before made the whole listing nil, is listed in place as `unspellable` with its variable name in native units, which `get_native` reads. On linux and darwin every entry is a `variable`. The vector and every entry are the caller's, released with `environ_free(?entries)`. `EnvError` gains `unavailable` for an environment that cannot be read. `environ_native()` is the environment in native units, kept for the life of the process.
+`std.process.env.environ()` returning `**u8` becomes `environ(a)` returning `res[Vector[Listed], EnvError]`, the UTF-8 listing for reading and editing variables. `Listed` is `tag Listed: u8 { variable: str; unspellable: NativeName; }`, one per entry in the order the environment holds them. A windows entry with no UTF-8 spelling, which before made the whole listing nil, is listed in place as `unspellable` with its variable name in native units, which `get_native` reads. On linux and darwin every entry is a `variable`. The vector and every entry are the caller's, released with `environ_dnit(?entries)`. `EnvError` gains `unavailable` for an environment that cannot be read. `environ_native()` is the environment in native units, kept for the life of the process.
 
-`std.system.os.environ` is removed. `os.environ_native()` is the one capture and `os.getenv_native` reads one value in native units. `std.system.os.linux.environ` and `std.system.os.darwin.environ` remain.
+`std.system.os.environ` and `std.system.os.windows.environ` are removed. `os.environ_native()` is the one capture and `os.getenv_native` reads one value in native units. `std.system.os.linux.environ` and `std.system.os.darwin.environ` remain.
 
 | 9.x | 10.0.0 |
 | --- | --- |
 | `exec.run(path, argv, nil)` | `exec.run(path, argv, exec.Environment.inherit{})` |
 | `exec.run(path, argv, env.environ())` to pass the environment on | `exec.run(path, argv, exec.Environment.inherit{})` |
 | `exec.run(path, argv, (?envp[0])::**u8)` | `exec.run(path, argv, exec.Environment.given{(?envp[0])::**u8})` |
-| `exec.run_native(path, argv, envp)` | `exec.run_native(path, argv, exec.NativeEnvironment.given{envp})`, or `.inherit{}` |
+| none | `exec.run_native(path, argv, exec.NativeEnvironment.given{envp})`, or `.inherit{}`, which spawns from native units |
 | `os.spawn(path, argv, envp)` | `os.spawn(path, argv, os.Environment.given{envp})`, or `os.Environment.inherit{}` |
 | `val e: **u8 = env.environ()` then `e[i]` | `val entries: Vector[env.Listed] = env.environ(a).ok` then `if (sel entries.data[i].variable) { ... }`, with `.unspellable` for an entry with no UTF-8 spelling |
 | `os.environ()` | `os.environ_native()`, or `env.environ(a)` for UTF-8 |
@@ -216,7 +191,7 @@ ref = "branch/dev"
 
 ## the cryptographic hashes, checksums and compression move to packages (#1004)
 
-The SHA-2 and Keccak hashes leave std for the mach-crypto package, and the checksums and compression leave for the mach-deflate package. Each package module has the same types and behaviour the std module had (mach-crypto's `sha512` also holds the public `State384` the std module had), and the same public names except its constructors and teardowns, which take the lifecycle names (mach#4484) listed in the second table below. Declare the package under its key and import the module by its source path in the package.
+The SHA-2 and Keccak hashes leave std for the mach-crypto package, and the checksums and compression leave for the mach-deflate package. Each package module has the same types and behaviour the std module had (mach-crypto's `sha512` also has a public SHA-384 `State384`, made by `make384`, which 9.x did not), and the same public names except its constructors and teardowns, which take the lifecycle names (mach#4484) listed in the second table below. Declare the package under its key and import the module by its source path in the package.
 
 ```toml
 [dep.crypto]
@@ -243,7 +218,6 @@ ref = "branch/dev"
 | `sha256.init_secret` | `sha256.secret_init` |
 | `sha256.destroy_secret` | `sha256.secret_dnit` |
 | `sha512.init` | `sha512.make` |
-| `sha512.init384` | `sha512.make384` |
 | `sha512.init_secret384`, `sha512.init_secret512` | `sha512.secret384_init`, `sha512.secret512_init` |
 | `sha512.destroy_secret384`, `sha512.destroy_secret512` | `sha512.secret384_dnit`, `sha512.secret512_dnit` |
 | `keccak.init`, `sha3_256.init`, `sha3_512.init`, `shake128.init`, `shake256.init` | `make` in the same module |
@@ -294,13 +268,13 @@ A long-running program that keeps many secrets may need a higher `RLIMIT_MEMLOCK
 | 9.x | 10.0.0 |
 | --- | --- |
 | `std.allocator.arena.make` | `std.allocator.arena.allocator` |
-| `std.allocator.heap.make_owned` | `std.allocator.heap.allocator_owned` |
+| `std.allocator.heap.make_owned` (development branch only) | `std.allocator.heap.allocator_owned` |
 | `std.allocator.heap.make` | `std.allocator.heap.allocator` |
 | `std.allocator.testing.make` | `std.allocator.testing.init` |
-| `std.compat.sha1.init` | `std.compat.sha1.make` |
+| `std.compat.sha1.init` (development branch only) | `std.compat.sha1.make` |
 | `std.crypto.hash.siphash.init` | `std.crypto.hash.siphash.make` |
-| `std.filesystem.listed_free` | `std.filesystem.listed_dnit` |
-| `std.filesystem.native_names_free` | `std.filesystem.native_names_dnit` |
+| `std.filesystem.listed_free` (development branch only) | `std.filesystem.listed_dnit` |
+| `std.filesystem.native_names_free` (development branch only) | `std.filesystem.native_names_dnit` |
 | `std.filesystem.transaction.ownership.root_destroy` | `std.filesystem.transaction.ownership.root_dnit` |
 | `std.filesystem.transaction.release_claim` | `std.filesystem.transaction.claim_dnit` |
 | `std.io.file.adapter.destroy` | `std.io.file.adapter.dnit` |
@@ -308,7 +282,7 @@ A long-running program that keeps many secrets may need a higher `RLIMIT_MEMLOCK
 | `std.io.file.destroy` | `std.io.file.dnit` |
 | `std.io.file.make` | `std.io.file.init` |
 | `std.io.file.watch_close` | `std.io.file.watch_dnit` |
-| `std.io.file.watch_open_native` | `std.io.file.watch_init_native` |
+| `std.io.file.watch_open_native` (development branch only) | `std.io.file.watch_init_native` |
 | `std.io.file.watch_open` | `std.io.file.watch_init` |
 | `std.io.runtime.destroy` | `std.io.runtime.dnit` |
 | `std.io.runtime.make` | `std.io.runtime.init` |
@@ -347,7 +321,7 @@ A long-running program that keeps many secrets may need a higher `RLIMIT_MEMLOCK
 | `std.net.resolve.make` | `std.net.resolve.init` |
 | `std.net.resolve.resolution_destroy` | `std.net.resolve.resolution_dnit` |
 | `std.net.resolve.shared.destroy` | `std.net.resolve.shared.dnit` |
-| `std.process.env.environ_free` | `std.process.env.environ_dnit` |
+| `std.process.env.environ_free` (development branch only) | `std.process.env.environ_dnit` |
 | `std.rand.init` | `std.rand.make` |
 | `std.sync.cancel.destroy` | `std.sync.cancel.dnit` |
 | `std.sync.cancel.init_registration` | `std.sync.cancel.registration_make` |
@@ -357,15 +331,17 @@ A long-running program that keeps many secrets may need a higher `RLIMIT_MEMLOCK
 | `std.system.os.darwin.shared.directory_close` | `std.system.os.darwin.shared.directory_dnit` |
 | `std.system.os.directory_close` | `std.system.os.directory_dnit` |
 | `std.system.os.linux.shared.directory_close` | `std.system.os.linux.shared.directory_dnit` |
-| `std.system.os.native_path_release` | `std.system.os.native_path_dnit` |
+| `std.system.os.native_path_release` (development branch only) | `std.system.os.native_path_dnit` |
 | `std.system.os.release_secret_typed` | `std.system.os.free_secret_typed` |
 | `std.system.os.release_secret` | `std.system.os.free_secret` |
 | `std.system.os.secret.release_typed` | `std.system.os.secret.free_typed` |
 | `std.system.os.secret.release` | `std.system.os.secret.free` |
-| `std.system.os.wasi.preview1.directory_close` | `std.system.os.wasi.preview1.directory_dnit` |
+| `std.system.os.wasi.preview1.directory_close` (development branch only) | `std.system.os.wasi.preview1.directory_dnit` |
 | `std.system.os.windows.shared.directory_close` | `std.system.os.windows.shared.directory_dnit` |
 | `std.types.string.owned_release` | `std.types.string.owned_dnit` |
 | `std.types.string.str_empty` | `std.types.string.str_is_empty` |
+
+The modules that re-export these, `std.system.os.linux`, `std.system.os.darwin`, `std.system.os.windows` and their per-architecture modules, carry `directory_dnit` in place of `directory_close` as well.
 
 ## name lookups run under a cancellation scope
 
@@ -397,6 +373,45 @@ Every entry that performs a lookup takes a `*std.sync.cancel.Scope`, as `process
 | 9.x | 10.0.0 |
 | --- | --- |
 | `format.rfc3339(dt, buf, len)` | `format.rfc3339(dt, format.Fraction.digits_unless_whole{9}, buf, len)` for the same output |
+
+## callback fields are named fn_
+
+Every std record field that holds a function for callers to invoke is named `fn_<action>`, as `Allocator`'s already were. The rule is in CONTRIBUTING.md. Signatures do not change.
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `std.io.reader.Reader.f_read` | `std.io.reader.Reader.fn_read` |
+| `std.io.writer.Writer.f_write` | `std.io.writer.Writer.fn_write` |
+| `std.log.record.Clock.f_now` | `std.log.record.Clock.fn_now` |
+| `std.log.sink.Sink.f_publish` | `std.log.sink.Sink.fn_publish` |
+| `std.log.sink.Direct.f_write` | `std.log.sink.Direct.fn_write` |
+| `std.collections.map.MapBy.hash_fn`, `eq_fn` | `std.collections.map.MapBy.fn_hash`, `fn_eq` |
+| `std.sync.worker_pool.Task.run` | `std.sync.worker_pool.Task.fn_run` |
+| `std.net.resolve.Resolver.adapter` | `std.net.resolve.Resolver.fn_adapter` |
+
+`std.crypto.hash.hasher.Hasher`, new in 10.0.0, has `fn_update`.
+
+## an allocator backend never sees a reallocation to size 0
+
+`allocator.reallocate_raw` frees a block resized to 0 through `fn_deallocate` and returns nil, so `fn_reallocate` is never called with `new_size` 0, as `fn_allocate` is never called with size 0. The backends' own size-0 branches are gone. A backend written against 9.x may drop its branch. Code that calls a backend's `fn_reallocate` directly with `new_size` 0 calls `fn_deallocate` instead.
+
+## linux stat_t is std's record, filled from statx
+
+On linux `std.system.os.stat` and `stat_path` read through `statx` on every architecture, and `stat_t` is one std-owned record in place of each architecture's kernel layout. It keeps the `st_*` field names and gains `st_birthtime`, `st_birthtime_nsec` and `st_birthtime_known`, so `stat_birth` and `filesystem.Metadata.created` report a file's birth time where the filesystem records one. The padding fields `_pad1`, `_pad2`, `_unused4` and `_unused5` and x86_64's `pad0` and `_reserved*` are gone, and `st_nlink` and `st_blksize` are `u32` and `i32` on every architecture.
+
+## other removed public names
+
+Each of these is gone with nothing in its place, or with the replacement named.
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `std.io.file.posix.rename_confined(root, source, destination)`, `std.io.file.windows.rename_confined` | `rename_confined_native` in the same module, which takes the names in native units |
+| `std.io.file.posix.no_follow_flag()` | `O_NOFOLLOW` from `std.system.os.linux`, `std.system.os.darwin` or `std.system.os.wasi` |
+| `std.io.runtime.DESTROYED` | removed. Nothing set it. `OPEN`, `CLOSING` and `CLOSED` remain |
+| `std.net.async.discarded_reads`, `std.net.async.local.discarded_reads` | removed. They always reported 0 since a cancelled read no longer discards bytes |
+| `std.system.os.shared.io_wake_posted` and `IoQueue.wakes_posted` | removed, with the other counters of internal steps |
+| `std.memory.buffers.Pool.steps`, `Snapshot.steps`, `std.net.async.iocp.Core.steps`, `std.net.async.local.Driver.claim_steps`, `std.net.resolve.Resolver.steps`, `std.net.async.readiness.Backend.watches`, `rearms`, `unwatches` and `locates` | removed. They counted internal steps for tests that are gone |
+| `std.allocator.testing.Testing.used` | removed. The live, peak and refusal counts have their own accessors |
 
 # std 6.x to 7.0.0
 
