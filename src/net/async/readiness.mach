@@ -59,6 +59,23 @@ pub rec Operation {
     pool_next: usize;
 }
 
+# one native socket the engine tracks: its queued operations and its registration
+# ---
+# state:        free or active
+# generation:   bumped on every acquire, the generation of its wire context
+# index:        its slot in the resource table
+# resource:     the native socket
+# read_head:    first queued read lane operation, NONE when empty
+# read_tail:    last queued read lane operation, NONE when empty
+# write_head:   first queued write lane operation, NONE when empty
+# write_tail:   last queued write lane operation, NONE when empty
+# close_index:  the close waiting for both lanes to drain, NONE when none
+# armed:        a native registration is armed for it
+# watched:      it holds a native registration
+# closing:      a close was submitted, so new operations are refused
+# write_closed: the write side was shut down
+# configured:   the backend set its datagram packet options on the socket
+# next_free:    the pool's free-list link while the resource is free
 pub rec Resource {
     state:        u8;
     generation:   u32;
@@ -96,6 +113,25 @@ pub rec Protocol {
     openings: bool;
 }
 
+# a readiness backend: the native queue, the tables and the finished queue
+# ---
+# queue:          the native readiness queue, borrowed from the caller
+# source_id:      the runtime source id carried in every wire context
+# protocol:       what the backend brings
+# operations:     the operation table, of protocol.operation_size records
+# resources:      the resource table
+# ready:          completions published by the last flush, dispatch or poll
+# resource_map:   open addressed map from native socket to resource index plus one
+# native:         the batch the native wait fills
+# map_capacity:   slots in resource_map, a power of two
+# live:           operations claimed and not yet released
+# resource_count: active resources
+# queued_head:    first finished operation waiting to be published
+# queued_tail:    last finished operation waiting to be published
+# queued_count:   finished operations waiting to be published
+# ready_count:    completions in ready
+# sequence:       the next submission order number
+# lock:           guards every field
 pub rec Backend {
     queue:     *shared.IoQueue;
     source_id: u16;
@@ -124,10 +160,20 @@ pub rec Backend {
     lock:       mutex.Mutex;
 }
 
+# the operation record at a table index, which must be inside the table
+# ---
+# backend: the backend
+# index:   the operation index
+# ret:     the record, valid until the table shrinks past it
 pub fun operation_at(backend: *Backend, index: usize) *Operation {
     ret table.at(?backend.operations, index)::*Operation;
 }
 
+# the resource record at a table index, which must be inside the table
+# ---
+# backend: the backend
+# index:   the resource index
+# ret:     the record, valid until the table shrinks past it
 pub fun resource_at(backend: *Backend, index: usize) *Resource {
     ret table.at(?backend.resources, index)::*Resource;
 }
@@ -136,6 +182,12 @@ fun ready_at(backend: *Backend, index: usize) *types.NativeCompletion {
     ret table.at(?backend.ready, index)::*types.NativeCompletion;
 }
 
+# whether a caller range overlaps memory the backend owns
+# ---
+# backend: the backend
+# data:    start of the range
+# len:     bytes in the range
+# ret:     true on overlap, and also when the range or the backend is not valid
 pub fun aliases(backend: *Backend, data: *u8, len: usize) bool {
     if (!memory.range_valid(data, len))                       { ret true; }
     if (len == 0)                                             { ret false; }
@@ -172,6 +224,9 @@ pub val NONE:            u32 = 0xffffffff;
 # readiness is harvested in fixed batches, so the batch is not a capacity
 val NATIVE_BATCH: usize = 256;
 
+# the status for an invalid argument
+# ---
+# ret: the native EINVAL
 pub fun invalid() i64 {
     ret sys.EINVAL;
 }
@@ -185,6 +240,12 @@ pub fun token_context(backend: *Backend, token: types.Token) usize {
     ret shared.io_source_context(backend.source_id, (token.index::u64 << 16) | token.generation::u64);
 }
 
+# decode a wire context back into the resource token it carries
+# ---
+# backend: the backend
+# context: the wire context from a native event
+# token:   receives the index and generation
+# ret:     false when the context belongs to another source, token is nil or the generation is 0
 pub fun context_token(backend: *Backend, context: usize, token: *types.Token) bool {
     val raw: u64 = context::u64;
     if (shared.io_context_source(context) != backend.source_id || token == nil) { ret false; }
@@ -201,6 +262,11 @@ fun next_wire_generation(current: u32) u32 {
     ret generation;
 }
 
+# the active operation a token names
+# ---
+# backend: the backend
+# token:   the operation token
+# ret:     nil when the token is stale, or the operation finished or was released
 #[testing]
 pub fun operation_for(backend: *Backend, token: types.Token) *Operation {
     if (table.pool_untouched(?backend.operation_pool, ?backend.operations, token.index::usize)) { ret nil; }
@@ -209,6 +275,11 @@ pub fun operation_for(backend: *Backend, token: types.Token) *Operation {
     ret operation;
 }
 
+# the operation a token names, active or finished and waiting to be published
+# ---
+# backend: the backend
+# token:   the operation token
+# ret:     nil when the token is stale or the operation was released
 pub fun operation_any(backend: *Backend, token: types.Token) *Operation {
     if (table.pool_untouched(?backend.operation_pool, ?backend.operations, token.index::usize)) { ret nil; }
     val operation: *Operation = operation_at(backend, token.index::usize);
@@ -216,6 +287,11 @@ pub fun operation_any(backend: *Backend, token: types.Token) *Operation {
     ret operation;
 }
 
+# the active resource a token names
+# ---
+# backend: the backend
+# token:   the resource token, as decoded from a wire context
+# ret:     nil when the token is stale or the resource was released
 pub fun resource_for(backend: *Backend, token: types.Token) *Resource {
     if (table.pool_untouched(?backend.resource_pool, ?backend.resources, token.index::usize)) { ret nil; }
     val resource: *Resource = resource_at(backend, token.index::usize);
@@ -223,6 +299,7 @@ pub fun resource_for(backend: *Backend, token: types.Token) *Resource {
     ret resource;
 }
 
+# the resource map size for a resource capacity: a power of two at least twice it, 0 when it would overflow
 fun required_map_capacity(capacity: usize) usize {
     if (capacity > 0x3fffffff) { ret 0; }
     val required: usize = capacity * 2;
@@ -243,6 +320,11 @@ fun resource_hash(resource: usize) usize {
     ret resource * GOLDEN;
 }
 
+# the resource tracking a native socket
+# ---
+# backend:  the backend
+# resource: the native socket
+# ret:      nil when the backend tracks no resource for it
 pub fun resource_lookup(backend: *Backend, resource: usize) *Resource {
     var slot:    usize = resource_hash(resource) & (backend.map_capacity - 1);
     var scanned: usize = 0;
@@ -345,6 +427,14 @@ fun grow_resources(backend: *Backend) bool {
     ret true;
 }
 
+# the resource for a native socket, created when there is none. a resource
+# under an older opening is dropped as stale first
+# ---
+# backend: the backend, locked
+# native:  the native socket
+# opening: the handle's opening, 0 for a backend whose handles carry none
+# created: set true when a new resource was made, false when an existing one is returned or the handle is refused
+# ret:     nil when the handle is older than the tracked socket or was retired, or the tables cannot grow
 pub fun resource_acquire(backend: *Backend, native: usize, opening: u64, created: *bool) *Resource {
     val existing: *Resource = resource_lookup(backend, native);
     # openings only grow, so the older of two openings is the socket that was
@@ -392,6 +482,10 @@ pub fun resource_acquire(backend: *Backend, native: usize, opening: u64, created
     ret resource;
 }
 
+# free a resource whose native registration is already gone, removing it from the map
+# ---
+# backend:  the backend, locked
+# resource: the active resource
 pub fun resource_release_unwatched(backend: *Backend, resource: *Resource) {
     val index: u32 = resource.index;
     set_watched(backend, resource, false);
@@ -453,6 +547,14 @@ fun grow_operations(backend: *Backend) bool {
     ret true;
 }
 
+# claim a free operation, growing the table when none is free
+# ---
+# backend: the backend, locked
+# kind:    the operation kind
+# native:  the native socket it acts on
+# context: the caller's context, carried to the completion
+# token:   receives the operation's token
+# ret:     the claimed operation, nil when the table cannot grow
 pub fun operation_claim(backend: *Backend, kind: runtime.Kind, native: usize, context: usize, token: *types.Token) *Operation {
     if (table.pool_peek(?backend.operation_pool, ?backend.operations) == table.NO_INDEX && !grow_operations(backend)) { ret nil; }
     var fresh:     bool       = false;
@@ -480,6 +582,10 @@ pub fun operation_claim(backend: *Backend, kind: runtime.Kind, native: usize, co
     ret operation;
 }
 
+# return an operation to the free pool
+# ---
+# backend: the backend, locked
+# index:   the operation index
 pub fun operation_release(backend: *Backend, index: u32) {
     val operation: *Operation = operation_at(backend, index::usize);
     operation.state    = SLOT_FREE;
@@ -594,6 +700,7 @@ pub fun would_block(status: i64) bool {
     ret status == sys.EAGAIN;
 }
 
+# finish every queued operation on a resource with status, oldest submission first
 fun fail_resource(backend: *Backend, resource: *Resource, status: i64) {
     for (resource.read_head != NONE || resource.write_head != NONE) {
         var index: u32 = resource.read_head;
@@ -604,6 +711,9 @@ fun fail_resource(backend: *Backend, resource: *Resource, status: i64) {
     }
 }
 
+# register or rearm a resource for what its lanes wait on. with both lanes
+# empty a pending close runs. a failed registration fails the resource and
+# releases it
 fun arm_resource(backend: *Backend, resource: *Resource) {
     var events: u32 = 0;
     if (resource.read_head != NONE)  { events = events | sys.IO_EVENT_READ; }
@@ -656,6 +766,7 @@ fun arm_resource(backend: *Backend, resource: *Resource) {
     resource.armed = true;
 }
 
+# try the queued operations each signalled lane allows, in order, then rearm
 fun drive_resource(backend: *Backend, resource: *Resource, events: u32) {
     val failure: bool = (events & (sys.IO_EVENT_ERROR | sys.IO_EVENT_HANGUP)) != 0;
     if ((events & sys.IO_EVENT_READ) != 0 || failure) {
@@ -719,6 +830,10 @@ pub fun begin(backend: *Backend, native: usize, opening: u64, kind: runtime.Kind
     ret status;
 }
 
+# end a submission: drive the resource once, trim, unlock and wake the waiter
+# ---
+# backend:  the backend, locked on entry and unlocked on return
+# resource: the resource the submission queued on
 pub fun submission_done(backend: *Backend, resource: *Resource) {
     drive_resource(backend, resource, sys.IO_EVENT_READ | sys.IO_EVENT_WRITE);
     trim_locked(backend);
@@ -789,6 +904,16 @@ pub fun init(backend: *Backend, queue: *shared.IoQueue, a: *allocator.Allocator,
     ret 0;
 }
 
+# queue a read into a borrowed buffer
+# ---
+# backend: the backend
+# native:  the native socket
+# opening: the handle's opening, 0 for a backend whose handles carry none
+# buffer:  where the bytes go, borrowed until the operation completes
+# length:  the buffer size in bytes
+# context: the caller's context, carried to the completion
+# token:   receives the operation's token
+# ret:     0 once queued, or a negative native error or STATUS_STALE
 pub fun submit_read(backend: *Backend, native: usize, opening: u64, buffer: *u8, length: usize, context: usize, token: *types.Token) i64 {
     if (backend == nil || token == nil || (buffer == nil && length != 0)) { ret invalid(); }
     mutex.lock(?backend.lock);
@@ -821,6 +946,16 @@ pub fun submit_readable(backend: *Backend, native: usize, opening: u64, context:
     ret 0;
 }
 
+# queue a write from a borrowed buffer
+# ---
+# backend: the backend
+# native:  the native socket
+# opening: the handle's opening, 0 for a backend whose handles carry none
+# buffer:  the bytes to send, borrowed until the operation completes
+# length:  bytes to send
+# context: the caller's context, carried to the completion
+# token:   receives the operation's token
+# ret:     0 once queued, or a negative native error or STATUS_STALE. EPIPE after a write shutdown
 pub fun submit_write(backend: *Backend, native: usize, opening: u64, buffer: *u8, length: usize, context: usize, token: *types.Token) i64 {
     if (backend == nil || token == nil || (buffer == nil && length != 0)) { ret invalid(); }
     mutex.lock(?backend.lock);
@@ -837,6 +972,14 @@ pub fun submit_write(backend: *Backend, native: usize, opening: u64, buffer: *u8
     ret 0;
 }
 
+# queue a shutdown of the write side, behind the writes already queued
+# ---
+# backend: the backend
+# native:  the native socket
+# opening: the handle's opening, 0 for a backend whose handles carry none
+# context: the caller's context, carried to the completion
+# token:   receives the operation's token
+# ret:     0 once queued, or a negative native error or STATUS_STALE
 pub fun submit_shutdown_write(backend: *Backend, native: usize, opening: u64, context: usize, token: *types.Token) i64 {
     if (backend == nil || token == nil) { ret invalid(); }
     mutex.lock(?backend.lock);
@@ -851,6 +994,15 @@ pub fun submit_shutdown_write(backend: *Backend, native: usize, opening: u64, co
     ret 0;
 }
 
+# start a close: queued reads finish cancelled and the close waits for the writes to drain
+# ---
+# backend:      the backend, locked
+# native:       the native socket
+# opening:      the handle's opening, 0 for a backend whose handles carry none
+# context:      the caller's context, carried to the completion
+# token:        receives the close operation's token
+# resource_out: receives the resource being closed
+# ret:          0 once started, or a negative native error or STATUS_STALE
 pub fun begin_close_locked(backend: *Backend, native: usize, opening: u64, context: usize, token: *types.Token, resource_out: **Resource) i64 {
     var operation: *Operation;
     val status:    i64 = begin(backend, native, opening, runtime.CLOSE, context, LANE_NONE, token, resource_out, ?operation);
@@ -865,6 +1017,14 @@ pub fun begin_close_locked(backend: *Backend, native: usize, opening: u64, conte
     ret 0;
 }
 
+# queue a close, which closes the native socket once its queued writes finish
+# ---
+# backend: the backend
+# native:  the native socket, owned by the backend from here
+# opening: the handle's opening, 0 for a backend whose handles carry none
+# context: the caller's context, carried to the completion
+# token:   receives the operation's token
+# ret:     0 once queued, or a negative native error or STATUS_STALE
 pub fun submit_close(backend: *Backend, native: usize, opening: u64, context: usize, token: *types.Token) i64 {
     if (backend == nil || token == nil) { ret invalid(); }
     mutex.lock(?backend.lock);
@@ -940,6 +1100,10 @@ fun publish_ready(backend: *Backend) usize {
     ret count;
 }
 
+# publish the finished operations without waiting
+# ---
+# backend: the backend
+# ret:     the number of completions now readable through completion, or EINVAL
 pub fun flush(backend: *Backend) i64 {
     if (backend == nil) { ret invalid(); }
     mutex.lock(?backend.lock);
@@ -948,6 +1112,15 @@ pub fun flush(backend: *Backend) i64 {
     ret ready::i64;
 }
 
+# handle one event the runtime's shared queue delivered
+# ---
+# backend: the backend
+# context: the event's wire context
+# events:  the native readiness events
+# status:  unused by this engine
+# flags:   unused by this engine
+# claimed: set true when the context belongs to this backend
+# ret:     the number of completions now readable through completion, or EINVAL
 pub fun dispatch(
     backend: *Backend,
     context: usize,
@@ -1007,12 +1180,22 @@ pub fun poll(backend: *Backend, timeout_ms: i32) i64 {
     ret ready::i64;
 }
 
+# copy out one completion the last publish made readable
+# ---
+# backend: the backend
+# index:   below the count the last flush, dispatch or poll returned
+# out:     receives the completion
+# ret:     0, or EINVAL for a bad argument or an index past the count
 pub fun completion(backend: *Backend, index: usize, out: *types.NativeCompletion) i64 {
     if (backend == nil || out == nil || index >= backend.ready_count) { ret invalid(); }
     @out = @ready_at(backend, index);
     ret 0;
 }
 
+# release the backend, its idle resources and their registrations
+# ---
+# backend: the backend
+# ret:     0, EBUSY while an operation is live or unpublished, EINVAL for nil
 pub fun dnit(backend: *Backend) i64 {
     if (backend == nil) { ret invalid(); }
     mutex.lock(?backend.lock);
@@ -1046,6 +1229,10 @@ pub fun dnit(backend: *Backend) i64 {
     ret 0;
 }
 
+# close a native socket
+# ---
+# resource: the native socket
+# ret:      0, or a negative native error
 pub fun socket_close(resource: usize) i64 {
     ret sys.sock_close(resource);
 }

@@ -3,13 +3,13 @@
 # threading model
 # each scope's lock guards its state, its registrations and its children's
 # sibling links. attach and unregister take only their scope's lock, and
-# make_child and destroy take the parent's (destroy then the scope's own).
+# make_child and dnit take the parent's (dnit then the scope's own).
 # a cancel walks the subtree top-down, holding a parent's lock while it visits
 # that parent's children. locks are only ever taken parent before child.
 # finish and reason take no lock.
 #
 # a shared scope serializes attach and unregister across every thread using
-# it, and a shared parent serializes make_child and destroy. servers should
+# it, and a shared parent serializes make_child and dnit. servers should
 # give each worker its own root and each connection its own child scope. on a
 # ryzen 7 5800x3d at -O2, attach plus unregister totals about 3.8M/s on one
 # scope shared by 8 threads, against about 78M/s on 8 per-thread children
@@ -99,6 +99,19 @@ val REG_CLAIMING:  i64 = 4;
 val REG_DETACHING: i64 = 5;
 val GATE_CLOSED:   i64 = -1;
 
+# a caller-owned slot that ties a cancellation callback to a scope
+#
+# prepare it with registration_make, then attach it. the fields are internal.
+# ---
+# root:       root of the scope it is attached to, nil while unattached
+# scope:      scope it is listed on, nil while unattached or once claimed
+# prev:       previous registration on the scope's list
+# next:       next registration on the scope's list, or on a cancel's claim list
+# callback:   hook run when the scope is cancelled or times out
+# completion: optional hook run after callback, nil when absent
+# context:    caller pointer passed to both hooks
+# reason:     state the claiming cancel moved the scope to
+# state:      lifecycle state of the registration, changed atomically
 pub rec Registration {
     root:       *Scope;
     scope:      *Scope;
@@ -111,6 +124,24 @@ pub rec Registration {
     state:      i64;
 }
 
+# a caller-owned node in a cancellation tree, fixed in memory once made
+#
+# prepare it with make_root or make_child and release it with dnit. the fields
+# are internal.
+# ---
+# root:               root of the tree, the scope itself for a root
+# parent:             parent scope, nil for a root
+# first_child:        head of the list of child scopes
+# prev_sibling:       previous child of the same parent
+# next_sibling:       next child of the same parent
+# first_registration: head of the list of attached registrations
+# deadline:           effective absolute monotonic deadline, none when absent
+# deadline_owner:     scope that declared the effective deadline
+# state:              active, cancelled, timed out or destroyed, changed atomically
+# waiters:            threads blocked in wait on this scope
+# gate:               in-flight callers, or GATE_CLOSED once destroyed
+# callback_count:     claimed callbacks still running, kept on the root
+# lock:               guards state, registrations and the children's sibling links
 pub rec Scope {
     root:               *Scope;
     parent:             *Scope;
@@ -137,6 +168,10 @@ fun valid_deadline(deadline: opt[time.Instant]) bool {
 #
 # a deadline is an absolute monotonic Instant, for example
 # `time.instant_add(time.instant().ok, timeout)`
+# ---
+# scope:    storage to make into a root scope
+# deadline: absolute monotonic deadline, or none
+# ret:      ok, or invalid for a nil scope or a malformed deadline
 pub fun make_root(scope: *Scope, deadline: opt[time.Instant]) Operation {
     if (scope == nil || !valid_deadline(deadline)) { ret Operation.err{StateError.invalid{}}; }
     scope.root               = scope;
@@ -175,6 +210,13 @@ fun scope_leave(scope: *Scope) {
 #
 # a deadline is an absolute monotonic Instant, for example
 # `time.instant_add(time.instant().ok, timeout)`
+# a child made under a parent that already left active starts in the same state
+# ---
+# scope:    storage to make into a child scope
+# parent:   live scope to attach the child under
+# deadline: absolute monotonic deadline of the child, or none
+# ret:      ok, invalid for nil operands, scope equal to parent or a malformed
+#           deadline, destroyed when the parent has been destroyed
 pub fun make_child(scope: *Scope, parent: *Scope, deadline: opt[time.Instant]) Operation {
     if (scope == nil || parent == nil || scope == parent || !valid_deadline(deadline)) { ret Operation.err{StateError.invalid{}}; }
     if (!scope_enter(parent))                                                          { ret Operation.err{StateError.destroyed{}}; }
@@ -217,6 +259,9 @@ pub fun make_child(scope: *Scope, parent: *Scope, deadline: opt[time.Instant]) O
 }
 
 # initialization is valid before first attachment or after terminal completion
+# ---
+# registration: storage to reset to the unused state
+# ret:          ok, or invalid for nil
 pub fun registration_make(registration: *Registration) Operation {
     if (registration == nil) { ret Operation.err{StateError.invalid{}}; }
     registration.root       = nil;
@@ -280,11 +325,26 @@ fun attach_internal(scope: *Scope, registration: *Registration, callback: Cancel
 }
 
 # successful registration is the ownership linearization point
+# ---
+# scope:        scope to attach to
+# registration: unused or completed registration to attach
+# callback:     hook run once if the scope is cancelled or times out
+# context:      caller pointer passed to callback
+# ret:          active once attached, the scope's reason when it already left
+#               active, destroyed for a destroyed scope, invalid for nil
+#               operands, a nil callback or a registration in use
 pub fun attach(scope: *Scope, registration: *Registration, callback: CancelFun, context: ptr) Reason {
     ret attach_internal(scope, registration, callback, (0::usize)::CancelFun, context);
 }
 
 # completion publishes external work and must call finish under its lifetime lock
+# ---
+# scope:        scope to attach to
+# registration: unused or completed registration to attach
+# callback:     hook run once if the scope is cancelled or times out
+# completion:   hook run right after callback, it must end with finish
+# context:      caller pointer passed to both hooks
+# ret:          as attach, and invalid for a nil completion
 pub fun attach_with_completion(scope: *Scope, registration: *Registration, callback: CancelFun, completion: CancelFun, context: ptr) Reason {
     if (completion::usize == 0) { ret Reason.invalid{}; }
     ret attach_internal(scope, registration, callback, completion, context);
@@ -292,8 +352,10 @@ pub fun attach_with_completion(scope: *Scope, registration: *Registration, callb
 
 # this must be the completion hook's final registration operation
 # ---
-# ret: true when this call completed a cancelled registration, false when the
-#      registration was not awaiting completion, invalid for nil
+# registration: registration whose completion hook is running
+# ret:          true when this call completed a cancelled registration, false
+#               when the registration was not awaiting completion, invalid for
+#               nil
 pub fun finish(registration: *Registration) Transition {
     if (registration == nil) { ret Transition.err{StateError.invalid{}}; }
     var expected: i64 = REG_CANCELLED;
@@ -302,8 +364,10 @@ pub fun finish(registration: *Registration) Transition {
 
 # completion wins only while the registration remains owned by its scope
 # ---
-# ret: true when this call detached the registration, false when cancellation
-#      already claimed it (the completion hook owns it), invalid for nil
+# registration: registration to detach from its scope
+# ret:          true when this call detached the registration, false when
+#               cancellation already claimed it (the completion hook owns it),
+#               invalid for nil
 pub fun unregister(registration: *Registration) Transition {
     if (registration == nil) { ret Transition.err{StateError.invalid{}}; }
     var expected: i64 = REG_ACTIVE;
@@ -435,23 +499,31 @@ fun transition(scope: *Scope, reason: i64) Transition {
     ret Transition.ok{true};
 }
 
-# ret: true when this call cancelled the scope, false when it was already
-#      cancelled or timed out
+# cancel a scope and its whole subtree, running each claimed callback
+# ---
+# scope: scope to cancel
+# ret:   true when this call cancelled the scope, false when it was already
+#        cancelled or timed out
 pub fun cancel(scope: *Scope) Transition {
     ret transition(scope, CANCELLED);
 }
 
-# ret: true when this call timed the scope out, false when it was already
-#      cancelled or timed out
+# time a scope and its whole subtree out, running each claimed callback
+# ---
+# scope: scope to time out
+# ret:   true when this call timed the scope out, false when it was already
+#        cancelled or timed out
 pub fun timeout(scope: *Scope) Transition {
     ret transition(scope, TIMED_OUT);
 }
 
 # callers without a runtime may drive absolute deadlines explicitly
 # ---
-# ret: true when now reached the effective deadline and this call timed its
-#      owner out, false when there is no deadline, it has not passed, or the
-#      owner had already left active
+# scope: scope whose effective deadline is checked
+# now:   current absolute monotonic instant
+# ret:   true when now reached the effective deadline and this call timed its
+#        owner out, false when there is no deadline, it has not passed, or the
+#        owner had already left active
 pub fun expire(scope: *Scope, now: time.Instant) Transition {
     if (scope == nil)        { ret Transition.err{StateError.invalid{}}; }
     if (!scope_enter(scope)) { ret Transition.err{StateError.destroyed{}}; }
@@ -470,8 +542,9 @@ pub fun expire(scope: *Scope, now: time.Instant) Transition {
 
 # returns the effective deadline and the ancestor that owns it
 # ---
-# ret: some{deadline} when the scope or an ancestor declared one, none when
-#      the scope has no deadline, destroyed once the scope is gone
+# scope: scope to query
+# ret:   some{deadline} when the scope or an ancestor declared one, none when
+#        the scope has no deadline, destroyed once the scope is gone
 pub fun get_deadline(scope: *Scope) DeadlineQuery {
     if (scope == nil)        { ret DeadlineQuery.err{StateError.invalid{}}; }
     if (!scope_enter(scope)) { ret DeadlineQuery.err{StateError.destroyed{}}; }
@@ -485,6 +558,10 @@ pub fun get_deadline(scope: *Scope) DeadlineQuery {
     ret DeadlineQuery.ok{opt[Deadline].some{found}};
 }
 
+# read why a scope is no longer active, or that it still is
+# ---
+# scope: scope to read
+# ret:   the scope's reason, destroyed for nil or a destroyed scope
 pub fun reason(scope: *Scope) Reason {
     if (scope == nil || !scope_enter(scope)) { ret Reason.destroyed{}; }
     val state: i64 = atomic.load(?scope.state);
@@ -492,6 +569,10 @@ pub fun reason(scope: *Scope) Reason {
     ret reason_of(state);
 }
 
+# block until a scope leaves active
+# ---
+# scope: scope to wait on
+# ret:   the reason it left active, destroyed for nil or a destroyed scope
 pub fun wait(scope: *Scope) Reason {
     if (scope == nil || !scope_enter(scope)) { ret Reason.destroyed{}; }
     for (true) {
@@ -507,6 +588,10 @@ pub fun wait(scope: *Scope) Reason {
     ret Reason.destroyed{};
 }
 
+# count the threads blocked in wait on a scope
+# ---
+# scope: scope to read
+# ret:   waiter count, 0 for nil or a destroyed scope
 pub fun waiter_count(scope: *Scope) i64 {
     if (scope == nil || !scope_enter(scope)) { ret 0; }
     val count: i64 = atomic.load(?scope.waiters);
