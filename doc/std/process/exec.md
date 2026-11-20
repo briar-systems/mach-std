@@ -689,7 +689,7 @@ pub fun output(a: *std.allocator.Allocator, pathname: str, argv: **u8, envp: std
 run a process and collect its complete standard output
 
 spawns the child with stdout bound to a pipe and drains it to end-of-file
-through io.read_all over the pipe's read end, so output of any length is
+through std.io.reader.read_all over the pipe's read end, so output of any length is
 captured and the child never blocks on a full pipe. a wait is attempted even
 when the drain fails, and a failed wait returns the remaining child owner.
 
@@ -764,7 +764,8 @@ pub fun spawn_with_options(pathname: str, argv: **u8, envp: std.system.os.Enviro
 
 start a process without waiting, as `options` describes
 
-every spawn of this module is this one with some options set.
+every spawn of this module that takes UTF-8 arguments is this one with some
+options set, apart from the windows spawn_shell, which builds its own line.
 
 | Parameter | |
 | :--- | :--- |
@@ -993,6 +994,8 @@ pub rec ProcessStatus {
     core_dumped: bool;
 }
 ```
+
+one observed change in a child's state
 
 ### PROCESS_EXITED
 

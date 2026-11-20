@@ -28,11 +28,17 @@ Uses types from [`std.allocator`](../allocator.md), [`std.chrono.time`](../chron
 | On `Resolver` | |
 | :--- | :--- |
 | [`init_with_adapter`](#init_with_adapter) | initialize a resolver in place over caller-owned storage; a refused acquisition releases what was acquired and leaves the storage unowned |
-| [`init`](#init), [`init_runtime_with_adapter`](#init_runtime_with_adapter), [`init_runtime`](#init_runtime), [`submit`](#submit), [`submit_runtime`](#submit_runtime) | |
+| [`init`](#init) | initialize a resolver in place that resolves through the system backend |
+| [`init_runtime_with_adapter`](#init_runtime_with_adapter) | initialize a resolver attached to an io runtime, with a caller's backend |
+| [`init_runtime`](#init_runtime) | initialize a resolver attached to an io runtime that resolves through the system backend |
+| [`submit`](#submit) | start a lookup on a resolver that is not attached to a runtime |
+| [`submit_runtime`](#submit_runtime) | start a lookup on a runtime-attached resolver, completed through the runtime |
 | [`cancel`](#cancel) | cancel a live operation |
-| [`poll`](#poll), [`wait`](#wait), [`wait_until`](#wait_until) | |
+| [`poll`](#poll) | take the completions ready now, without blocking |
+| [`wait`](#wait) | block until a completion is ready or no operation is live, then take them |
+| [`wait_until`](#wait_until) | wait, giving up at a deadline |
 | [`close`](#close) | stop admitting submissions; CLOSED when the resolver is not open |
-| [`dnit`](#dnit) | release the resolver's storage: INVALID with EINVAL before close, INVALID with EBUSY while operations, completions or waiters remain; a refused release reports the runtime's or the allocator's failure after every release has been attempted |
+| [`dnit`](#dnit) | release the resolver's storage: INVALID before close, and INVALID while operations, completions or waiters remain |
 
 | Functions | |
 | :--- | :--- |
@@ -102,6 +108,17 @@ pub fun init(resolver: *Resolver, pool: *std.sync.worker_pool.Pool, owner: *std.
     capacity: usize, result_limits: std.net.resolve.types.ResultLimits) err[std.net.resolve.types.Error]
 ```
 
+initialize a resolver in place that resolves through the system backend
+
+| Parameter | |
+| :--- | :--- |
+| `resolver` | the storage to initialize, released with close then dnit |
+| `pool` | the worker pool lookups run on, accepting work |
+| `owner` | the allocator of the resolver's storage and every result |
+| `capacity` | how many operations may be live or queued at once |
+| `result_limits` | the bounds of each resolution |
+| **returns** | ok, or INVALID for a nil argument, a capacity of zero or of 0xffffffff and above, zero limits or an invalid pool, CLOSED for a pool that no longer accepts work, OUT_OF_MEMORY when the storage cannot be allocated |
+
 ### init_runtime_with_adapter
 
 ```mach
@@ -109,6 +126,22 @@ pub fun init_runtime_with_adapter(resolver: *Resolver, runtime: *std.io.runtime.
     pool: *std.sync.worker_pool.Pool, owner: *std.allocator.Allocator, capacity: usize,
     result_limits: std.net.resolve.types.ResultLimits, adapter_context: ptr, adapter: std.net.resolve.types.AdapterFun) err[std.net.resolve.types.Error]
 ```
+
+initialize a resolver attached to an io runtime, with a caller's backend
+
+lookups are submitted with submit_runtime and complete through the runtime
+
+| Parameter | |
+| :--- | :--- |
+| `resolver` | the storage to initialize, released with close then dnit |
+| `runtime` | the runtime the resolver registers with as a source |
+| `pool` | the worker pool lookups run on |
+| `owner` | the allocator of the resolver's storage and every result |
+| `capacity` | how many operations may be live or queued at once |
+| `result_limits` | the bounds of each resolution |
+| `adapter_context` | the context the adapter is called with |
+| `adapter` | the backend that resolves each query |
+| **returns** | ok, or the failure as init_with_adapter reports it, INVALID for a nil runtime, or the runtime's refusal to register, after which nothing is left allocated |
 
 ### init_runtime
 
@@ -118,11 +151,37 @@ pub fun init_runtime(resolver: *Resolver, runtime: *std.io.runtime.Runtime,
     result_limits: std.net.resolve.types.ResultLimits) err[std.net.resolve.types.Error]
 ```
 
+initialize a resolver attached to an io runtime that resolves through the system backend
+
+| Parameter | |
+| :--- | :--- |
+| `resolver` | the storage to initialize, released with close then dnit |
+| `runtime` | the runtime the resolver registers with as a source |
+| `pool` | the worker pool lookups run on |
+| `owner` | the allocator of the resolver's storage and every result |
+| `capacity` | how many operations may be live or queued at once |
+| `result_limits` | the bounds of each resolution |
+| **returns** | ok, or the failure as init_runtime_with_adapter reports it |
+
 ### submit
 
 ```mach
 pub fun submit(resolver: *Resolver, scope: *std.sync.cancel.Scope, query: *std.net.resolve.types.Query, context: usize) res[std.net.resolve.types.Token, std.net.resolve.types.Error]
 ```
+
+start a lookup on a resolver that is not attached to a runtime
+
+the query's host and service are copied, so the caller's strings may go at
+once. a numeric host with a numeric service completes without the pool. the
+completion is collected with poll, wait or wait_until
+
+| Parameter | |
+| :--- | :--- |
+| `resolver` | the resolver, made with init or init_with_adapter |
+| `scope` | bounds and cancels the lookup |
+| `query` | what to resolve |
+| `context` | a value the completion carries back |
+| **returns** | the operation's token, or INVALID for a nil argument, an invalid query or a runtime-attached resolver, SYSTEM_FAILURE when the clock cannot be read, the scope's reason when it has already ended, CLOSED when the resolver is not open, OVERLOADED when every operation is live, or the pool's refusal |
 
 ### submit_runtime
 
@@ -130,6 +189,16 @@ pub fun submit(resolver: *Resolver, scope: *std.sync.cancel.Scope, query: *std.n
 pub fun submit_runtime(resolver: *Resolver, scope: *std.sync.cancel.Scope,
     query: *std.net.resolve.types.Query, context: usize) res[std.io.runtime.Token, std.net.resolve.types.Error]
 ```
+
+start a lookup on a runtime-attached resolver, completed through the runtime
+
+| Parameter | |
+| :--- | :--- |
+| `resolver` | the resolver, made with init_runtime or init_runtime_with_adapter |
+| `scope` | bounds and cancels the lookup, enforced by the runtime |
+| `query` | what to resolve |
+| `context` | a value the completion carries back |
+| **returns** | the runtime token of the operation, or INVALID for a nil argument, an invalid query or a resolver with no runtime, CLOSED when the resolver is not open, OVERLOADED when every operation is live, or the runtime's refusal |
 
 ### cancel
 
@@ -149,17 +218,47 @@ cancel a live operation
 pub fun poll(resolver: *Resolver, output: *std.net.resolve.types.Completion, capacity: usize) usize
 ```
 
+take the completions ready now, without blocking
+
+| Parameter | |
+| :--- | :--- |
+| `resolver` | the resolver |
+| `output` | room for capacity completions, each resolution then owned by the caller and released with resolution_dnit |
+| `capacity` | how many completions output holds |
+| **returns** | the completions written, 0 for a nil argument or a zero capacity |
+
 ### wait
 
 ```mach
 pub fun wait(resolver: *Resolver, output: *std.net.resolve.types.Completion, capacity: usize) usize
 ```
 
+block until a completion is ready or no operation is live, then take them
+
+a runtime-attached resolver does not block here and polls instead
+
+| Parameter | |
+| :--- | :--- |
+| `resolver` | the resolver |
+| `output` | room for capacity completions, each resolution then owned by the caller and released with resolution_dnit |
+| `capacity` | how many completions output holds |
+| **returns** | the completions written, 0 when none is live or for a nil argument or a zero capacity |
+
 ### wait_until
 
 ```mach
 pub fun wait_until(resolver: *Resolver, output: *std.net.resolve.types.Completion, capacity: usize, deadline: std.chrono.time.Instant) usize
 ```
+
+wait, giving up at a deadline
+
+| Parameter | |
+| :--- | :--- |
+| `resolver` | the resolver |
+| `output` | room for capacity completions, each resolution then owned by the caller and released with resolution_dnit |
+| `capacity` | how many completions output holds |
+| `deadline` | when to stop waiting |
+| **returns** | the completions written, 0 when the deadline passed first, none is live, or for a nil argument or a zero capacity |
 
 ### close
 
@@ -175,8 +274,8 @@ stop admitting submissions; CLOSED when the resolver is not open
 pub fun dnit(resolver: *Resolver) err[std.net.resolve.types.Error]
 ```
 
-release the resolver's storage: INVALID with EINVAL before close, INVALID
-with EBUSY while operations, completions or waiters remain; a refused
+release the resolver's storage: INVALID before close, and INVALID while
+operations, completions or waiters remain. a refused
 release reports the runtime's or the allocator's failure after every
 release has been attempted
 
@@ -406,6 +505,8 @@ pub rec Error {
 }
 ```
 
+a resolver failure
+
 ### Token
 
 Forwards [`std.net.resolve.types.Token`](resolve/types.md#token), only where `capability.HAS_CLOCK && capability.HAS_THREADS`.
@@ -416,6 +517,8 @@ pub rec Token {
     generation: u32;
 }
 ```
+
+names one submitted lookup
 
 ### Query
 
@@ -432,6 +535,8 @@ pub rec Query {
 }
 ```
 
+what a lookup asks for
+
 ### ResultLimits
 
 Forwards [`std.net.resolve.types.ResultLimits`](resolve/types.md#resultlimits), only where `capability.HAS_CLOCK && capability.HAS_THREADS`.
@@ -442,6 +547,8 @@ pub rec ResultLimits {
     max_canonical_name_bytes: usize;
 }
 ```
+
+caps on what one resolution may allocate
 
 ### Resolution
 
@@ -474,6 +581,8 @@ pub rec Completion {
     error:      Error;
 }
 ```
+
+one finished lookup as the resolver delivers it
 
 ### AdapterFun
 

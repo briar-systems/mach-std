@@ -6,8 +6,8 @@ null-terminated string queries and allocating constructors
 
 nil contract: nil is the empty string throughout. queries and predicates
 treat it as "", and constructors produce a fresh empty allocation for it.
-constructors fail only on allocation failure or a nil allocator, never on
-their string inputs.
+constructors fail only on allocation failure, a nil allocator, a length that
+does not fit usize, or a slice that does not lie within its string.
 
 Source: [`src/types/string.mach`](../../../src/types/string.mach)
 

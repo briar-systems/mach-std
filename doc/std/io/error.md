@@ -13,7 +13,7 @@ Source: [`src/io/error.mach`](../../../src/io/error.mach)
 | :--- | :--- | :--- |
 | [`Kind`](#kind) | `def` |  |
 | [`Operation`](#operation) | `def` |  |
-| [`Error`](#error) | `rec` |  |
+| [`Error`](#error) | `rec` | a normalized I/O error |
 
 | On `Kind` | |
 | :--- | :--- |
@@ -28,7 +28,7 @@ Source: [`src/io/error.mach`](../../../src/io/error.mach)
 
 | On `Error` | |
 | :--- | :--- |
-| [`retryable`](#retryable) | |
+| [`retryable`](#retryable) | whether retrying the failed operation may succeed |
 
 ---
 
@@ -130,9 +130,25 @@ pub rec Error {
 }
 ```
 
+a normalized I/O error
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `kind` | `Kind` | the portable classification |
+| `code` | `i64` | the native error code, 0 when std raised the error itself |
+| `operation` | `Operation` | the operation that failed |
+| `cleanup_code` | `i64` | first secondary cleanup failure, zero when none was observed |
+
 ### retryable
 
 ```mach
 pub fun retryable(error: Error) bool
 ```
+
+whether retrying the failed operation may succeed
+
+| Parameter | |
+| :--- | :--- |
+| `error` | the error to classify |
+| **returns** | true when the kind is INTERRUPTED or WOULD_BLOCK |
 

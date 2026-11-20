@@ -15,9 +15,9 @@ Uses types from [`std.chrono.time`](chrono/time.md), [`std.io.writer`](io/writer
 
 | On `Logger` | |
 | :--- | :--- |
-| [`logger_set_level`](#logger_set_level) | |
+| [`logger_set_level`](#logger_set_level) | change the logger's minimum level, ignored for a nil logger or a level past OFF |
 | [`emit`](#emit) | encode and publish one record; the report's offered count is the full record's size and truncated tells whether the sink saw a shortened line |
-| [`write_at`](#write_at) | |
+| [`write_at`](#write_at) | publish one record stamped with a caller-supplied time, sampling no clock |
 | [`write`](#write) | stamp and publish; a clock that cannot be sampled fails the write and publishes nothing, since a record is never given a time it did not have |
 
 | On `Made` | |
@@ -28,7 +28,14 @@ Uses types from [`std.chrono.time`](chrono/time.md), [`std.io.writer`](io/writer
 | :--- | :--- |
 | [`set_level`](#set_level) | messages below this level are suppressed before timestamp sampling |
 | [`set_writer`](#set_writer) | the writer ctx is borrowed and must outlive every subsequent global log call the pair changes under out_lock, so a concurrent log call sees the old pair or the new one |
-| [`debug_report`](#debug_report), [`info_report`](#info_report), [`warn_report`](#warn_report), [`error_report`](#error_report), [`debug`](#debug), [`info`](#info), [`warn`](#warn), [`error`](#error) | |
+| [`debug_report`](#debug_report) | write a message at DEBUG through the global writer and report the outcome |
+| [`info_report`](#info_report) | write a message at INFO through the global writer and report the outcome |
+| [`warn_report`](#warn_report) | write a message at WARN through the global writer and report the outcome |
+| [`error_report`](#error_report) | write a message at ERROR through the global writer and report the outcome |
+| [`debug`](#debug) | write a message at DEBUG through the global writer, discarding the report |
+| [`info`](#info) | write a message at INFO through the global writer, discarding the report |
+| [`warn`](#warn) | write a message at WARN through the global writer, discarding the report |
+| [`error`](#error) | write a message at ERROR through the global writer, discarding the report |
 
 | Forwards | |
 | :--- | :--- |
@@ -54,6 +61,13 @@ the sink and borrowed clock context must outlive the logger
 pub fun logger_set_level(log: *Logger, level: std.log.record.Level)
 ```
 
+change the logger's minimum level, ignored for a nil logger or a level past OFF
+
+| Parameter | |
+| :--- | :--- |
+| `log` | the logger to change |
+| `level` | records below this level are suppressed from now on |
+
 ### emit
 
 ```mach
@@ -68,6 +82,18 @@ record's size and truncated tells whether the sink saw a shortened line
 ```mach
 pub fun write_at(log: *Logger, timestamp: std.chrono.time.Time, level: std.log.record.Level, message: str, fields: *std.log.record.Field, field_count: usize) std.log.sink.WriteReport
 ```
+
+publish one record stamped with a caller-supplied time, sampling no clock
+
+| Parameter | |
+| :--- | :--- |
+| `log` | the logger to write through |
+| `timestamp` | the time recorded in the line, at the logger clock's precision |
+| `level` | the record's level |
+| `message` | the record's message |
+| `fields` | the record's fields, borrowed for the call |
+| `field_count` | how many fields are at fields |
+| **returns** | the write report emit gives, failed with invalid for a nil logger |
 
 ### write
 
@@ -121,11 +147,25 @@ the pair changes under out_lock, so a concurrent log call sees the old pair or t
 pub fun debug_report(message: str) std.log.sink.WriteReport
 ```
 
+write a message at DEBUG through the global writer and report the outcome
+
+| Parameter | |
+| :--- | :--- |
+| `message` | the message to log |
+| **returns** | the write report, suppressed below the global level, failed when the clock cannot be sampled or the record cannot be encoded, rejected with too_large past MAX_RECORD_BYTES, otherwise the outcome of one write to the global writer or standard error |
+
 ### info_report
 
 ```mach
 pub fun info_report(message: str) std.log.sink.WriteReport
 ```
+
+write a message at INFO through the global writer and report the outcome
+
+| Parameter | |
+| :--- | :--- |
+| `message` | the message to log |
+| **returns** | the write report, suppressed below the global level, failed when the clock cannot be sampled or the record cannot be encoded, rejected with too_large past MAX_RECORD_BYTES, otherwise the outcome of one write to the global writer or standard error |
 
 ### warn_report
 
@@ -133,11 +173,25 @@ pub fun info_report(message: str) std.log.sink.WriteReport
 pub fun warn_report(message: str) std.log.sink.WriteReport
 ```
 
+write a message at WARN through the global writer and report the outcome
+
+| Parameter | |
+| :--- | :--- |
+| `message` | the message to log |
+| **returns** | the write report, suppressed below the global level, failed when the clock cannot be sampled or the record cannot be encoded, rejected with too_large past MAX_RECORD_BYTES, otherwise the outcome of one write to the global writer or standard error |
+
 ### error_report
 
 ```mach
 pub fun error_report(message: str) std.log.sink.WriteReport
 ```
+
+write a message at ERROR through the global writer and report the outcome
+
+| Parameter | |
+| :--- | :--- |
+| `message` | the message to log |
+| **returns** | the write report, suppressed below the global level, failed when the clock cannot be sampled or the record cannot be encoded, rejected with too_large past MAX_RECORD_BYTES, otherwise the outcome of one write to the global writer or standard error |
 
 ### debug
 
@@ -145,11 +199,23 @@ pub fun error_report(message: str) std.log.sink.WriteReport
 pub fun debug(message: str)
 ```
 
+write a message at DEBUG through the global writer, discarding the report
+
+| Parameter | |
+| :--- | :--- |
+| `message` | the message to log |
+
 ### info
 
 ```mach
 pub fun info(message: str)
 ```
+
+write a message at INFO through the global writer, discarding the report
+
+| Parameter | |
+| :--- | :--- |
+| `message` | the message to log |
 
 ### warn
 
@@ -157,11 +223,23 @@ pub fun info(message: str)
 pub fun warn(message: str)
 ```
 
+write a message at WARN through the global writer, discarding the report
+
+| Parameter | |
+| :--- | :--- |
+| `message` | the message to log |
+
 ### error
 
 ```mach
 pub fun error(message: str)
 ```
+
+write a message at ERROR through the global writer, discarding the report
+
+| Parameter | |
+| :--- | :--- |
+| `message` | the message to log |
 
 ## Forwards
 
@@ -408,6 +486,8 @@ pub rec Bytes {
 }
 ```
 
+a borrowed run of bytes
+
 ### Field
 
 Forwards [`std.log.record.Field`](log/record.md#field).
@@ -525,7 +605,7 @@ Only where `capability.HAS_CLOCK`.
 pub fun system_clock(precision: Precision) Clock
 ```
 
-the system clock reads the OS layer's clock group
+a clock reading the system time, with no context
 
 ### clock
 
@@ -535,6 +615,8 @@ Forwards [`std.log.record.clock`](log/record.md#clock).
 pub fun clock(ctx: ptr, f_now: NowFun, precision: Precision) Clock
 ```
 
+a clock over a caller's source, borrowing its context
+
 ### clock_valid
 
 Forwards [`std.log.record.clock_valid`](log/record.md#clock_valid).
@@ -542,6 +624,8 @@ Forwards [`std.log.record.clock_valid`](log/record.md#clock_valid).
 ```mach
 pub fun clock_valid(c: *Clock) bool
 ```
+
+tell whether a clock can be sampled
 
 ### clock_now
 
@@ -561,6 +645,8 @@ Forwards [`std.log.record.record_at`](log/record.md#record_at).
 pub fun record_at(timestamp: Time, precision: Precision, level: Level, message: str, fields: *Field, field_count: usize) Record
 ```
 
+build a record stamped with a given time, truncated to the precision
+
 ### field_i64
 
 Forwards [`std.log.record.field_i64`](log/record.md#field_i64).
@@ -568,6 +654,8 @@ Forwards [`std.log.record.field_i64`](log/record.md#field_i64).
 ```mach
 pub fun field_i64(key: str, value: i64) Field
 ```
+
+a field carrying a signed integer
 
 ### field_u64
 
@@ -577,6 +665,8 @@ Forwards [`std.log.record.field_u64`](log/record.md#field_u64).
 pub fun field_u64(key: str, value: u64) Field
 ```
 
+a field carrying an unsigned integer
+
 ### field_bool
 
 Forwards [`std.log.record.field_bool`](log/record.md#field_bool).
@@ -584,6 +674,8 @@ Forwards [`std.log.record.field_bool`](log/record.md#field_bool).
 ```mach
 pub fun field_bool(key: str, value: bool) Field
 ```
+
+a field carrying a boolean
 
 ### field_bytes
 
@@ -593,6 +685,8 @@ Forwards [`std.log.record.field_bytes`](log/record.md#field_bytes).
 pub fun field_bytes(key: str, data: *u8, len: usize) Field
 ```
 
+a field carrying raw bytes, rendered as hex
+
 ### field_string
 
 Forwards [`std.log.record.field_string`](log/record.md#field_string).
@@ -600,6 +694,8 @@ Forwards [`std.log.record.field_string`](log/record.md#field_string).
 ```mach
 pub fun field_string(key: str, value: str) Field
 ```
+
+a field carrying a terminated string, rendered quoted
 
 ### field_error
 
@@ -609,6 +705,8 @@ Forwards [`std.log.record.field_error`](log/record.md#field_error).
 pub fun field_error(key: str, value: std.io.error.Error) Field
 ```
 
+a field carrying an io error
+
 ### level_name
 
 Forwards [`std.log.record.level_name`](log/record.md#level_name).
@@ -616,6 +714,8 @@ Forwards [`std.log.record.level_name`](log/record.md#level_name).
 ```mach
 pub fun level_name(level: Level) str
 ```
+
+the name a level renders as in a record
 
 ### encode_record
 
@@ -887,6 +987,8 @@ pub rec QueuedRecord {
 }
 ```
 
+one encoded record held in a queued sink's storage
+
 ### QueueStats
 
 Forwards [`std.log.sink.QueueStats`](log/sink.md#queuestats), only where `capability.HAS_CLOCK && capability.HAS_FILES && capability.HAS_THREADS`.
@@ -903,6 +1005,8 @@ pub rec QueueStats {
     last:      WriteReport;
 }
 ```
+
+a snapshot of a queued sink's counters
 
 ### Queued
 
@@ -941,6 +1045,8 @@ Forwards [`std.log.sink.report`](log/sink.md#report), only where `capability.HAS
 pub fun report(status: WriteStatus, offered: usize, persisted: usize, truncated: bool) WriteReport
 ```
 
+assemble a write report
+
 ### persisted
 
 Forwards [`std.log.sink.persisted`](log/sink.md#persisted), only where `capability.HAS_CLOCK && capability.HAS_FILES && capability.HAS_THREADS`.
@@ -948,6 +1054,8 @@ Forwards [`std.log.sink.persisted`](log/sink.md#persisted), only where `capabili
 ```mach
 pub fun persisted(bytes: usize) WriteReport
 ```
+
+a report for a publication the adapter fully confirmed
 
 ### partial
 
@@ -957,6 +1065,8 @@ Forwards [`std.log.sink.partial`](log/sink.md#partial), only where `capability.H
 pub fun partial(offered: usize, persisted_bytes: usize, error: SinkError) WriteReport
 ```
 
+a report for a publication the adapter confirmed only in part
+
 ### failed
 
 Forwards [`std.log.sink.failed`](log/sink.md#failed), only where `capability.HAS_CLOCK && capability.HAS_FILES && capability.HAS_THREADS`.
@@ -964,6 +1074,8 @@ Forwards [`std.log.sink.failed`](log/sink.md#failed), only where `capability.HAS
 ```mach
 pub fun failed(offered: usize, persisted_bytes: usize, error: SinkError) WriteReport
 ```
+
+a report for a publication that failed
 
 ### rejected
 
@@ -973,6 +1085,8 @@ Forwards [`std.log.sink.rejected`](log/sink.md#rejected), only where `capability
 pub fun rejected(offered: usize, error: SinkError) WriteReport
 ```
 
+a report for a publication nothing accepted, leaving the record with the caller
+
 ### dropped
 
 Forwards [`std.log.sink.dropped`](log/sink.md#dropped), only where `capability.HAS_CLOCK && capability.HAS_FILES && capability.HAS_THREADS`.
@@ -980,6 +1094,8 @@ Forwards [`std.log.sink.dropped`](log/sink.md#dropped), only where `capability.H
 ```mach
 pub fun dropped(offered: usize) WriteReport
 ```
+
+a report for a record a queue discarded under OVERLOAD_DROP_NEW
 
 ### enqueued
 
@@ -989,6 +1105,8 @@ Forwards [`std.log.sink.enqueued`](log/sink.md#enqueued), only where `capability
 pub fun enqueued(offered: usize) WriteReport
 ```
 
+a report for a record a queue accepted for later publication
+
 ### suppressed
 
 Forwards [`std.log.sink.suppressed`](log/sink.md#suppressed), only where `capability.HAS_CLOCK && capability.HAS_FILES && capability.HAS_THREADS`.
@@ -996,6 +1114,8 @@ Forwards [`std.log.sink.suppressed`](log/sink.md#suppressed), only where `capabi
 ```mach
 pub fun suppressed() WriteReport
 ```
+
+a report for a record below the level that was never encoded
 
 ### cause
 
@@ -1026,6 +1146,8 @@ Forwards [`std.log.sink.contract_valid`](log/sink.md#contract_valid), only where
 pub fun contract_valid(contract: Contract) bool
 ```
 
+tell whether a delivery contract is consistent
+
 ### queued_contract
 
 Forwards [`std.log.sink.queued_contract`](log/sink.md#queued_contract), only where `capability.HAS_CLOCK && capability.HAS_FILES && capability.HAS_THREADS`.
@@ -1053,6 +1175,8 @@ Forwards [`std.log.sink.publish`](log/sink.md#publish), only where `capability.H
 ```mach
 pub fun publish(sink: *Sink, data: *u8, len: usize) WriteReport
 ```
+
+publish one encoded record through a sink and check the adapter kept its contract
 
 ### direct_custom
 
@@ -1118,6 +1242,8 @@ Forwards [`std.log.sink.pipe_target_atomic_limit`](log/sink.md#pipe_target_atomi
 pub fun pipe_target_atomic_limit() usize
 ```
 
+the byte count a pipe write is atomic across processes on the build target
+
 ### queued_sink
 
 Forwards [`std.log.sink.queued`](log/sink.md#queued-1), only where `capability.HAS_CLOCK && capability.HAS_FILES && capability.HAS_THREADS`.
@@ -1125,6 +1251,8 @@ Forwards [`std.log.sink.queued`](log/sink.md#queued-1), only where `capability.H
 ```mach
 pub fun queued(queued: *Queued, storage: *QueuedRecord, capacity: usize, downstream: *Sink, max_record: usize, oversize: std.log.record.OversizePolicy, overload: OverloadPolicy) Created
 ```
+
+initialize a queued sink in place with the default worker thread configuration
 
 ### queued_sink_with_config
 
@@ -1179,6 +1307,8 @@ Forwards [`std.log.sink.queued_stats`](log/sink.md#queued_stats), only where `ca
 ```mach
 pub fun queued_stats(queued: *Queued) QueueStats
 ```
+
+snapshot a queued sink's counters
 
 ### queued_thread_error
 

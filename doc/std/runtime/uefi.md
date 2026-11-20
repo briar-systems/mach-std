@@ -25,7 +25,7 @@ Source: [`src/runtime/uefi.mach`](../../../src/runtime/uefi.mach)
 
 | Functions | |
 | :--- | :--- |
-| [`efi_main`](#efi_main) | |
+| [`efi_main`](#efi_main) | the uefi entry: keep the firmware's handle and table, then run main |
 | [`image_handle`](#image_handle) | the handle the firmware passed for this image |
 | [`system_table`](#system_table) | the system table the firmware passed, through which a program reaches the console and the boot and runtime services |
 
@@ -39,6 +39,14 @@ Source: [`src/runtime/uefi.mach`](../../../src/runtime/uefi.mach)
 #[symbol("efi_main")]
 pub fun efi_main(handle: ptr, system: *SystemTable) Status
 ```
+
+the uefi entry: keep the firmware's handle and table, then run main
+
+| Parameter | |
+| :--- | :--- |
+| `handle` | the handle of this image |
+| `system` | the system table |
+| **returns** | main's return value as the image's status |
 
 ### image_handle
 

@@ -22,7 +22,7 @@ Uses types from [`std.terminal.error`](error.md).
 | :--- | :--- |
 | [`is_raw`](#is_raw) | whether raw mode is currently active |
 | [`flush_input`](#flush_input) | no FlushConsoleInputBuffer binding yet -- poll_key already consumes only one event per call, so there is nothing separate to flush for this surface |
-| [`is_terminal`](#is_terminal) | |
+| [`is_terminal`](#is_terminal) | whether a descriptor is a terminal |
 | [`enable_raw`](#enable_raw) | switch stdin into raw mode -- same semantics as terminal.linux.enable_raw: no line buffering, no local echo |
 | [`disable_raw`](#disable_raw) | restore whatever GetConsoleMode saw before enable_raw ran |
 | [`poll_key`](#poll_key) | read one key-event record without blocking |
@@ -58,6 +58,13 @@ real binding would go here if that changes.
 ```mach
 pub fun is_terminal(fd: usize) bool
 ```
+
+whether a descriptor is a terminal
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the handle to test |
+| **returns** | true when fd is a console handle whose mode can be read |
 
 ### enable_raw
 

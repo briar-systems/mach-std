@@ -14,10 +14,10 @@ Uses types from [`std.sync.mutex`](../sync/mutex.md).
 | [`State`](#state) | `def` |  |
 | [`Mode`](#mode) | `def` |  |
 | [`Cause`](#cause) | `def` |  |
-| [`Lifecycle`](#lifecycle) | `rec` |  |
-| [`Attachment`](#attachment) | `rec` |  |
-| [`Snapshot`](#snapshot-1) | `rec` |  |
-| [`CloseResult`](#closeresult) | `rec` |  |
+| [`Lifecycle`](#lifecycle) | `rec` | the close and drain state of one shared resource |
+| [`Attachment`](#attachment) | `rec` | one unit of outstanding work held against a lifecycle |
+| [`Snapshot`](#snapshot-1) | `rec` | a consistent copy of a lifecycle's state |
+| [`CloseResult`](#closeresult) | `rec` | what a close request did |
 
 | On `State` | |
 | :--- | :--- |
@@ -35,7 +35,10 @@ Uses types from [`std.sync.mutex`](../sync/mutex.md).
 | :--- | :--- |
 | [`make`](#make) | initializes a lifecycle in place; the storage is address-bound from here on |
 | [`attach`](#attach) | initializes an attachment in place against an open lifecycle; the attachment is address-bound until it settles |
-| [`begin_close`](#begin_close), [`begin_process_drain`](#begin_process_drain), [`fail`](#fail), [`snapshot`](#snapshot) | |
+| [`begin_close`](#begin_close) | starts or escalates a close |
+| [`begin_process_drain`](#begin_process_drain) | starts a graceful close because the process is terminating |
+| [`fail`](#fail) | starts or escalates to an abortive close because the resource failed |
+| [`snapshot`](#snapshot) | reads a lifecycle's state under its lock |
 
 | On `Attachment` | |
 | :--- | :--- |
@@ -127,6 +130,21 @@ pub rec Lifecycle {
 }
 ```
 
+the close and drain state of one shared resource
+
+the storage is address-bound once make has run, since attachments point at it
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `state` | `State` | where the close stands |
+| `mode` | `Mode` | how the close treats outstanding work |
+| `cause` | `Cause` | why the close started |
+| `terminal_cause` | `Cause` | why the close took its final mode, the start or the last escalation |
+| `generation` | `u32` | bumped by each make, so attachments from an earlier one read as stale |
+| `submitted` | `u64` | attachments taken in this generation |
+| `settled` | `u64` | attachments settled in this generation |
+| `lock` | `std.sync.mutex.Mutex` | guards every field above |
+
 ### make
 
 ```mach
@@ -150,11 +168,32 @@ is address-bound until it settles
 pub fun begin_close(lifecycle: *Lifecycle, mode: Mode, cause: Cause) CloseResult
 ```
 
+starts or escalates a close
+
+an open lifecycle moves to CLOSING with the given mode and cause. a graceful
+close asked to go abortive escalates and records the cause as terminal. any
+other request changes nothing. the close completes at once when nothing is
+outstanding
+
+| Parameter | |
+| :--- | :--- |
+| `lifecycle` | the lifecycle to close |
+| `mode` | GRACEFUL or ABORTIVE |
+| `cause` | why the close is asked for |
+| **returns** | what the request did. a nil lifecycle or a mode or cause outside its set yields started false and a CLOSED, ABORTIVE, FAILURE snapshot |
+
 ### begin_process_drain
 
 ```mach
 pub fun begin_process_drain(lifecycle: *Lifecycle) CloseResult
 ```
+
+starts a graceful close because the process is terminating
+
+| Parameter | |
+| :--- | :--- |
+| `lifecycle` | the lifecycle to drain |
+| **returns** | what the request did, as for begin_close |
 
 ### fail
 
@@ -162,11 +201,25 @@ pub fun begin_process_drain(lifecycle: *Lifecycle) CloseResult
 pub fun fail(lifecycle: *Lifecycle) CloseResult
 ```
 
+starts or escalates to an abortive close because the resource failed
+
+| Parameter | |
+| :--- | :--- |
+| `lifecycle` | the lifecycle that failed |
+| **returns** | what the request did, as for begin_close |
+
 ### snapshot
 
 ```mach
 pub fun snapshot(lifecycle: *Lifecycle) Snapshot
 ```
+
+reads a lifecycle's state under its lock
+
+| Parameter | |
+| :--- | :--- |
+| `lifecycle` | the lifecycle to read |
+| **returns** | its state, or a CLOSED, ABORTIVE, FAILURE snapshot when lifecycle is nil |
 
 ## Attachment
 
@@ -178,6 +231,15 @@ pub rec Attachment {
     active:     bool;
 }
 ```
+
+one unit of outstanding work held against a lifecycle
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `owner` | `*Lifecycle` | the lifecycle it is attached to, nil once settled |
+| `generation` | `u32` | the owner's generation when it attached |
+| `sequence` | `u64` | the owner's submitted count when it attached |
+| `active` | `bool` | true from attach until settle |
 
 ### settle
 
@@ -208,6 +270,16 @@ pub rec Snapshot {
 }
 ```
 
+a consistent copy of a lifecycle's state
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `state` | `State` | where the close stands |
+| `mode` | `Mode` | how the close treats outstanding work |
+| `cause` | `Cause` | why the close started |
+| `terminal_cause` | `Cause` | why the close took its final mode |
+| `outstanding` | `usize` | attachments not yet settled |
+
 ## CloseResult
 
 ```mach
@@ -218,4 +290,13 @@ pub rec CloseResult {
     snapshot:  Snapshot;
 }
 ```
+
+what a close request did
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `started` | `bool` | true when this request moved the lifecycle out of OPEN |
+| `escalated` | `bool` | true when this request turned a graceful close abortive |
+| `complete` | `bool` | true when the lifecycle is CLOSED after the request |
+| `snapshot` | `Snapshot` | the state after the request |
 

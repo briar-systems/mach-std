@@ -27,40 +27,71 @@ Uses types from [`std.system.file_identity`](../../file_identity.md).
 | Type | | |
 | :--- | :--- | :--- |
 | [`stat_t`](#stat_t) | `rec` | the attributes of a file as the contract's consumers read them |
-| [`timespec`](#timespec) | `rec` |  |
-| [`DirectoryCursor`](#directorycursor) | `rec` |  |
+| [`timespec`](#timespec) | `rec` | time specification with seconds and nanoseconds |
+| [`DirectoryCursor`](#directorycursor) | `rec` | an open enumeration of one directory descriptor's entries |
 
 | On `stat_t` | |
 | :--- | :--- |
-| [`stat`](#stat), [`stat_path`](#stat_path), [`stat_mode`](#stat_mode) | |
+| [`stat`](#stat) | get file status by file descriptor |
+| [`stat_path`](#stat_path) | get file status of a path, an absolute or AT_FDCWD path resolved onto a preopen |
+| [`stat_mode`](#stat_mode) | read the mode word from a filled stat buffer, the file type alone here |
 
 | On `timespec` | |
 | :--- | :--- |
-| [`clock_gettime`](#clock_gettime) | |
+| [`clock_gettime`](#clock_gettime) | get time from a clock source |
 
 | On `DirectoryCursor` | |
 | :--- | :--- |
-| [`directory_init`](#directory_init), [`directory_next`](#directory_next), [`directory_dnit`](#directory_dnit) | |
+| [`directory_init`](#directory_init) | start enumerating a directory descriptor |
+| [`directory_next`](#directory_next) | read the next entry of a directory |
+| [`directory_dnit`](#directory_dnit) | |
 
 | Functions | |
 | :--- | :--- |
-| [`read`](#read), [`write`](#write), [`read_at`](#read_at), [`write_at`](#write_at) | |
+| [`read`](#read) | read bytes from a file descriptor |
+| [`write`](#write) | write bytes to a file descriptor |
+| [`read_at`](#read_at) | read bytes at a file offset without moving the descriptor offset |
+| [`write_at`](#write_at) | write bytes at a file offset without moving the descriptor offset |
 | [`open`](#open) | open a path, the rights asked for cut to what its directory may pass on |
-| [`close`](#close) | |
+| [`close`](#close) | close a file descriptor |
 | [`sync_fd`](#sync_fd) | the preview syncs files, and a host may refuse a directory, which is the host not supporting it rather than a bad descriptor |
-| [`access`](#access), [`set_mode`](#set_mode), [`set_mode_at`](#set_mode_at), [`file_identity`](#file_identity), [`identity_at`](#identity_at) | |
+| [`access`](#access) | check that a path exists, as the preview has no permission bits to test mode against |
+| [`set_mode`](#set_mode) | the preview has no permission bits, so setting them always fails |
+| [`set_mode_at`](#set_mode_at) | the preview has no permission bits, so setting them always fails |
+| [`file_identity`](#file_identity) | the identity of the file a descriptor names, retaining nothing after the call |
+| [`identity_at`](#identity_at) | the identity of the entry path names, without following a final symlink |
 | [`retain_identity_at`](#retain_identity_at) | a handle that only names a file does not exist here, so metadata alone is ENOTSUP |
 | [`publication_capabilities`](#publication_capabilities) | no file claims without advisory locks |
-| [`unlink`](#unlink), [`rename`](#rename), [`symlink`](#symlink), [`make_dir`](#make_dir) | |
+| [`unlink`](#unlink) | remove a file or directory, an absolute or AT_FDCWD path resolved onto a preopen |
+| [`rename`](#rename) | rename a file, an absolute or AT_FDCWD path resolved onto a preopen |
+| [`symlink`](#symlink) | create a symbolic link at linkpath pointing to target |
+| [`make_dir`](#make_dir) | create a directory, an absolute or AT_FDCWD path resolved onto a preopen |
 | [`seek`](#seek) | a directory has no position here: each cursor reads from cookie zero, so rewinding one moves nothing and any other seek on it is unsupported |
-| [`lock_fd`](#lock_fd), [`pipe`](#pipe), [`map_file`](#map_file), [`sync_file`](#sync_file) | |
+| [`lock_fd`](#lock_fd) | the preview has no advisory locks, so locking always fails |
+| [`pipe`](#pipe) | the preview cannot create pipes, so this always fails |
+| [`map_file`](#map_file) | the preview cannot map files, so this always fails |
+| [`sync_file`](#sync_file) | the preview cannot map files, so there is no mapping to flush |
 | [`getcwd`](#getcwd) | the preview has one directory the program starts in, the root |
 | [`capture_process`](#capture_process) | take the arguments and the environment from the host, before main |
-| [`arguments`](#arguments), [`argument_total`](#argument_total), [`environ`](#environ), [`getenv`](#getenv) | |
+| [`arguments`](#arguments) | the program's arguments capture_process read |
+| [`argument_total`](#argument_total) | how many arguments capture_process read |
+| [`environ`](#environ) | the environment capture_process read |
+| [`getenv`](#getenv) | look up an environment variable by name |
 | [`temp_dir`](#temp_dir) | the directory designated for temporary files: $TMPDIR, else "/tmp" |
-| [`terminate`](#terminate), [`abort`](#abort) | |
+| [`terminate`](#terminate) | exit the process with the given code |
+| [`abort`](#abort) | abort the process immediately with exit code 255 |
 | [`getpid`](#getpid) | the preview runs one process and knows no other |
-| [`terminate_child`](#terminate_child), [`spawn`](#spawn), [`spawn_in`](#spawn_in), [`spawn_redirected`](#spawn_redirected), [`spawn_redirected_in`](#spawn_redirected_in), [`wait`](#wait), [`wait_pid`](#wait_pid), [`ignore_sigpipe`](#ignore_sigpipe), [`open_file_limit`](#open_file_limit), [`set_open_file_limit`](#set_open_file_limit), [`random_fill`](#random_fill) | |
+| [`terminate_child`](#terminate_child) | the preview has no child processes, so this always fails |
+| [`spawn`](#spawn) | the preview cannot start processes, so this always fails |
+| [`spawn_in`](#spawn_in) | the preview cannot start processes, so this always fails |
+| [`spawn_redirected`](#spawn_redirected) | the preview cannot start processes, so this always fails |
+| [`spawn_redirected_in`](#spawn_redirected_in) | the preview cannot start processes, so this always fails |
+| [`wait`](#wait) | the preview has no child processes, so waiting always fails |
+| [`wait_pid`](#wait_pid) | the preview has no child processes, so waiting always fails |
+| [`ignore_sigpipe`](#ignore_sigpipe) | the preview delivers no signals, so there is nothing to ignore |
+| [`open_file_limit`](#open_file_limit) | the preview states no open-file limit, so reading it always fails |
+| [`set_open_file_limit`](#set_open_file_limit) | the preview states no open-file limit, so setting it always fails |
+| [`random_fill`](#random_fill) | fill a buffer with cryptographic random bytes from the host |
 | [`sleep`](#sleep) | block the one thread for nsec nanoseconds |
 | [`stack_bounds`](#stack_bounds) | linear memory holds its stack with no bound the module can read |
 
@@ -96,17 +127,42 @@ the attributes of a file as the contract's consumers read them
 pub fun stat(fd: i32, st: *stat_t) i64
 ```
 
+get file status by file descriptor
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | file descriptor |
+| `st` | pointer to stat_t to fill |
+| **returns** | 0 on success, or a negative native code |
+
 ### stat_path
 
 ```mach
 pub fun stat_path(dirfd: i32, path: *u8, st: *stat_t, flags: i32) i64
 ```
 
+get file status of a path, an absolute or AT_FDCWD path resolved onto a preopen
+
+| Parameter | |
+| :--- | :--- |
+| `dirfd` | directory fd (or AT_FDCWD) |
+| `path` | null-terminated path |
+| `st` | pointer to stat_t to fill |
+| `flags` | AT_SYMLINK_NOFOLLOW to stat a final symlink itself |
+| **returns** | 0 on success, ENOENT for a path under no preopen, or a negative native code |
+
 ### stat_mode
 
 ```mach
 pub fun stat_mode(st: *stat_t) u32
 ```
+
+read the mode word from a filled stat buffer, the file type alone here
+
+| Parameter | |
+| :--- | :--- |
+| `st` | pointer to a filled stat_t |
+| **returns** | the mode bits |
 
 ## timespec
 
@@ -117,11 +173,26 @@ pub rec timespec {
 }
 ```
 
+time specification with seconds and nanoseconds
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `tv_sec` | `i64` | whole seconds |
+| `tv_nsec` | `i64` | nanoseconds within the second |
+
 ### clock_gettime
 
 ```mach
 pub fun clock_gettime(clock_id: i32, ts: *timespec) i64
 ```
+
+get time from a clock source
+
+| Parameter | |
+| :--- | :--- |
+| `clock_id` | clock to query (CLOCK_REALTIME, CLOCK_MONOTONIC) |
+| `ts` | pointer to timespec to fill, untouched on failure |
+| **returns** | 0 on success, or a negative native code |
 
 ## DirectoryCursor
 
@@ -139,17 +210,50 @@ pub rec DirectoryCursor {
 }
 ```
 
+an open enumeration of one directory descriptor's entries
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `address` | `usize` | the cursor's own address, set by directory_init, so a moved or uninitialized cursor is refused |
+| `fd` | `i32` | the directory descriptor being enumerated |
+| `active` | `bool` | whether directory_init succeeded and directory_dnit has not run |
+| `ended` | `bool` | whether the host reported the end of the directory |
+| `error` | `i64` | the native code of the failure that stopped enumeration, kept and returned by every later directory_next |
+| `buffer` | `ptr` | DIRECTORY_BUFFER_SIZE bytes owned by the cursor, entries in the first half and the yielded name in the second |
+| `offset` | `usize` | the byte offset of the next unread entry in buffer |
+| `count` | `usize` | the bytes the last fd_readdir filled |
+| `cookie` | `u64` | where the next fd_readdir resumes |
+
 ### directory_init
 
 ```mach
 pub fun directory_init(out: *DirectoryCursor, fd: i32) DirectoryInitResult
 ```
 
+start enumerating a directory descriptor
+
+| Parameter | |
+| :--- | :--- |
+| `out` | the cursor, zeroed or one directory_dnit closed |
+| `fd` | an open directory descriptor, lent to the cursor until directory_dnit |
+| **returns** | a zero code, or EINVAL for a cursor in use, ENOTDIR, ENOMEM or a native code |
+
 ### directory_next
 
 ```mach
 pub fun directory_next(cursor: *DirectoryCursor, out: *DirectoryEntry) i64
 ```
+
+read the next entry of a directory
+
+the entry's name is borrowed from the cursor's buffer until the next cursor
+operation. a failure is kept, so every later call returns it again
+
+| Parameter | |
+| :--- | :--- |
+| `cursor` | a cursor directory_init made active |
+| `out` | receives the entry, untouched unless 1 is returned |
+| **returns** | 1 for an entry, 0 at the end, EINVAL for an inactive or moved cursor, ENAMETOOLONG for an entry that does not fit the buffer, or a native code |
 
 ### directory_dnit
 
@@ -165,11 +269,29 @@ pub fun directory_dnit(cursor: *DirectoryCursor) i64
 pub fun read(fd: i32, buf: *u8, count: usize) i64
 ```
 
+read bytes from a file descriptor
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | file descriptor |
+| `buf` | destination buffer |
+| `count` | maximum bytes to read |
+| **returns** | bytes read, or a negative native code |
+
 ### write
 
 ```mach
 pub fun write(fd: i32, buf: *u8, count: usize) i64
 ```
+
+write bytes to a file descriptor
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | file descriptor |
+| `buf` | source buffer |
+| `count` | bytes to write |
+| **returns** | bytes written, or a negative native code |
 
 ### read_at
 
@@ -177,11 +299,31 @@ pub fun write(fd: i32, buf: *u8, count: usize) i64
 pub fun read_at(fd: i32, buf: *u8, count: usize, offset: u64) i64
 ```
 
+read bytes at a file offset without moving the descriptor offset
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | file descriptor |
+| `buf` | destination buffer |
+| `count` | maximum bytes to read |
+| `offset` | file offset to read at |
+| **returns** | bytes read, or a negative native code |
+
 ### write_at
 
 ```mach
 pub fun write_at(fd: i32, buf: *u8, count: usize, offset: u64) i64
 ```
+
+write bytes at a file offset without moving the descriptor offset
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | file descriptor |
+| `buf` | source buffer |
+| `count` | bytes to write |
+| `offset` | file offset to write at |
+| **returns** | bytes written, or a negative native code |
 
 ### open
 
@@ -196,6 +338,13 @@ open a path, the rights asked for cut to what its directory may pass on
 ```mach
 pub fun close(fd: i32) i64
 ```
+
+close a file descriptor
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | file descriptor |
+| **returns** | 0 on success, or a negative native code |
 
 ### sync_fd
 
@@ -212,11 +361,27 @@ not supporting it rather than a bad descriptor
 pub fun access(dirfd: i32, path: *u8, mode: i32, flags: i32) i64
 ```
 
+check that a path exists, as the preview has no permission bits to test mode against
+
+| Parameter | |
+| :--- | :--- |
+| `dirfd` | directory fd (or AT_FDCWD) |
+| `path` | null-terminated path |
+| `mode` | access mode flags, ignored |
+| `flags` | AT_SYMLINK_NOFOLLOW to check a final symlink itself |
+| **returns** | 0 when the path exists, or a negative native code |
+
 ### set_mode
 
 ```mach
 pub fun set_mode(fd: i32, mode: i32) i64
 ```
+
+the preview has no permission bits, so setting them always fails
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | ENOTSUP |
 
 ### set_mode_at
 
@@ -224,17 +389,40 @@ pub fun set_mode(fd: i32, mode: i32) i64
 pub fun set_mode_at(dirfd: i32, name: *u8, mode: i32) i64
 ```
 
+the preview has no permission bits, so setting them always fails
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | ENOTSUP |
+
 ### file_identity
 
 ```mach
 pub fun file_identity(fd: i32, out: *std.system.file_identity.Identity) i64
 ```
 
+the identity of the file a descriptor names, retaining nothing after the call
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | file descriptor |
+| `out` | receives the identity, untouched on failure |
+| **returns** | 0 on success, or a negative native code |
+
 ### identity_at
 
 ```mach
 pub fun identity_at(dirfd: i32, path: *u8, out: *std.system.file_identity.Identity) i64
 ```
+
+the identity of the entry path names, without following a final symlink
+
+| Parameter | |
+| :--- | :--- |
+| `dirfd` | directory fd (or AT_FDCWD) |
+| `path` | null-terminated path |
+| `out` | receives the identity, untouched on failure |
+| **returns** | 0 on success, or a negative native code |
 
 ### retain_identity_at
 
@@ -258,11 +446,30 @@ no file claims without advisory locks
 pub fun unlink(dirfd: i32, path: *u8, flags: i32) i64
 ```
 
+remove a file or directory, an absolute or AT_FDCWD path resolved onto a preopen
+
+| Parameter | |
+| :--- | :--- |
+| `dirfd` | directory fd (or AT_FDCWD) |
+| `path` | null-terminated path |
+| `flags` | AT_REMOVEDIR to remove a directory |
+| **returns** | 0 on success, or a negative native code |
+
 ### rename
 
 ```mach
 pub fun rename(olddir: i32, oldpath: *u8, newdir: i32, newpath: *u8) i64
 ```
+
+rename a file, an absolute or AT_FDCWD path resolved onto a preopen
+
+| Parameter | |
+| :--- | :--- |
+| `olddir` | source directory fd (or AT_FDCWD) |
+| `oldpath` | source path |
+| `newdir` | destination directory fd (or AT_FDCWD) |
+| `newpath` | destination path |
+| **returns** | 0 on success, or a negative native code |
 
 ### symlink
 
@@ -270,11 +477,28 @@ pub fun rename(olddir: i32, oldpath: *u8, newdir: i32, newpath: *u8) i64
 pub fun symlink(target: *u8, linkpath: *u8) i64
 ```
 
+create a symbolic link at linkpath pointing to target
+
+| Parameter | |
+| :--- | :--- |
+| `target` | path the link points to, stored as given |
+| `linkpath` | path of the link to create, resolved onto a preopen |
+| **returns** | 0 on success, or a negative native code |
+
 ### make_dir
 
 ```mach
 pub fun make_dir(dirfd: i32, path: *u8, mode: i32) i64
 ```
+
+create a directory, an absolute or AT_FDCWD path resolved onto a preopen
+
+| Parameter | |
+| :--- | :--- |
+| `dirfd` | directory fd (or AT_FDCWD) |
+| `path` | null-terminated path |
+| `mode` | permission bits, ignored as the preview has none |
+| **returns** | 0 on success, or a negative native code |
 
 ### seek
 
@@ -291,11 +515,23 @@ rewinding one moves nothing and any other seek on it is unsupported
 pub fun lock_fd(fd: i32, op: i32) i64
 ```
 
+the preview has no advisory locks, so locking always fails
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | ENOTSUP |
+
 ### pipe
 
 ```mach
 pub fun pipe(fds: *i32) i64
 ```
+
+the preview cannot create pipes, so this always fails
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | ENOTSUP |
 
 ### map_file
 
@@ -303,11 +539,23 @@ pub fun pipe(fds: *i32) i64
 pub fun map_file(fd: i32, offset: usize, size: usize, prot: u32) ptr
 ```
 
+the preview cannot map files, so this always fails
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | nil |
+
 ### sync_file
 
 ```mach
 pub fun sync_file(p: ptr, size: usize) i64
 ```
+
+the preview cannot map files, so there is no mapping to flush
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | ENOTSUP |
 
 ### getcwd
 
@@ -335,11 +583,23 @@ take the arguments and the environment from the host, before main
 pub fun arguments() **u8
 ```
 
+the program's arguments capture_process read
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | a nil-terminated array of nul-terminated arguments, nil before capture |
+
 ### argument_total
 
 ```mach
 pub fun argument_total() usize
 ```
+
+how many arguments capture_process read
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the argument count, 0 before capture |
 
 ### environ
 
@@ -347,11 +607,29 @@ pub fun argument_total() usize
 pub fun environ() **u8
 ```
 
+the environment capture_process read
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | a nil-terminated array of NAME=value entries, nil before capture |
+
 ### getenv
 
 ```mach
 pub fun getenv(name: *u8, buf: *u8, cap: usize) i64
 ```
+
+look up an environment variable by name
+
+when the value fits (ret \< cap) it is copied and null-terminated.
+always returns the full value length, so ret >= cap signals truncation.
+
+| Parameter | |
+| :--- | :--- |
+| `name` | null-terminated variable name |
+| `buf` | destination buffer for the value |
+| `cap` | buffer capacity in bytes |
+| **returns** | full length of the value, or ENOENT when the variable is unset |
 
 ### temp_dir
 
@@ -373,11 +651,19 @@ the directory designated for temporary files: $TMPDIR, else "/tmp"
 pub fun terminate(code: i64)
 ```
 
+exit the process with the given code
+
+| Parameter | |
+| :--- | :--- |
+| `code` | exit code, passed to the host as a u32 |
+
 ### abort
 
 ```mach
 pub fun abort()
 ```
+
+abort the process immediately with exit code 255
 
 ### getpid
 
@@ -393,11 +679,23 @@ the preview runs one process and knows no other
 pub fun terminate_child(pid: i64) i64
 ```
 
+the preview has no child processes, so this always fails
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | ENOTSUP |
+
 ### spawn
 
 ```mach
 pub fun spawn(pathname: *u8, argv: **u8, envp: Environment) i64
 ```
+
+the preview cannot start processes, so this always fails
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | ENOTSUP |
 
 ### spawn_in
 
@@ -405,11 +703,23 @@ pub fun spawn(pathname: *u8, argv: **u8, envp: Environment) i64
 pub fun spawn_in(pathname: *u8, argv: **u8, envp: Environment, cwd: *u8) i64
 ```
 
+the preview cannot start processes, so this always fails
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | ENOTSUP |
+
 ### spawn_redirected
 
 ```mach
 pub fun spawn_redirected(pathname: *u8, argv: **u8, envp: Environment, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) i64
 ```
+
+the preview cannot start processes, so this always fails
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | ENOTSUP |
 
 ### spawn_redirected_in
 
@@ -417,11 +727,23 @@ pub fun spawn_redirected(pathname: *u8, argv: **u8, envp: Environment, stdin_fd:
 pub fun spawn_redirected_in(pathname: *u8, argv: **u8, envp: Environment, cwd: *u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) i64
 ```
 
+the preview cannot start processes, so this always fails
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | ENOTSUP |
+
 ### wait
 
 ```mach
 pub fun wait(pid: i64, status: *ProcessStatus, options: i32, rusage: *u8) WaitResult
 ```
+
+the preview has no child processes, so waiting always fails
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | a zero pid with an ENOTSUP error naming PROCESS_OP_WAIT |
 
 ### wait_pid
 
@@ -429,11 +751,23 @@ pub fun wait(pid: i64, status: *ProcessStatus, options: i32, rusage: *u8) WaitRe
 pub fun wait_pid(pid: i64, status: *ProcessStatus, options: i32) WaitResult
 ```
 
+the preview has no child processes, so waiting always fails
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | a zero pid with an ENOTSUP error naming PROCESS_OP_WAIT |
+
 ### ignore_sigpipe
 
 ```mach
 pub fun ignore_sigpipe() i64
 ```
+
+the preview delivers no signals, so there is nothing to ignore
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0 |
 
 ### open_file_limit
 
@@ -441,17 +775,37 @@ pub fun ignore_sigpipe() i64
 pub fun open_file_limit(out: *FileLimit) i64
 ```
 
+the preview states no open-file limit, so reading it always fails
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | ENOTSUP |
+
 ### set_open_file_limit
 
 ```mach
 pub fun set_open_file_limit(limit: FileLimit) i64
 ```
 
+the preview states no open-file limit, so setting it always fails
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | ENOTSUP |
+
 ### random_fill
 
 ```mach
 pub fun random_fill(buf: *u8, len: usize) i64
 ```
+
+fill a buffer with cryptographic random bytes from the host
+
+| Parameter | |
+| :--- | :--- |
+| `buf` | destination buffer |
+| `len` | number of bytes to fill |
+| **returns** | 0 on success, or a negative native code |
 
 ### sleep
 
@@ -511,6 +865,8 @@ pub rec ProcessStatus {
 }
 ```
 
+one observed change in a child's state
+
 ### FileLimit
 
 Forwards [`std.system.os.shared.FileLimit`](../shared.md#filelimit).
@@ -548,6 +904,8 @@ pub rec ProcessWaitError {
     operation:   u8;
 }
 ```
+
+why a process wait or the release of a child's handle failed
 
 ### WaitResult
 

@@ -18,7 +18,7 @@ Uses types from [`std.net.ip`](../ip.md), [`std.net.resolve.conf`](conf.md), [`s
 | Type | | |
 | :--- | :--- | :--- |
 | [`Outcome`](#outcome) | `tag` | how a lookup ended |
-| [`Answer`](#answer) | `rec` | a completed lookup: addresses in response order, A before AAAA merge order preserved per query, and the final CNAME target when a chain was followed |
+| [`Answer`](#answer) | `rec` | a completed lookup: addresses in the order their responses arrived, each response's records in answer order, and the canonical name |
 
 | On `Answer` | |
 | :--- | :--- |
@@ -42,7 +42,7 @@ how a lookup ended
 | Case | Payload | |
 | :--- | :--- | :--- |
 | `found` |  | the answer holds at least one address |
-| `no_name` |  | every nameserver answered and none knows the name |
+| `no_name` |  | every nameserver answered and none knows the name, or the name does not encode as a query |
 | `temporary` |  | a nameserver did not answer in time; retrying may succeed |
 | `failed` |  | no nameserver is configured or no family was requested |
 | `ended` | `std.sync.cancel.Reason` | the scope ended the lookup first, with its reason (invalid for a nil scope) |
@@ -58,8 +58,15 @@ pub rec Answer {
 }
 ```
 
-a completed lookup: addresses in response order, A before AAAA merge order
-preserved per query, and the final CNAME target when a chain was followed
+a completed lookup: addresses in the order their responses arrived, each
+response's records in answer order, and the canonical name
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `addrs` | `[32]std.net.ip.Addr` | the addresses found, at most MAX_ADDRS |
+| `count` | `usize` | valid entries in addrs |
+| `canonical` | `[254]u8` | nul-terminated final CNAME target when a chain was followed, otherwise after resolve_name the name that resolved |
+| `canonical_length` | `usize` | text length of canonical, 0 when there is none |
 
 ### query_name
 

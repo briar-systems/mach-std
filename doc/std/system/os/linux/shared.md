@@ -6,7 +6,7 @@ code shared across all linux ISA implementations
 
 contains types, constants, syscall wrappers, and all OS primitives that
 are identical across linux architectures. arch-specific modules provide
-only page_size and thread_spawn.
+page_size, thread creation, join and detach, and the thread pointer's block.
 
 Source: [`src/system/os/linux/shared.mach`](../../../../../src/system/os/linux/shared.mach)
 
@@ -16,10 +16,10 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | :--- | :--- | :--- |
 | [`stat_t`](#stat_t) | `rec` | riscv32 has no stat call: stat and stat_path fill this layout from statx |
 | [`timespec`](#timespec) | `rec` | time specification with seconds and nanoseconds |
-| [`DirectoryCursor`](#directorycursor) | `rec` |  |
+| [`DirectoryCursor`](#directorycursor) | `rec` | an open enumeration of one directory descriptor's entries |
 | [`TlsLayout`](#tlslayout) | `rec` | where an architecture's psABI puts the thread-local block against the thread pointer, as the linker lays out local-exec offsets |
 | [`IoCompletion`](#iocompletion) | `rec` | context is opaque to the OS and zero is reserved for the runtime wake source source: the id of the source that registered the context, 0 for a wake |
-| [`IoVector`](#iovector) | `rec` |  |
+| [`IoVector`](#iovector) | `rec` | one buffer of a vectored transfer, laid out as the kernel's iovec |
 
 | On `stat_t` | |
 | :--- | :--- |
@@ -34,7 +34,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | On `DirectoryCursor` | |
 | :--- | :--- |
 | [`directory_init`](#directory_init) | fd and its aliases lend exclusive enumeration and seek access until close |
-| [`directory_next`](#directory_next) | |
+| [`directory_next`](#directory_next) | read the next entry of a directory |
 | [`directory_dnit`](#directory_dnit) | consumes the owner, including when native release reports failure |
 
 | On `TlsLayout` | |
@@ -53,7 +53,9 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 
 | On `IoVector` | |
 | :--- | :--- |
-| [`sock_write_vector`](#sock_write_vector), [`sock_send_message`](#sock_send_message), [`sock_receive_message`](#sock_receive_message) | |
+| [`sock_write_vector`](#sock_write_vector) | write several buffers to a socket in one call |
+| [`sock_send_message`](#sock_send_message) | send buffers with an optional address and control records, without SIGPIPE |
+| [`sock_receive_message`](#sock_receive_message) | receive into buffers along with the sender's address and control records |
 
 | Functions | |
 | :--- | :--- |
@@ -74,7 +76,8 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`thread_block_bound`](#thread_block_bound) | record the stack a spawned thread runs on in its block |
 | [`capture_tls`](#capture_tls) | read the executable's thread-local template from its program headers |
 | [`thread_set_name`](#thread_set_name) | set the current thread's native diagnostic name |
-| [`thread_current_id`](#thread_current_id), [`thread_current_name`](#thread_current_name) | |
+| [`thread_current_id`](#thread_current_id) | the calling thread's kernel thread id |
+| [`thread_current_name`](#thread_current_name) | read the calling thread's native diagnostic name |
 | [`reallocate`](#reallocate) | resize a memory region via mremap |
 | [`heap_region_base`](#heap_region_base) | query the current program break via brk(0) |
 | [`heap_region_extend`](#heap_region_extend) | set the program break to addr via brk |
@@ -94,16 +97,16 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`read`](#read) | read bytes from a file descriptor |
 | [`write`](#write) | write bytes to a file descriptor |
 | [`read_at`](#read_at) | positioned file access does not mutate the descriptor offset |
-| [`write_at`](#write_at) | |
+| [`write_at`](#write_at) | write bytes at a file offset without moving the descriptor offset |
 | [`open`](#open) | openat: open a file relative to a directory file descriptor |
 | [`close`](#close) | close a file descriptor |
 | [`sync_fd`](#sync_fd) | flush an open file's data and metadata to its backing storage |
 | [`set_mode`](#set_mode) | set permission bits through a held descriptor |
 | [`set_mode_at`](#set_mode_at) | no following fallback is permitted when the flags-aware syscall is unavailable |
-| [`publication_capabilities`](#publication_capabilities) | |
+| [`publication_capabilities`](#publication_capabilities) | the cooperative publication capabilities of the filesystem fd lives on |
 | [`file_identity`](#file_identity) | observational ids do not retain an object after this call |
 | [`retain_identity_at`](#retain_identity_at) | o_path pins the entry without acquiring content-read permission |
-| [`identity_at`](#identity_at) | |
+| [`identity_at`](#identity_at) | the identity of the entry path names, without following a final symlink |
 | [`unlink`](#unlink) | unlinkat: remove a file or directory relative to a directory fd |
 | [`rename`](#rename) | renameat: rename a file relative to directory fds |
 | [`lock_fd`](#lock_fd) | flock: take or release an advisory whole-file lock on an open descriptor |
@@ -124,7 +127,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`vfork`](#vfork) | create child process sharing memory with parent |
 | [`exec`](#exec) | execve: replace the current process image with a new program |
 | [`wait`](#wait) | failures and no-event results leave the caller's status unchanged |
-| [`wait_pid`](#wait_pid) | |
+| [`wait_pid`](#wait_pid) | wait for a child state, as wait does with no resource usage |
 | [`terminate_child`](#terminate_child) | forcefully stop a spawned child without reaping it |
 | [`setpgid`](#setpgid) | setpgid: set (or join) the process group ID of a process |
 | [`getpgid`](#getpgid) | getpgid: read the process group ID of a process |
@@ -158,13 +161,14 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`thread_wait`](#thread_wait) | block until the value at addr changes from expected |
 | [`thread_wait_until`](#thread_wait_until) | block until the word changes or an absolute monotonic deadline is reached |
 | [`thread_wake`](#thread_wake) | wake one thread blocked on a futex wait at addr |
-| [`io_queue_create`](#io_queue_create) | |
+| [`io_queue_create`](#io_queue_create) | open a completion queue: an epoll instance with a wake eventfd watched under context 0 |
 | [`io_queue_watch`](#io_queue_watch) | registers a resource that has no registration on the queue yet |
 | [`io_queue_rearm`](#io_queue_rearm) | arms again a registration the caller made with io_queue_watch |
 | [`duplicate_to`](#duplicate_to) | makes the descriptor to name what from names, closing whatever to named before, in one step |
-| [`io_queue_unwatch`](#io_queue_unwatch), [`io_queue_wait`](#io_queue_wait) | |
+| [`io_queue_unwatch`](#io_queue_unwatch) | remove a resource's registration from the queue |
+| [`io_queue_wait`](#io_queue_wait) | wait for one completion and discard it |
 | [`io_queue_wake`](#io_queue_wake) | nil is invalid use and a closed queue is EBADF on every platform |
-| [`io_queue_close`](#io_queue_close) | |
+| [`io_queue_close`](#io_queue_close) | close a queue's descriptors and mark it closed |
 | [`sock_send`](#sock_send) | send data on a connected socket |
 | [`sock_recv`](#sock_recv) | receive data from a connected socket |
 | [`sock_peek_readable`](#sock_peek_readable) | peek at a stream socket without consuming or blocking |
@@ -175,17 +179,20 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`sock_connect_poll`](#sock_connect_poll) | ask whether a connect sock_connect_begin started has settled, without waiting |
 | [`sock_close`](#sock_close) | close a socket file descriptor |
 | [`sock_create`](#sock_create) | create a socket file descriptor |
-| [`sock_create_flags`](#sock_create_flags) | |
+| [`sock_create_flags`](#sock_create_flags) | create a socket file descriptor with its blocking and inheritance chosen |
 | [`sock_bind`](#sock_bind) | bind a socket to an address |
 | [`sock_listen`](#sock_listen) | mark a socket as a passive listener |
 | [`sock_accept`](#sock_accept) | accept a connection on a listening socket |
-| [`sock_accept_flags`](#sock_accept_flags) | |
+| [`sock_accept_flags`](#sock_accept_flags) | accept a connection with the accepted socket's blocking and inheritance chosen |
 | [`sock_connect`](#sock_connect) | connect a socket to a remote address |
 | [`sock_sendto`](#sock_sendto) | send data to a specific address |
 | [`sock_recvfrom`](#sock_recvfrom) | receive data and source address |
 | [`sock_shutdown`](#sock_shutdown) | shut down part or all of a socket connection |
 | [`sock_setopt`](#sock_setopt) | set a socket option |
-| [`sock_getopt`](#sock_getopt), [`sock_local_addr`](#sock_local_addr), [`sock_remote_addr`](#sock_remote_addr), [`sock_inheritable`](#sock_inheritable) | |
+| [`sock_getopt`](#sock_getopt) | read a socket option |
+| [`sock_local_addr`](#sock_local_addr) | the address a socket is bound to |
+| [`sock_remote_addr`](#sock_remote_addr) | the address of a connected socket's peer |
+| [`sock_inheritable`](#sock_inheritable) | whether a socket stays open across exec |
 | [`sock_set_rcvtimeo`](#sock_set_rcvtimeo) | set the receive timeout on a socket |
 | [`random_fill`](#random_fill) | fill a buffer with cryptographic random bytes via getrandom |
 | [`error_message`](#error_message) | return a human-readable message for a negated errno code |
@@ -401,6 +408,19 @@ pub rec DirectoryCursor {
 }
 ```
 
+an open enumeration of one directory descriptor's entries
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `address` | `usize` | the cursor's own address, set by directory_init, so a moved or uninitialized cursor is refused |
+| `fd` | `i32` | the directory descriptor being enumerated |
+| `active` | `bool` | whether directory_init succeeded and directory_dnit has not run |
+| `ended` | `bool` | whether getdents64 reported the end of the directory |
+| `error` | `i64` | the negated errno of the failure that stopped enumeration, kept and returned by every later directory_next |
+| `buffer` | `ptr` | the getdents64 buffer, DIRECTORY_BUFFER_SIZE bytes owned by the cursor |
+| `offset` | `usize` | the byte offset of the next unread record in buffer |
+| `count` | `usize` | the bytes the last getdents64 filled in buffer |
+
 ### directory_init
 
 ```mach
@@ -414,6 +434,18 @@ fd and its aliases lend exclusive enumeration and seek access until close
 ```mach
 pub fun directory_next(cursor: *DirectoryCursor, out: *DirectoryEntry) i64
 ```
+
+read the next entry of a directory
+
+the entry's name is borrowed from the cursor's buffer until the next cursor
+operation. a malformed record fails with EIO, and a failure is kept, so every
+later call returns it again
+
+| Parameter | |
+| :--- | :--- |
+| `cursor` | a cursor directory_init made active |
+| `out` | receives the entry, untouched unless 1 is returned |
+| **returns** | 1 for an entry, 0 at the end, EINVAL for an inactive or moved cursor, or negative errno |
 
 ### directory_dnit
 
@@ -554,11 +586,27 @@ pub rec IoVector {
 }
 ```
 
+one buffer of a vectored transfer, laid out as the kernel's iovec
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `data` | `*u8` | the buffer |
+| `length` | `usize` | its length in bytes |
+
 ### sock_write_vector
 
 ```mach
 pub fun sock_write_vector(fd: usize, vectors: *IoVector, count: usize) i64
 ```
+
+write several buffers to a socket in one call
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| `vectors` | the buffers, in order |
+| `count` | number of buffers, 1 to 1024 |
+| **returns** | bytes written, EINVAL for no buffers or too many, or negative errno |
 
 ### sock_send_message
 
@@ -566,11 +614,38 @@ pub fun sock_write_vector(fd: usize, vectors: *IoVector, count: usize) i64
 pub fun sock_send_message(fd: usize, vectors: *IoVector, vector_count: usize, address: *u8, address_length: u32, control: *u8, control_length: usize) i64
 ```
 
+send buffers with an optional address and control records, without SIGPIPE
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| `vectors` | the buffers, in order |
+| `vector_count` | number of buffers, 1 to 1024 |
+| `address` | destination sockaddr, or nil for a connected socket |
+| `address_length` | size of the sockaddr |
+| `control` | control records to attach, or nil |
+| `control_length` | bytes of control records |
+| **returns** | bytes sent, EINVAL for no buffers or too many, or negative errno |
+
 ### sock_receive_message
 
 ```mach
 pub fun sock_receive_message(fd: usize, vectors: *IoVector, vector_count: usize, address: *u8, address_length: *u32, control: *u8, control_length: *usize, flags: *i32) i64
 ```
+
+receive into buffers along with the sender's address and control records
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| `vectors` | the buffers, in order |
+| `vector_count` | number of buffers, 1 to 1024 |
+| `address` | receives the sender's sockaddr, or nil |
+| `address_length` | capacity of address in, its filled length out |
+| `control` | receives control records, or nil |
+| `control_length` | capacity of control in, its filled length out |
+| `flags` | receives the message flags, such as MSG_CTRUNC |
+| **returns** | bytes received, EINVAL for a bad argument, or negative errno |
 
 ## Functions
 
@@ -813,11 +888,25 @@ set the current thread's native diagnostic name
 pub fun thread_current_id() i64
 ```
 
+the calling thread's kernel thread id
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the thread id |
+
 ### thread_current_name
 
 ```mach
 pub fun thread_current_name(name: *u8, cap: usize) i64
 ```
+
+read the calling thread's native diagnostic name
+
+| Parameter | |
+| :--- | :--- |
+| `name` | destination, receives the nul-terminated name |
+| `cap` | capacity of name in bytes, at least 16 |
+| **returns** | length of the name, EINVAL when cap is below 16, or negative errno |
 
 ### reallocate
 
@@ -1086,6 +1175,18 @@ positioned file access does not mutate the descriptor offset
 pub fun write_at(fd: i32, buf: *u8, count: usize, offset: u64) i64
 ```
 
+write bytes at a file offset without moving the descriptor offset
+
+retries automatically on EINTR.
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | file descriptor |
+| `buf` | source buffer |
+| `count` | bytes to write |
+| `offset` | file offset to write at |
+| **returns** | bytes written, or negative errno |
+
 ### open
 
 ```mach
@@ -1147,6 +1248,16 @@ no following fallback is permitted when the flags-aware syscall is unavailable
 pub fun publication_capabilities(fd: i32) i64
 ```
 
+the cooperative publication capabilities of the filesystem fd lives on
+
+ext4, tmpfs, xfs and btrfs report every capability, and any other
+filesystem reports none
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | an open descriptor on the filesystem to ask about |
+| **returns** | a mask of os_shared PUBLICATION_* bits, or negative errno |
+
 ### file_identity
 
 ```mach
@@ -1168,6 +1279,15 @@ o_path pins the entry without acquiring content-read permission
 ```mach
 pub fun identity_at(dirfd: i32, path: *u8, out: *std.system.file_identity.Identity) i64
 ```
+
+the identity of the entry path names, without following a final symlink
+
+| Parameter | |
+| :--- | :--- |
+| `dirfd` | directory fd (or AT_FDCWD) |
+| `path` | null-terminated path |
+| `out` | receives the identity, untouched on failure |
+| **returns** | 0 on success, EINVAL for a nil path or out, or negative errno |
 
 ### unlink
 
@@ -1427,10 +1547,13 @@ create a new child process
 ### vfork
 
 ```mach
+#[naked]
 pub fun vfork() i64
 ```
 
-create child process sharing memory with parent
+create child process sharing memory with parent. the child runs on the
+parent's stack until it execs or exits, so this stub keeps no frame and holds
+its return address in a register across the syscall
 
 | Parameter | |
 | :--- | :--- |
@@ -1464,6 +1587,15 @@ failures and no-event results leave the caller's status unchanged
 ```mach
 pub fun wait_pid(pid: i64, status: *std.system.os.shared.ProcessStatus, options: i32) std.system.os.shared.WaitResult
 ```
+
+wait for a child state, as wait does with no resource usage
+
+| Parameter | |
+| :--- | :--- |
+| `pid` | the child to wait for, with wait4's selection rules |
+| `status` | receives the observed state, untouched on failure or no event |
+| `options` | wait options such as WNOHANG |
+| **returns** | the child's pid, a zero pid for no event, or the error |
 
 ### terminate_child
 
@@ -1721,7 +1853,7 @@ spawn a child with redirected streams and an explicit working directory,
 placed as the leader of its own new process group
 
 identical to spawn_redirected_in except the child calls setpgid(0, 0)
-between the clone and the exec (see spawn_trampoline), and the parent ALSO
+between the clone and the exec (see spawn_main), and the parent ALSO
 calls setpgid(pid, pid) once clone returns, ignoring its result (mach#535).
 on a real kernel CLONE_VFORK suspends the parent until the child execs or
 exits, so the parent-side call is redundant there (it either finds the
@@ -2032,6 +2164,14 @@ wake one thread blocked on a futex wait at addr
 pub fun io_queue_create(queue: *std.system.os.shared.IoQueue) i64
 ```
 
+open a completion queue: an epoll instance with a wake eventfd watched
+under context 0
+
+| Parameter | |
+| :--- | :--- |
+| `queue` | receives the queue, its descriptors -1 on failure |
+| **returns** | 0 on success, or negative errno |
+
 ### io_queue_watch
 
 ```mach
@@ -2070,11 +2210,27 @@ before, in one step. the copy is not inherited across exec
 pub fun io_queue_unwatch(queue: *std.system.os.shared.IoQueue, resource: usize) i64
 ```
 
+remove a resource's registration from the queue
+
+| Parameter | |
+| :--- | :--- |
+| `queue` | the queue |
+| `resource` | the descriptor io_queue_watch registered |
+| **returns** | 0, also when the resource was not registered, or negative errno |
+
 ### io_queue_wait
 
 ```mach
 pub fun io_queue_wait(queue: *std.system.os.shared.IoQueue, timeout_ms: i32) i64
 ```
+
+wait for one completion and discard it
+
+| Parameter | |
+| :--- | :--- |
+| `queue` | the queue |
+| `timeout_ms` | how long to wait, -1 for no limit |
+| **returns** | 1 when a completion arrived, 0 on timeout, or negative errno |
 
 ### io_queue_wake
 
@@ -2089,6 +2245,13 @@ nil is invalid use and a closed queue is EBADF on every platform
 ```mach
 pub fun io_queue_close(queue: *std.system.os.shared.IoQueue) i64
 ```
+
+close a queue's descriptors and mark it closed
+
+| Parameter | |
+| :--- | :--- |
+| `queue` | the queue, its descriptors set to -1 whatever the closes return |
+| **returns** | 0, EINVAL for a nil queue, or the negative errno of the first close that failed |
 
 ### sock_send
 
@@ -2230,6 +2393,18 @@ create a socket file descriptor
 pub fun sock_create_flags(domain: i32, typ: i32, protocol: i32, nonblocking: bool, non_inheritable: bool, out: *usize) i64
 ```
 
+create a socket file descriptor with its blocking and inheritance chosen
+
+| Parameter | |
+| :--- | :--- |
+| `domain` | address family (AF_INET, AF_INET6) |
+| `typ` | socket type (SOCK_STREAM, SOCK_DGRAM) |
+| `protocol` | protocol (0 for default) |
+| `nonblocking` | whether the socket starts nonblocking |
+| `non_inheritable` | whether the socket is closed across exec |
+| `out` | receives the native-width handle, -1 on failure |
+| **returns** | 0 on success, or negative errno |
+
 ### sock_bind
 
 ```mach
@@ -2280,6 +2455,18 @@ accept a connection on a listening socket
 ```mach
 pub fun sock_accept_flags(fd: usize, addr: *u8, addrlen: *u32, nonblocking: bool, non_inheritable: bool, out: *usize) i64
 ```
+
+accept a connection with the accepted socket's blocking and inheritance chosen
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | listening socket fd |
+| `addr` | pointer to sockaddr to fill with peer address |
+| `addrlen` | pointer to sockaddr length (in/out) |
+| `nonblocking` | whether the accepted socket is nonblocking |
+| `non_inheritable` | whether the accepted socket is closed across exec |
+| `out` | receives the native-width accepted handle, -1 on failure |
+| **returns** | 0 on success, or negative errno |
 
 ### sock_connect
 
@@ -2369,11 +2556,31 @@ set a socket option
 pub fun sock_getopt(fd: usize, level: i32, opt: i32, value: *u8, vallen: *u32) i64
 ```
 
+read a socket option
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| `level` | option level (SOL_SOCKET, etc.) |
+| `opt` | option name (SO_REUSEADDR, etc.) |
+| `value` | receives the option value |
+| `vallen` | capacity of value in, its filled length out |
+| **returns** | 0 on success, ENOTSUP for an option this host lacks, or negative errno |
+
 ### sock_local_addr
 
 ```mach
 pub fun sock_local_addr(fd: usize, addr: *u8, addrlen: *u32) i64
 ```
+
+the address a socket is bound to
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| `addr` | receives the sockaddr |
+| `addrlen` | capacity of addr in, the address length out |
+| **returns** | 0 on success, or negative errno |
 
 ### sock_remote_addr
 
@@ -2381,11 +2588,28 @@ pub fun sock_local_addr(fd: usize, addr: *u8, addrlen: *u32) i64
 pub fun sock_remote_addr(fd: usize, addr: *u8, addrlen: *u32) i64
 ```
 
+the address of a connected socket's peer
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| `addr` | receives the sockaddr |
+| `addrlen` | capacity of addr in, the address length out |
+| **returns** | 0 on success, ENOTCONN when not connected, or negative errno |
+
 ### sock_inheritable
 
 ```mach
 pub fun sock_inheritable(fd: usize, out: *bool) i64
 ```
+
+whether a socket stays open across exec
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| `out` | receives true when the descriptor lacks close-on-exec |
+| **returns** | 0 on success, EINVAL for a nil out, or negative errno |
 
 ### sock_set_rcvtimeo
 
@@ -2658,6 +2882,8 @@ pub rec ProcessWaitError {
     operation:   u8;
 }
 ```
+
+why a process wait or the release of a child's handle failed
 
 ### WaitResult
 

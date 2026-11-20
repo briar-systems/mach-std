@@ -43,7 +43,7 @@ every way a line read can fail
 | Case | Payload | |
 | :--- | :--- | :--- |
 | `read` | `ReadError` | the reader failed; the payload's progress is the bytes buffered before the outcome, and eof{0} is the end of input with nothing buffered (a final line without a newline is not an error) |
-| `too_long` | `usize` | the line does not fit; payload is the bytes buffered. the byte that overflowed was consumed from the reader and dropped, so the next call continues after it |
+| `too_long` | `usize` | the line does not fit; payload is the bytes buffered. the byte that overflowed was consumed from the reader and dropped, so the next call continues after it. an overflowing carriage return drops the byte after it too, read to tell it from "\\r\\n" |
 
 ### read_line_from
 
@@ -58,7 +58,9 @@ trailing "\\r\\n" or "\\n" and null-terminates; the returned length excludes the
 terminator. a line longer than cap-1 bytes is too_long rather than a silent
 truncation: the bytes that fit are in buf, the byte that overflowed has been
 consumed and dropped (a reader has no pushback), and the next call continues
-with the rest of the line. a read at end of input with no bytes buffered is
+with the rest of the line. a carriage return at the cap-1 limit is read past
+to tell "\\r\\n" from content, and when it is content the byte after it is
+dropped as well. a read at end of input with no bytes buffered is
 read{eof{0}} -- distinct from an empty line, which is ok{0}.
 
 | Parameter | |

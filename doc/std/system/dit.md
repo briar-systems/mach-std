@@ -93,6 +93,10 @@ pub fun available() bool
 
 whether the processor provides the mode and the process may switch it
 
+| Parameter | |
+| :--- | :--- |
+| **returns** | true once publish recorded 1 |
+
 ### enable
 
 Only where `$mach.build.arch == $mach.arch.aarch64 && $mach.build.sys != $mach.sys.windows`.

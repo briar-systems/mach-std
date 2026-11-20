@@ -23,29 +23,35 @@ Uses types from [`std.allocator`](../../allocator.md), [`std.io.error`](../../io
 | Type | | |
 | :--- | :--- | :--- |
 | [`Listener`](#listener) | `rec` | listener tokens are resolved only by the driver that created them |
-| [`Stream`](#stream) | `rec` |  |
+| [`Stream`](#stream) | `rec` | a stream token, resolved only by the driver that created it |
 | [`Detached`](#detached) | `rec` | an accepted or connected stream taken out of its driver by detach, owning the socket and nothing of any driver |
-| [`Driver`](#driver) | `rec` |  |
+| [`Driver`](#driver) | `rec` | an asynchronous local stream driver: a runtime source over the platform backend |
 
 | On `Driver` | |
 | :--- | :--- |
 | [`aliases`](#aliases) | whether a byte range overlaps the driver, its platform backend or its borrowed runtime |
 | [`init`](#init) | the driver starts at the runtime's initial size and grows with it |
-| [`submit_bind`](#submit_bind), [`bound_listener`](#bound_listener), [`submit_listen`](#submit_listen), [`listening`](#listening) | |
+| [`submit_bind`](#submit_bind) | bind a listener to a local endpoint |
+| [`bound_listener`](#bound_listener) | the listener a bind completion made |
+| [`submit_listen`](#submit_listen) | start listening on a bound listener |
+| [`listening`](#listening) | whether a listen completion left its listener listening |
 | [`listener_rename`](#listener_rename) | managed listeners must rename through their owning driver |
-| [`submit_accept`](#submit_accept), [`submit_connect`](#submit_connect) | |
+| [`submit_accept`](#submit_accept) | queue an accept on a listening listener |
+| [`submit_connect`](#submit_connect) | create a stream socket and queue its connect to a local endpoint |
 | [`submit_read`](#submit_read) | a read cancelled through its scope completes with has_error set and the cancel or timeout reason, and still reports in bytes and end_of_stream what it took before the cancellation took effect |
 | [`submit_readable`](#submit_readable) | wait until the local stream is readable, at orderly end of stream, or failed, without holding a buffer |
 | [`submit_write`](#submit_write) | cancelling a write does not unsend it |
-| [`submit_shutdown_write`](#submit_shutdown_write), [`submit_stream_close`](#submit_stream_close), [`submit_listener_close`](#submit_listener_close) | |
-| [`discarded_reads`](#discarded_reads) | always 0: a cancelled read no longer discards anything, its completion carries the bytes it took (see submit_read) |
+| [`submit_shutdown_write`](#submit_shutdown_write) | queue a shutdown of the stream's write side, behind the writes already queued |
+| [`submit_stream_close`](#submit_stream_close) | close a stream the driver holds |
+| [`submit_listener_close`](#submit_listener_close) | close a listener, removing its socket file when the listener owns it |
 | [`awaiting_cancellations`](#awaiting_cancellations) | operations cancelled on this driver whose native request has not yet reported back |
 | [`wait`](#wait) | returns 0 only on timeout, a caller's io.runtime.wake, or a closed runtime |
 | [`accepted`](#accepted) | the stream an accept completion hands over, whether it succeeded or was cancelled after its stream was already accepted |
-| [`connected`](#connected) | |
+| [`connected`](#connected) | the stream a connect completion opened |
 | [`detach`](#detach) | take an open stream out of this driver, so another driver, on this thread or another, can adopt it |
 | [`adopt`](#adopt) | register a detached stream with this driver |
-| [`peer_identity`](#peer_identity), [`dnit`](#dnit) | |
+| [`peer_identity`](#peer_identity) | the credentials of the process at the other end of a stream |
+| [`dnit`](#dnit) | release the driver once no operation is in flight, closing every listener and stream it holds |
 
 ---
 
@@ -70,6 +76,14 @@ pub rec Stream {
     owner:      u64;
 }
 ```
+
+a stream token, resolved only by the driver that created it
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `index` | `u32` | the stream's entry in the driver |
+| `generation` | `u32` | the entry's generation, 0 once the stream was closed or detached |
+| `owner` | `u64` | the instance of the driver that created it |
 
 ## Detached
 
@@ -109,6 +123,21 @@ pub rec Driver {
 }
 ```
 
+an asynchronous local stream driver: a runtime source over the platform backend
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `runtime` | `*std.io.runtime.Runtime` | the runtime it is registered with, borrowed |
+| `source` | `std.io.runtime.SourceToken` | its source registration in the runtime |
+| `backend` | `impl.Backend` | the platform backend |
+| `slots` | `std.memory.table.Table` | one slot per runtime token index routed here |
+| `listeners` | `std.memory.table.Table` | listener entries |
+| `streams` | `std.memory.table.Table` | stream entries |
+| `backend_destroyed` | `bool` | dnit has already released the backend |
+| `cleanup_code` | `i64` | the first native failure while closing at dnit |
+| `instance` | `u64` | this driver's process-unique number, stamped on its tokens |
+| `lock` | `std.sync.mutex.Mutex` | guards the tables and the backend |
+
 ### aliases
 
 ```mach
@@ -138,11 +167,31 @@ pub fun submit_bind(
 ) res[std.io.runtime.Token, std.io.error.Error]
 ```
 
+bind a listener to a local endpoint. the bind runs now and its completion
+carries the result for bound_listener
+
+| Parameter | |
+| :--- | :--- |
+| `driver` | the driver |
+| `scope` | the cancel scope the operation joins |
+| `bound` | the endpoint to bind |
+| `options` | how to bind |
+| `context` | the caller's context, carried to the completion |
+| **returns** | the operation's token, or the refusal: INVALID for a nil argument or an unsupported endpoint, RESOURCE_EXHAUSTED when no listener entry can be made, or the runtime's refusal. a failed bind is reported in the completion |
+
 ### bound_listener
 
 ```mach
 pub fun bound_listener(driver: *Driver, completion: std.io.runtime.Completion) res[Listener, std.io.error.Error]
 ```
+
+the listener a bind completion made
+
+| Parameter | |
+| :--- | :--- |
+| `driver` | the driver |
+| `completion` | the bind's completion |
+| **returns** | the listener's token, the completion's error, INVALID for a nil driver or another kind, or CLOSED when the listener is gone |
 
 ### submit_listen
 
@@ -156,11 +205,30 @@ pub fun submit_listen(
 ) res[std.io.runtime.Token, std.io.error.Error]
 ```
 
+start listening on a bound listener. the listen runs now and its completion carries the result
+
+| Parameter | |
+| :--- | :--- |
+| `driver` | the driver |
+| `scope` | the cancel scope the operation joins |
+| `listener` | the bound listener's token |
+| `backlog` | the pending connection queue length, above 0 |
+| `context` | the caller's context, carried to the completion |
+| **returns** | the operation's token, or the refusal: INVALID for a bad argument, CLOSED when the listener is not bound here, or the runtime's refusal. a failed listen is reported in the completion |
+
 ### listening
 
 ```mach
 pub fun listening(driver: *Driver, completion: std.io.runtime.Completion) err[std.io.error.Error]
 ```
+
+whether a listen completion left its listener listening
+
+| Parameter | |
+| :--- | :--- |
+| `driver` | the driver |
+| `completion` | the listen's completion |
+| **returns** | ok, the completion's error, INVALID for a nil driver or another kind, or CLOSED when the listener is gone or not listening |
 
 ### listener_rename
 
@@ -185,6 +253,16 @@ pub fun submit_accept(
 ) res[std.io.runtime.Token, std.io.error.Error]
 ```
 
+queue an accept on a listening listener
+
+| Parameter | |
+| :--- | :--- |
+| `driver` | the driver |
+| `scope` | the cancel scope the operation joins |
+| `listener` | the listening listener's token |
+| `context` | the caller's context, carried to the completion |
+| **returns** | the operation's token, whose completion goes to accepted, or the refusal: INVALID for a nil argument, CLOSED when the listener is not listening here, RESOURCE_EXHAUSTED when no stream entry can be made, or the runtime's refusal |
+
 ### submit_connect
 
 ```mach
@@ -195,6 +273,16 @@ pub fun submit_connect(
     context: usize,
 ) res[std.io.runtime.Token, std.io.error.Error]
 ```
+
+create a stream socket and queue its connect to a local endpoint
+
+| Parameter | |
+| :--- | :--- |
+| `driver` | the driver |
+| `scope` | the cancel scope the operation joins |
+| `remote` | the endpoint to connect to |
+| `context` | the caller's context, carried to the completion |
+| **returns** | the operation's token, whose completion goes to connected, or the refusal: INVALID for a bad argument, the socket creation failure, RESOURCE_EXHAUSTED when no stream entry can be made, or the runtime's refusal |
 
 ### submit_read
 
@@ -235,6 +323,16 @@ effect, so the stream continues after exactly those bytes
 pub fun submit_shutdown_write(driver: *Driver, scope: *std.sync.cancel.Scope, stream: *Stream, context: usize) res[std.io.runtime.Token, std.io.error.Error]
 ```
 
+queue a shutdown of the stream's write side, behind the writes already queued
+
+| Parameter | |
+| :--- | :--- |
+| `driver` | the driver |
+| `scope` | the cancel scope the operation joins |
+| `stream` | the open stream's token |
+| `context` | the caller's context, carried to the completion |
+| **returns** | the operation's token, or the refusal: INVALID for a nil argument, CLOSED when the stream is not open here, or the runtime's refusal |
+
 ### submit_stream_close
 
 ```mach
@@ -247,29 +345,33 @@ pub fun submit_stream_close(
 ) res[std.io.runtime.Token, std.io.error.Error]
 ```
 
+close a stream the driver holds. a graceful close shuts the write side down,
+and an abortive close cancels pending reads and closes the socket
+
+| Parameter | |
+| :--- | :--- |
+| `driver` | the driver |
+| `scope` | the cancel scope the operation joins |
+| `stream` | the open stream's token, zeroed once an abortive close is taken |
+| `mode` | GRACEFUL or ABORTIVE |
+| `context` | the caller's context, carried to the completion |
+| **returns** | the operation's token, or the refusal: INVALID for a bad argument, CLOSED when the stream is not open here, or the runtime's refusal |
+
 ### submit_listener_close
 
 ```mach
 pub fun submit_listener_close(driver: *Driver, scope: *std.sync.cancel.Scope, listener: *Listener, context: usize) res[std.io.runtime.Token, std.io.error.Error]
 ```
 
-### discarded_reads
-
-```mach
-pub fun discarded_reads(driver: *Driver, bytes: *u64) u64
-```
-
-**Deprecated:** always 0: a cancelled read reports its bytes; removed in 6.0
-
-always 0: a cancelled read no longer discards anything, its completion
-carries the bytes it took (see submit_read). kept only for compatibility and
-removed in 6.0
+close a listener, removing its socket file when the listener owns it
 
 | Parameter | |
 | :--- | :--- |
-| `driver` | ignored |
-| `bytes` | set to 0 when not nil |
-| **returns** | 0 |
+| `driver` | the driver |
+| `scope` | the cancel scope the operation joins |
+| `listener` | the listener's token, zeroed once the backend takes the close |
+| `context` | the caller's context, carried to the completion |
+| **returns** | the operation's token, or the refusal: INVALID for a nil argument, CLOSED when the listener is not bound or listening here, or the runtime's refusal |
 
 ### awaiting_cancellations
 
@@ -316,6 +418,14 @@ accepts takes the stream from every accept completion and serves or closes it
 pub fun connected(driver: *Driver, completion: std.io.runtime.Completion) res[Stream, std.io.error.Error]
 ```
 
+the stream a connect completion opened
+
+| Parameter | |
+| :--- | :--- |
+| `driver` | the driver |
+| `completion` | the connect's completion |
+| **returns** | the stream's token, the completion's error, INVALID for a nil driver or another kind, or CLOSED when the stream is gone |
+
 ### detach
 
 ```mach
@@ -361,9 +471,24 @@ on success detached gives up the socket, so a second adopt of it is refused
 pub fun peer_identity(driver: *Driver, stream: *Stream) res[std.net.local.types.PeerIdentity, std.io.error.Error]
 ```
 
+the credentials of the process at the other end of a stream
+
+| Parameter | |
+| :--- | :--- |
+| `driver` | the driver |
+| `stream` | the open stream's token |
+| **returns** | the identity, INVALID for a nil argument, CLOSED when the stream is not open here, or the platform's refusal |
+
 ### dnit
 
 ```mach
 pub fun dnit(driver: *Driver) err[std.io.error.Error]
 ```
+
+release the driver once no operation is in flight, closing every listener and stream it holds
+
+| Parameter | |
+| :--- | :--- |
+| `driver` | the driver |
+| **returns** | ok, INVALID for a nil or released driver, BUSY while an operation's completion has not been released, or the first failure to close or release |
 

@@ -25,9 +25,9 @@ directory on drive C. a UNC '\\\\server\\share' is one indivisible root unit
 root). join does no drive-relative special-casing: join("C:", "foo")
 inserts a separator yielding "C:\\foo".
 
-nil contract: a nil Path means "no path". predicates answer false for nil,
-views return nil, and clone/stem propagate nil as ok(nil) rather than
-allocating an empty path.
+nil contract: a nil Path means "no path". predicates other than is_empty
+answer false for nil (is_empty answers true), views return nil, and
+clone/stem propagate nil as ok(nil) rather than allocating an empty path.
 
 Source: [`src/types/path.mach`](../../../src/types/path.mach)
 
@@ -58,12 +58,17 @@ Uses types from [`std.allocator`](../allocator.md), [`std.types.view`](view.md).
 | :--- | :--- |
 | [`separator`](#separator) | platform path separator character, emitted by construction |
 | [`is_separator`](#is_separator) | check whether c separates path components on the target |
-| [`native_len`](#native_len) | the same rules over a name in std.runtime.native units, for the native filesystem calls |
-| [`native_is_empty`](#native_is_empty), [`native_is_root`](#native_is_root), [`native_is_separator`](#native_is_separator) | |
+| [`native_len`](#native_len) | count the units of a native name before its terminator |
+| [`native_is_empty`](#native_is_empty) | check whether a native name is nil or zero-length |
+| [`native_is_root`](#native_is_root) | check whether a native name is exactly a root unit, the rule is_root applies |
+| [`native_is_separator`](#native_is_separator) | check whether a native unit separates path components on the target |
 | [`native_root_len`](#native_root_len) | the length of root's prefix, in units |
-| [`native_clone`](#native_clone) | |
+| [`native_clone`](#native_clone) | duplicate a native name |
 | [`unit_is_separator`](#unit_is_separator) | the separator rules for a caller that is itself generic over the unit |
-| [`unit_separator`](#unit_separator), [`native_filename`](#native_filename), [`native_parent`](#native_parent), [`native_join`](#native_join) | |
+| [`unit_separator`](#unit_separator) | the platform-preferred separator in unit T, emitted by construction |
+| [`native_filename`](#native_filename) | return the final component of a native name, the rule filename applies |
+| [`native_parent`](#native_parent) | return the parent of a native name, the rule parent applies |
+| [`native_join`](#native_join) | join two native names with the platform separator, the rule join applies |
 
 ---
 
@@ -286,11 +291,12 @@ overlay needs: the compiler composes `<root>/./src/f.mach` from a manifest's
 missed unless those two compare equal. Resolving symlinks would be a different
 (and I/O-bearing) question.
 
-THE ROOT IS PRESERVED, NEVER CLIMBED THROUGH. `root_len` already knows what a root
-is on this target - a POSIX `/`, a drive `C:\`, a UNC `\\server\share` - so a `..`
-that would escape one is dropped, the way every real path resolver behaves. A
-RELATIVE path keeps its leading `..` segments, because there is nothing above it to
-cancel them against yet; `../a/../b` cleans to `../b`, not `b`.
+THE ROOT IS PRESERVED, NEVER CLIMBED THROUGH. `root_len` knows the windows roots,
+a drive `C:\` and a UNC `\\server\share`, and a leading separator is taken as the
+root everywhere else (a POSIX `/`), so a `..` that would escape one is dropped,
+the way every real path resolver behaves. A RELATIVE path keeps its leading `..`
+segments, because there is nothing above it to cancel them against yet;
+`../a/../b` cleans to `../b`, not `b`.
 
 SEPARATORS COME OUT NATIVE, and go in either way on windows. `is_separator` accepts
 both `/` and `\` there, which is what lets a compiler-produced forward-slash
@@ -345,9 +351,12 @@ windows accepts both '/' and '\\'; posix treats only '/' as a separator.
 pub fun native_len(p: *Unit) usize
 ```
 
-the same rules over a name in std.runtime.native units, for the native
-filesystem calls. each result is a nul-terminated native name, allocated
-like its Path counterpart's
+count the units of a native name before its terminator
+
+| Parameter | |
+| :--- | :--- |
+| `p` | the native name, not nil |
+| **returns** | the length in units |
 
 ### native_is_empty
 
@@ -355,17 +364,38 @@ like its Path counterpart's
 pub fun native_is_empty(p: *Unit) bool
 ```
 
+check whether a native name is nil or zero-length
+
+| Parameter | |
+| :--- | :--- |
+| `p` | the native name |
+| **returns** | true when p is nil or empty |
+
 ### native_is_root
 
 ```mach
 pub fun native_is_root(p: *Unit) bool
 ```
 
+check whether a native name is exactly a root unit, the rule is_root applies
+
+| Parameter | |
+| :--- | :--- |
+| `p` | the native name |
+| **returns** | true when p is only a root prefix and trailing separators |
+
 ### native_is_separator
 
 ```mach
 pub fun native_is_separator(c: Unit) bool
 ```
+
+check whether a native unit separates path components on the target
+
+| Parameter | |
+| :--- | :--- |
+| `c` | the unit to test |
+| **returns** | true when c is a separator |
 
 ### native_root_len
 
@@ -381,6 +411,14 @@ the length of root's prefix, in units
 pub fun native_clone(a: *std.allocator.Allocator, p: *Unit) res[*Unit, std.allocator.Error]
 ```
 
+duplicate a native name
+
+| Parameter | |
+| :--- | :--- |
+| `a` | allocator for the copy |
+| `p` | the native name to copy (nil returns nil) |
+| **returns** | the owned copy, or the allocator's refusal (invalid for a nil allocator) |
+
 ### unit_is_separator
 
 ```mach
@@ -395,11 +433,24 @@ the separator rules for a caller that is itself generic over the unit
 pub fun unit_separator[T]() T
 ```
 
+the platform-preferred separator in unit T, emitted by construction
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the separator unit |
+
 ### native_filename
 
 ```mach
 pub fun native_filename(p: *Unit) *Unit
 ```
+
+return the final component of a native name, the rule filename applies
+
+| Parameter | |
+| :--- | :--- |
+| `p` | the native name |
+| **returns** | pointer into p at the final component, empty after a trailing separator, or nil for a nil or empty name |
 
 ### native_parent
 
@@ -407,9 +458,26 @@ pub fun native_filename(p: *Unit) *Unit
 pub fun native_parent(a: *std.allocator.Allocator, p: *Unit) res[*Unit, std.allocator.Error]
 ```
 
+return the parent of a native name, the rule parent applies
+
+| Parameter | |
+| :--- | :--- |
+| `a` | allocator for the result |
+| `p` | the native name |
+| **returns** | the owned parent name (`.` for a bare or empty name), or the allocator's refusal |
+
 ### native_join
 
 ```mach
 pub fun native_join(a: *std.allocator.Allocator, left: *Unit, right: *Unit) res[*Unit, std.allocator.Error]
 ```
+
+join two native names with the platform separator, the rule join applies
+
+| Parameter | |
+| :--- | :--- |
+| `a` | allocator for the result |
+| `left` | left name segment |
+| `right` | right name segment |
+| **returns** | the owned joined name, or the allocator's refusal |
 

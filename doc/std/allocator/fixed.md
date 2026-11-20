@@ -42,7 +42,7 @@ fixed-buffer bump allocator state
 | Field | Type | |
 | :--- | :--- | :--- |
 | `buffer` | `*u8` | caller-provided backing buffer |
-| `capacity` | `usize` | capacity of buf in bytes |
+| `capacity` | `usize` | capacity of buffer in bytes |
 | `offset` | `usize` | bytes consumed so far (including alignment padding) |
 
 ### make

@@ -5,7 +5,7 @@
 | Module | |
 | :--- | :--- |
 | [`bool`](bool.md) |  |
-| [`char`](char.md) |  |
+| [`char`](char.md) | ascii character classification and case conversion over single bytes |
 | [`error`](error.md) | the canonical error tag: err[E] |
 | [`option`](option.md) | the canonical option tag: opt[T] |
 | [`path`](path.md) | path manipulation helpers |

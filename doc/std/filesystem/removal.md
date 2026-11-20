@@ -14,11 +14,11 @@ Uses types from [`std.io.error`](../io/error.md).
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`Error`](#error) | `rec` |  |
+| [`Error`](#error) | `rec` | why a removal failed |
 
 | On `Error` | |
 | :--- | :--- |
-| [`message`](#message) | |
+| [`message`](#message) | a static description of a removal error |
 | [`from_native`](#from_native) | the error for a native code a primitive returned |
 | [`contained`](#contained) | the error for a component or depth removal will not walk |
 | [`with_cleanup`](#with_cleanup) | keep the primary failure when releasing a cursor or descriptor also fails |
@@ -42,11 +42,27 @@ pub rec Error {
 }
 ```
 
+why a removal failed
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `kind` | `std.io.error.Kind` | the io error kind of the failure |
+| `code` | `i64` | the native code behind it, 0 when removal refused on its own |
+| `containment` | `bool` | true when removal refused the target, a component, a swapped directory or the depth limit |
+| `cleanup_code` | `i64` | the first independent cleanup failure, 0 when none |
+
 ### message
 
 ```mach
 pub fun message(e: Error) str
 ```
+
+a static description of a removal error
+
+| Parameter | |
+| :--- | :--- |
+| `e` | the error |
+| **returns** | the containment message, the native code's message, or the kind's name |
 
 ### from_native
 

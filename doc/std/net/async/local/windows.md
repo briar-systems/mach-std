@@ -16,11 +16,16 @@ Uses types from [`std.allocator`](../../../allocator.md), [`std.net.async.iocp.p
 | Functions | |
 | :--- | :--- |
 | [`init`](#init) | initial is the size the backend starts at: every table grows on demand |
-| [`submit_read`](#submit_read) | |
+| [`submit_read`](#submit_read) | post an overlapped read into a borrowed buffer |
 | [`submit_readable`](#submit_readable) | wait for the stream to be readable without a buffer: an overlapped zero-byte receive, settled on completion by the queued byte count |
-| [`submit_write`](#submit_write), [`create_connect`](#create_connect), [`cleanup_listener`](#cleanup_listener), [`rename_listener`](#rename_listener), [`close_resource`](#close_resource) | |
+| [`submit_write`](#submit_write) | post an overlapped write from a borrowed buffer |
+| [`create_connect`](#create_connect) | create a nonblocking local stream socket to connect to an endpoint |
+| [`cleanup_listener`](#cleanup_listener) | remove a listener's socket file when it is still the node the listener bound |
+| [`rename_listener`](#rename_listener) | move a listener's socket file to another path |
+| [`close_resource`](#close_resource) | close a native socket without a completion |
 | [`detach`](#detach) | give up a socket with nothing on it, so another backend can take it: the socket leaves the completion port and stays open |
-| [`submit_accept`](#submit_accept), [`submit_connect`](#submit_connect) | |
+| [`submit_accept`](#submit_accept) | post an overlapped accept on a listening socket, into a socket made for it here |
+| [`submit_connect`](#submit_connect) | post an overlapped connect to a local endpoint, binding the socket first when it is unbound |
 | [`submit_shutdown_write`](#submit_shutdown_write) | a shutdown waits for the socket's writes, and runs once none is left |
 | [`submit_close`](#submit_close) | a close aborts the socket's requests and completes once they have all left |
 
@@ -60,6 +65,18 @@ initial is the size the backend starts at: every table grows on demand
 pub fun submit_read(backend: *Backend, resource: usize, buffer: *u8, length: usize, context: usize, token: *std.net.async.types.Token) i64
 ```
 
+post an overlapped read into a borrowed buffer
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend |
+| `resource` | the native socket |
+| `buffer` | where the bytes go, borrowed until the operation completes |
+| `length` | the buffer size in bytes, at most 0xffffffff |
+| `context` | the caller's context, carried to the completion |
+| `token` | receives the operation's token |
+| **returns** | 0 once posted or held behind an earlier readiness wait, or a negative native error |
+
 ### submit_readable
 
 ```mach
@@ -75,11 +92,31 @@ receive, settled on completion by the queued byte count
 pub fun submit_write(backend: *Backend, resource: usize, buffer: *u8, length: usize, context: usize, token: *std.net.async.types.Token) i64
 ```
 
+post an overlapped write from a borrowed buffer
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend |
+| `resource` | the native socket |
+| `buffer` | the bytes to send, borrowed until the operation completes |
+| `length` | bytes to send, at most 0xffffffff |
+| `context` | the caller's context, carried to the completion |
+| `token` | receives the operation's token |
+| **returns** | 0 once posted, or a negative native error |
+
 ### create_connect
 
 ```mach
 pub fun create_connect(value: std.net.local.endpoint.Endpoint, resource: *usize) i64
 ```
+
+create a nonblocking local stream socket to connect to an endpoint
+
+| Parameter | |
+| :--- | :--- |
+| `value` | the endpoint it will connect to |
+| `resource` | receives the socket, owned by the caller |
+| **returns** | 0, or a negative native error |
 
 ### cleanup_listener
 
@@ -87,17 +124,40 @@ pub fun create_connect(value: std.net.local.endpoint.Endpoint, resource: *usize)
 pub fun cleanup_listener(listener: *std.net.local.types.Listener) i64
 ```
 
+remove a listener's socket file when it is still the node the listener bound
+
+| Parameter | |
+| :--- | :--- |
+| `listener` | the listener |
+| **returns** | 0, also when nothing is there, EBUSY when the path is not the listener's node or its identity cannot be read, or a negative native error |
+
 ### rename_listener
 
 ```mach
 pub fun rename_listener(listener: *std.net.local.types.Listener, replacement: std.net.local.endpoint.Endpoint) i64
 ```
 
+move a listener's socket file to another path
+
+| Parameter | |
+| :--- | :--- |
+| `listener` | the listener |
+| `replacement` | the new endpoint |
+| **returns** | 0, or a negative native error |
+
 ### close_resource
 
 ```mach
 pub fun close_resource(backend: *Backend, resource: usize) i64
 ```
+
+close a native socket without a completion. its outstanding requests settle in the background
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend |
+| `resource` | the native socket |
+| **returns** | 0, or a negative native error |
 
 ### detach
 
@@ -115,11 +175,32 @@ apart by its driver's tokens, so no record is kept
 pub fun submit_accept(backend: *Backend, listener: usize, context: usize, token: *std.net.async.types.Token) i64
 ```
 
+post an overlapped accept on a listening socket, into a socket made for it here
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend |
+| `listener` | the native listening socket |
+| `context` | the caller's context, carried to the completion |
+| `token` | receives the operation's token |
+| **returns** | 0 once posted, or a negative native error. the completion's resource is the accepted socket, owned by the caller |
+
 ### submit_connect
 
 ```mach
 pub fun submit_connect(backend: *Backend, resource: usize, peer: std.net.local.endpoint.Endpoint, context: usize, token: *std.net.async.types.Token) i64
 ```
+
+post an overlapped connect to a local endpoint, binding the socket first when it is unbound
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend |
+| `resource` | the native socket |
+| `peer` | the endpoint to connect to |
+| `context` | the caller's context, carried to the completion |
+| `token` | receives the operation's token |
+| **returns** | 0 once posted, or a negative native error. ENOTSUP or EINVAL for an endpoint with no socket address |
 
 ### submit_shutdown_write
 
@@ -156,6 +237,8 @@ pub rec Token {
 }
 ```
 
+names one operation a backend holds, refused once the slot is reused
+
 ### NativeCompletion
 
 Forwards [`std.net.async.types.NativeCompletion`](../types.md#nativecompletion).
@@ -171,6 +254,8 @@ pub rec NativeCompletion {
     end_of_stream: bool;
 }
 ```
+
+what a backend reports for one finished operation
 
 ### Backend
 
@@ -205,6 +290,8 @@ Forwards [`std.net.async.iocp.port.aliases`](../iocp/port.md#aliases).
 pub fun aliases(backend: *Backend, data: *u8, len: usize) bool
 ```
 
+whether a caller range overlaps memory the backend owns
+
 ### cancel
 
 Forwards [`std.net.async.iocp.port.cancel`](../iocp/port.md#cancel).
@@ -230,6 +317,8 @@ Forwards [`std.net.async.iocp.port.flush`](../iocp/port.md#flush).
 pub fun flush(backend: *Backend) i64
 ```
 
+publish the settled controls without waiting
+
 ### dispatch
 
 Forwards [`std.net.async.iocp.port.dispatch`](../iocp/port.md#dispatch).
@@ -244,6 +333,8 @@ pub fun dispatch(
     claimed: *bool,
 ) i64
 ```
+
+handle one packet the runtime's shared queue delivered
 
 ### poll
 
@@ -262,6 +353,8 @@ Forwards [`std.net.async.iocp.port.completion`](../iocp/port.md#completion).
 ```mach
 pub fun completion(backend: *Backend, index: usize, out: *std.net.async.types.NativeCompletion) i64
 ```
+
+copy out one completion the last publish made readable
 
 ### dnit
 

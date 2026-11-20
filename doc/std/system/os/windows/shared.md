@@ -19,21 +19,21 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`stat_t`](#stat_t) | `rec` |  |
-| [`timespec`](#timespec) | `rec` |  |
+| [`stat_t`](#stat_t) | `rec` | file metadata in the posix layout os.mach reads, filled from the windows file information by stat, stat_path and their native forms |
+| [`timespec`](#timespec) | `rec` | a time as clock_gettime reports it |
 | [`DirectoryCursor`](#directorycursor) | `rec` | the current entry's units are kept, terminated, just past the native area, and its UTF-8 spelling past them |
 | [`IoCompletion`](#iocompletion) | `rec` | source: the id of the source that registered the context, 0 for a wake |
 
 | On `stat_t` | |
 | :--- | :--- |
-| [`stat`](#stat) | |
+| [`stat`](#stat) | read the metadata of the object fd holds |
 | [`stat_mode`](#stat_mode) | read the type/permission bits from a filled stat buffer as a 32-bit word |
-| [`stat_path`](#stat_path) | |
+| [`stat_path`](#stat_path) | stat_path_native for a UTF-8 path, converted once |
 | [`stat_path_native`](#stat_path_native) | stat_path for a nul-terminated UTF-16 name, the units unchanged |
 
 | On `timespec` | |
 | :--- | :--- |
-| [`clock_gettime`](#clock_gettime) | |
+| [`clock_gettime`](#clock_gettime) | read a clock |
 
 | On `DirectoryCursor` | |
 | :--- | :--- |
@@ -51,49 +51,70 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | Functions | |
 | :--- | :--- |
 | [`last_error`](#last_error) | the calling thread's last Win32 error as a negated POSIX errno, for a consumer that binds a kernel32 call of its own (std.terminal.windows) |
-| [`allocate`](#allocate), [`deallocate`](#deallocate) | |
+| [`allocate`](#allocate) | commit size bytes of fresh zero-filled read-write pages |
+| [`deallocate`](#deallocate) | release pages allocate returned |
 | [`map_secret`](#map_secret) | map storage for secret-welded data: span locked bytes between two reserved, uncommitted guard pages, page aligned and zero-filled |
-| [`reallocate`](#reallocate), [`heap_region_base`](#heap_region_base), [`heap_region_extend`](#heap_region_extend), [`protect`](#protect), [`lock`](#lock), [`unlock`](#unlock), [`advise`](#advise), [`page_size`](#page_size) | |
+| [`reallocate`](#reallocate) | move an allocation into fresh pages of a new size, copying what fits |
+| [`heap_region_base`](#heap_region_base) | the current end of the heap region, reserving the region on first use |
+| [`heap_region_extend`](#heap_region_extend) | commit the heap region up to addr |
+| [`protect`](#protect) | change the protection of a range of pages |
+| [`lock`](#lock) | keep a range of pages resident with VirtualLock |
+| [`unlock`](#unlock) | release a range lock took |
+| [`advise`](#advise) | accept a memory usage hint, which windows does not act on |
+| [`page_size`](#page_size) | the page size, a fixed 4096 |
 | [`map_file`](#map_file) | map a file descriptor into memory via CreateFileMapping + MapViewOfFile |
 | [`sync_file`](#sync_file) | flush a memory-mapped region to its backing file via FlushViewOfFile |
-| [`unmap_file`](#unmap_file) | |
+| [`unmap_file`](#unmap_file) | unmap a view map_file returned |
 | [`native_spelling`](#native_spelling) | a name in UTF-16 units spelled in UTF-8 through the one converter, not terminated: the byte count written, or measured when out is nil, EINVAL for a name with no UTF-8 spelling, or ERANGE when out is too small |
 | [`native_path`](#native_path) | convert a UTF-8 path once into an owned native path, as every UTF-8 primitive does, for a caller that walks the name itself |
-| [`confined_path`](#confined_path) | release what native_path converted a confined path, walked a component at a time, converted once: a path over the converter's limit is ENAMETOOLONG, as each of its components would be |
-| [`native_path_release`](#native_path_release), [`open_root_utf8`](#open_root_utf8) | |
+| [`confined_path`](#confined_path) | a confined path, walked a component at a time, converted once: a path over the converter's limit is ENAMETOOLONG, as each of its components would be |
+| [`native_path_release`](#native_path_release) | release what native_path or confined_path converted, leaving path empty |
+| [`open_root_utf8`](#open_root_utf8) | open_root_native for a UTF-8 path, converted once |
 | [`open_root_native`](#open_root_native) | open a directory by a wide path, resolved by the W API |
-| [`make_dir_utf8`](#make_dir_utf8), [`remove_file_utf8`](#remove_file_utf8), [`remove_dir_utf8`](#remove_dir_utf8) | |
+| [`make_dir_utf8`](#make_dir_utf8) | make a directory at a UTF-8 path with mode 0o777, which keeps the inherited access control |
+| [`remove_file_utf8`](#remove_file_utf8) | delete the file a UTF-8 path names, through DeleteFileW |
+| [`remove_dir_utf8`](#remove_dir_utf8) | remove the empty directory a UTF-8 path names, through RemoveDirectoryW |
 | [`open_relative_utf8`](#open_relative_utf8) | open one utf-8 component from a pinned directory descriptor |
 | [`open_relative_native`](#open_relative_native) | open one wide component from a pinned directory descriptor |
 | [`positioned_begin`](#positioned_begin) | pin a descriptor's handle and file pointer around one positioned transfer: the entry lock serializes position changes and `positioned_end` restores the pointer the transfer moved |
-| [`positioned_end`](#positioned_end), [`read_at`](#read_at), [`write_at`](#write_at), [`publication_capabilities`](#publication_capabilities), [`rename_relative_utf8`](#rename_relative_utf8) | |
+| [`positioned_end`](#positioned_end) | restore the file pointer positioned_begin saved and release the entry lock |
+| [`read_at`](#read_at) | |
+| [`write_at`](#write_at) | write at an offset without moving the descriptor's file pointer |
+| [`publication_capabilities`](#publication_capabilities) | the publication guarantees the volume holding fd gives: all three on a local ntfs volume with posix unlink and rename, claims alone on another local ntfs or refs volume, and none on a remote or other volume |
+| [`rename_relative_utf8`](#rename_relative_utf8) | rename_relative_native for UTF-8 components, each converted once |
 | [`rename_relative_native`](#rename_relative_native) | rename one wide component to another between pinned directory descriptors |
-| [`read`](#read), [`write`](#write), [`open`](#open) | |
+| [`read`](#read) | read up to count bytes at the file pointer |
+| [`write`](#write) | write up to count bytes at the file pointer |
+| [`open`](#open) | open_native for a UTF-8 path, converted once |
 | [`open_native`](#open_native) | open a nul-terminated UTF-16 path as given: the units reach the W APIs unchanged, so a name holding an unpaired surrogate opens what it names |
-| [`close`](#close) | |
+| [`close`](#close) | close a descriptor and its handle |
 | [`lock_fd`](#lock_fd) | lock_fd: take or release an advisory whole-file lock on an open descriptor |
 | [`sync_fd`](#sync_fd) | flush file data or ntfs directory metadata through the pinned object other windows filesystems cannot certify directory persistence and return enotsup |
 | [`set_mode`](#set_mode) | an owner-only mode is enforced with a protected dacl granting only the current user, who also becomes the owner |
 | [`set_mode_at`](#set_mode_at) | the same mapping as set_mode, for the object named relative to dirfd |
 | [`set_mode_at_native`](#set_mode_at_native) | set_mode_at for a nul-terminated UTF-16 name, the units unchanged |
-| [`file_identity`](#file_identity), [`retain_identity_at`](#retain_identity_at) | |
+| [`file_identity`](#file_identity) | the identity of the object fd holds, from its volume and file id |
+| [`retain_identity_at`](#retain_identity_at) | retain_identity_at_native for a UTF-8 path, converted once |
 | [`retain_identity_at_native`](#retain_identity_at_native) | retain_identity_at for a nul-terminated UTF-16 name, the units unchanged |
-| [`identity_at`](#identity_at) | |
+| [`identity_at`](#identity_at) | identity_at_native for a UTF-8 path, converted once |
 | [`identity_at_native`](#identity_at_native) | identity_at for a nul-terminated UTF-16 name, the units unchanged |
 | [`local_endpoint_path`](#local_endpoint_path) | the sun_path bytes of a nul-terminated UTF-16 socket path, converted once |
-| [`local_endpoint_identity`](#local_endpoint_identity), [`unlink_force`](#unlink_force) | |
+| [`local_endpoint_identity`](#local_endpoint_identity) | the volume and file index of the AF_UNIX socket a UTF-8 path names |
+| [`unlink_force`](#unlink_force) | unlink a UTF-8 path relative to a directory descriptor, overriding the read-only attribute where the volume has posix delete semantics |
 | [`unlink_force_native`](#unlink_force_native) | unlink_force for a nul-terminated UTF-16 name, the units unchanged |
-| [`unlink`](#unlink) | |
+| [`unlink`](#unlink) | unlink_native for a UTF-8 path, converted once |
 | [`unlink_native`](#unlink_native) | remove a nul-terminated UTF-16 path as given, the units unchanged |
-| [`rename`](#rename) | |
+| [`rename`](#rename) | rename_native for UTF-8 paths, each converted once |
 | [`rename_native`](#rename_native) | rename for nul-terminated UTF-16 names, the units unchanged |
 | [`symlink`](#symlink) | relative targets remain relative, with native separators in the reparse data |
 | [`symlink_native`](#symlink_native) | symlink for nul-terminated UTF-16 names, the units unchanged |
-| [`make_dir`](#make_dir) | |
+| [`make_dir`](#make_dir) | make_dir_native for a UTF-8 path, converted once |
 | [`make_dir_native`](#make_dir_native) | make_dir for a nul-terminated UTF-16 name, the units unchanged |
-| [`access`](#access) | |
+| [`access`](#access) | check a UTF-8 path relative to dirfd by reading it as stat_path does |
 | [`access_native`](#access_native) | access for a nul-terminated UTF-16 name, the units unchanged |
-| [`seek`](#seek), [`terminate`](#terminate), [`abort`](#abort) | |
+| [`seek`](#seek) | move a descriptor's file pointer, or rewind a directory's listing |
+| [`terminate`](#terminate) | end the process with the low 32 bits of code as its exit code, never returning |
+| [`abort`](#abort) | end the process with exit code 255, never returning |
 | [`environment_name_compare`](#environment_name_compare) | compare complete UTF-8 names, each converted once and compared as environment_name_compare_native compares their units |
 | [`environment_name_compare_native`](#environment_name_compare_native) | compare complete names in UTF-16 units as given, with the operating system's ordinal case table and no conversion, so unpaired surrogates compare as units |
 | [`spawn`](#spawn) | create a child process running the given program |
@@ -116,7 +137,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`process_unwatch`](#process_unwatch) | release a watch process_watch made, whether or not it fired, removing a completion it queued and nobody took |
 | [`getpid`](#getpid) | return the current process ID |
 | [`open_file_limit`](#open_file_limit) | windows has no settable per-process descriptor limit: handles are bounded by kernel memory, so neither query nor set has a faithful answer |
-| [`set_open_file_limit`](#set_open_file_limit) | |
+| [`set_open_file_limit`](#set_open_file_limit) | windows has no settable descriptor limit |
 | [`ignore_sigpipe`](#ignore_sigpipe) | ignore SIGPIPE for this process |
 | [`pipe`](#pipe) | create a unidirectional pipe |
 | [`sleep`](#sleep) | suspend execution for the given number of nanoseconds |
@@ -132,35 +153,63 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`temp_dir`](#temp_dir) | resolve the directory designated for temporary files |
 | [`temp_dir_native`](#temp_dir_native) | temp_dir in UTF-16 units, under the same truncation contract with cap in units |
 | [`environ_native`](#environ_native) | captures the block once as UTF-16 entries, unconverted, and skips hidden drive-current-directory names |
-| [`wait`](#wait), [`wait_pid`](#wait_pid) | |
+| [`wait`](#wait) | wait for a tracked child to end and reap it |
+| [`wait_pid`](#wait_pid) | wait with no resource usage |
 | [`thread_block_enter`](#thread_block_enter) | install block as the calling thread's |
 | [`thread_block`](#thread_block) | the calling thread's block, read from its TEB without a system call |
 | [`stack_bounds`](#stack_bounds) | the calling thread's stack bounds, read from its TEB without a system call |
 | [`thread_exit_wipe`](#thread_exit_wipe) | wipe the calling thread's thread-local block as the thread ends |
 | [`thread_spawn`](#thread_spawn) | create a thread with a retained native handle |
-| [`thread_join`](#thread_join), [`thread_detach`](#thread_detach), [`thread_current_id`](#thread_current_id), [`thread_current_name`](#thread_current_name) | |
+| [`thread_join`](#thread_join) | wait for a thread thread_spawn made to end and close its handle |
+| [`thread_detach`](#thread_detach) | close a spawned thread's handle and let it run on unjoined |
+| [`thread_current_id`](#thread_current_id) | the calling thread's id |
+| [`thread_current_name`](#thread_current_name) | the calling thread's description, which must be ASCII |
 | [`thread_wait`](#thread_wait) | block until the value at addr changes from expected |
 | [`thread_wait_until`](#thread_wait_until) | block until the word changes or an absolute monotonic deadline is reached |
 | [`thread_wake`](#thread_wake) | wake one thread blocked on WaitOnAddress at addr |
-| [`io_queue_create`](#io_queue_create) | |
+| [`io_queue_create`](#io_queue_create) | create an io completion port for queue |
 | [`io_queue_attach`](#io_queue_attach) | every completion for resource reports source |
 | [`io_queue_detach`](#io_queue_detach) | resource leaves the completion port it is attached to, so another queue can attach it |
-| [`io_queue_wait`](#io_queue_wait) | |
+| [`io_queue_wait`](#io_queue_wait) | take one completion and discard it |
 | [`io_queue_wake`](#io_queue_wake) | nil is invalid use and a closed queue is EBADF on every platform |
-| [`io_queue_close`](#io_queue_close), [`io_queue_cancel`](#io_queue_cancel) | |
+| [`io_queue_close`](#io_queue_close) | close a queue's port |
+| [`io_queue_cancel`](#io_queue_cancel) | cancel one outstanding request on resource |
 | [`running_under_wine`](#running_under_wine) | detect whether the process is running under the wine windows compatibility layer rather than on genuine windows |
-| [`sock_send`](#sock_send), [`sock_recv`](#sock_recv), [`sock_close`](#sock_close), [`sock_async_accept`](#sock_async_accept), [`sock_async_connect`](#sock_async_connect), [`sock_async_receive`](#sock_async_receive), [`sock_async_send`](#sock_async_send) | |
+| [`sock_send`](#sock_send) | |
+| [`sock_recv`](#sock_recv) | receive up to len bytes from a connected socket |
+| [`sock_close`](#sock_close) | close a socket |
+| [`sock_async_accept`](#sock_async_accept) | start an overlapped AcceptEx on listener into accepted |
+| [`sock_async_connect`](#sock_async_connect) | start an overlapped ConnectEx to address on a bound socket |
+| [`sock_async_receive`](#sock_async_receive) | start an overlapped WSARecv into count WSABUFs |
+| [`sock_async_send`](#sock_async_send) | start an overlapped WSASend from count WSABUFs |
 | [`sock_pending_bytes`](#sock_pending_bytes) | the bytes queued for reading on a socket |
-| [`sock_async_receive_message`](#sock_async_receive_message) | |
+| [`sock_async_receive_message`](#sock_async_receive_message) | start an overlapped WSARecvMsg into a WSAMSG |
 | [`sock_receive_message_ready`](#sock_receive_message_ready) | receive one message now, without an overlapped operation |
-| [`sock_async_send_message`](#sock_async_send_message), [`sock_async_result`](#sock_async_result), [`sock_accept_context`](#sock_accept_context), [`sock_connect_context`](#sock_connect_context), [`sock_create`](#sock_create), [`sock_create_flags`](#sock_create_flags), [`sock_bind`](#sock_bind), [`sock_listen`](#sock_listen), [`sock_accept`](#sock_accept), [`sock_accept_flags`](#sock_accept_flags), [`sock_connect`](#sock_connect), [`sock_sendto`](#sock_sendto), [`sock_recvfrom`](#sock_recvfrom), [`sock_shutdown`](#sock_shutdown), [`sock_setopt`](#sock_setopt), [`sock_getopt`](#sock_getopt), [`sock_local_addr`](#sock_local_addr), [`sock_remote_addr`](#sock_remote_addr) | |
+| [`sock_async_send_message`](#sock_async_send_message) | start an overlapped WSASendMsg from a WSAMSG |
+| [`sock_async_result`](#sock_async_result) | the outcome of an overlapped socket request |
+| [`sock_accept_context`](#sock_accept_context) | give a socket AcceptEx accepted its listener's context |
+| [`sock_connect_context`](#sock_connect_context) | update a socket ConnectEx connected to its connected context |
+| [`sock_create`](#sock_create) | sock_create_flags for a blocking, non-inheritable socket |
+| [`sock_create_flags`](#sock_create_flags) | create an overlapped socket |
+| [`sock_bind`](#sock_bind) | bind a socket to an address |
+| [`sock_listen`](#sock_listen) | mark a bound socket as listening |
+| [`sock_accept`](#sock_accept) | sock_accept_flags for a blocking, non-inheritable socket |
+| [`sock_accept_flags`](#sock_accept_flags) | accept a connection on a listening socket |
+| [`sock_connect`](#sock_connect) | connect a socket to an address |
+| [`sock_sendto`](#sock_sendto) | send a datagram to an address |
+| [`sock_recvfrom`](#sock_recvfrom) | receive a datagram and its sender's address |
+| [`sock_shutdown`](#sock_shutdown) | shut down one or both directions of a socket |
+| [`sock_setopt`](#sock_setopt) | set a socket option |
+| [`sock_getopt`](#sock_getopt) | read a socket option |
+| [`sock_local_addr`](#sock_local_addr) | the address a socket is bound to |
+| [`sock_remote_addr`](#sock_remote_addr) | the address of a socket's peer |
 | [`sock_set_nonblocking`](#sock_set_nonblocking) | switch a socket between blocking and nonblocking |
 | [`sock_connect_begin`](#sock_connect_begin) | start a connect on a nonblocking socket |
 | [`sock_connect_poll`](#sock_connect_poll) | ask whether a connect sock_connect_begin started has settled, without waiting |
-| [`sock_inheritable`](#sock_inheritable) | |
+| [`sock_inheritable`](#sock_inheritable) | whether child processes inherit a socket |
 | [`sock_set_rcvtimeo`](#sock_set_rcvtimeo) | set the receive timeout on a socket |
 | [`random_fill`](#random_fill) | fill a buffer with cryptographic random bytes via BCryptGenRandom |
-| [`error_message`](#error_message) | |
+| [`error_message`](#error_message) | the text for a negated errno code, "unknown error" for one with none |
 
 | Constants | |
 | :--- | :--- |
@@ -206,11 +255,44 @@ pub rec stat_t {
 }
 ```
 
+file metadata in the posix layout os.mach reads, filled from the windows
+file information by stat, stat_path and their native forms
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `st_dev` | `u64` | the volume serial number |
+| `st_ino` | `u64` | the file index |
+| `st_nlink` | `u64` | the link count |
+| `st_mode` | `u32` | the S_IF type bits and the permission bits: 0o777 for a reparse point, else the owner bits an owner-only protected dacl enforces or a conventional default, with the write bits cleared for a read-only file |
+| `st_uid` | `u32` | always 0 |
+| `st_gid` | `u32` | always 0 |
+| `pad0` | `i32` | padding |
+| `st_rdev` | `u64` | always 0 |
+| `st_size` | `i64` | the size in bytes |
+| `st_blksize` | `i64` | always 4096 |
+| `st_blocks` | `i64` | the size in 512-byte blocks, rounded up |
+| `st_atime` | `i64` | last access, unix seconds |
+| `st_atime_nsec` | `i64` | last access, nanoseconds past st_atime |
+| `st_mtime` | `i64` | last write, unix seconds |
+| `st_mtime_nsec` | `i64` | last write, nanoseconds past st_mtime |
+| `st_ctime` | `i64` | creation time, unix seconds |
+| `st_ctime_nsec` | `i64` | creation time, nanoseconds past st_ctime |
+| `_reserved0` | `i64` | unused |
+| `_reserved1` | `i64` | unused |
+| `_reserved2` | `i64` | unused |
+
 ### stat
 
 ```mach
 pub fun stat(fd: i32, st: *stat_t) i64
 ```
+
+read the metadata of the object fd holds
+
+| Parameter | |
+| :--- | :--- |
+| `st` | filled on success |
+| **returns** | 0, or a negative native code |
 
 ### stat_mode
 
@@ -234,6 +316,12 @@ portable callers read the mode uniformly across platforms (darwin's is 16-bit).
 pub fun stat_path(dirfd: i32, path: *u8, st: *stat_t, flags: i32) i64
 ```
 
+stat_path_native for a UTF-8 path, converted once
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, or a negative native code |
+
 ### stat_path_native
 
 ```mach
@@ -251,11 +339,26 @@ pub rec timespec {
 }
 ```
 
+a time as clock_gettime reports it
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `tv_sec` | `i64` | whole seconds |
+| `tv_nsec` | `i64` | nanoseconds past tv_sec, below one second |
+
 ### clock_gettime
 
 ```mach
 pub fun clock_gettime(clock_id: i32, ts: *timespec) i64
 ```
+
+read a clock. CLOCK_MONOTONIC reads the performance counter and any other id
+the system wall clock
+
+| Parameter | |
+| :--- | :--- |
+| `ts` | filled on success |
+| **returns** | 0, or EIO when the performance counter has no frequency |
 
 ## DirectoryCursor
 
@@ -378,11 +481,26 @@ consumer that binds a kernel32 call of its own (std.terminal.windows)
 pub fun allocate(size: usize) ptr
 ```
 
+commit size bytes of fresh zero-filled read-write pages
+
+| Parameter | |
+| :--- | :--- |
+| `size` | the byte count, rounded up to whole pages by the system |
+| **returns** | the pages, released with deallocate, or nil when size is 0 or the system refuses |
+
 ### deallocate
 
 ```mach
 pub fun deallocate(p: ptr, size: usize) i64
 ```
+
+release pages allocate returned
+
+| Parameter | |
+| :--- | :--- |
+| `p` | the start allocate returned, or nil to do nothing |
+| `size` | the size allocate was given, 0 to do nothing |
+| **returns** | 0, or a negative native code |
 
 ### map_secret
 
@@ -411,11 +529,26 @@ as one, never served unlocked
 pub fun reallocate(p: ptr, old_size: usize, new_size: usize) ptr
 ```
 
+move an allocation into fresh pages of a new size, copying what fits
+
+| Parameter | |
+| :--- | :--- |
+| `p` | the allocation, or nil to allocate new_size bytes |
+| `old_size` | its size |
+| `new_size` | the size wanted, 0 to release p |
+| **returns** | the new allocation, nil when new_size is 0 and p was released, or nil when the system refuses, leaving p allocated |
+
 ### heap_region_base
 
 ```mach
 pub fun heap_region_base() usize
 ```
+
+the current end of the heap region, reserving the region on first use
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the end of the committed region, or 0 when the reservation is refused |
 
 ### heap_region_extend
 
@@ -423,11 +556,27 @@ pub fun heap_region_base() usize
 pub fun heap_region_extend(addr: usize) usize
 ```
 
+commit the heap region up to addr
+
+| Parameter | |
+| :--- | :--- |
+| `addr` | the new end wanted |
+| **returns** | the end after the call, unchanged when addr is not past it, lies beyond the reservation or cannot be committed, or 0 when there is no region |
+
 ### protect
 
 ```mach
 pub fun protect(p: ptr, size: usize, prot: u32) i64
 ```
+
+change the protection of a range of pages
+
+| Parameter | |
+| :--- | :--- |
+| `p` | the first page |
+| `size` | the byte count |
+| `prot` | PROT_READ, PROT_WRITE and PROT_EXEC combined, or PROT_NONE |
+| **returns** | 0, or a negative native code |
 
 ### lock
 
@@ -435,11 +584,23 @@ pub fun protect(p: ptr, size: usize, prot: u32) i64
 pub fun lock(p: ptr, size: usize) i64
 ```
 
+keep a range of pages resident with VirtualLock
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, or a negative native code |
+
 ### unlock
 
 ```mach
 pub fun unlock(p: ptr, size: usize) i64
 ```
+
+release a range lock took
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, or a negative native code |
 
 ### advise
 
@@ -447,11 +608,19 @@ pub fun unlock(p: ptr, size: usize) i64
 pub fun advise(p: ptr, size: usize, advice: u32) i64
 ```
 
+accept a memory usage hint, which windows does not act on
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | always 0 |
+
 ### page_size
 
 ```mach
 pub fun page_size() usize
 ```
+
+the page size, a fixed 4096
 
 ### map_file
 
@@ -489,6 +658,14 @@ flush a memory-mapped region to its backing file via FlushViewOfFile
 pub fun unmap_file(p: ptr, size: usize) i64
 ```
 
+unmap a view map_file returned
+
+| Parameter | |
+| :--- | :--- |
+| `p` | the view |
+| `size` | its size, which must not be 0 |
+| **returns** | 0, EINVAL for a nil view or a zero size, or a negative native code |
+
 ### native_spelling
 
 ```mach
@@ -514,7 +691,6 @@ primitive does, for a caller that walks the name itself
 pub fun confined_path(path: *u8, out: *std.system.os.shared.NativePath) i64
 ```
 
-release what native_path converted
 a confined path, walked a component at a time, converted once: a path over
 the converter's limit is ENAMETOOLONG, as each of its components would be
 
@@ -524,11 +700,19 @@ the converter's limit is ENAMETOOLONG, as each of its components would be
 pub fun native_path_release(path: *std.system.os.shared.NativePath)
 ```
 
+release what native_path or confined_path converted, leaving path empty
+
 ### open_root_utf8
 
 ```mach
 pub fun open_root_utf8(path: *u8) i64
 ```
+
+open_root_native for a UTF-8 path, converted once
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the new descriptor, or a negative native code |
 
 ### open_root_native
 
@@ -544,17 +728,36 @@ open a directory by a wide path, resolved by the W API
 pub fun make_dir_utf8(path: *u8) i64
 ```
 
+make a directory at a UTF-8 path with mode 0o777, which keeps the inherited
+access control
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, or a negative native code |
+
 ### remove_file_utf8
 
 ```mach
 pub fun remove_file_utf8(path: *u8) i64
 ```
 
+delete the file a UTF-8 path names, through DeleteFileW
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, or a negative native code |
+
 ### remove_dir_utf8
 
 ```mach
 pub fun remove_dir_utf8(path: *u8) i64
 ```
+
+remove the empty directory a UTF-8 path names, through RemoveDirectoryW
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, or a negative native code |
 
 ### open_relative_utf8
 
@@ -589,6 +792,15 @@ for its welded transfers
 pub fun positioned_end(fd: i32, handle: isize, saved: i64) i64
 ```
 
+restore the file pointer positioned_begin saved and release the entry lock
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the descriptor positioned_begin pinned |
+| `handle` | the handle it gave |
+| `saved` | the offset it gave |
+| **returns** | 0, or the native code of a failed restore |
+
 ### read_at
 
 ```mach
@@ -601,17 +813,41 @@ pub fun read_at(fd: i32, buffer: *u8, count: usize, offset: u64) i64
 pub fun write_at(fd: i32, buffer: *u8, count: usize, offset: u64) i64
 ```
 
+write at an offset without moving the descriptor's file pointer
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | an open descriptor |
+| `buffer` | the bytes |
+| `count` | the most bytes to write, at most 0xffffffff |
+| `offset` | the byte offset, at most the largest i64 |
+| **returns** | bytes written, or a negative native code |
+
 ### publication_capabilities
 
 ```mach
 pub fun publication_capabilities(fd: i32) i64
 ```
 
+the publication guarantees the volume holding fd gives: all three on a local
+ntfs volume with posix unlink and rename, claims alone on another local ntfs
+or refs volume, and none on a remote or other volume
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | a mask of the PUBLICATION_* flags, or a negative native code |
+
 ### rename_relative_utf8
 
 ```mach
 pub fun rename_relative_utf8(olddir: i32, oldpath: *u8, oldpath_length: usize, newdir: i32, newpath: *u8, newpath_length: usize) i64
 ```
+
+rename_relative_native for UTF-8 components, each converted once
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, or a negative native code |
 
 ### rename_relative_native
 
@@ -627,17 +863,35 @@ rename one wide component to another between pinned directory descriptors
 pub fun read(fd: i32, buf: *u8, count: usize) i64
 ```
 
+read up to count bytes at the file pointer
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | bytes read, zero at end of file or from a pipe whose writers all closed, or a negative native code |
+
 ### write
 
 ```mach
 pub fun write(fd: i32, buf: *u8, count: usize) i64
 ```
 
+write up to count bytes at the file pointer
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | bytes written, EPIPE when a pipe's reader has closed, or another negative native code |
+
 ### open
 
 ```mach
 pub fun open(dirfd: i32, path: *u8, flags: i32, mode: i32) i64
 ```
+
+open_native for a UTF-8 path, converted once
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the new descriptor, or a negative native code |
 
 ### open_native
 
@@ -653,6 +907,12 @@ unchanged, so a name holding an unpaired surrogate opens what it names
 ```mach
 pub fun close(fd: i32) i64
 ```
+
+close a descriptor and its handle
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, EBADF for a descriptor not open, or a negative native code |
 
 ### lock_fd
 
@@ -721,11 +981,24 @@ set_mode_at for a nul-terminated UTF-16 name, the units unchanged
 pub fun file_identity(fd: i32, out: *std.system.file_identity.Identity) i64
 ```
 
+the identity of the object fd holds, from its volume and file id
+
+| Parameter | |
+| :--- | :--- |
+| `out` | filled on success |
+| **returns** | 0, ENOTSUP on a remote volume, or a negative native code |
+
 ### retain_identity_at
 
 ```mach
 pub fun retain_identity_at(dirfd: i32, path: *u8, access: std.system.file_identity.Access, out: *std.system.file_identity.Identity) i64
 ```
+
+retain_identity_at_native for a UTF-8 path, converted once
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the retained descriptor, or a negative native code |
 
 ### retain_identity_at_native
 
@@ -740,6 +1013,12 @@ retain_identity_at for a nul-terminated UTF-16 name, the units unchanged
 ```mach
 pub fun identity_at(dirfd: i32, path: *u8, out: *std.system.file_identity.Identity) i64
 ```
+
+identity_at_native for a UTF-8 path, converted once
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, or a negative native code |
 
 ### identity_at_native
 
@@ -772,11 +1051,28 @@ it back, so an unpaired surrogate has no spelling there and is refused here
 pub fun local_endpoint_identity(path: *u8, device: *u64, file: *u64) i64
 ```
 
+the volume and file index of the AF_UNIX socket a UTF-8 path names
+
+| Parameter | |
+| :--- | :--- |
+| `device` | receives the volume serial number |
+| `file` | receives the file index |
+| **returns** | 0, ENOTSUP when the path is not an AF_UNIX reparse point, or a negative native code |
+
 ### unlink_force
 
 ```mach
 pub fun unlink_force(dirfd: i32, path: *u8, flags: i32) i64
 ```
+
+unlink a UTF-8 path relative to a directory descriptor, overriding the
+read-only attribute where the volume has posix delete semantics
+
+| Parameter | |
+| :--- | :--- |
+| `dirfd` | a directory descriptor, never AT_FDCWD |
+| `flags` | AT_REMOVEDIR to remove a directory, or 0 |
+| **returns** | 0, ENOTSUP for a read-only file the volume cannot delete that way, or a negative native code |
 
 ### unlink_force_native
 
@@ -792,6 +1088,12 @@ unlink_force for a nul-terminated UTF-16 name, the units unchanged
 pub fun unlink(dirfd: i32, path: *u8, flags: i32) i64
 ```
 
+unlink_native for a UTF-8 path, converted once
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, or a negative native code |
+
 ### unlink_native
 
 ```mach
@@ -805,6 +1107,12 @@ remove a nul-terminated UTF-16 path as given, the units unchanged
 ```mach
 pub fun rename(olddir: i32, oldpath: *u8, newdir: i32, newpath: *u8) i64
 ```
+
+rename_native for UTF-8 paths, each converted once
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, or a negative native code |
 
 ### rename_native
 
@@ -837,6 +1145,12 @@ copied, since its separators are made native in the copy
 pub fun make_dir(dirfd: i32, path: *u8, mode: i32) i64
 ```
 
+make_dir_native for a UTF-8 path, converted once
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, or a negative native code |
+
 ### make_dir_native
 
 ```mach
@@ -850,6 +1164,14 @@ make_dir for a nul-terminated UTF-16 name, the units unchanged
 ```mach
 pub fun access(dirfd: i32, path: *u8, mode: i32, flags: i32) i64
 ```
+
+check a UTF-8 path relative to dirfd by reading it as stat_path does
+
+| Parameter | |
+| :--- | :--- |
+| `mode` | ignored |
+| `flags` | passed to stat_path |
+| **returns** | 0, or stat_path's negative native code |
 
 ### access_native
 
@@ -865,17 +1187,29 @@ access for a nul-terminated UTF-16 name, the units unchanged
 pub fun seek(fd: i32, offset: i64, whence: i32) i64
 ```
 
+move a descriptor's file pointer, or rewind a directory's listing
+
+| Parameter | |
+| :--- | :--- |
+| `offset` | the byte offset, relative to whence. a directory takes only 0 |
+| `whence` | SEEK_SET, SEEK_CUR or SEEK_END. a directory takes only SEEK_SET |
+| **returns** | the resulting offset, 0 for a directory, or a negative native code |
+
 ### terminate
 
 ```mach
 pub fun terminate(code: i64)
 ```
 
+end the process with the low 32 bits of code as its exit code, never returning
+
 ### abort
 
 ```mach
 pub fun abort()
 ```
+
+end the process with exit code 255, never returning
 
 ### environment_name_compare
 
@@ -1244,6 +1578,12 @@ kernel memory, so neither query nor set has a faithful answer
 pub fun set_open_file_limit(limit: std.system.os.shared.FileLimit) i64
 ```
 
+windows has no settable descriptor limit
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | always ENOTSUP |
+
 ### ignore_sigpipe
 
 ```mach
@@ -1474,11 +1814,23 @@ drive-current-directory names
 pub fun wait(pid: i64, status: *std.system.os.shared.ProcessStatus, options: i32, rusage: *u8) std.system.os.shared.WaitResult
 ```
 
+wait for a tracked child to end and reap it
+
+| Parameter | |
+| :--- | :--- |
+| `pid` | a child's pid, or -1 for any tracked child |
+| `status` | receives how the child ended, or nil |
+| `options` | WNOHANG or 0. anything else is ENOTSUP |
+| `rusage` | must be nil, anything else is ENOTSUP |
+| **returns** | the reaped pid, a zero pid when WNOHANG found none ended, or the error, ECHILD when no such child is tracked |
+
 ### wait_pid
 
 ```mach
 pub fun wait_pid(pid: i64, status: *std.system.os.shared.ProcessStatus, options: i32) std.system.os.shared.WaitResult
 ```
+
+wait with no resource usage
 
 ### thread_block_enter
 
@@ -1549,11 +1901,25 @@ create a thread with a retained native handle
 pub fun thread_join(native: usize, reclaimable: *i64) i64
 ```
 
+wait for a thread thread_spawn made to end and close its handle
+
+| Parameter | |
+| :--- | :--- |
+| `native` | the handle thread_spawn wrote |
+| `reclaimable` | unused here |
+| **returns** | 0, or a negative native code |
+
 ### thread_detach
 
 ```mach
 pub fun thread_detach(native: usize) i64
 ```
+
+close a spawned thread's handle and let it run on unjoined
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, or a negative native code |
 
 ### thread_current_id
 
@@ -1561,11 +1927,21 @@ pub fun thread_detach(native: usize) i64
 pub fun thread_current_id() i64
 ```
 
+the calling thread's id
+
 ### thread_current_name
 
 ```mach
 pub fun thread_current_name(name: *u8, cap: usize) i64
 ```
+
+the calling thread's description, which must be ASCII
+
+| Parameter | |
+| :--- | :--- |
+| `name` | destination for the nul-terminated name |
+| `cap` | its capacity in bytes, terminator included |
+| **returns** | the name's length, -22 when cap is 0 or too small or the name is not ASCII, or the negative HRESULT of a failed query |
 
 ### thread_wait
 
@@ -1611,6 +1987,12 @@ wake one thread blocked on WaitOnAddress at addr
 pub fun io_queue_create(queue: *std.system.os.shared.IoQueue) i64
 ```
 
+create an io completion port for queue
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, or a negative native code |
+
 ### io_queue_attach
 
 ```mach
@@ -1635,6 +2017,13 @@ later replace a handle's port this way
 pub fun io_queue_wait(queue: *std.system.os.shared.IoQueue, timeout_ms: i32) i64
 ```
 
+take one completion and discard it
+
+| Parameter | |
+| :--- | :--- |
+| `timeout_ms` | the wait in milliseconds, -1 for none |
+| **returns** | 1 when a completion was taken, 0 on timeout, or a negative native code |
+
 ### io_queue_wake
 
 ```mach
@@ -1649,11 +2038,23 @@ nil is invalid use and a closed queue is EBADF on every platform
 pub fun io_queue_close(queue: *std.system.os.shared.IoQueue) i64
 ```
 
+close a queue's port. a queue already closed is 0
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, EINVAL for nil, or a negative native code |
+
 ### io_queue_cancel
 
 ```mach
 pub fun io_queue_cancel(resource: usize, overlapped: ptr) i64
 ```
+
+cancel one outstanding request on resource. a request already finished is 0
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, or a negative native code |
 
 ### running_under_wine
 
@@ -1684,11 +2085,23 @@ pub fun sock_send(fd: usize, buf: *u8, len: usize) i64
 pub fun sock_recv(fd: usize, buf: *u8, len: usize) i64
 ```
 
+receive up to len bytes from a connected socket
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | bytes received, zero at an orderly shutdown, or a negative native code |
+
 ### sock_close
 
 ```mach
 pub fun sock_close(fd: usize) i64
 ```
+
+close a socket
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, or a negative native code |
 
 ### sock_async_accept
 
@@ -1696,11 +2109,27 @@ pub fun sock_close(fd: usize) i64
 pub fun sock_async_accept(listener: usize, accepted: usize, address: *u8, address_capacity: usize, bytes: *u32, overlapped: ptr) i64
 ```
 
+start an overlapped AcceptEx on listener into accepted
+
+| Parameter | |
+| :--- | :--- |
+| `address` | receives both addresses, at least 288 bytes |
+| `address_capacity` | its size |
+| `bytes` | receives the bytes received |
+| `overlapped` | the request's OVERLAPPED |
+| **returns** | 0 when started or done, or a negative native code |
+
 ### sock_async_connect
 
 ```mach
 pub fun sock_async_connect(resource: usize, address: *u8, address_length: usize, bytes: *u32, overlapped: ptr) i64
 ```
+
+start an overlapped ConnectEx to address on a bound socket
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0 when started or done, or a negative native code |
 
 ### sock_async_receive
 
@@ -1708,11 +2137,23 @@ pub fun sock_async_connect(resource: usize, address: *u8, address_length: usize,
 pub fun sock_async_receive(resource: usize, buffers: ptr, count: usize, flags: *u32, overlapped: ptr) i64
 ```
 
+start an overlapped WSARecv into count WSABUFs
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0 when started or done, or a negative native code |
+
 ### sock_async_send
 
 ```mach
 pub fun sock_async_send(resource: usize, buffers: ptr, count: usize, flags: u32, overlapped: ptr) i64
 ```
+
+start an overlapped WSASend from count WSABUFs
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0 when started or done, or a negative native code |
 
 ### sock_pending_bytes
 
@@ -1734,6 +2175,12 @@ count means a datagram is waiting, so a receive would not pend
 ```mach
 pub fun sock_async_receive_message(resource: usize, message: ptr, overlapped: ptr) i64
 ```
+
+start an overlapped WSARecvMsg into a WSAMSG
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0 when started or done, or a negative native code |
 
 ### sock_receive_message_ready
 
@@ -1758,11 +2205,26 @@ wait
 pub fun sock_async_send_message(resource: usize, message: ptr, flags: u32, overlapped: ptr) i64
 ```
 
+start an overlapped WSASendMsg from a WSAMSG
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0 when started or done, or a negative native code |
+
 ### sock_async_result
 
 ```mach
 pub fun sock_async_result(resource: usize, overlapped: ptr, bytes: *u32, flags: *u32, wait: bool) i64
 ```
+
+the outcome of an overlapped socket request
+
+| Parameter | |
+| :--- | :--- |
+| `bytes` | receives the bytes transferred |
+| `flags` | receives the request's flags |
+| `wait` | true to block until the request finishes |
+| **returns** | 0, or a negative native code |
 
 ### sock_accept_context
 
@@ -1770,11 +2232,23 @@ pub fun sock_async_result(resource: usize, overlapped: ptr, bytes: *u32, flags: 
 pub fun sock_accept_context(accepted: usize, listener: usize) i64
 ```
 
+give a socket AcceptEx accepted its listener's context
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, or a negative native code |
+
 ### sock_connect_context
 
 ```mach
 pub fun sock_connect_context(resource: usize) i64
 ```
+
+update a socket ConnectEx connected to its connected context
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, or a negative native code |
 
 ### sock_create
 
@@ -1782,11 +2256,20 @@ pub fun sock_connect_context(resource: usize) i64
 pub fun sock_create(domain: i32, typ: i32, protocol: i32, out: *usize) i64
 ```
 
+sock_create_flags for a blocking, non-inheritable socket
+
 ### sock_create_flags
 
 ```mach
 pub fun sock_create_flags(domain: i32, typ: i32, protocol: i32, nonblocking: bool, non_inheritable: bool, out: *usize) i64
 ```
+
+create an overlapped socket
+
+| Parameter | |
+| :--- | :--- |
+| `out` | the socket on success, INVALID_SOCKET otherwise |
+| **returns** | 0, EIO when winsock cannot start, or a negative native code |
 
 ### sock_bind
 
@@ -1794,11 +2277,23 @@ pub fun sock_create_flags(domain: i32, typ: i32, protocol: i32, nonblocking: boo
 pub fun sock_bind(fd: usize, addr: *u8, addrlen: usize) i64
 ```
 
+bind a socket to an address
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, or a negative native code |
+
 ### sock_listen
 
 ```mach
 pub fun sock_listen(fd: usize, backlog: i32) i64
 ```
+
+mark a bound socket as listening
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, or a negative native code |
 
 ### sock_accept
 
@@ -1806,11 +2301,22 @@ pub fun sock_listen(fd: usize, backlog: i32) i64
 pub fun sock_accept(fd: usize, addr: *u8, addrlen: *u32, out: *usize) i64
 ```
 
+sock_accept_flags for a blocking, non-inheritable socket
+
 ### sock_accept_flags
 
 ```mach
 pub fun sock_accept_flags(fd: usize, addr: *u8, addrlen: *u32, nonblocking: bool, non_inheritable: bool, out: *usize) i64
 ```
+
+accept a connection on a listening socket
+
+| Parameter | |
+| :--- | :--- |
+| `addr` | receives the peer's address, or nil |
+| `addrlen` | its capacity in, its length out |
+| `out` | the accepted socket on success, INVALID_SOCKET otherwise |
+| **returns** | 0, or a negative native code |
 
 ### sock_connect
 
@@ -1818,11 +2324,23 @@ pub fun sock_accept_flags(fd: usize, addr: *u8, addrlen: *u32, nonblocking: bool
 pub fun sock_connect(fd: usize, addr: *u8, addrlen: usize) i64
 ```
 
+connect a socket to an address
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, or a negative native code |
+
 ### sock_sendto
 
 ```mach
 pub fun sock_sendto(fd: usize, buf: *u8, len: usize, flags: i32, addr: *u8, addrlen: usize) i64
 ```
+
+send a datagram to an address
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | bytes sent, or a negative native code |
 
 ### sock_recvfrom
 
@@ -1830,11 +2348,25 @@ pub fun sock_sendto(fd: usize, buf: *u8, len: usize, flags: i32, addr: *u8, addr
 pub fun sock_recvfrom(fd: usize, buf: *u8, len: usize, flags: i32, addr: *u8, addrlen: *u32) i64
 ```
 
+receive a datagram and its sender's address
+
+| Parameter | |
+| :--- | :--- |
+| `addrlen` | the address capacity in, its length out |
+| **returns** | bytes received, or a negative native code |
+
 ### sock_shutdown
 
 ```mach
 pub fun sock_shutdown(fd: usize, how: i32) i64
 ```
+
+shut down one or both directions of a socket
+
+| Parameter | |
+| :--- | :--- |
+| `how` | SHUT_RD, SHUT_WR or SHUT_RDWR |
+| **returns** | 0, or a negative native code |
 
 ### sock_setopt
 
@@ -1842,11 +2374,24 @@ pub fun sock_shutdown(fd: usize, how: i32) i64
 pub fun sock_setopt(fd: usize, level: i32, opt: i32, value: *u8, vallen: usize) i64
 ```
 
+set a socket option
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 0, ENOTSUP for SO_UNSUPPORTED, or a negative native code |
+
 ### sock_getopt
 
 ```mach
 pub fun sock_getopt(fd: usize, level: i32, opt: i32, value: *u8, vallen: *u32) i64
 ```
+
+read a socket option
+
+| Parameter | |
+| :--- | :--- |
+| `vallen` | the value capacity in, its length out |
+| **returns** | 0, ENOTSUP for SO_UNSUPPORTED, or a negative native code |
 
 ### sock_local_addr
 
@@ -1854,11 +2399,25 @@ pub fun sock_getopt(fd: usize, level: i32, opt: i32, value: *u8, vallen: *u32) i
 pub fun sock_local_addr(fd: usize, addr: *u8, addrlen: *u32) i64
 ```
 
+the address a socket is bound to
+
+| Parameter | |
+| :--- | :--- |
+| `addrlen` | the address capacity in, its length out |
+| **returns** | 0, or a negative native code |
+
 ### sock_remote_addr
 
 ```mach
 pub fun sock_remote_addr(fd: usize, addr: *u8, addrlen: *u32) i64
 ```
+
+the address of a socket's peer
+
+| Parameter | |
+| :--- | :--- |
+| `addrlen` | the address capacity in, its length out |
+| **returns** | 0, or a negative native code |
 
 ### sock_set_nonblocking
 
@@ -1912,6 +2471,13 @@ before the connect completes
 pub fun sock_inheritable(fd: usize, out: *bool) i64
 ```
 
+whether child processes inherit a socket
+
+| Parameter | |
+| :--- | :--- |
+| `out` | receives the answer |
+| **returns** | 0, EINVAL for a nil out, or EIO when the handle cannot be read |
+
 ### sock_set_rcvtimeo
 
 ```mach
@@ -1949,6 +2515,8 @@ fill a buffer with cryptographic random bytes via BCryptGenRandom
 ```mach
 pub fun error_message(code: i64) str
 ```
+
+the text for a negated errno code, "unknown error" for one with none
 
 ## Constants
 
@@ -2124,6 +2692,8 @@ pub rec ProcessStatus {
 }
 ```
 
+one observed change in a child's state
+
 ### FileLimit
 
 Forwards [`std.system.os.shared.FileLimit`](../shared.md#filelimit).
@@ -2161,6 +2731,8 @@ pub rec ProcessWaitError {
     operation:   u8;
 }
 ```
+
+why a process wait or the release of a child's handle failed
 
 ### WaitResult
 

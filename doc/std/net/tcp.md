@@ -17,19 +17,21 @@ Uses types from [`std.io.error`](../io/error.md), [`std.io.handle`](../io/handle
 | On `Listener` | |
 | :--- | :--- |
 | [`listen`](#listen) | create a TCP listener bound to an endpoint |
-| [`listen_with_flags`](#listen_with_flags) | |
+| [`listen_with_flags`](#listen_with_flags) | create a TCP listener bound to an endpoint with explicit creation flags |
 | [`accept`](#accept) | accept a new connection on a listener |
-| [`accept_with_flags`](#accept_with_flags) | |
+| [`accept_with_flags`](#accept_with_flags) | accept a new connection on a listener with explicit creation flags |
 | [`accept_ep`](#accept_ep) | accept a new connection and populate the remote endpoint |
-| [`accept_ep_with_flags`](#accept_ep_with_flags), [`listener_local_endpoint`](#listener_local_endpoint) | |
+| [`accept_ep_with_flags`](#accept_ep_with_flags) | accept a new connection with explicit creation flags and populate the remote endpoint |
+| [`listener_local_endpoint`](#listener_local_endpoint) | the local endpoint a listener is bound to, which names the port it was given |
 | [`listener_close`](#listener_close) | close a TCP listener |
 
 | On `Stream` | |
 | :--- | :--- |
 | [`connect`](#connect) | establish a TCP connection to a remote endpoint |
-| [`connect_with_flags`](#connect_with_flags) | |
+| [`connect_with_flags`](#connect_with_flags) | establish a TCP connection to a remote endpoint with explicit creation flags |
 | [`connect_within`](#connect_within) | establish a TCP connection to a remote endpoint within a cancellation scope |
-| [`stream_local_endpoint`](#stream_local_endpoint), [`stream_remote_endpoint`](#stream_remote_endpoint) | |
+| [`stream_local_endpoint`](#stream_local_endpoint) | the local endpoint of a stream |
+| [`stream_remote_endpoint`](#stream_remote_endpoint) | the remote endpoint of a stream |
 | [`stream_read`](#stream_read) | read bytes from a TCP stream |
 | [`stream_set_read_timeout`](#stream_set_read_timeout) | bound blocking reads on a TCP stream to a timeout |
 | [`stream_write`](#stream_write) | write bytes to a TCP stream |
@@ -66,20 +68,30 @@ pub fun listen(ep: std.net.ip.Endpoint, backlog: i32) res[Listener, std.io.error
 
 create a TCP listener bound to an endpoint
 
-creates a socket, sets SO_REUSEADDR, binds to the address and port,
-and begins listening with the given backlog.
+creates a blocking socket, sets SO_REUSEADDR except on windows, which
+rebinds such an address without it, binds to the address and port, and
+begins listening with the given backlog.
 
 | Parameter | |
 | :--- | :--- |
 | `ep` | endpoint to bind to |
 | `backlog` | maximum pending connection queue length |
-| **returns** | the Listener, or an error message |
+| **returns** | the Listener, which the caller closes with listener_close, or the failure |
 
 ### listen_with_flags
 
 ```mach
 pub fun listen_with_flags(ep: std.net.ip.Endpoint, backlog: i32, flags: std.net.socket.Flags) res[Listener, std.io.error.Error]
 ```
+
+create a TCP listener bound to an endpoint with explicit creation flags
+
+| Parameter | |
+| :--- | :--- |
+| `ep` | endpoint to bind to |
+| `backlog` | maximum pending connection queue length |
+| `flags` | socket creation flags |
+| **returns** | the Listener, or the failure |
 
 ### accept
 
@@ -92,13 +104,21 @@ accept a new connection on a listener
 | Parameter | |
 | :--- | :--- |
 | `ln` | the listener to accept on |
-| **returns** | a connected Stream, or an error message |
+| **returns** | a connected blocking Stream, which the caller closes with stream_close, or the failure |
 
 ### accept_with_flags
 
 ```mach
 pub fun accept_with_flags(ln: *Listener, flags: std.net.socket.Flags) res[Stream, std.io.error.Error]
 ```
+
+accept a new connection on a listener with explicit creation flags
+
+| Parameter | |
+| :--- | :--- |
+| `ln` | the listener to accept on |
+| `flags` | the creation state the accepted socket starts with |
+| **returns** | a connected Stream, or the failure |
 
 ### accept_ep
 
@@ -112,7 +132,7 @@ accept a new connection and populate the remote endpoint
 | :--- | :--- |
 | `ln` | the listener to accept on |
 | `ep` | pointer to an Endpoint to fill with the remote address |
-| **returns** | a connected Stream, or an error message |
+| **returns** | a connected Stream, or the failure. UNSUPPORTED when the remote address is not IP, and the accepted socket is then closed |
 
 ### accept_ep_with_flags
 
@@ -120,11 +140,27 @@ accept a new connection and populate the remote endpoint
 pub fun accept_ep_with_flags(ln: *Listener, ep: *std.net.ip.Endpoint, flags: std.net.socket.Flags) res[Stream, std.io.error.Error]
 ```
 
+accept a new connection with explicit creation flags and populate the remote endpoint
+
+| Parameter | |
+| :--- | :--- |
+| `ln` | the listener to accept on |
+| `ep` | pointer to an Endpoint to fill with the remote address, or nil |
+| `flags` | the creation state the accepted socket starts with |
+| **returns** | a connected Stream, or the failure. UNSUPPORTED when the remote address is not IP, and the accepted socket is then closed |
+
 ### listener_local_endpoint
 
 ```mach
 pub fun listener_local_endpoint(ln: *Listener) res[std.net.ip.Endpoint, std.io.error.Error]
 ```
+
+the local endpoint a listener is bound to, which names the port it was given
+
+| Parameter | |
+| :--- | :--- |
+| `ln` | the listener |
+| **returns** | the endpoint, or the failure |
 
 ### listener_close
 
@@ -136,7 +172,8 @@ close a TCP listener
 
 | Parameter | |
 | :--- | :--- |
-| `ln` | the listener to close |
+| `ln` | the listener to close, whose handle is invalid afterwards |
+| **returns** | ok, or the failure. CLOSED when the listener was already closed |
 
 ## Stream
 
@@ -163,13 +200,21 @@ establish a TCP connection to a remote endpoint
 | Parameter | |
 | :--- | :--- |
 | `ep` | endpoint to connect to |
-| **returns** | a connected Stream, or an error message |
+| **returns** | a connected Stream, which the caller closes with stream_close, or the failure |
 
 ### connect_with_flags
 
 ```mach
 pub fun connect_with_flags(ep: std.net.ip.Endpoint, flags: std.net.socket.Flags) res[Stream, std.io.error.Error]
 ```
+
+establish a TCP connection to a remote endpoint with explicit creation flags
+
+| Parameter | |
+| :--- | :--- |
+| `ep` | endpoint to connect to |
+| `flags` | socket creation flags |
+| **returns** | a connected Stream, or the failure, after which no socket is left open |
 
 ### connect_within
 
@@ -199,11 +244,25 @@ socket left open. the stream it returns blocks, like connect's
 pub fun stream_local_endpoint(stream: *Stream) res[std.net.ip.Endpoint, std.io.error.Error]
 ```
 
+the local endpoint of a stream
+
+| Parameter | |
+| :--- | :--- |
+| `stream` | the stream |
+| **returns** | the endpoint, or the failure |
+
 ### stream_remote_endpoint
 
 ```mach
 pub fun stream_remote_endpoint(stream: *Stream) res[std.net.ip.Endpoint, std.io.error.Error]
 ```
+
+the remote endpoint of a stream
+
+| Parameter | |
+| :--- | :--- |
+| `stream` | the stream |
+| **returns** | the endpoint, or the failure |
 
 ### stream_read
 
@@ -236,7 +295,7 @@ interval, distinct from a peer close. ms == 0 restores indefinite blocking.
 | :--- | :--- |
 | `s` | the stream to bound reads on |
 | `ms` | timeout in milliseconds, or 0 for no timeout |
-| **returns** | ok on success, or an error message |
+| **returns** | ok on success, or the failure |
 
 ### stream_write
 
@@ -251,7 +310,7 @@ write bytes to a TCP stream
 | `s` | the stream to write to |
 | `buf` | source buffer |
 | `len` | number of bytes to write |
-| **returns** | number of bytes written, or negative on error |
+| **returns** | number of bytes written, which may be fewer than len, or the failure |
 
 ### stream_shutdown
 
@@ -265,6 +324,7 @@ shut down part or all of a TCP stream
 | :--- | :--- |
 | `s` | the stream to shut down |
 | `how` | SHUT_RD (0), SHUT_WR (1), or SHUT_RDWR (2) |
+| **returns** | ok, or the failure |
 
 ### stream_close
 
@@ -276,7 +336,8 @@ close a TCP stream
 
 | Parameter | |
 | :--- | :--- |
-| `s` | the stream to close |
+| `s` | the stream to close, whose handle is invalid afterwards |
+| **returns** | ok, or the failure. CLOSED when the stream was already closed |
 
 ## ListenOptions
 

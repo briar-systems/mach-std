@@ -19,7 +19,8 @@ Uses types from [`std.io.error`](../io/error.md), [`std.system.file_identity`](f
 | Functions | |
 | :--- | :--- |
 | [`stdin`](#stdin) | the process's standard input, output and error |
-| [`stdout`](#stdout), [`stderr`](#stderr) | |
+| [`stdout`](#stdout) | the handle of the process's standard output |
+| [`stderr`](#stderr) | the handle of the process's standard error |
 | [`working_dir`](#working_dir) | the directory handle that resolves a relative path against the working directory |
 | [`allocate_secret`](#allocate_secret) | a zero-initialized welded region of size bytes, written through out |
 | [`free_secret`](#free_secret) | release a region allocate_secret returned, without wiping it |
@@ -36,31 +37,36 @@ Uses types from [`std.io.error`](../io/error.md), [`std.system.file_identity`](f
 | [`native_path`](#native_path) | convert a UTF-8 path once into native units, as each UTF-8 primitive does, for a caller that walks or splits the name before it reaches the kernel |
 | [`native_path_dnit`](#native_path_dnit) | release a path native_path gave, owned or borrowed |
 | [`native_spelling`](#native_spelling) | a native name spelled in UTF-8, the reverse of native_path, not terminated |
-| [`close`](#close) | |
+| [`close`](#close) | close a handle |
 | [`sync_fd`](#sync_fd) | windows directory sync certifies ntfs only and returns enotsup on other filesystems |
-| [`stat`](#stat), [`set_mode`](#set_mode), [`set_mode_at`](#set_mode_at) | |
+| [`stat`](#stat) | read the metadata of the object a handle holds |
+| [`set_mode`](#set_mode) | set the permission bits of the object a handle holds |
+| [`set_mode_at`](#set_mode_at) | set_mode for a UTF-8 name relative to dir, which does not follow a final link |
 | [`set_mode_at_native`](#set_mode_at_native) | set_mode_at for a name in the host's native units, which reach the kernel unchanged |
-| [`file_identity`](#file_identity), [`identity_at`](#identity_at) | |
+| [`file_identity`](#file_identity) | the identity of the object a handle holds |
+| [`identity_at`](#identity_at) | the identity of the object a UTF-8 path names relative to dir |
 | [`identity_at_native`](#identity_at_native) | identity_at for a name in the host's native units |
 | [`retain_identity_at`](#retain_identity_at) | open path relative to dir and pin its identity |
 | [`retain_identity_at_native`](#retain_identity_at_native) | retain_identity_at for a name in the host's native units |
-| [`publication_capabilities`](#publication_capabilities), [`stat_path`](#stat_path) | |
+| [`publication_capabilities`](#publication_capabilities) | the publication guarantees the filesystem holding handle gives |
+| [`stat_path`](#stat_path) | read the metadata of the object a UTF-8 path names relative to dir |
 | [`stat_path_native`](#stat_path_native) | stat_path for a name in the host's native units |
 | [`unlink`](#unlink) | remove a UTF-8 path relative to dir, converted as open converts it |
 | [`unlink_native`](#unlink_native) | remove a name given in the host's native units, which reach the kernel unchanged |
-| [`rename`](#rename) | |
+| [`rename`](#rename) | rename a UTF-8 path relative to old_dir to one relative to new_dir |
 | [`rename_native`](#rename_native) | rename names given in the host's native units |
-| [`make_dir`](#make_dir) | |
+| [`make_dir`](#make_dir) | make a directory at a UTF-8 path relative to dir |
 | [`make_dir_native`](#make_dir_native) | make_dir for a name in the host's native units |
 | [`directory_init`](#directory_init) | initialize a cursor in its final storage |
 | [`directory_next_native`](#directory_next_native) | next in the host's native units: one borrowed entry, zero eof or a terminal negative error |
 | [`directory_refused_native`](#directory_refused_native) | the entry the last directory_next refused for having no UTF-8 spelling |
-| [`access`](#access) | |
+| [`access`](#access) | check that a UTF-8 path relative to dir is accessible |
 | [`access_native`](#access_native) | access for a name in the host's native units |
-| [`seek`](#seek), [`lock_fd`](#lock_fd) | |
+| [`seek`](#seek) | move a handle's file offset |
+| [`lock_fd`](#lock_fd) | take or release an advisory whole-file lock |
 | [`exit`](#exit) | end the process with status, never returning |
 | [`spawn_redirected`](#spawn_redirected) | spawn with the child's standard handles replaced |
-| [`spawn_redirected_in`](#spawn_redirected_in) | |
+| [`spawn_redirected_in`](#spawn_redirected_in) | spawn_redirected with the child starting in cwd |
 | [`spawn_redirected_native`](#spawn_redirected_native) | spawn_redirected from an executable, arguments and environment in native units |
 | [`spawn_redirected_in_native`](#spawn_redirected_in_native) | spawn_redirected_in from an executable, arguments, environment and directory in native units |
 | [`pipe`](#pipe) | a unidirectional pipe |
@@ -104,7 +110,7 @@ Uses types from [`std.io.error`](../io/error.md), [`std.system.file_identity`](f
 | [`heap_region_base`](#heap_region_base), [`heap_region_extend`](#heap_region_extend), [`protect`](#protect), [`lock`](#lock), [`unlock`](#unlock), [`advise`](#advise), [`page_size`](#page_size), [`sync_file`](#sync_file), [`PUBLICATION_CLAIMS`](#publication_claims), [`PUBLICATION_RETAIN_REPLACE`](#publication_retain_replace), [`PUBLICATION_READ_RETAIN_REPLACE`](#publication_read_retain_replace), [`symlink`](#symlink) | |
 | [`symlink_native`](#symlink_native) | symlink(target, linkpath) for names in the host's native units |
 | [`directory_next`](#directory_next) | next returns one borrowed entry, zero eof or a negative error |
-| [`directory_dnit`](#directory_dnit) | close consumes the cursor and reports cleanup independently of iteration |
+| [`directory_dnit`](#directory_dnit) | directory_dnit consumes the cursor and reports cleanup independently of iteration |
 | [`abort`](#abort) | |
 | [`stack_bounds`](#stack_bounds) | the calling thread's stack bounds, low to one past high, read without a system call from what the implementation recorded once; false where it knows none |
 | [`panic_sink`](#panic_sink) | write msg to the process's error stream and end the process, never returning |
@@ -212,11 +218,15 @@ the process's standard input, output and error
 pub fun stdout() usize
 ```
 
+the handle of the process's standard output
+
 ### stderr
 
 ```mach
 pub fun stderr() usize
 ```
+
+the handle of the process's standard error
 
 ### working_dir
 
@@ -379,7 +389,7 @@ malformed UTF-8 is EINVAL and a path over the converter's limit ERANGE
 
 | Parameter | |
 | :--- | :--- |
-| `out` | the native path, written only on success and released with native_path_release |
+| `out` | the native path, written only on success and released with native_path_dnit |
 | **returns** | 0, or a negative native code |
 
 ### native_path_dnit
@@ -411,6 +421,13 @@ a native name spelled in UTF-8, the reverse of native_path, not terminated
 pub fun close(handle: usize) i64
 ```
 
+close a handle
+
+| Parameter | |
+| :--- | :--- |
+| `handle` | the handle to release, invalid after the call whatever it returns |
+| **returns** | 0, or a negative native code |
+
 ### sync_fd
 
 ```mach
@@ -425,17 +442,45 @@ windows directory sync certifies ntfs only and returns enotsup on other filesyst
 pub fun stat(handle: usize, st: *impl.stat_t) i64
 ```
 
+read the metadata of the object a handle holds
+
+| Parameter | |
+| :--- | :--- |
+| `handle` | an open handle |
+| `st` | filled on success |
+| **returns** | 0, or a negative native code |
+
 ### set_mode
 
 ```mach
 pub fun set_mode(handle: usize, mode: i32) i64
 ```
 
+set the permission bits of the object a handle holds
+
+a host whose access control cannot represent mode refuses it with a code
+error_kind reads as unsupported and leaves the object unchanged
+
+| Parameter | |
+| :--- | :--- |
+| `handle` | an open handle |
+| `mode` | the permission bits |
+| **returns** | 0, or a negative native code |
+
 ### set_mode_at
 
 ```mach
 pub fun set_mode_at(dir: usize, name: *u8, mode: i32) i64
 ```
+
+set_mode for a UTF-8 name relative to dir, which does not follow a final link
+
+| Parameter | |
+| :--- | :--- |
+| `dir` | a directory handle, or working_dir() |
+| `name` | the nul-terminated name |
+| `mode` | the permission bits |
+| **returns** | 0, or a negative native code |
 
 ### set_mode_at_native
 
@@ -451,11 +496,28 @@ set_mode_at for a name in the host's native units, which reach the kernel unchan
 pub fun file_identity(handle: usize, out: *std.system.file_identity.Identity) i64
 ```
 
+the identity of the object a handle holds
+
+| Parameter | |
+| :--- | :--- |
+| `handle` | an open handle |
+| `out` | filled on success |
+| **returns** | 0, or a negative native code |
+
 ### identity_at
 
 ```mach
 pub fun identity_at(dir: usize, path: *u8, out: *std.system.file_identity.Identity) i64
 ```
+
+the identity of the object a UTF-8 path names relative to dir
+
+| Parameter | |
+| :--- | :--- |
+| `dir` | a directory handle, or working_dir() |
+| `path` | the nul-terminated path |
+| `out` | filled on success |
+| **returns** | 0, or a negative native code |
 
 ### identity_at_native
 
@@ -492,11 +554,28 @@ retain_identity_at for a name in the host's native units
 pub fun publication_capabilities(handle: usize) i64
 ```
 
+the publication guarantees the filesystem holding handle gives
+
+| Parameter | |
+| :--- | :--- |
+| `handle` | an open handle on the filesystem |
+| **returns** | a mask of PUBLICATION_CLAIMS, PUBLICATION_RETAIN_REPLACE and PUBLICATION_READ_RETAIN_REPLACE, or a negative native code |
+
 ### stat_path
 
 ```mach
 pub fun stat_path(dir: usize, path: *u8, st: *impl.stat_t, flags: i32) i64
 ```
+
+read the metadata of the object a UTF-8 path names relative to dir
+
+| Parameter | |
+| :--- | :--- |
+| `dir` | a directory handle, or working_dir() |
+| `path` | the nul-terminated path |
+| `st` | filled on success |
+| `flags` | AT_SYMLINK_NOFOLLOW to read a final link itself, or 0 |
+| **returns** | 0, or a negative native code |
 
 ### stat_path_native
 
@@ -528,6 +607,16 @@ remove a name given in the host's native units, which reach the kernel unchanged
 pub fun rename(old_dir: usize, old_path: *u8, new_dir: usize, new_path: *u8) i64
 ```
 
+rename a UTF-8 path relative to old_dir to one relative to new_dir
+
+| Parameter | |
+| :--- | :--- |
+| `old_dir` | a directory handle, or working_dir() |
+| `old_path` | the nul-terminated source path |
+| `new_dir` | a directory handle, or working_dir() |
+| `new_path` | the nul-terminated destination path |
+| **returns** | 0, or a negative native code |
+
 ### rename_native
 
 ```mach
@@ -541,6 +630,15 @@ rename names given in the host's native units
 ```mach
 pub fun make_dir(dir: usize, path: *u8, mode: i32) i64
 ```
+
+make a directory at a UTF-8 path relative to dir
+
+| Parameter | |
+| :--- | :--- |
+| `dir` | a directory handle, or working_dir() |
+| `path` | the nul-terminated path |
+| `mode` | the permission bits |
+| **returns** | 0, or a negative native code |
 
 ### make_dir_native
 
@@ -556,7 +654,7 @@ make_dir for a name in the host's native units
 pub fun directory_init(out: *impl.DirectoryCursor, handle: usize) impl.DirectoryInitResult
 ```
 
-initialize a cursor in its final storage. it borrows handle until close
+initialize a cursor in its final storage. it borrows handle until directory_dnit
 
 ### directory_next_native
 
@@ -586,6 +684,16 @@ the entry the last directory_next refused for having no UTF-8 spelling
 pub fun access(dir: usize, path: *u8, mode: i32, flags: i32) i64
 ```
 
+check that a UTF-8 path relative to dir is accessible
+
+| Parameter | |
+| :--- | :--- |
+| `dir` | a directory handle, or working_dir() |
+| `path` | the nul-terminated path |
+| `mode` | the access to check, which windows ignores, checking only that the path can be read as stat_path reads it |
+| `flags` | AT_* flags |
+| **returns** | 0 when accessible, or a negative native code |
+
 ### access_native
 
 ```mach
@@ -600,11 +708,28 @@ access for a name in the host's native units
 pub fun seek(handle: usize, offset: i64, whence: i32) i64
 ```
 
+move a handle's file offset
+
+| Parameter | |
+| :--- | :--- |
+| `handle` | an open handle |
+| `offset` | the byte offset, relative to whence |
+| `whence` | SEEK_SET, SEEK_CUR or SEEK_END |
+| **returns** | the resulting offset, or a negative native code |
+
 ### lock_fd
 
 ```mach
 pub fun lock_fd(handle: usize, op: i32) i64
 ```
+
+take or release an advisory whole-file lock
+
+| Parameter | |
+| :--- | :--- |
+| `handle` | an open handle, a regular file where the lock must be portable |
+| `op` | LOCK_SH, LOCK_EX or LOCK_UN, optionally combined with LOCK_NB |
+| **returns** | 0, or a negative native code, EAGAIN when LOCK_NB was set and another holder has the lock |
 
 ### exit
 
@@ -631,6 +756,13 @@ spawn with the child's standard handles replaced
 ```mach
 pub fun spawn_redirected_in(pathname: *u8, argv: **u8, envp: std.system.os.shared.Environment, cwd: *u8, input: usize, output: usize, error_out: usize) i64
 ```
+
+spawn_redirected with the child starting in cwd
+
+| Parameter | |
+| :--- | :--- |
+| `cwd` | the child's working directory, or nil to inherit this process's |
+| **returns** | the child's pid, or a negative native code |
 
 ### spawn_redirected_native
 
@@ -1745,12 +1877,37 @@ advise the kernel on expected access patterns via madvise
 
 ### page_size
 
-Forwards the first of these whose condition holds:
+Forwards the first of these whose condition holds, and they differ.
 
-- [`std.system.os.linux.page_size`](os/linux.md#page_size), where `$mach.build.sys == $mach.sys.linux`
-- [`std.system.os.darwin.page_size`](os/darwin.md#page_size), where `$mach.build.sys == $mach.sys.darwin`
-- [`std.system.os.windows.page_size`](os/windows.md#page_size), where `$mach.build.sys == $mach.sys.windows`
-- [`std.system.os.wasi.page_size`](os/wasi.md#page_size), where `$mach.build.sys == $mach.sys.wasi`
+Where `$mach.build.sys == $mach.sys.linux`: [`std.system.os.linux.page_size`](os/linux.md#page_size).
+
+```mach
+pub fun page_size() usize
+```
+
+Where `$mach.build.sys == $mach.sys.darwin`: [`std.system.os.darwin.page_size`](os/darwin.md#page_size).
+
+Declared by the first of these arms whose condition holds.
+
+Where `$mach.build.arch == $mach.arch.aarch64`:
+
+```mach
+pub fun page_size() usize
+```
+
+Where `$mach.build.arch == $mach.arch.x86_64`:
+
+```mach
+pub fun page_size() usize
+```
+
+Where `$mach.build.sys == $mach.sys.windows`: [`std.system.os.windows.page_size`](os/windows.md#page_size).
+
+```mach
+pub fun page_size() usize
+```
+
+Where `$mach.build.sys == $mach.sys.wasi`: [`std.system.os.wasi.page_size`](os/wasi.md#page_size).
 
 ```mach
 pub fun page_size() usize
@@ -1884,7 +2041,7 @@ Forwards the first of these whose condition holds:
 pub fun directory_dnit(cursor: *DirectoryCursor) i64
 ```
 
-close consumes the cursor and reports cleanup independently of iteration
+directory_dnit consumes the cursor and reports cleanup independently of iteration
 
 ### abort
 
@@ -2508,6 +2665,8 @@ Where `$mach.build.sys == $mach.sys.wasi`: [`std.system.os.wasi.wait_pid`](os/wa
 pub fun wait_pid(pid: i64, status: *ProcessStatus, options: i32) WaitResult
 ```
 
+wait for a child state, as wait does with no resource usage
+
 ### ProcessStatus
 
 Forwards the first of these whose condition holds:
@@ -2525,6 +2684,8 @@ pub rec ProcessStatus {
     core_dumped: bool;
 }
 ```
+
+one observed change in a child's state
 
 ### FileLimit
 
@@ -2640,6 +2801,8 @@ pub rec ProcessWaitError {
     operation:   u8;
 }
 ```
+
+why a process wait or the release of a child's handle failed
 
 ### WaitResult
 

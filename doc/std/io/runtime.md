@@ -11,11 +11,11 @@ Uses types from [`std.allocator`](../allocator.md), [`std.chrono.time`](../chron
 | Type | | |
 | :--- | :--- | :--- |
 | [`Kind`](#kind) | `def` |  |
-| [`Token`](#token) | `rec` |  |
+| [`Token`](#token) | `rec` | names one submitted operation until its completion is dequeued |
 | [`Operation`](#operation) | `rec` | buffer is borrowed from successful submission until its completion is dequeued |
 | [`Completion`](#completion) | `rec` | a terminal result |
 | [`NativeEvent`](#nativeevent) | `rec` | one native completion, laid out as the platform's IoCompletion |
-| [`SourceToken`](#sourcetoken) | `rec` |  |
+| [`SourceToken`](#sourcetoken) | `rec` | names one registered source until it is released |
 | [`DispatchFun`](#dispatchfun) | `def` | offered each native event carrying the source's id, and every wake (context 0) |
 | [`CancelFun`](#cancelfun) | `def` |  |
 | [`ReleaseFun`](#releasefun) | `def` |  |
@@ -29,7 +29,7 @@ Uses types from [`std.allocator`](../allocator.md), [`std.chrono.time`](../chron
 
 | On `SourceToken` | |
 | :--- | :--- |
-| [`source_id`](#source_id) | |
+| [`source_id`](#source_id) | the id native events carry for a source |
 
 | On `Runtime` | |
 | :--- | :--- |
@@ -37,11 +37,15 @@ Uses types from [`std.allocator`](../allocator.md), [`std.chrono.time`](../chron
 | [`capacity`](#capacity) | the slot table is the runtime's current size, not a limit it was given the slots the runtime holds now, which grow with load and fall back after it |
 | [`pins_capacity`](#pins_capacity) | whether the live operation token names keeps capacity the runtime would otherwise give back |
 | [`init`](#init) | every byte the runtime owns comes from a: its tables, its native event batch, and the tables of every driver registered on it |
-| [`register_source`](#register_source), [`retire_source`](#retire_source), [`release_source`](#release_source), [`unregister_source`](#unregister_source) | |
-| [`unrouted_events`](#unrouted_events) | native events whose source id matched no registered source since make |
-| [`submit`](#submit), [`submit_owned`](#submit_owned) | |
+| [`register_source`](#register_source) | registers a backend that owns operations and receives native events |
+| [`retire_source`](#retire_source) | stops a source from taking new operations, the first step of unregistering |
+| [`release_source`](#release_source) | frees a retired source's slot and id |
+| [`unregister_source`](#unregister_source) | retires and releases a source in one call |
+| [`unrouted_events`](#unrouted_events) | native events whose source id matched no registered source since init |
+| [`submit`](#submit) | submits an operation no source owns |
+| [`submit_owned`](#submit_owned) | submits an operation a registered source owns |
 | [`submit_scoped`](#submit_scoped) | prior cancellation is observed or the returned token is atomically scope-owned |
-| [`submit_scoped_owned`](#submit_scoped_owned) | |
+| [`submit_scoped_owned`](#submit_scoped_owned) | submit_scoped for an operation a registered source owns |
 | [`complete`](#complete) | a byte completion |
 | [`complete_copy`](#complete_copy) | copy is atomic with terminal publication |
 | [`complete_opened`](#complete_opened) | a completion that hands the caller a socket it did not open itself, such as an accepted or a connected one, also carries that socket's opening, which is never zero |
@@ -50,18 +54,20 @@ Uses types from [`std.allocator`](../allocator.md), [`std.chrono.time`](../chron
 | [`complete_cancellation`](#complete_cancellation) | asynchronous sources publish only after target ownership has quiesced |
 | [`complete_cancellation_transfer`](#complete_cancellation_transfer) | publish an asynchronous cancellation together with the transfer its native request finished before the cancellation took effect |
 | [`submit_timer`](#submit_timer) | deadlines are absolute monotonic instants and never expire early late delivery is limited only by native scheduling and runtime dequeue latency |
-| [`submit_timer_scoped`](#submit_timer_scoped) | |
+| [`submit_timer_scoped`](#submit_timer_scoped) | submit_timer for a timer a cancellation scope owns |
 | [`cancel_timer`](#cancel_timer) | expiry and cancellation race under one lock and publish one terminal result |
 | [`poll`](#poll) | drains completions and expires due deadlines without entering the native wait a pending caller wake stays pending for the next wait or wait plan |
 | [`prepare_wait`](#prepare_wait) | prepares another subsystem to wait on the runtime's native queue |
-| [`begin_native_control`](#begin_native_control), [`end_native_control`](#end_native_control) | |
+| [`begin_native_control`](#begin_native_control) | takes exclusive use of the native queue away from waiters |
+| [`end_native_control`](#end_native_control) | gives the native queue back to waiters after begin_native_control |
 | [`wait`](#wait) | waits for completions |
 | [`wake`](#wake) | ends a blocked wait early, or the next wait if none is blocked wakes coalesce: one wait answers every wake that came before its return |
 | [`notify`](#notify) | makes a blocked wait collect every source again without ending it a source that queues completions off the native queue calls this, not wake |
 | [`begin_close`](#begin_close) | close rejects new work and queues one terminal completion for every active operation |
-| [`close`](#close) | |
-| [`dnit`](#dnit) | destroy is valid only after close completions have been dequeued: a runtime that is not closed or already destroyed is INVALID, one with live operations, queued completions, a native controller or a registered source is EBUSY; a refused destroy keeps every allocation |
-| [`pending`](#pending), [`snapshot`](#snapshot) | |
+| [`close`](#close) | begin_close with an abortive, explicit close |
+| [`dnit`](#dnit) | dnit is valid only after close completions have been dequeued: a runtime that is not closed or already destroyed is INVALID, one with live operations, queued completions, a native controller or a registered source is BUSY, and a refused dnit keeps every allocation |
+| [`pending`](#pending) | the number of operations submitted and not yet dequeued |
+| [`snapshot`](#snapshot) | the runtime's lifecycle state |
 
 | Constants | |
 | :--- | :--- |
@@ -103,6 +109,13 @@ pub rec Token {
     generation: u32;
 }
 ```
+
+names one submitted operation until its completion is dequeued
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `index` | `u32` | the slot holding the operation |
+| `generation` | `u32` | the slot's generation at submission, so a stale token is refused |
 
 ## Operation
 
@@ -174,11 +187,26 @@ pub rec SourceToken {
 }
 ```
 
+names one registered source until it is released
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `index` | `u32` | the source slot holding the registration |
+| `generation` | `u32` | the slot's generation at registration |
+| `tag` | `u16` | the source id native events carry, never 0 |
+
 ### source_id
 
 ```mach
 pub fun source_id(token: SourceToken) u16
 ```
+
+the id native events carry for a source
+
+| Parameter | |
+| :--- | :--- |
+| `token` | the source |
+| **returns** | its id, never 0 for a registered source |
 
 ## DispatchFun
 
@@ -347,7 +375,7 @@ nothing live moves when it does.
 | `runtime` | the runtime to initialize |
 | `a` | where every allocation is taken from and returned to |
 | `initial` | slots, timers and deadline records to start with, at least one |
-| **returns** | ok, INVALID for a nil runtime or allocator or an initial size of zero, RESOURCE_EXHAUSTED when a refuses |
+| **returns** | ok, INVALID for a nil runtime or allocator or an initial size of zero or above 0xffffffff, RESOURCE_EXHAUSTED when a refuses, or the native error when the io queue cannot be created |
 
 ### register_source
 
@@ -361,11 +389,30 @@ pub fun register_source(
 ) res[SourceToken, std.io.error.Error]
 ```
 
+registers a backend that owns operations and receives native events
+
+| Parameter | |
+| :--- | :--- |
+| `runtime` | the runtime to register with |
+| `context` | passed to every callback, never nil |
+| `dispatch` | offered native events carrying the source's id, and every wake |
+| `cancel_operation` | asked to cancel an operation the source owns |
+| `release` | called as a completion the source owns is dequeued |
+| **returns** | the source's token, or the failure. INVALID for a nil runtime or context, CLOSED once the runtime is closing or destroyed, RESOURCE_EXHAUSTED when no id or slot can be had |
+
 ### retire_source
 
 ```mach
 pub fun retire_source(runtime: *Runtime, token: SourceToken) res[bool, std.io.error.Error]
 ```
+
+stops a source from taking new operations, the first step of unregistering
+
+| Parameter | |
+| :--- | :--- |
+| `runtime` | the runtime the source is registered with |
+| `token` | the source |
+| **returns** | true when this call retired it, false when it was already retired. INVALID for a nil runtime or a stale token, BUSY while the source owns operations or is handling an event |
 
 ### release_source
 
@@ -373,11 +420,30 @@ pub fun retire_source(runtime: *Runtime, token: SourceToken) res[bool, std.io.er
 pub fun release_source(runtime: *Runtime, token: SourceToken) err[std.io.error.Error]
 ```
 
+frees a retired source's slot and id
+
+the id becomes reusable once every native collection begun before the
+release has ended
+
+| Parameter | |
+| :--- | :--- |
+| `runtime` | the runtime the source is registered with |
+| `token` | the retired source |
+| **returns** | the failure. INVALID for a nil runtime, a stale token, a source not retired or one still owning operations, or the native error when the wake that ends a closing runtime's drain fails |
+
 ### unregister_source
 
 ```mach
 pub fun unregister_source(runtime: *Runtime, token: SourceToken) err[std.io.error.Error]
 ```
+
+retires and releases a source in one call
+
+| Parameter | |
+| :--- | :--- |
+| `runtime` | the runtime the source is registered with |
+| `token` | the source |
+| **returns** | the failure from retire_source or release_source |
 
 ### unrouted_events
 
@@ -385,7 +451,7 @@ pub fun unregister_source(runtime: *Runtime, token: SourceToken) err[std.io.erro
 pub fun unrouted_events(runtime: *Runtime) u64
 ```
 
-native events whose source id matched no registered source since make
+native events whose source id matched no registered source since init
 
 a nonzero count is not by itself an error. a correct program raises it when a
 source is released between the harvest of a native batch and the dispatch of
@@ -398,11 +464,28 @@ backend reporting a wrong id
 pub fun submit(runtime: *Runtime, operation: Operation) res[Token, std.io.error.Error]
 ```
 
+submits an operation no source owns
+
+| Parameter | |
+| :--- | :--- |
+| `runtime` | the runtime to submit to |
+| `operation` | the operation, whose buffer is borrowed until its completion is dequeued |
+| **returns** | the operation's token, or the failure. INVALID for a nil runtime, CLOSED once the runtime is closing, RESOURCE_EXHAUSTED when the slot table cannot grow |
+
 ### submit_owned
 
 ```mach
 pub fun submit_owned(runtime: *Runtime, source_token: SourceToken, operation: Operation) res[Token, std.io.error.Error]
 ```
+
+submits an operation a registered source owns
+
+| Parameter | |
+| :--- | :--- |
+| `runtime` | the runtime to submit to |
+| `source_token` | the owning source |
+| `operation` | the operation, whose buffer is borrowed until its completion is dequeued |
+| **returns** | the operation's token, or the failure as for submit, and INVALID for a source that is not registered |
 
 ### submit_scoped
 
@@ -410,7 +493,8 @@ pub fun submit_owned(runtime: *Runtime, source_token: SourceToken, operation: Op
 pub fun submit_scoped(runtime: *Runtime, scope: *std.sync.cancel.Scope, operation: Operation) res[Token, std.io.error.Error]
 ```
 
-prior cancellation is observed or the returned token is atomically scope-owned
+prior cancellation is observed or the returned token is atomically scope-owned.
+a passed deadline refuses the submission with TIMEOUT
 
 ### submit_scoped_owned
 
@@ -422,6 +506,16 @@ pub fun submit_scoped_owned(
     operation: Operation,
 ) res[Token, std.io.error.Error]
 ```
+
+submit_scoped for an operation a registered source owns
+
+| Parameter | |
+| :--- | :--- |
+| `runtime` | the runtime to submit to |
+| `source_token` | the owning source |
+| `scope` | the cancellation scope that owns the operation |
+| `operation` | the operation, whose buffer is borrowed until its completion is dequeued |
+| **returns** | the operation's token, or the failure as for submit_scoped, and INVALID for a source that is not registered |
 
 ### complete
 
@@ -517,6 +611,18 @@ late delivery is limited only by native scheduling and runtime dequeue latency
 pub fun submit_timer_scoped(runtime: *Runtime, scope: *std.sync.cancel.Scope, deadline: std.chrono.time.Instant, context: usize) res[Token, std.io.error.Error]
 ```
 
+submit_timer for a timer a cancellation scope owns
+
+a scope already cancelled or expired refuses the timer
+
+| Parameter | |
+| :--- | :--- |
+| `runtime` | the runtime to submit to |
+| `scope` | the cancellation scope that owns the timer |
+| `deadline` | the absolute monotonic instant the timer fires at |
+| `context` | carried to the completion |
+| **returns** | the timer's token, or the failure. INVALID for a nil runtime or scope or a malformed deadline, the clock's failure, CLOSED or RESOURCE_EXHAUSTED as for submit, the native wake failure, or the scope's TIMEOUT, CANCELLED or CLOSED |
+
 ### cancel_timer
 
 ```mach
@@ -559,11 +665,26 @@ a caller's wake. a plan with wait unset must not be polled.
 pub fun begin_native_control(runtime: *Runtime) err[std.io.error.Error]
 ```
 
+takes exclusive use of the native queue away from waiters
+
+a blocked wait is woken and yields. the caller must call end_native_control
+
+| Parameter | |
+| :--- | :--- |
+| `runtime` | the runtime whose queue to control |
+| **returns** | the failure. INVALID for a nil or destroyed runtime, or the native wake failure |
+
 ### end_native_control
 
 ```mach
 pub fun end_native_control(runtime: *Runtime)
 ```
+
+gives the native queue back to waiters after begin_native_control
+
+| Parameter | |
+| :--- | :--- |
+| `runtime` | the runtime begin_native_control succeeded on |
 
 ### wait
 
@@ -618,16 +739,23 @@ close rejects new work and queues one terminal completion for every active opera
 pub fun close(runtime: *Runtime) res[bool, std.io.error.Error]
 ```
 
+begin_close with an abortive, explicit close
+
+| Parameter | |
+| :--- | :--- |
+| `runtime` | the runtime to close |
+| **returns** | true when this call started the close, or the failure from begin_close |
+
 ### dnit
 
 ```mach
 pub fun dnit(runtime: *Runtime) err[std.io.error.Error]
 ```
 
-destroy is valid only after close completions have been dequeued: a runtime
+dnit is valid only after close completions have been dequeued: a runtime
 that is not closed or already destroyed is INVALID, one with live operations,
-queued completions, a native controller or a registered source is EBUSY;
-a refused destroy keeps every allocation
+queued completions, a native controller or a registered source is BUSY, and
+a refused dnit keeps every allocation
 
 ### pending
 
@@ -635,11 +763,25 @@ a refused destroy keeps every allocation
 pub fun pending(runtime: *Runtime) usize
 ```
 
+the number of operations submitted and not yet dequeued
+
+| Parameter | |
+| :--- | :--- |
+| `runtime` | the runtime to inspect |
+| **returns** | the count, 0 for a nil or destroyed runtime |
+
 ### snapshot
 
 ```mach
 pub fun snapshot(runtime: *Runtime) std.io.lifecycle.Snapshot
 ```
+
+the runtime's lifecycle state
+
+| Parameter | |
+| :--- | :--- |
+| `runtime` | the runtime to inspect |
+| **returns** | its snapshot, or a CLOSED, ABORTIVE, FAILURE one for a nil or destroyed runtime |
 
 ## Constants
 

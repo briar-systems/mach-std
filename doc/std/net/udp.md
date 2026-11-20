@@ -14,13 +14,15 @@ Uses types from [`std.io.error`](../io/error.md), [`std.io.handle`](../io/handle
 
 | On `Socket` | |
 | :--- | :--- |
-| [`create`](#create) | create an unbound UDP socket |
-| [`create_v6`](#create_v6), [`create_with_flags`](#create_with_flags) | |
+| [`create`](#create) | create an unbound blocking IPv4 UDP socket |
+| [`create_v6`](#create_v6) | create an unbound blocking IPv6 UDP socket |
+| [`create_with_flags`](#create_with_flags) | create an unbound UDP socket with explicit creation flags |
 | [`bind`](#bind) | create a UDP socket bound to an endpoint |
-| [`bind_with_flags`](#bind_with_flags) | |
+| [`bind_with_flags`](#bind_with_flags) | create a UDP socket bound to an endpoint with explicit creation flags |
 | [`bind_with`](#bind_with) | create a blocking UDP socket bound with explicit options |
 | [`bind_with_options`](#bind_with_options) | create a UDP socket bound with explicit options and creation flags |
-| [`local_endpoint`](#local_endpoint), [`remote_endpoint`](#remote_endpoint) | |
+| [`local_endpoint`](#local_endpoint) | the local endpoint the socket is bound to |
+| [`remote_endpoint`](#remote_endpoint) | the remote endpoint the socket is connected to |
 | [`send_to`](#send_to) | send a datagram to a remote endpoint |
 | [`recv_from`](#recv_from) | receive a datagram and populate the source endpoint |
 | [`socket_set_recv_timeout`](#socket_set_recv_timeout) | bound blocking receives on a UDP socket to a timeout |
@@ -42,6 +44,7 @@ a bound or unbound UDP socket
 | Field | Type | |
 | :--- | :--- | :--- |
 | `handle` | `std.io.handle.SocketHandle` | the native-width socket handle |
+| `family` | `i32` | the address family it was created for, AF_INET or AF_INET6 |
 
 ### create
 
@@ -49,11 +52,11 @@ a bound or unbound UDP socket
 pub fun create() res[Socket, std.io.error.Error]
 ```
 
-create an unbound UDP socket
+create an unbound blocking IPv4 UDP socket
 
 | Parameter | |
 | :--- | :--- |
-| **returns** | the Socket, or an error message |
+| **returns** | the Socket, which the caller closes with socket_close, or the failure |
 
 ### create_v6
 
@@ -61,11 +64,25 @@ create an unbound UDP socket
 pub fun create_v6() res[Socket, std.io.error.Error]
 ```
 
+create an unbound blocking IPv6 UDP socket
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the Socket, which the caller closes with socket_close, or the failure |
+
 ### create_with_flags
 
 ```mach
 pub fun create_with_flags(family: i32, flags: std.net.socket.Flags) res[Socket, std.io.error.Error]
 ```
+
+create an unbound UDP socket with explicit creation flags
+
+| Parameter | |
+| :--- | :--- |
+| `family` | the address family, AF_INET or AF_INET6 |
+| `flags` | socket creation flags |
+| **returns** | the Socket, which the caller closes with socket_close, or the failure |
 
 ### bind
 
@@ -78,13 +95,21 @@ create a UDP socket bound to an endpoint
 | Parameter | |
 | :--- | :--- |
 | `ep` | endpoint to bind to |
-| **returns** | the bound Socket, or an error message |
+| **returns** | the bound Socket, or the failure |
 
 ### bind_with_flags
 
 ```mach
 pub fun bind_with_flags(ep: std.net.ip.Endpoint, flags: std.net.socket.Flags) res[Socket, std.io.error.Error]
 ```
+
+create a UDP socket bound to an endpoint with explicit creation flags
+
+| Parameter | |
+| :--- | :--- |
+| `ep` | endpoint to bind to |
+| `flags` | socket creation flags |
+| **returns** | the bound Socket, or the failure |
 
 ### bind_with
 
@@ -121,11 +146,25 @@ create a UDP socket bound with explicit options and creation flags
 pub fun local_endpoint(s: *Socket) res[std.net.ip.Endpoint, std.io.error.Error]
 ```
 
+the local endpoint the socket is bound to
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the socket |
+| **returns** | the endpoint, or the failure. UNSUPPORTED when the address family is not IP |
+
 ### remote_endpoint
 
 ```mach
 pub fun remote_endpoint(s: *Socket) res[std.net.ip.Endpoint, std.io.error.Error]
 ```
+
+the remote endpoint the socket is connected to
+
+| Parameter | |
+| :--- | :--- |
+| `s` | the socket |
+| **returns** | the endpoint, or the failure. UNSUPPORTED when the address family is not IP |
 
 ### send_to
 
@@ -141,7 +180,7 @@ send a datagram to a remote endpoint
 | `buf` | source buffer |
 | `len` | number of bytes to send |
 | `ep` | destination endpoint |
-| **returns** | number of bytes sent, or negative on error |
+| **returns** | number of bytes sent, or the failure. INVALID when ep's family is not the socket's |
 
 ### recv_from
 
@@ -156,8 +195,8 @@ receive a datagram and populate the source endpoint
 | `s` | the socket to receive on |
 | `buf` | destination buffer |
 | `len` | maximum bytes to receive |
-| `ep` | pointer to an Endpoint to fill with the source address |
-| **returns** | number of bytes received, or negative on error |
+| `ep` | pointer to an Endpoint to fill with the source address, or nil |
+| **returns** | number of bytes received, or the failure. UNSUPPORTED when the source address cannot be read as an IP endpoint |
 
 ### socket_set_recv_timeout
 
@@ -175,7 +214,7 @@ restores indefinite blocking.
 | :--- | :--- |
 | `s` | the socket to bound receives on |
 | `ms` | timeout in milliseconds, or 0 for no timeout |
-| **returns** | ok on success, or an error message |
+| **returns** | ok on success, or the failure |
 
 ### socket_close
 
@@ -187,5 +226,6 @@ close a UDP socket
 
 | Parameter | |
 | :--- | :--- |
-| `s` | the socket to close |
+| `s` | the socket to close, whose handle is invalid afterwards |
+| **returns** | ok, or the failure. CLOSED when the socket was already closed |
 

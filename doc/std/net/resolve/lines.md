@@ -14,9 +14,9 @@ Uses types from [`std.io.error`](../../io/error.md).
 
 | On `Reader` | |
 | :--- | :--- |
-| [`open`](#open) | |
-| [`close`](#close) | release the descriptor; a reader that is already closed or was never opened closes as a success, a refused native close is the failure |
-| [`next`](#next) | copy the next line into output without its newline, nul-terminated |
+| [`open`](#open) | open path for reading and reset the reader |
+| [`close`](#close) | release the descriptor |
+| [`next`](#next) | copy the next line into output without its LF or CRLF ending, nul-terminated |
 
 | Constants | |
 | :--- | :--- |
@@ -52,14 +52,24 @@ a buffered reader yielding one nul-terminated line at a time
 pub fun open(reader: *Reader, path: str) err[std.io.error.Error]
 ```
 
+open path for reading and reset the reader
+
+a failed open leaves the reader untouched
+
+| Parameter | |
+| :--- | :--- |
+| `reader` | the reader to open |
+| `path` | the file, relative to the working directory when not absolute |
+| **returns** | ok, or the open failure |
+
 ### close
 
 ```mach
 pub fun close(reader: *Reader) err[std.io.error.Error]
 ```
 
-release the descriptor; a reader that is already closed or was never
-opened closes as a success, a refused native close is the failure
+release the descriptor. a reader that is already closed (its fd is
+os.INVALID_HANDLE) closes as a success, a refused native close is the failure
 
 ### next
 
@@ -67,7 +77,7 @@ opened closes as a success, a refused native close is the failure
 pub fun next(reader: *Reader, output: *u8, capacity: usize) res[opt[usize], std.io.error.Error]
 ```
 
-copy the next line into output without its newline, nul-terminated
+copy the next line into output without its LF or CRLF ending, nul-terminated
 
 a line longer than capacity - 1 bytes is consumed whole but truncated in
 output; the returned length is the untruncated length so the caller can

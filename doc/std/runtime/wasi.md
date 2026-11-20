@@ -21,7 +21,7 @@ Uses types from [`std.runtime.native.view`](native/view.md).
 
 | Functions | |
 | :--- | :--- |
-| [`_start`](#_start) | |
+| [`_start`](#_start) | the wasi entry: capture the host's arguments, run main and end the process with its code |
 | [`native_args`](#native_args) | the arguments as the host passed them, which are the bytes main's argv holds |
 
 ---
@@ -34,6 +34,8 @@ Uses types from [`std.runtime.native.view`](native/view.md).
 #[symbol("_start")]
 pub fun _start()
 ```
+
+the wasi entry: capture the host's arguments, run main and end the process with its code
 
 ### native_args
 

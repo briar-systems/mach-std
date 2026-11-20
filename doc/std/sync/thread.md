@@ -113,6 +113,11 @@ pub fun code(e: ThreadError) i64
 
 the portable status code of an error, for diagnostics that keep an i64
 
+| Parameter | |
+| :--- | :--- |
+| `e` | error to convert |
+| **returns** | a negative code, the native code itself for ThreadError.native |
+
 ## Operation
 
 ```mach
@@ -145,6 +150,10 @@ pub fun config_default(c: *Config)
 
 initialize a thread configuration with portable defaults
 
+| Parameter | |
+| :--- | :--- |
+| `c` | configuration to fill with the default reserve, no commit and no name |
+
 ### spawn_with_config
 
 ```mach
@@ -154,6 +163,14 @@ pub fun spawn_with_config(f: fun(*u8), arg: *u8, c: *Config, t: *Thread) Operati
 spawn with borrowed caller context and explicit configuration
 
 arg must remain valid until the entry returns. ownership stays with the caller.
+
+| Parameter | |
+| :--- | :--- |
+| `f` | entry function run on the new thread with arg |
+| `arg` | borrowed context passed to f |
+| `c` | creation policy, validated before anything is allocated |
+| `t` | handle filled in, its tid holding the failure code on refusal |
+| **returns** | ok, invalid for a config outside the policy, exhausted, unsupported, or the native refusal |
 
 ### spawn_owned_with_config
 
@@ -166,6 +183,15 @@ spawn with owned caller context and explicit configuration
 destroy runs exactly once after the entry returns, including an early return.
 if spawning fails, destroy runs before this call returns.
 
+| Parameter | |
+| :--- | :--- |
+| `f` | entry function run on the new thread with arg |
+| `arg` | owned context passed to f and then to destroy |
+| `destroy` | releases arg |
+| `c` | creation policy, validated before anything is allocated |
+| `t` | handle filled in, its tid holding the failure code on refusal |
+| **returns** | as spawn_with_config |
+
 ### spawn_config
 
 ```mach
@@ -173,6 +199,13 @@ pub fun spawn_config(f: fun(), c: *Config, t: *Thread) Operation
 ```
 
 spawn a zero-argument function with explicit configuration
+
+| Parameter | |
+| :--- | :--- |
+| `f` | entry function run on the new thread |
+| `c` | creation policy |
+| `t` | handle filled in |
+| **returns** | as spawn_with_config |
 
 ## Thread
 
@@ -200,6 +233,13 @@ pub fun spawn_with(f: fun(*u8), arg: *u8, t: *Thread) Operation
 
 spawn with borrowed caller context and default configuration
 
+| Parameter | |
+| :--- | :--- |
+| `f` | entry function run on the new thread with arg |
+| `arg` | borrowed context passed to f, valid until f returns |
+| `t` | handle filled in |
+| **returns** | as spawn_with_config |
+
 ### spawn_owned
 
 ```mach
@@ -208,6 +248,14 @@ pub fun spawn_owned(f: fun(*u8), arg: *u8, destroy: fun(*u8), t: *Thread) Operat
 
 spawn with owned caller context and default configuration
 
+| Parameter | |
+| :--- | :--- |
+| `f` | entry function run on the new thread with arg |
+| `arg` | owned context passed to f and then to destroy |
+| `destroy` | releases arg, run once after f returns or before a refusal returns |
+| `t` | handle filled in |
+| **returns** | as spawn_with_config |
+
 ### spawn
 
 ```mach
@@ -215,6 +263,12 @@ pub fun spawn(f: fun(), t: *Thread) Operation
 ```
 
 spawn a zero-argument function with default configuration
+
+| Parameter | |
+| :--- | :--- |
+| `f` | entry function run on the new thread |
+| `t` | handle filled in |
+| **returns** | as spawn_with_config |
 
 ### join
 
@@ -226,6 +280,7 @@ join and release every library-owned resource
 
 | Parameter | |
 | :--- | :--- |
+| `t` | handle of a joinable thread |
 | **returns** | ok once joined and released, invalid for a handle that is not joinable, or the target's refusal with the handle still joinable |
 
 ### detach
@@ -238,6 +293,7 @@ transfer ownership to the running or completed thread
 
 | Parameter | |
 | :--- | :--- |
+| `t` | handle of a joinable thread |
 | **returns** | ok once the thread owns its record, invalid for a handle that is not joinable, or the target's refusal with the handle still joinable |
 
 ### is_done
@@ -248,6 +304,11 @@ pub fun is_done(t: *Thread) bool
 
 check whether a joinable thread body has finished
 
+| Parameter | |
+| :--- | :--- |
+| `t` | thread handle |
+| **returns** | true once the body finished or the handle was joined, false after detach |
+
 ### diagnostic_id
 
 ```mach
@@ -255,6 +316,11 @@ pub fun diagnostic_id(t: *Thread) i64
 ```
 
 return the stable native diagnostic identifier captured at spawn
+
+| Parameter | |
+| :--- | :--- |
+| `t` | thread handle |
+| **returns** | its tid, negative when the spawn failed |
 
 ## Token
 
@@ -329,6 +395,10 @@ pub fun cpu_set_clear(set: *CpuSet)
 
 remove every CPU from the set
 
+| Parameter | |
+| :--- | :--- |
+| `set` | set whose capacity words are all cleared |
+
 ### cpu_set_add
 
 ```mach
@@ -339,6 +409,8 @@ add a CPU to the set
 
 | Parameter | |
 | :--- | :--- |
+| `set` | set to add to |
+| `cpu` | global CPU index |
 | **returns** | false when the CPU does not fit the set's words |
 
 ### cpu_set_contains
@@ -349,6 +421,12 @@ pub fun cpu_set_contains(set: *CpuSet, cpu: usize) bool
 
 whether a CPU is in the set
 
+| Parameter | |
+| :--- | :--- |
+| `set` | set to read |
+| `cpu` | global CPU index |
+| **returns** | true when cpu is in the set |
+
 ### cpu_set_size
 
 ```mach
@@ -356,6 +434,11 @@ pub fun cpu_set_size(set: *CpuSet) usize
 ```
 
 the number of CPUs in the set
+
+| Parameter | |
+| :--- | :--- |
+| `set` | set to read |
+| **returns** | count of set bits over the words in use |
 
 ### cpu_set_nth
 
@@ -367,6 +450,8 @@ the n-th CPU in the set, counting from zero in ascending index order
 
 | Parameter | |
 | :--- | :--- |
+| `set` | set to read |
+| `n` | zero-based position among the CPUs in the set |
 | **returns** | the CPU index, or none when the set holds n CPUs or fewer |
 
 ### current_affinity
@@ -382,6 +467,7 @@ affinity_words first. darwin has no CPU affinity and refuses with UNSUPPORTED.
 
 | Parameter | |
 | :--- | :--- |
+| `set` | set whose words receive the mask |
 | **returns** | ok with set.count updated, or the refusal |
 
 ### set_current_affinity
@@ -394,6 +480,7 @@ pin the calling thread to the CPUs in set
 
 | Parameter | |
 | :--- | :--- |
+| `set` | CPUs to allow |
 | **returns** | ok, INVALID for an empty set or CPUs the process may not use, UNSUPPORTED where the platform cannot express the set, or the refusal |
 
 ## Functions

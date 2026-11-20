@@ -13,13 +13,14 @@ Source: [`src/io/handle.mach`](../../../src/io/handle.mach)
 
 | On `FileHandle` | |
 | :--- | :--- |
-| [`invalid_file`](#invalid_file), [`file_is_valid`](#file_is_valid) | |
+| [`invalid_file`](#invalid_file) | a file handle that refers to no file |
+| [`file_is_valid`](#file_is_valid) | whether a file handle refers to a file |
 
 | On `SocketHandle` | |
 | :--- | :--- |
-| [`invalid_socket`](#invalid_socket) | |
+| [`invalid_socket`](#invalid_socket) | a socket handle that refers to no socket |
 | [`socket`](#socket) | a handle for a native socket this process has just opened or accepted |
-| [`socket_is_valid`](#socket_is_valid) | |
+| [`socket_is_valid`](#socket_is_valid) | whether a socket handle refers to a socket |
 
 | Constants | |
 | :--- | :--- |
@@ -43,11 +44,24 @@ file handle owned by the filesystem layer
 pub fun invalid_file() FileHandle
 ```
 
+a file handle that refers to no file
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | a handle holding INVALID_VALUE |
+
 ### file_is_valid
 
 ```mach
 pub fun file_is_valid(handle: FileHandle) bool
 ```
+
+whether a file handle refers to a file
+
+| Parameter | |
+| :--- | :--- |
+| `handle` | the handle to test |
+| **returns** | true unless the handle holds INVALID_VALUE |
 
 ## SocketHandle
 
@@ -73,6 +87,12 @@ socket that took over its value
 pub fun invalid_socket() SocketHandle
 ```
 
+a socket handle that refers to no socket
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | a handle holding INVALID_VALUE with opening 0 |
+
 ### socket
 
 ```mach
@@ -95,6 +115,13 @@ sockets, and an async driver treats the older one as closed
 ```mach
 pub fun socket_is_valid(handle: SocketHandle) bool
 ```
+
+whether a socket handle refers to a socket
+
+| Parameter | |
+| :--- | :--- |
+| `handle` | the handle to test |
+| **returns** | true unless the handle holds INVALID_VALUE |
 
 ## Constants
 

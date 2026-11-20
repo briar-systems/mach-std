@@ -17,8 +17,8 @@ Source: [`src/system/os/shared.mach`](../../../../src/system/os/shared.mach)
 | [`NativePath`](#nativepath) | `rec` | a whole path in native units, nul-terminated, as native_path gives it |
 | [`NativeEntry`](#nativeentry) | `rec` | a directory entry in native units, borrowed until the next cursor operation like a DirectoryEntry |
 | [`DirectoryInitResult`](#directoryinitresult) | `rec` | initialization failure and failed duplicate cleanup remain independent |
-| [`ProcessStatus`](#processstatus) | `rec` |  |
-| [`ProcessWaitError`](#processwaiterror) | `rec` |  |
+| [`ProcessStatus`](#processstatus) | `rec` | one observed change in a child's state |
+| [`ProcessWaitError`](#processwaiterror) | `rec` | why a process wait or the release of a child's handle failed |
 | [`FileLimit`](#filelimit) | `rec` | the open-file limit |
 | [`WaitResult`](#waitresult) | `rec` | pid is positive for an observation, zero for no event or an error |
 | [`EnvironmentOf`](#environmentof) | `tag` | the environment a spawn or exec hands its child, its entries in units T |
@@ -149,6 +149,12 @@ pub rec DirectoryEntry {
 
 the name is borrowed until the next cursor operation, including eof or failure
 
+| Field | Type | |
+| :--- | :--- | :--- |
+| `name` | `str` | the entry's nul-terminated name |
+| `length` | `usize` | its length in bytes |
+| `type_hint` | `u8` | the entry's type as a DT_* value (0 unknown, 1 fifo, 2 character device, 4 directory, 6 block device, 8 regular, 10 symlink, 12 socket) |
+
 ## NativePath
 
 ```mach
@@ -205,6 +211,15 @@ pub rec ProcessStatus {
 }
 ```
 
+one observed change in a child's state
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `kind` | `u8` | which change it is, one of the PROCESS_* states above |
+| `code` | `u32` | the exit code when kind is PROCESS_EXITED, zero otherwise |
+| `signal` | `i32` | the terminating or stopping signal for PROCESS_SIGNALED and PROCESS_STOPPED, zero otherwise |
+| `core_dumped` | `bool` | whether a signaled child left a core dump |
+
 ### posix_status
 
 ```mach
@@ -222,6 +237,14 @@ pub rec ProcessWaitError {
     operation:   u8;
 }
 ```
+
+why a process wait or the release of a child's handle failed
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `code` | `i64` | the negated errno, zero when nothing failed |
+| `native_code` | `u32` | the exact windows GetLastError, zero on posix |
+| `operation` | `u8` | the PROCESS_OP_* stage that failed |
 
 ## FileLimit
 

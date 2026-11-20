@@ -11,9 +11,9 @@ Uses types from [`std.io.error`](../io/error.md), [`std.io.lifecycle`](../io/lif
 | Type | | |
 | :--- | :--- | :--- |
 | [`Kind`](#kind) | `def` |  |
-| [`Event`](#event) | `rec` |  |
-| [`Capabilities`](#capabilities) | `rec` |  |
-| [`Source`](#source) | `rec` |  |
+| [`Event`](#event) | `rec` | one lifecycle event, as next drains it |
+| [`Capabilities`](#capabilities) | `rec` | which kinds of event the target can deliver |
+| [`Source`](#source) | `rec` | the process's one event source, filled by make or make_runtime |
 
 | On `Kind` | |
 | :--- | :--- |
@@ -21,7 +21,7 @@ Uses types from [`std.io.error`](../io/error.md), [`std.io.lifecycle`](../io/lif
 
 | On `Capabilities` | |
 | :--- | :--- |
-| [`capabilities`](#capabilities-1) | |
+| [`capabilities`](#capabilities-1) | which kinds of event this target delivers |
 
 | On `Source` | |
 | :--- | :--- |
@@ -29,7 +29,7 @@ Uses types from [`std.io.error`](../io/error.md), [`std.io.lifecycle`](../io/lif
 | [`make_runtime`](#make_runtime) | the source must close before the runtime whose queue it borrows |
 | [`notify_service_stop`](#notify_service_stop) | windows service handlers call this for stop, shutdown, or preshutdown control |
 | [`next`](#next) | events are coalesced by kind and drained in service-to-reload priority order |
-| [`begin_runtime_drain`](#begin_runtime_drain) | |
+| [`begin_runtime_drain`](#begin_runtime_drain) | begin the graceful close of a runtime in answer to a termination event |
 | [`wait`](#wait) | standalone sources may wait directly, runtime-attached sources use runtime wait |
 | [`queue`](#queue) | the wait queue a standalone source waits on and every event wakes, so a caller can watch more on it (a child's end, std.process.exec.watch_exit) and have `wait` return for either |
 | [`close`](#close) | release the process's event source: the native handlers are restored, the owned queue closed and the runtime registration released; the first refusal is reported after every step has run |
@@ -58,6 +58,12 @@ pub rec Event {
 }
 ```
 
+one lifecycle event, as next drains it
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `kind` | `Kind` | which event |
+
 ## Capabilities
 
 ```mach
@@ -70,11 +76,27 @@ pub rec Capabilities {
 }
 ```
 
+which kinds of event the target can deliver
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `terminate` | `bool` | TERMINATE is delivered |
+| `interrupt` | `bool` | INTERRUPT is delivered |
+| `reload` | `bool` | RELOAD is delivered |
+| `console_close` | `bool` | CONSOLE_CLOSE is delivered |
+| `service_stop` | `bool` | SERVICE_STOP is delivered |
+
 ### capabilities
 
 ```mach
 pub fun capabilities() Capabilities
 ```
+
+which kinds of event this target delivers
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | reload on posix, console_close and service_stop on windows, terminate and interrupt on both |
 
 ## Source
 
@@ -88,6 +110,16 @@ pub rec Source {
 }
 ```
 
+the process's one event source, filled by make or make_runtime
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `generation` | `usize` | which claim of the process this source holds |
+| `owns_queue` | `bool` | the source made its own wait queue, so wait and queue work |
+| `runtime` | `*std.io.runtime.Runtime` | the runtime the source is attached to, or nil |
+| `registration` | `std.io.runtime.SourceToken` | the source's registration with that runtime |
+| `registered` | `bool` | registration is live |
+
 ### make
 
 ```mach
@@ -98,6 +130,7 @@ claim the process's event source with its own wait queue
 
 | Parameter | |
 | :--- | :--- |
+| `source` | the source to fill, which close releases |
 | **returns** | BUSY when another source owns the process, or the native failure |
 
 ### make_runtime
@@ -141,6 +174,15 @@ pub fun begin_runtime_drain(
     event: Event,
 ) res[std.io.lifecycle.CloseResult, std.io.error.Error]
 ```
+
+begin the graceful close of a runtime in answer to a termination event
+
+| Parameter | |
+| :--- | :--- |
+| `source` | the open source the event came from |
+| `runtime` | the runtime to close |
+| `event` | the event, any kind but RELOAD |
+| **returns** | the runtime's close result, or INVALID for a source that is not the open owner, a nil runtime or a RELOAD event |
 
 ### wait
 

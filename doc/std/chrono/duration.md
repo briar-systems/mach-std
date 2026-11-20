@@ -132,7 +132,7 @@ return the absolute value of d
 | Parameter | |
 | :--- | :--- |
 | `d` | duration to take absolute value of |
-| **returns** | \|d\| |
+| **returns** | \|d\|, or the largest Duration when d is the most negative one |
 
 ### format_duration
 

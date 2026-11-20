@@ -46,15 +46,27 @@ Uses types from [`std.io.error`](../io/error.md), [`std.io.lifecycle`](../io/lif
 
 | Functions | |
 | :--- | :--- |
-| [`capabilities`](#capabilities), [`filesystem`](#filesystem), [`filesystem_bytes`](#filesystem_bytes) | |
+| [`capabilities`](#capabilities) | the local transport capabilities of the build target |
+| [`filesystem`](#filesystem) | a filesystem endpoint named by a nul-terminated UTF-8 path |
+| [`filesystem_bytes`](#filesystem_bytes) | a filesystem endpoint named by length bytes of a path |
 | [`filesystem_native`](#filesystem_native) | a filesystem endpoint from a path in native units (see endpoint.filesystem_native) |
-| [`abstract`](#abstract), [`target`](#target), [`target_bytes`](#target_bytes), [`default_listen_options`](#default_listen_options), [`default_bind_options`](#default_bind_options) | |
+| [`abstract`](#abstract) | a linux abstract endpoint named by length bytes |
+| [`target`](#target) | a target-name endpoint named by a nul-terminated name |
+| [`target_bytes`](#target_bytes) | a target-name endpoint named by length bytes |
+| [`default_listen_options`](#default_listen_options) | listen options with a backlog of 128, an owned socket file, stale files rejected and inherited permissions |
+| [`default_bind_options`](#default_bind_options) | bind options with an owned socket file, stale files rejected and inherited permissions |
 | [`bind`](#bind) | filesystem ownership is race-free when the caller controls mutations in the parent directory |
-| [`listener_start`](#listener_start), [`listen`](#listen), [`connect`](#connect), [`accept`](#accept) | |
+| [`listener_start`](#listener_start) | start accepting connections on a bound listener |
+| [`listen`](#listen) | bind an endpoint and start listening on it |
+| [`connect`](#connect) | connect a blocking stream to a listening endpoint |
+| [`accept`](#accept) | wait for and accept one connection as a blocking stream |
 | [`stream_read`](#stream_read) | exclusively borrow the stream receive queue and close state, including raw aliases |
-| [`stream_write`](#stream_write), [`stream_shutdown_write`](#stream_shutdown_write), [`peer_identity`](#peer_identity) | |
+| [`stream_write`](#stream_write) | write bytes to a stream |
+| [`stream_shutdown_write`](#stream_shutdown_write) | shut down the sending side, so the peer reads the end of the stream |
+| [`peer_identity`](#peer_identity) | the credentials of a stream's peer, as far as the target reports them |
 | [`listener_rename`](#listener_rename) | rename never knowingly replaces an occupied path callers must serialize parent directory mutation where atomic no-replace rename is unavailable |
-| [`stream_close`](#stream_close), [`listener_close`](#listener_close) | |
+| [`stream_close`](#stream_close) | close a stream, shutting down its sending side first when graceful |
+| [`listener_close`](#listener_close) | close a listener, and when it is owned remove its socket file if the path still names it |
 
 | Forwards | |
 | :--- | :--- |
@@ -70,17 +82,38 @@ Uses types from [`std.io.error`](../io/error.md), [`std.io.lifecycle`](../io/lif
 pub fun capabilities() std.net.local.endpoint.Capabilities
 ```
 
+the local transport capabilities of the build target
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the capability set (see endpoint.capabilities) |
+
 ### filesystem
 
 ```mach
 pub fun filesystem(path: str) res[std.net.local.endpoint.Endpoint, std.io.error.Error]
 ```
 
+a filesystem endpoint named by a nul-terminated UTF-8 path
+
+| Parameter | |
+| :--- | :--- |
+| `path` | the path, copied |
+| **returns** | the endpoint, or the refusal (see endpoint.filesystem_bytes) |
+
 ### filesystem_bytes
 
 ```mach
 pub fun filesystem_bytes(data: *u8, length: usize) res[std.net.local.endpoint.Endpoint, std.io.error.Error]
 ```
+
+a filesystem endpoint named by length bytes of a path
+
+| Parameter | |
+| :--- | :--- |
+| `data` | the path bytes, copied |
+| `length` | path bytes |
+| **returns** | the endpoint, or the refusal (see endpoint.filesystem_bytes) |
 
 ### filesystem_native
 
@@ -96,11 +129,26 @@ a filesystem endpoint from a path in native units (see endpoint.filesystem_nativ
 pub fun abstract(data: *u8, length: usize) res[std.net.local.endpoint.Endpoint, std.io.error.Error]
 ```
 
+a linux abstract endpoint named by length bytes
+
+| Parameter | |
+| :--- | :--- |
+| `data` | the name bytes, copied |
+| `length` | name bytes |
+| **returns** | the endpoint, or the refusal (see endpoint.abstract) |
+
 ### target
 
 ```mach
 pub fun target(name: str) res[std.net.local.endpoint.Endpoint, std.io.error.Error]
 ```
+
+a target-name endpoint named by a nul-terminated name
+
+| Parameter | |
+| :--- | :--- |
+| `name` | the name, copied |
+| **returns** | the endpoint, or the refusal (see endpoint.target_bytes) |
 
 ### target_bytes
 
@@ -108,17 +156,39 @@ pub fun target(name: str) res[std.net.local.endpoint.Endpoint, std.io.error.Erro
 pub fun target_bytes(data: *u8, length: usize) res[std.net.local.endpoint.Endpoint, std.io.error.Error]
 ```
 
+a target-name endpoint named by length bytes
+
+| Parameter | |
+| :--- | :--- |
+| `data` | the name bytes, copied |
+| `length` | name bytes |
+| **returns** | the endpoint, or the refusal (see endpoint.target_bytes) |
+
 ### default_listen_options
 
 ```mach
 pub fun default_listen_options() std.net.local.types.ListenOptions
 ```
 
+listen options with a backlog of 128, an owned socket file, stale files
+rejected and inherited permissions
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the options |
+
 ### default_bind_options
 
 ```mach
 pub fun default_bind_options() std.net.local.types.BindOptions
 ```
+
+bind options with an owned socket file, stale files rejected and inherited
+permissions
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the options |
 
 ### bind
 
@@ -128,11 +198,25 @@ pub fun bind(bound: std.net.local.endpoint.Endpoint, options: std.net.local.type
 
 filesystem ownership is race-free when the caller controls mutations in the parent directory
 
+| Parameter | |
+| :--- | :--- |
+| `bound` | the endpoint to bind |
+| `options` | ownership, stale policy and permissions |
+| **returns** | the bound listener, not yet listening, which the caller closes with listener_close, INVALID for an unsupported endpoint or bad options, or the bind failure |
+
 ### listener_start
 
 ```mach
 pub fun listener_start(listener: *std.net.local.types.Listener, backlog: i32) err[std.io.error.Error]
 ```
+
+start accepting connections on a bound listener
+
+| Parameter | |
+| :--- | :--- |
+| `listener` | the bound listener |
+| `backlog` | pending connections the system may queue, above zero |
+| **returns** | ok, INVALID for a nil or closed listener or a backlog of zero or less, or the listen failure |
 
 ### listen
 
@@ -140,17 +224,42 @@ pub fun listener_start(listener: *std.net.local.types.Listener, backlog: i32) er
 pub fun listen(bound: std.net.local.endpoint.Endpoint, options: std.net.local.types.ListenOptions) res[std.net.local.types.Listener, std.io.error.Error]
 ```
 
+bind an endpoint and start listening on it
+
+when listening fails the listener is closed as owned, removing a socket file
+it created
+
+| Parameter | |
+| :--- | :--- |
+| `bound` | the endpoint to bind |
+| `options` | backlog, ownership, stale policy and permissions |
+| **returns** | the listening listener, which the caller closes with listener_close, INVALID for a backlog of zero or less, or the bind or listen failure |
+
 ### connect
 
 ```mach
 pub fun connect(remote: std.net.local.endpoint.Endpoint) res[std.net.local.types.Stream, std.io.error.Error]
 ```
 
+connect a blocking stream to a listening endpoint
+
+| Parameter | |
+| :--- | :--- |
+| `remote` | the endpoint to connect to |
+| **returns** | the stream, which the caller closes with stream_close, INVALID for an unsupported endpoint, or the connect failure |
+
 ### accept
 
 ```mach
 pub fun accept(listener: *std.net.local.types.Listener) res[std.net.local.types.Stream, std.io.error.Error]
 ```
+
+wait for and accept one connection as a blocking stream
+
+| Parameter | |
+| :--- | :--- |
+| `listener` | the listening listener |
+| **returns** | the server-side stream, which the caller closes with stream_close, INVALID for a nil or closed listener, or the accept failure |
 
 ### stream_read
 
@@ -167,17 +276,40 @@ darwin rejects ancillary input without consuming it and leaves the stream owned.
 pub fun stream_write(stream: *std.net.local.types.Stream, buffer: *u8, length: usize) res[usize, std.io.error.Error]
 ```
 
+write bytes to a stream
+
+| Parameter | |
+| :--- | :--- |
+| `stream` | the open stream |
+| `buffer` | the bytes to send, nil only for a zero length |
+| `length` | bytes to send |
+| **returns** | bytes written, which may be fewer than length, INVALID for a nil or closed stream or nil buffer, or the write failure |
+
 ### stream_shutdown_write
 
 ```mach
 pub fun stream_shutdown_write(stream: *std.net.local.types.Stream) err[std.io.error.Error]
 ```
 
+shut down the sending side, so the peer reads the end of the stream
+
+| Parameter | |
+| :--- | :--- |
+| `stream` | the open stream |
+| **returns** | ok, INVALID for a nil or closed stream, or the shutdown failure |
+
 ### peer_identity
 
 ```mach
 pub fun peer_identity(stream: *std.net.local.types.Stream) res[std.net.local.types.PeerIdentity, std.io.error.Error]
 ```
+
+the credentials of a stream's peer, as far as the target reports them
+
+| Parameter | |
+| :--- | :--- |
+| `stream` | the open stream |
+| **returns** | the identity with its has_ flags set for what was reported, INVALID for a nil or closed stream, or the failure, UNSUPPORTED where the target reports none |
 
 ### listener_rename
 
@@ -194,11 +326,31 @@ callers must serialize parent directory mutation where atomic no-replace rename 
 pub fun stream_close(stream: *std.net.local.types.Stream, mode: std.io.lifecycle.Mode) err[std.io.error.Error]
 ```
 
+close a stream, shutting down its sending side first when graceful
+
+the handle is closed and the stream marked closed even when shutdown fails
+
+| Parameter | |
+| :--- | :--- |
+| `stream` | the open stream |
+| `mode` | lifecycle.GRACEFUL or lifecycle.ABORTIVE |
+| **returns** | ok, INVALID for a nil or closed stream or an unknown mode, the shutdown failure, or the close failure |
+
 ### listener_close
 
 ```mach
 pub fun listener_close(listener: *std.net.local.types.Listener) err[std.io.error.Error]
 ```
+
+close a listener, and when it is owned remove its socket file if the path
+still names it
+
+the listener is marked closed whatever the outcome
+
+| Parameter | |
+| :--- | :--- |
+| `listener` | the open listener |
+| **returns** | ok, INVALID for a nil or closed listener, the close failure, or the removal failure, BUSY when the path names another file |
 
 ## Forwards
 
@@ -248,6 +400,8 @@ pub rec Capabilities {
     custom_permissions:       bool;
 }
 ```
+
+what the target's local transport supports
 
 ### FILESYSTEM
 
@@ -341,6 +495,8 @@ pub rec BindOptions {
 }
 ```
 
+how a listener is bound
+
 ### ListenOptions
 
 Forwards [`std.net.local.types.ListenOptions`](local/types.md#listenoptions).
@@ -353,6 +509,8 @@ pub rec ListenOptions {
     permissions: u32;
 }
 ```
+
+how a listener is bound and started
 
 ### Listener
 
@@ -368,6 +526,8 @@ pub rec Listener {
     has_node_identity: bool;
 }
 ```
+
+a bound local listener
 
 ### Stream
 
@@ -396,4 +556,6 @@ pub rec PeerIdentity {
     has_group:   bool;
 }
 ```
+
+the credentials of a connected peer, as far as the target reports them
 

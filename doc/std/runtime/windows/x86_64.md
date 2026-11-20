@@ -27,7 +27,7 @@ Uses types from [`std.runtime.native.view`](../native/view.md).
 | Functions | |
 | :--- | :--- |
 | [`native_args`](#native_args) | the arguments as the UTF-16 units the command line held, for std.runtime.native |
-| [`_start`](#_start) | |
+| [`_start`](#_start) | the PE entry, the steps the module comment lists |
 
 ---
 
@@ -52,4 +52,6 @@ the arguments as the UTF-16 units the command line held, for std.runtime.native
 #[symbol("mainCRTStartup")]
 pub fun _start()
 ```
+
+the PE entry, the steps the module comment lists
 

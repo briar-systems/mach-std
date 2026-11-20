@@ -18,7 +18,7 @@ Uses types from [`std.chrono.time`](../chrono/time.md), [`std.io.error`](../io/e
 | [`Sample`](#sample) | `def` | the outcome of one sample, normalized to the clock's precision |
 | [`Clock`](#clock-1) | `rec` | the clock context is borrowed and must outlive every logger using it |
 | [`FieldKind`](#fieldkind) | `def` |  |
-| [`Bytes`](#bytes) | `rec` |  |
+| [`Bytes`](#bytes) | `rec` | a borrowed run of bytes |
 | [`Field`](#field) | `rec` | keys and borrowed string or byte values must outlive record encoding |
 | [`Record`](#record) | `rec` | the timestamp is owned by value while message and fields are borrowed |
 | [`OversizePolicy`](#oversizepolicy) | `def` |  |
@@ -28,13 +28,14 @@ Uses types from [`std.chrono.time`](../chrono/time.md), [`std.io.error`](../io/e
 
 | On `Level` | |
 | :--- | :--- |
-| [`DEBUG`](#level), [`INFO`](#level), [`WARN`](#level), [`ERROR`](#level), [`OFF`](#level), [`level_name`](#level_name) | |
+| [`DEBUG`](#level), [`INFO`](#level), [`WARN`](#level), [`ERROR`](#level), [`OFF`](#level) | |
+| [`level_name`](#level_name) | the name a level renders as in a record |
 
 | On `Precision` | |
 | :--- | :--- |
 | [`PRECISION_SECONDS`](#precision), [`PRECISION_MILLIS`](#precision), [`PRECISION_MICROS`](#precision), [`PRECISION_NANOS`](#precision) | |
-| [`system_clock`](#system_clock) | the system clock reads the OS layer's clock group |
-| [`record_at`](#record_at) | |
+| [`system_clock`](#system_clock) | a clock reading the system time, with no context |
+| [`record_at`](#record_at) | build a record stamped with a given time, truncated to the precision |
 
 | On `ClockOwnership` | |
 | :--- | :--- |
@@ -42,11 +43,11 @@ Uses types from [`std.chrono.time`](../chrono/time.md), [`std.io.error`](../io/e
 
 | On `NowFun` | |
 | :--- | :--- |
-| [`clock`](#clock) | |
+| [`clock`](#clock) | a clock over a caller's source, borrowing its context |
 
 | On `Clock` | |
 | :--- | :--- |
-| [`clock_valid`](#clock_valid) | |
+| [`clock_valid`](#clock_valid) | tell whether a clock can be sampled |
 | [`clock_now`](#clock_now) | sample the clock; a failed clock is never zero time |
 
 | On `FieldKind` | |
@@ -56,9 +57,13 @@ Uses types from [`std.chrono.time`](../chrono/time.md), [`std.io.error`](../io/e
 
 | On `Field` | |
 | :--- | :--- |
-| [`field_i64`](#field_i64), [`field_u64`](#field_u64), [`field_bool`](#field_bool), [`field_bytes`](#field_bytes), [`field_string`](#field_string) | |
+| [`field_i64`](#field_i64) | a field carrying a signed integer |
+| [`field_u64`](#field_u64) | a field carrying an unsigned integer |
+| [`field_bool`](#field_bool) | a field carrying a boolean |
+| [`field_bytes`](#field_bytes) | a field carrying raw bytes, rendered as hex |
+| [`field_string`](#field_string) | a field carrying a terminated string, rendered quoted |
 | [`field_text`](#field_text) | borrowed text with an explicit length, for a view that carries no terminator |
-| [`field_error`](#field_error) | |
+| [`field_error`](#field_error) | a field carrying an io error |
 
 | On `Record` | |
 | :--- | :--- |
@@ -94,6 +99,13 @@ pub def Level: u8
 pub fun level_name(level: Level) str
 ```
 
+the name a level renders as in a record
+
+| Parameter | |
+| :--- | :--- |
+| `level` | the level to name |
+| **returns** | DEBUG, INFO, WARN, ERROR or OFF, or INVALID for any other value |
+
 ## Precision
 
 ```mach
@@ -115,13 +127,30 @@ Only where `capability.HAS_CLOCK`.
 pub fun system_clock(precision: Precision) Clock
 ```
 
-the system clock reads the OS layer's clock group
+a clock reading the system time, with no context
+
+| Parameter | |
+| :--- | :--- |
+| `precision` | the resolution samples are truncated to |
+| **returns** | the clock |
 
 ### record_at
 
 ```mach
 pub fun record_at(timestamp: Time, precision: Precision, level: Level, message: str, fields: *Field, field_count: usize) Record
 ```
+
+build a record stamped with a given time, truncated to the precision
+
+| Parameter | |
+| :--- | :--- |
+| `timestamp` | the record's time |
+| `precision` | the resolution the time is truncated to and rendered at |
+| `level` | the record's level |
+| `message` | the message, borrowed until the record is encoded |
+| `fields` | the fields, borrowed until the record is encoded |
+| `field_count` | how many fields are at fields |
+| **returns** | the record, not validated here (encode checks it) |
 
 ## ClockOwnership
 
@@ -147,6 +176,15 @@ a clock source samples the current time or reports why it could not
 ```mach
 pub fun clock(ctx: ptr, f_now: NowFun, precision: Precision) Clock
 ```
+
+a clock over a caller's source, borrowing its context
+
+| Parameter | |
+| :--- | :--- |
+| `ctx` | the context passed to f_now, which must outlive every logger using the clock |
+| `f_now` | the source sampled for the current time |
+| `precision` | the resolution samples are truncated to |
+| **returns** | the clock, not checked here (see clock_valid) |
 
 ## ClockError
 
@@ -191,6 +229,13 @@ the clock context is borrowed and must outlive every logger using it
 pub fun clock_valid(c: *Clock) bool
 ```
 
+tell whether a clock can be sampled
+
+| Parameter | |
+| :--- | :--- |
+| `c` | the clock to check |
+| **returns** | true when c is not nil, has a source and a known precision, and its ownership matches its context |
+
 ### clock_now
 
 ```mach
@@ -224,6 +269,13 @@ pub rec Bytes {
 }
 ```
 
+a borrowed run of bytes
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `data` | `*u8` | the first byte, nil only when len is zero |
+| `len` | `usize` | the byte count |
+
 ## Field
 
 ```mach
@@ -250,11 +302,27 @@ keys and borrowed string or byte values must outlive record encoding
 pub fun field_i64(key: str, value: i64) Field
 ```
 
+a field carrying a signed integer
+
+| Parameter | |
+| :--- | :--- |
+| `key` | the field key, borrowed until the record is encoded |
+| `value` | the integer |
+| **returns** | the field |
+
 ### field_u64
 
 ```mach
 pub fun field_u64(key: str, value: u64) Field
 ```
+
+a field carrying an unsigned integer
+
+| Parameter | |
+| :--- | :--- |
+| `key` | the field key, borrowed until the record is encoded |
+| `value` | the integer |
+| **returns** | the field |
 
 ### field_bool
 
@@ -262,17 +330,42 @@ pub fun field_u64(key: str, value: u64) Field
 pub fun field_bool(key: str, value: bool) Field
 ```
 
+a field carrying a boolean
+
+| Parameter | |
+| :--- | :--- |
+| `key` | the field key, borrowed until the record is encoded |
+| `value` | the boolean |
+| **returns** | the field |
+
 ### field_bytes
 
 ```mach
 pub fun field_bytes(key: str, data: *u8, len: usize) Field
 ```
 
+a field carrying raw bytes, rendered as hex
+
+| Parameter | |
+| :--- | :--- |
+| `key` | the field key, borrowed until the record is encoded |
+| `data` | the bytes, borrowed until the record is encoded |
+| `len` | the byte count |
+| **returns** | the field |
+
 ### field_string
 
 ```mach
 pub fun field_string(key: str, value: str) Field
 ```
+
+a field carrying a terminated string, rendered quoted
+
+| Parameter | |
+| :--- | :--- |
+| `key` | the field key, borrowed until the record is encoded |
+| `value` | the string, borrowed until the record is encoded |
+| **returns** | the field |
 
 ### field_text
 
@@ -287,6 +380,14 @@ borrowed text with an explicit length, for a view that carries no terminator
 ```mach
 pub fun field_error(key: str, value: std.io.error.Error) Field
 ```
+
+a field carrying an io error
+
+| Parameter | |
+| :--- | :--- |
+| `key` | the field key, borrowed until the record is encoded |
+| `value` | the error, copied into the field |
+| **returns** | the field |
 
 ## Record
 

@@ -160,6 +160,11 @@ pub rec StampRead {
 
 a value read and the bytes it took
 
+| Field | Type | |
+| :--- | :--- | :--- |
+| `stamp` | `Stamp` | the value read |
+| `size` | `usize` | bytes of the span it took |
+
 ### read_rfc3339
 
 ```mach
@@ -212,14 +217,15 @@ pub fun rfc2822(dt: Datetime, buf: *u8, len: usize) usize
 
 write a Datetime as RFC 2822 into a buffer
 
-output: Fri, 13 Feb 2009 23:31:30 +0000
+output: Fri, 13 Feb 2009 23:31:30 +0000, with -0000 for an unknown offset
+(RFC 2822 section 3.3)
 
 | Parameter | |
 | :--- | :--- |
 | `dt` | datetime to format |
 | `buf` | output buffer (at least 32 bytes) |
 | `len` | buffer length |
-| **returns** | bytes written (excluding null terminator), 0 if buffer too small, the offset's hours do not fit two digits, or the offset is not a whole number of minutes |
+| **returns** | bytes written (excluding null terminator), 0 if buffer too small, the year is outside [0, 9999], the offset's hours do not fit two digits, the offset is not a whole number of minutes, or the date or the time of day is not valid |
 
 ### unix_sec
 

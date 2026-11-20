@@ -17,15 +17,15 @@ Uses types from [`std.allocator`](../allocator.md).
 | :--- | :--- |
 | [`init`](#init) | a table whose chunks come from a |
 | [`grow`](#grow) | appended elements are uninitialised and the caller owns their first write |
-| [`reserve`](#reserve) | |
+| [`reserve`](#reserve) | grow until the table holds at least count elements |
 | [`chunk_of`](#chunk_of) | the chunk holding index, for an index below the capacity |
 | [`chunk_start`](#chunk_start) | the first index chunk holds |
 | [`chunk_capacity`](#chunk_capacity) | how many elements chunk holds |
 | [`shrink`](#shrink) | return the last chunk to the table's allocator |
-| [`at`](#at) | |
+| [`at`](#at) | the address of one element |
 | [`index_of`](#index_of) | recover an element's index from its address, for callers that hand the address itself out as a resource identity |
 | [`dnit`](#dnit) | return every chunk to the table's allocator |
-| [`aliases`](#aliases) | |
+| [`aliases`](#aliases) | tell whether a byte range overlaps any chunk of the table |
 | [`trim`](#trim) | release the capacity a peak left behind |
 | [`trim_backed`](#trim_backed) | trim for a table that has promised capacity no element holds yet |
 
@@ -105,6 +105,14 @@ appended elements are uninitialised and the caller owns their first write
 pub fun reserve(table: *Table, count: usize) bool
 ```
 
+grow until the table holds at least count elements
+
+| Parameter | |
+| :--- | :--- |
+| `table` | the table to grow |
+| `count` | the element count the capacity must reach |
+| **returns** | whether the capacity reached count, false for a nil table or when a growth is refused, which keeps every chunk already added |
+
 ### chunk_of
 
 ```mach
@@ -154,6 +162,14 @@ table keeps it and a shrink is refused
 pub fun at(table: *Table, index: usize) ptr
 ```
 
+the address of one element
+
+| Parameter | |
+| :--- | :--- |
+| `table` | the table to index |
+| `index` | the element's index |
+| **returns** | its address, fixed until its chunk is released, or nil for a nil table or an index at or past the capacity |
+
 ### index_of
 
 ```mach
@@ -184,6 +200,15 @@ afterwards either way. destroying an empty or never-made table succeeds
 ```mach
 pub fun aliases(table: *Table, data: *u8, len: usize) bool
 ```
+
+tell whether a byte range overlaps any chunk of the table
+
+| Parameter | |
+| :--- | :--- |
+| `table` | the table to check |
+| `data` | the first byte of the range |
+| `len` | the range's length |
+| **returns** | true on any overlap, and conservatively true for a nil table, a malformed range or a chunk whose size cannot be represented, false for an empty range |
 
 ### trim
 

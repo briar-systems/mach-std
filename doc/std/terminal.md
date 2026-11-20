@@ -32,7 +32,9 @@ Uses types from [`std.terminal.error`](terminal/error.md).
 | :--- | :--- |
 | [`control_failure`](#control_failure) | a native refusal on a mode or queue control call |
 | [`read_failure`](#read_failure) | a native refusal on a poll |
-| [`poll_key_decoded`](#poll_key_decoded) | poll_key, decoding an arrow escape into a special key |
+| [`flush_input`](#flush_input) | drop whatever's sitting unread in the input queue, read-ahead bytes included |
+| [`poll_key`](#poll_key) | read one key without blocking |
+| [`poll_key_decoded`](#poll_key_decoded) | poll_key, which already decodes arrows on windows |
 
 | Forwards | |
 | :--- | :--- |
@@ -42,8 +44,7 @@ Uses types from [`std.terminal.error`](terminal/error.md).
 | [`Operation`](#operation), [`Poll`](#poll), [`code`](#code) | |
 | [`is_terminal`](#is_terminal) | whether a descriptor is a terminal, as os.stdout() or any other handle |
 | [`enable_raw`](#enable_raw) | mode control (per-os backend) |
-| [`disable_raw`](#disable_raw), [`is_raw`](#is_raw), [`flush_input`](#flush_input) | |
-| [`poll_key`](#poll_key) | raw, per-frame polling (per-os backend) |
+| [`disable_raw`](#disable_raw), [`is_raw`](#is_raw) | |
 
 ---
 
@@ -65,25 +66,57 @@ pub fun read_failure(code: i64) std.terminal.error.TermError
 
 a native refusal on a poll
 
+### flush_input
+
+```mach
+pub fun flush_input() std.terminal.error.Operation
+```
+
+drop whatever's sitting unread in the input queue, read-ahead bytes included
+
+worth calling right before enable_raw / disable_raw so a burst of stale
+keystrokes from the old mode doesn't leak into the new one.
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | ok, or the native refusal |
+
+### poll_key
+
+```mach
+pub fun poll_key() std.terminal.error.Poll
+```
+
+read one key without blocking
+
+a byte poll_key_decoded read ahead and did not consume comes first, then the
+backend's own poll. requires raw mode (enable_raw).
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | some{key} if one was waiting, none when the queue was empty, or the native read failure |
+
 ### poll_key_decoded
+
+Declared by the first of these arms whose condition holds.
+
+Where `$mach.build.sys == $mach.sys.windows`:
 
 ```mach
 pub fun poll_key_decoded() std.terminal.error.Poll
 ```
 
-poll_key, decoding an arrow escape into a special key
+Otherwise:
 
-on posix backends an arrow arrives as the 3-byte sequence ESC '[' 'A'..'D';
-this consumes those follow-up bytes and returns the matching special key. a
-bare ESC (or any byte that is not the start of an arrow) is returned as-is.
-windows already decodes arrows in poll_key, so this is a passthrough there.
+```mach
+pub fun poll_key_decoded() std.terminal.error.Poll
+```
 
-caveat: on a slow link the follow-up bytes could arrive a poll later than the
-ESC; fine over a local terminal. requires raw mode.
+poll_key, which already decodes arrows on windows
 
 | Parameter | |
 | :--- | :--- |
-| **returns** | some{key} -- a special arrow or an ordinary byte -- none when nothing was waiting, or the native failure of whichever read refused |
+| **returns** | some{key} -- a special arrow or an ordinary byte -- none when nothing was waiting, or the native read failure |
 
 ## Forwards
 
@@ -342,35 +375,4 @@ pub fun is_raw() bool
 ```
 
 whether raw mode is currently active
-
-### flush_input
-
-Forwards the first of these whose condition holds:
-
-- [`std.terminal.linux.flush_input`](terminal/linux.md#flush_input), where `capability.HAS_FILES` and `$mach.build.sys == $mach.sys.linux`
-- [`std.terminal.darwin.flush_input`](terminal/darwin.md#flush_input), where `capability.HAS_FILES` and `$mach.build.sys == $mach.sys.darwin`
-- [`std.terminal.windows.flush_input`](terminal/windows.md#flush_input), where `capability.HAS_FILES` and `$mach.build.sys == $mach.sys.windows`
-
-```mach
-pub fun flush_input() std.terminal.error.Operation
-```
-
-drop whatever's sitting unread in the input queue
-
-worth calling right before enable_raw / disable_raw so a burst of stale
-keystrokes from the old mode doesn't leak into the new one.
-
-### poll_key
-
-Forwards the first of these whose condition holds:
-
-- [`std.terminal.linux.poll_key`](terminal/linux.md#poll_key), where `capability.HAS_FILES` and `$mach.build.sys == $mach.sys.linux`
-- [`std.terminal.darwin.poll_key`](terminal/darwin.md#poll_key), where `capability.HAS_FILES` and `$mach.build.sys == $mach.sys.darwin`
-- [`std.terminal.windows.poll_key`](terminal/windows.md#poll_key), where `capability.HAS_FILES` and `$mach.build.sys == $mach.sys.windows`
-
-```mach
-pub fun poll_key() std.terminal.error.Poll
-```
-
-raw, per-frame polling (per-os backend)
 

@@ -16,7 +16,7 @@ Source: [`src/compat/sha1.mach`](../../../src/compat/sha1.mach)
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`State`](#state) | `rec` |  |
+| [`State`](#state) | `rec` | a running SHA-1 computation, made by `make` and finished by `final` |
 
 | On `State` | |
 | :--- | :--- |
@@ -48,6 +48,19 @@ pub rec State {
     total:   u64;
 }
 ```
+
+a running SHA-1 computation, made by `make` and finished by `final`
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `h0` | `u32` | first word of the chaining value |
+| `h1` | `u32` | second word of the chaining value |
+| `h2` | `u32` | third word of the chaining value |
+| `h3` | `u32` | fourth word of the chaining value |
+| `h4` | `u32` | fifth word of the chaining value |
+| `buf` | `[64]u8` | input bytes waiting for a full block |
+| `buf_len` | `usize` | number of bytes held in buf |
+| `total` | `u64` | number of input bytes fed so far |
 
 ### make
 

@@ -10,10 +10,10 @@ Uses types from [`std.io.runtime`](../../io/runtime.md), [`std.net.ip`](../ip.md
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`Token`](#token) | `rec` |  |
-| [`Vector`](#vector) | `rec` |  |
+| [`Token`](#token) | `rec` | names one operation a backend holds, refused once the slot is reused |
+| [`Vector`](#vector) | `rec` | one borrowed buffer of a vectored write |
 | [`Packet`](#packet) | `rec` | packet storage is borrowed until its operation completes |
-| [`NativeCompletion`](#nativecompletion) | `rec` |  |
+| [`NativeCompletion`](#nativecompletion) | `rec` | what a backend reports for one finished operation |
 
 | Constants | |
 | :--- | :--- |
@@ -31,6 +31,13 @@ pub rec Token {
 }
 ```
 
+names one operation a backend holds, refused once the slot is reused
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `index` | `u32` | the operation's slot in the backend's table |
+| `generation` | `u32` | the slot's generation when the operation was claimed |
+
 ## Vector
 
 ```mach
@@ -39,6 +46,13 @@ pub rec Vector {
     length: usize;
 }
 ```
+
+one borrowed buffer of a vectored write
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `data` | `*u8` | the bytes, borrowed until the operation completes |
+| `length` | `usize` | bytes in data |
 
 ## Packet
 
@@ -77,6 +91,18 @@ pub rec NativeCompletion {
     end_of_stream: bool;
 }
 ```
+
+what a backend reports for one finished operation
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `context` | `usize` | the caller's context from the submission |
+| `kind` | `std.io.runtime.Kind` | the operation kind |
+| `bytes` | `usize` | bytes moved |
+| `items` | `usize` | packets moved by a batch operation |
+| `resource` | `usize` | the native socket, or the accepted socket for an accept |
+| `status` | `i64` | 0, a negative native error, STATUS_STALE or STATUS_CANCELLED |
+| `end_of_stream` | `bool` | a read or readable wait saw the orderly end of the stream |
 
 ## Constants
 

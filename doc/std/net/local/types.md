@@ -12,11 +12,11 @@ Uses types from [`std.net.local.endpoint`](endpoint.md).
 | :--- | :--- | :--- |
 | [`Ownership`](#ownership) | `def` |  |
 | [`StalePolicy`](#stalepolicy) | `def` |  |
-| [`BindOptions`](#bindoptions) | `rec` |  |
-| [`ListenOptions`](#listenoptions) | `rec` |  |
-| [`Listener`](#listener) | `rec` |  |
+| [`BindOptions`](#bindoptions) | `rec` | how a listener is bound |
+| [`ListenOptions`](#listenoptions) | `rec` | how a listener is bound and started |
+| [`Listener`](#listener) | `rec` | a bound local listener |
 | [`Stream`](#stream) | `rec` | one owner closes the handle, and receive operations exclude aliased reads and close |
-| [`PeerIdentity`](#peeridentity) | `rec` |  |
+| [`PeerIdentity`](#peeridentity) | `rec` | the credentials of a connected peer, as far as the target reports them |
 
 | On `Ownership` | |
 | :--- | :--- |
@@ -64,6 +64,14 @@ pub rec BindOptions {
 }
 ```
 
+how a listener is bound
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `ownership` | `Ownership` | whether the listener removes its socket file on close |
+| `stale` | `StalePolicy` | what to do with a socket file already at the path |
+| `permissions` | `u32` | mode bits 0o777 to set on the socket file, or INHERIT_PERMISSIONS |
+
 ## ListenOptions
 
 ```mach
@@ -74,6 +82,15 @@ pub rec ListenOptions {
     permissions: u32;
 }
 ```
+
+how a listener is bound and started
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `backlog` | `i32` | pending connections the system may queue, above zero |
+| `ownership` | `Ownership` | whether the listener removes its socket file on close |
+| `stale` | `StalePolicy` | what to do with a socket file already at the path |
+| `permissions` | `u32` | mode bits 0o777 to set on the socket file, or INHERIT_PERMISSIONS |
 
 ## Listener
 
@@ -87,6 +104,17 @@ pub rec Listener {
     has_node_identity: bool;
 }
 ```
+
+a bound local listener
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `handle` | `usize` | the native socket, all ones when closed |
+| `endpoint` | `std.net.local.endpoint.Endpoint` | the endpoint it is bound to |
+| `ownership` | `Ownership` | whether close removes its socket file |
+| `node_device` | `u64` | device of the socket file as bound |
+| `node_file` | `u64` | file number of the socket file as bound |
+| `has_node_identity` | `bool` | node_device and node_file were captured |
 
 ## Stream
 
@@ -111,6 +139,17 @@ pub rec PeerIdentity {
     has_group:   bool;
 }
 ```
+
+the credentials of a connected peer, as far as the target reports them
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `process` | `u64` | the peer's process id, valid when has_process |
+| `user` | `u64` | the peer's user id, valid when has_user |
+| `group` | `u64` | the peer's group id, valid when has_group |
+| `has_process` | `bool` | process was reported |
+| `has_user` | `bool` | user was reported |
+| `has_group` | `bool` | group was reported |
 
 ## Constants
 

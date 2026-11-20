@@ -19,13 +19,15 @@ Uses types from [`std.allocator`](../../allocator.md), [`std.io.runtime`](../../
 | :--- | :--- | :--- |
 | [`Link`](#link) | `rec` | the core's part of an operation, embedded in the backend's operation record |
 | [`Socket`](#socket) | `rec` | one native socket under one opening |
-| [`Core`](#core) | `rec` |  |
+| [`Core`](#core) | `rec` | the socket records of one backend, their map and the control lists |
 
 | On `Core` | |
 | :--- | :--- |
-| [`link`](#link-1), [`socket_at`](#socket_at) | |
+| [`link`](#link-1) | the Link embedded in an operation record |
+| [`socket_at`](#socket_at) | the socket record at a table index, which must be inside the table |
 | [`init`](#init) | the socket table starts at initial records and grows on demand |
-| [`dnit`](#dnit), [`aliases`](#aliases) | |
+| [`dnit`](#dnit) | release the socket table and map |
+| [`aliases`](#aliases) | whether a caller range overlaps the socket table or the map |
 | [`lookup`](#lookup) | the mapped record for a socket value, or NONE |
 | [`trim`](#trim) | give back the socket records a peak grew: a chunk goes once it and the chunk below it hold no record in use, and the map is rehashed to the smaller table |
 | [`acquire`](#acquire) | the record a submit for socket under opening joins |
@@ -143,6 +145,8 @@ pub rec Core {
 }
 ```
 
+the socket records of one backend, their map and the control lists
+
 | Field | Type | |
 | :--- | :--- | :--- |
 | `allocator` | `std.allocator.Allocator` | where the socket table and map come from |
@@ -160,11 +164,28 @@ pub rec Core {
 pub fun link(core: *Core, ops: *std.memory.table.Table, index: u32) *Link
 ```
 
+the Link embedded in an operation record
+
+| Parameter | |
+| :--- | :--- |
+| `core` | the core |
+| `ops` | the backend's operation table |
+| `index` | the operation index |
+| **returns** | the operation's Link |
+
 ### socket_at
 
 ```mach
 pub fun socket_at(core: *Core, index: u32) *Socket
 ```
+
+the socket record at a table index, which must be inside the table
+
+| Parameter | |
+| :--- | :--- |
+| `core` | the core |
+| `index` | the record index |
+| **returns** | the record |
 
 ### init
 
@@ -180,11 +201,26 @@ the socket table starts at initial records and grows on demand
 pub fun dnit(core: *Core)
 ```
 
+release the socket table and map. operations still joined are not touched
+
+| Parameter | |
+| :--- | :--- |
+| `core` | the core, nil is ignored |
+
 ### aliases
 
 ```mach
 pub fun aliases(core: *Core, data: *u8, len: usize) bool
 ```
+
+whether a caller range overlaps the socket table or the map
+
+| Parameter | |
+| :--- | :--- |
+| `core` | the core |
+| `data` | start of the range |
+| `len` | bytes in the range |
+| **returns** | true on overlap, and also when the map size cannot be computed |
 
 ### lookup
 

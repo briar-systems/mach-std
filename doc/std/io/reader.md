@@ -5,7 +5,7 @@
 generic reader interface
 
 backend-agnostic read interface using ctx + fn_ptr dispatch. concrete
-sources (fd, buffer, etc.) wire themselves via make().
+sources (fd, buffer, etc.) build a Reader from their context and read callback.
 
 a source hands over what it knows: the bytes it delivered, or the native
 failure it hit. this module classifies the outcome once, in read(): zero
@@ -28,7 +28,7 @@ Uses types from [`std.allocator`](../allocator.md), [`std.io.error`](error.md).
 
 | On `ReadError` | |
 | :--- | :--- |
-| [`native_failure`](#native_failure) | |
+| [`native_failure`](#native_failure) | a native failure as a read error |
 | [`advance`](#advance) | add the bytes delivered by earlier calls to the error's progress |
 
 | On `Reader` | |
@@ -76,6 +76,14 @@ every way a read can fail
 ```mach
 pub fun native_failure(delivered: usize, error: std.io.error.Error) ReadError
 ```
+
+a native failure as a read error
+
+| Parameter | |
+| :--- | :--- |
+| `delivered` | bytes delivered before the failure |
+| `error` | the native failure |
+| **returns** | the native case carrying both |
 
 ### advance
 

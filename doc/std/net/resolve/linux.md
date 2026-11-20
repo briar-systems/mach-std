@@ -19,7 +19,7 @@ Uses types from [`std.allocator`](../../allocator.md), [`std.net.resolve.conf`](
 | Functions | |
 | :--- | :--- |
 | [`resolve_with_config`](#resolve_with_config) | the adapter body with an injected resolver policy, split out so tests can aim the lookup at a deterministic local nameserver |
-| [`resolve`](#resolve) | |
+| [`resolve`](#resolve) | resolve a query with the policy loaded from /etc/resolv.conf |
 
 ---
 
@@ -41,4 +41,15 @@ aim the lookup at a deterministic local nameserver
 pub fun resolve(scope: *std.sync.cancel.Scope, query: *std.net.resolve.types.Query, owner: *std.allocator.Allocator, limits: std.net.resolve.types.ResultLimits,
     output: *std.net.resolve.types.Resolution) std.net.resolve.types.Error
 ```
+
+resolve a query with the policy loaded from /etc/resolv.conf
+
+| Parameter | |
+| :--- | :--- |
+| `scope` | bounds and cancels the lookup |
+| `query` | what to resolve |
+| `owner` | the allocator the result's storage comes from |
+| `limits` | caps on the result |
+| `output` | the resolution to fill, owned by the caller and released with shared.dnit |
+| **returns** | kind NO_ERROR on success, SYSTEM_FAILURE when resolv.conf cannot be read, or the lookup's failure |
 

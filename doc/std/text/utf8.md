@@ -93,7 +93,7 @@ return the sequence length from a UTF-8 leading byte
 | Parameter | |
 | :--- | :--- |
 | `first_byte` | the first byte of a UTF-8 sequence |
-| **returns** | 1-4 for valid leading bytes, 0 for invalid |
+| **returns** | 1-4 from the leading bit pattern, 0 for a continuation byte or a byte from 0xF8 up (0xC0, 0xC1 and 0xF5-0xF7 still report 2 or 4, and decode rejects what they start) |
 
 ### is_continuation
 

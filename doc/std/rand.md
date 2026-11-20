@@ -11,7 +11,7 @@ Source: [`src/rand.mach`](../../src/rand.mach)
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`Rng`](#rng) | `rec` |  |
+| [`Rng`](#rng) | `rec` | the state of one xoshiro256** generator, which make and seed keep from being all zero |
 
 | On `Rng` | |
 | :--- | :--- |
@@ -35,6 +35,15 @@ pub rec Rng {
     s3: u64;
 }
 ```
+
+the state of one xoshiro256** generator, which make and seed keep from being all zero
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `s0` | `u64` | first state word |
+| `s1` | `u64` | second state word |
+| `s2` | `u64` | third state word |
+| `s3` | `u64` | fourth state word |
 
 ### make
 

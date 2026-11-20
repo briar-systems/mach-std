@@ -79,7 +79,7 @@ Uses types from [`std.allocator`](../allocator.md).
 | :--- | :--- |
 | [`init`](#init) | initialize a testing allocator |
 | [`allocator_of`](#allocator_of) | the allocator interface to hand to the code under test |
-| [`fail_at_ordinal`](#fail_at_ordinal) | make the `n`th allocation from now fail, counting the allocations this instance has already served |
+| [`fail_at_ordinal`](#fail_at_ordinal) | make the `n`th allocation request fail, counting every request of a nonzero size this instance has received since `init`, refused ones included |
 | [`fail_from_ordinal`](#fail_from_ordinal) | make the `n`th allocation and every one after it fail, counting as `fail_at_ordinal` does |
 | [`refuse_reallocates`](#refuse_reallocates) | refuse every reallocate of an existing block while `on`, leaving allocates to the ordinal rules |
 | [`clear_failure`](#clear_failure) | stop failing allocations |
@@ -209,8 +209,8 @@ the allocator interface to hand to the code under test
 pub fun fail_at_ordinal(t: *Testing, n: usize)
 ```
 
-make the `n`th allocation from now fail, counting the allocations this
-instance has already served
+make the `n`th allocation request fail, counting every request of a nonzero
+size this instance has received since `init`, refused ones included
 
 passing zero disables failure injection.
 

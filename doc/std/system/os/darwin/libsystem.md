@@ -82,73 +82,139 @@ Uses types from [`std.system.os.shared`](../shared.md).
 | :--- | :--- | :--- |
 | [`DirectoryStream`](#directorystream) | `def` | opaque public dir stream, never dereferenced by mach |
 | [`DirectoryRecord`](#directoryrecord) | `rec` | variable-length native record, only the header and actual name extent are read |
-| [`IoVector`](#iovector) | `rec` |  |
-| [`ControlHeader`](#controlheader) | `rec` |  |
-| [`MessageHeader`](#messageheader) | `rec` |  |
+| [`IoVector`](#iovector) | `rec` | one buffer of a gather or scatter list, the layout of struct iovec |
+| [`ControlHeader`](#controlheader) | `rec` | the header of one ancillary data item, the layout of struct cmsghdr |
+| [`MessageHeader`](#messageheader) | `rec` | the argument of sendmsg and recvmsg, the layout of struct msghdr |
 | [`Termios`](#termios) | `rec` | public lp64 termios layout from darwin sys/termios.h |
 | [`DlInfo`](#dlinfo) | `rec` | what dladdr reports of the image holding an address |
-| [`ResourceLimit`](#resourcelimit) | `rec` |  |
+| [`ResourceLimit`](#resourcelimit) | `rec` | a resource limit, the layout of struct rlimit |
 | [`Kevent`](#kevent) | `rec` | pointer-only storage with the SDK field offsets and stronger alignment |
 
 | On `DirectoryStream` | |
 | :--- | :--- |
-| [`fdopendir`](#fdopendir), [`readdir`](#readdir), [`closedir`](#closedir) | |
+| [`fdopendir`](#fdopendir) | open a directory stream over a directory descriptor, which the stream then owns |
+| [`readdir`](#readdir) | the next record of a directory stream |
+| [`closedir`](#closedir) | close a directory stream and the descriptor it owns |
 
 | On `IoVector` | |
 | :--- | :--- |
-| [`writev`](#writev) | |
+| [`writev`](#writev) | write a gather list to a descriptor |
 
 | On `MessageHeader` | |
 | :--- | :--- |
-| [`sendmsg`](#sendmsg), [`recvmsg`](#recvmsg) | |
+| [`sendmsg`](#sendmsg) | send a message with optional address and ancillary data |
+| [`recvmsg`](#recvmsg) | receive a message with its address and ancillary data |
 
 | On `Termios` | |
 | :--- | :--- |
-| [`tcgetattr`](#tcgetattr), [`tcsetattr`](#tcsetattr) | |
+| [`tcgetattr`](#tcgetattr) | read a terminal's settings |
+| [`tcsetattr`](#tcsetattr) | apply a terminal's settings |
 
 | On `DlInfo` | |
 | :--- | :--- |
-| [`dladdr`](#dladdr) | |
+| [`dladdr`](#dladdr) | describe the image and nearest symbol holding an address |
 
 | On `ResourceLimit` | |
 | :--- | :--- |
-| [`getrlimit`](#getrlimit), [`setrlimit`](#setrlimit) | |
+| [`getrlimit`](#getrlimit) | read a resource limit |
+| [`setrlimit`](#setrlimit) | set a resource limit |
 
 | On `Kevent` | |
 | :--- | :--- |
-| [`kevent`](#kevent-1) | |
+| [`kevent`](#kevent-1) | apply changes to an event queue and collect pending events |
 
 | Functions | |
 | :--- | :--- |
 | [`errno`](#errno) | the calling thread's current errno, as a positive number |
-| [`clear_errno`](#clear_errno) | |
+| [`clear_errno`](#clear_errno) | set the calling thread's errno to 0 |
 | [`fail_errno`](#fail_errno) | the current errno negated, for a darwin OS primitive's return |
-| [`sysctlbyname`](#sysctlbyname), [`getentropy`](#getentropy), [`mmap`](#mmap), [`munmap`](#munmap), [`mprotect`](#mprotect), [`mlock`](#mlock), [`munlock`](#munlock), [`madvise`](#madvise), [`msync`](#msync), [`read`](#read), [`write`](#write), [`pread`](#pread), [`pwrite`](#pwrite) | |
+| [`sysctlbyname`](#sysctlbyname) | read or write a kernel state value by name |
+| [`getentropy`](#getentropy) | fill a buffer with cryptographic random bytes |
+| [`mmap`](#mmap) | map memory or a file into the address space |
+| [`munmap`](#munmap) | unmap a region |
+| [`mprotect`](#mprotect) | change the protection of a region |
+| [`mlock`](#mlock) | lock a region into physical memory |
+| [`munlock`](#munlock) | unlock a region mlock locked |
+| [`madvise`](#madvise) | advise the kernel how a region will be accessed |
+| [`msync`](#msync) | flush a shared file mapping to its file |
+| [`read`](#read) | read bytes from a descriptor |
+| [`write`](#write) | write bytes to a descriptor |
+| [`pread`](#pread) | read bytes at a file offset without moving the descriptor offset |
+| [`pwrite`](#pwrite) | write bytes at a file offset without moving the descriptor offset |
 | [`openat`](#openat) | `openat` is C-variadic: the mode argument is only read when the flags carry O_CREAT |
-| [`close`](#close), [`fsync`](#fsync), [`lseek`](#lseek) | |
-| [`fstat`](#fstat) | the stat family carries the `$INODE64` suffix on x86_64 only; see the module header |
-| [`fstatfs`](#fstatfs) | the stat family carries the `$INODE64` suffix on x86_64 only; see the module header |
-| [`fstatat`](#fstatat) | the stat family carries the `$INODE64` suffix on x86_64 only; see the module header |
+| [`close`](#close) | close a descriptor, which is released even when the close reports failure |
+| [`fsync`](#fsync) | flush an open file's data and metadata to storage |
+| [`lseek`](#lseek) | reposition a descriptor's offset |
+| [`fstat`](#fstat) | read an open file's metadata |
+| [`fstatfs`](#fstatfs) | read the metadata of the filesystem holding an open file |
+| [`fstatat`](#fstatat) | read a path's metadata relative to a directory |
 | [`flock`](#flock) | flock: advisory whole-file lock on an open descriptor |
-| [`unlinkat`](#unlinkat), [`renameat`](#renameat), [`symlink`](#symlink), [`mkdirat`](#mkdirat), [`faccessat`](#faccessat) | |
+| [`unlinkat`](#unlinkat) | remove a name relative to a directory |
+| [`renameat`](#renameat) | rename a path, each side relative to its own directory |
+| [`symlink`](#symlink) | create a symbolic link |
+| [`mkdirat`](#mkdirat) | create a directory relative to a directory |
+| [`faccessat`](#faccessat) | check access to a path relative to a directory |
 | [`getcwd`](#getcwd) | `getcwd(3)` replaces the open(".") + fcntl(F_GETPATH) dance the raw-syscall backend needed |
-| [`pipe`](#pipe), [`socket`](#socket), [`bind`](#bind), [`listen`](#listen), [`accept`](#accept), [`connect`](#connect), [`sendto`](#sendto), [`recvfrom`](#recvfrom), [`shutdown`](#shutdown), [`setsockopt`](#setsockopt), [`getsockopt`](#getsockopt), [`getsockname`](#getsockname), [`getpeername`](#getpeername), [`tcflush`](#tcflush) | |
+| [`pipe`](#pipe) | create a unidirectional pipe |
+| [`socket`](#socket) | create a socket |
+| [`bind`](#bind) | bind a socket to a local address |
+| [`listen`](#listen) | mark a socket as accepting connections |
+| [`accept`](#accept) | accept a pending connection |
+| [`connect`](#connect) | connect a socket to a peer |
+| [`sendto`](#sendto) | send bytes on a socket, to an address when it is unconnected |
+| [`recvfrom`](#recvfrom) | receive bytes from a socket, with the sender's address |
+| [`shutdown`](#shutdown) | shut down one or both directions of a socket |
+| [`setsockopt`](#setsockopt) | set a socket option |
+| [`getsockopt`](#getsockopt) | read a socket option |
+| [`getsockname`](#getsockname) | read a socket's local address |
+| [`getpeername`](#getpeername) | read a connected socket's peer address |
+| [`tcflush`](#tcflush) | discard a terminal's queued data |
 | [`signal`](#signal) | install a process-wide signal disposition |
-| [`sigaction`](#sigaction), [`raise`](#raise) | |
+| [`sigaction`](#sigaction) | examine or change a signal's disposition |
+| [`raise`](#raise) | send a signal to the calling thread |
 | [`clock_gettime`](#clock_gettime) | time |
 | [`nanosleep`](#nanosleep) | suspend the calling thread for the requested interval |
 | [`pthread_create`](#pthread_create) | `start` is a `void *(*)(void *)` passed as a bare address, matching how the windows backend hands CreateThread its trampoline |
-| [`pthread_join`](#pthread_join), [`pthread_detach`](#pthread_detach), [`pthread_setname_np`](#pthread_setname_np), [`pthread_getname_np`](#pthread_getname_np), [`pthread_self`](#pthread_self), [`pthread_threadid_np`](#pthread_threadid_np) | |
+| [`pthread_join`](#pthread_join) | wait for a thread to end and release it |
+| [`pthread_detach`](#pthread_detach) | let a thread release itself when it ends, so it is never joined |
+| [`pthread_setname_np`](#pthread_setname_np) | name the calling thread |
+| [`pthread_getname_np`](#pthread_getname_np) | read a thread's name |
+| [`pthread_self`](#pthread_self) | the calling thread |
+| [`pthread_threadid_np`](#pthread_threadid_np) | a thread's system-wide unique id |
 | [`pthread_get_stackaddr_np`](#pthread_get_stackaddr_np) | the top of thread's stack, its highest address plus one |
-| [`pthread_get_stacksize_np`](#pthread_get_stacksize_np) | |
+| [`pthread_get_stacksize_np`](#pthread_get_stacksize_np) | the size of a thread's stack |
 | [`pthread_key_create`](#pthread_key_create) | a pthread_key_t is an unsigned long on darwin |
-| [`pthread_setspecific`](#pthread_setspecific), [`pthread_getspecific`](#pthread_getspecific), [`pthread_attr_init`](#pthread_attr_init), [`pthread_attr_destroy`](#pthread_attr_destroy), [`pthread_attr_setstacksize`](#pthread_attr_setstacksize), [`pthread_attr_setdetachstate`](#pthread_attr_setdetachstate), [`pthread_mutex_init`](#pthread_mutex_init), [`pthread_mutex_lock`](#pthread_mutex_lock), [`pthread_mutex_unlock`](#pthread_mutex_unlock), [`pthread_cond_init`](#pthread_cond_init), [`pthread_cond_wait`](#pthread_cond_wait), [`pthread_cond_timedwait_relative_np`](#pthread_cond_timedwait_relative_np), [`pthread_cond_broadcast`](#pthread_cond_broadcast) | |
+| [`pthread_setspecific`](#pthread_setspecific) | set the calling thread's value for a key |
+| [`pthread_getspecific`](#pthread_getspecific) | the calling thread's value for a key |
+| [`pthread_attr_init`](#pthread_attr_init) | initialize thread attributes to the defaults |
+| [`pthread_attr_destroy`](#pthread_attr_destroy) | release thread attributes |
+| [`pthread_attr_setstacksize`](#pthread_attr_setstacksize) | set the stack size threads created with attr get |
+| [`pthread_attr_setdetachstate`](#pthread_attr_setdetachstate) | set whether threads created with attr start joinable or detached |
+| [`pthread_mutex_init`](#pthread_mutex_init) | initialize a mutex |
+| [`pthread_mutex_lock`](#pthread_mutex_lock) | lock a mutex, blocking until it is free |
+| [`pthread_mutex_unlock`](#pthread_mutex_unlock) | unlock a mutex the caller holds |
+| [`pthread_cond_init`](#pthread_cond_init) | initialize a condition variable |
+| [`pthread_cond_wait`](#pthread_cond_wait) | release m and wait on c, holding m again on return |
+| [`pthread_cond_timedwait_relative_np`](#pthread_cond_timedwait_relative_np) | release m and wait on c for at most a relative interval, holding m again on return |
+| [`pthread_cond_broadcast`](#pthread_cond_broadcast) | wake every thread waiting on a condition variable |
 | [`pthread_once`](#pthread_once) | `init` is a `void (*)(void)` passed as a bare address |
 | [`umask`](#umask) | set the file-mode creation mask, returning the previous one |
 | [`fcntl`](#fcntl) | `fcntl` is C-variadic |
-| [`fchmod`](#fchmod), [`fchmodat`](#fchmodat), [`fork`](#fork), [`vfork`](#vfork), [`execve`](#execve), [`wait4`](#wait4) | |
+| [`fchmod`](#fchmod) | set a file's permission bits through an open descriptor |
+| [`fchmodat`](#fchmodat) | set the permission bits of a path relative to a directory |
+| [`fork`](#fork) | create a child process duplicating the caller |
+| [`vfork`](#vfork) | create a child process through vfork |
+| [`execve`](#execve) | replace the process image, returning only on failure |
+| [`wait4`](#wait4) | wait for a child to change state |
 | [`waitid`](#waitid) | `info` is a `siginfo_t *` (104 bytes on darwin); the caller passes storage and never reads it, so it is taken as bytes |
-| [`kill`](#kill), [`getpid`](#getpid), [`setpgid`](#setpgid), [`getpgid`](#getpgid), [`dup2`](#dup2), [`chdir`](#chdir), [`_exit`](#_exit), [`kqueue`](#kqueue) | |
+| [`kill`](#kill) | send a signal to a process, or to a process group for a negated pid |
+| [`getpid`](#getpid) | the calling process's id |
+| [`setpgid`](#setpgid) | set the process group of a process |
+| [`getpgid`](#getpgid) | the process group of a process |
+| [`dup2`](#dup2) | make to name what from names, closing what to named before |
+| [`chdir`](#chdir) | change the working directory |
+| [`_exit`](#_exit) | end the process at once without running atexit handlers |
+| [`kqueue`](#kqueue) | create a kernel event queue |
 
 | Constants | |
 | :--- | :--- |
@@ -190,6 +256,13 @@ Otherwise:
 pub ext fun fdopendir(fd: i32) DirectoryStream
 ```
 
+open a directory stream over a directory descriptor, which the stream then owns
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | an open directory descriptor |
+| **returns** | the stream, or nil with errno set |
+
 ### readdir
 
 Declared by the first of these arms whose condition holds.
@@ -209,12 +282,26 @@ Otherwise:
 pub ext fun readdir(stream: DirectoryStream) *DirectoryRecord
 ```
 
+the next record of a directory stream
+
+| Parameter | |
+| :--- | :--- |
+| `stream` | a stream fdopendir opened |
+| **returns** | the record, valid until the next call on the stream, or nil at the end (errno untouched) or on failure (errno set) |
+
 ### closedir
 
 ```mach
 #[library("libsystem")]
 pub ext fun closedir(stream: DirectoryStream) i32
 ```
+
+close a directory stream and the descriptor it owns
+
+| Parameter | |
+| :--- | :--- |
+| `stream` | a stream fdopendir opened, consumed even when the close fails |
+| **returns** | 0, or -1 with errno set |
 
 ## DirectoryRecord
 
@@ -240,12 +327,28 @@ pub rec IoVector {
 }
 ```
 
+one buffer of a gather or scatter list, the layout of struct iovec
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `data` | `*u8` | start of the buffer |
+| `length` | `usize` | its size in bytes |
+
 ### writev
 
 ```mach
 #[library("libsystem")]
 pub ext fun writev(fd: i32, vectors: *IoVector, count: i32) i64
 ```
+
+write a gather list to a descriptor
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the descriptor |
+| `vectors` | the buffers, written in order |
+| `count` | entries in vectors |
+| **returns** | bytes written, or -1 with errno set |
 
 ## ControlHeader
 
@@ -256,6 +359,14 @@ pub rec ControlHeader {
     kind:   i32;
 }
 ```
+
+the header of one ancillary data item, the layout of struct cmsghdr
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `length` | `u32` | bytes of the item, header included |
+| `level` | `i32` | originating protocol |
+| `kind` | `i32` | protocol-specific type |
 
 ## MessageHeader
 
@@ -271,6 +382,18 @@ pub rec MessageHeader {
 }
 ```
 
+the argument of sendmsg and recvmsg, the layout of struct msghdr
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `address` | `*u8` | peer address, or nil |
+| `address_length` | `u32` | size of address |
+| `vectors` | `*IoVector` | the gather or scatter list |
+| `vector_count` | `i32` | entries in vectors |
+| `control` | `*u8` | ancillary data buffer, or nil |
+| `control_length` | `u32` | size of control |
+| `flags` | `i32` | flags recvmsg reports |
+
 ### sendmsg
 
 ```mach
@@ -278,12 +401,30 @@ pub rec MessageHeader {
 pub ext fun sendmsg(fd: i32, message: *MessageHeader, flags: i32) i64
 ```
 
+send a message with optional address and ancillary data
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the socket |
+| `message` | what to send |
+| `flags` | MSG_* bits |
+| **returns** | bytes sent, or -1 with errno set |
+
 ### recvmsg
 
 ```mach
 #[library("libsystem")]
 pub ext fun recvmsg(fd: i32, message: *MessageHeader, flags: i32) i64
 ```
+
+receive a message with its address and ancillary data
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the socket |
+| `message` | the buffers to fill, whose lengths and flags are updated |
+| `flags` | MSG_* bits |
+| **returns** | bytes received, 0 at orderly end, or -1 with errno set |
 
 ## Termios
 
@@ -308,12 +449,29 @@ public lp64 termios layout from darwin sys/termios.h
 pub ext fun tcgetattr(fd: i32, settings: *Termios) i32
 ```
 
+read a terminal's settings
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the terminal descriptor |
+| `settings` | receives the settings |
+| **returns** | 0, or -1 with errno set |
+
 ### tcsetattr
 
 ```mach
 #[library("libsystem")]
 pub ext fun tcsetattr(fd: i32, action: i32, settings: *Termios) i32
 ```
+
+apply a terminal's settings
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the terminal descriptor |
+| `action` | when to apply them, such as TCSAFLUSH |
+| `settings` | the settings |
+| **returns** | 0, or -1 with errno set |
 
 ## DlInfo
 
@@ -342,6 +500,14 @@ what dladdr reports of the image holding an address
 pub ext fun dladdr(addr: ptr, info: *DlInfo) i32
 ```
 
+describe the image and nearest symbol holding an address
+
+| Parameter | |
+| :--- | :--- |
+| `addr` | the address |
+| `info` | receives the description |
+| **returns** | nonzero on success, 0 when no image holds addr |
+
 ## ResourceLimit
 
 ```mach
@@ -351,6 +517,13 @@ pub rec ResourceLimit {
 }
 ```
 
+a resource limit, the layout of struct rlimit
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `current` | `u64` | the soft limit in force |
+| `maximum` | `u64` | the hard limit |
+
 ### getrlimit
 
 ```mach
@@ -358,12 +531,28 @@ pub rec ResourceLimit {
 pub ext fun getrlimit(resource: i32, limit: *ResourceLimit) i32
 ```
 
+read a resource limit
+
+| Parameter | |
+| :--- | :--- |
+| `resource` | RLIMIT_* value |
+| `limit` | receives the limit |
+| **returns** | 0, or -1 with errno set |
+
 ### setrlimit
 
 ```mach
 #[library("libsystem")]
 pub ext fun setrlimit(resource: i32, limit: *ResourceLimit) i32
 ```
+
+set a resource limit
+
+| Parameter | |
+| :--- | :--- |
+| `resource` | RLIMIT_* value |
+| `limit` | the limit |
+| **returns** | 0, or -1 with errno set |
 
 ## Kevent
 
@@ -387,6 +576,18 @@ pointer-only storage with the SDK field offsets and stronger alignment
 pub ext fun kevent(queue: i32, changes: *Kevent, change_count: i32, events: *Kevent, capacity: i32, timeout: *std.system.os.shared.Timespec) i32
 ```
 
+apply changes to an event queue and collect pending events
+
+| Parameter | |
+| :--- | :--- |
+| `queue` | the kqueue descriptor |
+| `changes` | filters to add, change or delete, or nil |
+| `change_count` | entries in changes |
+| `events` | receives pending events, or nil |
+| `capacity` | entries events holds |
+| `timeout` | how long to wait, or nil to wait indefinitely |
+| **returns** | events stored, 0 on timeout, or -1 with errno set |
+
 ## Functions
 
 ### errno
@@ -409,6 +610,11 @@ failure - errno is not cleared by a successful call.
 ```mach
 pub fun clear_errno()
 ```
+
+set the calling thread's errno to 0
+
+a call that reports failure only through errno, such as readdir at its end,
+needs errno cleared before it so a stale value is not read as its failure
 
 ### fail_errno
 
@@ -438,12 +644,31 @@ caller, so it is reported as EINVAL rather than silently swallowed.
 pub ext fun sysctlbyname(name: *u8, old: ptr, old_len: *usize, new: ptr, new_len: usize) i32
 ```
 
+read or write a kernel state value by name
+
+| Parameter | |
+| :--- | :--- |
+| `name` | null-terminated sysctl name |
+| `old` | receives the current value, or nil |
+| `old_len` | in, the capacity of old, out, the bytes written |
+| `new` | the value to set, or nil |
+| `new_len` | the size of new |
+| **returns** | 0, or -1 with errno set |
+
 ### getentropy
 
 ```mach
 #[library("libsystem")]
 pub ext fun getentropy(data: ptr, length: usize) i32
 ```
+
+fill a buffer with cryptographic random bytes
+
+| Parameter | |
+| :--- | :--- |
+| `data` | destination buffer |
+| `length` | bytes to fill, at most 256 |
+| **returns** | 0, or -1 with errno set |
 
 ### mmap
 
@@ -452,12 +677,32 @@ pub ext fun getentropy(data: ptr, length: usize) i32
 pub ext fun mmap(address: ptr, length: usize, protection: i32, flags: i32, fd: i32, offset: i64) ptr
 ```
 
+map memory or a file into the address space
+
+| Parameter | |
+| :--- | :--- |
+| `address` | placement hint, or nil |
+| `length` | bytes to map |
+| `protection` | PROT_* bits |
+| `flags` | MAP_* bits |
+| `fd` | the file to map, or -1 for an anonymous mapping |
+| `offset` | page-aligned offset into the file |
+| **returns** | the mapping, or MAP_FAILED (all bits one) with errno set |
+
 ### munmap
 
 ```mach
 #[library("libsystem")]
 pub ext fun munmap(address: ptr, length: usize) i32
 ```
+
+unmap a region
+
+| Parameter | |
+| :--- | :--- |
+| `address` | page-aligned start of the region |
+| `length` | bytes to unmap |
+| **returns** | 0, or -1 with errno set |
 
 ### mprotect
 
@@ -466,12 +711,29 @@ pub ext fun munmap(address: ptr, length: usize) i32
 pub ext fun mprotect(address: ptr, length: usize, protection: i32) i32
 ```
 
+change the protection of a region
+
+| Parameter | |
+| :--- | :--- |
+| `address` | page-aligned start of the region |
+| `length` | region size in bytes |
+| `protection` | PROT_* bits |
+| **returns** | 0, or -1 with errno set |
+
 ### mlock
 
 ```mach
 #[library("libsystem")]
 pub ext fun mlock(address: ptr, length: usize) i32
 ```
+
+lock a region into physical memory
+
+| Parameter | |
+| :--- | :--- |
+| `address` | start of the region |
+| `length` | region size in bytes |
+| **returns** | 0, or -1 with errno set |
 
 ### munlock
 
@@ -480,12 +742,29 @@ pub ext fun mlock(address: ptr, length: usize) i32
 pub ext fun munlock(address: ptr, length: usize) i32
 ```
 
+unlock a region mlock locked
+
+| Parameter | |
+| :--- | :--- |
+| `address` | start of the region |
+| `length` | region size in bytes |
+| **returns** | 0, or -1 with errno set |
+
 ### madvise
 
 ```mach
 #[library("libsystem")]
 pub ext fun madvise(address: ptr, length: usize, advice: i32) i32
 ```
+
+advise the kernel how a region will be accessed
+
+| Parameter | |
+| :--- | :--- |
+| `address` | start of the region |
+| `length` | region size in bytes |
+| `advice` | MADV_* value |
+| **returns** | 0, or -1 with errno set |
 
 ### msync
 
@@ -494,12 +773,30 @@ pub ext fun madvise(address: ptr, length: usize, advice: i32) i32
 pub ext fun msync(address: ptr, length: usize, flags: i32) i32
 ```
 
+flush a shared file mapping to its file
+
+| Parameter | |
+| :--- | :--- |
+| `address` | page-aligned start of the region |
+| `length` | region size in bytes |
+| `flags` | MS_* bits |
+| **returns** | 0, or -1 with errno set |
+
 ### read
 
 ```mach
 #[library("libsystem")]
 pub ext fun read(fd: i32, buf: *u8, count: usize) i64
 ```
+
+read bytes from a descriptor
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the descriptor |
+| `buf` | destination buffer |
+| `count` | most bytes to read |
+| **returns** | bytes read, 0 at end of file, or -1 with errno set |
 
 ### write
 
@@ -508,6 +805,15 @@ pub ext fun read(fd: i32, buf: *u8, count: usize) i64
 pub ext fun write(fd: i32, buf: *u8, count: usize) i64
 ```
 
+write bytes to a descriptor
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the descriptor |
+| `buf` | source bytes |
+| `count` | bytes to write |
+| **returns** | bytes written, or -1 with errno set |
+
 ### pread
 
 ```mach
@@ -515,12 +821,32 @@ pub ext fun write(fd: i32, buf: *u8, count: usize) i64
 pub ext fun pread(fd: i32, buf: *u8, count: usize, offset: i64) i64
 ```
 
+read bytes at a file offset without moving the descriptor offset
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the descriptor |
+| `buf` | destination buffer |
+| `count` | most bytes to read |
+| `offset` | file offset to read from |
+| **returns** | bytes read, 0 at end of file, or -1 with errno set |
+
 ### pwrite
 
 ```mach
 #[library("libsystem")]
 pub ext fun pwrite(fd: i32, buf: *u8, count: usize, offset: i64) i64
 ```
+
+write bytes at a file offset without moving the descriptor offset
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the descriptor |
+| `buf` | source bytes |
+| `count` | bytes to write |
+| `offset` | file offset to write at |
+| **returns** | bytes written, or -1 with errno set |
 
 ### openat
 
@@ -541,6 +867,13 @@ third parameter would be lowered into x2 (see mach's doc/language/ext-fun.md).
 pub ext fun close(fd: i32) i32
 ```
 
+close a descriptor, which is released even when the close reports failure
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the descriptor |
+| **returns** | 0, or -1 with errno set |
+
 ### fsync
 
 ```mach
@@ -548,12 +881,28 @@ pub ext fun close(fd: i32) i32
 pub ext fun fsync(fd: i32) i32
 ```
 
+flush an open file's data and metadata to storage
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the descriptor |
+| **returns** | 0, or -1 with errno set |
+
 ### lseek
 
 ```mach
 #[library("libsystem")]
 pub ext fun lseek(fd: i32, offset: i64, whence: i32) i64
 ```
+
+reposition a descriptor's offset
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the descriptor |
+| `offset` | offset relative to whence |
+| `whence` | SEEK_SET, SEEK_CUR or SEEK_END |
+| **returns** | the resulting offset, or exactly -1 with errno set |
 
 ### fstat
 
@@ -574,9 +923,13 @@ Otherwise:
 pub ext fun fstat(fd: i32, st: *u8) i32
 ```
 
-the stat family carries the `$INODE64` suffix on x86_64 only; see the module
-header. the two arms are mutually exclusive, so the duplicate-attribution
-check does not apply to them.
+read an open file's metadata
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the descriptor |
+| `st` | receives a stat_t |
+| **returns** | 0, or -1 with errno set |
 
 ### fstatfs
 
@@ -597,9 +950,13 @@ Otherwise:
 pub ext fun fstatfs(fd: i32, st: *u8) i32
 ```
 
-the stat family carries the `$INODE64` suffix on x86_64 only; see the module
-header. the two arms are mutually exclusive, so the duplicate-attribution
-check does not apply to them.
+read the metadata of the filesystem holding an open file
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the descriptor |
+| `st` | receives a struct statfs |
+| **returns** | 0, or -1 with errno set |
 
 ### fstatat
 
@@ -620,9 +977,15 @@ Otherwise:
 pub ext fun fstatat(dirfd: i32, path: *u8, st: *u8, flags: i32) i32
 ```
 
-the stat family carries the `$INODE64` suffix on x86_64 only; see the module
-header. the two arms are mutually exclusive, so the duplicate-attribution
-check does not apply to them.
+read a path's metadata relative to a directory
+
+| Parameter | |
+| :--- | :--- |
+| `dirfd` | directory descriptor, or AT_FDCWD |
+| `path` | null-terminated path |
+| `st` | receives a stat_t |
+| `flags` | AT_SYMLINK_NOFOLLOW or 0 |
+| **returns** | 0, or -1 with errno set |
 
 ### flock
 
@@ -643,12 +1006,31 @@ last descriptor on that description closes, including at process exit.
 pub ext fun unlinkat(dirfd: i32, path: *u8, flags: i32) i32
 ```
 
+remove a name relative to a directory
+
+| Parameter | |
+| :--- | :--- |
+| `dirfd` | directory descriptor, or AT_FDCWD |
+| `path` | null-terminated path |
+| `flags` | AT_REMOVEDIR to remove an empty directory, or 0 |
+| **returns** | 0, or -1 with errno set |
+
 ### renameat
 
 ```mach
 #[library("libsystem")]
 pub ext fun renameat(olddir: i32, oldpath: *u8, newdir: i32, newpath: *u8) i32
 ```
+
+rename a path, each side relative to its own directory
+
+| Parameter | |
+| :--- | :--- |
+| `olddir` | source directory descriptor, or AT_FDCWD |
+| `oldpath` | source path |
+| `newdir` | destination directory descriptor, or AT_FDCWD |
+| `newpath` | destination path |
+| **returns** | 0, or -1 with errno set |
 
 ### symlink
 
@@ -657,6 +1039,14 @@ pub ext fun renameat(olddir: i32, oldpath: *u8, newdir: i32, newpath: *u8) i32
 pub ext fun symlink(target: *u8, linkpath: *u8) i32
 ```
 
+create a symbolic link
+
+| Parameter | |
+| :--- | :--- |
+| `target` | the path the link holds, stored as given |
+| `linkpath` | the path of the link to create |
+| **returns** | 0, or -1 with errno set |
+
 ### mkdirat
 
 ```mach
@@ -664,12 +1054,31 @@ pub ext fun symlink(target: *u8, linkpath: *u8) i32
 pub ext fun mkdirat(dirfd: i32, path: *u8, mode: u32) i32
 ```
 
+create a directory relative to a directory
+
+| Parameter | |
+| :--- | :--- |
+| `dirfd` | directory descriptor, or AT_FDCWD |
+| `path` | null-terminated path |
+| `mode` | permission bits, before the umask |
+| **returns** | 0, or -1 with errno set |
+
 ### faccessat
 
 ```mach
 #[library("libsystem")]
 pub ext fun faccessat(dirfd: i32, path: *u8, mode: i32, flags: i32) i32
 ```
+
+check access to a path relative to a directory
+
+| Parameter | |
+| :--- | :--- |
+| `dirfd` | directory descriptor, or AT_FDCWD |
+| `path` | null-terminated path |
+| `mode` | R_OK, W_OK and X_OK bits, or F_OK |
+| `flags` | AT_* flags |
+| **returns** | 0 when accessible, or -1 with errno set |
 
 ### getcwd
 
@@ -693,12 +1102,28 @@ by the callee instead of being defended against afterwards.
 pub ext fun pipe(fds: *i32) i32
 ```
 
+create a unidirectional pipe
+
+| Parameter | |
+| :--- | :--- |
+| `fds` | receives two descriptors, fds[0] the read end and fds[1] the write end |
+| **returns** | 0, or -1 with errno set |
+
 ### socket
 
 ```mach
 #[library("libsystem")]
 pub ext fun socket(domain: i32, kind: i32, protocol: i32) i32
 ```
+
+create a socket
+
+| Parameter | |
+| :--- | :--- |
+| `domain` | AF_* family |
+| `kind` | SOCK_* type |
+| `protocol` | protocol, or 0 for the default |
+| **returns** | the descriptor, or -1 with errno set |
 
 ### bind
 
@@ -707,12 +1132,29 @@ pub ext fun socket(domain: i32, kind: i32, protocol: i32) i32
 pub ext fun bind(fd: i32, address: *u8, length: u32) i32
 ```
 
+bind a socket to a local address
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the socket |
+| `address` | the sockaddr |
+| `length` | size of the sockaddr |
+| **returns** | 0, or -1 with errno set |
+
 ### listen
 
 ```mach
 #[library("libsystem")]
 pub ext fun listen(fd: i32, backlog: i32) i32
 ```
+
+mark a socket as accepting connections
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the socket |
+| `backlog` | most pending connections to queue |
+| **returns** | 0, or -1 with errno set |
 
 ### accept
 
@@ -721,12 +1163,30 @@ pub ext fun listen(fd: i32, backlog: i32) i32
 pub ext fun accept(fd: i32, address: *u8, length: *u32) i32
 ```
 
+accept a pending connection
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the listening socket |
+| `address` | receives the peer address, or nil |
+| `length` | in, the capacity of address, out, its size |
+| **returns** | the connected descriptor, or -1 with errno set |
+
 ### connect
 
 ```mach
 #[library("libsystem")]
 pub ext fun connect(fd: i32, address: *u8, length: u32) i32
 ```
+
+connect a socket to a peer
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the socket |
+| `address` | the peer sockaddr |
+| `length` | size of the sockaddr |
+| **returns** | 0, or -1 with errno set (EINPROGRESS on a nonblocking socket) |
 
 ### sendto
 
@@ -735,12 +1195,36 @@ pub ext fun connect(fd: i32, address: *u8, length: u32) i32
 pub ext fun sendto(fd: i32, buffer: *u8, length: usize, flags: i32, address: *u8, address_length: u32) i64
 ```
 
+send bytes on a socket, to an address when it is unconnected
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the socket |
+| `buffer` | source bytes |
+| `length` | bytes to send |
+| `flags` | MSG_* bits |
+| `address` | destination sockaddr, or nil |
+| `address_length` | size of address |
+| **returns** | bytes sent, or -1 with errno set |
+
 ### recvfrom
 
 ```mach
 #[library("libsystem")]
 pub ext fun recvfrom(fd: i32, buffer: *u8, length: usize, flags: i32, address: *u8, address_length: *u32) i64
 ```
+
+receive bytes from a socket, with the sender's address
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the socket |
+| `buffer` | destination buffer |
+| `length` | most bytes to receive |
+| `flags` | MSG_* bits |
+| `address` | receives the sender address, or nil |
+| `address_length` | in, the capacity of address, out, its size, or nil |
+| **returns** | bytes received, 0 at orderly end, or -1 with errno set |
 
 ### shutdown
 
@@ -749,12 +1233,31 @@ pub ext fun recvfrom(fd: i32, buffer: *u8, length: usize, flags: i32, address: *
 pub ext fun shutdown(fd: i32, how: i32) i32
 ```
 
+shut down one or both directions of a socket
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the socket |
+| `how` | SHUT_RD, SHUT_WR or SHUT_RDWR |
+| **returns** | 0, or -1 with errno set |
+
 ### setsockopt
 
 ```mach
 #[library("libsystem")]
 pub ext fun setsockopt(fd: i32, level: i32, option: i32, value: *u8, length: u32) i32
 ```
+
+set a socket option
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the socket |
+| `level` | option level |
+| `option` | option name |
+| `value` | the option value |
+| `length` | size of value |
+| **returns** | 0, or -1 with errno set |
 
 ### getsockopt
 
@@ -763,12 +1266,32 @@ pub ext fun setsockopt(fd: i32, level: i32, option: i32, value: *u8, length: u32
 pub ext fun getsockopt(fd: i32, level: i32, option: i32, value: *u8, length: *u32) i32
 ```
 
+read a socket option
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the socket |
+| `level` | option level |
+| `option` | option name |
+| `value` | receives the option value |
+| `length` | in, the capacity of value, out, its size |
+| **returns** | 0, or -1 with errno set |
+
 ### getsockname
 
 ```mach
 #[library("libsystem")]
 pub ext fun getsockname(fd: i32, address: *u8, length: *u32) i32
 ```
+
+read a socket's local address
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the socket |
+| `address` | receives the sockaddr |
+| `length` | in, the capacity of address, out, its size |
+| **returns** | 0, or -1 with errno set |
 
 ### getpeername
 
@@ -777,12 +1300,29 @@ pub ext fun getsockname(fd: i32, address: *u8, length: *u32) i32
 pub ext fun getpeername(fd: i32, address: *u8, length: *u32) i32
 ```
 
+read a connected socket's peer address
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the socket |
+| `address` | receives the sockaddr |
+| `length` | in, the capacity of address, out, its size |
+| **returns** | 0, or -1 with errno set (ENOTCONN while unconnected) |
+
 ### tcflush
 
 ```mach
 #[library("libsystem")]
 pub ext fun tcflush(fd: i32, queue: i32) i32
 ```
+
+discard a terminal's queued data
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the terminal descriptor |
+| `queue` | which queue, such as TCIFLUSH |
+| **returns** | 0, or -1 with errno set |
 
 ### signal
 
@@ -807,12 +1347,28 @@ libSystem surface instead of reproducing the platform's sigaction layout.
 pub ext fun sigaction(sig: i32, action: *usize, previous: *usize) i32
 ```
 
+examine or change a signal's disposition
+
+| Parameter | |
+| :--- | :--- |
+| `sig` | the signal |
+| `action` | the new struct sigaction, or nil |
+| `previous` | receives the old struct sigaction, or nil |
+| **returns** | 0, or -1 with errno set |
+
 ### raise
 
 ```mach
 #[library("libsystem")]
 pub ext fun raise(sig: i32) i32
 ```
+
+send a signal to the calling thread
+
+| Parameter | |
+| :--- | :--- |
+| `sig` | the signal |
+| **returns** | 0, or nonzero on failure |
 
 ### clock_gettime
 
@@ -877,12 +1433,27 @@ windows backend hands CreateThread its trampoline.
 pub ext fun pthread_join(thread: usize, value: *usize) i32
 ```
 
+wait for a thread to end and release it
+
+| Parameter | |
+| :--- | :--- |
+| `thread` | the thread |
+| `value` | receives its exit value, or nil |
+| **returns** | 0, or an errno value |
+
 ### pthread_detach
 
 ```mach
 #[library("libsystem")]
 pub ext fun pthread_detach(thread: usize) i32
 ```
+
+let a thread release itself when it ends, so it is never joined
+
+| Parameter | |
+| :--- | :--- |
+| `thread` | the thread |
+| **returns** | 0, or an errno value |
 
 ### pthread_setname_np
 
@@ -891,12 +1462,28 @@ pub ext fun pthread_detach(thread: usize) i32
 pub ext fun pthread_setname_np(name: *u8) i32
 ```
 
+name the calling thread
+
+| Parameter | |
+| :--- | :--- |
+| `name` | null-terminated name |
+| **returns** | 0, or an errno value |
+
 ### pthread_getname_np
 
 ```mach
 #[library("libsystem")]
 pub ext fun pthread_getname_np(thread: usize, name: *u8, len: usize) i32
 ```
+
+read a thread's name
+
+| Parameter | |
+| :--- | :--- |
+| `thread` | the thread |
+| `name` | receives the null-terminated name |
+| `len` | capacity of name |
+| **returns** | 0, or an errno value |
 
 ### pthread_self
 
@@ -905,12 +1492,26 @@ pub ext fun pthread_getname_np(thread: usize, name: *u8, len: usize) i32
 pub ext fun pthread_self() usize
 ```
 
+the calling thread
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | its pthread handle |
+
 ### pthread_threadid_np
 
 ```mach
 #[library("libsystem")]
 pub ext fun pthread_threadid_np(thread: usize, id: *u64) i32
 ```
+
+a thread's system-wide unique id
+
+| Parameter | |
+| :--- | :--- |
+| `thread` | the thread, or 0 for the calling thread |
+| `id` | receives the id |
+| **returns** | 0, or an errno value |
 
 ### pthread_get_stackaddr_np
 
@@ -928,6 +1529,13 @@ the top of thread's stack, its highest address plus one
 pub ext fun pthread_get_stacksize_np(thread: usize) usize
 ```
 
+the size of a thread's stack
+
+| Parameter | |
+| :--- | :--- |
+| `thread` | the thread |
+| **returns** | the stack size in bytes |
+
 ### pthread_key_create
 
 ```mach
@@ -944,12 +1552,27 @@ a pthread_key_t is an unsigned long on darwin. std's key has no destructor
 pub ext fun pthread_setspecific(key: usize, value: ptr) i32
 ```
 
+set the calling thread's value for a key
+
+| Parameter | |
+| :--- | :--- |
+| `key` | a key pthread_key_create made |
+| `value` | the value |
+| **returns** | 0, or an errno value |
+
 ### pthread_getspecific
 
 ```mach
 #[library("libsystem")]
 pub ext fun pthread_getspecific(key: usize) ptr
 ```
+
+the calling thread's value for a key
+
+| Parameter | |
+| :--- | :--- |
+| `key` | a key pthread_key_create made |
+| **returns** | the value, or nil when none is set |
 
 ### pthread_attr_init
 
@@ -958,12 +1581,26 @@ pub ext fun pthread_getspecific(key: usize) ptr
 pub ext fun pthread_attr_init(attr: *u8) i32
 ```
 
+initialize thread attributes to the defaults
+
+| Parameter | |
+| :--- | :--- |
+| `attr` | PTHREAD_ATTR_BYTES of storage |
+| **returns** | 0, or an errno value |
+
 ### pthread_attr_destroy
 
 ```mach
 #[library("libsystem")]
 pub ext fun pthread_attr_destroy(attr: *u8) i32
 ```
+
+release thread attributes
+
+| Parameter | |
+| :--- | :--- |
+| `attr` | attributes pthread_attr_init initialized |
+| **returns** | 0, or an errno value |
 
 ### pthread_attr_setstacksize
 
@@ -972,12 +1609,28 @@ pub ext fun pthread_attr_destroy(attr: *u8) i32
 pub ext fun pthread_attr_setstacksize(attr: *u8, size: usize) i32
 ```
 
+set the stack size threads created with attr get
+
+| Parameter | |
+| :--- | :--- |
+| `attr` | the attributes |
+| `size` | stack size in bytes |
+| **returns** | 0, or an errno value |
+
 ### pthread_attr_setdetachstate
 
 ```mach
 #[library("libsystem")]
 pub ext fun pthread_attr_setdetachstate(attr: *u8, state: i32) i32
 ```
+
+set whether threads created with attr start joinable or detached
+
+| Parameter | |
+| :--- | :--- |
+| `attr` | the attributes |
+| `state` | PTHREAD_CREATE_JOINABLE or PTHREAD_CREATE_DETACHED |
+| **returns** | 0, or an errno value |
 
 ### pthread_mutex_init
 
@@ -986,12 +1639,27 @@ pub ext fun pthread_attr_setdetachstate(attr: *u8, state: i32) i32
 pub ext fun pthread_mutex_init(m: *u8, attr: *u8) i32
 ```
 
+initialize a mutex
+
+| Parameter | |
+| :--- | :--- |
+| `m` | PTHREAD_MUTEX_BYTES of storage |
+| `attr` | mutex attributes, or nil for the defaults |
+| **returns** | 0, or an errno value |
+
 ### pthread_mutex_lock
 
 ```mach
 #[library("libsystem")]
 pub ext fun pthread_mutex_lock(m: *u8) i32
 ```
+
+lock a mutex, blocking until it is free
+
+| Parameter | |
+| :--- | :--- |
+| `m` | the mutex |
+| **returns** | 0, or an errno value |
 
 ### pthread_mutex_unlock
 
@@ -1000,12 +1668,27 @@ pub ext fun pthread_mutex_lock(m: *u8) i32
 pub ext fun pthread_mutex_unlock(m: *u8) i32
 ```
 
+unlock a mutex the caller holds
+
+| Parameter | |
+| :--- | :--- |
+| `m` | the mutex |
+| **returns** | 0, or an errno value |
+
 ### pthread_cond_init
 
 ```mach
 #[library("libsystem")]
 pub ext fun pthread_cond_init(c: *u8, attr: *u8) i32
 ```
+
+initialize a condition variable
+
+| Parameter | |
+| :--- | :--- |
+| `c` | PTHREAD_COND_BYTES of storage |
+| `attr` | condition attributes, or nil for the defaults |
+| **returns** | 0, or an errno value |
 
 ### pthread_cond_wait
 
@@ -1014,6 +1697,14 @@ pub ext fun pthread_cond_init(c: *u8, attr: *u8) i32
 pub ext fun pthread_cond_wait(c: *u8, m: *u8) i32
 ```
 
+release m and wait on c, holding m again on return
+
+| Parameter | |
+| :--- | :--- |
+| `c` | the condition variable |
+| `m` | the mutex the caller holds |
+| **returns** | 0, or an errno value |
+
 ### pthread_cond_timedwait_relative_np
 
 ```mach
@@ -1021,12 +1712,28 @@ pub ext fun pthread_cond_wait(c: *u8, m: *u8) i32
 pub ext fun pthread_cond_timedwait_relative_np(c: *u8, m: *u8, relative: *u8) i32
 ```
 
+release m and wait on c for at most a relative interval, holding m again on return
+
+| Parameter | |
+| :--- | :--- |
+| `c` | the condition variable |
+| `m` | the mutex the caller holds |
+| `relative` | a timespec interval |
+| **returns** | 0, ETIMEDOUT when the interval passed, or another errno value |
+
 ### pthread_cond_broadcast
 
 ```mach
 #[library("libsystem")]
 pub ext fun pthread_cond_broadcast(c: *u8) i32
 ```
+
+wake every thread waiting on a condition variable
+
+| Parameter | |
+| :--- | :--- |
+| `c` | the condition variable |
+| **returns** | 0, or an errno value |
 
 ### pthread_once
 
@@ -1070,12 +1777,30 @@ a float, which is what keeps `AL` at zero on the SysV x86_64 leg.
 pub ext fun fchmod(fd: i32, mode: u32) i32
 ```
 
+set a file's permission bits through an open descriptor
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the descriptor |
+| `mode` | permission bits |
+| **returns** | 0, or -1 with errno set |
+
 ### fchmodat
 
 ```mach
 #[library("libsystem")]
 pub ext fun fchmodat(dirfd: i32, name: *u8, mode: u32, flags: i32) i32
 ```
+
+set the permission bits of a path relative to a directory
+
+| Parameter | |
+| :--- | :--- |
+| `dirfd` | directory descriptor, or AT_FDCWD |
+| `name` | null-terminated path |
+| `mode` | permission bits |
+| `flags` | AT_SYMLINK_NOFOLLOW or 0 |
+| **returns** | 0, or -1 with errno set |
 
 ### fork
 
@@ -1084,12 +1809,24 @@ pub ext fun fchmodat(dirfd: i32, name: *u8, mode: u32, flags: i32) i32
 pub ext fun fork() i32
 ```
 
+create a child process duplicating the caller
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the child pid in the parent, 0 in the child, or -1 with errno set |
+
 ### vfork
 
 ```mach
 #[library("libsystem")]
 pub ext fun vfork() i32
 ```
+
+create a child process through vfork
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the child pid in the parent, 0 in the child, or -1 with errno set |
 
 ### execve
 
@@ -1098,12 +1835,31 @@ pub ext fun vfork() i32
 pub ext fun execve(path: *u8, argv: **u8, envp: **u8) i32
 ```
 
+replace the process image, returning only on failure
+
+| Parameter | |
+| :--- | :--- |
+| `path` | the program |
+| `argv` | null-terminated argument array |
+| `envp` | null-terminated environment array |
+| **returns** | -1 with errno set |
+
 ### wait4
 
 ```mach
 #[library("libsystem")]
 pub ext fun wait4(pid: i32, status: *i32, options: i32, rusage: *u8) i32
 ```
+
+wait for a child to change state
+
+| Parameter | |
+| :--- | :--- |
+| `pid` | the child, or -1 for any child |
+| `status` | receives the raw wait status |
+| `options` | WNOHANG, WUNTRACED, WCONTINUED |
+| `rusage` | receives a struct rusage, or nil |
+| **returns** | the child's pid, 0 under WNOHANG when nothing changed, or -1 with errno set |
 
 ### waitid
 
@@ -1122,12 +1878,26 @@ and never reads it, so it is taken as bytes
 pub ext fun kill(pid: i32, sig: i32) i32
 ```
 
+send a signal to a process, or to a process group for a negated pid
+
+| Parameter | |
+| :--- | :--- |
+| `pid` | the target |
+| `sig` | the signal, or 0 to check the target exists |
+| **returns** | 0, or -1 with errno set |
+
 ### getpid
 
 ```mach
 #[library("libsystem")]
 pub ext fun getpid() i32
 ```
+
+the calling process's id
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the pid |
 
 ### setpgid
 
@@ -1136,12 +1906,27 @@ pub ext fun getpid() i32
 pub ext fun setpgid(pid: i32, pgid: i32) i32
 ```
 
+set the process group of a process
+
+| Parameter | |
+| :--- | :--- |
+| `pid` | the process, or 0 for the caller |
+| `pgid` | the group, or 0 to make pid its own group's leader |
+| **returns** | 0, or -1 with errno set |
+
 ### getpgid
 
 ```mach
 #[library("libsystem")]
 pub ext fun getpgid(pid: i32) i32
 ```
+
+the process group of a process
+
+| Parameter | |
+| :--- | :--- |
+| `pid` | the process, or 0 for the caller |
+| **returns** | the group id, or -1 with errno set |
 
 ### dup2
 
@@ -1150,12 +1935,27 @@ pub ext fun getpgid(pid: i32) i32
 pub ext fun dup2(from: i32, to: i32) i32
 ```
 
+make to name what from names, closing what to named before
+
+| Parameter | |
+| :--- | :--- |
+| `from` | an open descriptor |
+| `to` | the descriptor number to take over |
+| **returns** | to, or -1 with errno set |
+
 ### chdir
 
 ```mach
 #[library("libsystem")]
 pub ext fun chdir(path: *u8) i32
 ```
+
+change the working directory
+
+| Parameter | |
+| :--- | :--- |
+| `path` | null-terminated path |
+| **returns** | 0, or -1 with errno set |
 
 ### _exit
 
@@ -1164,12 +1964,24 @@ pub ext fun chdir(path: *u8) i32
 pub ext fun _exit(code: i32)
 ```
 
+end the process at once without running atexit handlers
+
+| Parameter | |
+| :--- | :--- |
+| `code` | the exit code |
+
 ### kqueue
 
 ```mach
 #[library("libsystem")]
 pub ext fun kqueue() i32
 ```
+
+create a kernel event queue
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | its descriptor, or -1 with errno set |
 
 ## Constants
 

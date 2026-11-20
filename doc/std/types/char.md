@@ -2,6 +2,8 @@
 
 # std.types.char
 
+ascii character classification and case conversion over single bytes
+
 Source: [`src/types/char.mach`](../../../src/types/char.mach)
 
 | Type | | |

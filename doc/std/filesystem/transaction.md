@@ -69,16 +69,16 @@ Uses types from [`std.allocator`](../allocator.md), [`std.crypto.hash.hasher`](.
 | :--- | :--- | :--- |
 | [`ErrorKind`](#errorkind) | `def` | what went wrong |
 | [`Op`](#op) | `def` | which step failed, so a caller can say where without this module having to build a sentence |
-| [`Error`](#error-1) | `rec` |  |
+| [`Error`](#error-1) | `rec` | a publication failure |
 | [`EntryProbe`](#entryprobe) | `rec` | what a name under a root currently refers to |
 | [`Claim`](#claim) | `rec` | planned reservations remain owned by the session until its workers have joined |
-| [`Worker`](#worker) | `rec` |  |
+| [`Worker`](#worker) | `rec` | a worker's admission under a held lock, which keeps recovery and unlock refused |
 | [`Durability`](#durability) | `def` | how much of a publication must reach stable storage before commit reports success |
-| [`DurabilityRequest`](#durabilityrequest) | `rec` |  |
+| [`DurabilityRequest`](#durabilityrequest) | `rec` | the durability preparation asks for |
 | [`Precondition`](#precondition) | `def` | what the destination must look like at commit for the publication to be allowed to land |
 | [`PrepareOptions`](#prepareoptions) | `rec` | selected before any destination observation or staging work |
 | [`EntryKind`](#entrykind) | `def` | what a transaction publishes |
-| [`Transaction`](#transaction) | `rec` | leaf is the destination claim's native name |
+| [`Transaction`](#transaction) | `rec` | one publication in flight |
 | [`Outcome`](#outcome) | `rec` | what a commit actually achieved |
 | [`BackupOutcome`](#backupoutcome) | `rec` | exact effects of a caller-journaled file publication, including failure |
 | [`Entry`](#entry) | `rec` | one item in a subtree about to be published |
@@ -91,7 +91,7 @@ Uses types from [`std.allocator`](../allocator.md), [`std.crypto.hash.hasher`](.
 | [`CONTAINMENT`](#errorkind) | a name was not a single path component, or a walk left the root |
 | [`PRECONDITION`](#errorkind) | the destination did not satisfy the precondition asked for at commit |
 | [`DURABILITY`](#errorkind) | a required durability level could not be achieved |
-| [`LOCK_HELD`](#errorkind) | another process holds the root lock |
+| [`LOCK_HELD`](#errorkind) | the root is already claimed, by another process or by this one |
 | [`CONFLICT`](#errorkind) | the destination changed underneath in a way the operation cannot absorb |
 | [`REJECTED`](#errorkind) | a validator rejected the staged content |
 | [`INVALID`](#errorkind) | the caller misused the interface: a spent transaction, a nil argument |
@@ -99,11 +99,12 @@ Uses types from [`std.allocator`](../allocator.md), [`std.crypto.hash.hasher`](.
 | [`IO`](#errorkind) | the operating system refused, and `code` carries the errno |
 | [`ENTROPY`](#errorkind) | entropy for a staging name was unavailable |
 | [`UNSUPPORTED`](#errorkind) | the backend cannot provide the requested contract |
-| [`error`](#error) | |
+| [`error`](#error) | an error with no native code behind it |
 
 | On `Op` | |
 | :--- | :--- |
-| [`OP_ROOT_OPEN`](#op), [`OP_LOCK`](#op), [`OP_PREPARE`](#op), [`OP_VALIDATE`](#op), [`OP_COMMIT`](#op), [`OP_ABORT`](#op), [`OP_RECOVER`](#op), [`OP_REMOVE`](#op), [`io_error`](#io_error) | |
+| [`OP_ROOT_OPEN`](#op), [`OP_LOCK`](#op), [`OP_PREPARE`](#op), [`OP_VALIDATE`](#op), [`OP_COMMIT`](#op), [`OP_ABORT`](#op), [`OP_RECOVER`](#op), [`OP_REMOVE`](#op) | |
+| [`io_error`](#io_error) | the error for a native code an operating system call returned |
 
 | On `Error` | |
 | :--- | :--- |
@@ -149,7 +150,8 @@ Uses types from [`std.allocator`](../allocator.md), [`std.crypto.hash.hasher`](.
 
 | On `Worker` | |
 | :--- | :--- |
-| [`borrow_worker`](#borrow_worker), [`release_worker`](#release_worker) | |
+| [`borrow_worker`](#borrow_worker) | admit a worker under a lock whose claims are initialized |
+| [`release_worker`](#release_worker) | end a worker's admission |
 
 | On `Durability` | |
 | :--- | :--- |
@@ -159,7 +161,9 @@ Uses types from [`std.allocator`](../allocator.md), [`std.crypto.hash.hasher`](.
 
 | On `DurabilityRequest` | |
 | :--- | :--- |
-| [`durability_none`](#durability_none), [`durability_file`](#durability_file), [`durability_full`](#durability_full) | |
+| [`durability_none`](#durability_none) | a request for no barriers |
+| [`durability_file`](#durability_file) | a request for file content barriers |
+| [`durability_full`](#durability_full) | a request for content barriers and a parent directory flush after rename |
 
 | On `Precondition` | |
 | :--- | :--- |
@@ -175,7 +179,8 @@ Uses types from [`std.allocator`](../allocator.md), [`std.crypto.hash.hasher`](.
 
 | On `Transaction` | |
 | :--- | :--- |
-| [`transaction_len`](#transaction_len), [`transaction_kind`](#transaction_kind) | |
+| [`transaction_len`](#transaction_len) | the size of what a transaction stages |
+| [`transaction_kind`](#transaction_kind) | what a transaction publishes |
 | [`transaction_prior_identity`](#transaction_prior_identity) | the identity the destination had when prepare ran |
 | [`transaction_staged_identity`](#transaction_staged_identity) | the identity of the staged entry, before it is committed |
 | [`transaction_staged_child_identity`](#transaction_staged_child_identity) | observe one prepared subtree child through its original held staging directory the observation does not transfer a reference or admit a mutation |
@@ -193,13 +198,15 @@ Uses types from [`std.allocator`](../allocator.md), [`std.crypto.hash.hasher`](.
 
 | On `Entry` | |
 | :--- | :--- |
-| [`entry_file`](#entry_file), [`entry_dir`](#entry_dir) | |
+| [`entry_file`](#entry_file) | an inventory item for a regular file |
+| [`entry_dir`](#entry_dir) | an inventory item for a directory |
 | [`entry_file_native`](#entry_file_native) | entry_file for a canonical path in native units, borrowed until the inventory is released |
 | [`entry_dir_native`](#entry_dir_native) | entry_dir for a canonical path in native units, borrowed until the inventory is released |
 
 | On `Inventory` | |
 | :--- | :--- |
-| [`inventory_init`](#inventory_init), [`inventory_dnit`](#inventory_dnit) | |
+| [`inventory_init`](#inventory_init) | an empty inventory |
+| [`inventory_dnit`](#inventory_dnit) | release an inventory and the native paths it converted |
 | [`inventory_push`](#inventory_push) | add an item, refusing a path that is not canonical or that repeats one already added |
 
 | On `Descent` | |
@@ -214,14 +221,16 @@ Uses types from [`std.allocator`](../allocator.md), [`std.crypto.hash.hasher`](.
 
 | Functions | |
 | :--- | :--- |
-| [`identity_equal`](#identity_equal), [`identity_encode`](#identity_encode), [`identity_decode`](#identity_decode) | |
+| [`identity_equal`](#identity_equal) | whether two identities name the same object |
+| [`identity_encode`](#identity_encode) | encode an identity as hex text |
+| [`identity_decode`](#identity_decode) | decode an identity from text identity_encode produced |
 | [`root_fd`](#root_fd) | the descriptor behind a root, for callers that must reach the operating system directly |
 | [`root_home_fd`](#root_home_fd) | the directory holding the root's lock sentinel, claims and backups: the root itself unless it was opened with a home |
-| [`coordinator_entry`](#coordinator_entry) | |
+| [`coordinator_entry`](#coordinator_entry) | whether name is one of the root's coordinator entries, the lock sentinel or the claims directory |
 
 | Constants | |
 | :--- | :--- |
-| [`IDENTITY_TEXT_CAPACITY`](#constants) | complete observations have backend-qualified scope and do not retain an object |
+| [`IDENTITY_TEXT_CAPACITY`](#constants) | the buffer size identity_encode needs for an encoded identity |
 | [`LOCK_LEAF`](#constants) | the sentinel file a root lock is taken on |
 | [`STAGING_TAG`](#constants) | the prefix on every entry this module creates while a transaction is in flight |
 
@@ -245,7 +254,7 @@ of these, and no variant carries a message the caller has to parse.
 | `CONTAINMENT` | `1` | a name was not a single path component, or a walk left the root |
 | `PRECONDITION` | `2` | the destination did not satisfy the precondition asked for at commit |
 | `DURABILITY` | `3` | a required durability level could not be achieved |
-| `LOCK_HELD` | `4` | another process holds the root lock |
+| `LOCK_HELD` | `4` | the root is already claimed, by another process or by this one |
 | `CONFLICT` | `5` | the destination changed underneath in a way the operation cannot absorb |
 | `REJECTED` | `6` | a validator rejected the staged content |
 | `INVALID` | `7` | the caller misused the interface: a spent transaction, a nil argument |
@@ -259,6 +268,14 @@ of these, and no variant carries a message the caller has to parse.
 ```mach
 pub fun error(kind: ErrorKind, op: Op) Error
 ```
+
+an error with no native code behind it
+
+| Parameter | |
+| :--- | :--- |
+| `kind` | what went wrong |
+| `op` | the step that failed |
+| **returns** | the error, with code and cleanup_code 0 |
 
 ## Op
 
@@ -286,6 +303,14 @@ build a sentence.
 pub fun io_error(op: Op, code: i64) Error
 ```
 
+the error for a native code an operating system call returned
+
+| Parameter | |
+| :--- | :--- |
+| `op` | the step that failed |
+| `code` | the negative native code |
+| **returns** | UNSUPPORTED when the code is classified unsupported, IO otherwise, keeping code |
+
 ## Error
 
 ```mach
@@ -298,6 +323,15 @@ pub rec Error {
     cleanup_code: i64;
 }
 ```
+
+a publication failure
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `kind` | `ErrorKind` | what went wrong |
+| `op` | `Op` | the step that failed |
+| `code` | `i64` | the native code behind it, 0 when none |
+| `cleanup_code` | `i64` | the first independent cleanup failure, 0 when none |
 
 ### error_message
 
@@ -455,7 +489,8 @@ read a whole small file under a root into a caller-provided buffer
 
 for the fixed-size records a caller keeps beside its own data, where the
 expected size is known and anything larger is corruption rather than a file
-to grow a buffer for.
+to grow a buffer for. the leaf is never followed: a symlink is refused with
+CONTAINMENT, and anything else that is not a regular file with INVALID.
 
 | Parameter | |
 | :--- | :--- |
@@ -718,17 +753,38 @@ pub rec Worker {
 }
 ```
 
+a worker's admission under a held lock, which keeps recovery and unlock refused
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `admission` | `std.filesystem.transaction.ownership.Borrow` | the lock borrow the worker holds until release_worker |
+
 ### borrow_worker
 
 ```mach
 pub fun borrow_worker(out: *Worker, held: *Lock) err[Error]
 ```
 
+admit a worker under a lock whose claims are initialized
+
+| Parameter | |
+| :--- | :--- |
+| `out` | the worker to fill, at its final address |
+| `held` | the lock |
+| **returns** | ok, or INVALID when the lock is not admitting |
+
 ### release_worker
 
 ```mach
 pub fun release_worker(worker: *Worker) err[Error]
 ```
+
+end a worker's admission
+
+| Parameter | |
+| :--- | :--- |
+| `worker` | the admitted worker |
+| **returns** | ok, INVALID for a nil, copied or released worker |
 
 ## Durability
 
@@ -755,11 +811,24 @@ pub rec DurabilityRequest {
 }
 ```
 
+the durability preparation asks for
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `level` | `Durability` | the barriers to run |
+| `required` | `bool` | whether a failed barrier is an error |
+
 ### durability_none
 
 ```mach
 pub fun durability_none() DurabilityRequest
 ```
+
+a request for no barriers
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | DUR_NONE, not required |
 
 ### durability_file
 
@@ -767,11 +836,25 @@ pub fun durability_none() DurabilityRequest
 pub fun durability_file(required: bool) DurabilityRequest
 ```
 
+a request for file content barriers
+
+| Parameter | |
+| :--- | :--- |
+| `required` | whether a failed barrier is an error |
+| **returns** | the DUR_FILE request |
+
 ### durability_full
 
 ```mach
 pub fun durability_full(required: bool) DurabilityRequest
 ```
+
+a request for content barriers and a parent directory flush after rename
+
+| Parameter | |
+| :--- | :--- |
+| `required` | whether a failed barrier is an error |
+| **returns** | the DUR_FULL request |
 
 ## Precondition
 
@@ -842,6 +925,10 @@ pub rec Transaction {
 }
 ```
 
+one publication in flight
+
+created in final storage and consumed by commit or abort
+the original staging descriptor remains owned for validation and observations
 leaf is the destination claim's native name. staging_name is the staging
 entry's name, and staging the same name in native units
 
@@ -851,11 +938,25 @@ entry's name, and staging the same name in native units
 pub fun transaction_len(t: *Transaction) usize
 ```
 
+the size of what a transaction stages
+
+| Parameter | |
+| :--- | :--- |
+| `t` | the transaction |
+| **returns** | the staged byte count for a file, the inventory entry count for a subtree, 0 for a directory |
+
 ### transaction_kind
 
 ```mach
 pub fun transaction_kind(t: *Transaction) EntryKind
 ```
+
+what a transaction publishes
+
+| Parameter | |
+| :--- | :--- |
+| `t` | the transaction |
+| **returns** | ENTRY_FILE, ENTRY_DIR or ENTRY_SUBTREE |
 
 ### transaction_prior_identity
 
@@ -1118,11 +1219,29 @@ one item in a subtree about to be published
 pub fun entry_file(rel: str, data: *u8, len: usize, mode: i32) Entry
 ```
 
+an inventory item for a regular file
+
+| Parameter | |
+| :--- | :--- |
+| `rel` | canonical path relative to the subtree root, in UTF-8 |
+| `data` | the file's content, borrowed until prepare_subtree returns |
+| `len` | its length in bytes |
+| `mode` | permission bits for the file |
+| **returns** | the entry, its native path converted by inventory_push |
+
 ### entry_dir
 
 ```mach
 pub fun entry_dir(rel: str, mode: i32) Entry
 ```
+
+an inventory item for a directory
+
+| Parameter | |
+| :--- | :--- |
+| `rel` | canonical path relative to the subtree root, in UTF-8 |
+| `mode` | permission bits for the directory |
+| **returns** | the entry, its native path converted by inventory_push |
 
 ### entry_file_native
 
@@ -1162,11 +1281,25 @@ step rather than appearing a file at a time.
 pub fun inventory_init(alloc: *std.allocator.Allocator) Inventory
 ```
 
+an empty inventory
+
+| Parameter | |
+| :--- | :--- |
+| `alloc` | allocator for its entries, released by inventory_dnit |
+| **returns** | the inventory |
+
 ### inventory_dnit
 
 ```mach
 pub fun inventory_dnit(inv: *Inventory) err[std.allocator.Error]
 ```
+
+release an inventory and the native paths it converted
+
+| Parameter | |
+| :--- | :--- |
+| `inv` | the inventory |
+| **returns** | ok, or the allocator's failure releasing the entries |
 
 ### inventory_push
 
@@ -1265,17 +1398,42 @@ release a native descent and everything it allocated
 pub fun identity_equal(a: Identity, b: Identity) bool
 ```
 
+whether two identities name the same object
+
+| Parameter | |
+| :--- | :--- |
+| `a` | one identity |
+| `b` | the other |
+| **returns** | true when both are valid and equal, false when either is malformed |
+
 ### identity_encode
 
 ```mach
 pub fun identity_encode(value: Identity, out: *u8, capacity: usize) bool
 ```
 
+encode an identity as hex text
+
+| Parameter | |
+| :--- | :--- |
+| `value` | the identity |
+| `out` | destination buffer |
+| `capacity` | its size in bytes, at least IDENTITY_TEXT_CAPACITY |
+| **returns** | false for a nil out, a short buffer or a malformed identity, leaving out untouched |
+
 ### identity_decode
 
 ```mach
 pub fun identity_decode(text: str, out: *Identity) bool
 ```
+
+decode an identity from text identity_encode produced
+
+| Parameter | |
+| :--- | :--- |
+| `text` | the encoded identity |
+| `out` | receives the identity |
+| **returns** | false for text that is not one complete valid identity, leaving out untouched |
 
 ### root_fd
 
@@ -1301,11 +1459,18 @@ root itself unless it was opened with a home. the root retains ownership.
 pub fun coordinator_entry(name: str) bool
 ```
 
+whether name is one of the root's coordinator entries, the lock sentinel or the claims directory
+
+| Parameter | |
+| :--- | :--- |
+| `name` | a leaf name |
+| **returns** | true for LOCK_LEAF or the claims directory name |
+
 ## Constants
 
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
-| `IDENTITY_TEXT_CAPACITY` | `usize` | `identities.TEXT_CAPACITY` | complete observations have backend-qualified scope and do not retain an object |
+| `IDENTITY_TEXT_CAPACITY` | `usize` | `identities.TEXT_CAPACITY` | the buffer size identity_encode needs for an encoded identity |
 | `LOCK_LEAF` | `str` | `".mach-txn-lock"` | the sentinel file a root lock is taken on |
 | `STAGING_TAG` | `str` | `".machtxn."` | the prefix on every entry this module creates while a transaction is in flight |
 
@@ -1322,6 +1487,10 @@ pub rec Identity {
 ```
 
 opaque to filesystem callers, native producers initialize every byte
+
+byte 0 is the backend, bytes 1 to 16 are zero, bytes 17 to 24 hold the
+volume and 25 to 32 the file number, little-endian. bytes 33 to 40 are zero
+except on windows, where they may be nonzero
 
 ### METADATA_ONLY
 
@@ -1376,4 +1545,8 @@ pub rec Lock {
     closing:     bool;
 }
 ```
+
+the exclusive claim on a root, held through a locked sentinel file
+
+an acquired lock stays at its original address until it is released
 

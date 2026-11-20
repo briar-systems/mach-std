@@ -23,18 +23,18 @@ and relies on `check[T]` for every refusal, which is why each walk's trailing
 failed the build. `check[T]` recurses alongside the walk it guards, so a nested
 record is classified at every depth.
 
-| field shape        | gate                | what happens                     |
-|--------------------|---------------------|----------------------------------|
-| union              | `$is_union`         | refused, with a written message  |
-| reference          | `$is_pointer`       | detected, never followed         |
-| record             | `$is_record`        | descended into                   |
-| scalar numeric     | type comparison     | the derive's leaf action         |
-| anything else      | the `$or` fallback  | refused, with a written message  |
+| field shape    | gate                       | what happens                    |
+|----------------|----------------------------|---------------------------------|
+| union          | `$is_union`                | refused, with a written message |
+| reference      | `$is_pointer`              | detected, never followed        |
+| record         | `$is_record`               | descended into                  |
+| scalar numeric | `$is_integer`, `$is_float` | the derive's leaf action        |
+| anything else  | the `$or` fallback         | refused, with a written message |
 
 a scalar numeric is a signed or unsigned integer of any width, or a float. a
-`def` over such a scalar counts (its underlying type is what the gate sees), so
-`bool` and `char` fields qualify. the fallback catches arrays, vectors, and
-`^` secrets.
+`def` over such a scalar counts (its underlying type is what the predicate
+sees), so `bool` and `char` fields qualify. the fallback catches arrays,
+vectors, and `^` secrets.
 
 adding a derive is the drop-in this shape is for: write the walk with your own
 leaf action, call `check[T]` first, and every refusal and message comes with
@@ -63,18 +63,17 @@ this one gets for free. see briar-systems/mach#2693.
 
 ## secrets are refused, not skipped
 
-none of these helpers is secrecy-aware, and none can be: no comptime surface
-reports that a field is secret (briar-systems/mach#2694). a secrecy-aware derive
--- skip in `fmt`, refuse in `hash`, constant-time compare in `eq` -- waits on
-that.
+none of these helpers is secrecy-aware. `$is_secret` reports a `^` field, so
+a secrecy-aware derive (skip in `fmt`, refuse in `hash`, constant-time compare
+in `eq`) can be written, but the derives here never test for one.
 
 what makes that safe rather than silent is that **nothing strips `^`**. type
 comparison never did, and since briar-systems/mach#2692 the shape predicates do
-not either, so `^u64` fails `f.type == u64` and `^Rec` fails `$is_record`.
+not either, so `^u64` fails `$is_integer` and `^Rec` fails `$is_record`.
 both fall to the fallback and are refused at comptime, with our message rather
 than a raw intrinsic error.
 
-that is why the leaf is an explicit whitelist and the fallback is an `$error`.
+that is why the leaf is a positive classification and the fallback is an `$error`.
 under the current predicate rule a walk that ACTED on its fallback would
 silently skip a secret instead of refusing it, so the refusal is what makes
 "nothing classifies it" a safe answer rather than a dangerous one. inverting
@@ -220,8 +219,8 @@ carries the bytes this call persisted before it.
 able to do otherwise.** what saves it today is that a secret field does not
 classify, so `check[T]` fails the build rather than letting one through -- see
 the module note on secrets. do not read that as a redaction: nothing here
-recognizes a secret, and a secrecy-aware `fmt` waits on
-briar-systems/mach#2694.
+recognizes a secret, and a secrecy-aware `fmt` would have to test
+`$is_secret` itself.
 
 eligibility matches `eq` and `hash`.
 

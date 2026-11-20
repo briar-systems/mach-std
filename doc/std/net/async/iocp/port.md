@@ -16,15 +16,15 @@ Uses types from [`std.allocator`](../../../allocator.md), [`std.io.runtime`](../
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`NativeOverlapped`](#nativeoverlapped) | `rec` |  |
-| [`NativeBuffer`](#nativebuffer) | `rec` |  |
+| [`NativeOverlapped`](#nativeoverlapped) | `rec` | the native OVERLAPPED a request posts with, laid out as the kernel reads it |
+| [`NativeBuffer`](#nativebuffer) | `rec` | the native WSABUF a send or receive borrows |
 | [`Header`](#header) | `rec` | the part of an operation this layer owns |
 | [`Hooks`](#hooks) | `rec` | what differs between the backends |
 | [`Backend`](#backend) | `rec` | a bounded completion port backend |
 
 | On `NativeOverlapped` | |
 | :--- | :--- |
-| [`zero_overlapped`](#zero_overlapped) | |
+| [`zero_overlapped`](#zero_overlapped) | clear a native request before it is posted |
 
 | On `Header` | |
 | :--- | :--- |
@@ -32,12 +32,15 @@ Uses types from [`std.allocator`](../../../allocator.md), [`std.io.runtime`](../
 
 | On `Backend` | |
 | :--- | :--- |
-| [`header_at`](#header_at), [`socket_record`](#socket_record), [`aliases`](#aliases), [`operation_for`](#operation_for) | |
+| [`header_at`](#header_at) | the operation record at a table index, which must be inside the table |
+| [`socket_record`](#socket_record) | the core's socket record at an index |
+| [`aliases`](#aliases) | whether a caller range overlaps memory the backend owns |
+| [`operation_for`](#operation_for) | the operation a token names, in any state but free |
 | [`trim_locked`](#trim_locked) | give back what a peak grew |
 | [`unlock`](#unlock) | every hold of backend.lock that may have freed something ends here, so what a drained peak grew goes back as soon as the lock is let go |
 | [`claim_locked`](#claim_locked) | a free operation joins the socket record sock in state |
 | [`release_locked`](#release_locked) | the operation leaves its own socket record, never one found by socket value |
-| [`push_completion_locked`](#push_completion_locked) | |
+| [`push_completion_locked`](#push_completion_locked) | append a completion to those the current publish makes readable |
 | [`init`](#init) | initial is the size the backend starts at: the operation, completion and socket tables grow on demand |
 | [`acquire_locked`](#acquire_locked) | the socket record a submit joins, associated with the completion port once per opening when associate is set |
 | [`controlled_locked`](#controlled_locked) | a socket with a shutdown or close submitted takes no further requests |
@@ -51,15 +54,16 @@ Uses types from [`std.allocator`](../../../allocator.md), [`std.io.runtime`](../
 | [`cancel`](#cancel) | cancellation is asynchronous for a request the kernel holds |
 | [`settle_locked`](#settle_locked) | publish the operation's result and release it |
 | [`finish_locked`](#finish_locked) | a request settled with status: an accept's socket is finished or closed, a readiness wait reads the queued byte count, and the rest report their bytes |
-| [`flush`](#flush), [`dispatch`](#dispatch) | |
+| [`flush`](#flush) | publish the settled controls without waiting |
+| [`dispatch`](#dispatch) | handle one packet the runtime's shared queue delivered |
 | [`poll`](#poll) | one thread owns poll and completion storage |
-| [`completion`](#completion) | |
+| [`completion`](#completion) | copy out one completion the last publish made readable |
 | [`dnit`](#dnit) | a cancelled operation keeps the backend busy until its packet is consumed |
 | [`awaiting_cancellations`](#awaiting_cancellations) | cancelled operations whose packet has not arrived yet |
 
 | Functions | |
 | :--- | :--- |
-| [`invalid`](#invalid) | |
+| [`invalid`](#invalid) | the status for an invalid argument |
 
 | Constants | |
 | :--- | :--- |
@@ -79,11 +83,27 @@ pub rec NativeOverlapped {
 }
 ```
 
+the native OVERLAPPED a request posts with, laid out as the kernel reads it
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `internal` | `usize` | the request's status, written by the kernel |
+| `internal_high` | `usize` | bytes transferred, written by the kernel |
+| `offset` | `u32` | low half of a file offset, zero for sockets |
+| `offset_high` | `u32` | high half of a file offset, zero for sockets |
+| `event` | `usize` | an event handle to signal, zero here |
+
 ### zero_overlapped
 
 ```mach
 pub fun zero_overlapped(overlapped: *NativeOverlapped)
 ```
+
+clear a native request before it is posted
+
+| Parameter | |
+| :--- | :--- |
+| `overlapped` | the request |
 
 ## NativeBuffer
 
@@ -93,6 +113,13 @@ pub rec NativeBuffer {
     data:   *u8;
 }
 ```
+
+the native WSABUF a send or receive borrows
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `length` | `u32` | bytes in data |
+| `data` | `*u8` | the bytes |
 
 ## Header
 
@@ -188,11 +215,27 @@ a bounded completion port backend
 pub fun header_at(backend: *Backend, index: usize) *Header
 ```
 
+the operation record at a table index, which must be inside the table
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend |
+| `index` | the operation index |
+| **returns** | the record's Header |
+
 ### socket_record
 
 ```mach
 pub fun socket_record(backend: *Backend, sock: u32) *std.net.async.iocp.Socket
 ```
+
+the core's socket record at an index
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend |
+| `sock` | the record index |
+| **returns** | the record |
 
 ### aliases
 
@@ -200,11 +243,28 @@ pub fun socket_record(backend: *Backend, sock: u32) *std.net.async.iocp.Socket
 pub fun aliases(backend: *Backend, data: *u8, len: usize) bool
 ```
 
+whether a caller range overlaps memory the backend owns
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend |
+| `data` | start of the range |
+| `len` | bytes in the range |
+| **returns** | true on overlap, and also when the range or the backend is not valid |
+
 ### operation_for
 
 ```mach
 pub fun operation_for(backend: *Backend, token: std.net.async.types.Token) *Header
 ```
+
+the operation a token names, in any state but free
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend |
+| `token` | the operation token |
+| **returns** | nil when the token is stale or the operation was released |
 
 ### trim_locked
 
@@ -258,6 +318,20 @@ pub fun push_completion_locked(
     end_of_stream: bool,
 ) bool
 ```
+
+append a completion to those the current publish makes readable
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend, locked |
+| `context` | the caller's context from the submission |
+| `kind` | the operation kind |
+| `bytes` | bytes moved |
+| `items` | packets moved by a batch operation |
+| `resource` | the native socket, or the accepted socket for an accept |
+| `status` | 0, a negative native error or a STATUS_ value |
+| `end_of_stream` | a read or readable wait saw the orderly end of the stream |
+| **returns** | false when the completion table is full and nothing was added |
 
 ### init
 
@@ -408,6 +482,13 @@ its cancellation hands the socket over
 pub fun flush(backend: *Backend) i64
 ```
 
+publish the settled controls without waiting
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend |
+| **returns** | the number of completions now readable through completion, or EINVAL |
+
 ### dispatch
 
 ```mach
@@ -420,6 +501,18 @@ pub fun dispatch(
     claimed: *bool,
 ) i64
 ```
+
+handle one packet the runtime's shared queue delivered
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend |
+| `context` | the packet's context, an operation's overlapped address |
+| `events` | the native event bits |
+| `status` | the packet's status |
+| `flags` | the packet's transferred byte count |
+| `claimed` | set true when the packet belongs to a live operation of this backend |
+| **returns** | the number of completions now readable through completion, or EINVAL |
 
 ### poll
 
@@ -434,6 +527,15 @@ one thread owns poll and completion storage
 ```mach
 pub fun completion(backend: *Backend, index: usize, out: *std.net.async.types.NativeCompletion) i64
 ```
+
+copy out one completion the last publish made readable
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend |
+| `index` | below the count the last flush, dispatch or poll returned |
+| `out` | receives the completion |
+| **returns** | 0, or EINVAL for a bad argument or an index past the count |
 
 ### dnit
 
@@ -458,6 +560,12 @@ cancelled operations whose packet has not arrived yet
 ```mach
 pub fun invalid() i64
 ```
+
+the status for an invalid argument
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the native EINVAL |
 
 ## Constants
 

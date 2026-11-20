@@ -7,7 +7,7 @@ code shared across all darwin ISA implementations
 contains types, constants and every OS primitive, each a call into
 libSystem (std.system.os.darwin.libsystem): no darwin primitive issues a
 trap, because apple promises none. arch-specific modules provide only
-page_size and pipe.
+pipe.
 
 Source: [`src/system/os/darwin/shared.mach`](../../../../../src/system/os/darwin/shared.mach)
 
@@ -17,12 +17,13 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | :--- | :--- | :--- |
 | [`stat_t`](#stat_t) | `rec` | darwin stat64 structure for file metadata |
 | [`timespec`](#timespec) | `rec` | time specification with seconds and nanoseconds |
-| [`DirectoryCursor`](#directorycursor) | `rec` |  |
+| [`DirectoryCursor`](#directorycursor) | `rec` | an open directory enumeration, which directory_init fills in place |
 | [`IoCompletion`](#iocompletion) | `rec` | context is opaque to the OS and zero is reserved for the runtime wake source source: the id of the source that registered the context, 0 for a wake |
 
 | On `stat_t` | |
 | :--- | :--- |
-| [`stat`](#stat), [`stat_path`](#stat_path) | |
+| [`stat`](#stat) | read an open file's metadata |
+| [`stat_path`](#stat_path) | read a path's metadata relative to a directory |
 | [`stat_mode`](#stat_mode) | read the type/permission bits from a filled stat buffer as a 32-bit word |
 
 | On `timespec` | |
@@ -32,36 +33,50 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | On `DirectoryCursor` | |
 | :--- | :--- |
 | [`directory_init`](#directory_init) | fd and its aliases lend exclusive enumeration and seek access until close |
-| [`directory_next`](#directory_next) | |
+| [`directory_next`](#directory_next) | read the next entry of a directory cursor |
 | [`directory_dnit`](#directory_dnit) | closedir consumes its stream even when the underlying close fails |
 
 | On `IoCompletion` | |
 | :--- | :--- |
-| [`io_queue_poll`](#io_queue_poll) | |
+| [`io_queue_poll`](#io_queue_poll) | collect ready completions, waiting up to timeout_ms |
 
 | Functions | |
 | :--- | :--- |
 | [`terminate`](#terminate) | exit the process with the given code |
 | [`abort`](#abort) | abort the process immediately with exit code 255 |
-| [`allocate`](#allocate), [`deallocate`](#deallocate) | |
+| [`allocate`](#allocate) | map anonymous read-write memory |
+| [`deallocate`](#deallocate) | unmap memory allocate mapped |
 | [`map_secret`](#map_secret) | map storage for secret-welded data: span locked bytes between two inaccessible guard pages, page aligned and zero-filled |
 | [`reallocate`](#reallocate) | darwin has no mremap, allocate new, copy, free old |
-| [`heap_region_base`](#heap_region_base), [`heap_region_extend`](#heap_region_extend), [`protect`](#protect), [`lock`](#lock), [`unlock`](#unlock), [`advise`](#advise), [`map_file`](#map_file), [`sync_file`](#sync_file) | |
+| [`page_size`](#page_size) | |
+| [`heap_region_base`](#heap_region_base) | the current end of the simulated program break |
+| [`heap_region_extend`](#heap_region_extend) | move the simulated program break up to addr |
+| [`protect`](#protect) | change the protection of a memory region |
+| [`lock`](#lock) | lock a memory region into physical memory, keeping it out of swap |
+| [`unlock`](#unlock) | unlock a memory region lock locked |
+| [`advise`](#advise) | advise the kernel how a memory region will be accessed |
+| [`map_file`](#map_file) | map part of a file into memory, shared with the file |
+| [`sync_file`](#sync_file) | flush a shared file mapping to its file and wait for the write |
 | [`environ`](#environ) | pointer to the environment captured by the runtime at program start (null-terminated array of "NAME=value" strings) |
-| [`read`](#read), [`write`](#write) | |
+| [`read`](#read) | read bytes from a descriptor |
+| [`write`](#write) | write bytes to a descriptor |
 | [`read_at`](#read_at) | positioned file access does not mutate the descriptor offset |
-| [`write_at`](#write_at) | |
+| [`write_at`](#write_at) | write bytes at a file offset without moving the descriptor offset |
 | [`open`](#open) | open a path relative to a directory descriptor |
 | [`close`](#close) | close a descriptor |
 | [`sync_fd`](#sync_fd) | flush an open file's data and metadata to its backing storage |
-| [`set_mode`](#set_mode), [`set_mode_at`](#set_mode_at), [`publication_capabilities`](#publication_capabilities) | |
+| [`set_mode`](#set_mode) | set a file's permission bits through an open descriptor |
+| [`set_mode_at`](#set_mode_at) | set the permission bits of a path relative to a directory, without following a final symlink |
+| [`publication_capabilities`](#publication_capabilities) | the cooperative publication capabilities of the filesystem holding fd |
 | [`file_identity`](#file_identity) | observational ids do not retain an object after this call |
 | [`retain_identity_at`](#retain_identity_at) | o_evtonly retains identity without data i/o after explicit read authorization |
-| [`identity_at`](#identity_at), [`unlink`](#unlink) | |
+| [`identity_at`](#identity_at) | the identity of the object a path relative to a directory names, without following a final symlink |
+| [`unlink`](#unlink) | remove a name relative to a directory |
 | [`lock_fd`](#lock_fd) | flock: take or release an advisory whole-file lock on an open descriptor |
-| [`rename`](#rename) | |
+| [`rename`](#rename) | rename a path, each side relative to its own directory |
 | [`symlink`](#symlink) | create a symbolic link at linkpath pointing to target |
-| [`make_dir`](#make_dir), [`access`](#access) | |
+| [`make_dir`](#make_dir) | create a directory relative to a directory |
+| [`access`](#access) | check access to a path relative to a directory |
 | [`seek`](#seek) | reposition a descriptor's offset |
 | [`fd_flags`](#fd_flags) | read a descriptor's descriptor-level flags (FD_CLOEXEC) |
 | [`set_fd_flags`](#set_fd_flags) | set a descriptor's descriptor-level flags |
@@ -71,7 +86,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`vfork`](#vfork) | create a child process through vfork(2) |
 | [`exec`](#exec) | replace the calling process image; returns only on failure |
 | [`wait`](#wait) | failures and no-event results leave the caller's status unchanged |
-| [`wait_pid`](#wait_pid) | |
+| [`wait_pid`](#wait_pid) | wait for a child to change state, as wait does without resource usage |
 | [`terminate_child`](#terminate_child) | forcefully stop a spawned child without reaping it |
 | [`setpgid`](#setpgid) | setpgid: set (or join) the process group ID of a process |
 | [`getpgid`](#getpgid) | getpgid: read the process group ID of a process |
@@ -105,27 +120,50 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`stack_bounds`](#stack_bounds) | the calling thread's stack bounds, recorded in its block when it was installed, or asked of libpthread on a thread std did not create |
 | [`thread_exit_wipe`](#thread_exit_wipe) | wipe the calling thread's thread-local block as the thread ends |
 | [`thread_spawn`](#thread_spawn) | create a joinable pthread and release it only through join or detach |
-| [`thread_join`](#thread_join), [`thread_detach`](#thread_detach), [`thread_current_id`](#thread_current_id), [`thread_current_name`](#thread_current_name) | |
+| [`thread_join`](#thread_join) | wait for a thread thread_spawn created to end, and release its native handle |
+| [`thread_detach`](#thread_detach) | hand a thread's native teardown to libpthread, so it is never joined |
+| [`thread_current_id`](#thread_current_id) | the calling thread's system-wide id |
+| [`thread_current_name`](#thread_current_name) | copy the calling thread's name into name, null-terminated |
 | [`thread_wait`](#thread_wait) | block until the value at addr changes from expected |
 | [`thread_wait_until`](#thread_wait_until) | block until the word changes or an absolute monotonic deadline is reached |
 | [`thread_wake`](#thread_wake) | wake threads blocked in thread_wait on addr |
-| [`io_queue_create`](#io_queue_create), [`io_queue_watch`](#io_queue_watch) | |
+| [`io_queue_create`](#io_queue_create) | open a close-on-exec kqueue for queue, with the user event io_queue_wake posts already registered |
+| [`io_queue_watch`](#io_queue_watch) | register one-shot readiness interest in a descriptor |
 | [`duplicate_to`](#duplicate_to) | makes the descriptor to name what from names, closing whatever to named before, in one step |
 | [`io_queue_rearm`](#io_queue_rearm) | arms again a registration the caller made with io_queue_watch |
-| [`io_queue_unwatch`](#io_queue_unwatch), [`io_queue_wait`](#io_queue_wait), [`io_queue_wake`](#io_queue_wake), [`io_queue_close`](#io_queue_close), [`sock_send`](#sock_send) | |
+| [`io_queue_unwatch`](#io_queue_unwatch) | drop both readiness filters of a descriptor, where one that is not registered is not an error |
+| [`io_queue_wait`](#io_queue_wait) | wait up to timeout_ms for one completion and discard it |
+| [`io_queue_wake`](#io_queue_wake) | wake a thread waiting on queue |
+| [`io_queue_close`](#io_queue_close) | close the kqueue behind queue, where closing a closed queue returns 0 |
+| [`sock_send`](#sock_send) | send bytes on a connected socket through write |
 | [`sock_recv`](#sock_recv) | raw native read semantics do not safely discard ancillary descriptor rights |
 | [`local_stream_recv`](#local_stream_recv) | exclusively borrow the receive queue through peek and consume, including all aliases |
-| [`sock_write_vector`](#sock_write_vector), [`sock_send_message`](#sock_send_message) | |
+| [`sock_write_vector`](#sock_write_vector) | write a gather list to a socket |
+| [`sock_send_message`](#sock_send_message) | send a gather list with an optional address and ancillary data |
 | [`sock_receive_message`](#sock_receive_message) | raw recvmsg preserves native ancillary ownership and truncation behavior |
 | [`sock_set_nonblocking`](#sock_set_nonblocking) | switch a socket between blocking and nonblocking |
 | [`sock_connect_begin`](#sock_connect_begin) | start a connect on a nonblocking socket |
 | [`sock_connect_poll`](#sock_connect_poll) | ask whether a connect sock_connect_begin started has settled, without waiting |
-| [`sock_close`](#sock_close), [`sock_create`](#sock_create), [`sock_create_flags`](#sock_create_flags), [`sock_bind`](#sock_bind), [`sock_listen`](#sock_listen), [`sock_accept`](#sock_accept), [`sock_accept_flags`](#sock_accept_flags), [`sock_connect`](#sock_connect), [`sock_sendto`](#sock_sendto) | |
+| [`sock_close`](#sock_close) | close a socket |
+| [`sock_create`](#sock_create) | create a blocking, close-on-exec socket |
+| [`sock_create_flags`](#sock_create_flags) | create a socket with chosen blocking and inheritance |
+| [`sock_bind`](#sock_bind) | bind a socket to a local address |
+| [`sock_listen`](#sock_listen) | mark a socket as accepting connections |
+| [`sock_accept`](#sock_accept) | accept a connection as a blocking, close-on-exec socket |
+| [`sock_accept_flags`](#sock_accept_flags) | accept a connection with chosen blocking and inheritance |
+| [`sock_connect`](#sock_connect) | connect a socket to a peer |
+| [`sock_sendto`](#sock_sendto) | send bytes to an address |
 | [`sock_peek_readable`](#sock_peek_readable) | peek at a stream socket without consuming or blocking |
-| [`sock_recvfrom`](#sock_recvfrom), [`sock_shutdown`](#sock_shutdown), [`sock_setopt`](#sock_setopt), [`sock_getopt`](#sock_getopt), [`sock_local_addr`](#sock_local_addr), [`sock_remote_addr`](#sock_remote_addr), [`sock_inheritable`](#sock_inheritable) | |
+| [`sock_recvfrom`](#sock_recvfrom) | receive bytes with the sender's address |
+| [`sock_shutdown`](#sock_shutdown) | shut down one or both directions of a socket |
+| [`sock_setopt`](#sock_setopt) | set a socket option |
+| [`sock_getopt`](#sock_getopt) | read a socket option |
+| [`sock_local_addr`](#sock_local_addr) | read a socket's local address |
+| [`sock_remote_addr`](#sock_remote_addr) | read a connected socket's peer address |
+| [`sock_inheritable`](#sock_inheritable) | whether a child process would inherit a socket |
 | [`sock_set_rcvtimeo`](#sock_set_rcvtimeo) | set the receive timeout on a socket |
 | [`random_fill`](#random_fill) | fill a buffer with cryptographic random bytes via getentropy |
-| [`error_message`](#error_message) | |
+| [`error_message`](#error_message) | a human-readable message for a negated errno |
 
 | Constants | |
 | :--- | :--- |
@@ -189,11 +227,29 @@ darwin stat64 structure for file metadata
 pub fun stat(fd: i32, st: *stat_t) i64
 ```
 
+read an open file's metadata
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | file descriptor |
+| `st` | receives the metadata |
+| **returns** | 0 on success, or negative errno |
+
 ### stat_path
 
 ```mach
 pub fun stat_path(dirfd: i32, path: *u8, st: *stat_t, flags: i32) i64
 ```
+
+read a path's metadata relative to a directory
+
+| Parameter | |
+| :--- | :--- |
+| `dirfd` | directory descriptor, or AT_FDCWD |
+| `path` | null-terminated path |
+| `st` | receives the metadata |
+| `flags` | AT_SYMLINK_NOFOLLOW to describe a final symlink itself, or 0 |
+| **returns** | 0 on success, or negative errno |
 
 ### stat_mode
 
@@ -253,6 +309,16 @@ pub rec DirectoryCursor {
 }
 ```
 
+an open directory enumeration, which directory_init fills in place
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `address` | `usize` | the cursor's own address, so a moved or foreign cursor is refused |
+| `active` | `bool` | set from directory_init until directory_dnit |
+| `ended` | `bool` | set once the stream reported its end |
+| `error` | `i64` | the sticky negative errno of a failed read, 0 before one |
+| `stream` | `std.system.os.darwin.libsystem.DirectoryStream` | the libSystem stream over a duplicate of the caller's descriptor |
+
 ### directory_init
 
 ```mach
@@ -266,6 +332,18 @@ fd and its aliases lend exclusive enumeration and seek access until close
 ```mach
 pub fun directory_next(cursor: *DirectoryCursor, out: *DirectoryEntry) i64
 ```
+
+read the next entry of a directory cursor
+
+a failure is sticky, so every later call returns the same code. a record
+with an empty name, a name or terminator past its extent, or a null byte
+inside the name is EIO
+
+| Parameter | |
+| :--- | :--- |
+| `cursor` | a cursor directory_init activated |
+| `out` | receives the entry, whose name is borrowed until the next cursor operation |
+| **returns** | 1 with an entry, 0 at the end, EINVAL for a cursor that is not active, or negative errno |
 
 ### directory_dnit
 
@@ -296,6 +374,19 @@ source: the id of the source that registered the context, 0 for a wake. it
 ```mach
 pub fun io_queue_poll(queue: *std.system.os.shared.IoQueue, completions: *IoCompletion, capacity: usize, timeout_ms: i32) i64
 ```
+
+collect ready completions, waiting up to timeout_ms
+
+completions is also the native kevent buffer, and each record is rewritten in
+place. a wake reports IO_EVENT_WAKE with source 0
+
+| Parameter | |
+| :--- | :--- |
+| `queue` | the queue |
+| `completions` | receives the completions |
+| `capacity` | records completions holds, 0 or above i32 range is EINVAL |
+| `timeout_ms` | milliseconds to wait, negative waits indefinitely |
+| **returns** | completions filled, 0 on timeout, or negative errno |
 
 ## Functions
 
@@ -332,11 +423,26 @@ is ignored or handled, the exit below still ends the process.
 pub fun allocate(size: usize) ptr
 ```
 
+map anonymous read-write memory
+
+| Parameter | |
+| :--- | :--- |
+| `size` | bytes to map |
+| **returns** | the mapping, or nil when size is 0 or mmap fails |
+
 ### deallocate
 
 ```mach
 pub fun deallocate(p: ptr, size: usize) i64
 ```
+
+unmap memory allocate mapped
+
+| Parameter | |
+| :--- | :--- |
+| `p` | the mapping, nil returns 0 |
+| `size` | the size it was mapped with, 0 returns 0 |
+| **returns** | 0 on success, or negative errno |
 
 ### map_secret
 
@@ -366,11 +472,36 @@ pub fun reallocate(p: ptr, old_size: usize, new_size: usize) ptr
 
 darwin has no mremap, allocate new, copy, free old
 
+### page_size
+
+Declared by the first of these arms whose condition holds.
+
+Where `$mach.build.arch == $mach.arch.aarch64`:
+
+```mach
+pub fun page_size() usize
+```
+
+Where `$mach.build.arch == $mach.arch.x86_64`:
+
+```mach
+pub fun page_size() usize
+```
+
 ### heap_region_base
 
 ```mach
 pub fun heap_region_base() usize
 ```
+
+the current end of the simulated program break
+
+the first call reserves HEAP_RESERVE bytes of inaccessible address space, and
+the break starts at its base
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the current break address, or 0 when the reservation fails |
 
 ### heap_region_extend
 
@@ -378,11 +509,30 @@ pub fun heap_region_base() usize
 pub fun heap_region_extend(addr: usize) usize
 ```
 
+move the simulated program break up to addr
+
+the pages between the old and the new break are made read-write. the break
+never moves down and never past the reserve
+
+| Parameter | |
+| :--- | :--- |
+| `addr` | the desired break address |
+| **returns** | the break after the call, unchanged when addr is not above it, lies past the reserve or the commit fails, or 0 when the reserve cannot be made |
+
 ### protect
 
 ```mach
 pub fun protect(p: ptr, size: usize, prot: u32) i64
 ```
+
+change the protection of a memory region
+
+| Parameter | |
+| :--- | :--- |
+| `p` | page-aligned start of the region |
+| `size` | region size in bytes |
+| `prot` | PROT_* bits |
+| **returns** | 0 on success, or negative errno |
 
 ### lock
 
@@ -390,11 +540,27 @@ pub fun protect(p: ptr, size: usize, prot: u32) i64
 pub fun lock(p: ptr, size: usize) i64
 ```
 
+lock a memory region into physical memory, keeping it out of swap
+
+| Parameter | |
+| :--- | :--- |
+| `p` | start of the region |
+| `size` | region size in bytes |
+| **returns** | 0 on success, or negative errno |
+
 ### unlock
 
 ```mach
 pub fun unlock(p: ptr, size: usize) i64
 ```
+
+unlock a memory region lock locked
+
+| Parameter | |
+| :--- | :--- |
+| `p` | start of the region |
+| `size` | region size in bytes |
+| **returns** | 0 on success, or negative errno |
 
 ### advise
 
@@ -402,17 +568,44 @@ pub fun unlock(p: ptr, size: usize) i64
 pub fun advise(p: ptr, size: usize, advice: u32) i64
 ```
 
+advise the kernel how a memory region will be accessed
+
+| Parameter | |
+| :--- | :--- |
+| `p` | start of the region |
+| `size` | region size in bytes |
+| `advice` | MADV_* value |
+| **returns** | 0 on success, or negative errno |
+
 ### map_file
 
 ```mach
 pub fun map_file(fd: i32, offset: usize, size: usize, prot: u32) ptr
 ```
 
+map part of a file into memory, shared with the file
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | file descriptor to map |
+| `offset` | page-aligned byte offset into the file |
+| `size` | bytes to map |
+| `prot` | PROT_* bits |
+| **returns** | the mapping, or nil when size is 0, offset is above i64 range or mmap fails |
+
 ### sync_file
 
 ```mach
 pub fun sync_file(p: ptr, size: usize) i64
 ```
+
+flush a shared file mapping to its file and wait for the write
+
+| Parameter | |
+| :--- | :--- |
+| `p` | start of the mapped region, nil returns 0 |
+| `size` | region size in bytes, 0 returns 0 |
+| **returns** | 0 on success, or negative errno |
 
 ### environ
 
@@ -430,11 +623,35 @@ runtime init.
 pub fun read(fd: i32, buf: *u8, count: usize) i64
 ```
 
+read bytes from a descriptor
+
+a call EINTR interrupts is tried again, for at most EINTR_MAX_RETRIES attempts
+in all
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | file descriptor |
+| `buf` | destination buffer |
+| `count` | most bytes to read |
+| **returns** | bytes read, 0 at end of file, or negative errno (EINTR once the retries run out) |
+
 ### write
 
 ```mach
 pub fun write(fd: i32, buf: *u8, count: usize) i64
 ```
+
+write bytes to a descriptor
+
+a call EINTR interrupts is tried again, for at most EINTR_MAX_RETRIES attempts
+in all
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | file descriptor |
+| `buf` | source bytes |
+| `count` | bytes to write |
+| **returns** | bytes written, or negative errno (EINTR once the retries run out) |
 
 ### read_at
 
@@ -449,6 +666,19 @@ positioned file access does not mutate the descriptor offset
 ```mach
 pub fun write_at(fd: i32, buf: *u8, count: usize, offset: u64) i64
 ```
+
+write bytes at a file offset without moving the descriptor offset
+
+a call EINTR interrupts is tried again, for at most EINTR_MAX_RETRIES attempts
+in all
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | file descriptor |
+| `buf` | source bytes |
+| `count` | bytes to write |
+| `offset` | file offset to write at, above i64 range is EINVAL |
+| **returns** | bytes written, or negative errno (EINTR once the retries run out) |
 
 ### open
 
@@ -498,17 +728,45 @@ flush an open file's data and metadata to its backing storage
 pub fun set_mode(fd: i32, mode: i32) i64
 ```
 
+set a file's permission bits through an open descriptor
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | file descriptor |
+| `mode` | permission bits |
+| **returns** | 0 on success, or negative errno |
+
 ### set_mode_at
 
 ```mach
 pub fun set_mode_at(dirfd: i32, name: *u8, mode: i32) i64
 ```
 
+set the permission bits of a path relative to a directory, without following
+a final symlink
+
+| Parameter | |
+| :--- | :--- |
+| `dirfd` | directory descriptor, or AT_FDCWD |
+| `name` | null-terminated path, nil is EINVAL |
+| `mode` | permission bits |
+| **returns** | 0 on success, or negative errno |
+
 ### publication_capabilities
 
 ```mach
 pub fun publication_capabilities(fd: i32) i64
 ```
+
+the cooperative publication capabilities of the filesystem holding fd
+
+only a local apfs or hfs volume has any, and it has PUBLICATION_CLAIMS and
+PUBLICATION_READ_RETAIN_REPLACE
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | an open descriptor on the filesystem |
+| **returns** | the PUBLICATION_* bits, 0 when none applies, or negative errno |
 
 ### file_identity
 
@@ -532,11 +790,32 @@ o_evtonly retains identity without data i/o after explicit read authorization
 pub fun identity_at(dirfd: i32, path: *u8, out: *std.system.file_identity.Identity) i64
 ```
 
+the identity of the object a path relative to a directory names, without
+following a final symlink
+
+the identity is observational and retains nothing
+
+| Parameter | |
+| :--- | :--- |
+| `dirfd` | directory descriptor, or AT_FDCWD |
+| `path` | null-terminated path, nil is EINVAL |
+| `out` | receives the identity, nil is EINVAL |
+| **returns** | 0 on success, or negative errno |
+
 ### unlink
 
 ```mach
 pub fun unlink(dirfd: i32, path: *u8, flags: i32) i64
 ```
+
+remove a name relative to a directory
+
+| Parameter | |
+| :--- | :--- |
+| `dirfd` | directory descriptor, or AT_FDCWD |
+| `path` | null-terminated path |
+| `flags` | AT_REMOVEDIR to remove an empty directory, or 0 |
+| **returns** | 0 on success, or negative errno |
 
 ### lock_fd
 
@@ -568,6 +847,16 @@ file inside it rather than the directory itself.
 pub fun rename(olddir: i32, oldpath: *u8, newdir: i32, newpath: *u8) i64
 ```
 
+rename a path, each side relative to its own directory
+
+| Parameter | |
+| :--- | :--- |
+| `olddir` | source directory descriptor, or AT_FDCWD |
+| `oldpath` | source path |
+| `newdir` | destination directory descriptor, or AT_FDCWD |
+| `newpath` | destination path |
+| **returns** | 0 on success, or negative errno |
+
 ### symlink
 
 ```mach
@@ -591,11 +880,30 @@ keeps resolving correctly after the containing tree is moved.
 pub fun make_dir(dirfd: i32, path: *u8, mode: i32) i64
 ```
 
+create a directory relative to a directory
+
+| Parameter | |
+| :--- | :--- |
+| `dirfd` | directory descriptor, or AT_FDCWD |
+| `path` | null-terminated path |
+| `mode` | permission bits, before the umask |
+| **returns** | 0 on success, or negative errno |
+
 ### access
 
 ```mach
 pub fun access(dirfd: i32, path: *u8, mode: i32, flags: i32) i64
 ```
+
+check access to a path relative to a directory
+
+| Parameter | |
+| :--- | :--- |
+| `dirfd` | directory descriptor, or AT_FDCWD |
+| `path` | null-terminated path |
+| `mode` | R_OK, W_OK and X_OK bits, or F_OK |
+| `flags` | AT_* flags |
+| **returns** | 0 when accessible, or negative errno |
 
 ### seek
 
@@ -723,6 +1031,15 @@ failures and no-event results leave the caller's status unchanged
 ```mach
 pub fun wait_pid(pid: i64, status: *std.system.os.shared.ProcessStatus, options: i32) std.system.os.shared.WaitResult
 ```
+
+wait for a child to change state, as wait does without resource usage
+
+| Parameter | |
+| :--- | :--- |
+| `pid` | the child, or -1 for any child |
+| `status` | receives the decoded status when a child changed state, may be nil |
+| `options` | WNOHANG, WUNTRACED, WCONTINUED |
+| **returns** | the pid of the child that changed state, 0 under WNOHANG when nothing changed, or an error tagged PROCESS_OP_WAIT |
 
 ### terminate_child
 
@@ -952,7 +1269,7 @@ pub fun spawn_redirected_in(pathname: *u8, argv: **u8, envp: Environment, cwd: *
 spawn a child with redirected streams and an explicit working directory
 
 `cwd` is the directory the child starts in, or nil to inherit the parent's.
-the chdir happens in the child, after the fork/clone, so the parent's own
+the chdir happens in the child, after the fork, so the parent's own
 working directory is untouched. passing it here rather than prefixing a `cd`
 onto a shell command keeps the path out of the command line, where it would
 have to survive a quoting convention the target program may not share
@@ -1265,11 +1582,26 @@ create a joinable pthread and release it only through join or detach
 pub fun thread_join(native: usize, reclaimable: *i64) i64
 ```
 
+wait for a thread thread_spawn created to end, and release its native handle
+
+| Parameter | |
+| :--- | :--- |
+| `native` | the handle thread_spawn stored |
+| `reclaimable` | unused, the join is itself the teardown barrier |
+| **returns** | 0, or pthread_join's negated error |
+
 ### thread_detach
 
 ```mach
 pub fun thread_detach(native: usize) i64
 ```
+
+hand a thread's native teardown to libpthread, so it is never joined
+
+| Parameter | |
+| :--- | :--- |
+| `native` | the handle thread_spawn stored |
+| **returns** | 0, or pthread_detach's negated error |
 
 ### thread_current_id
 
@@ -1277,11 +1609,25 @@ pub fun thread_detach(native: usize) i64
 pub fun thread_current_id() i64
 ```
 
+the calling thread's system-wide id
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the id, or pthread_threadid_np's negated error |
+
 ### thread_current_name
 
 ```mach
 pub fun thread_current_name(name: *u8, cap: usize) i64
 ```
+
+copy the calling thread's name into name, null-terminated
+
+| Parameter | |
+| :--- | :--- |
+| `name` | destination buffer |
+| `cap` | capacity of name including the terminator, 0 is EINVAL |
+| **returns** | the name's length, or pthread_getname_np's negated error |
 
 ### thread_wait
 
@@ -1333,11 +1679,32 @@ this call was meant to deliver would be lost.
 pub fun io_queue_create(queue: *std.system.os.shared.IoQueue) i64
 ```
 
+open a close-on-exec kqueue for queue, with the user event io_queue_wake
+posts already registered
+
+| Parameter | |
+| :--- | :--- |
+| `queue` | the queue to fill, its handle left invalid on failure |
+| **returns** | 0, or negative errno |
+
 ### io_queue_watch
 
 ```mach
 pub fun io_queue_watch(queue: *std.system.os.shared.IoQueue, resource: usize, context: usize, events: u32) i64
 ```
+
+register one-shot readiness interest in a descriptor
+
+each requested direction gets its own one-shot filter, which fires once until
+it is armed again. registering an existing filter updates it
+
+| Parameter | |
+| :--- | :--- |
+| `queue` | the queue |
+| `resource` | the descriptor |
+| `context` | the nonzero value its completions carry, 0 is EINVAL |
+| `events` | IO_EVENT_READ, IO_EVENT_WRITE or both, neither is EINVAL |
+| **returns** | 0, or negative errno |
 
 ### duplicate_to
 
@@ -1370,11 +1737,28 @@ descriptor closes, so re-arming and registering are the same change
 pub fun io_queue_unwatch(queue: *std.system.os.shared.IoQueue, resource: usize) i64
 ```
 
+drop both readiness filters of a descriptor, where one that is not
+registered is not an error
+
+| Parameter | |
+| :--- | :--- |
+| `queue` | the queue, nil is EINVAL |
+| `resource` | the descriptor |
+| **returns** | 0, or the read filter's negative errno before the write filter's |
+
 ### io_queue_wait
 
 ```mach
 pub fun io_queue_wait(queue: *std.system.os.shared.IoQueue, timeout_ms: i32) i64
 ```
+
+wait up to timeout_ms for one completion and discard it
+
+| Parameter | |
+| :--- | :--- |
+| `queue` | the queue |
+| `timeout_ms` | milliseconds to wait, negative waits indefinitely |
+| **returns** | 1 when a completion arrived, 0 on timeout, or negative errno |
 
 ### io_queue_wake
 
@@ -1382,17 +1766,43 @@ pub fun io_queue_wait(queue: *std.system.os.shared.IoQueue, timeout_ms: i32) i64
 pub fun io_queue_wake(queue: *std.system.os.shared.IoQueue) i64
 ```
 
+wake a thread waiting on queue
+
+only the first request before a poll harvests the wake posts the event, and
+later requests in that window return 0 having posted nothing
+
+| Parameter | |
+| :--- | :--- |
+| `queue` | the queue |
+| **returns** | 0, EINVAL for nil, EBADF for a closed queue, or negative errno |
+
 ### io_queue_close
 
 ```mach
 pub fun io_queue_close(queue: *std.system.os.shared.IoQueue) i64
 ```
 
+close the kqueue behind queue, where closing a closed queue returns 0
+
+| Parameter | |
+| :--- | :--- |
+| `queue` | the queue |
+| **returns** | 0, EINVAL for nil, or close's negative errno |
+
 ### sock_send
 
 ```mach
 pub fun sock_send(fd: usize, buf: *u8, len: usize) i64
 ```
+
+send bytes on a connected socket through write
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| `buf` | source bytes |
+| `len` | bytes to send |
+| **returns** | bytes sent, or negative errno |
 
 ### sock_recv
 
@@ -1418,11 +1828,33 @@ ancillary refusal leaves the socket and its queued rights owned by the caller.
 pub fun sock_write_vector(fd: usize, vectors: *IoVector, count: usize) i64
 ```
 
+write a gather list to a socket
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| `vectors` | the buffers, written in order, nil is EINVAL |
+| `count` | entries in vectors, 1 to 1024, otherwise EINVAL |
+| **returns** | bytes written, or negative errno |
+
 ### sock_send_message
 
 ```mach
 pub fun sock_send_message(fd: usize, vectors: *IoVector, vector_count: usize, address: *u8, address_length: u32, control: *u8, control_length: usize) i64
 ```
+
+send a gather list with an optional address and ancillary data
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| `vectors` | the buffers, nil is EINVAL |
+| `vector_count` | entries in vectors, 1 to 1024, otherwise EINVAL |
+| `address` | destination sockaddr, or nil |
+| `address_length` | size of address |
+| `control` | ancillary data, or nil |
+| `control_length` | size of control, above u32 range is EINVAL |
+| **returns** | bytes sent, or negative errno |
 
 ### sock_receive_message
 
@@ -1482,11 +1914,28 @@ ask whether a connect sock_connect_begin started has settled, without waiting
 pub fun sock_close(fd: usize) i64
 ```
 
+close a socket
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| **returns** | 0, or negative errno |
+
 ### sock_create
 
 ```mach
 pub fun sock_create(domain: i32, typ: i32, protocol: i32, out: *usize) i64
 ```
+
+create a blocking, close-on-exec socket
+
+| Parameter | |
+| :--- | :--- |
+| `domain` | AF_* family |
+| `typ` | SOCK_* type |
+| `protocol` | protocol, or 0 for the default |
+| `out` | receives the handle, all bits one on failure |
+| **returns** | 0, or negative errno |
 
 ### sock_create_flags
 
@@ -1494,11 +1943,32 @@ pub fun sock_create(domain: i32, typ: i32, protocol: i32, out: *usize) i64
 pub fun sock_create_flags(domain: i32, typ: i32, protocol: i32, nonblocking: bool, non_inheritable: bool, out: *usize) i64
 ```
 
+create a socket with chosen blocking and inheritance
+
+| Parameter | |
+| :--- | :--- |
+| `domain` | AF_* family |
+| `typ` | SOCK_* type |
+| `protocol` | protocol, or 0 for the default |
+| `nonblocking` | true for a nonblocking socket |
+| `non_inheritable` | true to set close-on-exec |
+| `out` | receives the handle, all bits one on failure, nil is EINVAL |
+| **returns** | 0, or negative errno |
+
 ### sock_bind
 
 ```mach
 pub fun sock_bind(fd: usize, addr: *u8, addrlen: usize) i64
 ```
+
+bind a socket to a local address
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| `addr` | the sockaddr |
+| `addrlen` | size of the sockaddr, above u32 range is EINVAL |
+| **returns** | 0, or negative errno |
 
 ### sock_listen
 
@@ -1506,11 +1976,29 @@ pub fun sock_bind(fd: usize, addr: *u8, addrlen: usize) i64
 pub fun sock_listen(fd: usize, backlog: i32) i64
 ```
 
+mark a socket as accepting connections
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| `backlog` | most pending connections to queue |
+| **returns** | 0, or negative errno |
+
 ### sock_accept
 
 ```mach
 pub fun sock_accept(fd: usize, addr: *u8, addrlen: *u32, out: *usize) i64
 ```
+
+accept a connection as a blocking, close-on-exec socket
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | listening socket fd |
+| `addr` | receives the peer address, or nil |
+| `addrlen` | in, the capacity of addr, out, its size |
+| `out` | receives the handle, all bits one on failure |
+| **returns** | 0, or negative errno |
 
 ### sock_accept_flags
 
@@ -1518,17 +2006,50 @@ pub fun sock_accept(fd: usize, addr: *u8, addrlen: *u32, out: *usize) i64
 pub fun sock_accept_flags(fd: usize, addr: *u8, addrlen: *u32, nonblocking: bool, non_inheritable: bool, out: *usize) i64
 ```
 
+accept a connection with chosen blocking and inheritance
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | listening socket fd |
+| `addr` | receives the peer address, or nil |
+| `addrlen` | in, the capacity of addr, out, its size |
+| `nonblocking` | true for a nonblocking socket |
+| `non_inheritable` | true to set close-on-exec |
+| `out` | receives the handle, all bits one on failure, nil is EINVAL |
+| **returns** | 0, or negative errno |
+
 ### sock_connect
 
 ```mach
 pub fun sock_connect(fd: usize, addr: *u8, addrlen: usize) i64
 ```
 
+connect a socket to a peer
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| `addr` | the peer sockaddr |
+| `addrlen` | size of the sockaddr, above u32 range is EINVAL |
+| **returns** | 0, or negative errno (EINPROGRESS on a nonblocking socket) |
+
 ### sock_sendto
 
 ```mach
 pub fun sock_sendto(fd: usize, buf: *u8, len: usize, flags: i32, addr: *u8, addrlen: usize) i64
 ```
+
+send bytes to an address
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| `buf` | source bytes |
+| `len` | bytes to send |
+| `flags` | MSG_* bits |
+| `addr` | destination sockaddr, or nil on a connected socket |
+| `addrlen` | size of addr, above u32 range is EINVAL |
+| **returns** | bytes sent, or negative errno |
 
 ### sock_peek_readable
 
@@ -1549,11 +2070,31 @@ peek at a stream socket without consuming or blocking
 pub fun sock_recvfrom(fd: usize, buf: *u8, len: usize, flags: i32, addr: *u8, addrlen: *u32) i64
 ```
 
+receive bytes with the sender's address
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| `buf` | destination buffer |
+| `len` | most bytes to receive |
+| `flags` | MSG_* bits |
+| `addr` | receives the sender address, or nil |
+| `addrlen` | in, the capacity of addr, out, its size, or nil |
+| **returns** | bytes received, 0 at orderly end, or negative errno |
+
 ### sock_shutdown
 
 ```mach
 pub fun sock_shutdown(fd: usize, how: i32) i64
 ```
+
+shut down one or both directions of a socket
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| `how` | SHUT_RD, SHUT_WR or SHUT_RDWR |
+| **returns** | 0, or negative errno |
 
 ### sock_setopt
 
@@ -1561,11 +2102,33 @@ pub fun sock_shutdown(fd: usize, how: i32) i64
 pub fun sock_setopt(fd: usize, level: i32, opt: i32, value: *u8, vallen: usize) i64
 ```
 
+set a socket option
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| `level` | option level (SOL_SOCKET, IPPROTO_TCP, etc.) |
+| `opt` | option name |
+| `value` | the option value |
+| `vallen` | size of value, above u32 range is EINVAL |
+| **returns** | 0, ENOTSUP for SO_UNSUPPORTED or an option the protocol lacks, or negative errno |
+
 ### sock_getopt
 
 ```mach
 pub fun sock_getopt(fd: usize, level: i32, opt: i32, value: *u8, vallen: *u32) i64
 ```
+
+read a socket option
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| `level` | option level (SOL_SOCKET, IPPROTO_TCP, etc.) |
+| `opt` | option name |
+| `value` | receives the option value |
+| `vallen` | in, the capacity of value, out, its size |
+| **returns** | 0, ENOTSUP for SO_UNSUPPORTED or an option the protocol lacks, or negative errno |
 
 ### sock_local_addr
 
@@ -1573,17 +2136,43 @@ pub fun sock_getopt(fd: usize, level: i32, opt: i32, value: *u8, vallen: *u32) i
 pub fun sock_local_addr(fd: usize, addr: *u8, addrlen: *u32) i64
 ```
 
+read a socket's local address
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| `addr` | receives the sockaddr |
+| `addrlen` | in, the capacity of addr, out, its size |
+| **returns** | 0, or negative errno |
+
 ### sock_remote_addr
 
 ```mach
 pub fun sock_remote_addr(fd: usize, addr: *u8, addrlen: *u32) i64
 ```
 
+read a connected socket's peer address
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| `addr` | receives the sockaddr |
+| `addrlen` | in, the capacity of addr, out, its size |
+| **returns** | 0, or negative errno (ENOTCONN while unconnected) |
+
 ### sock_inheritable
 
 ```mach
 pub fun sock_inheritable(fd: usize, out: *bool) i64
 ```
+
+whether a child process would inherit a socket
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| `out` | receives true when close-on-exec is clear, nil is EINVAL |
+| **returns** | 0, or negative errno |
 
 ### sock_set_rcvtimeo
 
@@ -1625,6 +2214,13 @@ fill a buffer with cryptographic random bytes via getentropy
 ```mach
 pub fun error_message(code: i64) str
 ```
+
+a human-readable message for a negated errno
+
+| Parameter | |
+| :--- | :--- |
+| `code` | negated errno value |
+| **returns** | the message, "unknown error" for a code it does not name |
 
 ## Constants
 
@@ -1793,6 +2389,8 @@ pub rec IoVector {
 }
 ```
 
+one buffer of a gather or scatter list, the layout of struct iovec
+
 ### ProcessStatus
 
 Forwards [`std.system.os.shared.ProcessStatus`](../shared.md#processstatus).
@@ -1845,6 +2443,8 @@ pub rec ProcessWaitError {
     operation:   u8;
 }
 ```
+
+why a process wait or the release of a child's handle failed
 
 ### WaitResult
 

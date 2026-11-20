@@ -6,7 +6,7 @@ incremental FNV-1a hashing
 
 the type interners hash composite records field-by-field rather than over a
 contiguous byte buffer, so they need an incremental folding API. this mirrors
-the byte-wise FNV-1a used by the stdlib map's `hash_str`, exposed as the
+the byte-wise FNV-1a used by `std.derive`'s record hash, exposed as the
 `FNV_INIT` seed constant plus per-value `step_*` folds. `step_bytes` folds a
 whole buffer, so hashing a string is `step_bytes(FNV_INIT, s, str_len(s))`.
 

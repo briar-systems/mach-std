@@ -44,5 +44,5 @@ resolve a service name to a port via /etc/services
 
 | Parameter | |
 | :--- | :--- |
-| **returns** | the port of the first matching entry, absent when no entry matches or the file is missing, or the read failure |
+| **returns** | the port of the first matching entry, absent when no entry matches or the file is missing, or the open, read or close failure |
 

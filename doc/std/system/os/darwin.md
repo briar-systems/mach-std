@@ -117,6 +117,8 @@ pub rec DirectoryCursor {
 }
 ```
 
+an open directory enumeration, which directory_init fills in place
+
 ### DirectoryEntry
 
 Forwards the first of these whose condition holds:
@@ -923,6 +925,8 @@ Forwards the first of these whose condition holds:
 pub fun deallocate(p: ptr, size: usize) i64
 ```
 
+unmap memory allocate mapped
+
 ### reallocate
 
 Forwards the first of these whose condition holds:
@@ -947,6 +951,11 @@ Forwards the first of these whose condition holds:
 pub fun heap_region_base() usize
 ```
 
+the current end of the simulated program break
+
+the first call reserves HEAP_RESERVE bytes of inaccessible address space, and
+the break starts at its base
+
 ### heap_region_extend
 
 Forwards the first of these whose condition holds:
@@ -957,6 +966,11 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun heap_region_extend(addr: usize) usize
 ```
+
+move the simulated program break up to addr
+
+the pages between the old and the new break are made read-write. the break
+never moves down and never past the reserve
 
 ### protect
 
@@ -969,6 +983,8 @@ Forwards the first of these whose condition holds:
 pub fun protect(p: ptr, size: usize, prot: u32) i64
 ```
 
+change the protection of a memory region
+
 ### lock
 
 Forwards the first of these whose condition holds:
@@ -979,6 +995,8 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun lock(p: ptr, size: usize) i64
 ```
+
+lock a memory region into physical memory, keeping it out of swap
 
 ### unlock
 
@@ -991,6 +1009,8 @@ Forwards the first of these whose condition holds:
 pub fun unlock(p: ptr, size: usize) i64
 ```
 
+unlock a memory region lock locked
+
 ### advise
 
 Forwards the first of these whose condition holds:
@@ -1002,12 +1022,24 @@ Forwards the first of these whose condition holds:
 pub fun advise(p: ptr, size: usize, advice: u32) i64
 ```
 
+advise the kernel how a memory region will be accessed
+
 ### page_size
 
 Forwards the first of these whose condition holds:
 
 - [`std.system.os.darwin.aarch64.page_size`](darwin/aarch64.md#page_size), where `$mach.build.arch == $mach.arch.aarch64`
 - [`std.system.os.darwin.x86_64.page_size`](darwin/x86_64.md#page_size), where `$mach.build.arch == $mach.arch.x86_64`
+
+Declared by the first of these arms whose condition holds.
+
+Where `$mach.build.arch == $mach.arch.aarch64`:
+
+```mach
+pub fun page_size() usize
+```
+
+Where `$mach.build.arch == $mach.arch.x86_64`:
 
 ```mach
 pub fun page_size() usize
@@ -1024,6 +1056,8 @@ Forwards the first of these whose condition holds:
 pub fun map_file(fd: i32, offset: usize, size: usize, prot: u32) ptr
 ```
 
+map part of a file into memory, shared with the file
+
 ### sync_file
 
 Forwards the first of these whose condition holds:
@@ -1034,6 +1068,8 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun sync_file(p: ptr, size: usize) i64
 ```
+
+flush a shared file mapping to its file and wait for the write
 
 ### read
 
@@ -1059,6 +1095,11 @@ Forwards the first of these whose condition holds:
 pub fun write(fd: i32, buf: *u8, count: usize) i64
 ```
 
+write bytes to a descriptor
+
+a call EINTR interrupts is tried again, for at most EINTR_MAX_RETRIES attempts
+in all
+
 ### read_at
 
 Forwards the first of these whose condition holds:
@@ -1082,6 +1123,11 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun write_at(fd: i32, buf: *u8, count: usize, offset: u64) i64
 ```
+
+write bytes at a file offset without moving the descriptor offset
+
+a call EINTR interrupts is tried again, for at most EINTR_MAX_RETRIES attempts
+in all
 
 ### open
 
@@ -1156,6 +1202,8 @@ Forwards the first of these whose condition holds:
 pub fun stat(fd: i32, st: *stat_t) i64
 ```
 
+read an open file's metadata
+
 ### set_mode
 
 Forwards the first of these whose condition holds:
@@ -1167,6 +1215,8 @@ Forwards the first of these whose condition holds:
 pub fun set_mode(fd: i32, mode: i32) i64
 ```
 
+set a file's permission bits through an open descriptor
+
 ### set_mode_at
 
 Forwards the first of these whose condition holds:
@@ -1177,6 +1227,9 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun set_mode_at(dirfd: i32, name: *u8, mode: i32) i64
 ```
+
+set the permission bits of a path relative to a directory, without following
+a final symlink
 
 ### set_mode_at_native
 
@@ -1216,6 +1269,11 @@ Forwards the first of these whose condition holds:
 pub fun identity_at(dirfd: i32, path: *u8, out: *std.system.file_identity.Identity) i64
 ```
 
+the identity of the object a path relative to a directory names, without
+following a final symlink
+
+the identity is observational and retains nothing
+
 ### identity_at_native
 
 Forwards the first of these whose condition holds:
@@ -1226,6 +1284,11 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun identity_at(dirfd: i32, path: *u8, out: *std.system.file_identity.Identity) i64
 ```
+
+the identity of the object a path relative to a directory names, without
+following a final symlink
+
+the identity is observational and retains nothing
 
 ### retain_identity_at
 
@@ -1264,6 +1327,11 @@ Forwards the first of these whose condition holds:
 pub fun publication_capabilities(fd: i32) i64
 ```
 
+the cooperative publication capabilities of the filesystem holding fd
+
+only a local apfs or hfs volume has any, and it has PUBLICATION_CLAIMS and
+PUBLICATION_READ_RETAIN_REPLACE
+
 ### stat_path
 
 Forwards the first of these whose condition holds:
@@ -1275,6 +1343,8 @@ Forwards the first of these whose condition holds:
 pub fun stat_path(dirfd: i32, path: *u8, st: *stat_t, flags: i32) i64
 ```
 
+read a path's metadata relative to a directory
+
 ### stat_path_native
 
 Forwards the first of these whose condition holds:
@@ -1285,6 +1355,8 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun stat_path(dirfd: i32, path: *u8, st: *stat_t, flags: i32) i64
 ```
+
+read a path's metadata relative to a directory
 
 ### stat_mode
 
@@ -1313,6 +1385,8 @@ Forwards the first of these whose condition holds:
 pub fun unlink(dirfd: i32, path: *u8, flags: i32) i64
 ```
 
+remove a name relative to a directory
+
 ### unlink_native
 
 Forwards the first of these whose condition holds:
@@ -1323,6 +1397,8 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun unlink(dirfd: i32, path: *u8, flags: i32) i64
 ```
+
+remove a name relative to a directory
 
 ### rename
 
@@ -1335,6 +1411,8 @@ Forwards the first of these whose condition holds:
 pub fun rename(olddir: i32, oldpath: *u8, newdir: i32, newpath: *u8) i64
 ```
 
+rename a path, each side relative to its own directory
+
 ### rename_native
 
 Forwards the first of these whose condition holds:
@@ -1345,6 +1423,8 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun rename(olddir: i32, oldpath: *u8, newdir: i32, newpath: *u8) i64
 ```
+
+rename a path, each side relative to its own directory
 
 ### symlink
 
@@ -1389,6 +1469,8 @@ Forwards the first of these whose condition holds:
 pub fun make_dir(dirfd: i32, path: *u8, mode: i32) i64
 ```
 
+create a directory relative to a directory
+
 ### make_dir_native
 
 Forwards the first of these whose condition holds:
@@ -1399,6 +1481,8 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun make_dir(dirfd: i32, path: *u8, mode: i32) i64
 ```
+
+create a directory relative to a directory
 
 ### directory_init
 
@@ -1424,6 +1508,12 @@ Forwards the first of these whose condition holds:
 pub fun directory_next(cursor: *DirectoryCursor, out: *DirectoryEntry) i64
 ```
 
+read the next entry of a directory cursor
+
+a failure is sticky, so every later call returns the same code. a record
+with an empty name, a name or terminator past its extent, or a null byte
+inside the name is EIO
+
 ### directory_dnit
 
 Forwards the first of these whose condition holds:
@@ -1448,6 +1538,8 @@ Forwards the first of these whose condition holds:
 pub fun access(dirfd: i32, path: *u8, mode: i32, flags: i32) i64
 ```
 
+check access to a path relative to a directory
+
 ### access_native
 
 Forwards the first of these whose condition holds:
@@ -1458,6 +1550,8 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun access(dirfd: i32, path: *u8, mode: i32, flags: i32) i64
 ```
+
+check access to a path relative to a directory
 
 ### seek
 
@@ -1745,7 +1839,7 @@ pub fun spawn_redirected_in(pathname: *u8, argv: **u8, envp: Environment, cwd: *
 spawn a child with redirected streams and an explicit working directory
 
 `cwd` is the directory the child starts in, or nil to inherit the parent's.
-the chdir happens in the child, after the fork/clone, so the parent's own
+the chdir happens in the child, after the fork, so the parent's own
 working directory is untouched. passing it here rather than prefixing a `cd`
 onto a shell command keeps the path out of the command line, where it would
 have to survive a quoting convention the target program may not share
@@ -1831,7 +1925,7 @@ pub fun spawn_redirected_in(pathname: *u8, argv: **u8, envp: Environment, cwd: *
 spawn a child with redirected streams and an explicit working directory
 
 `cwd` is the directory the child starts in, or nil to inherit the parent's.
-the chdir happens in the child, after the fork/clone, so the parent's own
+the chdir happens in the child, after the fork, so the parent's own
 working directory is untouched. passing it here rather than prefixing a `cd`
 onto a shell command keeps the path out of the command line, where it would
 have to survive a quoting convention the target program may not share
@@ -2185,6 +2279,8 @@ Forwards the first of these whose condition holds:
 pub fun wait_pid(pid: i64, status: *std.system.os.shared.ProcessStatus, options: i32) std.system.os.shared.WaitResult
 ```
 
+wait for a child to change state, as wait does without resource usage
+
 ### ProcessStatus
 
 Forwards the first of these whose condition holds:
@@ -2200,6 +2296,8 @@ pub rec ProcessStatus {
     core_dumped: bool;
 }
 ```
+
+one observed change in a child's state
 
 ### FileLimit
 
@@ -2279,6 +2377,8 @@ pub rec ProcessWaitError {
     operation:   u8;
 }
 ```
+
+why a process wait or the release of a child's handle failed
 
 ### WaitResult
 
@@ -2764,6 +2864,8 @@ Forwards the first of these whose condition holds:
 pub fun sock_send(fd: usize, buf: *u8, len: usize) i64
 ```
 
+send bytes on a connected socket through write
+
 ### sock_recv
 
 Forwards the first of these whose condition holds:
@@ -2803,6 +2905,8 @@ pub rec IoVector {
 }
 ```
 
+one buffer of a gather or scatter list, the layout of struct iovec
+
 ### sock_write_vector
 
 Forwards the first of these whose condition holds:
@@ -2814,6 +2918,8 @@ Forwards the first of these whose condition holds:
 pub fun sock_write_vector(fd: usize, vectors: *IoVector, count: usize) i64
 ```
 
+write a gather list to a socket
+
 ### sock_send_message
 
 Forwards the first of these whose condition holds:
@@ -2824,6 +2930,8 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun sock_send_message(fd: usize, vectors: *IoVector, vector_count: usize, address: *u8, address_length: u32, control: *u8, control_length: usize) i64
 ```
+
+send a gather list with an optional address and ancillary data
 
 ### sock_receive_message
 
@@ -2903,6 +3011,8 @@ Forwards the first of these whose condition holds:
 pub fun sock_close(fd: usize) i64
 ```
 
+close a socket
+
 ### sock_create
 
 Forwards the first of these whose condition holds:
@@ -2913,6 +3023,8 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun sock_create(domain: i32, typ: i32, protocol: i32, out: *usize) i64
 ```
+
+create a blocking, close-on-exec socket
 
 ### sock_create_flags
 
@@ -2925,6 +3037,8 @@ Forwards the first of these whose condition holds:
 pub fun sock_create_flags(domain: i32, typ: i32, protocol: i32, nonblocking: bool, non_inheritable: bool, out: *usize) i64
 ```
 
+create a socket with chosen blocking and inheritance
+
 ### sock_bind
 
 Forwards the first of these whose condition holds:
@@ -2935,6 +3049,8 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun sock_bind(fd: usize, addr: *u8, addrlen: usize) i64
 ```
+
+bind a socket to a local address
 
 ### sock_listen
 
@@ -2947,6 +3063,8 @@ Forwards the first of these whose condition holds:
 pub fun sock_listen(fd: usize, backlog: i32) i64
 ```
 
+mark a socket as accepting connections
+
 ### sock_accept
 
 Forwards the first of these whose condition holds:
@@ -2957,6 +3075,8 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun sock_accept(fd: usize, addr: *u8, addrlen: *u32, out: *usize) i64
 ```
+
+accept a connection as a blocking, close-on-exec socket
 
 ### sock_accept_flags
 
@@ -2969,6 +3089,8 @@ Forwards the first of these whose condition holds:
 pub fun sock_accept_flags(fd: usize, addr: *u8, addrlen: *u32, nonblocking: bool, non_inheritable: bool, out: *usize) i64
 ```
 
+accept a connection with chosen blocking and inheritance
+
 ### sock_connect
 
 Forwards the first of these whose condition holds:
@@ -2979,6 +3101,8 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun sock_connect(fd: usize, addr: *u8, addrlen: usize) i64
 ```
+
+connect a socket to a peer
 
 ### sock_sendto
 
@@ -2991,6 +3115,8 @@ Forwards the first of these whose condition holds:
 pub fun sock_sendto(fd: usize, buf: *u8, len: usize, flags: i32, addr: *u8, addrlen: usize) i64
 ```
 
+send bytes to an address
+
 ### sock_recvfrom
 
 Forwards the first of these whose condition holds:
@@ -3001,6 +3127,8 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun sock_recvfrom(fd: usize, buf: *u8, len: usize, flags: i32, addr: *u8, addrlen: *u32) i64
 ```
+
+receive bytes with the sender's address
 
 ### sock_peek_readable
 
@@ -3026,6 +3154,8 @@ Forwards the first of these whose condition holds:
 pub fun sock_shutdown(fd: usize, how: i32) i64
 ```
 
+shut down one or both directions of a socket
+
 ### sock_setopt
 
 Forwards the first of these whose condition holds:
@@ -3036,6 +3166,8 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun sock_setopt(fd: usize, level: i32, opt: i32, value: *u8, vallen: usize) i64
 ```
+
+set a socket option
 
 ### sock_getopt
 
@@ -3048,6 +3180,8 @@ Forwards the first of these whose condition holds:
 pub fun sock_getopt(fd: usize, level: i32, opt: i32, value: *u8, vallen: *u32) i64
 ```
 
+read a socket option
+
 ### sock_local_addr
 
 Forwards the first of these whose condition holds:
@@ -3058,6 +3192,8 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun sock_local_addr(fd: usize, addr: *u8, addrlen: *u32) i64
 ```
+
+read a socket's local address
 
 ### sock_remote_addr
 
@@ -3070,6 +3206,8 @@ Forwards the first of these whose condition holds:
 pub fun sock_remote_addr(fd: usize, addr: *u8, addrlen: *u32) i64
 ```
 
+read a connected socket's peer address
+
 ### sock_inheritable
 
 Forwards the first of these whose condition holds:
@@ -3080,6 +3218,8 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun sock_inheritable(fd: usize, out: *bool) i64
 ```
+
+whether a child process would inherit a socket
 
 ### IoCompletion
 
@@ -3168,6 +3308,9 @@ Forwards the first of these whose condition holds:
 pub fun io_queue_create(queue: *std.system.os.shared.IoQueue) i64
 ```
 
+open a close-on-exec kqueue for queue, with the user event io_queue_wake
+posts already registered
+
 ### io_queue_wait
 
 Forwards the first of these whose condition holds:
@@ -3179,6 +3322,8 @@ Forwards the first of these whose condition holds:
 pub fun io_queue_wait(queue: *std.system.os.shared.IoQueue, timeout_ms: i32) i64
 ```
 
+wait up to timeout_ms for one completion and discard it
+
 ### io_queue_watch
 
 Forwards the first of these whose condition holds:
@@ -3189,6 +3334,11 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun io_queue_watch(queue: *std.system.os.shared.IoQueue, resource: usize, context: usize, events: u32) i64
 ```
+
+register one-shot readiness interest in a descriptor
+
+each requested direction gets its own one-shot filter, which fires once until
+it is armed again. registering an existing filter updates it
 
 ### io_queue_rearm
 
@@ -3230,6 +3380,9 @@ Forwards the first of these whose condition holds:
 pub fun io_queue_unwatch(queue: *std.system.os.shared.IoQueue, resource: usize) i64
 ```
 
+drop both readiness filters of a descriptor, where one that is not
+registered is not an error
+
 ### io_queue_poll
 
 Forwards the first of these whose condition holds:
@@ -3240,6 +3393,11 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun io_queue_poll(queue: *std.system.os.shared.IoQueue, completions: *IoCompletion, capacity: usize, timeout_ms: i32) i64
 ```
+
+collect ready completions, waiting up to timeout_ms
+
+completions is also the native kevent buffer, and each record is rewritten in
+place. a wake reports IO_EVENT_WAKE with source 0
 
 ### io_queue_wake
 
@@ -3252,6 +3410,11 @@ Forwards the first of these whose condition holds:
 pub fun io_queue_wake(queue: *std.system.os.shared.IoQueue) i64
 ```
 
+wake a thread waiting on queue
+
+only the first request before a poll harvests the wake posts the event, and
+later requests in that window return 0 having posted nothing
+
 ### io_queue_close
 
 Forwards the first of these whose condition holds:
@@ -3262,6 +3425,8 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun io_queue_close(queue: *std.system.os.shared.IoQueue) i64
 ```
+
+close the kqueue behind queue, where closing a closed queue returns 0
 
 ### sock_set_rcvtimeo
 
@@ -3337,6 +3502,8 @@ Forwards the first of these whose condition holds:
 pub fun thread_join(native: usize, reclaimable: *i64) i64
 ```
 
+wait for a thread thread_spawn created to end, and release its native handle
+
 ### thread_detach
 
 Forwards the first of these whose condition holds:
@@ -3347,6 +3514,8 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun thread_detach(native: usize) i64
 ```
+
+hand a thread's native teardown to libpthread, so it is never joined
 
 ### thread_current_id
 
@@ -3359,6 +3528,8 @@ Forwards the first of these whose condition holds:
 pub fun thread_current_id() i64
 ```
 
+the calling thread's system-wide id
+
 ### thread_current_name
 
 Forwards the first of these whose condition holds:
@@ -3369,6 +3540,8 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun thread_current_name(name: *u8, cap: usize) i64
 ```
+
+copy the calling thread's name into name, null-terminated
 
 ### thread_wait
 
@@ -3491,4 +3664,6 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun error_message(code: i64) str
 ```
+
+a human-readable message for a negated errno
 

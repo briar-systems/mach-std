@@ -13,9 +13,18 @@ Uses types from [`std.allocator`](../../../allocator.md), [`std.net.async.readin
 | Functions | |
 | :--- | :--- |
 | [`init`](#init) | initial is the size the backend starts at: the operation, resource and ready tables grow on demand and the resource map rehashes with them |
-| [`create_connect`](#create_connect), [`cleanup_listener`](#cleanup_listener), [`rename_listener`](#rename_listener), [`close_resource`](#close_resource) | |
+| [`create_connect`](#create_connect) | create a nonblocking local stream socket to connect to an endpoint |
+| [`cleanup_listener`](#cleanup_listener) | remove a listener's socket file when it is still the node the listener bound |
+| [`rename_listener`](#rename_listener) | move a listener's socket file to another path |
+| [`close_resource`](#close_resource) | close a native socket outside any operation |
 | [`detach`](#detach) | give up a socket with nothing queued on it, so another backend can take it: its registration and record go and the socket stays open |
-| [`submit_accept`](#submit_accept), [`submit_connect`](#submit_connect), [`submit_read`](#submit_read), [`submit_readable`](#submit_readable), [`submit_write`](#submit_write), [`submit_shutdown_write`](#submit_shutdown_write), [`submit_close`](#submit_close) | |
+| [`submit_accept`](#submit_accept) | queue an accept on a listening socket |
+| [`submit_connect`](#submit_connect) | queue a connect of a socket to a local endpoint |
+| [`submit_read`](#submit_read) | queue a read into a borrowed buffer |
+| [`submit_readable`](#submit_readable) | queue a wait for the stream to be readable, reading nothing |
+| [`submit_write`](#submit_write) | queue a write from a borrowed buffer |
+| [`submit_shutdown_write`](#submit_shutdown_write) | queue a shutdown of the write side, behind the writes already queued |
+| [`submit_close`](#submit_close) | queue a close, which closes the native socket once its queued writes finish |
 
 | Forwards | |
 | :--- | :--- |
@@ -44,11 +53,26 @@ tables grow on demand and the resource map rehashes with them
 pub fun create_connect(value: std.net.local.endpoint.Endpoint, resource: *usize) i64
 ```
 
+create a nonblocking local stream socket to connect to an endpoint
+
+| Parameter | |
+| :--- | :--- |
+| `value` | the endpoint it will connect to |
+| `resource` | receives the socket, owned by the caller |
+| **returns** | 0, or a negative native error |
+
 ### cleanup_listener
 
 ```mach
 pub fun cleanup_listener(listener: *std.net.local.types.Listener) i64
 ```
+
+remove a listener's socket file when it is still the node the listener bound
+
+| Parameter | |
+| :--- | :--- |
+| `listener` | the listener |
+| **returns** | 0, also when nothing is there, EBUSY when the path is not the listener's node, or a negative native error |
 
 ### rename_listener
 
@@ -56,11 +80,27 @@ pub fun cleanup_listener(listener: *std.net.local.types.Listener) i64
 pub fun rename_listener(listener: *std.net.local.types.Listener, replacement: std.net.local.endpoint.Endpoint) i64
 ```
 
+move a listener's socket file to another path
+
+| Parameter | |
+| :--- | :--- |
+| `listener` | the listener |
+| `replacement` | the new endpoint |
+| **returns** | 0, EEXIST when the new path is taken, EBUSY when the old path is not the listener's node, or a negative native error |
+
 ### close_resource
 
 ```mach
 pub fun close_resource(backend: *std.net.async.readiness.Backend, resource: usize) i64
 ```
+
+close a native socket outside any operation
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | unused |
+| `resource` | the native socket |
+| **returns** | 0, or a negative native error |
 
 ### detach
 
@@ -82,11 +122,32 @@ its registration and record go and the socket stays open
 pub fun submit_accept(backend: *std.net.async.readiness.Backend, listener: usize, context: usize, token: *std.net.async.types.Token) i64
 ```
 
+queue an accept on a listening socket
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend |
+| `listener` | the native listening socket |
+| `context` | the caller's context, carried to the completion |
+| `token` | receives the operation's token |
+| **returns** | 0 once queued, or a negative native error. the completion's resource is the accepted socket, nonblocking and owned by the caller |
+
 ### submit_connect
 
 ```mach
 pub fun submit_connect(backend: *std.net.async.readiness.Backend, resource_value: usize, peer: std.net.local.endpoint.Endpoint, context: usize, token: *std.net.async.types.Token) i64
 ```
+
+queue a connect of a socket to a local endpoint
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend |
+| `resource_value` | the native socket |
+| `peer` | the endpoint to connect to, copied |
+| `context` | the caller's context, carried to the completion |
+| `token` | receives the operation's token |
+| **returns** | 0 once queued, or a negative native error |
 
 ### submit_read
 
@@ -94,11 +155,34 @@ pub fun submit_connect(backend: *std.net.async.readiness.Backend, resource_value
 pub fun submit_read(backend: *std.net.async.readiness.Backend, resource_value: usize, buffer: *u8, length: usize, context: usize, token: *std.net.async.types.Token) i64
 ```
 
+queue a read into a borrowed buffer. descriptor rights sent with the bytes are
+closed on linux and fail the read with ENOTSUP on darwin
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend |
+| `resource_value` | the native socket |
+| `buffer` | where the bytes go, borrowed until the operation completes |
+| `length` | the buffer size in bytes |
+| `context` | the caller's context, carried to the completion |
+| `token` | receives the operation's token |
+| **returns** | 0 once queued, or a negative native error |
+
 ### submit_readable
 
 ```mach
 pub fun submit_readable(backend: *std.net.async.readiness.Backend, resource_value: usize, context: usize, token: *std.net.async.types.Token) i64
 ```
+
+queue a wait for the stream to be readable, reading nothing
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend |
+| `resource_value` | the native socket |
+| `context` | the caller's context, carried to the completion |
+| `token` | receives the operation's token |
+| **returns** | 0 once queued, or a negative native error |
 
 ### submit_write
 
@@ -106,17 +190,49 @@ pub fun submit_readable(backend: *std.net.async.readiness.Backend, resource_valu
 pub fun submit_write(backend: *std.net.async.readiness.Backend, resource_value: usize, buffer: *u8, length: usize, context: usize, token: *std.net.async.types.Token) i64
 ```
 
+queue a write from a borrowed buffer
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend |
+| `resource_value` | the native socket |
+| `buffer` | the bytes to send, borrowed until the operation completes |
+| `length` | bytes to send |
+| `context` | the caller's context, carried to the completion |
+| `token` | receives the operation's token |
+| **returns** | 0 once queued, or a negative native error |
+
 ### submit_shutdown_write
 
 ```mach
 pub fun submit_shutdown_write(backend: *std.net.async.readiness.Backend, resource_value: usize, context: usize, token: *std.net.async.types.Token) i64
 ```
 
+queue a shutdown of the write side, behind the writes already queued
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend |
+| `resource_value` | the native socket |
+| `context` | the caller's context, carried to the completion |
+| `token` | receives the operation's token |
+| **returns** | 0 once queued, or a negative native error |
+
 ### submit_close
 
 ```mach
 pub fun submit_close(backend: *std.net.async.readiness.Backend, resource_value: usize, context: usize, token: *std.net.async.types.Token) i64
 ```
+
+queue a close, which closes the native socket once its queued writes finish
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend |
+| `resource_value` | the native socket, owned by the backend from here |
+| `context` | the caller's context, carried to the completion |
+| `token` | receives the operation's token |
+| **returns** | 0 once queued, or a negative native error |
 
 ## Forwards
 
@@ -130,6 +246,8 @@ pub rec Token {
     generation: u32;
 }
 ```
+
+names one operation a backend holds, refused once the slot is reused
 
 ### NativeCompletion
 
@@ -146,6 +264,8 @@ pub rec NativeCompletion {
     end_of_stream: bool;
 }
 ```
+
+what a backend reports for one finished operation
 
 ### CANCEL_NEEDS_NATIVE_CONTROL
 
@@ -192,6 +312,8 @@ pub rec Backend {
 }
 ```
 
+a readiness backend: the native queue, the tables and the finished queue
+
 ### aliases
 
 Forwards [`std.net.async.readiness.aliases`](../readiness.md#aliases).
@@ -199,6 +321,8 @@ Forwards [`std.net.async.readiness.aliases`](../readiness.md#aliases).
 ```mach
 pub fun aliases(backend: *Backend, data: *u8, len: usize) bool
 ```
+
+whether a caller range overlaps memory the backend owns
 
 ### cancel
 
@@ -221,6 +345,8 @@ Forwards [`std.net.async.readiness.flush`](../readiness.md#flush).
 pub fun flush(backend: *Backend) i64
 ```
 
+publish the finished operations without waiting
+
 ### dispatch
 
 Forwards [`std.net.async.readiness.dispatch`](../readiness.md#dispatch).
@@ -235,6 +361,8 @@ pub fun dispatch(
     claimed: *bool,
 ) i64
 ```
+
+handle one event the runtime's shared queue delivered
 
 ### poll
 
@@ -254,6 +382,8 @@ Forwards [`std.net.async.readiness.completion`](../readiness.md#completion).
 pub fun completion(backend: *Backend, index: usize, out: *std.net.async.types.NativeCompletion) i64
 ```
 
+copy out one completion the last publish made readable
+
 ### dnit
 
 Forwards [`std.net.async.readiness.dnit`](../readiness.md#dnit).
@@ -261,4 +391,6 @@ Forwards [`std.net.async.readiness.dnit`](../readiness.md#dnit).
 ```mach
 pub fun dnit(backend: *Backend) i64
 ```
+
+release the backend, its idle resources and their registrations
 

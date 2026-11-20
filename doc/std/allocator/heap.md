@@ -61,7 +61,8 @@ how many bytes the pool may hold:
 
 native_source is only on a target with the pages capability. init's budget bounds the retained empty spans. a heap
 over a source that cannot release keeps them past the budget, because there
-is nowhere else for them to go. allocator_source makes that choice once: over
+is nowhere else for them to go, and one whose release is refused is kept too,
+so dnit tries it again and reports the failure. allocator_source makes that choice once: over
 a backing that does not reclaim it leaves fn_release nil, so the heap keeps
 every span it obtained and reuses it, and mapped_bytes still counts them
 after dnit because the backing never took them back.
@@ -297,7 +298,7 @@ initialized once and then shared; every field below is under `lock`.
 | `spans` | `*Span` | empty class spans held for reuse |
 | `cache` | `*Span` | freed large spans held for reuse |
 | `large` | `*Span` | live spans holding one block reachable by address masking |
-| `huge` | `*Span` | live spans holding one block aligned past SPAN_ALIGN |
+| `huge` | `*Span` | live spans holding one block aligned at or past SPAN_ALIGN |
 | `held` | `usize` | bytes in `spans` and `cache` |
 | `budget` | `usize` | byte ceiling for `held` before a span is handed back to the source |
 | `live` | `usize` | bytes in live blocks, counted as class size or payload capacity |
@@ -306,6 +307,8 @@ initialized once and then shared; every field below is under `lock`.
 | `blocks` | `usize` | live block count |
 | `total_blocks` | `usize` | blocks handed out over the heap's life, never decremented |
 | `total_bytes` | `usize` | bytes charged for them, counted as `live` counts and never decremented |
+| `idx_small` | `[64]u8` | class index for each 16 byte step of a size up to 1024 |
+| `idx_mid` | `[64]u8` | class index for each 128 byte step of a size up to MAX_SMALL |
 
 ### init
 

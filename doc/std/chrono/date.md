@@ -49,7 +49,8 @@ Source: [`src/chrono/date.mach`](../../../src/chrono/date.mach)
 | :--- | :--- |
 | [`is_leap_year`](#is_leap_year) | report whether year is a leap year |
 | [`days_in_month`](#days_in_month) | return the number of days in a given month |
-| [`floor_div`](#floor_div), [`civil_to_days`](#civil_to_days) | |
+| [`floor_div`](#floor_div) | divide rounding toward negative infinity |
+| [`civil_to_days`](#civil_to_days) | count the days from 1970-01-01 to a date of the proleptic Gregorian calendar |
 
 ---
 
@@ -376,9 +377,26 @@ return the number of days in a given month
 pub fun floor_div(a: i64, b: i64) i64
 ```
 
+divide rounding toward negative infinity
+
+| Parameter | |
+| :--- | :--- |
+| `a` | dividend |
+| `b` | divisor, nonzero |
+| **returns** | the largest integer not above a / b |
+
 ### civil_to_days
 
 ```mach
 pub fun civil_to_days(y: i64, m: i64, d: i64) i64
 ```
+
+count the days from 1970-01-01 to a date of the proleptic Gregorian calendar
+
+| Parameter | |
+| :--- | :--- |
+| `y` | year |
+| `m` | month [1, 12] |
+| `d` | day of month [1, 31] |
+| **returns** | days since the unix epoch, negative before it |
 

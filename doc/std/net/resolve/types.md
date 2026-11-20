@@ -13,12 +13,12 @@ Uses types from [`std.allocator`](../../allocator.md), [`std.net.ip`](../ip.md),
 | [`Family`](#family) | `def` |  |
 | [`SocketKind`](#socketkind) | `def` |  |
 | [`ErrorKind`](#errorkind) | `def` |  |
-| [`Error`](#error) | `rec` |  |
-| [`Token`](#token) | `rec` |  |
-| [`Query`](#query) | `rec` |  |
-| [`ResultLimits`](#resultlimits) | `rec` |  |
+| [`Error`](#error) | `rec` | a resolver failure |
+| [`Token`](#token) | `rec` | names one submitted lookup |
+| [`Query`](#query) | `rec` | what a lookup asks for |
+| [`ResultLimits`](#resultlimits) | `rec` | caps on what one resolution may allocate |
 | [`Resolution`](#resolution) | `rec` | result storage belongs to the caller after completion is dequeued |
-| [`Completion`](#completion) | `rec` |  |
+| [`Completion`](#completion) | `rec` | one finished lookup as the resolver delivers it |
 | [`AdapterFun`](#adapterfun) | `def` | a resolver backend: context, the scope that bounds and cancels the lookup, the query, the result's allocator, its limits and the result to fill |
 
 | On `Family` | |
@@ -92,6 +92,13 @@ pub rec Error {
 }
 ```
 
+a resolver failure
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `kind` | `ErrorKind` | what kind of failure it is |
+| `native_code` | `i64` | the backend's own status, 0 when there is none |
+
 ## Token
 
 ```mach
@@ -100,6 +107,13 @@ pub rec Token {
     generation: u32;
 }
 ```
+
+names one submitted lookup
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `index` | `u32` | the lookup slot |
+| `generation` | `u32` | the slot's use count, so a stale token never names a later lookup |
 
 ## Query
 
@@ -114,6 +128,17 @@ pub rec Query {
 }
 ```
 
+what a lookup asks for
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `host` | `str` | nul-terminated host name or numeric address, nil only with PASSIVE |
+| `service` | `str` | nul-terminated service name or port, nil for port zero |
+| `family` | `Family` | the address families wanted |
+| `socket_kind` | `SocketKind` | the socket kind the service is looked up for |
+| `protocol` | `i32` | the protocol number handed to the system resolver, 0 for any |
+| `flags` | `u32` | CANONICAL_NAME, NUMERIC_HOST, NUMERIC_SERVICE and PASSIVE bits |
+
 ## ResultLimits
 
 ```mach
@@ -122,6 +147,13 @@ pub rec ResultLimits {
     max_canonical_name_bytes: usize;
 }
 ```
+
+caps on what one resolution may allocate
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `max_endpoints` | `usize` | the most endpoints a resolution may hold |
+| `max_canonical_name_bytes` | `usize` | the most bytes a canonical name may take, its terminator included |
 
 ## Resolution
 
@@ -150,6 +182,16 @@ pub rec Completion {
     error:      Error;
 }
 ```
+
+one finished lookup as the resolver delivers it
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `token` | `Token` | the lookup it finishes |
+| `context` | `usize` | the caller's value given at submission |
+| `resolution` | `Resolution` | the result, which the caller owns once the completion is dequeued |
+| `has_error` | `bool` | the lookup failed and error says how |
+| `error` | `Error` | the failure, kind NO_ERROR on success |
 
 ## AdapterFun
 

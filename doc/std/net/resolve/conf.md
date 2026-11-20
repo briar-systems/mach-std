@@ -14,7 +14,8 @@ Uses types from [`std.io.error`](../../io/error.md), [`std.net.ip`](../ip.md).
 
 | On `Config` | |
 | :--- | :--- |
-| [`defaults`](#defaults), [`search_domain`](#search_domain) | |
+| [`defaults`](#defaults) | reset config to the default policy with no nameservers or search domains |
+| [`search_domain`](#search_domain) | the search domain slot at index |
 | [`parse_line`](#parse_line) | fold one configuration line into config; comments and noise are skipped |
 | [`finish`](#finish) | a configuration with no reachable nameserver falls back to loopback, matching every mainstream resolver's behavior |
 | [`load`](#load) | load the target resolver policy from /etc/resolv.conf |
@@ -59,11 +60,25 @@ parsed resolver policy with glibc-compatible defaults and caps
 pub fun defaults(config: *Config)
 ```
 
+reset config to the default policy with no nameservers or search domains
+
+| Parameter | |
+| :--- | :--- |
+| `config` | the configuration to reset |
+
 ### search_domain
 
 ```mach
 pub fun search_domain(config: *Config, index: usize) *u8
 ```
+
+the search domain slot at index
+
+| Parameter | |
+| :--- | :--- |
+| `config` | the configuration holding the slots |
+| `index` | the slot, below MAX_SEARCH, not checked |
+| **returns** | the nul-terminated slot inside config |
 
 ### parse_line
 

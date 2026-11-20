@@ -20,7 +20,7 @@ Source: [`src/system/os/wasi/shared.mach`](../../../../../src/system/os/wasi/sha
 | :--- | :--- |
 | [`code`](#code) | the contract's code for what the host returned |
 | [`error_message`](#error_message) | the native text for a negative code |
-| [`page_size`](#page_size) | |
+| [`page_size`](#page_size) | the wasm page size, 64 KiB, which every allocation here is counted in |
 | [`map_secret`](#map_secret) | storage for span bytes between two pages, which cannot be guarded or locked here |
 | [`allocate`](#allocate) | whole zero-filled pages, kept ones first |
 | [`deallocate`](#deallocate) | keep pages for the next allocate, merged with their neighbours |
@@ -28,7 +28,9 @@ Source: [`src/system/os/wasi/shared.mach`](../../../../../src/system/os/wasi/sha
 | [`heap_region_base`](#heap_region_base) | the first address past what has been handed out |
 | [`heap_region_extend`](#heap_region_extend) | move the region's end up to addr |
 | [`protect`](#protect) | linear memory has one protection, every page readable and writable |
-| [`lock`](#lock), [`unlock`](#unlock), [`advise`](#advise) | |
+| [`lock`](#lock) | linear memory cannot be locked, so locking a region always fails |
+| [`unlock`](#unlock) | linear memory cannot be locked, so unlocking a region always fails |
+| [`advise`](#advise) | linear memory takes no access advice, so advising always fails |
 
 | Constants | |
 | :--- | :--- |
@@ -66,6 +68,12 @@ the native text for a negative code
 ```mach
 pub fun page_size() usize
 ```
+
+the wasm page size, 64 KiB, which every allocation here is counted in
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | page size in bytes |
 
 ### map_secret
 
@@ -159,17 +167,35 @@ linear memory has one protection, every page readable and writable
 pub fun lock(p: ptr, size: usize) i64
 ```
 
+linear memory cannot be locked, so locking a region always fails
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | ENOTSUP |
+
 ### unlock
 
 ```mach
 pub fun unlock(p: ptr, size: usize) i64
 ```
 
+linear memory cannot be locked, so unlocking a region always fails
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | ENOTSUP |
+
 ### advise
 
 ```mach
 pub fun advise(p: ptr, size: usize, advice: u32) i64
 ```
+
+linear memory takes no access advice, so advising always fails
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | ENOTSUP |
 
 ## Constants
 

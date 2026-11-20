@@ -46,7 +46,7 @@ Uses types from [`std.io.error`](../io/error.md).
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`Borrow`](#borrow) | `rec` |  |
+| [`Borrow`](#borrow) | `rec` | a handle to welded storage lent to the borrow table, not an address |
 
 | On `Borrow` | |
 | :--- | :--- |
@@ -83,6 +83,13 @@ pub rec Borrow {
     generation: u32;
 }
 ```
+
+a handle to welded storage lent to the borrow table, not an address
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `index` | `u32` | the entry's slot in the table |
+| `generation` | `u32` | the slot's generation when the borrow was acquired, so a handle outlived by its release names no later borrow of the same slot |
 
 ### borrow_span
 

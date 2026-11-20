@@ -66,6 +66,8 @@ pub rec timespec {
 }
 ```
 
+time specification with seconds and nanoseconds
+
 ### DirectoryCursor
 
 Forwards [`std.system.os.wasi.preview1.DirectoryCursor`](wasi/preview1.md#directorycursor), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -83,6 +85,8 @@ pub rec DirectoryCursor {
     cookie:  u64;
 }
 ```
+
+an open enumeration of one directory descriptor's entries
 
 ### DirectoryEntry
 
@@ -661,6 +665,8 @@ Forwards [`std.system.os.wasi.shared.lock`](wasi/shared.md#lock), only where `$m
 pub fun lock(p: ptr, size: usize) i64
 ```
 
+linear memory cannot be locked, so locking a region always fails
+
 ### unlock
 
 Forwards [`std.system.os.wasi.shared.unlock`](wasi/shared.md#unlock), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -668,6 +674,8 @@ Forwards [`std.system.os.wasi.shared.unlock`](wasi/shared.md#unlock), only where
 ```mach
 pub fun unlock(p: ptr, size: usize) i64
 ```
+
+linear memory cannot be locked, so unlocking a region always fails
 
 ### advise
 
@@ -677,6 +685,8 @@ Forwards [`std.system.os.wasi.shared.advise`](wasi/shared.md#advise), only where
 pub fun advise(p: ptr, size: usize, advice: u32) i64
 ```
 
+linear memory takes no access advice, so advising always fails
+
 ### page_size
 
 Forwards [`std.system.os.wasi.shared.page_size`](wasi/shared.md#page_size), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -684,6 +694,8 @@ Forwards [`std.system.os.wasi.shared.page_size`](wasi/shared.md#page_size), only
 ```mach
 pub fun page_size() usize
 ```
+
+the wasm page size, 64 KiB, which every allocation here is counted in
 
 ### map_file
 
@@ -693,6 +705,8 @@ Forwards [`std.system.os.wasi.preview1.map_file`](wasi/preview1.md#map_file), on
 pub fun map_file(fd: i32, offset: usize, size: usize, prot: u32) ptr
 ```
 
+the preview cannot map files, so this always fails
+
 ### sync_file
 
 Forwards [`std.system.os.wasi.preview1.sync_file`](wasi/preview1.md#sync_file), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -700,6 +714,8 @@ Forwards [`std.system.os.wasi.preview1.sync_file`](wasi/preview1.md#sync_file), 
 ```mach
 pub fun sync_file(p: ptr, size: usize) i64
 ```
+
+the preview cannot map files, so there is no mapping to flush
 
 ### read
 
@@ -719,6 +735,8 @@ Forwards [`std.system.os.wasi.preview1.write`](wasi/preview1.md#write), only whe
 pub fun write(fd: i32, buf: *u8, count: usize) i64
 ```
 
+write bytes to a file descriptor
+
 ### read_at
 
 Forwards [`std.system.os.wasi.preview1.read_at`](wasi/preview1.md#read_at), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -727,6 +745,8 @@ Forwards [`std.system.os.wasi.preview1.read_at`](wasi/preview1.md#read_at), only
 pub fun read_at(fd: i32, buf: *u8, count: usize, offset: u64) i64
 ```
 
+read bytes at a file offset without moving the descriptor offset
+
 ### write_at
 
 Forwards [`std.system.os.wasi.preview1.write_at`](wasi/preview1.md#write_at), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -734,6 +754,8 @@ Forwards [`std.system.os.wasi.preview1.write_at`](wasi/preview1.md#write_at), on
 ```mach
 pub fun write_at(fd: i32, buf: *u8, count: usize, offset: u64) i64
 ```
+
+write bytes at a file offset without moving the descriptor offset
 
 ### open
 
@@ -763,6 +785,8 @@ Forwards [`std.system.os.wasi.preview1.close`](wasi/preview1.md#close), only whe
 pub fun close(fd: i32) i64
 ```
 
+close a file descriptor
+
 ### sync_fd
 
 Forwards [`std.system.os.wasi.preview1.sync_fd`](wasi/preview1.md#sync_fd), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -782,6 +806,8 @@ Forwards [`std.system.os.wasi.preview1.stat`](wasi/preview1.md#stat), only where
 pub fun stat(fd: i32, st: *stat_t) i64
 ```
 
+get file status by file descriptor
+
 ### set_mode
 
 Forwards [`std.system.os.wasi.preview1.set_mode`](wasi/preview1.md#set_mode), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -789,6 +815,8 @@ Forwards [`std.system.os.wasi.preview1.set_mode`](wasi/preview1.md#set_mode), on
 ```mach
 pub fun set_mode(fd: i32, mode: i32) i64
 ```
+
+the preview has no permission bits, so setting them always fails
 
 ### set_mode_at
 
@@ -798,6 +826,8 @@ Forwards [`std.system.os.wasi.preview1.set_mode_at`](wasi/preview1.md#set_mode_a
 pub fun set_mode_at(dirfd: i32, name: *u8, mode: i32) i64
 ```
 
+the preview has no permission bits, so setting them always fails
+
 ### set_mode_at_native
 
 Forwards [`std.system.os.wasi.preview1.set_mode_at`](wasi/preview1.md#set_mode_at), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -805,6 +835,8 @@ Forwards [`std.system.os.wasi.preview1.set_mode_at`](wasi/preview1.md#set_mode_a
 ```mach
 pub fun set_mode_at(dirfd: i32, name: *u8, mode: i32) i64
 ```
+
+the preview has no permission bits, so setting them always fails
 
 ### file_identity
 
@@ -814,6 +846,8 @@ Forwards [`std.system.os.wasi.preview1.file_identity`](wasi/preview1.md#file_ide
 pub fun file_identity(fd: i32, out: *std.system.file_identity.Identity) i64
 ```
 
+the identity of the file a descriptor names, retaining nothing after the call
+
 ### identity_at
 
 Forwards [`std.system.os.wasi.preview1.identity_at`](wasi/preview1.md#identity_at), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -822,6 +856,8 @@ Forwards [`std.system.os.wasi.preview1.identity_at`](wasi/preview1.md#identity_a
 pub fun identity_at(dirfd: i32, path: *u8, out: *std.system.file_identity.Identity) i64
 ```
 
+the identity of the entry path names, without following a final symlink
+
 ### identity_at_native
 
 Forwards [`std.system.os.wasi.preview1.identity_at`](wasi/preview1.md#identity_at), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -829,6 +865,8 @@ Forwards [`std.system.os.wasi.preview1.identity_at`](wasi/preview1.md#identity_a
 ```mach
 pub fun identity_at(dirfd: i32, path: *u8, out: *std.system.file_identity.Identity) i64
 ```
+
+the identity of the entry path names, without following a final symlink
 
 ### retain_identity_at
 
@@ -868,6 +906,8 @@ Forwards [`std.system.os.wasi.preview1.stat_path`](wasi/preview1.md#stat_path), 
 pub fun stat_path(dirfd: i32, path: *u8, st: *stat_t, flags: i32) i64
 ```
 
+get file status of a path, an absolute or AT_FDCWD path resolved onto a preopen
+
 ### stat_path_native
 
 Forwards [`std.system.os.wasi.preview1.stat_path`](wasi/preview1.md#stat_path), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -875,6 +915,8 @@ Forwards [`std.system.os.wasi.preview1.stat_path`](wasi/preview1.md#stat_path), 
 ```mach
 pub fun stat_path(dirfd: i32, path: *u8, st: *stat_t, flags: i32) i64
 ```
+
+get file status of a path, an absolute or AT_FDCWD path resolved onto a preopen
 
 ### stat_mode
 
@@ -884,6 +926,8 @@ Forwards [`std.system.os.wasi.preview1.stat_mode`](wasi/preview1.md#stat_mode), 
 pub fun stat_mode(st: *stat_t) u32
 ```
 
+read the mode word from a filled stat buffer, the file type alone here
+
 ### unlink
 
 Forwards [`std.system.os.wasi.preview1.unlink`](wasi/preview1.md#unlink), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -891,6 +935,8 @@ Forwards [`std.system.os.wasi.preview1.unlink`](wasi/preview1.md#unlink), only w
 ```mach
 pub fun unlink(dirfd: i32, path: *u8, flags: i32) i64
 ```
+
+remove a file or directory, an absolute or AT_FDCWD path resolved onto a preopen
 
 ### unlink_native
 
@@ -900,6 +946,8 @@ Forwards [`std.system.os.wasi.preview1.unlink`](wasi/preview1.md#unlink), only w
 pub fun unlink(dirfd: i32, path: *u8, flags: i32) i64
 ```
 
+remove a file or directory, an absolute or AT_FDCWD path resolved onto a preopen
+
 ### rename
 
 Forwards [`std.system.os.wasi.preview1.rename`](wasi/preview1.md#rename), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -907,6 +955,8 @@ Forwards [`std.system.os.wasi.preview1.rename`](wasi/preview1.md#rename), only w
 ```mach
 pub fun rename(olddir: i32, oldpath: *u8, newdir: i32, newpath: *u8) i64
 ```
+
+rename a file, an absolute or AT_FDCWD path resolved onto a preopen
 
 ### rename_native
 
@@ -916,6 +966,8 @@ Forwards [`std.system.os.wasi.preview1.rename`](wasi/preview1.md#rename), only w
 pub fun rename(olddir: i32, oldpath: *u8, newdir: i32, newpath: *u8) i64
 ```
 
+rename a file, an absolute or AT_FDCWD path resolved onto a preopen
+
 ### symlink
 
 Forwards [`std.system.os.wasi.preview1.symlink`](wasi/preview1.md#symlink), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -923,6 +975,8 @@ Forwards [`std.system.os.wasi.preview1.symlink`](wasi/preview1.md#symlink), only
 ```mach
 pub fun symlink(target: *u8, linkpath: *u8) i64
 ```
+
+create a symbolic link at linkpath pointing to target
 
 ### symlink_native
 
@@ -932,6 +986,8 @@ Forwards [`std.system.os.wasi.preview1.symlink`](wasi/preview1.md#symlink), only
 pub fun symlink(target: *u8, linkpath: *u8) i64
 ```
 
+create a symbolic link at linkpath pointing to target
+
 ### make_dir
 
 Forwards [`std.system.os.wasi.preview1.make_dir`](wasi/preview1.md#make_dir), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -939,6 +995,8 @@ Forwards [`std.system.os.wasi.preview1.make_dir`](wasi/preview1.md#make_dir), on
 ```mach
 pub fun make_dir(dirfd: i32, path: *u8, mode: i32) i64
 ```
+
+create a directory, an absolute or AT_FDCWD path resolved onto a preopen
 
 ### make_dir_native
 
@@ -948,6 +1006,8 @@ Forwards [`std.system.os.wasi.preview1.make_dir`](wasi/preview1.md#make_dir), on
 pub fun make_dir(dirfd: i32, path: *u8, mode: i32) i64
 ```
 
+create a directory, an absolute or AT_FDCWD path resolved onto a preopen
+
 ### directory_init
 
 Forwards [`std.system.os.wasi.preview1.directory_init`](wasi/preview1.md#directory_init), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -956,6 +1016,8 @@ Forwards [`std.system.os.wasi.preview1.directory_init`](wasi/preview1.md#directo
 pub fun directory_init(out: *DirectoryCursor, fd: i32) DirectoryInitResult
 ```
 
+start enumerating a directory descriptor
+
 ### directory_next
 
 Forwards [`std.system.os.wasi.preview1.directory_next`](wasi/preview1.md#directory_next), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -963,6 +1025,11 @@ Forwards [`std.system.os.wasi.preview1.directory_next`](wasi/preview1.md#directo
 ```mach
 pub fun directory_next(cursor: *DirectoryCursor, out: *DirectoryEntry) i64
 ```
+
+read the next entry of a directory
+
+the entry's name is borrowed from the cursor's buffer until the next cursor
+operation. a failure is kept, so every later call returns it again
 
 ### directory_dnit
 
@@ -980,6 +1047,8 @@ Forwards [`std.system.os.wasi.preview1.access`](wasi/preview1.md#access), only w
 pub fun access(dirfd: i32, path: *u8, mode: i32, flags: i32) i64
 ```
 
+check that a path exists, as the preview has no permission bits to test mode against
+
 ### access_native
 
 Forwards [`std.system.os.wasi.preview1.access`](wasi/preview1.md#access), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -987,6 +1056,8 @@ Forwards [`std.system.os.wasi.preview1.access`](wasi/preview1.md#access), only w
 ```mach
 pub fun access(dirfd: i32, path: *u8, mode: i32, flags: i32) i64
 ```
+
+check that a path exists, as the preview has no permission bits to test mode against
 
 ### seek
 
@@ -1007,6 +1078,8 @@ Forwards [`std.system.os.wasi.preview1.lock_fd`](wasi/preview1.md#lock_fd), only
 pub fun lock_fd(fd: i32, op: i32) i64
 ```
 
+the preview has no advisory locks, so locking always fails
+
 ### pipe
 
 Forwards [`std.system.os.wasi.preview1.pipe`](wasi/preview1.md#pipe), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -1014,6 +1087,8 @@ Forwards [`std.system.os.wasi.preview1.pipe`](wasi/preview1.md#pipe), only where
 ```mach
 pub fun pipe(fds: *i32) i64
 ```
+
+the preview cannot create pipes, so this always fails
 
 ### getcwd
 
@@ -1053,6 +1128,8 @@ Forwards [`std.system.os.wasi.preview1.arguments`](wasi/preview1.md#arguments), 
 pub fun arguments() **u8
 ```
 
+the program's arguments capture_process read
+
 ### argument_total
 
 Forwards [`std.system.os.wasi.preview1.argument_total`](wasi/preview1.md#argument_total), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -1060,6 +1137,8 @@ Forwards [`std.system.os.wasi.preview1.argument_total`](wasi/preview1.md#argumen
 ```mach
 pub fun argument_total() usize
 ```
+
+how many arguments capture_process read
 
 ### terminate
 
@@ -1069,6 +1148,8 @@ Forwards [`std.system.os.wasi.preview1.terminate`](wasi/preview1.md#terminate), 
 pub fun terminate(code: i64)
 ```
 
+exit the process with the given code
+
 ### abort
 
 Forwards [`std.system.os.wasi.preview1.abort`](wasi/preview1.md#abort), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -1076,6 +1157,8 @@ Forwards [`std.system.os.wasi.preview1.abort`](wasi/preview1.md#abort), only whe
 ```mach
 pub fun abort()
 ```
+
+abort the process immediately with exit code 255
 
 ### terminate_child
 
@@ -1085,6 +1168,8 @@ Forwards [`std.system.os.wasi.preview1.terminate_child`](wasi/preview1.md#termin
 pub fun terminate_child(pid: i64) i64
 ```
 
+the preview has no child processes, so this always fails
+
 ### spawn
 
 Forwards [`std.system.os.wasi.preview1.spawn`](wasi/preview1.md#spawn), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -1092,6 +1177,8 @@ Forwards [`std.system.os.wasi.preview1.spawn`](wasi/preview1.md#spawn), only whe
 ```mach
 pub fun spawn(pathname: *u8, argv: **u8, envp: Environment) i64
 ```
+
+the preview cannot start processes, so this always fails
 
 ### spawn_in
 
@@ -1101,6 +1188,8 @@ Forwards [`std.system.os.wasi.preview1.spawn_in`](wasi/preview1.md#spawn_in), on
 pub fun spawn_in(pathname: *u8, argv: **u8, envp: Environment, cwd: *u8) i64
 ```
 
+the preview cannot start processes, so this always fails
+
 ### spawn_redirected
 
 Forwards [`std.system.os.wasi.preview1.spawn_redirected`](wasi/preview1.md#spawn_redirected), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -1108,6 +1197,8 @@ Forwards [`std.system.os.wasi.preview1.spawn_redirected`](wasi/preview1.md#spawn
 ```mach
 pub fun spawn_redirected(pathname: *u8, argv: **u8, envp: Environment, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) i64
 ```
+
+the preview cannot start processes, so this always fails
 
 ### spawn_redirected_in
 
@@ -1117,6 +1208,8 @@ Forwards [`std.system.os.wasi.preview1.spawn_redirected_in`](wasi/preview1.md#sp
 pub fun spawn_redirected_in(pathname: *u8, argv: **u8, envp: Environment, cwd: *u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) i64
 ```
 
+the preview cannot start processes, so this always fails
+
 ### spawn_native
 
 Forwards [`std.system.os.wasi.preview1.spawn`](wasi/preview1.md#spawn), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -1124,6 +1217,8 @@ Forwards [`std.system.os.wasi.preview1.spawn`](wasi/preview1.md#spawn), only whe
 ```mach
 pub fun spawn(pathname: *u8, argv: **u8, envp: Environment) i64
 ```
+
+the preview cannot start processes, so this always fails
 
 ### spawn_in_native
 
@@ -1133,6 +1228,8 @@ Forwards [`std.system.os.wasi.preview1.spawn_in`](wasi/preview1.md#spawn_in), on
 pub fun spawn_in(pathname: *u8, argv: **u8, envp: Environment, cwd: *u8) i64
 ```
 
+the preview cannot start processes, so this always fails
+
 ### spawn_redirected_native
 
 Forwards [`std.system.os.wasi.preview1.spawn_redirected`](wasi/preview1.md#spawn_redirected), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -1141,6 +1238,8 @@ Forwards [`std.system.os.wasi.preview1.spawn_redirected`](wasi/preview1.md#spawn
 pub fun spawn_redirected(pathname: *u8, argv: **u8, envp: Environment, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) i64
 ```
 
+the preview cannot start processes, so this always fails
+
 ### spawn_redirected_in_native
 
 Forwards [`std.system.os.wasi.preview1.spawn_redirected_in`](wasi/preview1.md#spawn_redirected_in), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -1148,6 +1247,8 @@ Forwards [`std.system.os.wasi.preview1.spawn_redirected_in`](wasi/preview1.md#sp
 ```mach
 pub fun spawn_redirected_in(pathname: *u8, argv: **u8, envp: Environment, cwd: *u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) i64
 ```
+
+the preview cannot start processes, so this always fails
 
 ### getpid
 
@@ -1167,6 +1268,8 @@ Forwards [`std.system.os.wasi.preview1.ignore_sigpipe`](wasi/preview1.md#ignore_
 pub fun ignore_sigpipe() i64
 ```
 
+the preview delivers no signals, so there is nothing to ignore
+
 ### getenv
 
 Forwards [`std.system.os.wasi.preview1.getenv`](wasi/preview1.md#getenv), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -1174,6 +1277,11 @@ Forwards [`std.system.os.wasi.preview1.getenv`](wasi/preview1.md#getenv), only w
 ```mach
 pub fun getenv(name: *u8, buf: *u8, cap: usize) i64
 ```
+
+look up an environment variable by name
+
+when the value fits (ret \< cap) it is copied and null-terminated.
+always returns the full value length, so ret >= cap signals truncation.
 
 ### environ
 
@@ -1183,6 +1291,8 @@ Forwards [`std.system.os.wasi.preview1.environ`](wasi/preview1.md#environ), only
 pub fun environ() **u8
 ```
 
+the environment capture_process read
+
 ### getenv_native
 
 Forwards [`std.system.os.wasi.preview1.getenv`](wasi/preview1.md#getenv), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -1191,6 +1301,11 @@ Forwards [`std.system.os.wasi.preview1.getenv`](wasi/preview1.md#getenv), only w
 pub fun getenv(name: *u8, buf: *u8, cap: usize) i64
 ```
 
+look up an environment variable by name
+
+when the value fits (ret \< cap) it is copied and null-terminated.
+always returns the full value length, so ret >= cap signals truncation.
+
 ### environ_native
 
 Forwards [`std.system.os.wasi.preview1.environ`](wasi/preview1.md#environ), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -1198,6 +1313,8 @@ Forwards [`std.system.os.wasi.preview1.environ`](wasi/preview1.md#environ), only
 ```mach
 pub fun environ() **u8
 ```
+
+the environment capture_process read
 
 ### temp_dir
 
@@ -1217,6 +1334,8 @@ Forwards [`std.system.os.wasi.preview1.wait`](wasi/preview1.md#wait), only where
 pub fun wait(pid: i64, status: *ProcessStatus, options: i32, rusage: *u8) WaitResult
 ```
 
+the preview has no child processes, so waiting always fails
+
 ### wait_pid
 
 Forwards [`std.system.os.wasi.preview1.wait_pid`](wasi/preview1.md#wait_pid), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -1224,6 +1343,8 @@ Forwards [`std.system.os.wasi.preview1.wait_pid`](wasi/preview1.md#wait_pid), on
 ```mach
 pub fun wait_pid(pid: i64, status: *ProcessStatus, options: i32) WaitResult
 ```
+
+the preview has no child processes, so waiting always fails
 
 ### ProcessStatus
 
@@ -1237,6 +1358,8 @@ pub rec ProcessStatus {
     core_dumped: bool;
 }
 ```
+
+one observed change in a child's state
 
 ### FileLimit
 
@@ -1272,6 +1395,8 @@ Forwards [`std.system.os.wasi.preview1.open_file_limit`](wasi/preview1.md#open_f
 pub fun open_file_limit(out: *FileLimit) i64
 ```
 
+the preview states no open-file limit, so reading it always fails
+
 ### set_open_file_limit
 
 Forwards [`std.system.os.wasi.preview1.set_open_file_limit`](wasi/preview1.md#set_open_file_limit), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -1279,6 +1404,8 @@ Forwards [`std.system.os.wasi.preview1.set_open_file_limit`](wasi/preview1.md#se
 ```mach
 pub fun set_open_file_limit(limit: FileLimit) i64
 ```
+
+the preview states no open-file limit, so setting it always fails
 
 ### ProcessWaitError
 
@@ -1291,6 +1418,8 @@ pub rec ProcessWaitError {
     operation:   u8;
 }
 ```
+
+why a process wait or the release of a child's handle failed
 
 ### WaitResult
 
@@ -1413,6 +1542,8 @@ Forwards [`std.system.os.wasi.preview1.clock_gettime`](wasi/preview1.md#clock_ge
 pub fun clock_gettime(clock_id: i32, ts: *timespec) i64
 ```
 
+get time from a clock source
+
 ### random_fill
 
 Forwards [`std.system.os.wasi.preview1.random_fill`](wasi/preview1.md#random_fill), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -1420,6 +1551,8 @@ Forwards [`std.system.os.wasi.preview1.random_fill`](wasi/preview1.md#random_fil
 ```mach
 pub fun random_fill(buf: *u8, len: usize) i64
 ```
+
+fill a buffer with cryptographic random bytes from the host
 
 ### stack_bounds
 

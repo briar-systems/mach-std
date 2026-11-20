@@ -5,7 +5,7 @@
 generic writer interface
 
 backend-agnostic write interface using ctx + fn_ptr dispatch. concrete
-sinks (fd, buffer, etc.) wire themselves via make().
+sinks (fd, buffer, etc.) build a Writer from their context and write callback.
 
 a sink hands over what it knows: the bytes it accepted, or the native
 failure it hit. this module classifies the outcome once, in write(): zero
@@ -30,7 +30,7 @@ Uses types from [`std.allocator`](../allocator.md), [`std.io.error`](error.md).
 
 | On `WriteError` | |
 | :--- | :--- |
-| [`native_failure`](#native_failure) | |
+| [`native_failure`](#native_failure) | a native failure as a write error |
 | [`persisted`](#persisted) | the bytes the sink persisted before the failure |
 | [`advance`](#advance) | add the bytes persisted by earlier calls to the error's prefix |
 | [`reprefix`](#reprefix) | the same failure with its persisted prefix replaced |
@@ -90,6 +90,14 @@ every way a write can fail
 ```mach
 pub fun native_failure(written: usize, error: std.io.error.Error) WriteError
 ```
+
+a native failure as a write error
+
+| Parameter | |
+| :--- | :--- |
+| `written` | bytes persisted before the failure |
+| `error` | the native failure |
+| **returns** | the native case carrying both |
 
 ### persisted
 

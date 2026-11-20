@@ -112,7 +112,7 @@ Uses types from [`std.allocator`](allocator.md), [`std.filesystem.removal`](file
 
 | Functions | |
 | :--- | :--- |
-| [`identity_equal`](#identity_equal) | |
+| [`identity_equal`](#identity_equal) | check whether two identity observations name the same file |
 | [`identity_link`](#identity_link) | the final symlink itself is observed and unsupported domains remain explicit |
 | [`identity_link_native`](#identity_link_native) | identity_link for a name in native units |
 | [`exists`](#exists) | check whether a path exists (as any entry, including a broken symlink) |
@@ -417,11 +417,14 @@ pub fun read_string(a: *std.allocator.Allocator, p: Path) res[str, FsError]
 
 read an entire file into an allocated, null-terminated string
 
-stats the file for its size and composes io.read_exact into an exact buffer,
-allocating once with no growth. for text; binary content with embedded NUL
-bytes loses its length to the first NUL when read through str_len. a file
-that shrinks between the stat and the read is reported as read{eof} with the
-bytes that were delivered, and nothing stays allocated.
+a regular file with a nonzero size is stat'ed and read through io.read_exact
+into an exact buffer, allocating once with no growth. anything else (pipes,
+special files, files that report no size) composes io.read_all and is cut
+to the content and its terminator. for text; binary content with embedded
+NUL bytes loses its length to the first NUL when read through str_len. a
+file that shrinks between the stat and the read is reported as read{eof}
+with the bytes that were delivered, and nothing stays allocated. a refused
+allocation is alloc on either path.
 
 | Parameter | |
 | :--- | :--- |
@@ -900,6 +903,14 @@ close and remove a native temporary file, as temp_close_and_remove does
 pub fun identity_equal(a: Identity, b: Identity) bool
 ```
 
+check whether two identity observations name the same file
+
+| Parameter | |
+| :--- | :--- |
+| `a` | first identity |
+| `b` | second identity |
+| **returns** | true when both identities are well formed and every byte matches |
+
 ### identity_link
 
 ```mach
@@ -1148,6 +1159,10 @@ pub rec Identity {
 ```
 
 opaque to filesystem callers, native producers initialize every byte
+
+byte 0 is the backend, bytes 1 to 16 are zero, bytes 17 to 24 hold the
+volume and 25 to 32 the file number, little-endian. bytes 33 to 40 are zero
+except on windows, where they may be nonzero
 
 ### SEEK_SET
 

@@ -69,7 +69,7 @@ sine of an angle in radians
 | Parameter | |
 | :--- | :--- |
 | `x` | angle in radians |
-| **returns** | sin(x) |
+| **returns** | sin(x), or nan for an infinite or nan x |
 
 ### cos_f32
 
@@ -82,7 +82,7 @@ cosine of an angle in radians
 | Parameter | |
 | :--- | :--- |
 | `x` | angle in radians |
-| **returns** | cos(x) |
+| **returns** | cos(x), or nan for an infinite or nan x |
 
 ### asin_f32
 

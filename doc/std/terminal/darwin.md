@@ -12,7 +12,7 @@ Uses types from [`std.terminal.error`](error.md).
 
 | Functions | |
 | :--- | :--- |
-| [`is_terminal`](#is_terminal) | |
+| [`is_terminal`](#is_terminal) | whether a descriptor is a terminal |
 | [`flush_input`](#flush_input) | drop whatever's sitting unread in the input queue |
 | [`is_raw`](#is_raw) | whether raw mode is currently active |
 | [`enable_raw`](#enable_raw) | switch stdin into raw mode -- same semantics as terminal.linux.enable_raw: no line buffering, no local echo, non-blocking reads (VMIN=0, VTIME=0) |
@@ -28,6 +28,13 @@ Uses types from [`std.terminal.error`](error.md).
 ```mach
 pub fun is_terminal(fd: usize) bool
 ```
+
+whether a descriptor is a terminal
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the descriptor to test |
+| **returns** | true when tcgetattr succeeds on fd, false for a pipe, a file or a closed descriptor |
 
 ### flush_input
 

@@ -126,8 +126,8 @@ pub fun parse_i64(s: str, base: u8) res[i64, ParseError]
 
 parse a signed 64-bit integer prefix from a string
 
-delegates to parse_u64 for the unsigned portion, so it inherits the same
-prefix-parsing behavior. use parse_i64_exact to require full input
+leading whitespace is skipped before the sign, and the digits after the sign
+are parsed as parse_u64 parses them, with no whitespace allowed between. use parse_i64_exact to require full input
 consumption.
 
 | Parameter | |

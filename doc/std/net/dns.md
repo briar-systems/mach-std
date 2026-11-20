@@ -74,7 +74,8 @@ resolve to the loopback address (127.0.0.1) without consulting the hosts
 file or a nameserver, this is resolver behavior, not hosts-file content,
 and so is portable across platforms whose hosts file omits localhost.
 other names fall back to the hosts file, then DNS with the target's
-search-domain policy applied.
+search-domain policy applied. on windows a name the hosts file does not
+hold is not found.
 
 | Parameter | |
 | :--- | :--- |

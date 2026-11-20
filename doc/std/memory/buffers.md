@@ -75,9 +75,9 @@ Uses types from [`std.allocator`](../allocator.md), [`std.memory.table`](table.m
 | [`Request`](#request) | `rec` | what a caller asks for |
 | [`Ref`](#ref) | `rec` | a chunk's identity: an index and a generation, stale once released |
 | [`Chunk`](#chunk) | `rec` | a held chunk |
-| [`Status`](#status) | `tag` |  |
-| [`Reason`](#reason) | `tag` |  |
-| [`Acquired`](#acquired) | `rec` |  |
+| [`Status`](#status) | `tag` | how an acquisition ended |
+| [`Reason`](#reason) | `tag` | why a call was refused |
+| [`Acquired`](#acquired) | `rec` | the outcome of an acquisition |
 | [`Budgets`](#budgets) | `rec` | the per-lane byte budgets an account opens with |
 | [`Account`](#account) | `rec` | an owner of chunks and budgets, embedded by the caller |
 | [`Shape`](#shape) | `rec` | the typed shape a held secret chunk is viewed as, built by the typed views |
@@ -85,7 +85,7 @@ Uses types from [`std.allocator`](../allocator.md), [`std.memory.table`](table.m
 | [`SecretSource`](#secretsource) | `rec` | the interface for secret-welded chunks |
 | [`ClassConfig`](#classconfig) | `rec` | one declared size class |
 | [`Config`](#config) | `rec` | pool configuration |
-| [`ClassCounters`](#classcounters) | `rec` |  |
+| [`ClassCounters`](#classcounters) | `rec` | one class's counters in a snapshot |
 | [`Snapshot`](#snapshot) | `rec` | a point-in-time view of a pool |
 | [`Pool`](#pool) | `rec` | std's buffer source |
 
@@ -211,6 +211,14 @@ pub tag Status: u8 {
 }
 ```
 
+how an acquisition ended
+
+| Case | Payload | |
+| :--- | :--- | :--- |
+| `ok` |  | the chunk was acquired |
+| `blocked` |  | a budget, the shared budget or a backing refused, see the reason |
+| `error` |  | the call was misuse and had no effect |
+
 ## Reason
 
 ```mach
@@ -223,6 +231,16 @@ pub tag Reason: u8 {
 }
 ```
 
+why a call was refused
+
+| Case | Payload | |
+| :--- | :--- | :--- |
+| `none` |  | it was not |
+| `budget` |  | the account's own lane budget, never registered for a wake-up |
+| `exhausted` |  | the global budget less every reservation is gone |
+| `memory` |  | a backing or the slot metadata refused |
+| `misuse` |  | a stale ref, a foreign chunk, a held or in-flight violation, a malformed request or a concurrent entry |
+
 ## Acquired
 
 ```mach
@@ -232,6 +250,14 @@ pub rec Acquired {
     chunk:  Chunk;
 }
 ```
+
+the outcome of an acquisition
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `status` | `Status` | how it ended |
+| `reason` | `Reason` | none on success, otherwise why it was refused |
+| `chunk` | `Chunk` | the chunk on success, the first of the set for acquire_n, zeroed otherwise |
 
 ## Budgets
 
@@ -659,6 +685,20 @@ pub rec ClassCounters {
     backing_allocations: u64;
 }
 ```
+
+one class's counters in a snapshot
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `size` | `usize` | usable bytes per chunk |
+| `live` | `usize` | chunks held |
+| `peak` | `usize` | the most chunks held at once |
+| `retained` | `usize` | released chunks kept for reuse |
+| `held_bytes` | `usize` | live times size |
+| `acquisitions` | `u64` | chunks acquired |
+| `releases` | `u64` | chunks released |
+| `refusals` | `u64` | acquisitions refused |
+| `backing_allocations` | `u64` | chunks taken from the backing |
 
 ## Snapshot
 

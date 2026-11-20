@@ -8,7 +8,7 @@ Source: [`src/runtime/freestanding/riscv32.mach`](../../../../src/runtime/freest
 
 | Functions | |
 | :--- | :--- |
-| [`_start`](#_start) | |
+| [`_start`](#_start) | the image entry, the steps the module comment lists |
 
 ---
 
@@ -22,4 +22,6 @@ Source: [`src/runtime/freestanding/riscv32.mach`](../../../../src/runtime/freest
 #[symbol("_start")]
 pub fun _start()
 ```
+
+the image entry, the steps the module comment lists
 

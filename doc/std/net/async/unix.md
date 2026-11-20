@@ -16,7 +16,11 @@ Uses types from [`std.allocator`](../../allocator.md), [`std.net.async.readiness
 | Functions | |
 | :--- | :--- |
 | [`init`](#init) | initial is the size the backend starts at: the operation, resource and ready tables grow on demand and the resource map rehashes with them |
-| [`submit_accept`](#submit_accept), [`submit_connect`](#submit_connect), [`submit_write_vector`](#submit_write_vector), [`submit_receive_batch`](#submit_receive_batch), [`submit_send_batch`](#submit_send_batch) | |
+| [`submit_accept`](#submit_accept) | queue an accept on a listening socket |
+| [`submit_connect`](#submit_connect) | queue a connect of a socket to a peer |
+| [`submit_write_vector`](#submit_write_vector) | queue a vectored write |
+| [`submit_receive_batch`](#submit_receive_batch) | queue a receive of up to count datagrams |
+| [`submit_send_batch`](#submit_send_batch) | queue a send of count datagrams, each to its own peer |
 | [`detach`](#detach) | give up a socket with nothing queued on it, so another backend can take it |
 | [`adopt`](#adopt) | take a socket another backend detached, under the opening its handle now carries, so a handle with an older opening is refused as stale |
 
@@ -47,11 +51,35 @@ tables grow on demand and the resource map rehashes with them
 pub fun submit_accept(backend: *std.net.async.readiness.Backend, listener: usize, opening: u64, peer: *std.net.ip.Endpoint, context: usize, token: *std.net.async.types.Token) i64
 ```
 
+queue an accept on a listening socket
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend |
+| `listener` | the native listening socket |
+| `opening` | the handle's opening |
+| `peer` | receives the peer's endpoint, nil to skip it. borrowed until the operation completes |
+| `context` | the caller's context, carried to the completion |
+| `token` | receives the operation's token |
+| **returns** | 0 once queued, or a negative native error or STATUS_STALE. the completion's resource is the accepted socket, nonblocking and owned by the caller |
+
 ### submit_connect
 
 ```mach
 pub fun submit_connect(backend: *std.net.async.readiness.Backend, native: usize, opening: u64, peer: std.net.ip.Endpoint, context: usize, token: *std.net.async.types.Token) i64
 ```
+
+queue a connect of a socket to a peer
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend |
+| `native` | the native socket |
+| `opening` | the handle's opening |
+| `peer` | the endpoint to connect to, copied |
+| `context` | the caller's context, carried to the completion |
+| `token` | receives the operation's token |
+| **returns** | 0 once queued, or a negative native error or STATUS_STALE |
 
 ### submit_write_vector
 
@@ -59,17 +87,57 @@ pub fun submit_connect(backend: *std.net.async.readiness.Backend, native: usize,
 pub fun submit_write_vector(backend: *std.net.async.readiness.Backend, native: usize, opening: u64, vectors: *std.net.async.types.Vector, count: usize, context: usize, token: *std.net.async.types.Token) i64
 ```
 
+queue a vectored write
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend |
+| `native` | the native socket |
+| `opening` | the handle's opening |
+| `vectors` | the buffers, borrowed with their bytes until the operation completes |
+| `count` | buffers in vectors, 1 to 1024 |
+| `context` | the caller's context, carried to the completion |
+| `token` | receives the operation's token |
+| **returns** | 0 once queued, or a negative native error or STATUS_STALE |
+
 ### submit_receive_batch
 
 ```mach
 pub fun submit_receive_batch(backend: *std.net.async.readiness.Backend, native: usize, opening: u64, packets: *std.net.async.types.Packet, count: usize, context: usize, token: *std.net.async.types.Token) i64
 ```
 
+queue a receive of up to count datagrams. the socket is configured to report
+packet metadata the first time it is seen under an opening
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend |
+| `native` | the native datagram socket |
+| `opening` | the handle's opening |
+| `packets` | the packets to fill, borrowed until the operation completes |
+| `count` | packets in the batch, at least 1 |
+| `context` | the caller's context, carried to the completion |
+| `token` | receives the operation's token |
+| **returns** | 0 once queued, or a negative native error or STATUS_STALE. the completion's items is the packets filled |
+
 ### submit_send_batch
 
 ```mach
 pub fun submit_send_batch(backend: *std.net.async.readiness.Backend, native: usize, opening: u64, packets: *std.net.async.types.Packet, count: usize, context: usize, token: *std.net.async.types.Token) i64
 ```
+
+queue a send of count datagrams, each to its own peer
+
+| Parameter | |
+| :--- | :--- |
+| `backend` | the backend |
+| `native` | the native datagram socket |
+| `opening` | the handle's opening |
+| `packets` | the packets to send, borrowed until the operation completes |
+| `count` | packets in the batch, at least 1 |
+| `context` | the caller's context, carried to the completion |
+| `token` | receives the operation's token |
+| **returns** | 0 once queued, a negative native error or STATUS_STALE, or the refusal of an invalid packet. the completion's items is the packets sent |
 
 ### detach
 
@@ -113,6 +181,8 @@ pub rec Vector {
 }
 ```
 
+one borrowed buffer of a vectored write
+
 ### Packet
 
 Forwards [`std.net.async.types.Packet`](types.md#packet).
@@ -144,6 +214,8 @@ pub rec Token {
 }
 ```
 
+names one operation a backend holds, refused once the slot is reused
+
 ### NativeCompletion
 
 Forwards [`std.net.async.types.NativeCompletion`](types.md#nativecompletion).
@@ -159,6 +231,8 @@ pub rec NativeCompletion {
     end_of_stream: bool;
 }
 ```
+
+what a backend reports for one finished operation
 
 ### CANCEL_NEEDS_NATIVE_CONTROL
 
@@ -205,6 +279,8 @@ pub rec Backend {
 }
 ```
 
+a readiness backend: the native queue, the tables and the finished queue
+
 ### aliases
 
 Forwards [`std.net.async.readiness.aliases`](readiness.md#aliases).
@@ -213,6 +289,8 @@ Forwards [`std.net.async.readiness.aliases`](readiness.md#aliases).
 pub fun aliases(backend: *Backend, data: *u8, len: usize) bool
 ```
 
+whether a caller range overlaps memory the backend owns
+
 ### submit_read
 
 Forwards [`std.net.async.readiness.submit_read`](readiness.md#submit_read).
@@ -220,6 +298,8 @@ Forwards [`std.net.async.readiness.submit_read`](readiness.md#submit_read).
 ```mach
 pub fun submit_read(backend: *Backend, native: usize, opening: u64, buffer: *u8, length: usize, context: usize, token: *std.net.async.types.Token) i64
 ```
+
+queue a read into a borrowed buffer
 
 ### submit_readable
 
@@ -240,6 +320,8 @@ Forwards [`std.net.async.readiness.submit_write`](readiness.md#submit_write).
 pub fun submit_write(backend: *Backend, native: usize, opening: u64, buffer: *u8, length: usize, context: usize, token: *std.net.async.types.Token) i64
 ```
 
+queue a write from a borrowed buffer
+
 ### submit_shutdown_write
 
 Forwards [`std.net.async.readiness.submit_shutdown_write`](readiness.md#submit_shutdown_write).
@@ -248,6 +330,8 @@ Forwards [`std.net.async.readiness.submit_shutdown_write`](readiness.md#submit_s
 pub fun submit_shutdown_write(backend: *Backend, native: usize, opening: u64, context: usize, token: *std.net.async.types.Token) i64
 ```
 
+queue a shutdown of the write side, behind the writes already queued
+
 ### submit_close
 
 Forwards [`std.net.async.readiness.submit_close`](readiness.md#submit_close).
@@ -255,6 +339,8 @@ Forwards [`std.net.async.readiness.submit_close`](readiness.md#submit_close).
 ```mach
 pub fun submit_close(backend: *Backend, native: usize, opening: u64, context: usize, token: *std.net.async.types.Token) i64
 ```
+
+queue a close, which closes the native socket once its queued writes finish
 
 ### cancel
 
@@ -277,6 +363,8 @@ Forwards [`std.net.async.readiness.flush`](readiness.md#flush).
 pub fun flush(backend: *Backend) i64
 ```
 
+publish the finished operations without waiting
+
 ### dispatch
 
 Forwards [`std.net.async.readiness.dispatch`](readiness.md#dispatch).
@@ -291,6 +379,8 @@ pub fun dispatch(
     claimed: *bool,
 ) i64
 ```
+
+handle one event the runtime's shared queue delivered
 
 ### poll
 
@@ -310,6 +400,8 @@ Forwards [`std.net.async.readiness.completion`](readiness.md#completion).
 pub fun completion(backend: *Backend, index: usize, out: *std.net.async.types.NativeCompletion) i64
 ```
 
+copy out one completion the last publish made readable
+
 ### dnit
 
 Forwards [`std.net.async.readiness.dnit`](readiness.md#dnit).
@@ -317,4 +409,6 @@ Forwards [`std.net.async.readiness.dnit`](readiness.md#dnit).
 ```mach
 pub fun dnit(backend: *Backend) i64
 ```
+
+release the backend, its idle resources and their registrations
 

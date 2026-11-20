@@ -49,17 +49,17 @@ Uses types from [`std.allocator`](../allocator.md), [`std.io.error`](../io/error
 | [`submit_listener_close`](#submit_listener_close) | close a listener the driver knows about |
 | [`detach`](#detach) | take a stream this driver accepted or connected out of it, so another driver, on this thread or another, can adopt it |
 | [`adopt`](#adopt) | register a detached stream with this driver |
-| [`discarded_reads`](#discarded_reads) | always 0: a cancelled read no longer discards anything, its completion carries the bytes it took (see submit_read) |
 | [`awaiting_cancellations`](#awaiting_cancellations) | operations cancelled on this driver whose native request has not yet reported back |
 | [`wait`](#wait) | one thread owns wait; submission may run concurrently returns 0 only on timeout, a caller's io.runtime.wake, or a closed runtime |
-| [`dnit`](#dnit) | |
+| [`dnit`](#dnit) | tear down an idle driver: retire its runtime source, destroy its backend and free its slot table |
 
 | Functions | |
 | :--- | :--- |
-| [`listen`](#listen), [`bind_datagram`](#bind_datagram) | |
+| [`listen`](#listen) | a nonblocking listener for this driver's runtime |
+| [`bind_datagram`](#bind_datagram) | a nonblocking datagram socket bound to an endpoint |
 | [`listen_with`](#listen_with) | a nonblocking listener with explicit options, for this driver's runtime |
 | [`bind_datagram_with`](#bind_datagram_with) | a nonblocking datagram socket bound with explicit options |
-| [`create_datagram`](#create_datagram) | |
+| [`create_datagram`](#create_datagram) | an unbound nonblocking datagram socket |
 | [`stream`](#stream) | the stream an accept or connect completion hands over |
 | [`accepted`](#accepted) | the stream an accept completion hands over, whether it succeeded or was cancelled after its socket was already accepted |
 
@@ -314,7 +314,7 @@ saw the socket included
 | :--- | :--- |
 | `driver` | the driver the stream belongs to |
 | `stream` | the stream |
-| **returns** | the detached stream, which owns the socket, or the refusal: CLOSED for a handle already known to be stale, BUSY while an operation is in flight, EXHAUSTED when the retirement cannot be recorded, or the platform's refusal to give the socket up |
+| **returns** | the detached stream, which owns the socket, or the refusal: CLOSED for a handle already known to be stale, BUSY while an operation is in flight, RESOURCE_EXHAUSTED when the retirement cannot be recorded, or the platform's refusal to give the socket up |
 
 ### adopt
 
@@ -333,24 +333,6 @@ adopt of it is refused
 | `driver` | the driver that takes the stream |
 | `detached` | the stream detach returned |
 | **returns** | the stream, or the refusal, which leaves detached owning the socket |
-
-### discarded_reads
-
-```mach
-pub fun discarded_reads(driver: *Driver, bytes: *u64) u64
-```
-
-**Deprecated:** always 0: a cancelled read reports its bytes; removed in 6.0
-
-always 0: a cancelled read no longer discards anything, its completion
-carries the bytes it took (see submit_read). kept only for compatibility and
-removed in 6.0
-
-| Parameter | |
-| :--- | :--- |
-| `driver` | ignored |
-| `bytes` | set to 0 when not nil |
-| **returns** | 0 |
 
 ### awaiting_cancellations
 
@@ -384,6 +366,16 @@ returns 0 only on timeout, a caller's io.runtime.wake, or a closed runtime
 pub fun dnit(driver: *Driver) err[std.io.error.Error]
 ```
 
+tear down an idle driver: retire its runtime source, destroy its backend
+and free its slot table
+
+the runtime stays the caller's to close
+
+| Parameter | |
+| :--- | :--- |
+| `driver` | the driver |
+| **returns** | ok, INVALID for a nil or torn down driver, BUSY while any operation's completion has not been released, or the runtime's, backend's or allocator's refusal |
+
 ## Detached
 
 ```mach
@@ -404,11 +396,26 @@ adopted is closed with tcp.stream_close
 pub fun listen(endpoint: std.net.ip.Endpoint, backlog: i32) res[std.net.tcp.Listener, std.io.error.Error]
 ```
 
+a nonblocking listener for this driver's runtime
+
+| Parameter | |
+| :--- | :--- |
+| `endpoint` | endpoint to bind to |
+| `backlog` | pending connections the system may queue |
+| **returns** | the listener, or the refusal |
+
 ### bind_datagram
 
 ```mach
 pub fun bind_datagram(endpoint: std.net.ip.Endpoint) res[std.net.udp.Socket, std.io.error.Error]
 ```
+
+a nonblocking datagram socket bound to an endpoint
+
+| Parameter | |
+| :--- | :--- |
+| `endpoint` | endpoint to bind to |
+| **returns** | the socket, or the refusal |
 
 ### listen_with
 
@@ -443,6 +450,13 @@ a nonblocking datagram socket bound with explicit options
 ```mach
 pub fun create_datagram(family: i32) res[std.net.udp.Socket, std.io.error.Error]
 ```
+
+an unbound nonblocking datagram socket
+
+| Parameter | |
+| :--- | :--- |
+| `family` | os.AF_INET or os.AF_INET6 |
+| **returns** | the socket, or the refusal |
 
 ### stream
 
@@ -490,6 +504,8 @@ pub rec Vector {
     length: usize;
 }
 ```
+
+one borrowed buffer of a vectored write
 
 ### Packet
 

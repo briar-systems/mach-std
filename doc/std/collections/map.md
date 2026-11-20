@@ -28,7 +28,7 @@ whether `Map` itself should be keyed is an open question, not settled here.
 
 THE LAYOUT. three buffers of `cap` slots: keys, values, and one control
 byte per slot. a control byte is `EMPTY`, `DELETED` (a tombstone), or the
-top seven bits of the key's hash with the high bit clear, which marks the
+low seven bits of the key's hash with the high bit clear, which marks the
 slot full. a probe compares control bytes first, so a mismatch is rejected
 without touching the key buffer, and a miss on a full table walks one byte
 per slot. this is the groundwork for matching a group of control bytes at
@@ -42,8 +42,8 @@ capacity is set.
 one core serves the three records: each carries a zero-size `policy` field,
 the public entry point hands its value to the core, and the core is
 generic over the record and the policy and dispatches on `$type_of(p)`, the
-same shape `sort` and `heap` use. every routine in the core, the two
-one-line policy readers included, is generic over exactly `[K, V, M, P]` in
+same shape `sort` and `heap` use. every routine that reads the policy, the
+two one-line policy readers included, is generic over exactly `[K, V, M, P]` in
 that order, so a call from one to another forwards the whole list unchanged.
 
 Source: [`src/collections/map.mach`](../../../src/collections/map.mach)

@@ -23,25 +23,32 @@ Source: [`src/net/ip.mach`](../../../src/net/ip.mach)
 | [`ipv4_from_u32`](#ipv4_from_u32) | convert a network byte order u32 to an IPv4 address |
 | [`ipv4_format`](#ipv4_format) | format an IPv4 address as "a.b.c.d" into a buffer |
 | [`addr_v4`](#addr_v4) | wrap an IPv4 address in an Addr |
-| [`endpoint_v4`](#endpoint_v4), [`ipv4_parse`](#ipv4_parse) | |
+| [`endpoint_v4`](#endpoint_v4) | create an Endpoint from an IPv4 address and a port |
+| [`ipv4_parse`](#ipv4_parse) | parse a dotted-quad IPv4 address |
 
 | On `IPv6` | |
 | :--- | :--- |
 | [`ipv6_any`](#ipv6_any) | return the unspecified IPv6 address (::) |
 | [`ipv6_loopback`](#ipv6_loopback) | return the IPv6 loopback address (::1) |
 | [`addr_v6`](#addr_v6) | wrap an IPv6 address in an Addr |
-| [`endpoint_v6`](#endpoint_v6), [`ipv6_parse`](#ipv6_parse), [`ipv6_format`](#ipv6_format) | |
+| [`endpoint_v6`](#endpoint_v6) | create an Endpoint from an IPv6 address, a port and a scope |
+| [`ipv6_parse`](#ipv6_parse) | parse an IPv6 address in colon-hexadecimal form |
+| [`ipv6_format`](#ipv6_format) | format an IPv6 address in its compressed lowercase form into a buffer |
 
 | On `Addr` | |
 | :--- | :--- |
 | [`addr_parse`](#addr_parse) | parse a borrowed address string without retaining or allocating it |
 | [`addr_format`](#addr_format) | format an address into caller-owned storage without allocating |
-| [`addr_is_unspecified`](#addr_is_unspecified), [`addr_is_loopback`](#addr_is_loopback), [`addr_is_multicast`](#addr_is_multicast), [`addr_is_v4_mapped`](#addr_is_v4_mapped) | |
+| [`addr_is_unspecified`](#addr_is_unspecified) | check for the unspecified address, 0.0.0.0 or :: |
+| [`addr_is_loopback`](#addr_is_loopback) | check for a loopback address, 127.0.0.0/8 or ::1 |
+| [`addr_is_multicast`](#addr_is_multicast) | check for a multicast address, 224.0.0.0/4 or ff00::/8 |
+| [`addr_is_v4_mapped`](#addr_is_v4_mapped) | check for an IPv4-mapped IPv6 address, ::ffff:0:0/96 |
 
 | On `Endpoint` | |
 | :--- | :--- |
 | [`endpoint`](#endpoint-1) | create an Endpoint from octets and a port |
-| [`endpoint_family`](#endpoint_family), [`sockaddr_size`](#sockaddr_size) | |
+| [`endpoint_family`](#endpoint_family) | the socket address family of an endpoint |
+| [`sockaddr_size`](#sockaddr_size) | the size of the sockaddr to_sockaddr writes for an endpoint |
 | [`to_sockaddr`](#to_sockaddr) | serialize an Endpoint into a sockaddr_in or sockaddr_in6 byte buffer |
 | [`from_sockaddr`](#from_sockaddr) | deserialize a sockaddr_in or sockaddr_in6 byte buffer into an Endpoint |
 | [`endpoint_parse`](#endpoint_parse) | parse a borrowed endpoint string into a self-contained value |
@@ -159,11 +166,28 @@ wrap an IPv4 address in an Addr
 pub fun endpoint_v4(addr: IPv4, port: u16) Endpoint
 ```
 
+create an Endpoint from an IPv4 address and a port
+
+| Parameter | |
+| :--- | :--- |
+| `addr` | the IPv4 address |
+| `port` | port number in host byte order |
+| **returns** | the endpoint, with scope zero |
+
 ### ipv4_parse
 
 ```mach
 pub fun ipv4_parse(text: str) res[IPv4, ParseError]
 ```
+
+parse a dotted-quad IPv4 address
+
+each of the four parts is decimal, 0 to 255, leading zeros included
+
+| Parameter | |
+| :--- | :--- |
+| `text` | the nul-terminated text, borrowed |
+| **returns** | the address, or syntax |
 
 ## IPv6
 
@@ -214,17 +238,47 @@ wrap an IPv6 address in an Addr
 pub fun endpoint_v6(addr: IPv6, port: u16, scope: u32) Endpoint
 ```
 
+create an Endpoint from an IPv6 address, a port and a scope
+
+| Parameter | |
+| :--- | :--- |
+| `addr` | the IPv6 address |
+| `port` | port number in host byte order |
+| `scope` | interface scope identifier, or zero |
+| **returns** | the endpoint |
+
 ### ipv6_parse
 
 ```mach
 pub fun ipv6_parse(text: str) res[IPv6, ParseError]
 ```
 
+parse an IPv6 address in colon-hexadecimal form
+
+accepts one `::` and a trailing embedded IPv4 address, and no zone
+
+| Parameter | |
+| :--- | :--- |
+| `text` | the nul-terminated text, borrowed |
+| **returns** | the address, or syntax |
+
 ### ipv6_format
 
 ```mach
 pub fun ipv6_format(addr: IPv6, buf: *u8, cap: usize) usize
 ```
+
+format an IPv6 address in its compressed lowercase form into a buffer
+
+the first longest run of two or more zero groups becomes `::`. bytes past
+cap are counted but not written, and a terminator is written when it fits
+
+| Parameter | |
+| :--- | :--- |
+| `addr` | the IPv6 address |
+| `buf` | destination buffer |
+| `cap` | buffer capacity in bytes |
+| **returns** | the length of the full text, not including the terminator |
 
 ## Addr
 
@@ -266,11 +320,25 @@ format an address into caller-owned storage without allocating
 pub fun addr_is_unspecified(addr: Addr) bool
 ```
 
+check for the unspecified address, 0.0.0.0 or ::
+
+| Parameter | |
+| :--- | :--- |
+| `addr` | the address |
+| **returns** | true when every octet of the address is zero |
+
 ### addr_is_loopback
 
 ```mach
 pub fun addr_is_loopback(addr: Addr) bool
 ```
+
+check for a loopback address, 127.0.0.0/8 or ::1
+
+| Parameter | |
+| :--- | :--- |
+| `addr` | the address |
+| **returns** | true when the address is loopback in its own family |
 
 ### addr_is_multicast
 
@@ -278,11 +346,25 @@ pub fun addr_is_loopback(addr: Addr) bool
 pub fun addr_is_multicast(addr: Addr) bool
 ```
 
+check for a multicast address, 224.0.0.0/4 or ff00::/8
+
+| Parameter | |
+| :--- | :--- |
+| `addr` | the address |
+| **returns** | true when the address is multicast in its own family |
+
 ### addr_is_v4_mapped
 
 ```mach
 pub fun addr_is_v4_mapped(addr: Addr) bool
 ```
+
+check for an IPv4-mapped IPv6 address, ::ffff:0:0/96
+
+| Parameter | |
+| :--- | :--- |
+| `addr` | the address |
+| **returns** | true for an IPv6 address in that range, false for any IPv4 address |
 
 ## Endpoint
 
@@ -325,11 +407,25 @@ create an Endpoint from octets and a port
 pub fun endpoint_family(ep: Endpoint) i32
 ```
 
+the socket address family of an endpoint
+
+| Parameter | |
+| :--- | :--- |
+| `ep` | the endpoint |
+| **returns** | os.AF_INET6 for an IPv6 address, otherwise os.AF_INET |
+
 ### sockaddr_size
 
 ```mach
 pub fun sockaddr_size(ep: Endpoint) usize
 ```
+
+the size of the sockaddr to_sockaddr writes for an endpoint
+
+| Parameter | |
+| :--- | :--- |
+| `ep` | the endpoint |
+| **returns** | os.SOCKADDR_IN6_SIZE for an IPv6 address, otherwise os.SOCKADDR_IN_SIZE |
 
 ### to_sockaddr
 

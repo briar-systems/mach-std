@@ -8,7 +8,7 @@ Source: [`src/types/size.mach`](../../../src/types/size.mach)
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`usize`](#usize) | `def` | default to 64-bit size |
+| [`usize`](#usize) | `def` | unsigned integer for an unknown pointer width default to 64-bit size |
 | [`isize`](#isize) | `def` |  |
 
 ---
@@ -41,6 +41,7 @@ Otherwise:
 pub def usize: u64
 ```
 
+unsigned integer for an unknown pointer width
 default to 64-bit size
 
 ## isize

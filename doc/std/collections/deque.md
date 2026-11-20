@@ -10,7 +10,7 @@ Uses types from [`std.allocator`](../allocator.md).
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`Deque`](#deque) | `rec` |  |
+| [`Deque`](#deque) | `rec` | growable ring buffer of T with pushes and pops at both ends |
 
 | On `Deque` | |
 | :--- | :--- |
@@ -38,6 +38,16 @@ pub rec Deque[T] {
     cap:   usize;
 }
 ```
+
+growable ring buffer of T with pushes and pops at both ends
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `alloc` | `*std.allocator.Allocator` | allocator for the ring buffer |
+| `data` | `*T` | ring buffer of cap slots, nil until the first push |
+| `head` | `usize` | slot index of the front element |
+| `len` | `usize` | number of elements held |
+| `cap` | `usize` | number of slots in data |
 
 ### init
 

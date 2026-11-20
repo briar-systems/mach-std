@@ -11,17 +11,20 @@ Uses types from [`std.filesystem`](../../filesystem.md), [`std.io.error`](../err
 | Type | | |
 | :--- | :--- | :--- |
 | [`Request`](#request) | `rec` | a secret request names its scratch span and read destination by borrow handle only: no welded pointer is stored here, so the request stays a `ptr` context the worker pool and the runtime can carry |
-| [`Adapter`](#adapter) | `rec` | request, task, abort, worker, thread, and scratch storage are caller-owned the adapter is initialized in place by make: the runtime source and the worker pool hold its address until destroy |
+| [`Adapter`](#adapter) | `rec` | request, task, abort, worker, thread, and scratch storage are caller-owned the adapter is initialized in place by init: the runtime source and the worker pool hold its address until dnit |
 
 | On `Adapter` | |
 | :--- | :--- |
-| [`init`](#init) | |
+| [`init`](#init) | initializes an adapter in place, registers it with the runtime and starts its workers |
 | [`submit_read`](#submit_read) | file handles and cancellation scopes remain borrowed until the request retires read buffers remain borrowed until their runtime completion is dequeued |
 | [`submit_write`](#submit_write) | write bytes are copied into bounded adapter storage before this call succeeds |
 | [`attach_secret_scratch`](#attach_secret_scratch) | lend welded scratch to the adapter for secret requests: one span of max_transfer bytes per request, the same geometry as the public scratch |
 | [`submit_secret_read`](#submit_secret_read) | the welded destination is borrowed until the completion is dequeued, and is written exactly then with exactly the delivered prefix; on any error or cancellation it is unchanged |
 | [`submit_secret_write`](#submit_secret_write) | welded bytes are copied into the attached secret scratch before this call succeeds; the caller's storage is not borrowed past the return |
-| [`shutdown_drain`](#shutdown_drain), [`shutdown_abort`](#shutdown_abort), [`active`](#active), [`dnit`](#dnit) | |
+| [`shutdown_drain`](#shutdown_drain) | stops new submissions, lets queued and running requests finish and joins the workers |
+| [`shutdown_abort`](#shutdown_abort) | stops new submissions, fails queued requests as CANCELLED and joins the workers |
+| [`active`](#active) | the number of requests claimed and not yet retired |
+| [`dnit`](#dnit) | retires the runtime source, destroys the pool and ends the secret scratch borrow |
 
 ---
 
@@ -80,8 +83,8 @@ pub rec Adapter {
 ```
 
 request, task, abort, worker, thread, and scratch storage are caller-owned
-the adapter is initialized in place by make: the runtime source and the
-worker pool hold its address until destroy
+the adapter is initialized in place by init: the runtime source and the
+worker pool hold its address until dnit
 
 ### init
 
@@ -101,6 +104,24 @@ pub fun init(
     worker_count: usize,
 ) err[std.io.error.Error]
 ```
+
+initializes an adapter in place, registers it with the runtime and starts its workers
+
+| Parameter | |
+| :--- | :--- |
+| `adapter` | the adapter to initialize, address-bound until dnit |
+| `runtime` | the runtime completions are published to |
+| `requests` | request_capacity request slots |
+| `request_capacity` | the most requests in flight at once |
+| `scratch` | public staging storage, one max_transfer span per request |
+| `scratch_length` | size of scratch in bytes, at least request_capacity * max_transfer |
+| `max_transfer` | the largest single read or write in bytes |
+| `tasks` | request_capacity task slots for the worker pool queue |
+| `abort_tasks` | request_capacity task slots that receive queued work on abort |
+| `threads` | worker_count thread slots |
+| `workers` | worker_count worker slots |
+| `worker_count` | the number of worker threads |
+| **returns** | the failure. INVALID for a nil pointer, a zero count or a zero max_transfer, RESOURCE_EXHAUSTED when scratch is too small or its required size overflows, the runtime's registration failure, or WOULD_BLOCK when the pool refused to start |
 
 ### submit_read
 
@@ -129,7 +150,7 @@ lend welded scratch to the adapter for secret requests: one span of
 max_transfer bytes per request, the same geometry as the public scratch.
 the storage stays the caller's; the adapter wipes each span after its
 request's terminal completion is dequeued, wipes the whole of it and ends
-the borrow in destroy, and the caller releases it after that
+the borrow in dnit, and the caller releases it after that
 
 ### submit_secret_read
 
@@ -156,11 +177,27 @@ succeeds; the caller's storage is not borrowed past the return
 pub fun shutdown_drain(adapter: *Adapter) res[bool, std.io.error.Error]
 ```
 
+stops new submissions, lets queued and running requests finish and joins the workers
+
+| Parameter | |
+| :--- | :--- |
+| `adapter` | the adapter to drain |
+| **returns** | true when this call drained it, false when it was already joined. INVALID for a nil or uninitialized adapter, BUSY while another shutdown is under way or after dnit began, IO when the pool fails to close or join |
+
 ### shutdown_abort
 
 ```mach
 pub fun shutdown_abort(adapter: *Adapter) res[usize, std.io.error.Error]
 ```
+
+stops new submissions, fails queued requests as CANCELLED and joins the workers
+
+requests already running finish normally
+
+| Parameter | |
+| :--- | :--- |
+| `adapter` | the adapter to abort |
+| **returns** | the number of queued requests failed, or the failure. INVALID for a nil or uninitialized adapter, BUSY unless the adapter is open, IO when the pool fails to close or join |
 
 ### active
 
@@ -168,9 +205,26 @@ pub fun shutdown_abort(adapter: *Adapter) res[usize, std.io.error.Error]
 pub fun active(adapter: *Adapter) usize
 ```
 
+the number of requests claimed and not yet retired
+
+| Parameter | |
+| :--- | :--- |
+| `adapter` | the adapter to inspect |
+| **returns** | the count, 0 for a nil or uninitialized adapter |
+
 ### dnit
 
 ```mach
 pub fun dnit(adapter: *Adapter) err[std.io.error.Error]
 ```
+
+retires the runtime source, destroys the pool and ends the secret scratch borrow
+
+the adapter must be joined by a shutdown with no request outstanding. a call
+that fails part-way may be repeated and resumes where it stopped
+
+| Parameter | |
+| :--- | :--- |
+| `adapter` | the adapter to tear down |
+| **returns** | the failure. INVALID for a nil or uninitialized adapter, BUSY before the join or while requests are outstanding, the runtime's retire or release failure, or IO when the pool cannot be destroyed |
 

@@ -4,8 +4,9 @@
 
 riscv64-specific linux OS primitives
 
-provides page_size and thread_spawn which require arch-specific assembly.
-everything else is in shared.mach.
+provides page_size, thread creation, join and detach, and the thread
+pointer's block, which require arch-specific assembly. everything else is in
+shared.mach.
 
 Source: [`src/system/os/linux/riscv64.mach`](../../../../../src/system/os/linux/riscv64.mach)
 
@@ -15,7 +16,8 @@ Uses types from [`std.system.os.shared`](../shared.md).
 | :--- | :--- |
 | [`page_size`](#page_size) | return the system page size |
 | [`thread_spawn`](#thread_spawn) | create a new thread sharing the current address space |
-| [`thread_join`](#thread_join), [`thread_detach`](#thread_detach) | |
+| [`thread_join`](#thread_join) | wait for a thread thread_spawn made to end and its stack to be released |
+| [`thread_detach`](#thread_detach) | give up joining a thread thread_spawn made |
 | [`thread_block_enter`](#thread_block_enter) | install block as the calling thread's, as the tp just above it |
 | [`thread_block`](#thread_block) | the calling thread's block, just below tp, without a system call |
 | [`main_thread_block`](#main_thread_block) | the main thread's block, in an area with its thread-local block when the executable has thread-locals, else the static fallback |
@@ -104,11 +106,30 @@ exit.
 pub fun thread_join(native: usize, reclaimable: *i64) i64
 ```
 
+wait for a thread thread_spawn made to end and its stack to be released
+
+| Parameter | |
+| :--- | :--- |
+| `native` | the handle thread_spawn stored, used only on a loader-hosted thread |
+| `reclaimable` | the reclaim word given to thread_spawn, which the thread sets once its stack is unmapped |
+| **returns** | 0, or the backend's negative errno on a loader-hosted thread |
+
 ### thread_detach
 
 ```mach
 pub fun thread_detach(native: usize) i64
 ```
+
+give up joining a thread thread_spawn made
+
+a std thread needs nothing here, as the join state the caller holds decides
+who releases the owner block. a loader-hosted thread's handle is handed back
+to the backend
+
+| Parameter | |
+| :--- | :--- |
+| `native` | the handle thread_spawn stored |
+| **returns** | 0, or the backend's negative errno on a loader-hosted thread |
 
 ### thread_block_enter
 
@@ -298,6 +319,8 @@ pub rec DirectoryCursor {
     count:   usize;
 }
 ```
+
+an open enumeration of one directory descriptor's entries
 
 ### DirectoryEntry
 
@@ -1238,6 +1261,10 @@ Forwards [`std.system.os.linux.shared.write_at`](shared.md#write_at).
 pub fun write_at(fd: i32, buf: *u8, count: usize, offset: u64) i64
 ```
 
+write bytes at a file offset without moving the descriptor offset
+
+retries automatically on EINTR.
+
 ### open
 
 Forwards [`std.system.os.linux.shared.open`](shared.md#open).
@@ -1318,6 +1345,8 @@ Forwards [`std.system.os.linux.shared.identity_at`](shared.md#identity_at).
 pub fun identity_at(dirfd: i32, path: *u8, out: *std.system.file_identity.Identity) i64
 ```
 
+the identity of the entry path names, without following a final symlink
+
 ### retain_identity_at
 
 Forwards [`std.system.os.linux.shared.retain_identity_at`](shared.md#retain_identity_at).
@@ -1335,6 +1364,11 @@ Forwards [`std.system.os.linux.shared.publication_capabilities`](shared.md#publi
 ```mach
 pub fun publication_capabilities(fd: i32) i64
 ```
+
+the cooperative publication capabilities of the filesystem fd lives on
+
+ext4, tmpfs, xfs and btrfs report every capability, and any other
+filesystem reports none
 
 ### stat_path
 
@@ -1419,6 +1453,12 @@ Forwards [`std.system.os.linux.shared.directory_next`](shared.md#directory_next)
 ```mach
 pub fun directory_next(cursor: *DirectoryCursor, out: *DirectoryEntry) i64
 ```
+
+read the next entry of a directory
+
+the entry's name is borrowed from the cursor's buffer until the next cursor
+operation. a malformed record fails with EIO, and a failure is kept, so every
+later call returns it again
 
 ### directory_dnit
 
@@ -1683,7 +1723,7 @@ spawn a child with redirected streams and an explicit working directory,
 placed as the leader of its own new process group
 
 identical to spawn_redirected_in except the child calls setpgid(0, 0)
-between the clone and the exec (see spawn_trampoline), and the parent ALSO
+between the clone and the exec (see spawn_main), and the parent ALSO
 calls setpgid(pid, pid) once clone returns, ignoring its result (mach#535).
 on a real kernel CLONE_VFORK suspends the parent until the child execs or
 exits, so the parent-side call is redundant there (it either finds the
@@ -1860,10 +1900,13 @@ create a new child process
 Forwards [`std.system.os.linux.shared.vfork`](shared.md#vfork).
 
 ```mach
+#[naked]
 pub fun vfork() i64
 ```
 
-create child process sharing memory with parent
+create child process sharing memory with parent. the child runs on the
+parent's stack until it execs or exits, so this stub keeps no frame and holds
+its return address in a register across the syscall
 
 ### exec
 
@@ -1893,6 +1936,8 @@ Forwards [`std.system.os.linux.shared.wait_pid`](shared.md#wait_pid).
 pub fun wait_pid(pid: i64, status: *std.system.os.shared.ProcessStatus, options: i32) std.system.os.shared.WaitResult
 ```
 
+wait for a child state, as wait does with no resource usage
+
 ### ProcessStatus
 
 Forwards [`std.system.os.linux.shared.ProcessStatus`](shared.md#processstatus).
@@ -1905,6 +1950,8 @@ pub rec ProcessStatus {
     core_dumped: bool;
 }
 ```
+
+one observed change in a child's state
 
 ### FileLimit
 
@@ -1965,6 +2012,8 @@ pub rec ProcessWaitError {
     operation:   u8;
 }
 ```
+
+why a process wait or the release of a child's handle failed
 
 ### WaitResult
 
@@ -2354,6 +2403,8 @@ pub rec IoVector {
 }
 ```
 
+one buffer of a vectored transfer, laid out as the kernel's iovec
+
 ### sock_write_vector
 
 Forwards [`std.system.os.linux.shared.sock_write_vector`](shared.md#sock_write_vector).
@@ -2361,6 +2412,8 @@ Forwards [`std.system.os.linux.shared.sock_write_vector`](shared.md#sock_write_v
 ```mach
 pub fun sock_write_vector(fd: usize, vectors: *IoVector, count: usize) i64
 ```
+
+write several buffers to a socket in one call
 
 ### sock_send_message
 
@@ -2370,6 +2423,8 @@ Forwards [`std.system.os.linux.shared.sock_send_message`](shared.md#sock_send_me
 pub fun sock_send_message(fd: usize, vectors: *IoVector, vector_count: usize, address: *u8, address_length: u32, control: *u8, control_length: usize) i64
 ```
 
+send buffers with an optional address and control records, without SIGPIPE
+
 ### sock_receive_message
 
 Forwards [`std.system.os.linux.shared.sock_receive_message`](shared.md#sock_receive_message).
@@ -2377,6 +2432,8 @@ Forwards [`std.system.os.linux.shared.sock_receive_message`](shared.md#sock_rece
 ```mach
 pub fun sock_receive_message(fd: usize, vectors: *IoVector, vector_count: usize, address: *u8, address_length: *u32, control: *u8, control_length: *usize, flags: *i32) i64
 ```
+
+receive into buffers along with the sender's address and control records
 
 ### sock_set_nonblocking
 
@@ -2446,6 +2503,8 @@ Forwards [`std.system.os.linux.shared.sock_create_flags`](shared.md#sock_create_
 pub fun sock_create_flags(domain: i32, typ: i32, protocol: i32, nonblocking: bool, non_inheritable: bool, out: *usize) i64
 ```
 
+create a socket file descriptor with its blocking and inheritance chosen
+
 ### sock_bind
 
 Forwards [`std.system.os.linux.shared.sock_bind`](shared.md#sock_bind).
@@ -2483,6 +2542,8 @@ Forwards [`std.system.os.linux.shared.sock_accept_flags`](shared.md#sock_accept_
 ```mach
 pub fun sock_accept_flags(fd: usize, addr: *u8, addrlen: *u32, nonblocking: bool, non_inheritable: bool, out: *usize) i64
 ```
+
+accept a connection with the accepted socket's blocking and inheritance chosen
 
 ### sock_connect
 
@@ -2552,6 +2613,8 @@ Forwards [`std.system.os.linux.shared.sock_getopt`](shared.md#sock_getopt).
 pub fun sock_getopt(fd: usize, level: i32, opt: i32, value: *u8, vallen: *u32) i64
 ```
 
+read a socket option
+
 ### sock_local_addr
 
 Forwards [`std.system.os.linux.shared.sock_local_addr`](shared.md#sock_local_addr).
@@ -2559,6 +2622,8 @@ Forwards [`std.system.os.linux.shared.sock_local_addr`](shared.md#sock_local_add
 ```mach
 pub fun sock_local_addr(fd: usize, addr: *u8, addrlen: *u32) i64
 ```
+
+the address a socket is bound to
 
 ### sock_remote_addr
 
@@ -2568,6 +2633,8 @@ Forwards [`std.system.os.linux.shared.sock_remote_addr`](shared.md#sock_remote_a
 pub fun sock_remote_addr(fd: usize, addr: *u8, addrlen: *u32) i64
 ```
 
+the address of a connected socket's peer
+
 ### sock_inheritable
 
 Forwards [`std.system.os.linux.shared.sock_inheritable`](shared.md#sock_inheritable).
@@ -2575,6 +2642,8 @@ Forwards [`std.system.os.linux.shared.sock_inheritable`](shared.md#sock_inherita
 ```mach
 pub fun sock_inheritable(fd: usize, out: *bool) i64
 ```
+
+whether a socket stays open across exec
 
 ### io_queue_create
 
@@ -2584,6 +2653,9 @@ Forwards [`std.system.os.linux.shared.io_queue_create`](shared.md#io_queue_creat
 pub fun io_queue_create(queue: *std.system.os.shared.IoQueue) i64
 ```
 
+open a completion queue: an epoll instance with a wake eventfd watched
+under context 0
+
 ### io_queue_wait
 
 Forwards [`std.system.os.linux.shared.io_queue_wait`](shared.md#io_queue_wait).
@@ -2591,6 +2663,8 @@ Forwards [`std.system.os.linux.shared.io_queue_wait`](shared.md#io_queue_wait).
 ```mach
 pub fun io_queue_wait(queue: *std.system.os.shared.IoQueue, timeout_ms: i32) i64
 ```
+
+wait for one completion and discard it
 
 ### IoCompletion
 
@@ -2690,6 +2764,8 @@ Forwards [`std.system.os.linux.shared.io_queue_unwatch`](shared.md#io_queue_unwa
 pub fun io_queue_unwatch(queue: *std.system.os.shared.IoQueue, resource: usize) i64
 ```
 
+remove a resource's registration from the queue
+
 ### io_queue_poll
 
 Forwards [`std.system.os.linux.shared.io_queue_poll`](shared.md#io_queue_poll).
@@ -2718,6 +2794,8 @@ Forwards [`std.system.os.linux.shared.io_queue_close`](shared.md#io_queue_close)
 ```mach
 pub fun io_queue_close(queue: *std.system.os.shared.IoQueue) i64
 ```
+
+close a queue's descriptors and mark it closed
 
 ### sock_set_rcvtimeo
 
@@ -2770,6 +2848,8 @@ Forwards [`std.system.os.linux.shared.thread_current_name`](shared.md#thread_cur
 ```mach
 pub fun thread_current_name(name: *u8, cap: usize) i64
 ```
+
+read the calling thread's native diagnostic name
 
 ### thread_wait
 

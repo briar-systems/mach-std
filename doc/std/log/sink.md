@@ -23,21 +23,26 @@ Uses types from [`std.filesystem`](../filesystem.md), [`std.io.writer`](../io/wr
 | [`PublishFun`](#publishfun) | `def` |  |
 | [`Sink`](#sink) | `rec` | sink ctx is borrowed and must outlive every publish publish callbacks must consume or copy the borrowed bytes before returning |
 | [`Direct`](#direct) | `rec` | direct sinks must remain at a stable address and must not be copied in use reinitialization requires every current publication to stop first existing sinks retarget to the new adapter but retain their copied contract and must be discarded direct owns no resources and requires no destruction |
-| [`QueuedRecord`](#queuedrecord) | `rec` |  |
-| [`QueueStats`](#queuestats) | `rec` |  |
+| [`QueuedRecord`](#queuedrecord) | `rec` | one encoded record held in a queued sink's storage |
+| [`QueueStats`](#queuestats) | `rec` | a snapshot of a queued sink's counters |
 | [`Queued`](#queued) | `rec` | queued and its caller-owned records remain stable through join |
 
 | On `SinkError` | |
 | :--- | :--- |
-| [`partial`](#partial), [`failed`](#failed), [`rejected`](#rejected) | |
+| [`partial`](#partial) | a report for a publication the adapter confirmed only in part |
+| [`failed`](#failed) | a report for a publication that failed |
+| [`rejected`](#rejected) | a report for a publication nothing accepted, leaving the record with the caller |
 
 | On `WriteStatus` | |
 | :--- | :--- |
-| [`report`](#report) | |
+| [`report`](#report) | assemble a write report |
 
 | On `WriteReport` | |
 | :--- | :--- |
-| [`persisted`](#persisted), [`dropped`](#dropped), [`enqueued`](#enqueued), [`suppressed`](#suppressed) | |
+| [`persisted`](#persisted) | a report for a publication the adapter fully confirmed |
+| [`dropped`](#dropped) | a report for a record a queue discarded under OVERLOAD_DROP_NEW |
+| [`enqueued`](#enqueued) | a report for a record a queue accepted for later publication |
+| [`suppressed`](#suppressed) | a report for a record below the level that was never encoded |
 | [`cause`](#cause) | the cause carried by a report, or none for the cases that have no failure |
 | [`report_write`](#report_write) | fold a writer outcome into a report: the persisted prefix is kept and the writer's failure is the cause; a short accept is the stalled prefix |
 
@@ -56,7 +61,7 @@ Uses types from [`std.filesystem`](../filesystem.md), [`std.io.writer`](../io/wr
 
 | On `Contract` | |
 | :--- | :--- |
-| [`contract_valid`](#contract_valid) | |
+| [`contract_valid`](#contract_valid) | tell whether a delivery contract is consistent |
 
 | On `PublishFun` | |
 | :--- | :--- |
@@ -64,7 +69,7 @@ Uses types from [`std.filesystem`](../filesystem.md), [`std.io.writer`](../io/wr
 
 | On `Sink` | |
 | :--- | :--- |
-| [`publish`](#publish) | |
+| [`publish`](#publish) | publish one encoded record through a sink and check the adapter kept its contract |
 
 | On `Direct` | |
 | :--- | :--- |
@@ -77,17 +82,17 @@ Uses types from [`std.filesystem`](../filesystem.md), [`std.io.writer`](../io/wr
 | On `Queued` | |
 | :--- | :--- |
 | [`queued_with_config`](#queued_with_config) | initialize the queued sink in place: queued is address-bound and stays uninitialized after any refusal, with the channel released |
-| [`queued`](#queued-1) | |
+| [`queued`](#queued-1) | initialize a queued sink in place with the default worker thread configuration |
 | [`queued_close_drain`](#queued_close_drain) | stop accepting records; the worker drains what was enqueued |
 | [`queued_close_abort`](#queued_close_abort) | abort transfers every unpublished record to caller storage in fifo order |
 | [`queued_join`](#queued_join) | wait for the worker after close; concurrent joins share one native join and a failed join is replayed to every later caller downstream callbacks must not join their own queue |
-| [`queued_stats`](#queued_stats) | |
+| [`queued_stats`](#queued_stats) | snapshot a queued sink's counters |
 | [`queued_thread_error`](#queued_thread_error) | the native code of the worker's join failure, 0 when the join succeeded or has not run, ERROR_INVALID for a sink that was never made |
 | [`queued_dnit`](#queued_dnit) | release the queue after a completed join; refused while joiners wait |
 
 | Functions | |
 | :--- | :--- |
-| [`pipe_target_atomic_limit`](#pipe_target_atomic_limit) | |
+| [`pipe_target_atomic_limit`](#pipe_target_atomic_limit) | the byte count a pipe write is atomic across processes on the build target |
 
 ---
 
@@ -137,17 +142,43 @@ every way a sink, a logger or one publication can fail
 pub fun partial(offered: usize, persisted_bytes: usize, error: SinkError) WriteReport
 ```
 
+a report for a publication the adapter confirmed only in part
+
+| Parameter | |
+| :--- | :--- |
+| `offered` | the full size offered |
+| `persisted_bytes` | the confirmed prefix |
+| `error` | why the rest was not persisted |
+| **returns** | the report |
+
 ### failed
 
 ```mach
 pub fun failed(offered: usize, persisted_bytes: usize, error: SinkError) WriteReport
 ```
 
+a report for a publication that failed
+
+| Parameter | |
+| :--- | :--- |
+| `offered` | the full size offered |
+| `persisted_bytes` | the confirmed prefix, which may be zero |
+| `error` | the cause |
+| **returns** | the report |
+
 ### rejected
 
 ```mach
 pub fun rejected(offered: usize, error: SinkError) WriteReport
 ```
+
+a report for a publication nothing accepted, leaving the record with the caller
+
+| Parameter | |
+| :--- | :--- |
+| `offered` | the full size offered |
+| `error` | why it was refused |
+| **returns** | the report, with nothing persisted |
 
 ## Created
 
@@ -205,6 +236,16 @@ the outcome of one publication; the cases that failed carry their cause
 pub fun report(status: WriteStatus, offered: usize, persisted: usize, truncated: bool) WriteReport
 ```
 
+assemble a write report
+
+| Parameter | |
+| :--- | :--- |
+| `status` | the outcome |
+| `offered` | the full logical size of the record |
+| `persisted` | the bytes the adapter confirmed |
+| `truncated` | whether the sink saw a shortened line |
+| **returns** | the report |
+
 ## WriteReport
 
 ```mach
@@ -225,11 +266,25 @@ persisted is the byte count confirmed by the adapter
 pub fun persisted(bytes: usize) WriteReport
 ```
 
+a report for a publication the adapter fully confirmed
+
+| Parameter | |
+| :--- | :--- |
+| `bytes` | the size offered and persisted |
+| **returns** | the report |
+
 ### dropped
 
 ```mach
 pub fun dropped(offered: usize) WriteReport
 ```
+
+a report for a record a queue discarded under OVERLOAD_DROP_NEW
+
+| Parameter | |
+| :--- | :--- |
+| `offered` | the full size offered |
+| **returns** | the report, with nothing persisted |
 
 ### enqueued
 
@@ -237,11 +292,24 @@ pub fun dropped(offered: usize) WriteReport
 pub fun enqueued(offered: usize) WriteReport
 ```
 
+a report for a record a queue accepted for later publication
+
+| Parameter | |
+| :--- | :--- |
+| `offered` | the full size offered |
+| **returns** | the report, with nothing persisted yet |
+
 ### suppressed
 
 ```mach
 pub fun suppressed() WriteReport
 ```
+
+a report for a record below the level that was never encoded
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the report, with nothing offered or persisted |
 
 ### cause
 
@@ -327,6 +395,13 @@ every direct adapter still serializes callbacks within this process
 pub fun contract_valid(contract: Contract) bool
 ```
 
+tell whether a delivery contract is consistent
+
+| Parameter | |
+| :--- | :--- |
+| `contract` | the contract to check |
+| **returns** | true when every enum is known, max_record is nonzero, within MAX_RECORD_BYTES and can hold a truncated line under OVERSIZE_TRUNCATE, and queue_capacity is zero exactly for direct delivery |
+
 ## PublishFun
 
 ```mach
@@ -359,6 +434,15 @@ publish callbacks must consume or copy the borrowed bytes before returning
 ```mach
 pub fun publish(sink: *Sink, data: *u8, len: usize) WriteReport
 ```
+
+publish one encoded record through a sink and check the adapter kept its contract
+
+| Parameter | |
+| :--- | :--- |
+| `sink` | the sink to publish through |
+| `data` | the record's bytes, borrowed for the call |
+| `len` | the byte count |
+| **returns** | the report, failed with invalid for an unusable sink or data, rejected with too_large past the contract's max_record, failed with malformed when the adapter's report breaks the contract |
 
 ## Direct
 
@@ -432,6 +516,13 @@ pub rec QueuedRecord {
 }
 ```
 
+one encoded record held in a queued sink's storage
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `data` | `[record.MAX_RECORD_BYTES]u8` | the record's bytes |
+| `len` | `usize` | how many bytes of data are used |
+
 ## QueueStats
 
 ```mach
@@ -446,6 +537,19 @@ pub rec QueueStats {
     last:      WriteReport;
 }
 ```
+
+a snapshot of a queued sink's counters
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `enqueued` | `usize` | records the queue accepted |
+| `persisted` | `usize` | records the downstream sink fully persisted |
+| `partial` | `usize` | records the downstream sink persisted only in part |
+| `failed` | `usize` | records the downstream sink failed or refused |
+| `rejected` | `usize` | records the queue refused |
+| `dropped` | `usize` | records the queue discarded under OVERLOAD_DROP_NEW |
+| `aborted` | `usize` | records handed back by queued_close_abort |
+| `last` | `WriteReport` | the report of the latest downstream publication |
 
 ## Queued
 
@@ -492,6 +596,19 @@ downstream publication failure is recorded and does not stop queue service
 pub fun queued(queued: *Queued, storage: *QueuedRecord, capacity: usize, downstream: *Sink, max_record: usize, oversize: std.log.record.OversizePolicy, overload: OverloadPolicy) Created
 ```
 
+initialize a queued sink in place with the default worker thread configuration
+
+| Parameter | |
+| :--- | :--- |
+| `queued` | the queue to initialize, which must stay at a stable address through join |
+| `storage` | caller-owned storage for capacity records, which must outlive join |
+| `capacity` | how many records the queue holds |
+| `downstream` | the direct sink the worker publishes to, borrowed through join |
+| `max_record` | the largest record accepted, at most the downstream's max_record |
+| `oversize` | what to do with a record past max_record |
+| `overload` | what to do when the queue is full |
+| **returns** | the queued sink, or why it could not be made (see queued_with_config) |
+
 ### queued_close_drain
 
 ```mach
@@ -528,6 +645,13 @@ downstream callbacks must not join their own queue
 pub fun queued_stats(queued: *Queued) QueueStats
 ```
 
+snapshot a queued sink's counters
+
+| Parameter | |
+| :--- | :--- |
+| `queued` | the queue to read |
+| **returns** | the counters, all zero with a failed invalid last report for a nil queue, one never made or one already released |
+
 ### queued_thread_error
 
 ```mach
@@ -552,4 +676,10 @@ release the queue after a completed join; refused while joiners wait
 ```mach
 pub fun pipe_target_atomic_limit() usize
 ```
+
+the byte count a pipe write is atomic across processes on the build target
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | 512 on darwin, 0 on windows where no portable limit exists, 4096 on every other target |
 

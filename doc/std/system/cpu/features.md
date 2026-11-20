@@ -183,6 +183,7 @@ decode the riscv_hwprobe values for the base behaviour and IMA_EXT_0 keys
 
 | Parameter | |
 | :--- | :--- |
+| `out` | record to fill, zicsr and zifencei set false |
 | `base` | the value for HWPROBE_BASE_BEHAVIOR, 0 when the key is unknown |
 | `ext0` | the value for HWPROBE_IMA_EXT_0, 0 when the key is unknown |
 
@@ -195,6 +196,11 @@ pub fun from_hwcap(out: *Features, hwcap: u64)
 ```
 
 decode AT_HWCAP, which names single-letter extensions only
+
+| Parameter | |
+| :--- | :--- |
+| `out` | record to fill, zkt, zicsr and zifencei set false |
+| `hwcap` | the AT_HWCAP auxv value |
 
 ## Constants
 
