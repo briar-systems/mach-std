@@ -330,6 +330,11 @@ initialized once and then shared; every field below is under `lock`.
 | `total_bytes` | `usize` | bytes charged for them, counted as `live` counts and never decremented |
 | `idx_small` | `[64]u8` | class index for each 16 byte step of a size up to 1024 |
 | `idx_mid` | `[64]u8` | class index for each 128 byte step of a size up to MAX_SMALL |
+| `id` | `usize` | the heap's identity, never shared with another heap of the process |
+| `caches` | `*Cache` | the thread caches bound to the heap |
+| `spare` | `*Cache` | cache records given back, for the next thread that binds |
+| `records` | `*Span` | the span cache records are carved from, nil before the first |
+| `carved` | `usize` | records carved from it |
 
 ### init
 
@@ -521,7 +526,11 @@ again, whole, to the next request whose range takes it, the smallest such
 span and of those the last given back. a heap uses only the least of a
 grant, so which span a heap is handed, which depends on what other heaps
 gave back, never changes what the heap does or counts. nothing is rounded, so no byte of a
-span lies past what its holder was granted. when a span given back would
+span lies past what its holder was granted. when no held span is in range and
+the source cuts, the smallest span past the range is cut: its first bytes,
+the request rounded to SPAN_ALIGN when the range takes that, are granted and
+the rest stays held, so a pool holding large spans serves a smaller request
+without going to its source. when a span given back would
 take the held bytes past the budget, the spans held longest go back to the
 source first, since the next requests take the last given back. a request no
 held span fits goes to the source as it is, and so does a span past the
