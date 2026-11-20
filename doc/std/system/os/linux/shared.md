@@ -116,8 +116,10 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`access`](#access) | faccessat: check file accessibility relative to a directory fd |
 | [`seek`](#seek) | lseek: reposition read/write offset of a file descriptor |
 | [`environ`](#environ) | pointer to the environment captured by the runtime at program start (null-terminated array of "NAME=value" strings) |
+| [`auxv_of`](#auxv_of) | the auxiliary vector, which the kernel places immediately past the NULL terminator of the null-terminated pointer array `envp` addresses |
+| [`capture_envp`](#capture_envp) | publish the program's envp and the auxiliary vector past it, once at entry |
 | [`capture_pagesz`](#capture_pagesz) | publish the auxv page size into `_pagesz` |
-| [`capture_main_stack`](#capture_main_stack) | capture the main thread's stack bounds, once, at entry |
+| [`capture_thread_pointer`](#capture_thread_pointer) | record, once at entry after capture_pagesz, whether std owns the thread pointer, which it does where no loader started the process |
 | [`thread_pointer_owned`](#thread_pointer_owned) | whether the block a thread reads through its thread pointer is std's |
 | [`stack_bounds_of`](#stack_bounds_of) | the calling thread's stack bounds, from its block or the main thread's record |
 | [`loader_started`](#loader_started) | whether a program interpreter ran before the entry point |
@@ -226,6 +228,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | Variables | |
 | :--- | :--- |
 | [`_envp`](#variables) | environment (set by runtime at program start) |
+| [`_auxv`](#variables) | the auxiliary vector past it, 0 where std has no envp |
 | [`_pagesz`](#variables) | the runtime page size in bytes, read from the auxiliary vector (AT_PAGESZ) at program start |
 
 | Forwards | |
@@ -1378,6 +1381,35 @@ pointer to the environment captured by the runtime at program
 start (null-terminated array of "NAME=value" strings). nil before
 runtime init.
 
+### auxv_of
+
+```mach
+pub fun auxv_of(envp: *usize) *usize
+```
+
+the auxiliary vector, which the kernel places immediately past the NULL
+terminator of the null-terminated pointer array `envp` addresses
+
+the one walk of the environment std makes to reach it: the entrypoint
+publishes it once, and every entry is read from it after
+
+| Parameter | |
+| :--- | :--- |
+| `envp` | the runtime envp pointer (the value the entrypoint captured) |
+| **returns** | the auxv's first word |
+
+### capture_envp
+
+```mach
+pub fun capture_envp(envp: usize)
+```
+
+publish the program's envp and the auxiliary vector past it, once at entry
+
+| Parameter | |
+| :--- | :--- |
+| `envp` | the runtime envp pointer (the value the entrypoint captured) |
+
 ### capture_pagesz
 
 ```mach
@@ -1386,27 +1418,21 @@ pub fun capture_pagesz()
 
 publish the auxv page size into `_pagesz`
 
-called once by the entrypoint at startup, after `_envp` is set and (in a PIE)
+called once by the entrypoint at startup, after `_auxv` is set and (in a PIE)
 after `_rt_relocate` has applied any relocations, so it runs as ordinary
 post-relocation code that may touch globals. `_pagesz` stays 0 only if the auxv
 lacks the mandatory AT_PAGESZ, which page_size() treats as a fatal invariant
 breach rather than fabricating a default. a shared artifact has no entrypoint
 and no envp, so its first page_size() calls this and reads the kernel's copy.
 
-### capture_main_stack
+### capture_thread_pointer
 
 ```mach
-pub fun capture_main_stack()
+pub fun capture_thread_pointer()
 ```
 
-capture the main thread's stack bounds, once, at entry
-
-the kernel grows the main stack down from the end of its mapping by at most
-RLIMIT_STACK. the first thing the kernel writes below that end is the
-executable's path (AT_EXECFN) and one null word, so the page boundary above
-the path's terminator ends the mapping. the soft limit is read once, and an
-unlimited one, or an auxv without AT_EXECFN, leaves the bounds unknown. runs
-after capture_pagesz, and records whether a loader owns the thread pointer
+record, once at entry after capture_pagesz, whether std owns the thread
+pointer, which it does where no loader started the process
 
 ### thread_pointer_owned
 
@@ -1436,7 +1462,7 @@ owns, gets the main thread's when the caller's frame lies inside them
 ### loader_started
 
 ```mach
-pub fun loader_started(envp: *usize) bool
+pub fun loader_started(auxv: *usize) bool
 ```
 
 whether a program interpreter ran before the entry point
@@ -1452,7 +1478,7 @@ the stack it points into and the headers, and its constants are literals
 
 | Parameter | |
 | :--- | :--- |
-| `envp` | the runtime envp pointer (the value the entrypoint captured) |
+| `auxv` | the auxiliary vector (`auxv_of` the envp the entrypoint captured) |
 | **returns** | true when AT_BASE is nonzero or the image names an interpreter |
 
 ### loader_present
@@ -1468,7 +1494,7 @@ runtime installs std's block there only when this is false
 
 | Parameter | |
 | :--- | :--- |
-| **returns** | `loader_started` of the published envp, false before the runtime publishes it |
+| **returns** | `loader_started` of the published auxv, false before the runtime publishes it |
 
 ### terminate
 
@@ -2760,6 +2786,7 @@ return a human-readable message for a negated errno code
 | Name | Type | Value | |
 | :--- | :--- | :--- | :--- |
 | `_envp` (var) | `usize` | `0` | environment (set by runtime at program start) |
+| `_auxv` (var) | `usize` | `0` | the auxiliary vector past it, 0 where std has no envp |
 | `_pagesz` (var) | `usize` | `0` | the runtime page size in bytes, read from the auxiliary vector (AT_PAGESZ) at program start |
 
 ## Forwards

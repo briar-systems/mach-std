@@ -103,7 +103,7 @@ Uses types from [`std.allocator`](../allocator.md), [`std.sync.mutex`](../sync/m
 | [`dnit`](#dnit) | release every span back to the source and zero the heap state |
 | [`zallocate_raw`](#zallocate_raw) | allocate `size` bytes of zeroed memory at `align` |
 | [`live_bytes`](#live_bytes) | bytes in live blocks, counted as the class size or payload capacity charged for each one rather than the size requested |
-| [`mapped_bytes`](#mapped_bytes) | bytes obtained from the source and not yet returned |
+| [`mapped_bytes`](#mapped_bytes) | bytes of the spans obtained from the source and not yet returned, each counted at the size the heap asked for, never at a larger grant |
 | [`peak_mapped_bytes`](#peak_mapped_bytes) | high water mark of mapped_bytes over the heap's life |
 | [`live_blocks`](#live_blocks) | live block count |
 | [`allocated_blocks`](#allocated_blocks) | blocks handed out over the heap's life, never decremented |
@@ -302,7 +302,7 @@ initialized once and then shared; every field below is under `lock`.
 | `held` | `usize` | bytes in `spans` and `cache` |
 | `budget` | `usize` | byte ceiling for `held` before a span is handed back to the source |
 | `live` | `usize` | bytes in live blocks, counted as class size or payload capacity |
-| `mapped` | `usize` | bytes obtained from the source and not yet released |
+| `mapped` | `usize` | bytes of the spans obtained from the source and not yet released, each counted at the size the heap uses |
 | `peak` | `usize` | high water mark of `mapped` |
 | `blocks` | `usize` | live block count |
 | `total_blocks` | `usize` | blocks handed out over the heap's life, never decremented |
@@ -407,7 +407,8 @@ for each one rather than the size requested
 pub fun mapped_bytes(h: *Heap) usize
 ```
 
-bytes obtained from the source and not yet returned
+bytes of the spans obtained from the source and not yet returned, each
+counted at the size the heap asked for, never at a larger grant
 
 ### peak_mapped_bytes
 
@@ -496,7 +497,9 @@ its budget. over the host mapper that unmaps them, and the next heap maps and
 faults the same memory in again. a pool stands between heaps and their real
 source: a span given back is held at the size it was granted and granted
 again, whole, to the next request whose range takes it, the smallest such
-span and of those the last given back. nothing is rounded, so no byte of a
+span and of those the last given back. a heap uses only the least of a
+grant, so which span a heap is handed, which depends on what other heaps
+gave back, never changes what the heap does or counts. nothing is rounded, so no byte of a
 span lies past what its holder was granted. when a span given back would
 take the held bytes past the budget, the spans held longest go back to the
 source first, since the next requests take the last given back. a request no

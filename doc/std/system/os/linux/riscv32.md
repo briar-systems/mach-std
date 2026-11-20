@@ -41,7 +41,7 @@ Uses types from [`std.system.os.shared`](../shared.md).
 | [`allocate`](#allocate) | memory |
 | [`deallocate`](#deallocate), [`reallocate`](#reallocate), [`heap_region_base`](#heap_region_base), [`heap_region_extend`](#heap_region_extend), [`protect`](#protect), [`lock`](#lock), [`unlock`](#unlock), [`advise`](#advise), [`allocate_huge`](#allocate_huge), [`numa_node_count`](#numa_node_count), [`numa_current_node`](#numa_current_node), [`numa_allocate`](#numa_allocate), [`numa_move`](#numa_move), [`map_file`](#map_file), [`sync_file`](#sync_file) | |
 | [`_envp`](#_envp) | environment |
-| [`environ`](#environ), [`capture_pagesz`](#capture_pagesz), [`loader_present`](#loader_present), [`capture_main_stack`](#capture_main_stack), [`capture_tls`](#capture_tls) | |
+| [`capture_envp`](#capture_envp), [`environ`](#environ), [`capture_pagesz`](#capture_pagesz), [`loader_present`](#loader_present), [`capture_thread_pointer`](#capture_thread_pointer), [`thread_pointer_owned`](#thread_pointer_owned), [`capture_tls`](#capture_tls) | |
 | [`read`](#read) | filesystem |
 | [`write`](#write), [`read_at`](#read_at), [`write_at`](#write_at), [`open`](#open), [`close`](#close), [`sync_fd`](#sync_fd), [`stat`](#stat), [`set_mode`](#set_mode), [`set_mode_at`](#set_mode_at), [`file_identity`](#file_identity), [`identity_at`](#identity_at), [`retain_identity_at`](#retain_identity_at), [`publication_capabilities`](#publication_capabilities), [`stat_path`](#stat_path), [`stat_mode`](#stat_mode), [`stat_birth`](#stat_birth), [`unlink`](#unlink), [`rename`](#rename), [`symlink`](#symlink), [`make_dir`](#make_dir), [`directory_init`](#directory_init), [`directory_next`](#directory_next), [`directory_dnit`](#directory_dnit), [`access`](#access), [`seek`](#seek), [`lock_fd`](#lock_fd) | |
 | [`terminate`](#terminate) | process |
@@ -1097,6 +1097,16 @@ pub var _envp: usize = 0
 
 environment
 
+### capture_envp
+
+Forwards [`std.system.os.linux.shared.capture_envp`](shared.md#capture_envp).
+
+```mach
+pub fun capture_envp(envp: usize)
+```
+
+publish the program's envp and the auxiliary vector past it, once at entry
+
 ### environ
 
 Forwards [`std.system.os.linux.shared.environ`](shared.md#environ).
@@ -1119,7 +1129,7 @@ pub fun capture_pagesz()
 
 publish the auxv page size into `_pagesz`
 
-called once by the entrypoint at startup, after `_envp` is set and (in a PIE)
+called once by the entrypoint at startup, after `_auxv` is set and (in a PIE)
 after `_rt_relocate` has applied any relocations, so it runs as ordinary
 post-relocation code that may touch globals. `_pagesz` stays 0 only if the auxv
 lacks the mandatory AT_PAGESZ, which page_size() treats as a fatal invariant
@@ -1139,22 +1149,26 @@ whether a program interpreter started this process
 whoever starts the process owns the main thread's thread pointer, so the
 runtime installs std's block there only when this is false
 
-### capture_main_stack
+### capture_thread_pointer
 
-Forwards [`std.system.os.linux.shared.capture_main_stack`](shared.md#capture_main_stack).
+Forwards [`std.system.os.linux.shared.capture_thread_pointer`](shared.md#capture_thread_pointer).
 
 ```mach
-pub fun capture_main_stack()
+pub fun capture_thread_pointer()
 ```
 
-capture the main thread's stack bounds, once, at entry
+record, once at entry after capture_pagesz, whether std owns the thread
+pointer, which it does where no loader started the process
 
-the kernel grows the main stack down from the end of its mapping by at most
-RLIMIT_STACK. the first thing the kernel writes below that end is the
-executable's path (AT_EXECFN) and one null word, so the page boundary above
-the path's terminator ends the mapping. the soft limit is read once, and an
-unlimited one, or an auxv without AT_EXECFN, leaves the bounds unknown. runs
-after capture_pagesz, and records whether a loader owns the thread pointer
+### thread_pointer_owned
+
+Forwards [`std.system.os.linux.shared.thread_pointer_owned`](shared.md#thread_pointer_owned).
+
+```mach
+pub fun thread_pointer_owned() bool
+```
+
+whether the block a thread reads through its thread pointer is std's
 
 ### capture_tls
 
