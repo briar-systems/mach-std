@@ -139,7 +139,7 @@ The visible difference is teardown. `dnit` on such a heap leaves `mapped_bytes` 
 # after
 fun feed(ctx: ptr, data: *u8, len: usize) { sha256.update(ctx::*sha256.State, data, len); }
 
-var state:  sha256.State = sha256.init();
+var state:  sha256.State = sha256.make();
 var hasher: hasher.Hasher = hasher.Hasher{ctx: (?state)::ptr, f_update: feed};
 prepare_bytes(?t, ?alloc, claim, data, len, 0o644, ?hasher, options);
 sha256.final(?state, ?digest[0]);
@@ -186,7 +186,7 @@ Every spawn and exec, in `std.process.exec` and `std.system.os` alike, takes the
 
 ## `data.json` and `data.toml` move to packages (#1004)
 
-`std.data.json` and `std.data.toml` are removed. JSON reading and writing is the mach-json package and TOML reading is the mach-toml package, each with the same public names, types and behaviour the std module had. Declare the package under the key its library binds, then import from that root instead of `std.data`.
+`std.data.json` and `std.data.toml` are removed. JSON reading and writing is the mach-json package and TOML reading is the mach-toml package, each with the same public names, types and behaviour the std module had. Declare the package under its key and import each module by its source path in the package, so a name is qualified by the module that declares it instead of by `json` or `toml`.
 
 ```toml
 [dep.json]
@@ -200,14 +200,23 @@ ref = "branch/dev"
 
 | 9.x | 10.0.0 |
 | --- | --- |
-| `use std.data.json;`, `json.parse`, `json.Object`, `json.field_str` | `use json;`, with the same names |
-| `use std.data.json.JsonError;` and any other member | `use json.JsonError;` |
-| `use std.data.toml;`, `toml.parse`, `toml.get_str`, `toml.Table` | `use toml;`, with the same names |
-| `use std.data.toml.TomlError;` and any other member | `use toml.TomlError;` |
+| `json.parse`, `json.MAX_DEPTH` | `use json.parse;` |
+| `json.Value`, `json.Kind`, the kind constants, `json.dnit`, the `json.value_*` accessors | `use json.value;` |
+| `json.value_string_decode` | `use json.decode;` |
+| `json.emit`, `json.write_value` | `use json.write;` |
+| `json.Object`, `json.Array`, the `object_*`, `array_*` and `field_*` writers, `json.value_f64`, `json.write_json_string` | `use json.ndjson;` |
+| `json.JsonError` | `use json.error;`, or `use json.error.JsonError;` |
+| `toml.parse`, `toml.parse_bytes` | `use toml.parse;` |
+| `toml.get`, the `toml.get_*` readers, `toml.table_*`, `toml.array_*` | `use toml.lookup;` |
+| `toml.Value`, `toml.Array`, `toml.Table`, `toml.Span`, the `TYPE_*` constants | `use toml.value;` |
+| `toml.dnit` | `use toml.tree;` |
+| `toml.escape`, `toml.datetime_literal`, `toml.DATETIME_LITERAL_MAX` | `use toml.write;` |
+| `toml.MAX_VALUE_DEPTH` | `use toml.expr;` |
+| `toml.TomlError` | `use toml.error;`, or `use toml.error.TomlError;` |
 
 ## the cryptographic hashes, checksums and compression move to packages (#1004)
 
-The SHA-2 and Keccak hashes leave std for the mach-crypto package, and the checksums and compression leave for the mach-deflate package. Each package module has the same public names, types and behaviour the std module had (mach-crypto's `sha512` also holds the public `State384` the std module had). Declare the package under the key its library binds and import the module by its source path in the package.
+The SHA-2 and Keccak hashes leave std for the mach-crypto package, and the checksums and compression leave for the mach-deflate package. Each package module has the same types and behaviour the std module had (mach-crypto's `sha512` also holds the public `State384` the std module had), and the same public names except its constructors and teardowns, which take the lifecycle names (mach#4484) listed in the second table below. Declare the package under its key and import the module by its source path in the package.
 
 ```toml
 [dep.crypto]
@@ -227,6 +236,18 @@ ref = "branch/dev"
 | `use std.crypto.hash.crc32;`, `use std.crypto.hash.adler32;` | `use deflate.crc32;`, `use deflate.adler32;` |
 | `use std.compress.inflate;`, `deflate`, `zlib`, `gzip` | `use deflate.inflate;` and the same module names under `deflate` |
 | `use std.compress.format;`, or the `compress_format` re-export | `use deflate.format;` |
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `sha256.init` | `sha256.make` |
+| `sha256.init_secret` | `sha256.secret_init` |
+| `sha256.destroy_secret` | `sha256.secret_dnit` |
+| `sha512.init` | `sha512.make` |
+| `sha512.init384` | `sha512.make384` |
+| `sha512.init_secret384`, `sha512.init_secret512` | `sha512.secret384_init`, `sha512.secret512_init` |
+| `sha512.destroy_secret384`, `sha512.destroy_secret512` | `sha512.secret384_dnit`, `sha512.secret512_dnit` |
+| `keccak.init`, `sha3_256.init`, `sha3_512.init`, `shake128.init`, `shake256.init` | `make` in the same module |
+| `crc32.init`, `adler32.init` | `crc32.make`, `adler32.make` |
 
 `std.crypto.ct`, `std.crypto.rand`, `std.crypto.hash.hasher`, `std.crypto.hash.fnv1a`, `std.crypto.hash.siphash` and `std.memory.secret` stay in std.
 
@@ -366,6 +387,16 @@ Every entry that performs a lookup takes a `*std.sync.cancel.Scope`, as `process
 | `types.AdapterFun`: `fun(ptr, *Query, *Allocator, ResultLimits, *Resolution) Error` | `fun(ptr, *cancel.Scope, *Query, *Allocator, ResultLimits, *Resolution) Error` |
 | `linux.resolve(query, ...)`, `darwin.resolve(query, ...)`, `windows.resolve(query, ...)` | `resolve(scope, query, ...)` |
 | `linux.resolve_with_config(query, ..., config)` | `linux.resolve_with_config(scope, query, ..., config)` |
+
+## chrono.format writes a chosen fraction and refuses invalid values
+
+`std.chrono.format.rfc3339` takes a `fraction: Fraction` after the datetime, which states how the fraction of a second is written: `Fraction.shortest{}` writes the fewest digits that hold `nsec` exactly, `Fraction.digits{n}` exactly `n` digits, and `Fraction.digits_unless_whole{n}` `n` digits and none when they are all zero. 9.x wrote nine digits when `nsec` was not zero and none otherwise, which `Fraction.digits_unless_whole{9}` reproduces.
+
+`rfc3339` now returns 0 for a datetime `datetime_is_valid` refuses, a year outside [0, 9999], an offset that is not a whole number of minutes or a fraction of more than 9 digits, and `rfc3339_date` returns 0 for a date `date_is_valid` refuses or a year outside [0, 9999]. `Datetime` gains `offset_unknown`, and a datetime with it set is written with the offset `-00:00`. `rfc3339_time`, `rfc3339_local` and `read_rfc3339` are new, with `TimeOfDay` and `LocalDatetime` in `std.chrono.date`.
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `format.rfc3339(dt, buf, len)` | `format.rfc3339(dt, format.Fraction.digits_unless_whole{9}, buf, len)` for the same output |
 
 # std 6.x to 7.0.0
 
