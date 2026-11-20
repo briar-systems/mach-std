@@ -57,7 +57,8 @@
 #
 # native_source is only on a target with the pages capability. init's budget bounds the retained empty spans. a heap
 # over a source that cannot release keeps them past the budget, because there
-# is nowhere else for them to go. allocator_source makes that choice once: over
+# is nowhere else for them to go, and one whose release is refused is kept too,
+# so dnit tries it again and reports the failure. allocator_source makes that choice once: over
 # a backing that does not reclaim it leaves fn_release nil, so the heap keeps
 # every span it obtained and reuses it, and mapped_bytes still counts them
 # after dnit because the backing never took them back.
@@ -377,34 +378,35 @@ fun release(h: *Heap, s: *Span) i64 {
     ret 0;
 }
 
-# retire an empty class span: hold it for any class, or give it back once the
-# cache is over budget. a source that cannot reclaim keeps it regardless,
-# which is the only shape a grow-only host can have.
-fun retire_span(h: *Heap, s: *Span) {
-    if (h.held + s.size <= h.budget || h.src.fn_release == nil) {
-        s.used   = 0;
-        s.free   = nil;
-        s.bump   = 0;
-        s.zeroed = 0;
-        list_push(?h.spans, s);
-        h.held = h.held + s.size;
-        ret;
-    }
+# whether a retired span went back to the source: only once the cache is over
+# budget, and never when the source cannot reclaim or refuses
+fun retire_released(h: *Heap, s: *Span) bool {
+    if (h.held + s.size <= h.budget || h.src.fn_release == nil) { ret false; }
+    ret release(h, s) == 0;
+}
 
-    release(h, s);
+# retire an empty class span: give it back once the cache is over budget, else
+# hold it for any class. a span the source cannot reclaim or refuses is held
+# past the budget, so dnit still releases it and reports a failure there.
+fun retire_span(h: *Heap, s: *Span) {
+    if (retire_released(h, s)) { ret; }
+
+    s.used   = 0;
+    s.free   = nil;
+    s.bump   = 0;
+    s.zeroed = 0;
+    list_push(?h.spans, s);
+    h.held = h.held + s.size;
 }
 
 # retire a large span the same way, keyed by its own size
 fun retire_large(h: *Heap, s: *Span) {
-    if (h.held + s.size <= h.budget || h.src.fn_release == nil) {
-        s.used   = 0;
-        s.zeroed = 0;
-        list_push(?h.cache, s);
-        h.held = h.held + s.size;
-        ret;
-    }
+    if (retire_released(h, s)) { ret; }
 
-    release(h, s);
+    s.used   = 0;
+    s.zeroed = 0;
+    list_push(?h.cache, s);
+    h.held = h.held + s.size;
 }
 
 # a fresh span for a class, from the cache when one is held
@@ -559,18 +561,11 @@ fun find_span(h: *Heap, p: ptr, align: usize) *Span {
     ret s;
 }
 
-# release a block back to its span, unwinding the span when it runs empty
-fun give_back(h: *Heap, s: *Span, p: ptr, size: usize) i64 {
+# 0 when p starts a live block of span s that `size` bytes fit, else EINVAL
+fun check_block(s: *Span, p: ptr, size: usize) i64 {
     if (s.class == CLASS_LARGE) {
         if ((s::usize + s.data)::ptr != p) { ret EINVAL; }
         if (size > s.cap)                  { ret EINVAL; }
-
-        if (s.data >= SPAN_ALIGN) { list_remove(?h.huge, s); }
-        or                        { list_remove(?h.large, s); }
-
-        h.live   = h.live - s.cap;
-        h.blocks = h.blocks - 1;
-        retire_large(h, s);
         ret 0;
     }
 
@@ -582,6 +577,22 @@ fun give_back(h: *Heap, s: *Span, p: ptr, size: usize) i64 {
     if ((off - s.data) % class_size != 0) { ret EINVAL; }
     if (size > class_size)                { ret EINVAL; }
     if (s.used == 0)                      { ret EINVAL; }
+    ret 0;
+}
+
+# release a block check_block accepted, unwinding the span when it runs empty
+fun give_back(h: *Heap, s: *Span, p: ptr) {
+    if (s.class == CLASS_LARGE) {
+        if (s.data >= SPAN_ALIGN) { list_remove(?h.huge, s); }
+        or                        { list_remove(?h.large, s); }
+
+        h.live   = h.live - s.cap;
+        h.blocks = h.blocks - 1;
+        retire_large(h, s);
+        ret;
+    }
+
+    val class_size: usize = CLASS_SIZE[s.class];
 
     @(p::*usize) = s.free::usize;
     s.free       = p;
@@ -599,8 +610,6 @@ fun give_back(h: *Heap, s: *Span, p: ptr, size: usize) i64 {
         list_remove(?h.partial[s.class], s);
         retire_span(h, s);
     }
-
-    ret 0;
 }
 
 fun do_allocate(ctx: ptr, size: usize, align: usize) opt[ptr] {
@@ -650,7 +659,10 @@ fun free_block(h: *Heap, p: ptr, size: usize, align: usize) i64 {
     if (p == nil) { ret 0; }
     val s: *Span = find_span(h, p, align);
     if (s == nil) { ret EINVAL; }
-    ret give_back(h, s, p, size);
+    val code: i64 = check_block(s, p, size);
+    if (code != 0) { ret code; }
+    give_back(h, s, p);
+    ret 0;
 }
 
 fun do_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) opt[ptr] {
@@ -677,7 +689,8 @@ fun resize(h: *Heap, p: ptr, old_size: usize, new_size: usize, align: usize) opt
     }
 
     val s: *Span = find_span(h, p, align);
-    if (s == nil) { ret opt[ptr].none{}; }
+    if (s == nil)                         { ret opt[ptr].none{}; }
+    if (check_block(s, p, old_size) != 0) { ret opt[ptr].none{}; }
 
     # capacity of the block as its span sees it, which outranks old_size
     var room: usize = s.cap;
@@ -700,9 +713,7 @@ fun resize(h: *Heap, p: ptr, old_size: usize, new_size: usize, align: usize) opt
     if (copy > room)     { copy = room; }
     if (new_size < copy) { copy = new_size; }
     memory.raw_copy(fresh, p, copy);
-
-    val code: i64 = give_back(h, s, p, old_size);
-    if (code != 0) { ret opt[ptr].none{}; }
+    give_back(h, s, p);
 
     ret opt[ptr].some{fresh};
 }

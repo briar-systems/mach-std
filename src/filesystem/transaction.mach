@@ -885,8 +885,7 @@ fun remove_entry_checked(dirfd: usize, name: *Unit, removed: *usize) err[Error] 
         if (os.error_kind(sr) == io_errors.NOT_FOUND) { ret err[Error].ok{}; }
         ret err[Error].err{io_error(OP_REMOVE, sr)};
     }
-    val kind: u32 = fsnative.stat_mode(?st) & os.S_IFMT;
-    if (kind != os.S_IFDIR && kind != os.S_IFREG) {
+    if ((fsnative.stat_mode(?st) & os.S_IFMT) == os.S_IFLNK) {
         ret err[Error].err{error(CONTAINMENT, OP_REMOVE)};
     }
     ret remove_counted(dirfd, name, removed);
@@ -909,7 +908,8 @@ pub fun entry_make_dir(destination: *Claim, mode: i32) res[bool, Error] {
 #
 # for the fixed-size records a caller keeps beside its own data, where the
 # expected size is known and anything larger is corruption rather than a file
-# to grow a buffer for.
+# to grow a buffer for. the leaf is never followed: a symlink is refused with
+# CONTAINMENT, and anything else that is not a regular file with INVALID.
 # ---
 # out:     destination buffer
 # out_cap: its capacity; a file larger than this is refused, not truncated
@@ -930,8 +930,21 @@ pub fun entry_read_all_native(r: *Root, leaf: *Unit, out: *u8,
     if (!ownership.root_valid(r))       { ret res[opt[usize], Error].err{error(INVALID, OP_ROOT_OPEN)}; }
     if (!leaf_is_component[Unit](leaf)) { ret res[opt[usize], Error].err{error(CONTAINMENT, OP_ROOT_OPEN)}; }
 
+    var before: os.stat_t;
+    val probed: i64 = os.stat_path_native(r.dirfd, leaf, ?before, os.AT_SYMLINK_NOFOLLOW);
+    if (probed < 0) {
+        if (os.error_kind(probed) == io_errors.NOT_FOUND) { ret res[opt[usize], Error].ok{opt[usize].none{}}; }
+        ret res[opt[usize], Error].err{io_error(OP_ROOT_OPEN, probed)};
+    }
+    val kind: u32 = fsnative.stat_mode(?before) & os.S_IFMT;
+    if (kind == os.S_IFLNK) { ret res[opt[usize], Error].err{error(CONTAINMENT, OP_ROOT_OPEN)}; }
+    if (kind != os.S_IFREG) { ret res[opt[usize], Error].err{error(INVALID, OP_ROOT_OPEN)}; }
+
+    # nofollow and nonblocking so an entry swapped after the probe is refused, never followed or waited on
+    var flags: i32 = os.O_RDONLY;
+    $if ($mach.build.sys != $mach.sys.windows) { flags = flags | nofollow_os.O_NOFOLLOW | nofollow_os.O_NONBLOCK; }
     var raw_handle: usize = os.INVALID_HANDLE;
-    val raw:        i64   = os.open_native(r.dirfd, leaf, os.O_RDONLY, 0, ?raw_handle);
+    val raw:        i64   = os.open_native(r.dirfd, leaf, flags, 0, ?raw_handle);
     if (raw < 0) {
         if (os.error_kind(raw) == io_errors.NOT_FOUND) { ret res[opt[usize], Error].ok{opt[usize].none{}}; }
         ret res[opt[usize], Error].err{io_error(OP_ROOT_OPEN, raw)};
@@ -943,6 +956,10 @@ pub fun entry_read_all_native(r: *Root, leaf: *Unit, out: *u8,
     if (sr < 0) {
         os.close(fd);
         ret res[opt[usize], Error].err{io_error(OP_ROOT_OPEN, sr)};
+    }
+    if ((fsnative.stat_mode(?st) & os.S_IFMT) != os.S_IFREG) {
+        os.close(fd);
+        ret res[opt[usize], Error].err{error(INVALID, OP_ROOT_OPEN)};
     }
     val len: usize = st.st_size::usize;
     if (len > out_cap) {
@@ -2284,7 +2301,10 @@ pub fun prepare_dir(out: *Transaction, alloc: *A.Allocator, destination: *Claim,
 # entry aborts the whole replacement. a tree the caller does not fully own is
 # never destroyed. the walk is in native units, so every name the directory
 # holds is shown, and `owns` either decides an entry or fails the walk.
-fun walk_owned[C](alloc: *A.Allocator, dirfd: usize, prefix: *Unit, ctx: *C,
+#
+# `depth` is the depth of the entries `dirfd` holds, counted as the removal
+# counts it, so a tree the walk accepts is one the backup removal can delete.
+fun walk_owned[C](alloc: *A.Allocator, dirfd: usize, prefix: *Unit, depth: usize, ctx: *C,
     owns: fun(*C, *Unit, bool) res[bool, Error]) err[Error] {
     var names:            Vector[*Unit] = vector.init[*Unit](alloc);
     val err_list_entries: err[Error]    = list_entries(alloc, dirfd, ?names);
@@ -2298,6 +2318,10 @@ fun walk_owned[C](alloc: *A.Allocator, dirfd: usize, prefix: *Unit, ctx: *C,
     for (i < names.len && !sel err_failure.err) {
         val name: *Unit = names.data[i];
         i = i + 1;
+        if (depth > MAX_REMOVE_DEPTH) {
+            err_failure = err[Error].err{error(CONTAINMENT, OP_COMMIT)};
+            cnt;
+        }
 
         val res_rel: res[*Unit, Error] = join_units(alloc, prefix, name);
         if (sel res_rel.err) {
@@ -2341,7 +2365,7 @@ fun walk_owned[C](alloc: *A.Allocator, dirfd: usize, prefix: *Unit, ctx: *C,
                 cnt;
             }
             val child:   usize      = res_opened.ok;
-            val err_sub: err[Error] = walk_owned[C](alloc, child, rel, ctx, owns);
+            val err_sub: err[Error] = walk_owned[C](alloc, child, rel, depth + 1, ctx, owns);
             val closed:  i64        = os.close(child);
             if (sel err_sub.err) { err_failure = err_sub; }
             or (closed < 0)      { err_failure = err[Error].err{io_error(OP_COMMIT, closed)}; }
@@ -2527,7 +2551,7 @@ fun replace_owned[C](t: *Transaction, callable: bool, ctx: *C,
         ret owned_replace_failed(t, backupfd, true, e);
     }
     val targetfd:      usize      = res_target.ok;
-    val err_checked:   err[Error] = walk_owned[C](t.alloc, targetfd, nil, ctx, owns);
+    val err_checked:   err[Error] = walk_owned[C](t.alloc, targetfd, nil, 1, ctx, owns);
     val target_closed: i64        = os.close(targetfd);
     if (sel err_checked.err) { ret owned_replace_failed(t, backupfd, true, err_checked.err); }
     if (target_closed < 0)   { ret owned_replace_failed(t, backupfd, true, io_error(OP_COMMIT, target_closed)); }

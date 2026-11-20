@@ -21,6 +21,7 @@
 # re-exported here.
 
 use std.types.option.opt;
+use std.types.size.usize;
 
 use io_error: std.io.error;
 use std.system.capability;
@@ -91,52 +92,106 @@ fwd impl.is_terminal;
 fwd impl.enable_raw;
 fwd impl.disable_raw;
 fwd impl.is_raw;
-fwd impl.flush_input;
 
-# raw, per-frame polling (per-os backend)
-fwd impl.poll_key;
+# bytes poll_key_decoded read past the key it returned, delivered before any
+# new read. a decode looks at most three bytes ahead and consumes at least one
+var _ahead:     [3]u8;
+var _ahead_len: usize = 0;
 
-# poll_key, decoding an arrow escape into a special key
+# drop whatever's sitting unread in the input queue, read-ahead bytes included
 #
-# on posix backends an arrow arrives as the 3-byte sequence ESC '[' 'A'..'D';
-# this consumes those follow-up bytes and returns the matching special key. a
-# bare ESC (or any byte that is not the start of an arrow) is returned as-is.
-# windows already decodes arrows in poll_key, so this is a passthrough there.
-#
-# caveat: on a slow link the follow-up bytes could arrive a poll later than the
-# ESC; fine over a local terminal. requires raw mode.
+# worth calling right before enable_raw / disable_raw so a burst of stale
+# keystrokes from the old mode doesn't leak into the new one.
 # ---
-# ret: some{key} -- a special arrow or an ordinary byte -- none when nothing
-#      was waiting, or the native failure of whichever read refused
-pub fun poll_key_decoded() terr.Poll {
-    val res_escape_polled: terr.Poll = impl.poll_key();
-    if (sel res_escape_polled.err)      { ret res_escape_polled; }
-    if (!sel res_escape_polled.ok.some) { ret res_escape_polled; }
-    val first: key.Key = res_escape_polled.ok.some;
-
-    # an arrow sequence can only begin with a raw ESC byte
-    if (first.kind != key.KIND_BYTE) { ret res_escape_polled; }
-    if (first.byte != 27)            { ret res_escape_polled; }
-
-    val res_bracket_polled: terr.Poll = impl.poll_key();
-    if (sel res_bracket_polled.err)      { ret res_bracket_polled; }
-    if (!sel res_bracket_polled.ok.some) { ret res_escape_polled; }
-    val second: key.Key = res_bracket_polled.ok.some;
-    if (second.kind != key.KIND_BYTE || second.byte != 91) { ret res_escape_polled; } # not '['
-
-    val res_arrow_polled: terr.Poll = impl.poll_key();
-    if (sel res_arrow_polled.err)      { ret res_arrow_polled; }
-    if (!sel res_arrow_polled.ok.some) { ret res_escape_polled; }
-    val third: key.Key = res_arrow_polled.ok.some;
-    if (third.kind != key.KIND_BYTE) { ret res_escape_polled; }
-
-    if (third.byte == 65) { ret decoded(key.KEY_UP); }
-    if (third.byte == 66) { ret decoded(key.KEY_DOWN); }
-    if (third.byte == 67) { ret decoded(key.KEY_RIGHT); }
-    if (third.byte == 68) { ret decoded(key.KEY_LEFT); }
-    ret res_escape_polled;
+# ret: ok, or the native refusal
+pub fun flush_input() terr.Operation {
+    _ahead_len = 0;
+    ret impl.flush_input();
 }
 
-fun decoded(s: key.Special) terr.Poll {
-    ret terr.Poll.ok{opt[key.Key].some{key.key_special(s)}};
+# read one key without blocking
+#
+# a byte poll_key_decoded read ahead and did not consume comes first, then the
+# backend's own poll. requires raw mode (enable_raw).
+# ---
+# ret: some{key} if one was waiting, none when the queue was empty, or the
+#      native read failure
+pub fun poll_key() terr.Poll {
+    if (_ahead_len > 0) { ret waiting(key.key_byte(take_ahead())); }
+    ret impl.poll_key();
+}
+
+$if ($mach.build.sys == $mach.sys.windows) {
+    # poll_key, which already decodes arrows on windows
+    # ---
+    # ret: some{key} -- a special arrow or an ordinary byte -- none when nothing
+    #      was waiting, or the native read failure
+    pub fun poll_key_decoded() terr.Poll {
+        ret poll_key();
+    }
+}
+$or {
+    # poll_key, decoding an arrow escape into a special key
+    #
+    # an arrow arrives as the 3-byte sequence ESC '[' 'A'..'D', which this
+    # consumes whole and returns as the matching special key. any other byte,
+    # including a bare ESC, is returned as-is, and the bytes read ahead to rule
+    # out an arrow are delivered by the following polls.
+    #
+    # caveat: on a slow link the follow-up bytes could arrive a poll later than
+    # the ESC, which then reads as a bare ESC. requires raw mode.
+    # ---
+    # ret: some{key} -- a special arrow or an ordinary byte -- none when nothing
+    #      was waiting, or the native failure of whichever read refused
+    pub fun poll_key_decoded() terr.Poll {
+        val err_first: terr.Operation = read_ahead(1);
+        if (sel err_first.err) { ret terr.Poll.err{err_first.err}; }
+        if (_ahead_len == 0)   { ret terr.Poll.ok{opt[key.Key].none{}}; }
+        if (_ahead[0] != 27)   { ret waiting(key.key_byte(take_ahead())); }
+
+        val err_rest: terr.Operation = read_ahead(3);
+        if (sel err_rest.err)                  { ret terr.Poll.err{err_rest.err}; }
+        if (_ahead_len < 3 || _ahead[1] != 91) { ret waiting(key.key_byte(take_ahead())); } # not '['
+
+        val arrow: u8 = _ahead[2];
+        if (arrow < 65 || arrow > 68) { ret waiting(key.key_byte(take_ahead())); }
+        _ahead_len = 0;
+
+        if (arrow == 65) { ret waiting(key.key_special(key.KEY_UP)); }
+        if (arrow == 66) { ret waiting(key.key_special(key.KEY_DOWN)); }
+        if (arrow == 67) { ret waiting(key.key_special(key.KEY_RIGHT)); }
+        ret waiting(key.key_special(key.KEY_LEFT));
+    }
+}
+
+# poll the backend until n bytes are read ahead or nothing more is waiting
+# ---
+# n:   how many read-ahead bytes to hold, at most three
+# ret: ok, or the native read failure
+fun read_ahead(n: usize) terr.Operation {
+    for (_ahead_len < n) {
+        val res_polled: terr.Poll = impl.poll_key();
+        if (sel res_polled.err)      { ret terr.Operation.err{res_polled.err}; }
+        if (!sel res_polled.ok.some) { ret terr.Operation.ok{}; }
+        val polled: key.Key = res_polled.ok.some;
+        _ahead[_ahead_len] = polled.byte;
+        _ahead_len         = _ahead_len + 1;
+    }
+    ret terr.Operation.ok{};
+}
+
+# remove and return the oldest read-ahead byte
+fun take_ahead() u8 {
+    val b: u8    = _ahead[0];
+    var i: usize = 1;
+    for (i < _ahead_len) {
+        _ahead[i - 1] = _ahead[i];
+        i             = i + 1;
+    }
+    _ahead_len = _ahead_len - 1;
+    ret b;
+}
+
+fun waiting(k: key.Key) terr.Poll {
+    ret terr.Poll.ok{opt[key.Key].some{k}};
 }
