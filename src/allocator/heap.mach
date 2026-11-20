@@ -16,6 +16,17 @@
 # one thread owns, as one per unit of work, takes the allocator `allocator_owned`
 # wires, which takes no lock.
 #
+# a thread std started keeps a cache of small blocks for each heap it uses
+# through the allocator `allocator` wires, up to BOUND heaps at once, so most of
+# its requests and releases there take no lock: a class it has no block of is
+# refilled with a batch under one lock, and a class it holds too many of gives a
+# batch back. the cache goes back to its heap when the thread ends
+# (thread.at_exit), when the thread binds more heaps than it keeps caches for,
+# and when the heap is torn down. a thread std did not start takes the lock
+# every time, since nothing would give its cache back when it ends. a block a
+# cache holds counts as live, and a release is checked against its span as it
+# would be under the lock.
+#
 # it satisfies the std.allocator interface, so it drops in wherever an Allocator
 # is taken:
 #
@@ -27,7 +38,8 @@
 #   heap.allocator(?a, ?h);
 #
 # requests up to MAX_SMALL (8 KiB) round to one of 32 classes carved from
-# 64 KiB spans. a larger request gets a span sized to the request.
+# 64 KiB spans. a larger request gets a span of its own, from its size up to
+# that rounded to 64 KiB, the address range the span takes in any case.
 #
 # alignment is honoured for every request. a small request aligned beyond 16
 # bytes is served by the first class that is a multiple of it, and one aligned
@@ -82,6 +94,7 @@ use std.types.size.usize;
 
 use A: std.allocator;
 use std.memory;
+use std.sync.atomic;
 use std.sync.mutex;
 use std.system.capability;
 
@@ -89,11 +102,14 @@ $if (capability.HAS_PAGES) {
     use std.system.os;
 }
 
+$if (capability.HAS_THREADS) {
+    use std.sync.thread;
+}
+
 $if (capability.HAS_PAGES && capability.HAS_THREADS) {
     use std.allocator.fixed;
     use std.allocator.page;
     use std.allocator.testing;
-    use std.sync.thread;
 }
 
 # where a heap's backing memory comes from
@@ -107,17 +123,20 @@ $if (capability.HAS_PAGES && capability.HAS_THREADS) {
 # fn_release(ctx, span, size) returns a span obtained earlier, at the size it
 # was granted, 0 on success or a negative backend native code. it is nil for a
 # source that cannot return memory; the core then retains every span for reuse
-# and never calls it.
+# and never calls it. a source that `cuts` also takes a granted span back in
+# pieces cut at multiples of SPAN_ALIGN from its base, each piece on its own.
 # ---
 # ctx:        opaque context passed to both callbacks
 # fn_obtain:  acquire a span, or none when the source is exhausted
 # fn_release: return a span, or nil when the source cannot reclaim
 # stale:      a span it gives may hold what was written to it before
+# cuts:       a span it gives may come back in pieces
 pub rec Source {
     ctx:        ptr;
     fn_obtain:  fun(ptr, usize, usize) opt[Grant];
     fn_release: fun(ptr, ptr, usize) i64;
     stale:      bool;
+    cuts:       bool;
 }
 
 # a span a source granted
@@ -149,7 +168,9 @@ pub val PAGE_FLOOR: usize = 4096;
 val CLASS_LARGE: usize = 32;
 
 # a block that owns its span asks the source for one up to an eighth larger
-# than it needs, and every byte it is granted is the block's capacity
+# than it needs, or up to its size rounded to SPAN_ALIGN when that is more, the
+# address range its span takes in any case, and every byte it is granted is the
+# block's capacity
 val LARGE_SPARE_SHIFT: usize = 3;
 
 # alignment every size class satisfies without being widened
@@ -238,6 +259,11 @@ rec Span {
 # total_bytes:  bytes charged for them, counted as `live` counts and never decremented
 # idx_small:    class index for each 16 byte step of a size up to 1024
 # idx_mid:      class index for each 128 byte step of a size up to MAX_SMALL
+# id:           the heap's identity, never shared with another heap of the process
+# caches:       the thread caches bound to the heap
+# spare:        cache records given back, for the next thread that binds
+# records:      the span cache records are carved from, nil before the first
+# carved:       records carved from it
 pub rec Heap {
     src:  Source;
     lock: mutex.Mutex;
@@ -263,6 +289,64 @@ pub rec Heap {
 
     idx_small: [64]u8;
     idx_mid:   [64]u8;
+
+    id:      usize;
+    caches:  *Cache;
+    spare:   *Cache;
+    records: *Span;
+    carved:  usize;
+}
+
+# the small blocks one thread holds of one heap, carved from the heap's record span
+# ---
+# heap:   the heap the blocks belong to
+# slot:   the binding of the thread that holds it
+# next:   the record after it among the heap's caches or its spare records
+# prev:   the record before it among the heap's caches
+# heads:  per class, the blocks held, linked through their first word
+# counts: per class, how many are held
+rec Cache {
+    heap:   *Heap;
+    slot:   *Binding;
+    next:   *Cache;
+    prev:   *Cache;
+    heads:  [32]ptr;
+    counts: [32]u32;
+}
+
+# a thread's cache for one heap, or an empty binding for id 0. a binding with no
+# cache marks a heap the thread found it could not cache for
+# ---
+# id:    the heap's identity
+# cache: the thread's cache of it
+rec Binding {
+    id:    usize;
+    cache: *Cache;
+}
+
+# the identity the last heap initialized took
+var heap_ids: usize;
+
+# the most shared heaps a thread keeps a cache for at once
+val BOUND: usize = 4;
+
+# a cache holds a batch of a class's blocks of about CACHE_BATCH_BYTES, at least
+# two and at most CACHE_BATCH_MOST blocks, and gives a batch back at twice that
+val CACHE_BATCH_BYTES: usize = 16384;
+val CACHE_BATCH_MOST:  usize = 32;
+
+$if (capability.HAS_THREADS) {
+    # the calling thread's caches
+    #[thread]
+    var bound: [4]Binding;
+
+    # serializes binding, unbinding and a heap's teardown detaching its caches,
+    # since a teardown writes the bindings of the threads whose caches it drops
+    var bind_lock: mutex.Mutex;
+
+    # 0 before the first binding, 1 once caches_end is an exit routine, 2 when it
+    # could not be registered and no thread caches. under bind_lock
+    var exits_hooked: u8;
 }
 
 # the granule a span's size rounds to: the host page, or PAGE_FLOOR on a target
@@ -499,7 +583,11 @@ fun take_large(h: *Heap, size: usize, align: usize, zeroed: *bool) ptr {
 
     var spare: usize = (total >> LARGE_SPARE_SHIFT) & ~(page - 1);
     if (spare > ~(0::usize) - total) { spare = 0; }
-    val most: usize = total + spare;
+    var most: usize = total + spare;
+    if (total <= ~(0::usize) - SPAN_ALIGN) {
+        val slot: usize = align_up(total, SPAN_ALIGN);
+        if (slot > most) { most = slot; }
+    }
 
     var s: *Span = nil;
 
@@ -624,6 +712,15 @@ fun give_back(h: *Heap, s: *Span, p: ptr) {
 fun do_allocate(ctx: ptr, size: usize, align: usize) opt[ptr] {
     if (ctx == nil) { ret opt[ptr].none{}; }
     val h: *Heap = ctx::*Heap;
+    $if (capability.HAS_THREADS) {
+        if (size != 0 && size <= MAX_SMALL) {
+            val c: usize = class_of(h, size, align);
+            if (c != CLASS_LARGE) {
+                val k: *Cache = cache_of(h);
+                if (k != nil) { ret cached_take(h, k, c); }
+            }
+        }
+    }
     mutex.lock(?h.lock);
     fin { mutex.unlock(?h.lock); }
     ret acquire(h, size, align);
@@ -653,6 +750,12 @@ fun take(h: *Heap, size: usize, align: usize, zeroed: *bool) ptr {
 fun do_deallocate(ctx: ptr, p: ptr, size: usize, align: usize) i64 {
     if (ctx == nil) { ret EINVAL; }
     val h: *Heap = ctx::*Heap;
+    $if (capability.HAS_THREADS) {
+        if (p != nil && align < SPAN_ALIGN) {
+            val k: *Cache = cache_of(h);
+            if (k != nil) { ret cached_give(h, k, p, size, align); }
+        }
+    }
     mutex.lock(?h.lock);
     fin { mutex.unlock(?h.lock); }
     ret free_block(h, p, size, align);
@@ -677,6 +780,12 @@ fun free_block(h: *Heap, p: ptr, size: usize, align: usize) i64 {
 fun do_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) opt[ptr] {
     if (ctx == nil) { ret opt[ptr].none{}; }
     val h: *Heap = ctx::*Heap;
+    $if (capability.HAS_THREADS) {
+        if (p != nil && new_size != 0 && align < SPAN_ALIGN) {
+            val k: *Cache = cache_of(h);
+            if (k != nil) { ret cached_resize(h, k, p, old_size, new_size, align); }
+        }
+    }
     mutex.lock(?h.lock);
     fin { mutex.unlock(?h.lock); }
     ret resize(h, p, old_size, new_size, align);
@@ -721,6 +830,269 @@ fun resize(h: *Heap, p: ptr, old_size: usize, new_size: usize, align: usize) opt
     ret opt[ptr].some{fresh};
 }
 
+$if (capability.HAS_THREADS) {
+    # the blocks of a class a cache takes or gives back at once
+    fun cache_batch(c: usize) usize {
+        val n: usize = CACHE_BATCH_BYTES / CLASS_SIZE[c];
+        if (n < 2)                { ret 2; }
+        if (n > CACHE_BATCH_MOST) { ret CACHE_BATCH_MOST; }
+        ret n;
+    }
+
+    # the calling thread's cache of h, bound on its first use, or nil when the
+    # thread does not cache h
+    fun cache_of(h: *Heap) *Cache {
+        var i: usize = 0;
+        for (i < BOUND) {
+            if (bound[i].id == h.id) { ret bound[i].cache; }
+            i = i + 1;
+        }
+        if (!thread.runs_at_exit()) { ret nil; }
+        ret cache_bind(h);
+    }
+
+    # bind a cache of h to the calling thread, giving up its last binding when
+    # every one is taken. a heap the thread cannot cache for is bound with no cache,
+    # so the thread does not ask again
+    fun cache_bind(h: *Heap) *Cache {
+        mutex.lock(?bind_lock);
+        fin { mutex.unlock(?bind_lock); }
+
+        if (exits_hooked == 0) {
+            exits_hooked = 2;
+            if (thread.at_exit(caches_end)) { exits_hooked = 1; }
+        }
+
+        var i: usize = 0;
+        for (i < BOUND && bound[i].id != 0) { i = i + 1; }
+        if (i == BOUND) {
+            i = BOUND - 1;
+            cache_unbind(?bound[i]);
+        }
+
+        var k: *Cache = nil;
+        if (exits_hooked == 1) {
+            mutex.lock(?h.lock);
+            k = record_take(h);
+            if (k != nil) {
+                k.heap = h;
+                k.slot = ?bound[i];
+                k.prev = nil;
+                k.next = h.caches;
+                if (k.next != nil) { k.next.prev = k; }
+                h.caches = k;
+            }
+            mutex.unlock(?h.lock);
+        }
+        bound[i] = Binding{id: h.id, cache: k};
+        ret k;
+    }
+
+    # a cache record of h, empty, from its spare records or carved from its record
+    # span, or nil when there is none. under h's lock
+    fun record_take(h: *Heap) *Cache {
+        var k: *Cache = h.spare;
+        if (k != nil) {
+            h.spare = k.next;
+        }
+        or {
+            val step: usize = align_up($size_of(Cache), 64);
+            if (h.records == nil) {
+                h.records = obtain(h, SPAN_SIZE, SPAN_SIZE);
+                if (h.records == nil) { ret nil; }
+                # no block lookup may take the record span for a span of blocks
+                h.records.magic = 0;
+                h.carved        = 0;
+            }
+            val at: usize = span_header_size() + h.carved * step;
+            if (at + step > h.records.size) { ret nil; }
+            h.carved = h.carved + 1;
+            k        = (h.records::usize + at)::*Cache;
+        }
+        var c: usize = 0;
+        for (c < CLASS_COUNT) {
+            k.heads[c]  = nil;
+            k.counts[c] = 0;
+            c           = c + 1;
+        }
+        ret k;
+    }
+
+    # give a binding's cache back to its heap and empty the binding. under bind_lock,
+    # which keeps the heap from being torn down while a binding names its cache
+    fun cache_unbind(b: *Binding) {
+        val k: *Cache = b.cache;
+        b.id    = 0;
+        b.cache = nil;
+        if (k == nil) { ret; }
+        val h: *Heap = k.heap;
+        mutex.lock(?h.lock);
+        var c: usize = 0;
+        for (c < CLASS_COUNT) {
+            cache_drain(h, k, c, k.counts[c]::usize);
+            c = c + 1;
+        }
+        if (k.prev != nil) { k.prev.next = k.next; }
+        or                 { h.caches = k.next; }
+        if (k.next != nil) { k.next.prev = k.prev; }
+        k.next  = h.spare;
+        h.spare = k;
+        mutex.unlock(?h.lock);
+    }
+
+    # the exit routine: an ending thread gives every cache back
+    fun caches_end() {
+        mutex.lock(?bind_lock);
+        var i: usize = 0;
+        for (i < BOUND) {
+            cache_unbind(?bound[i]);
+            i = i + 1;
+        }
+        mutex.unlock(?bind_lock);
+    }
+
+    # drop h's caches before its teardown: each holding thread's binding is emptied,
+    # its blocks go with their spans, and the record span goes back to the source.
+    # a thread holding one is alive, since an ending thread unbinds under bind_lock
+    # ---
+    # ret: 0, or the source's status refusing the record span
+    fun caches_detach(h: *Heap) i64 {
+        mutex.lock(?h.lock);
+        val held: bool = h.caches != nil || h.records != nil;
+        mutex.unlock(?h.lock);
+        if (!held) { ret 0; }
+
+        mutex.lock(?bind_lock);
+        mutex.lock(?h.lock);
+        var k: *Cache = h.caches;
+        for (k != nil) {
+            k.slot.id    = 0;
+            k.slot.cache = nil;
+            k            = k.next;
+        }
+        h.caches = nil;
+        h.spare  = nil;
+        var code: i64 = 0;
+        if (h.records != nil) {
+            code = release(h, h.records);
+            # a refused record span stays the heap's, still no span of blocks
+            if (code == 0) { h.records = nil; }
+            or             { h.records.magic = 0; }
+        }
+        mutex.unlock(?h.lock);
+        mutex.unlock(?bind_lock);
+        ret code;
+    }
+
+    # a block of class c from the cache, refilling the class under one lock when
+    # it holds none
+    fun cached_take(h: *Heap, k: *Cache, c: usize) opt[ptr] {
+        if (k.heads[c] == nil) {
+            mutex.lock(?h.lock);
+            val n: usize = cache_batch(c);
+            var i: usize = 0;
+            for (i < n) {
+                var zeroed: bool = false;
+                val p:      ptr  = take_small(h, c, ?zeroed);
+                if (p == nil) { brk; }
+                @(p::*usize) = k.heads[c]::usize;
+                k.heads[c]   = p;
+                i            = i + 1;
+            }
+            mutex.unlock(?h.lock);
+            k.counts[c] = i::u32;
+            if (i == 0) { ret opt[ptr].none{}; }
+        }
+        val p: ptr = k.heads[c];
+        k.heads[c]  = (@(p::*usize))::ptr;
+        k.counts[c] = k.counts[c] - 1;
+        ret opt[ptr].some{p};
+    }
+
+    # hold a block of class c, a batch going back once the class holds two
+    fun cache_hold(h: *Heap, k: *Cache, c: usize, p: ptr) {
+        @(p::*usize) = k.heads[c]::usize;
+        k.heads[c]   = p;
+        k.counts[c]  = k.counts[c] + 1;
+        val n: usize = cache_batch(c);
+        if (k.counts[c]::usize >= 2 * n) {
+            mutex.lock(?h.lock);
+            cache_drain(h, k, c, n);
+            mutex.unlock(?h.lock);
+        }
+    }
+
+    # give n held blocks of class c back to their spans. under h's lock
+    fun cache_drain(h: *Heap, k: *Cache, c: usize, n: usize) {
+        var i: usize = 0;
+        for (i < n && k.heads[c] != nil) {
+            val p: ptr = k.heads[c];
+            k.heads[c] = (@(p::*usize))::ptr;
+            give_back(h, span_of(p), p);
+            i = i + 1;
+        }
+        k.counts[c] = k.counts[c] - i::u32;
+    }
+
+    # release a block into the cache, checked against its span first. the span
+    # fields the check reads stay as they are while the block is live, so for a
+    # block of h it needs no lock, and for any other pointer it is the same
+    # detection the locked path makes. a block that owns its span goes to the core
+    fun cached_give(h: *Heap, k: *Cache, p: ptr, size: usize, align: usize) i64 {
+        val s: *Span = find_span(h, p, align);
+        if (s == nil) { ret EINVAL; }
+        if (s.class == CLASS_LARGE) {
+            mutex.lock(?h.lock);
+            fin { mutex.unlock(?h.lock); }
+            ret free_block(h, p, size, align);
+        }
+        val code: i64 = check_block(s, p, size);
+        if (code != 0) { ret code; }
+        cache_hold(h, k, s.class, p);
+        ret 0;
+    }
+
+    # resize a small block through the cache, by the rule resize keeps; a block
+    # that owns its span is resized by the core
+    fun cached_resize(h: *Heap, k: *Cache, p: ptr, old_size: usize, new_size: usize, align: usize) opt[ptr] {
+        val s: *Span = find_span(h, p, align);
+        if (s == nil) { ret opt[ptr].none{}; }
+        if (s.class == CLASS_LARGE) {
+            mutex.lock(?h.lock);
+            fin { mutex.unlock(?h.lock); }
+            ret resize(h, p, old_size, new_size, align);
+        }
+        if (check_block(s, p, old_size) != 0) { ret opt[ptr].none{}; }
+
+        val room: usize = CLASS_SIZE[s.class];
+        val want: usize = class_of(h, new_size, align);
+        if (new_size <= room) {
+            if (want == s.class || new_size * 2 > room) { ret opt[ptr].some{p}; }
+        }
+
+        var fresh: ptr = nil;
+        if (want != CLASS_LARGE) {
+            val opt_taken: opt[ptr] = cached_take(h, k, want);
+            if (!sel opt_taken.some) { ret opt[ptr].none{}; }
+            fresh = opt_taken.some;
+        }
+        or {
+            var zeroed: bool = false;
+            mutex.lock(?h.lock);
+            fresh = take(h, new_size, align, ?zeroed);
+            mutex.unlock(?h.lock);
+            if (fresh == nil) { ret opt[ptr].none{}; }
+        }
+
+        var copy: usize = old_size;
+        if (copy > room)     { copy = room; }
+        if (new_size < copy) { copy = new_size; }
+        memory.raw_copy(fresh, p, copy);
+        cache_hold(h, k, s.class, p);
+        ret opt[ptr].some{fresh};
+    }
+}
+
 # initialize a Heap over a span source
 #
 # the source is copied into the heap, so the caller's Source may be discarded;
@@ -761,6 +1133,12 @@ pub fun init(h: *Heap, src: *Source, budget: usize) err[A.Error] {
     h.blocks       = 0;
     h.total_blocks = 0;
     h.total_bytes  = 0;
+
+    h.id      = atomic.fetch_add_word(?heap_ids, 1) + 1;
+    h.caches  = nil;
+    h.spare   = nil;
+    h.records = nil;
+    h.carved  = 0;
 
     # size to class, by 16 byte steps up to 1024 and 128 byte steps beyond
     var c: usize = 0;
@@ -832,10 +1210,13 @@ pub fun allocator_owned(a: *A.Allocator, h: *Heap) err[A.Error] {
 pub fun dnit(h: *Heap) err[A.Error] {
     if (h == nil) { ret err[A.Error].ok{}; }
 
+    var first: i64 = 0;
+    $if (capability.HAS_THREADS) {
+        first = caches_detach(h);
+    }
+
     mutex.lock(?h.lock);
     fin { mutex.unlock(?h.lock); }
-
-    var first: i64 = 0;
 
     var i: usize = 0;
     for (i < CLASS_COUNT) {
@@ -1079,6 +1460,8 @@ $if (capability.HAS_PAGES) {
         s.fn_obtain  = native_obtain;
         s.fn_release = native_release;
         s.stale      = false;
+        # a windows reservation goes back whole, from its own base
+        s.cuts = $mach.build.sys != $mach.sys.windows;
     }
 
     # a span of exactly `least` bytes, since the mapper grants any page multiple
@@ -1143,6 +1526,7 @@ pub fun allocator_source(s: *Source, backing: *A.Allocator) {
     s.fn_obtain  = backed_obtain;
     s.fn_release = nil;
     s.stale      = false;
+    s.cuts       = false;
     if (A.reclaims(backing)) { s.fn_release = backed_release; }
 }
 
@@ -1197,6 +1581,7 @@ pub fun region_source(s: *Source, r: *Region, base: ptr, len: usize) {
     s.fn_obtain  = region_obtain;
     s.fn_release = nil;
     s.stale      = false;
+    s.cuts       = true;
 }
 
 fun region_obtain(ctx: ptr, least: usize, most: usize) opt[Grant] {
@@ -1243,7 +1628,11 @@ rec Held {
 # span and of those the last given back. a heap uses only the least of a
 # grant, so which span a heap is handed, which depends on what other heaps
 # gave back, never changes what the heap does or counts. nothing is rounded, so no byte of a
-# span lies past what its holder was granted. when a span given back would
+# span lies past what its holder was granted. when no held span is in range and
+# the source cuts, the smallest span past the range is cut: its first bytes,
+# the request rounded to SPAN_ALIGN when the range takes that, are granted and
+# the rest stays held, so a pool holding large spans serves a smaller request
+# without going to its source. when a span given back would
 # take the held bytes past the budget, the spans held longest go back to the
 # source first, since the next requests take the last given back. a request no
 # held span fits goes to the source as it is, and so does a span past the
@@ -1342,6 +1731,7 @@ pub fun pool_source(s: *Source, p: *Pool) {
     s.fn_obtain  = pooled_obtain;
     s.fn_release = pooled_release;
     s.stale      = true;
+    s.cuts       = p.src.cuts;
 }
 
 # the bin a span of `size` bytes is held in, POOL_BINS for one past the largest
@@ -1383,6 +1773,26 @@ fun held_unlink(p: *Pool, s: *Held) {
     p.held = p.held - s.size;
 }
 
+# the smallest span bin k holds of `least` to `most` bytes, of those the last given
+# back, or nil. a bin below 1 << EXACT_SHIFT pages holds one size, so its first
+# span answers
+fun bin_smallest(p: *Pool, k: usize, least: usize, most: usize) *Held {
+    var s: *Held = p.bins[k];
+    if (k < (1 << EXACT_SHIFT)) {
+        if (s != nil && s.size >= least && s.size <= most) { ret s; }
+        ret nil;
+    }
+    var best: *Held = nil;
+    for (s != nil) {
+        if (s.size >= least && s.size <= most && (best == nil || s.size < best.size)) {
+            best = s;
+            if (s.size == least) { brk; }
+        }
+        s = s.next;
+    }
+    ret best;
+}
+
 fun pooled_obtain(ctx: ptr, least: usize, most: usize) opt[Grant] {
     val p:     *Pool = ctx::*Pool;
     val first: usize = pool_bin(least);
@@ -1396,21 +1806,40 @@ fun pooled_obtain(ctx: ptr, least: usize, most: usize) opt[Grant] {
     var best: *Held = nil;
     var k:    usize = first;
     for (k <= last && best == nil) {
-        var s: *Held = p.bins[k];
-        for (s != nil) {
-            if (s.size >= least && s.size <= most && (best == nil || s.size < best.size)) {
-                best = s;
-                if (s.size == least) { brk; }
-            }
-            s = s.next;
-        }
-        k = k + 1;
+        best = bin_smallest(p, k, least, most);
+        k    = k + 1;
     }
     if (best != nil) { held_unlink(p, best); }
+    or               { best = pool_cut(p, last, least, most); }
     mutex.unlock(?p.lock);
 
     if (best != nil) { ret opt[Grant].some{Grant{base: best::ptr, size: best.size}}; }
     ret p.src.fn_obtain(p.src.ctx, least, most);
+}
+
+# the first `least` bytes rounded to SPAN_ALIGN of the smallest span held in a bin
+# past `last`, its record naming that size and the rest of it held again, or nil
+# when the source does not cut, the rounded size is past `most`, or no such span
+# is held. under the lock
+fun pool_cut(p: *Pool, last: usize, least: usize, most: usize) *Held {
+    if (!p.src.cuts)                      { ret nil; }
+    if (least > ~(0::usize) - SPAN_ALIGN) { ret nil; }
+    val cut: usize = align_up(least, SPAN_ALIGN);
+    if (cut > most) { ret nil; }
+
+    var best: *Held = nil;
+    var k:    usize = last + 1;
+    for (k < POOL_BINS && best == nil) {
+        best = bin_smallest(p, k, cut + 1, ~(0::usize));
+        k    = k + 1;
+    }
+    if (best == nil) { ret nil; }
+
+    held_unlink(p, best);
+    val rest: usize = best.size - cut;
+    held_link(p, (best::usize + cut)::*Held, rest);
+    best.size = cut;
+    ret best;
 }
 
 fun pooled_release(ctx: ptr, span: ptr, size: usize) i64 {

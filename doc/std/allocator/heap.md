@@ -20,6 +20,17 @@ a Heap is safe to share between threads: one lock covers the core. a heap
 one thread owns, as one per unit of work, takes the allocator `allocator_owned`
 wires, which takes no lock.
 
+a thread std started keeps a cache of small blocks for each heap it uses
+through the allocator `allocator` wires, up to BOUND heaps at once, so most of
+its requests and releases there take no lock: a class it has no block of is
+refilled with a batch under one lock, and a class it holds too many of gives a
+batch back. the cache goes back to its heap when the thread ends
+(thread.at_exit), when the thread binds more heaps than it keeps caches for,
+and when the heap is torn down. a thread std did not start takes the lock
+every time, since nothing would give its cache back when it ends. a block a
+cache holds counts as live, and a release is checked against its span as it
+would be under the lock.
+
 it satisfies the std.allocator interface, so it drops in wherever an Allocator
 is taken:
 
@@ -31,7 +42,8 @@ is taken:
   heap.allocator(?a, ?h);
 
 requests up to MAX_SMALL (8 KiB) round to one of 32 classes carved from
-64 KiB spans. a larger request gets a span sized to the request.
+64 KiB spans. a larger request gets a span of its own, from its size up to
+that rounded to 64 KiB, the address range the span takes in any case.
 
 alignment is honoured for every request. a small request aligned beyond 16
 bytes is served by the first class that is a multiple of it, and one aligned
@@ -134,6 +146,7 @@ pub rec Source {
     fn_obtain:  fun(ptr, usize, usize) opt[Grant];
     fn_release: fun(ptr, ptr, usize) i64;
     stale:      bool;
+    cuts:       bool;
 }
 ```
 
@@ -148,7 +161,8 @@ PAGE_FLOOR on a target with no pages, and `least` is never above `most`.
 fn_release(ctx, span, size) returns a span obtained earlier, at the size it
 was granted, 0 on success or a negative backend native code. it is nil for a
 source that cannot return memory; the core then retains every span for reuse
-and never calls it.
+and never calls it. a source that `cuts` also takes a granted span back in
+pieces cut at multiples of SPAN_ALIGN from its base, each piece on its own.
 
 | Field | Type | |
 | :--- | :--- | :--- |
@@ -156,6 +170,7 @@ and never calls it.
 | `fn_obtain` | `fun(ptr, usize, usize) opt[Grant]` | acquire a span, or none when the source is exhausted |
 | `fn_release` | `fun(ptr, ptr, usize) i64` | return a span, or nil when the source cannot reclaim |
 | `stale` | `bool` | a span it gives may hold what was written to it before |
+| `cuts` | `bool` | a span it gives may come back in pieces |
 
 ### native_source
 
@@ -279,6 +294,12 @@ pub rec Heap {
 
     idx_small: [64]u8;
     idx_mid:   [64]u8;
+
+    id:      usize;
+    caches:  *Cache;
+    spare:   *Cache;
+    records: *Span;
+    carved:  usize;
 }
 ```
 

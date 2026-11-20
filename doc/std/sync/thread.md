@@ -80,6 +80,8 @@ Uses types from [`std.io.error`](../io/error.md).
 
 | Functions | |
 | :--- | :--- |
+| [`at_exit`](#at_exit) | register a routine every thread std starts runs once its entry has returned and its context was destroyed, after the routines registered before it, for a module that keeps per-thread state to give it back |
+| [`runs_at_exit`](#runs_at_exit) | whether the calling thread runs the routines at_exit registers when it ends, which only a thread std started does |
 | [`affinity_words`](#affinity_words) | the number of words a CPU set needs to hold the calling thread's affinity |
 | [`pin_current_to`](#pin_current_to) | pin the calling thread to one CPU |
 | [`allowed_cpus`](#allowed_cpus) | list the CPUs the calling thread may run on, in ascending index order |
@@ -484,6 +486,30 @@ pin the calling thread to the CPUs in set
 | **returns** | ok, INVALID for an empty set or CPUs the process may not use, UNSUPPORTED where the platform cannot express the set, or the refusal |
 
 ## Functions
+
+### at_exit
+
+```mach
+pub fun at_exit(f: fun()) bool
+```
+
+register a routine every thread std starts runs once its entry has returned and its context was
+destroyed, after the routines registered before it, for a module that keeps per-thread state to
+give it back. a thread std did not start never runs them (runs_at_exit). nothing takes one back
+
+| Parameter | |
+| :--- | :--- |
+| `f` | the routine, run on the ending thread |
+| **returns** | false when EXIT_ROUTINES are registered already and f is not |
+
+### runs_at_exit
+
+```mach
+pub fun runs_at_exit() bool
+```
+
+whether the calling thread runs the routines at_exit registers when it ends, which only a thread
+std started does
 
 ### affinity_words
 
