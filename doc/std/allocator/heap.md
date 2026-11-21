@@ -63,6 +63,11 @@ program states, which is the source on a target with no page mapper:
   var r: heap.Region;
   heap.region_source(?src, ?r, base, len);
 
+on a wasm target, with a system or without one, linear_source grows the
+module's linear memory a page at a time (std.memory.linear):
+
+  heap.linear_source(?src);
+
 a program that makes one heap after another, each torn down whole, gives
 them a Pool to share: pool_source draws spans from it and gives them back to
 it, so the next heap is handed the spans the last one used. the program states
@@ -105,6 +110,7 @@ Uses types from [`std.allocator`](../allocator.md), [`std.sync.mutex`](../sync/m
 | On `Source` | |
 | :--- | :--- |
 | [`native_source`](#native_source) | fill in a Source backed by the host's page mapper |
+| [`linear_source`](#linear_source) | fill in a Source over the module's linear memory |
 | [`allocator_source`](#allocator_source) | fill in a Source backed by another allocator |
 | [`region_source`](#region_source) | fill in a Source that carves spans from one region of memory |
 | [`pool_source`](#pool_source) | fill in a Source that draws spans from a pool and gives them back to it |
@@ -186,6 +192,25 @@ fill in a Source backed by the host's page mapper
 
 spans come from the platform mapper over-mapped and trimmed to SPAN_ALIGN,
 and are returned to it whole.
+
+| Parameter | |
+| :--- | :--- |
+| `s` | Source to initialize |
+
+### linear_source
+
+Only where `$mach.build.arch == $mach.arch.wasm32`.
+
+```mach
+pub fun linear_source(s: *Source)
+```
+
+fill in a Source over the module's linear memory
+
+spans are whole 64 KiB pages, a multiple of SPAN_ALIGN, grown past the
+memory's end with memory.grow and kept for the next span when given back,
+since linear memory never shrinks. it reaches no system, so it is a heap's
+source on a freestanding module as on wasi
 
 | Parameter | |
 | :--- | :--- |

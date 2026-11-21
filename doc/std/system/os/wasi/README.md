@@ -14,5 +14,5 @@ The directory's root module is [`std.system.os.wasi`](../wasi.md).
 | Module | |
 | :--- | :--- |
 | [`preview1`](preview1.md) | the os contract over wasi preview 1 |
-| [`shared`](shared.md) | what every wasi row shares: the contract's constants, the native codes and the pages of linear memory |
+| [`shared`](shared.md) | what every wasi row shares: the contract's constants, the native codes and the pages of linear memory, which std.memory.linear keeps |
 

@@ -1045,6 +1045,8 @@ Where `$mach.build.arch == $mach.arch.x86_64`:
 pub fun page_size() usize
 ```
 
+the size of a page, 16 KiB on apple silicon
+
 ### map_alignment
 
 Forwards the first of these whose condition holds:

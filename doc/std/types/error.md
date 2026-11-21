@@ -32,7 +32,7 @@ Source: [`src/types/error.mach`](../../../src/types/error.mach)
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`err`](#err) | `tag` |  |
+| [`err`](#err) | `tag` | the outcome of a fallible operation with no value |
 
 ---
 
@@ -41,4 +41,11 @@ Source: [`src/types/error.mach`](../../../src/types/error.mach)
 ```mach
 pub tag err[E]: u8 { err: E; ok; }
 ```
+
+the outcome of a fallible operation with no value
+
+| Case | Payload | |
+| :--- | :--- | :--- |
+| `err` | `E` | the producing module's error, case 0 so a zero value reads as failure |
+| `ok` |  | success |
 

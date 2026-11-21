@@ -12,6 +12,17 @@ resolution:
 
   $if (capability.HAS_FILES) { use std.system.os; ... }
 
+a module that cannot exist without a group refuses itself at module scope,
+naming itself and the flag, so a program that imports it on a target without
+the group is told what the target lacks:
+
+  $or { $error("std.sync.cancel needs the threads capability (std.system.capability.HAS_THREADS)"); }
+
+a single declaration cannot refuse that way: a function whose body reaches a
+`$error` fires wherever its module is checked, used or not. so a public name
+gated on a group inside a module that exists everywhere is absent where the
+group is, and naming it there reports it as not exported.
+
 this module imports nothing OS-bound and builds on every target, freestanding
 included. the members and assumptions behind each group are the contract
 itself: std.system.os, described in OS-CONTRACT.md.

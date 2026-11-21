@@ -1138,6 +1138,8 @@ Forwards the first of these whose condition holds:
 pub fun read_at(fd: i32, buffer: *u8, count: usize, offset: u64) i64
 ```
 
+read at an offset without moving the descriptor's file pointer
+
 ### write_at
 
 Forwards the first of these whose condition holds:
@@ -3040,6 +3042,8 @@ Forwards the first of these whose condition holds:
 ```mach
 pub fun sock_send(fd: usize, buf: *u8, len: usize) i64
 ```
+
+send up to len bytes on a connected socket
 
 ### sock_recv
 

@@ -1069,6 +1069,8 @@ Forwards [`std.system.os.wasi.preview1.directory_dnit`](wasi/preview1.md#directo
 pub fun directory_dnit(cursor: *DirectoryCursor) i64
 ```
 
+end an enumeration and release the cursor's buffer
+
 ### access
 
 Forwards [`std.system.os.wasi.preview1.access`](wasi/preview1.md#access), only where `$mach.build.sys == $mach.sys.wasi`.

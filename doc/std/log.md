@@ -22,7 +22,7 @@ Uses types from [`std.chrono.time`](chrono/time.md), [`std.io.writer`](io/writer
 
 | On `Made` | |
 | :--- | :--- |
-| [`logger`](#logger-1) | |
+| [`logger`](#logger-1) | make a logger that writes records at min_level and above to output |
 
 | Functions | |
 | :--- | :--- |
@@ -118,8 +118,13 @@ a made logger, or why it could not be made
 pub fun logger(output: *std.log.sink.Sink, clock: std.log.record.Clock, min_level: std.log.record.Level) Made
 ```
 
+make a logger that writes records at min_level and above to output
+
 | Parameter | |
 | :--- | :--- |
+| `output` | the sink, which must outlive the logger |
+| `clock` | the clock records are stamped with, borrowed for the logger's life |
+| `min_level` | the least level written |
 | **returns** | the logger; invalid for a nil sink, an invalid clock or a level past OFF, contract for a sink whose contract is inconsistent |
 
 ## Functions

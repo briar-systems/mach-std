@@ -15,7 +15,7 @@ Uses types from [`std.system.os`](../../system/os.md).
 | [`open_root_native`](#open_root_native) | opens a directory named in native units as a confinement root |
 | [`open_confined`](#open_confined) | open_confined_native for a UTF-8 path, converted once |
 | [`open_confined_native`](#open_confined_native) | every component is resolved from a pinned directory handle |
-| [`rename_confined_native`](#rename_confined_native) | |
+| [`rename_confined_native`](#rename_confined_native) | rename one entry under root to another through parents opened from root, following neither leaf |
 | [`read_at`](#read_at) | reads at an offset |
 | [`write_at`](#write_at) | writes at an offset |
 | [`unmap_file`](#unmap_file) | releases a file mapping |
@@ -101,6 +101,15 @@ every component is resolved from a pinned directory handle
 ```mach
 pub fun rename_confined_native(root: i32, source: *u16, destination: *u16) i64
 ```
+
+rename one entry under root to another through parents opened from root, following neither leaf
+
+| Parameter | |
+| :--- | :--- |
+| `root` | the confining directory descriptor |
+| `source` | the entry's path relative to root, nul-terminated UTF-16 |
+| `destination` | its new path relative to root, nul-terminated UTF-16 |
+| **returns** | 0 or more once the destination's directory is flushed, or a negative native code |
 
 ### read_at
 

@@ -31,7 +31,7 @@ Source: [`src/types/option.mach`](../../../src/types/option.mach)
 
 | Type | | |
 | :--- | :--- | :--- |
-| [`opt`](#opt) | `tag` |  |
+| [`opt`](#opt) | `tag` | a value that may be absent |
 
 ---
 
@@ -40,4 +40,11 @@ Source: [`src/types/option.mach`](../../../src/types/option.mach)
 ```mach
 pub tag opt[T]: u8 { none; some: T; }
 ```
+
+a value that may be absent
+
+| Case | Payload | |
+| :--- | :--- | :--- |
+| `none` |  | no value, case 0 so a zero value reads as absent |
+| `some` | `T` | the value |
 

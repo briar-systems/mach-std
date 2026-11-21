@@ -29,7 +29,8 @@ darwin, wasi, windows, uefi and freestanding have arms. spirv reaches the `$erro
 shader has no write target and no process to end.
 
 THE FREESTANDING ARM HAS NO WRITE TARGET of its own, so the program installs one with
-`install` and the arm parks the core after it, or parks at once when none is installed.
+`install` and the arm parks the core after it, or parks at once when none is installed. a
+wasm module has no core to park, so it traps instead.
 The hook is set at run time rather than overridden at link time because a sink usually
 drives a device the program brings up itself, so a panic before that point must park
 rather than call into a device that is not ready yet.

@@ -808,6 +808,8 @@ Forwards [`std.system.os.windows.shared.read_at`](shared.md#read_at).
 pub fun read_at(fd: i32, buffer: *u8, count: usize, offset: u64) i64
 ```
 
+read at an offset without moving the descriptor's file pointer
+
 ### write_at
 
 Forwards [`std.system.os.windows.shared.write_at`](shared.md#write_at).
@@ -2245,6 +2247,8 @@ Forwards [`std.system.os.windows.shared.sock_send`](shared.md#sock_send).
 ```mach
 pub fun sock_send(fd: usize, buf: *u8, len: usize) i64
 ```
+
+send up to len bytes on a connected socket
 
 ### sock_recv
 

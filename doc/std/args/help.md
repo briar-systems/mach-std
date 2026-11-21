@@ -6,10 +6,12 @@ a neutral help page rendered from the records std.args reads a command line agai
 
 the page of a command is its usage line, its help text, the commands nested
 under it and its flag table, wrapped at word boundaries to the width given,
-clamped to 56 through 240 columns. it is written straight to a writer and
-nothing is allocated, so a program that writes to an unbuffered stream wraps
-it in io.writer.buffered first. the page is opt-in: a program decides when to
-print it and what follows.
+clamped to 56 through 240 columns. a command list's help starts two columns
+past its longest name, at most column 24, a longer name standing on its own
+line with its help under it, and a `(default: ...)` group wraps as one word.
+it is written straight to a writer and nothing is allocated, so a program
+that writes to an unbuffered stream wraps it in io.writer.buffered first. the
+page is opt-in: a program decides when to print it and what follows.
 
 Source: [`src/args/help.mach`](../../../src/args/help.mach)
 

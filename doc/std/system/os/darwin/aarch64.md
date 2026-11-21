@@ -1356,6 +1356,8 @@ Where `$mach.build.arch == $mach.arch.x86_64`:
 pub fun page_size() usize
 ```
 
+the size of a page, 16 KiB on apple silicon
+
 ### map_alignment
 
 Forwards [`std.system.os.darwin.shared.map_alignment`](shared.md#map_alignment).

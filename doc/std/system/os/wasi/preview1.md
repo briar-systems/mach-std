@@ -45,7 +45,7 @@ Uses types from [`std.system.file_identity`](../../file_identity.md), [`std.syst
 | :--- | :--- |
 | [`directory_init`](#directory_init) | start enumerating a directory descriptor |
 | [`directory_next`](#directory_next) | read the next entry of a directory |
-| [`directory_dnit`](#directory_dnit) | |
+| [`directory_dnit`](#directory_dnit) | end an enumeration and release the cursor's buffer |
 
 | Functions | |
 | :--- | :--- |
@@ -277,6 +277,13 @@ operation. a failure is kept, so every later call returns it again
 ```mach
 pub fun directory_dnit(cursor: *DirectoryCursor) i64
 ```
+
+end an enumeration and release the cursor's buffer
+
+| Parameter | |
+| :--- | :--- |
+| `cursor` | a cursor directory_init opened, or one already ended |
+| **returns** | 0, EINVAL for a cursor never opened or since moved, or the code of a failed release |
 
 ## Functions
 

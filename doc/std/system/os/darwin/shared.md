@@ -49,7 +49,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`deallocate`](#deallocate) | unmap memory allocate mapped |
 | [`map_secret`](#map_secret) | map storage for secret-welded data: span locked bytes between two inaccessible guard pages, page aligned and zero-filled |
 | [`reallocate`](#reallocate) | darwin has no mremap, allocate new, copy, free old |
-| [`page_size`](#page_size) | |
+| [`page_size`](#page_size) | the size of a page, 16 KiB on apple silicon |
 | [`map_alignment`](#map_alignment) | the alignment map_file requires of an offset, the page size |
 | [`heap_region_base`](#heap_region_base) | the current end of the simulated program break |
 | [`heap_region_extend`](#heap_region_extend) | move the simulated program break up to addr |
@@ -505,6 +505,8 @@ Where `$mach.build.arch == $mach.arch.x86_64`:
 ```mach
 pub fun page_size() usize
 ```
+
+the size of a page, 16 KiB on apple silicon
 
 ### map_alignment
 

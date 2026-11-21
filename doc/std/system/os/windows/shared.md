@@ -80,7 +80,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`open_relative_native`](#open_relative_native) | open one wide component from a pinned directory descriptor |
 | [`positioned_begin`](#positioned_begin) | pin a descriptor's handle and file pointer around one positioned transfer: the entry lock serializes position changes and `positioned_end` restores the pointer the transfer moved |
 | [`positioned_end`](#positioned_end) | restore the file pointer positioned_begin saved and release the entry lock |
-| [`read_at`](#read_at) | |
+| [`read_at`](#read_at) | read at an offset without moving the descriptor's file pointer |
 | [`write_at`](#write_at) | write at an offset without moving the descriptor's file pointer |
 | [`publication_capabilities`](#publication_capabilities) | the publication guarantees the volume holding fd gives: all three on a local ntfs volume with posix unlink and rename, claims alone on another local ntfs or refs volume, and none on a remote or other volume |
 | [`rename_relative_utf8`](#rename_relative_utf8) | rename_relative_native for UTF-8 components, each converted once |
@@ -178,7 +178,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`io_queue_close`](#io_queue_close) | close a queue's port |
 | [`io_queue_cancel`](#io_queue_cancel) | cancel one outstanding request on resource |
 | [`running_under_wine`](#running_under_wine) | detect whether the process is running under the wine windows compatibility layer rather than on genuine windows |
-| [`sock_send`](#sock_send) | |
+| [`sock_send`](#sock_send) | send up to len bytes on a connected socket |
 | [`sock_recv`](#sock_recv) | receive up to len bytes from a connected socket |
 | [`sock_close`](#sock_close) | close a socket |
 | [`sock_async_accept`](#sock_async_accept) | start an overlapped AcceptEx on listener into accepted |
@@ -833,6 +833,16 @@ restore the file pointer positioned_begin saved and release the entry lock
 ```mach
 pub fun read_at(fd: i32, buffer: *u8, count: usize, offset: u64) i64
 ```
+
+read at an offset without moving the descriptor's file pointer
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | an open descriptor |
+| `buffer` | receives the bytes |
+| `count` | the most bytes to read, a larger count a short read of 0xffffffff |
+| `offset` | the byte offset, at most the largest i64 |
+| **returns** | bytes read, 0 at end of file, or a negative native code |
 
 ### write_at
 
@@ -2122,6 +2132,12 @@ win32 process, so GetModuleHandleA resolves it without a load.
 ```mach
 pub fun sock_send(fd: usize, buf: *u8, len: usize) i64
 ```
+
+send up to len bytes on a connected socket
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | bytes sent, or a negative native code |
 
 ### sock_recv
 
