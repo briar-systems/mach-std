@@ -32,6 +32,7 @@ Uses types from [`std.io.error`](../io/error.md), [`std.system.file_identity`](f
 | [`map_file`](#map_file) | map a file's pages, at an offset that is a multiple of map_alignment() |
 | [`read`](#read) | read up to count bytes |
 | [`write`](#write) | write up to count bytes |
+| [`write_vector`](#write_vector) | write several buffers in order, in one call where the OS has a gather write |
 | [`open`](#open) | open a UTF-8 path relative to dir |
 | [`open_native`](#open_native) | open a name given in the host's native units relative to dir |
 | [`native_path`](#native_path) | convert a UTF-8 path once into native units, as each UTF-8 primitive does, for a caller that walks or splits the name before it reaches the kernel |
@@ -83,7 +84,7 @@ Uses types from [`std.io.error`](../io/error.md), [`std.system.file_identity`](f
 | Forwards | |
 | :--- | :--- |
 | [`Timespec`](#timespec) | abstract types |
-| [`IoQueue`](#ioqueue), [`NativePath`](#nativepath) | |
+| [`IoQueue`](#ioqueue), [`NativePath`](#nativepath), [`IoVector`](#iovector) | |
 | [`stat_t`](#stat_t) | kernel ABI types |
 | [`DirectoryCursor`](#directorycursor) | initialize cursors in final storage and keep the borrowed fd open until close |
 | [`DirectoryEntry`](#directoryentry), [`NativeEntry`](#nativeentry), [`DirectoryInitResult`](#directoryinitresult) | |
@@ -335,6 +336,18 @@ write up to count bytes
 | Parameter | |
 | :--- | :--- |
 | **returns** | bytes written, or a negative native code |
+
+### write_vector
+
+```mach
+pub fun write_vector(handle: usize, vectors: *IoVector, count: usize) i64
+```
+
+write several buffers in order, in one call where the OS has a gather write
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | bytes written, which may stop short of the whole, or a negative native code |
 
 ### open
 
@@ -899,6 +912,20 @@ pub rec NativePath {
 ```
 
 a whole path in native units, nul-terminated, as native_path gives it
+
+### IoVector
+
+Forwards [`std.system.os.shared.IoVector`](os/shared.md#iovector).
+
+```mach
+pub rec IoVector {
+    data:   *u8;
+    length: usize;
+}
+```
+
+one buffer of a gather write, laid out as struct iovec on linux and darwin
+and as wasi's ciovec
 
 ### stat_t
 

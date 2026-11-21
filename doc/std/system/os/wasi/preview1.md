@@ -22,7 +22,7 @@ open-file limit, and locks, modes and file mappings stop there too.
 
 Source: [`src/system/os/wasi/preview1.mach`](../../../../../src/system/os/wasi/preview1.mach)
 
-Uses types from [`std.system.file_identity`](../../file_identity.md).
+Uses types from [`std.system.file_identity`](../../file_identity.md), [`std.system.os.shared`](../shared.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -51,6 +51,7 @@ Uses types from [`std.system.file_identity`](../../file_identity.md).
 | :--- | :--- |
 | [`read`](#read) | read bytes from a file descriptor |
 | [`write`](#write) | write bytes to a file descriptor |
+| [`write_vector`](#write_vector) | write several buffers to a file descriptor in order, in one call |
 | [`read_at`](#read_at) | read bytes at a file offset without moving the descriptor offset |
 | [`write_at`](#write_at) | write bytes at a file offset without moving the descriptor offset |
 | [`open`](#open) | open a path, the rights asked for cut to what its directory may pass on |
@@ -308,6 +309,21 @@ write bytes to a file descriptor
 | `buf` | source buffer |
 | `count` | bytes to write |
 | **returns** | bytes written, or a negative native code |
+
+### write_vector
+
+```mach
+pub fun write_vector(fd: i32, vectors: *std.system.os.shared.IoVector, count: usize) i64
+```
+
+write several buffers to a file descriptor in order, in one call
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | file descriptor |
+| `vectors` | the buffers, in order |
+| `count` | number of buffers |
+| **returns** | bytes written, which may stop short of the whole, or a negative native code |
 
 ### read_at
 

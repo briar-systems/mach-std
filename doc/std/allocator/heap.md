@@ -27,7 +27,9 @@ refilled with a batch under one lock, and a class it holds too many of gives a
 batch back. the cache goes back to its heap when the thread ends
 (thread.at_exit), when the thread binds more heaps than it keeps caches for,
 and when the heap is torn down. a thread std did not start takes the lock
-every time, since nothing would give its cache back when it ends. a block a
+every time, since nothing would give its cache back when it ends, and until
+std has started a thread (thread.any_started) no request reads the thread's
+bindings at all, so a process that never spawns touches no thread-local. a block a
 cache holds counts as live, and a release is checked against its span as it
 would be under the lock.
 

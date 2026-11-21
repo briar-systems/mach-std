@@ -81,6 +81,7 @@ Uses types from [`std.io.error`](../io/error.md).
 | Functions | |
 | :--- | :--- |
 | [`at_exit`](#at_exit) | register a routine every thread std starts runs once its entry has returned and its context was destroyed, after the routines registered before it, for a module that keeps per-thread state to give it back |
+| [`any_started`](#any_started) | whether std has started a thread in this process, without reading a thread-local |
 | [`runs_at_exit`](#runs_at_exit) | whether the calling thread runs the routines at_exit registers when it ends, which only a thread std started does |
 | [`affinity_words`](#affinity_words) | the number of words a CPU set needs to hold the calling thread's affinity |
 | [`pin_current_to`](#pin_current_to) | pin the calling thread to one CPU |
@@ -502,6 +503,19 @@ give it back. a thread std did not start never runs them (runs_at_exit). nothing
 | `f` | the routine, run on the ending thread |
 | **returns** | false when EXIT_ROUTINES are registered already and f is not |
 
+### any_started
+
+```mach
+pub fun any_started() bool
+```
+
+whether std has started a thread in this process, without reading a thread-local
+
+until it holds, no thread std started exists, so per-thread state std keeps
+for its own threads has nothing to find. a program that never spawns, or
+whose spawns all failed, reads no thread-local in std, which is what lets one
+that replaced the runtime's mach_thread_setup allocate, print and exit
+
 ### runs_at_exit
 
 ```mach
@@ -509,7 +523,7 @@ pub fun runs_at_exit() bool
 ```
 
 whether the calling thread runs the routines at_exit registers when it ends, which only a thread
-std started does
+std started does. it reads a thread-local only once any_started holds
 
 ### affinity_words
 

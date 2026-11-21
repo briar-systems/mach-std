@@ -19,7 +19,6 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`DirectoryCursor`](#directorycursor) | `rec` | an open enumeration of one directory descriptor's entries |
 | [`TlsLayout`](#tlslayout) | `rec` | where an architecture's psABI puts the thread-local block against the thread pointer, as the linker lays out local-exec offsets |
 | [`IoCompletion`](#iocompletion) | `rec` | context is opaque to the OS and zero is reserved for the runtime wake source source: the id of the source that registered the context, 0 for a wake |
-| [`IoVector`](#iovector) | `rec` | one buffer of a vectored transfer, laid out as the kernel's iovec |
 
 | On `stat_t` | |
 | :--- | :--- |
@@ -52,12 +51,6 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | :--- | :--- |
 | [`io_queue_poll`](#io_queue_poll) | completions is also the kernel scratch buffer |
 
-| On `IoVector` | |
-| :--- | :--- |
-| [`sock_write_vector`](#sock_write_vector) | write several buffers to a socket in one call |
-| [`sock_send_message`](#sock_send_message) | send buffers with an optional address and control records, without SIGPIPE |
-| [`sock_receive_message`](#sock_receive_message) | receive into buffers along with the sender's address and control records |
-
 | Functions | |
 | :--- | :--- |
 | [`syscall0`](#syscall0) | execute a syscall with no arguments |
@@ -76,6 +69,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`thread_block_prepare`](#thread_block_prepare) | fill a thread block before it is installed, with no stack bounds yet |
 | [`thread_block_bound`](#thread_block_bound) | record the stack a spawned thread runs on in its block |
 | [`capture_tls`](#capture_tls) | read the executable's thread-local template from its program headers |
+| [`thread_tls_present`](#thread_tls_present) | whether the executable has thread-locals, as its template was read at entry |
 | [`thread_set_name`](#thread_set_name) | set the current thread's native diagnostic name |
 | [`thread_current_id`](#thread_current_id) | the calling thread's kernel thread id |
 | [`thread_current_name`](#thread_current_name) | read the calling thread's native diagnostic name |
@@ -97,6 +91,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`has_huge_pages`](#has_huge_pages) | check if the kernel supports huge page allocation |
 | [`read`](#read) | read bytes from a file descriptor |
 | [`write`](#write) | write bytes to a file descriptor |
+| [`write_vector`](#write_vector) | write several buffers to a file descriptor in order, in one call |
 | [`read_at`](#read_at) | positioned file access does not mutate the descriptor offset |
 | [`write_at`](#write_at) | write bytes at a file offset without moving the descriptor offset |
 | [`open`](#open) | openat: open a file relative to a directory file descriptor |
@@ -116,6 +111,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`access`](#access) | faccessat: check file accessibility relative to a directory fd |
 | [`seek`](#seek) | lseek: reposition read/write offset of a file descriptor |
 | [`environ`](#environ) | pointer to the environment captured by the runtime at program start (null-terminated array of "NAME=value" strings) |
+| [`page_size_unpublished`](#page_size_unpublished) | the page size of an image whose entry published none, read from the kernel's copy of the auxiliary vector |
 | [`auxv_of`](#auxv_of) | the auxiliary vector, which the kernel places immediately past the NULL terminator of the null-terminated pointer array `envp` addresses |
 | [`capture_envp`](#capture_envp) | publish the program's envp and the auxiliary vector past it, once at entry |
 | [`capture_pagesz`](#capture_pagesz) | publish the auxv page size into `_pagesz` |
@@ -175,6 +171,9 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`sock_send`](#sock_send) | send data on a connected socket |
 | [`sock_recv`](#sock_recv) | receive data from a connected socket |
 | [`sock_peek_readable`](#sock_peek_readable) | peek at a stream socket without consuming or blocking |
+| [`sock_write_vector`](#sock_write_vector) | write several buffers to a socket in one call |
+| [`sock_send_message`](#sock_send_message) | send buffers with an optional address and control records, without SIGPIPE |
+| [`sock_receive_message`](#sock_receive_message) | receive into buffers along with the sender's address and control records |
 | [`sock_recv_close_rights`](#sock_recv_close_rights) | receives bytes and closes every descriptor the kernel installed for them |
 | [`local_stream_recv`](#local_stream_recv) | byte reception for local streams: rights a peer attaches are observed and closed |
 | [`sock_set_nonblocking`](#sock_set_nonblocking) | switch a socket between blocking and nonblocking |
@@ -235,7 +234,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | :--- | :--- |
 | [`DirectoryEntry`](#directoryentry), [`DirectoryInitResult`](#directoryinitresult) | |
 | [`ProcessStatus`](#processstatus) | canonical process observations |
-| [`FileLimit`](#filelimit), [`LIMIT_UNLIMITED`](#limit_unlimited), [`ProcessWaitError`](#processwaiterror), [`WaitResult`](#waitresult), [`PROCESS_OP_WAIT`](#process_op_wait), [`PROCESS_OP_STATUS`](#process_op_status), [`PROCESS_OP_CLOSE`](#process_op_close), [`PROCESS_OP_SPAWN`](#process_op_spawn), [`PROCESS_OP_READ`](#process_op_read), [`PROCESS_OP_PIPE`](#process_op_pipe), [`PROCESS_OP_TERMINATE`](#process_op_terminate), [`PROCESS_EXITED`](#process_exited), [`PROCESS_SIGNALED`](#process_signaled), [`PROCESS_STOPPED`](#process_stopped), [`PROCESS_CONTINUED`](#process_continued) | |
+| [`FileLimit`](#filelimit), [`LIMIT_UNLIMITED`](#limit_unlimited), [`ProcessWaitError`](#processwaiterror), [`WaitResult`](#waitresult), [`PROCESS_OP_WAIT`](#process_op_wait), [`PROCESS_OP_STATUS`](#process_op_status), [`PROCESS_OP_CLOSE`](#process_op_close), [`PROCESS_OP_SPAWN`](#process_op_spawn), [`PROCESS_OP_READ`](#process_op_read), [`PROCESS_OP_PIPE`](#process_op_pipe), [`PROCESS_OP_TERMINATE`](#process_op_terminate), [`PROCESS_EXITED`](#process_exited), [`PROCESS_SIGNALED`](#process_signaled), [`PROCESS_STOPPED`](#process_stopped), [`PROCESS_CONTINUED`](#process_continued), [`IoVector`](#iovector) | |
 
 ---
 
@@ -514,13 +513,13 @@ pass removes. nothing may read a thread-local after this
 
 | Parameter | |
 | :--- | :--- |
-| `tp` | the calling thread's thread pointer |
+| `tp` | the calling thread's thread pointer, read once thread_tls_present holds |
 
 ## IoCompletion
 
 ```mach
 pub rec IoCompletion {
-    context: usize;
+    context: u64;
     events:  u32;
     source:  u16;
     status:  i64;
@@ -540,76 +539,6 @@ pub fun io_queue_poll(queue: *std.system.os.shared.IoQueue, completions: *IoComp
 
 completions is also the kernel scratch buffer. normalization runs backwards
 so expanding packed x86-64 epoll records cannot overwrite unread records.
-
-## IoVector
-
-```mach
-pub rec IoVector {
-    data:   *u8;
-    length: usize;
-}
-```
-
-one buffer of a vectored transfer, laid out as the kernel's iovec
-
-| Field | Type | |
-| :--- | :--- | :--- |
-| `data` | `*u8` | the buffer |
-| `length` | `usize` | its length in bytes |
-
-### sock_write_vector
-
-```mach
-pub fun sock_write_vector(fd: usize, vectors: *IoVector, count: usize) i64
-```
-
-write several buffers to a socket in one call
-
-| Parameter | |
-| :--- | :--- |
-| `fd` | socket fd |
-| `vectors` | the buffers, in order |
-| `count` | number of buffers, 1 to 1024 |
-| **returns** | bytes written, EINVAL for no buffers or too many, or negative errno |
-
-### sock_send_message
-
-```mach
-pub fun sock_send_message(fd: usize, vectors: *IoVector, vector_count: usize, address: *u8, address_length: u32, control: *u8, control_length: usize) i64
-```
-
-send buffers with an optional address and control records, without SIGPIPE
-
-| Parameter | |
-| :--- | :--- |
-| `fd` | socket fd |
-| `vectors` | the buffers, in order |
-| `vector_count` | number of buffers, 1 to 1024 |
-| `address` | destination sockaddr, or nil for a connected socket |
-| `address_length` | size of the sockaddr |
-| `control` | control records to attach, or nil |
-| `control_length` | bytes of control records |
-| **returns** | bytes sent, EINVAL for no buffers or too many, or negative errno |
-
-### sock_receive_message
-
-```mach
-pub fun sock_receive_message(fd: usize, vectors: *IoVector, vector_count: usize, address: *u8, address_length: *u32, control: *u8, control_length: *usize, flags: *i32) i64
-```
-
-receive into buffers along with the sender's address and control records
-
-| Parameter | |
-| :--- | :--- |
-| `fd` | socket fd |
-| `vectors` | the buffers, in order |
-| `vector_count` | number of buffers, 1 to 1024 |
-| `address` | receives the sender's sockaddr, or nil |
-| `address_length` | capacity of address in, its filled length out |
-| `control` | receives control records, or nil |
-| `control_length` | capacity of control in, its filled length out |
-| `flags` | receives the message flags, such as MSG_CTRUNC |
-| **returns** | bytes received, EINVAL for a bad argument, or negative errno |
 
 ## Functions
 
@@ -761,10 +690,9 @@ pub fun map_secret(span: usize, page: usize, out: *ptr, locking: *bool) i64
 map storage for secret-welded data: span locked, dump-excluded bytes between
 two inaccessible guard pages, page aligned and zero-filled
 
-memfd_secret backs the span where the kernel provides it, which locks it,
-keeps it out of dumps and removes it from the kernel's direct map. a kernel
-without it (ENOSYS) gets an anonymous span locked with mlock and marked
-MADV_DONTDUMP. a refused lock is reported as one, never served unlocked
+the span is anonymous memory locked with mlock, which faults in and charges
+every page before it returns, so a refused lock comes back here and no page
+of the span faults later
 
 | Parameter | |
 | :--- | :--- |
@@ -837,6 +765,17 @@ AT_PHDR and AT_PHNUM locate the headers, and PT_PHDR gives the load bias of a
 position-independent image, which a fixed image without one does not need.
 runs once at entry, after relocation and before the main thread's block is
 installed
+
+### thread_tls_present
+
+```mach
+pub fun thread_tls_present() bool
+```
+
+whether the executable has thread-locals, as its template was read at entry
+
+false too where the template was never read, so a caller asks this before it
+reads a thread pointer nothing may have set
 
 ### thread_set_name
 
@@ -1125,6 +1064,23 @@ retries automatically on EINTR.
 | `count` | bytes to write |
 | **returns** | bytes written, or negative errno |
 
+### write_vector
+
+```mach
+pub fun write_vector(fd: i32, vectors: *IoVector, count: usize) i64
+```
+
+write several buffers to a file descriptor in order, in one call
+
+retries automatically on EINTR.
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | file descriptor |
+| `vectors` | the buffers, in order |
+| `count` | number of buffers |
+| **returns** | bytes written, which may stop short of the whole, or negative errno |
+
 ### read_at
 
 ```mach
@@ -1381,6 +1337,23 @@ pointer to the environment captured by the runtime at program
 start (null-terminated array of "NAME=value" strings). nil before
 runtime init.
 
+### page_size_unpublished
+
+```mach
+pub fun page_size_unpublished() usize
+```
+
+the page size of an image whose entry published none, read from the kernel's
+copy of the auxiliary vector
+
+a shared artifact has no std entry and no envp, so its first page_size() call
+reads it here. an executable's entry publishes AT_PAGESZ before main, so
+page_size compiles this call only into an artifact whose $bin.kind is not bin
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the AT_PAGESZ value in bytes, or 0 if it could not be read |
+
 ### auxv_of
 
 ```mach
@@ -1422,8 +1395,7 @@ called once by the entrypoint at startup, after `_auxv` is set and (in a PIE)
 after `_rt_relocate` has applied any relocations, so it runs as ordinary
 post-relocation code that may touch globals. `_pagesz` stays 0 only if the auxv
 lacks the mandatory AT_PAGESZ, which page_size() treats as a fatal invariant
-breach rather than fabricating a default. a shared artifact has no entrypoint
-and no envp, so its first page_size() calls this and reads the kernel's copy.
+breach rather than fabricating a default.
 
 ### capture_thread_pointer
 
@@ -1684,7 +1656,7 @@ process may not signal still counts, so EPERM reads as present.
 ### process_watch
 
 ```mach
-pub fun process_watch(queue: *std.system.os.shared.IoQueue, pid: i64, context: usize) i64
+pub fun process_watch(queue: *std.system.os.shared.IoQueue, pid: i64, context: u64) i64
 ```
 
 make the end of the child `pid` a readiness event on `queue`, so the queue's
@@ -2162,7 +2134,7 @@ under context 0
 ### io_queue_watch
 
 ```mach
-pub fun io_queue_watch(queue: *std.system.os.shared.IoQueue, resource: usize, context: usize, events: u32) i64
+pub fun io_queue_watch(queue: *std.system.os.shared.IoQueue, resource: usize, context: u64, events: u32) i64
 ```
 
 registers a resource that has no registration on the queue yet. a resource
@@ -2171,7 +2143,7 @@ that is already registered is refused with EEXIST, never taken over
 ### io_queue_rearm
 
 ```mach
-pub fun io_queue_rearm(queue: *std.system.os.shared.IoQueue, resource: usize, context: usize, events: u32) i64
+pub fun io_queue_rearm(queue: *std.system.os.shared.IoQueue, resource: usize, context: u64, events: u32) i64
 ```
 
 arms again a registration the caller made with io_queue_watch
@@ -2282,6 +2254,60 @@ peek at a stream socket without consuming or blocking
 | :--- | :--- |
 | `fd` | socket fd |
 | **returns** | 1 when a byte is readable, 0 at orderly end of stream, EAGAIN when nothing is ready yet, or the socket's negative errno |
+
+### sock_write_vector
+
+```mach
+pub fun sock_write_vector(fd: usize, vectors: *IoVector, count: usize) i64
+```
+
+write several buffers to a socket in one call
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| `vectors` | the buffers, in order |
+| `count` | number of buffers, 1 to 1024 |
+| **returns** | bytes written, EINVAL for no buffers or too many, or negative errno |
+
+### sock_send_message
+
+```mach
+pub fun sock_send_message(fd: usize, vectors: *IoVector, vector_count: usize, address: *u8, address_length: u32, control: *u8, control_length: usize) i64
+```
+
+send buffers with an optional address and control records, without SIGPIPE
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| `vectors` | the buffers, in order |
+| `vector_count` | number of buffers, 1 to 1024 |
+| `address` | destination sockaddr, or nil for a connected socket |
+| `address_length` | size of the sockaddr |
+| `control` | control records to attach, or nil |
+| `control_length` | bytes of control records |
+| **returns** | bytes sent, EINVAL for no buffers or too many, or negative errno |
+
+### sock_receive_message
+
+```mach
+pub fun sock_receive_message(fd: usize, vectors: *IoVector, vector_count: usize, address: *u8, address_length: *u32, control: *u8, control_length: *usize, flags: *i32) i64
+```
+
+receive into buffers along with the sender's address and control records
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | socket fd |
+| `vectors` | the buffers, in order |
+| `vector_count` | number of buffers, 1 to 1024 |
+| `address` | receives the sender's sockaddr, or nil |
+| `address_length` | capacity of address in, its filled length out |
+| `control` | receives control records, or nil |
+| `control_length` | capacity of control in, its filled length out |
+| `flags` | receives the message flags, such as MSG_CTRUNC |
+| **returns** | bytes received, EINVAL for a bad argument, or negative errno |
 
 ### sock_recv_close_rights
 
@@ -2975,4 +3001,18 @@ Forwards [`std.system.os.shared.PROCESS_CONTINUED`](../shared.md#constants).
 ```mach
 pub val PROCESS_CONTINUED: u8 = 4
 ```
+
+### IoVector
+
+Forwards [`std.system.os.shared.IoVector`](../shared.md#iovector).
+
+```mach
+pub rec IoVector {
+    data:   *u8;
+    length: usize;
+}
+```
+
+one buffer of a gather write, laid out as struct iovec on linux and darwin
+and as wasi's ciovec
 

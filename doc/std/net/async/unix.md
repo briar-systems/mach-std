@@ -26,7 +26,7 @@ Uses types from [`std.allocator`](../../allocator.md), [`std.net.async.readiness
 
 | Forwards | |
 | :--- | :--- |
-| [`Vector`](#vector), [`Packet`](#packet), [`Token`](#token), [`NativeCompletion`](#nativecompletion), [`CANCEL_NEEDS_NATIVE_CONTROL`](#cancel_needs_native_control), [`Backend`](#backend), [`aliases`](#aliases), [`submit_read`](#submit_read), [`submit_readable`](#submit_readable), [`submit_write`](#submit_write), [`submit_shutdown_write`](#submit_shutdown_write), [`submit_close`](#submit_close), [`cancel`](#cancel), [`flush`](#flush), [`dispatch`](#dispatch), [`poll`](#poll), [`completion`](#completion), [`dnit`](#dnit) | |
+| [`Packet`](#packet), [`Token`](#token), [`NativeCompletion`](#nativecompletion), [`CANCEL_NEEDS_NATIVE_CONTROL`](#cancel_needs_native_control), [`Backend`](#backend), [`aliases`](#aliases), [`submit_read`](#submit_read), [`submit_readable`](#submit_readable), [`submit_write`](#submit_write), [`submit_shutdown_write`](#submit_shutdown_write), [`submit_close`](#submit_close), [`cancel`](#cancel), [`flush`](#flush), [`dispatch`](#dispatch), [`poll`](#poll), [`completion`](#completion), [`dnit`](#dnit) | |
 
 ---
 
@@ -48,7 +48,7 @@ tables grow on demand and the resource map rehashes with them
 ### submit_accept
 
 ```mach
-pub fun submit_accept(backend: *std.net.async.readiness.Backend, listener: usize, opening: u64, peer: *std.net.ip.Endpoint, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_accept(backend: *std.net.async.readiness.Backend, listener: usize, opening: u64, peer: *std.net.ip.Endpoint, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 queue an accept on a listening socket
@@ -66,7 +66,7 @@ queue an accept on a listening socket
 ### submit_connect
 
 ```mach
-pub fun submit_connect(backend: *std.net.async.readiness.Backend, native: usize, opening: u64, peer: std.net.ip.Endpoint, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_connect(backend: *std.net.async.readiness.Backend, native: usize, opening: u64, peer: std.net.ip.Endpoint, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 queue a connect of a socket to a peer
@@ -84,7 +84,7 @@ queue a connect of a socket to a peer
 ### submit_write_vector
 
 ```mach
-pub fun submit_write_vector(backend: *std.net.async.readiness.Backend, native: usize, opening: u64, vectors: *std.net.async.types.Vector, count: usize, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_write_vector(backend: *std.net.async.readiness.Backend, native: usize, opening: u64, vectors: *std.system.os.shared.IoVector, count: usize, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 queue a vectored write
@@ -103,7 +103,7 @@ queue a vectored write
 ### submit_receive_batch
 
 ```mach
-pub fun submit_receive_batch(backend: *std.net.async.readiness.Backend, native: usize, opening: u64, packets: *std.net.async.types.Packet, count: usize, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_receive_batch(backend: *std.net.async.readiness.Backend, native: usize, opening: u64, packets: *std.net.async.types.Packet, count: usize, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 queue a receive of up to count datagrams. the socket is configured to report
@@ -123,7 +123,7 @@ packet metadata the first time it is seen under an opening
 ### submit_send_batch
 
 ```mach
-pub fun submit_send_batch(backend: *std.net.async.readiness.Backend, native: usize, opening: u64, packets: *std.net.async.types.Packet, count: usize, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_send_batch(backend: *std.net.async.readiness.Backend, native: usize, opening: u64, packets: *std.net.async.types.Packet, count: usize, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 queue a send of count datagrams, each to its own peer
@@ -170,19 +170,6 @@ registered with its first operation
 
 ## Forwards
 
-### Vector
-
-Forwards [`std.net.async.types.Vector`](types.md#vector).
-
-```mach
-pub rec Vector {
-    data:   *u8;
-    length: usize;
-}
-```
-
-one borrowed buffer of a vectored write
-
 ### Packet
 
 Forwards [`std.net.async.types.Packet`](types.md#packet).
@@ -222,7 +209,7 @@ Forwards [`std.net.async.types.NativeCompletion`](types.md#nativecompletion).
 
 ```mach
 pub rec NativeCompletion {
-    context:       usize;
+    context:       u64;
     kind:          std.io.runtime.Kind;
     bytes:         usize;
     items:         usize;
@@ -296,7 +283,7 @@ whether a caller range overlaps memory the backend owns
 Forwards [`std.net.async.readiness.submit_read`](readiness.md#submit_read).
 
 ```mach
-pub fun submit_read(backend: *Backend, native: usize, opening: u64, buffer: *u8, length: usize, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_read(backend: *Backend, native: usize, opening: u64, buffer: *u8, length: usize, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 queue a read into a borrowed buffer
@@ -306,7 +293,7 @@ queue a read into a borrowed buffer
 Forwards [`std.net.async.readiness.submit_readable`](readiness.md#submit_readable).
 
 ```mach
-pub fun submit_readable(backend: *Backend, native: usize, opening: u64, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_readable(backend: *Backend, native: usize, opening: u64, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 wait for the stream to be readable without a buffer: the completion reports
@@ -317,7 +304,7 @@ end_of_stream at orderly EOF, and nothing is read
 Forwards [`std.net.async.readiness.submit_write`](readiness.md#submit_write).
 
 ```mach
-pub fun submit_write(backend: *Backend, native: usize, opening: u64, buffer: *u8, length: usize, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_write(backend: *Backend, native: usize, opening: u64, buffer: *u8, length: usize, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 queue a write from a borrowed buffer
@@ -327,7 +314,7 @@ queue a write from a borrowed buffer
 Forwards [`std.net.async.readiness.submit_shutdown_write`](readiness.md#submit_shutdown_write).
 
 ```mach
-pub fun submit_shutdown_write(backend: *Backend, native: usize, opening: u64, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_shutdown_write(backend: *Backend, native: usize, opening: u64, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 queue a shutdown of the write side, behind the writes already queued
@@ -337,7 +324,7 @@ queue a shutdown of the write side, behind the writes already queued
 Forwards [`std.net.async.readiness.submit_close`](readiness.md#submit_close).
 
 ```mach
-pub fun submit_close(backend: *Backend, native: usize, opening: u64, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_close(backend: *Backend, native: usize, opening: u64, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 queue a close, which closes the native socket once its queued writes finish
@@ -372,7 +359,7 @@ Forwards [`std.net.async.readiness.dispatch`](readiness.md#dispatch).
 ```mach
 pub fun dispatch(
     backend: *Backend,
-    context: usize,
+    context: u64,
     events: u32,
     status: i64,
     flags: u64,

@@ -11,7 +11,6 @@ Uses types from [`std.io.runtime`](../../io/runtime.md), [`std.net.ip`](../ip.md
 | Type | | |
 | :--- | :--- | :--- |
 | [`Token`](#token) | `rec` | names one operation a backend holds, refused once the slot is reused |
-| [`Vector`](#vector) | `rec` | one borrowed buffer of a vectored write |
 | [`Packet`](#packet) | `rec` | packet storage is borrowed until its operation completes |
 | [`NativeCompletion`](#nativecompletion) | `rec` | what a backend reports for one finished operation |
 
@@ -37,22 +36,6 @@ names one operation a backend holds, refused once the slot is reused
 | :--- | :--- | :--- |
 | `index` | `u32` | the operation's slot in the backend's table |
 | `generation` | `u32` | the slot's generation when the operation was claimed |
-
-## Vector
-
-```mach
-pub rec Vector {
-    data:   *u8;
-    length: usize;
-}
-```
-
-one borrowed buffer of a vectored write
-
-| Field | Type | |
-| :--- | :--- | :--- |
-| `data` | `*u8` | the bytes, borrowed until the operation completes |
-| `length` | `usize` | bytes in data |
 
 ## Packet
 
@@ -82,7 +65,7 @@ packet storage is borrowed until its operation completes
 
 ```mach
 pub rec NativeCompletion {
-    context:       usize;
+    context:       u64;
     kind:          std.io.runtime.Kind;
     bytes:         usize;
     items:         usize;
@@ -96,7 +79,7 @@ what a backend reports for one finished operation
 
 | Field | Type | |
 | :--- | :--- | :--- |
-| `context` | `usize` | the caller's context from the submission |
+| `context` | `u64` | the caller's context from the submission |
 | `kind` | `std.io.runtime.Kind` | the operation kind |
 | `bytes` | `usize` | bytes moved |
 | `items` | `usize` | packets moved by a batch operation |

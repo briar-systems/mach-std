@@ -26,7 +26,7 @@ Source: [`src/system/os/linux.mach`](../../../../src/system/os/linux.mach)
 | [`allocate`](#allocate) | memory |
 | [`deallocate`](#deallocate), [`reallocate`](#reallocate), [`heap_region_base`](#heap_region_base), [`heap_region_extend`](#heap_region_extend), [`protect`](#protect), [`lock`](#lock), [`unlock`](#unlock), [`advise`](#advise), [`page_size`](#page_size), [`map_alignment`](#map_alignment), [`allocate_huge`](#allocate_huge), [`numa_node_count`](#numa_node_count), [`numa_current_node`](#numa_current_node), [`numa_allocate`](#numa_allocate), [`numa_move`](#numa_move), [`map_file`](#map_file), [`sync_file`](#sync_file) | |
 | [`read`](#read) | filesystem |
-| [`write`](#write), [`read_at`](#read_at), [`write_at`](#write_at), [`open`](#open) | |
+| [`write`](#write), [`write_vector`](#write_vector), [`read_at`](#read_at), [`write_at`](#write_at), [`open`](#open) | |
 | [`open_native`](#open_native) | the kernel takes a name as bytes, so the native-unit open is open itself |
 | [`close`](#close), [`sync_fd`](#sync_fd), [`stat`](#stat), [`set_mode`](#set_mode), [`set_mode_at`](#set_mode_at) | |
 | [`set_mode_at_native`](#set_mode_at_native) | every name below reaches the kernel as bytes, so each native form is the UTF-8 primitive itself |
@@ -1523,6 +1523,23 @@ write bytes to a file descriptor
 
 retries automatically on EINTR.
 
+### write_vector
+
+Forwards the first of these whose condition holds:
+
+- [`std.system.os.linux.x86_64.write_vector`](linux/x86_64.md#write_vector), where `$mach.build.arch == $mach.arch.x86_64`
+- [`std.system.os.linux.aarch64.write_vector`](linux/aarch64.md#write_vector), where `$mach.build.arch == $mach.arch.aarch64`
+- [`std.system.os.linux.riscv64.write_vector`](linux/riscv64.md#write_vector), where `$mach.build.arch == $mach.arch.riscv64`
+- [`std.system.os.linux.riscv32.write_vector`](linux/riscv32.md#write_vector), where `$mach.build.arch == $mach.arch.riscv32`
+
+```mach
+pub fun write_vector(fd: i32, vectors: *IoVector, count: usize) i64
+```
+
+write several buffers to a file descriptor in order, in one call
+
+retries automatically on EINTR.
+
 ### read_at
 
 Forwards the first of these whose condition holds:
@@ -2227,7 +2244,7 @@ Forwards the first of these whose condition holds:
 - [`std.system.os.linux.riscv32.process_watch`](linux/riscv32.md#process_watch), where `$mach.build.arch == $mach.arch.riscv32`
 
 ```mach
-pub fun process_watch(queue: *std.system.os.shared.IoQueue, pid: i64, context: usize) i64
+pub fun process_watch(queue: *std.system.os.shared.IoQueue, pid: i64, context: u64) i64
 ```
 
 make the end of the child `pid` a readiness event on `queue`, so the queue's
@@ -3616,7 +3633,8 @@ pub rec IoVector {
 }
 ```
 
-one buffer of a vectored transfer, laid out as the kernel's iovec
+one buffer of a gather write, laid out as struct iovec on linux and darwin
+and as wasi's ciovec
 
 ### sock_write_vector
 
@@ -4085,7 +4103,7 @@ Forwards the first of these whose condition holds:
 
 ```mach
 pub rec IoCompletion {
-    context: usize;
+    context: u64;
     events:  u32;
     source:  u16;
     status:  i64;
@@ -4203,7 +4221,7 @@ Forwards the first of these whose condition holds:
 - [`std.system.os.linux.riscv32.io_queue_watch`](linux/riscv32.md#io_queue_watch), where `$mach.build.arch == $mach.arch.riscv32`
 
 ```mach
-pub fun io_queue_watch(queue: *std.system.os.shared.IoQueue, resource: usize, context: usize, events: u32) i64
+pub fun io_queue_watch(queue: *std.system.os.shared.IoQueue, resource: usize, context: u64, events: u32) i64
 ```
 
 registers a resource that has no registration on the queue yet. a resource
@@ -4219,7 +4237,7 @@ Forwards the first of these whose condition holds:
 - [`std.system.os.linux.riscv32.io_queue_rearm`](linux/riscv32.md#io_queue_rearm), where `$mach.build.arch == $mach.arch.riscv32`
 
 ```mach
-pub fun io_queue_rearm(queue: *std.system.os.shared.IoQueue, resource: usize, context: usize, events: u32) i64
+pub fun io_queue_rearm(queue: *std.system.os.shared.IoQueue, resource: usize, context: u64, events: u32) i64
 ```
 
 arms again a registration the caller made with io_queue_watch

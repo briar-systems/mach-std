@@ -87,6 +87,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`rename_relative_native`](#rename_relative_native) | rename one wide component to another between pinned directory descriptors |
 | [`read`](#read) | read up to count bytes at the file pointer |
 | [`write`](#write) | write up to count bytes at the file pointer |
+| [`write_vector`](#write_vector) | write several buffers in order: windows has no gather write for consoles and pipes, so the pieces are joined in a stack buffer and each full buffer is one write, a long piece taking as many as it fills |
 | [`open`](#open) | open_native for a UTF-8 path, converted once |
 | [`open_native`](#open_native) | open a nul-terminated UTF-16 path as given: the units reach the W APIs unchanged, so a name holding an unpaired surrogate opens what it names |
 | [`close`](#close) | close a descriptor and its handle |
@@ -449,7 +450,7 @@ consumes the owner, including when native release reports failure
 
 ```mach
 pub rec IoCompletion {
-    context: usize;
+    context: u64;
     events:  u32;
     source:  u16;
     status:  i64;
@@ -906,6 +907,23 @@ write up to count bytes at the file pointer
 | Parameter | |
 | :--- | :--- |
 | **returns** | bytes written, EPIPE when a pipe's reader has closed, or another negative native code |
+
+### write_vector
+
+```mach
+pub fun write_vector(fd: i32, vectors: *std.system.os.shared.IoVector, count: usize) i64
+```
+
+write several buffers in order: windows has no gather write for consoles and
+pipes, so the pieces are joined in a stack buffer and each full buffer is one
+write, a long piece taking as many as it fills
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | file descriptor |
+| `vectors` | the buffers, in order |
+| `count` | number of buffers |
+| **returns** | bytes written, which stop at the first short or refused write, or the negative native code when nothing was written |
 
 ### open
 
@@ -1551,7 +1569,7 @@ ends every process left in it, so a group whose child is gone has none left.
 ### process_watch
 
 ```mach
-pub fun process_watch(queue: *std.system.os.shared.IoQueue, pid: i64, context: usize) i64
+pub fun process_watch(queue: *std.system.os.shared.IoQueue, pid: i64, context: u64) i64
 ```
 
 make the end of the tracked child `pid` a completion on `queue`, so the

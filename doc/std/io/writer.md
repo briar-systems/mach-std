@@ -32,6 +32,7 @@ Uses types from [`std.allocator`](../allocator.md), [`std.io.error`](error.md).
 | :--- | :--- |
 | [`native_failure`](#native_failure) | a native failure as a write error |
 | [`persisted`](#persisted) | the bytes the sink persisted before the failure |
+| [`classify`](#classify) | a stall reported as a native error is the would_block case, which write() applies to every sink's failure and a caller that writes past a Writer applies to its own |
 | [`advance`](#advance) | add the bytes persisted by earlier calls to the error's prefix |
 | [`reprefix`](#reprefix) | the same failure with its persisted prefix replaced |
 
@@ -106,6 +107,16 @@ pub fun persisted(error: WriteError) usize
 ```
 
 the bytes the sink persisted before the failure
+
+### classify
+
+```mach
+pub fun classify(error: WriteError) WriteError
+```
+
+a stall reported as a native error is the would_block case, which write()
+applies to every sink's failure and a caller that writes past a Writer applies
+to its own
 
 ### advance
 

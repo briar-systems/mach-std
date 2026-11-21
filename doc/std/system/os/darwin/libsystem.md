@@ -82,7 +82,6 @@ Uses types from [`std.system.os.shared`](../shared.md).
 | :--- | :--- | :--- |
 | [`DirectoryStream`](#directorystream) | `def` | opaque public dir stream, never dereferenced by mach |
 | [`DirectoryRecord`](#directoryrecord) | `rec` | variable-length native record, only the header and actual name extent are read |
-| [`IoVector`](#iovector) | `rec` | one buffer of a gather or scatter list, the layout of struct iovec |
 | [`ControlHeader`](#controlheader) | `rec` | the header of one ancillary data item, the layout of struct cmsghdr |
 | [`MessageHeader`](#messageheader) | `rec` | the argument of sendmsg and recvmsg, the layout of struct msghdr |
 | [`Termios`](#termios) | `rec` | public lp64 termios layout from darwin sys/termios.h |
@@ -95,10 +94,6 @@ Uses types from [`std.system.os.shared`](../shared.md).
 | [`fdopendir`](#fdopendir) | open a directory stream over a directory descriptor, which the stream then owns |
 | [`readdir`](#readdir) | the next record of a directory stream |
 | [`closedir`](#closedir) | close a directory stream and the descriptor it owns |
-
-| On `IoVector` | |
-| :--- | :--- |
-| [`writev`](#writev) | write a gather list to a descriptor |
 
 | On `MessageHeader` | |
 | :--- | :--- |
@@ -168,6 +163,7 @@ Uses types from [`std.system.os.shared`](../shared.md).
 | [`getsockopt`](#getsockopt) | read a socket option |
 | [`getsockname`](#getsockname) | read a socket's local address |
 | [`getpeername`](#getpeername) | read a connected socket's peer address |
+| [`writev`](#writev) | write a gather list to a descriptor |
 | [`tcflush`](#tcflush) | discard a terminal's queued data |
 | [`signal`](#signal) | install a process-wide signal disposition |
 | [`sigaction`](#sigaction) | examine or change a signal's disposition |
@@ -226,6 +222,10 @@ Uses types from [`std.system.os.shared`](../shared.md).
 | [`P_PID`](#constants) | waitid selectors and options (\<sys/wait.h>) |
 | [`WEXITED`](#constants), [`WNOWAIT`](#constants) | |
 | [`RLIMIT_NOFILE`](#constants) | resource limits (\<sys/resource.h>); `rlim_t` is u64 on LP64 |
+
+| Forwards | |
+| :--- | :--- |
+| [`IoVector`](#iovector) | |
 
 ---
 
@@ -317,38 +317,6 @@ pub rec DirectoryRecord {
 ```
 
 variable-length native record, only the header and actual name extent are read
-
-## IoVector
-
-```mach
-pub rec IoVector {
-    data:   *u8;
-    length: usize;
-}
-```
-
-one buffer of a gather or scatter list, the layout of struct iovec
-
-| Field | Type | |
-| :--- | :--- | :--- |
-| `data` | `*u8` | start of the buffer |
-| `length` | `usize` | its size in bytes |
-
-### writev
-
-```mach
-#[library("libsystem")]
-pub ext fun writev(fd: i32, vectors: *IoVector, count: i32) i64
-```
-
-write a gather list to a descriptor
-
-| Parameter | |
-| :--- | :--- |
-| `fd` | the descriptor |
-| `vectors` | the buffers, written in order |
-| `count` | entries in vectors |
-| **returns** | bytes written, or -1 with errno set |
 
 ## ControlHeader
 
@@ -1309,6 +1277,22 @@ read a connected socket's peer address
 | `length` | in, the capacity of address, out, its size |
 | **returns** | 0, or -1 with errno set (ENOTCONN while unconnected) |
 
+### writev
+
+```mach
+#[library("libsystem")]
+pub ext fun writev(fd: i32, vectors: *IoVector, count: i32) i64
+```
+
+write a gather list to a descriptor
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | the descriptor |
+| `vectors` | the buffers, written in order |
+| `count` | entries in vectors |
+| **returns** | bytes written, or -1 with errno set |
+
 ### tcflush
 
 ```mach
@@ -2008,4 +1992,20 @@ create a kernel event queue
 | `WEXITED` | `i32` | `0x4` |  |
 | `WNOWAIT` | `i32` | `0x20` |  |
 | `RLIMIT_NOFILE` | `i32` | `8` | resource limits (\<sys/resource.h>); `rlim_t` is u64 on LP64 |
+
+## Forwards
+
+### IoVector
+
+Forwards [`std.system.os.shared.IoVector`](../shared.md#iovector).
+
+```mach
+pub rec IoVector {
+    data:   *u8;
+    length: usize;
+}
+```
+
+one buffer of a gather write, laid out as struct iovec on linux and darwin
+and as wasi's ciovec
 

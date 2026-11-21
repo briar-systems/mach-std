@@ -49,6 +49,7 @@ Uses types from [`std.allocator`](allocator.md), [`std.filesystem.removal`](file
 | [`sync`](#sync) | flush an open file's data and metadata to its backing storage |
 | [`read`](#read) | read up to len bytes into buf |
 | [`write`](#write) | write up to len bytes from buf |
+| [`write_vector`](#write_vector) | write several buffers in order, in one call where the OS has a gather write |
 | [`seek`](#seek) | reposition the file offset |
 | [`reader`](#reader) | adapt a file to an io.Reader (the file must outlive the reader) |
 | [`writer`](#writer) | adapt a file to an io.Writer (the file must outlive the writer) |
@@ -138,6 +139,7 @@ Uses types from [`std.allocator`](allocator.md), [`std.filesystem.removal`](file
 | Forwards | |
 | :--- | :--- |
 | [`Identity`](#identity) | |
+| [`IoVector`](#iovector) | one buffer of write_vector's gather list |
 | [`SEEK_SET`](#seek_set) | seek anchors for `seek` |
 | [`SEEK_CUR`](#seek_cur), [`SEEK_END`](#seek_end) | |
 
@@ -268,6 +270,21 @@ write up to len bytes from buf
 | `buf` | source buffer |
 | `len` | bytes to write |
 | **returns** | bytes written, or the native refusal |
+
+### write_vector
+
+```mach
+pub fun write_vector(f: File, vectors: *IoVector, count: usize) res[usize, std.io.error.Error]
+```
+
+write several buffers in order, in one call where the OS has a gather write
+
+| Parameter | |
+| :--- | :--- |
+| `f` | file to write to |
+| `vectors` | the buffers, in order |
+| `count` | number of buffers |
+| **returns** | bytes written, which may stop short of the whole, or the native refusal |
 
 ### seek
 
@@ -1163,6 +1180,19 @@ opaque to filesystem callers, native producers initialize every byte
 byte 0 is the backend, bytes 1 to 16 are zero, bytes 17 to 24 hold the
 volume and 25 to 32 the file number, little-endian. bytes 33 to 40 are zero
 except on windows, where they may be nonzero
+
+### IoVector
+
+Forwards [`std.system.os.IoVector`](system/os.md#iovector), only where `capability.HAS_FILES`.
+
+```mach
+pub rec IoVector {
+    data:   *u8;
+    length: usize;
+}
+```
+
+one buffer of write_vector's gather list
 
 ### SEEK_SET
 

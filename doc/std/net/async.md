@@ -24,7 +24,7 @@ accept took, which the caller owns (accepted)
 
 Source: [`src/net/async.mach`](../../../src/net/async.mach)
 
-Uses types from [`std.allocator`](../allocator.md), [`std.io.error`](../io/error.md), [`std.io.lifecycle`](../io/lifecycle.md), [`std.io.runtime`](../io/runtime.md), [`std.memory.table`](../memory/table.md), [`std.net.async.types`](async/types.md), [`std.net.ip`](ip.md), [`std.net.socket`](socket.md), [`std.net.tcp`](tcp.md), [`std.net.udp`](udp.md), [`std.sync.cancel`](../sync/cancel.md), [`std.sync.mutex`](../sync/mutex.md).
+Uses types from [`std.allocator`](../allocator.md), [`std.io.error`](../io/error.md), [`std.io.lifecycle`](../io/lifecycle.md), [`std.io.runtime`](../io/runtime.md), [`std.memory.table`](../memory/table.md), [`std.net.async.types`](async/types.md), [`std.net.ip`](ip.md), [`std.net.socket`](socket.md), [`std.net.tcp`](tcp.md), [`std.net.udp`](udp.md), [`std.sync.cancel`](../sync/cancel.md), [`std.sync.mutex`](../sync/mutex.md), [`std.system.os`](../system/os.md).
 
 | Type | | |
 | :--- | :--- | :--- |
@@ -65,7 +65,7 @@ Uses types from [`std.allocator`](../allocator.md), [`std.io.error`](../io/error
 
 | Forwards | |
 | :--- | :--- |
-| [`Vector`](#vector), [`Packet`](#packet) | |
+| [`IoVector`](#iovector), [`Packet`](#packet) | |
 
 ---
 
@@ -192,7 +192,7 @@ pub fun submit_write_vector(
     driver: *Driver,
     scope: *std.sync.cancel.Scope,
     stream: *std.net.tcp.Stream,
-    vectors: *std.net.async.types.Vector,
+    vectors: *std.system.os.IoVector,
     count: usize,
     context: usize,
 ) res[std.io.runtime.Token, std.io.error.Error]
@@ -494,18 +494,19 @@ stream from every accept completion it receives and serves or closes it
 
 ## Forwards
 
-### Vector
+### IoVector
 
-Forwards [`std.net.async.types.Vector`](async/types.md#vector), only where `capability.HAS_CLOCK && capability.HAS_SOCKETS`.
+Forwards [`std.system.os.IoVector`](../system/os.md#iovector), only where `capability.HAS_CLOCK && capability.HAS_SOCKETS`.
 
 ```mach
-pub rec Vector {
+pub rec IoVector {
     data:   *u8;
     length: usize;
 }
 ```
 
-one borrowed buffer of a vectored write
+one buffer of a gather write, laid out as struct iovec on linux and darwin
+and as wasi's ciovec
 
 ### Packet
 

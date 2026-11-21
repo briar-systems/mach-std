@@ -62,6 +62,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`environ`](#environ) | pointer to the environment captured by the runtime at program start (null-terminated array of "NAME=value" strings) |
 | [`read`](#read) | read bytes from a descriptor |
 | [`write`](#write) | write bytes to a descriptor |
+| [`write_vector`](#write_vector) | write several buffers to a file descriptor in order, in one call |
 | [`read_at`](#read_at) | positioned file access does not mutate the descriptor offset |
 | [`write_at`](#write_at) | write bytes at a file offset without moving the descriptor offset |
 | [`open`](#open) | open a path relative to a directory descriptor |
@@ -374,7 +375,7 @@ closedir consumes its stream even when the underlying close fails
 
 ```mach
 pub rec IoCompletion {
-    context: usize;
+    context: u64;
     events:  u32;
     source:  u16;
     status:  i64;
@@ -677,6 +678,24 @@ in all
 | `buf` | source bytes |
 | `count` | bytes to write |
 | **returns** | bytes written, or negative errno (EINTR once the retries run out) |
+
+### write_vector
+
+```mach
+pub fun write_vector(fd: i32, vectors: *IoVector, count: usize) i64
+```
+
+write several buffers to a file descriptor in order, in one call
+
+a call EINTR interrupts is tried again, for at most EINTR_MAX_RETRIES attempts
+in all
+
+| Parameter | |
+| :--- | :--- |
+| `fd` | file descriptor |
+| `vectors` | the buffers, in order |
+| `count` | number of buffers |
+| **returns** | bytes written, which may stop short of the whole, or negative errno |
 
 ### read_at
 
@@ -1166,7 +1185,7 @@ process may not signal still counts, so EPERM reads as present.
 ### process_watch
 
 ```mach
-pub fun process_watch(queue: *std.system.os.shared.IoQueue, pid: i64, context: usize) i64
+pub fun process_watch(queue: *std.system.os.shared.IoQueue, pid: i64, context: u64) i64
 ```
 
 make the end of the child `pid` a readiness event on `queue`, so the queue's
@@ -1715,7 +1734,7 @@ posts already registered
 ### io_queue_watch
 
 ```mach
-pub fun io_queue_watch(queue: *std.system.os.shared.IoQueue, resource: usize, context: usize, events: u32) i64
+pub fun io_queue_watch(queue: *std.system.os.shared.IoQueue, resource: usize, context: u64, events: u32) i64
 ```
 
 register one-shot readiness interest in a descriptor
@@ -1749,7 +1768,7 @@ before, in one step
 ### io_queue_rearm
 
 ```mach
-pub fun io_queue_rearm(queue: *std.system.os.shared.IoQueue, resource: usize, context: usize, events: u32) i64
+pub fun io_queue_rearm(queue: *std.system.os.shared.IoQueue, resource: usize, context: u64, events: u32) i64
 ```
 
 arms again a registration the caller made with io_queue_watch. kqueue's
@@ -2414,7 +2433,8 @@ pub rec IoVector {
 }
 ```
 
-one buffer of a gather or scatter list, the layout of struct iovec
+one buffer of a gather write, laid out as struct iovec on linux and darwin
+and as wasi's ciovec
 
 ### ProcessStatus
 

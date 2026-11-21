@@ -62,7 +62,7 @@ initial is the size the backend starts at: every table grows on demand
 ### submit_read
 
 ```mach
-pub fun submit_read(backend: *Backend, resource: usize, buffer: *u8, length: usize, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_read(backend: *Backend, resource: usize, buffer: *u8, length: usize, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 post an overlapped read into a borrowed buffer
@@ -80,7 +80,7 @@ post an overlapped read into a borrowed buffer
 ### submit_readable
 
 ```mach
-pub fun submit_readable(backend: *Backend, resource: usize, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_readable(backend: *Backend, resource: usize, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 wait for the stream to be readable without a buffer: an overlapped zero-byte
@@ -89,7 +89,7 @@ receive, settled on completion by the queued byte count
 ### submit_write
 
 ```mach
-pub fun submit_write(backend: *Backend, resource: usize, buffer: *u8, length: usize, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_write(backend: *Backend, resource: usize, buffer: *u8, length: usize, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 post an overlapped write from a borrowed buffer
@@ -172,7 +172,7 @@ apart by its driver's tokens, so no record is kept
 ### submit_accept
 
 ```mach
-pub fun submit_accept(backend: *Backend, listener: usize, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_accept(backend: *Backend, listener: usize, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 post an overlapped accept on a listening socket, into a socket made for it here
@@ -188,7 +188,7 @@ post an overlapped accept on a listening socket, into a socket made for it here
 ### submit_connect
 
 ```mach
-pub fun submit_connect(backend: *Backend, resource: usize, peer: std.net.local.endpoint.Endpoint, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_connect(backend: *Backend, resource: usize, peer: std.net.local.endpoint.Endpoint, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 post an overlapped connect to a local endpoint, binding the socket first when it is unbound
@@ -205,7 +205,7 @@ post an overlapped connect to a local endpoint, binding the socket first when it
 ### submit_shutdown_write
 
 ```mach
-pub fun submit_shutdown_write(backend: *Backend, resource: usize, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_shutdown_write(backend: *Backend, resource: usize, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 a shutdown waits for the socket's writes, and runs once none is left
@@ -213,7 +213,7 @@ a shutdown waits for the socket's writes, and runs once none is left
 ### submit_close
 
 ```mach
-pub fun submit_close(backend: *Backend, resource: usize, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_close(backend: *Backend, resource: usize, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 a close aborts the socket's requests and completes once they have all left
@@ -245,7 +245,7 @@ Forwards [`std.net.async.types.NativeCompletion`](../types.md#nativecompletion).
 
 ```mach
 pub rec NativeCompletion {
-    context:       usize;
+    context:       u64;
     kind:          std.io.runtime.Kind;
     bytes:         usize;
     items:         usize;
@@ -326,7 +326,7 @@ Forwards [`std.net.async.iocp.port.dispatch`](../iocp/port.md#dispatch).
 ```mach
 pub fun dispatch(
     backend: *Backend,
-    context: usize,
+    context: u64,
     events: u32,
     status: i64,
     flags: u64,

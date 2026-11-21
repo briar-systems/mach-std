@@ -119,7 +119,7 @@ its registration and record go and the socket stays open
 ### submit_accept
 
 ```mach
-pub fun submit_accept(backend: *std.net.async.readiness.Backend, listener: usize, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_accept(backend: *std.net.async.readiness.Backend, listener: usize, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 queue an accept on a listening socket
@@ -135,7 +135,7 @@ queue an accept on a listening socket
 ### submit_connect
 
 ```mach
-pub fun submit_connect(backend: *std.net.async.readiness.Backend, resource_value: usize, peer: std.net.local.endpoint.Endpoint, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_connect(backend: *std.net.async.readiness.Backend, resource_value: usize, peer: std.net.local.endpoint.Endpoint, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 queue a connect of a socket to a local endpoint
@@ -152,7 +152,7 @@ queue a connect of a socket to a local endpoint
 ### submit_read
 
 ```mach
-pub fun submit_read(backend: *std.net.async.readiness.Backend, resource_value: usize, buffer: *u8, length: usize, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_read(backend: *std.net.async.readiness.Backend, resource_value: usize, buffer: *u8, length: usize, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 queue a read into a borrowed buffer. descriptor rights sent with the bytes are
@@ -171,7 +171,7 @@ closed on linux and fail the read with ENOTSUP on darwin
 ### submit_readable
 
 ```mach
-pub fun submit_readable(backend: *std.net.async.readiness.Backend, resource_value: usize, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_readable(backend: *std.net.async.readiness.Backend, resource_value: usize, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 queue a wait for the stream to be readable, reading nothing
@@ -187,7 +187,7 @@ queue a wait for the stream to be readable, reading nothing
 ### submit_write
 
 ```mach
-pub fun submit_write(backend: *std.net.async.readiness.Backend, resource_value: usize, buffer: *u8, length: usize, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_write(backend: *std.net.async.readiness.Backend, resource_value: usize, buffer: *u8, length: usize, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 queue a write from a borrowed buffer
@@ -205,7 +205,7 @@ queue a write from a borrowed buffer
 ### submit_shutdown_write
 
 ```mach
-pub fun submit_shutdown_write(backend: *std.net.async.readiness.Backend, resource_value: usize, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_shutdown_write(backend: *std.net.async.readiness.Backend, resource_value: usize, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 queue a shutdown of the write side, behind the writes already queued
@@ -221,7 +221,7 @@ queue a shutdown of the write side, behind the writes already queued
 ### submit_close
 
 ```mach
-pub fun submit_close(backend: *std.net.async.readiness.Backend, resource_value: usize, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_close(backend: *std.net.async.readiness.Backend, resource_value: usize, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 queue a close, which closes the native socket once its queued writes finish
@@ -255,7 +255,7 @@ Forwards [`std.net.async.types.NativeCompletion`](../types.md#nativecompletion).
 
 ```mach
 pub rec NativeCompletion {
-    context:       usize;
+    context:       u64;
     kind:          std.io.runtime.Kind;
     bytes:         usize;
     items:         usize;
@@ -354,7 +354,7 @@ Forwards [`std.net.async.readiness.dispatch`](../readiness.md#dispatch).
 ```mach
 pub fun dispatch(
     backend: *Backend,
-    context: usize,
+    context: u64,
     events: u32,
     status: i64,
     flags: u64,

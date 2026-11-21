@@ -132,7 +132,7 @@ pub rec Header {
     next_free:    usize;
     resource:     usize;
     auxiliary:    usize;
-    context:      usize;
+    context:      u64;
     buffer:       NativeBuffer;
     address:      [288]u8;
     transferred:  u32;
@@ -291,7 +291,7 @@ a drained peak grew goes back as soon as the lock is let go
 ### claim_locked
 
 ```mach
-pub fun claim_locked(backend: *Backend, sock: u32, kind: std.io.runtime.Kind, resource: usize, context: usize, state: u8, token: *std.net.async.types.Token) *Header
+pub fun claim_locked(backend: *Backend, sock: u32, kind: std.io.runtime.Kind, resource: usize, context: u64, state: u8, token: *std.net.async.types.Token) *Header
 ```
 
 a free operation joins the socket record sock in state
@@ -309,7 +309,7 @@ the operation leaves its own socket record, never one found by socket value
 ```mach
 pub fun push_completion_locked(
     backend: *Backend,
-    context: usize,
+    context: u64,
     kind: std.io.runtime.Kind,
     bytes: usize,
     items: usize,
@@ -379,7 +379,7 @@ the socket record a request joins, or the refusal. backend.lock stays held on su
 ### submit_buffer
 
 ```mach
-pub fun submit_buffer(backend: *Backend, resource: usize, opening: u64, buffer: *u8, length: usize, context: usize, kind: std.io.runtime.Kind, token: *std.net.async.types.Token) i64
+pub fun submit_buffer(backend: *Backend, resource: usize, opening: u64, buffer: *u8, length: usize, context: u64, kind: std.io.runtime.Kind, token: *std.net.async.types.Token) i64
 ```
 
 a read, readiness wait or write over one borrowed buffer
@@ -387,7 +387,7 @@ a read, readiness wait or write over one borrowed buffer
 ### submit_shutdown_write
 
 ```mach
-pub fun submit_shutdown_write(backend: *Backend, resource: usize, opening: u64, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_shutdown_write(backend: *Backend, resource: usize, opening: u64, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 a shutdown waits for the socket's writes, and runs once none is left
@@ -395,7 +395,7 @@ a shutdown waits for the socket's writes, and runs once none is left
 ### submit_close
 
 ```mach
-pub fun submit_close(backend: *Backend, resource: usize, opening: u64, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_close(backend: *Backend, resource: usize, opening: u64, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 a close aborts the socket's requests and completes once they have all left.
@@ -494,7 +494,7 @@ publish the settled controls without waiting
 ```mach
 pub fun dispatch(
     backend: *Backend,
-    context: usize,
+    context: u64,
     events: u32,
     status: i64,
     flags: u64,

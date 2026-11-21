@@ -76,7 +76,7 @@ pub rec Operation {
     completion:     std.net.async.types.NativeCompletion;
     kind:           std.io.runtime.Kind;
     resource:       usize;
-    context:        usize;
+    context:        u64;
     buffer:         *u8;
     length:         usize;
     sequence:       u64;
@@ -259,7 +259,7 @@ whether a caller range overlaps memory the backend owns
 ### token_context
 
 ```mach
-pub fun token_context(backend: *Backend, token: std.net.async.types.Token) usize
+pub fun token_context(backend: *Backend, token: std.net.async.types.Token) u64
 ```
 
 the wire context is a 16-bit source id, a 32-bit resource index and a 16-bit
@@ -271,7 +271,7 @@ being orphaned and arriving for a stale one to pass as live
 ### context_token
 
 ```mach
-pub fun context_token(backend: *Backend, context: usize, token: *std.net.async.types.Token) bool
+pub fun context_token(backend: *Backend, context: u64, token: *std.net.async.types.Token) bool
 ```
 
 decode a wire context back into the resource token it carries
@@ -367,7 +367,7 @@ each one before the runtime recycles the source id they carry
 ### operation_claim
 
 ```mach
-pub fun operation_claim(backend: *Backend, kind: std.io.runtime.Kind, native: usize, context: usize, token: *std.net.async.types.Token) *Operation
+pub fun operation_claim(backend: *Backend, kind: std.io.runtime.Kind, native: usize, context: u64, token: *std.net.async.types.Token) *Operation
 ```
 
 claim a free operation, growing the table when none is free
@@ -427,7 +427,7 @@ and reused, or detached
 ### begin
 
 ```mach
-pub fun begin(backend: *Backend, native: usize, opening: u64, kind: std.io.runtime.Kind, context: usize, lane: u8, token: *std.net.async.types.Token, resource_out: **Resource, operation_out: **Operation) i64
+pub fun begin(backend: *Backend, native: usize, opening: u64, kind: std.io.runtime.Kind, context: u64, lane: u8, token: *std.net.async.types.Token, resource_out: **Resource, operation_out: **Operation) i64
 ```
 
 a refused submission may have dropped a stale resource, so it trims too
@@ -462,7 +462,7 @@ tables grow on demand and the resource map rehashes with them
 ### submit_read
 
 ```mach
-pub fun submit_read(backend: *Backend, native: usize, opening: u64, buffer: *u8, length: usize, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_read(backend: *Backend, native: usize, opening: u64, buffer: *u8, length: usize, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 queue a read into a borrowed buffer
@@ -481,7 +481,7 @@ queue a read into a borrowed buffer
 ### submit_readable
 
 ```mach
-pub fun submit_readable(backend: *Backend, native: usize, opening: u64, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_readable(backend: *Backend, native: usize, opening: u64, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 wait for the stream to be readable without a buffer: the completion reports
@@ -490,7 +490,7 @@ end_of_stream at orderly EOF, and nothing is read
 ### submit_write
 
 ```mach
-pub fun submit_write(backend: *Backend, native: usize, opening: u64, buffer: *u8, length: usize, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_write(backend: *Backend, native: usize, opening: u64, buffer: *u8, length: usize, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 queue a write from a borrowed buffer
@@ -509,7 +509,7 @@ queue a write from a borrowed buffer
 ### submit_shutdown_write
 
 ```mach
-pub fun submit_shutdown_write(backend: *Backend, native: usize, opening: u64, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_shutdown_write(backend: *Backend, native: usize, opening: u64, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 queue a shutdown of the write side, behind the writes already queued
@@ -526,7 +526,7 @@ queue a shutdown of the write side, behind the writes already queued
 ### begin_close_locked
 
 ```mach
-pub fun begin_close_locked(backend: *Backend, native: usize, opening: u64, context: usize, token: *std.net.async.types.Token, resource_out: **Resource) i64
+pub fun begin_close_locked(backend: *Backend, native: usize, opening: u64, context: u64, token: *std.net.async.types.Token, resource_out: **Resource) i64
 ```
 
 start a close: queued reads finish cancelled and the close waits for the writes to drain
@@ -544,7 +544,7 @@ start a close: queued reads finish cancelled and the close waits for the writes 
 ### submit_close
 
 ```mach
-pub fun submit_close(backend: *Backend, native: usize, opening: u64, context: usize, token: *std.net.async.types.Token) i64
+pub fun submit_close(backend: *Backend, native: usize, opening: u64, context: u64, token: *std.net.async.types.Token) i64
 ```
 
 queue a close, which closes the native socket once its queued writes finish
@@ -587,7 +587,7 @@ publish the finished operations without waiting
 ```mach
 pub fun dispatch(
     backend: *Backend,
-    context: usize,
+    context: u64,
     events: u32,
     status: i64,
     flags: u64,

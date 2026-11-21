@@ -11,6 +11,7 @@ Source: [`src/system/os/shared.mach`](../../../../src/system/os/shared.mach)
 | Type | | |
 | :--- | :--- | :--- |
 | [`Timespec`](#timespec) | `rec` | seconds and nanoseconds from a clock source |
+| [`IoVector`](#iovector) | `rec` | one buffer of a gather write, laid out as struct iovec on linux and darwin and as wasi's ciovec |
 | [`IoQueue`](#ioqueue) | `rec` | native wait queue state owned by the portable completion runtime |
 | [`ThreadBlock`](#threadblock) | `rec` | the per-thread block std installs for each thread it runs |
 | [`DirectoryEntry`](#directoryentry) | `rec` | the name is borrowed until the next cursor operation, including eof or failure |
@@ -75,6 +76,23 @@ seconds and nanoseconds from a clock source
 | :--- | :--- | :--- |
 | `sec` | `i64` | whole seconds |
 | `nsec` | `i64` | nanoseconds within second [0, 999999999] |
+
+## IoVector
+
+```mach
+pub rec IoVector {
+    data:   *u8;
+    length: usize;
+}
+```
+
+one buffer of a gather write, laid out as struct iovec on linux and darwin
+and as wasi's ciovec
+
+| Field | Type | |
+| :--- | :--- | :--- |
+| `data` | `*u8` | start of the buffer |
+| `length` | `usize` | its size in bytes |
 
 ## IoQueue
 
@@ -309,7 +327,7 @@ on linux and darwin the units are bytes, so it is Environment itself
 ### io_context_source
 
 ```mach
-pub fun io_context_source(context: usize) u16
+pub fun io_context_source(context: u64) u16
 ```
 
 the source id a registered readiness context carries
@@ -317,7 +335,7 @@ the source id a registered readiness context carries
 ### io_source_context
 
 ```mach
-pub fun io_source_context(source: u16, low: u64) usize
+pub fun io_source_context(source: u16, low: u64) u64
 ```
 
 a readiness context for source from the source's own 48 low bits

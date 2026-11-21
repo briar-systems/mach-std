@@ -11,11 +11,10 @@ std.memory.secret. a negative return is a native code.
 every allocation is span usable bytes, the request rounded up to whole pages,
 between two inaccessible guard pages, so a run off either end faults. the
 span is locked against paging and, where the host can say so, kept out of
-core dumps:
+core dumps. every page is resident and charged to the lock limit before the
+allocation returns, so a span handed out never faults for want of a page:
 
-  linux    memfd_secret, which also removes the pages from the kernel's
-           direct map, or on a kernel without it an anonymous mapping with
-           mlock and MADV_DONTDUMP
+  linux    an anonymous mapping with mlock and MADV_DONTDUMP
   darwin   mmap and mlock. xnu has no per-mapping dump exclusion
   windows  VirtualAlloc and VirtualLock, the guards reserved and never
            committed. windows has no per-allocation dump exclusion

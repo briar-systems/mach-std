@@ -163,7 +163,7 @@ caller owns and closes like any other
 
 ```mach
 pub rec NativeEvent {
-    context: usize;
+    context: u64;
     events:  u32;
     source:  u16;
     status:  i64;
@@ -211,7 +211,7 @@ the id native events carry for a source
 ## DispatchFun
 
 ```mach
-pub def DispatchFun: fun(ptr, usize, u32, i64, u64) bool
+pub def DispatchFun: fun(ptr, u64, u32, i64, u64) bool
 ```
 
 offered each native event carrying the source's id, and every wake (context

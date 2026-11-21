@@ -22,7 +22,7 @@ Source: [`src/system/os/darwin.mach`](../../../../src/system/os/darwin.mach)
 | [`allocate`](#allocate) | memory |
 | [`deallocate`](#deallocate), [`reallocate`](#reallocate), [`heap_region_base`](#heap_region_base), [`heap_region_extend`](#heap_region_extend), [`protect`](#protect), [`lock`](#lock), [`unlock`](#unlock), [`advise`](#advise), [`page_size`](#page_size), [`map_alignment`](#map_alignment), [`map_file`](#map_file), [`sync_file`](#sync_file) | |
 | [`read`](#read) | filesystem |
-| [`write`](#write), [`read_at`](#read_at), [`write_at`](#write_at), [`open`](#open) | |
+| [`write`](#write), [`write_vector`](#write_vector), [`read_at`](#read_at), [`write_at`](#write_at), [`open`](#open) | |
 | [`open_native`](#open_native) | the kernel takes a name as bytes, so the native-unit open is open itself |
 | [`close`](#close), [`sync_fd`](#sync_fd), [`stat`](#stat), [`set_mode`](#set_mode), [`set_mode_at`](#set_mode_at) | |
 | [`set_mode_at_native`](#set_mode_at_native) | every name below reaches the kernel as bytes, so each native form is the UTF-8 primitive itself |
@@ -1113,6 +1113,22 @@ write bytes to a descriptor
 a call EINTR interrupts is tried again, for at most EINTR_MAX_RETRIES attempts
 in all
 
+### write_vector
+
+Forwards the first of these whose condition holds:
+
+- [`std.system.os.darwin.aarch64.write_vector`](darwin/aarch64.md#write_vector), where `$mach.build.arch == $mach.arch.aarch64`
+- [`std.system.os.darwin.x86_64.write_vector`](darwin/x86_64.md#write_vector), where `$mach.build.arch == $mach.arch.x86_64`
+
+```mach
+pub fun write_vector(fd: i32, vectors: *IoVector, count: usize) i64
+```
+
+write several buffers to a file descriptor in order, in one call
+
+a call EINTR interrupts is tried again, for at most EINTR_MAX_RETRIES attempts
+in all
+
 ### read_at
 
 Forwards the first of these whose condition holds:
@@ -1753,7 +1769,7 @@ Forwards the first of these whose condition holds:
 - [`std.system.os.darwin.x86_64.process_watch`](darwin/x86_64.md#process_watch), where `$mach.build.arch == $mach.arch.x86_64`
 
 ```mach
-pub fun process_watch(queue: *std.system.os.shared.IoQueue, pid: i64, context: usize) i64
+pub fun process_watch(queue: *std.system.os.shared.IoQueue, pid: i64, context: u64) i64
 ```
 
 make the end of the child `pid` a readiness event on `queue`, so the queue's
@@ -2931,7 +2947,8 @@ pub rec IoVector {
 }
 ```
 
-one buffer of a gather or scatter list, the layout of struct iovec
+one buffer of a gather write, laid out as struct iovec on linux and darwin
+and as wasi's ciovec
 
 ### sock_write_vector
 
@@ -3256,7 +3273,7 @@ Forwards the first of these whose condition holds:
 
 ```mach
 pub rec IoCompletion {
-    context: usize;
+    context: u64;
     events:  u32;
     source:  u16;
     status:  i64;
@@ -3358,7 +3375,7 @@ Forwards the first of these whose condition holds:
 - [`std.system.os.darwin.x86_64.io_queue_watch`](darwin/x86_64.md#io_queue_watch), where `$mach.build.arch == $mach.arch.x86_64`
 
 ```mach
-pub fun io_queue_watch(queue: *std.system.os.shared.IoQueue, resource: usize, context: usize, events: u32) i64
+pub fun io_queue_watch(queue: *std.system.os.shared.IoQueue, resource: usize, context: u64, events: u32) i64
 ```
 
 register one-shot readiness interest in a descriptor
@@ -3374,7 +3391,7 @@ Forwards the first of these whose condition holds:
 - [`std.system.os.darwin.x86_64.io_queue_rearm`](darwin/x86_64.md#io_queue_rearm), where `$mach.build.arch == $mach.arch.x86_64`
 
 ```mach
-pub fun io_queue_rearm(queue: *std.system.os.shared.IoQueue, resource: usize, context: usize, events: u32) i64
+pub fun io_queue_rearm(queue: *std.system.os.shared.IoQueue, resource: usize, context: u64, events: u32) i64
 ```
 
 arms again a registration the caller made with io_queue_watch. kqueue's

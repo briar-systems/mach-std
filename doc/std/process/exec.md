@@ -379,7 +379,7 @@ always means still running and never means interrupted.
 ### watch_exit
 
 ```mach
-pub fun watch_exit(queue: *std.system.os.IoQueue, child: Child, context: usize) res[ExitWatch, Error]
+pub fun watch_exit(queue: *std.system.os.IoQueue, child: Child, context: u64) res[ExitWatch, Error]
 ```
 
 watch the end of `child` on `queue`

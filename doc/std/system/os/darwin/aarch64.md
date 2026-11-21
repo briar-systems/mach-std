@@ -29,7 +29,7 @@ Source: [`src/system/os/darwin/aarch64.mach`](../../../../../src/system/os/darwi
 | [`_envp`](#_envp) | environment |
 | [`environ`](#environ) | |
 | [`read`](#read) | filesystem |
-| [`write`](#write), [`read_at`](#read_at), [`write_at`](#write_at), [`open`](#open), [`close`](#close), [`sync_fd`](#sync_fd), [`stat`](#stat), [`set_mode`](#set_mode), [`set_mode_at`](#set_mode_at), [`file_identity`](#file_identity), [`identity_at`](#identity_at), [`retain_identity_at`](#retain_identity_at), [`publication_capabilities`](#publication_capabilities), [`stat_path`](#stat_path), [`stat_mode`](#stat_mode), [`stat_birth`](#stat_birth), [`unlink`](#unlink), [`rename`](#rename), [`symlink`](#symlink), [`make_dir`](#make_dir), [`directory_init`](#directory_init), [`directory_next`](#directory_next), [`directory_dnit`](#directory_dnit), [`access`](#access), [`seek`](#seek), [`lock_fd`](#lock_fd) | |
+| [`write`](#write), [`write_vector`](#write_vector), [`read_at`](#read_at), [`write_at`](#write_at), [`open`](#open), [`close`](#close), [`sync_fd`](#sync_fd), [`stat`](#stat), [`set_mode`](#set_mode), [`set_mode_at`](#set_mode_at), [`file_identity`](#file_identity), [`identity_at`](#identity_at), [`retain_identity_at`](#retain_identity_at), [`publication_capabilities`](#publication_capabilities), [`stat_path`](#stat_path), [`stat_mode`](#stat_mode), [`stat_birth`](#stat_birth), [`unlink`](#unlink), [`rename`](#rename), [`symlink`](#symlink), [`make_dir`](#make_dir), [`directory_init`](#directory_init), [`directory_next`](#directory_next), [`directory_dnit`](#directory_dnit), [`access`](#access), [`seek`](#seek), [`lock_fd`](#lock_fd) | |
 | [`AF_INET`](#af_inet) | sockets |
 | [`SOCK_STREAM`](#sock_stream), [`SOCK_DGRAM`](#sock_dgram), [`SOL_SOCKET`](#sol_socket), [`SO_UNSUPPORTED`](#so_unsupported), [`SO_REUSEADDR`](#so_reuseaddr), [`SO_REUSEPORT`](#so_reuseport), [`SO_EXCLUSIVEADDRUSE`](#so_exclusiveaddruse), [`SO_KEEPALIVE`](#so_keepalive), [`SO_SNDBUF`](#so_sndbuf), [`SO_RCVBUF`](#so_rcvbuf), [`SO_LINGER`](#so_linger), [`SO_RCVTIMEO`](#so_rcvtimeo), [`IPPROTO_IP`](#ipproto_ip), [`IPPROTO_TCP`](#ipproto_tcp), [`IPPROTO_IPV6`](#ipproto_ipv6), [`IP_TOS`](#ip_tos), [`IPV6_V6ONLY`](#ipv6_v6only), [`IPV6_TCLASS`](#ipv6_tclass), [`TCP_NODELAY`](#tcp_nodelay), [`TCP_KEEPIDLE`](#tcp_keepidle), [`TCP_KEEPINTVL`](#tcp_keepintvl), [`TCP_KEEPCNT`](#tcp_keepcnt), [`TCP_FASTOPEN`](#tcp_fastopen), [`SHUT_RD`](#shut_rd), [`SHUT_WR`](#shut_wr), [`SHUT_RDWR`](#shut_rdwr), [`SOCKADDR_IN_SIZE`](#sockaddr_in_size), [`sock_send`](#sock_send), [`sock_recv`](#sock_recv), [`IoVector`](#iovector), [`sock_write_vector`](#sock_write_vector), [`sock_send_message`](#sock_send_message), [`sock_receive_message`](#sock_receive_message), [`sock_set_nonblocking`](#sock_set_nonblocking), [`sock_connect_begin`](#sock_connect_begin), [`sock_connect_poll`](#sock_connect_poll), [`CONNECT_PENDING`](#connect_pending), [`sock_close`](#sock_close), [`sock_create`](#sock_create), [`sock_create_flags`](#sock_create_flags), [`sock_bind`](#sock_bind), [`sock_listen`](#sock_listen), [`sock_accept`](#sock_accept), [`sock_accept_flags`](#sock_accept_flags), [`sock_connect`](#sock_connect), [`sock_sendto`](#sock_sendto), [`sock_recvfrom`](#sock_recvfrom), [`sock_peek_readable`](#sock_peek_readable), [`sock_shutdown`](#sock_shutdown), [`sock_setopt`](#sock_setopt), [`sock_getopt`](#sock_getopt), [`sock_local_addr`](#sock_local_addr), [`sock_remote_addr`](#sock_remote_addr), [`sock_inheritable`](#sock_inheritable), [`io_queue_create`](#io_queue_create), [`io_queue_wait`](#io_queue_wait), [`IoCompletion`](#iocompletion), [`IO_EVENT_READ`](#io_event_read), [`IO_EVENT_WRITE`](#io_event_write), [`IO_EVENT_ERROR`](#io_event_error), [`IO_EVENT_HANGUP`](#io_event_hangup), [`IO_EVENT_WAKE`](#io_event_wake), [`io_queue_watch`](#io_queue_watch), [`io_queue_rearm`](#io_queue_rearm), [`duplicate_to`](#duplicate_to), [`io_queue_unwatch`](#io_queue_unwatch), [`io_queue_poll`](#io_queue_poll), [`io_queue_wake`](#io_queue_wake), [`io_queue_close`](#io_queue_close), [`sock_set_rcvtimeo`](#sock_set_rcvtimeo) | |
 | [`DNS_HOSTS_PATH`](#dns_hosts_path) | dns |
@@ -756,7 +756,7 @@ process may not signal still counts, so EPERM reads as present.
 Forwards [`std.system.os.darwin.shared.process_watch`](shared.md#process_watch).
 
 ```mach
-pub fun process_watch(queue: *std.system.os.shared.IoQueue, pid: i64, context: usize) i64
+pub fun process_watch(queue: *std.system.os.shared.IoQueue, pid: i64, context: u64) i64
 ```
 
 make the end of the child `pid` a readiness event on `queue`, so the queue's
@@ -1431,6 +1431,19 @@ write bytes to a descriptor
 a call EINTR interrupts is tried again, for at most EINTR_MAX_RETRIES attempts
 in all
 
+### write_vector
+
+Forwards [`std.system.os.darwin.shared.write_vector`](shared.md#write_vector).
+
+```mach
+pub fun write_vector(fd: i32, vectors: *IoVector, count: usize) i64
+```
+
+write several buffers to a file descriptor in order, in one call
+
+a call EINTR interrupts is tried again, for at most EINTR_MAX_RETRIES attempts
+in all
+
 ### read_at
 
 Forwards [`std.system.os.darwin.shared.read_at`](shared.md#read_at).
@@ -1984,7 +1997,8 @@ pub rec IoVector {
 }
 ```
 
-one buffer of a gather or scatter list, the layout of struct iovec
+one buffer of a gather write, laid out as struct iovec on linux and darwin
+and as wasi's ciovec
 
 ### sock_write_vector
 
@@ -2255,7 +2269,7 @@ Forwards [`std.system.os.darwin.shared.IoCompletion`](shared.md#iocompletion).
 
 ```mach
 pub rec IoCompletion {
-    context: usize;
+    context: u64;
     events:  u32;
     source:  u16;
     status:  i64;
@@ -2312,7 +2326,7 @@ pub val IO_EVENT_WAKE:   u32 = 0x10
 Forwards [`std.system.os.darwin.shared.io_queue_watch`](shared.md#io_queue_watch).
 
 ```mach
-pub fun io_queue_watch(queue: *std.system.os.shared.IoQueue, resource: usize, context: usize, events: u32) i64
+pub fun io_queue_watch(queue: *std.system.os.shared.IoQueue, resource: usize, context: u64, events: u32) i64
 ```
 
 register one-shot readiness interest in a descriptor
@@ -2325,7 +2339,7 @@ it is armed again. registering an existing filter updates it
 Forwards [`std.system.os.darwin.shared.io_queue_rearm`](shared.md#io_queue_rearm).
 
 ```mach
-pub fun io_queue_rearm(queue: *std.system.os.shared.IoQueue, resource: usize, context: usize, events: u32) i64
+pub fun io_queue_rearm(queue: *std.system.os.shared.IoQueue, resource: usize, context: u64, events: u32) i64
 ```
 
 arms again a registration the caller made with io_queue_watch. kqueue's

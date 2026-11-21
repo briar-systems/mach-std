@@ -22,7 +22,7 @@ Source: [`src/system/os/windows/aarch64.mach`](../../../../../src/system/os/wind
 | [`allocate`](#allocate) | memory |
 | [`deallocate`](#deallocate), [`reallocate`](#reallocate), [`heap_region_base`](#heap_region_base), [`heap_region_extend`](#heap_region_extend), [`protect`](#protect), [`lock`](#lock), [`unlock`](#unlock), [`advise`](#advise), [`page_size`](#page_size), [`map_alignment`](#map_alignment), [`map_file`](#map_file), [`sync_file`](#sync_file), [`unmap_file`](#unmap_file) | |
 | [`read`](#read) | filesystem |
-| [`write`](#write), [`read_at`](#read_at), [`write_at`](#write_at), [`open`](#open), [`open_native`](#open_native), [`native_path`](#native_path), [`native_path_release`](#native_path_release), [`native_spelling`](#native_spelling), [`confined_path`](#confined_path), [`open_root_utf8`](#open_root_utf8), [`open_root_native`](#open_root_native), [`open_relative_utf8`](#open_relative_utf8), [`open_relative_native`](#open_relative_native), [`make_dir_utf8`](#make_dir_utf8), [`remove_file_utf8`](#remove_file_utf8), [`remove_dir_utf8`](#remove_dir_utf8), [`close`](#close), [`sync_fd`](#sync_fd), [`stat`](#stat), [`set_mode`](#set_mode), [`set_mode_at`](#set_mode_at), [`set_mode_at_native`](#set_mode_at_native), [`file_identity`](#file_identity), [`identity_at`](#identity_at), [`identity_at_native`](#identity_at_native), [`retain_identity_at`](#retain_identity_at), [`retain_identity_at_native`](#retain_identity_at_native), [`publication_capabilities`](#publication_capabilities), [`stat_path`](#stat_path), [`stat_path_native`](#stat_path_native), [`stat_mode`](#stat_mode), [`stat_birth`](#stat_birth), [`unlink`](#unlink), [`unlink_native`](#unlink_native), [`unlink_force`](#unlink_force), [`unlink_force_native`](#unlink_force_native), [`rename`](#rename), [`rename_native`](#rename_native), [`rename_relative_utf8`](#rename_relative_utf8), [`rename_relative_native`](#rename_relative_native), [`symlink`](#symlink), [`symlink_native`](#symlink_native), [`make_dir`](#make_dir), [`make_dir_native`](#make_dir_native), [`directory_init`](#directory_init), [`directory_next`](#directory_next), [`directory_next_native`](#directory_next_native), [`directory_refused_native`](#directory_refused_native), [`directory_dnit`](#directory_dnit), [`access`](#access), [`access_native`](#access_native), [`seek`](#seek), [`lock_fd`](#lock_fd) | |
+| [`write`](#write), [`write_vector`](#write_vector), [`read_at`](#read_at), [`write_at`](#write_at), [`open`](#open), [`open_native`](#open_native), [`native_path`](#native_path), [`native_path_release`](#native_path_release), [`native_spelling`](#native_spelling), [`confined_path`](#confined_path), [`open_root_utf8`](#open_root_utf8), [`open_root_native`](#open_root_native), [`open_relative_utf8`](#open_relative_utf8), [`open_relative_native`](#open_relative_native), [`make_dir_utf8`](#make_dir_utf8), [`remove_file_utf8`](#remove_file_utf8), [`remove_dir_utf8`](#remove_dir_utf8), [`close`](#close), [`sync_fd`](#sync_fd), [`stat`](#stat), [`set_mode`](#set_mode), [`set_mode_at`](#set_mode_at), [`set_mode_at_native`](#set_mode_at_native), [`file_identity`](#file_identity), [`identity_at`](#identity_at), [`identity_at_native`](#identity_at_native), [`retain_identity_at`](#retain_identity_at), [`retain_identity_at_native`](#retain_identity_at_native), [`publication_capabilities`](#publication_capabilities), [`stat_path`](#stat_path), [`stat_path_native`](#stat_path_native), [`stat_mode`](#stat_mode), [`stat_birth`](#stat_birth), [`unlink`](#unlink), [`unlink_native`](#unlink_native), [`unlink_force`](#unlink_force), [`unlink_force_native`](#unlink_force_native), [`rename`](#rename), [`rename_native`](#rename_native), [`rename_relative_utf8`](#rename_relative_utf8), [`rename_relative_native`](#rename_relative_native), [`symlink`](#symlink), [`symlink_native`](#symlink_native), [`make_dir`](#make_dir), [`make_dir_native`](#make_dir_native), [`directory_init`](#directory_init), [`directory_next`](#directory_next), [`directory_next_native`](#directory_next_native), [`directory_refused_native`](#directory_refused_native), [`directory_dnit`](#directory_dnit), [`access`](#access), [`access_native`](#access_native), [`seek`](#seek), [`lock_fd`](#lock_fd) | |
 | [`terminate`](#terminate) | process |
 | [`abort`](#abort), [`terminate_child`](#terminate_child), [`terminate_group`](#terminate_group), [`probe_group`](#probe_group), [`process_watch`](#process_watch), [`process_unwatch`](#process_unwatch), [`spawn`](#spawn), [`spawn_grouped`](#spawn_grouped), [`spawn_in`](#spawn_in), [`spawn_redirected`](#spawn_redirected), [`spawn_redirected_grouped`](#spawn_redirected_grouped), [`spawn_redirected_in`](#spawn_redirected_in), [`spawn_redirected_in_grouped`](#spawn_redirected_in_grouped), [`spawn_native`](#spawn_native), [`spawn_in_native`](#spawn_in_native), [`spawn_redirected_native`](#spawn_redirected_native), [`spawn_redirected_in_native`](#spawn_redirected_in_native), [`spawn_redirected_in_grouped_native`](#spawn_redirected_in_grouped_native), [`spawn_command_line`](#spawn_command_line), [`getpid`](#getpid), [`pipe`](#pipe), [`ignore_sigpipe`](#ignore_sigpipe), [`sleep`](#sleep), [`cpu_count`](#cpu_count), [`cpu_features`](#cpu_features), [`cpu_dit`](#cpu_dit), [`thread_affinity`](#thread_affinity), [`set_thread_affinity`](#set_thread_affinity), [`getcwd`](#getcwd), [`getcwd_native`](#getcwd_native), [`getenv`](#getenv), [`getenv_native`](#getenv_native), [`temp_dir`](#temp_dir), [`temp_dir_native`](#temp_dir_native), [`environ_native`](#environ_native), [`wait`](#wait), [`wait_pid`](#wait_pid), [`ProcessStatus`](#processstatus), [`FileLimit`](#filelimit), [`LIMIT_UNLIMITED`](#limit_unlimited), [`open_file_limit`](#open_file_limit), [`set_open_file_limit`](#set_open_file_limit), [`ProcessWaitError`](#processwaiterror), [`WaitResult`](#waitresult), [`PROCESS_OP_WAIT`](#process_op_wait), [`PROCESS_OP_STATUS`](#process_op_status), [`PROCESS_OP_CLOSE`](#process_op_close), [`PROCESS_OP_SPAWN`](#process_op_spawn), [`PROCESS_OP_READ`](#process_op_read), [`PROCESS_OP_PIPE`](#process_op_pipe), [`PROCESS_OP_TERMINATE`](#process_op_terminate), [`PROCESS_EXITED`](#process_exited), [`PROCESS_SIGNALED`](#process_signaled), [`PROCESS_STOPPED`](#process_stopped), [`PROCESS_CONTINUED`](#process_continued) | |
 | [`AF_INET`](#af_inet) | sockets |
@@ -788,6 +788,18 @@ pub fun write(fd: i32, buf: *u8, count: usize) i64
 
 write up to count bytes at the file pointer
 
+### write_vector
+
+Forwards [`std.system.os.windows.shared.write_vector`](shared.md#write_vector).
+
+```mach
+pub fun write_vector(fd: i32, vectors: *std.system.os.shared.IoVector, count: usize) i64
+```
+
+write several buffers in order: windows has no gather write for consoles and
+pipes, so the pieces are joined in a stack buffer and each full buffer is one
+write, a long piece taking as many as it fills
+
 ### read_at
 
 Forwards [`std.system.os.windows.shared.read_at`](shared.md#read_at).
@@ -1410,7 +1422,7 @@ ends every process left in it, so a group whose child is gone has none left.
 Forwards [`std.system.os.windows.shared.process_watch`](shared.md#process_watch).
 
 ```mach
-pub fun process_watch(queue: *std.system.os.shared.IoQueue, pid: i64, context: usize) i64
+pub fun process_watch(queue: *std.system.os.shared.IoQueue, pid: i64, context: u64) i64
 ```
 
 make the end of the tracked child `pid` a completion on `queue`, so the
@@ -2516,7 +2528,7 @@ Forwards [`std.system.os.windows.shared.IoCompletion`](shared.md#iocompletion).
 
 ```mach
 pub rec IoCompletion {
-    context: usize;
+    context: u64;
     events:  u32;
     source:  u16;
     status:  i64;

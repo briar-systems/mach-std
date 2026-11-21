@@ -4,9 +4,11 @@
 
 formatted output to stdout/stderr
 
-convenience wrappers around std.format backed by filesystem stdout/stderr.
-checked printing stays checked: every function reports the writer's outcome,
-and the printf family adds the format string's failures on top.
+print, println, eprint and eprintln hand their text, and the newline, to the
+file in one gather write. the rest format through std.format into a staging
+buffer drained to the file. checked printing stays checked: every function
+reports the writer's outcome, and the printf family adds the format string's
+failures on top.
 
 Source: [`src/print.mach`](../../src/print.mach)
 
