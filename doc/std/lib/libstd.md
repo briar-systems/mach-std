@@ -13,7 +13,7 @@ Source: [`src/lib/libstd.mach`](../../../src/lib/libstd.mach)
 | :--- | :--- |
 | [`bool`](#bool), [`result`](#result), [`option`](#option), [`error`](#error), [`char`](#char), [`size`](#size), [`string`](#string), [`view`](#view), [`path`](#path), [`slice`](#slice), [`vector`](#vector), [`map`](#map), [`natural`](#natural), [`sort`](#sort), [`set`](#set), [`bitset`](#bitset), [`deque`](#deque), [`heap`](#heap), [`allocator`](#allocator), [`arena`](#arena), [`bump`](#bump), [`fixed`](#fixed) | |
 | [`allocator_heap`](#allocator_heap) | `heap` is taken by the binary heap in collections |
-| [`page`](#page), [`testing`](#testing), [`memory`](#memory), [`memory_table`](#memory_table), [`memory_buffers`](#memory_buffers), [`writer`](#writer), [`reader`](#reader), [`handle`](#handle), [`io_error`](#io_error), [`file`](#file), [`io_runtime`](#io_runtime), [`io_lifecycle`](#io_lifecycle), [`filesystem`](#filesystem), [`fs_transaction`](#fs_transaction), [`math`](#math), [`float`](#float), [`bits`](#bits), [`bignum`](#bignum), [`nat`](#nat), [`ieee`](#ieee), [`mat4`](#mat4), [`quat`](#quat), [`select`](#select), [`reduce`](#reduce), [`shuffle`](#shuffle), [`saturate`](#saturate), [`gather`](#gather), [`matmul`](#matmul), [`format`](#format), [`derive`](#derive), [`print`](#print), [`args`](#args), [`args_help`](#args_help), [`input`](#input), [`terminal`](#terminal), [`runtime`](#runtime), [`native`](#native), [`stack`](#stack), [`parse`](#parse), [`utf8`](#utf8), [`duration`](#duration), [`time`](#time), [`date`](#date), [`chrono_format`](#chrono_format), [`base64`](#base64), [`hex`](#hex), [`leb128`](#leb128), [`binary`](#binary), [`sha1`](#sha1), [`ct`](#ct), [`hasher`](#hasher), [`siphash`](#siphash), [`crypto_rand`](#crypto_rand), [`rand`](#rand), [`env`](#env), [`exec`](#exec), [`events`](#events), [`ip`](#ip), [`socket`](#socket), [`tcp`](#tcp), [`udp`](#udp), [`dns`](#dns), [`resolve`](#resolve), [`async`](#async), [`local`](#local), [`async_local`](#async_local), [`atomic`](#atomic), [`condition`](#condition), [`once`](#once), [`semaphore`](#semaphore), [`channel`](#channel), [`cancel`](#cancel), [`thread`](#thread), [`worker_pool`](#worker_pool), [`mutex`](#mutex), [`log`](#log) | |
+| [`page`](#page), [`testing`](#testing), [`memory`](#memory), [`memory_table`](#memory_table), [`memory_buffers`](#memory_buffers), [`writer`](#writer), [`reader`](#reader), [`handle`](#handle), [`io_error`](#io_error), [`file`](#file), [`io_runtime`](#io_runtime), [`io_lifecycle`](#io_lifecycle), [`filesystem`](#filesystem), [`fs_transaction`](#fs_transaction), [`math`](#math), [`float`](#float), [`bits`](#bits), [`bignum`](#bignum), [`nat`](#nat), [`ieee`](#ieee), [`select`](#select), [`reduce`](#reduce), [`shuffle`](#shuffle), [`saturate`](#saturate), [`gather`](#gather), [`matmul`](#matmul), [`format`](#format), [`derive`](#derive), [`print`](#print), [`args`](#args), [`args_help`](#args_help), [`input`](#input), [`terminal`](#terminal), [`runtime`](#runtime), [`native`](#native), [`stack`](#stack), [`parse`](#parse), [`utf8`](#utf8), [`duration`](#duration), [`time`](#time), [`date`](#date), [`chrono_format`](#chrono_format), [`hex`](#hex), [`leb128`](#leb128), [`binary`](#binary), [`sha1`](#sha1), [`ct`](#ct), [`hasher`](#hasher), [`siphash`](#siphash), [`crypto_rand`](#crypto_rand), [`rand`](#rand), [`env`](#env), [`exec`](#exec), [`events`](#events), [`ip`](#ip), [`socket`](#socket), [`tcp`](#tcp), [`udp`](#udp), [`dns`](#dns), [`resolve`](#resolve), [`async`](#async), [`local`](#local), [`async_local`](#async_local), [`atomic`](#atomic), [`condition`](#condition), [`once`](#once), [`semaphore`](#semaphore), [`channel`](#channel), [`cancel`](#cancel), [`thread`](#thread), [`worker_pool`](#worker_pool), [`mutex`](#mutex), [`log`](#log) | |
 
 ---
 
@@ -279,18 +279,6 @@ Forwards the first of these whose condition holds, and they differ.
 
 Otherwise: [`std.math.ieee`](../math/ieee.md).
 
-### mat4
-
-Forwards the first of these whose condition holds, and they differ.
-
-Otherwise: [`std.math.mat4`](../math/mat4.md).
-
-### quat
-
-Forwards the first of these whose condition holds, and they differ.
-
-Otherwise: [`std.math.quat`](../math/quat.md).
-
 ### select
 
 Forwards the first of these whose condition holds, and they differ.
@@ -422,12 +410,6 @@ Otherwise: [`std.chrono.date`](../chrono/date.md).
 Forwards the first of these whose condition holds, and they differ.
 
 Otherwise: [`std.chrono.format`](../chrono/format.md).
-
-### base64
-
-Forwards the first of these whose condition holds, and they differ.
-
-Otherwise: [`std.encoding.base64`](../encoding/base64.md).
 
 ### hex
 
