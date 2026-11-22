@@ -86,7 +86,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`file_flags`](#file_flags) | read a descriptor's file-status flags (access mode, O_APPEND, O_NONBLOCK) |
 | [`set_file_flags`](#set_file_flags) | set a descriptor's file-status flags |
 | [`fork`](#fork) | create a child process by duplicating the caller |
-| [`vfork`](#vfork) | create a child process through vfork(2) |
+| [`vfork`](#vfork) | create a child process |
 | [`exec`](#exec) | replace the calling process image; returns only on failure |
 | [`wait`](#wait) | failures and no-event results leave the caller's status unchanged |
 | [`wait_pid`](#wait_pid) | wait for a child to change state, as wait does without resource usage |
@@ -1045,9 +1045,11 @@ create a child process by duplicating the caller
 pub fun vfork() i64
 ```
 
-create a child process through vfork(2)
+create a child process
 
-the wrapper promises the fork contract only; see the libsystem module.
+darwin vfork(2) shares the parent's stack frame until exec/exit, so a normal
+mach wrapper returning from it overwrites the parent's return address. this
+wrapper forwards to fork(2), matching its documented fork-only contract.
 
 | Parameter | |
 | :--- | :--- |

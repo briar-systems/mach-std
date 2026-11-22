@@ -1026,9 +1026,11 @@ Forwards [`std.system.os.darwin.shared.vfork`](shared.md#vfork).
 pub fun vfork() i64
 ```
 
-create a child process through vfork(2)
+create a child process
 
-the wrapper promises the fork contract only; see the libsystem module.
+darwin vfork(2) shares the parent's stack frame until exec/exit, so a normal
+mach wrapper returning from it overwrites the parent's return address. this
+wrapper forwards to fork(2), matching its documented fork-only contract.
 
 ### exec
 
