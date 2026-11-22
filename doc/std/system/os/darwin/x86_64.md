@@ -655,6 +655,7 @@ pub val EINTR_MAX_RETRIES: usize = 8
 Forwards [`std.system.os.darwin.shared.terminate`](shared.md#terminate).
 
 ```mach
+#[noreturn]
 pub fun terminate(code: i64)
 ```
 
@@ -665,6 +666,7 @@ process
 Forwards [`std.system.os.darwin.shared.abort`](shared.md#abort).
 
 ```mach
+#[noreturn]
 pub fun abort()
 ```
 

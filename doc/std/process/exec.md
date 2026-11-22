@@ -971,6 +971,7 @@ check if a stopped process was continued
 ### exit
 
 ```mach
+#[noreturn]
 pub fun exit(code: i64)
 ```
 

@@ -1359,6 +1359,7 @@ to exclude writers from a directory must lock a regular file inside it.
 Forwards [`std.system.os.windows.shared.terminate`](shared.md#terminate).
 
 ```mach
+#[noreturn]
 pub fun terminate(code: i64)
 ```
 
@@ -1369,6 +1370,7 @@ process
 Forwards [`std.system.os.windows.shared.abort`](shared.md#abort).
 
 ```mach
+#[noreturn]
 pub fun abort()
 ```
 

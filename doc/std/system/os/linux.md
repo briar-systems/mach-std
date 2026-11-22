@@ -2106,6 +2106,7 @@ Forwards the first of these whose condition holds:
 - [`std.system.os.linux.riscv32.terminate`](linux/riscv32.md#terminate), where `$mach.build.arch == $mach.arch.riscv32`
 
 ```mach
+#[noreturn]
 pub fun terminate(code: i64)
 ```
 
@@ -2121,6 +2122,7 @@ Forwards the first of these whose condition holds:
 - [`std.system.os.linux.riscv32.abort`](linux/riscv32.md#abort), where `$mach.build.arch == $mach.arch.riscv32`
 
 ```mach
+#[noreturn]
 pub fun abort()
 ```
 

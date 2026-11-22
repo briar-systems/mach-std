@@ -1845,6 +1845,7 @@ Forwards the first of these whose condition holds:
 - [`std.system.os.windows.aarch64.terminate`](windows/aarch64.md#terminate), where `$mach.build.arch == $mach.arch.aarch64`
 
 ```mach
+#[noreturn]
 pub fun terminate(code: i64)
 ```
 
@@ -1858,6 +1859,7 @@ Forwards the first of these whose condition holds:
 - [`std.system.os.windows.aarch64.abort`](windows/aarch64.md#abort), where `$mach.build.arch == $mach.arch.aarch64`
 
 ```mach
+#[noreturn]
 pub fun abort()
 ```
 

@@ -1945,6 +1945,7 @@ change the working directory
 
 ```mach
 #[library("libsystem")]
+#[noreturn]
 pub ext fun _exit(code: i32)
 ```
 

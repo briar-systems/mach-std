@@ -1252,6 +1252,7 @@ move a descriptor's file pointer, or rewind a directory's listing
 ### terminate
 
 ```mach
+#[noreturn]
 pub fun terminate(code: i64)
 ```
 
@@ -1260,6 +1261,7 @@ end the process with the low 32 bits of code as its exit code, never returning
 ### abort
 
 ```mach
+#[noreturn]
 pub fun abort()
 ```
 

@@ -1471,6 +1471,7 @@ runtime installs std's block there only when this is false
 ### terminate
 
 ```mach
+#[noreturn]
 pub fun terminate(code: i64)
 ```
 
@@ -1486,6 +1487,7 @@ exit would only end the calling thread, leaving the process alive.
 ### abort
 
 ```mach
+#[noreturn]
 pub fun abort()
 ```
 

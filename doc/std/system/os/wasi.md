@@ -1177,6 +1177,7 @@ how many arguments capture_process read
 Forwards [`std.system.os.wasi.preview1.terminate`](wasi/preview1.md#terminate), only where `$mach.build.sys == $mach.sys.wasi`.
 
 ```mach
+#[noreturn]
 pub fun terminate(code: i64)
 ```
 
@@ -1187,6 +1188,7 @@ exit the process with the given code
 Forwards [`std.system.os.wasi.preview1.abort`](wasi/preview1.md#abort), only where `$mach.build.sys == $mach.sys.wasi`.
 
 ```mach
+#[noreturn]
 pub fun abort()
 ```
 

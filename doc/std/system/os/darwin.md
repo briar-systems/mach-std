@@ -1646,6 +1646,7 @@ Forwards the first of these whose condition holds:
 - [`std.system.os.darwin.x86_64.terminate`](darwin/x86_64.md#terminate), where `$mach.build.arch == $mach.arch.x86_64`
 
 ```mach
+#[noreturn]
 pub fun terminate(code: i64)
 ```
 
@@ -1659,6 +1660,7 @@ Forwards the first of these whose condition holds:
 - [`std.system.os.darwin.x86_64.abort`](darwin/x86_64.md#abort), where `$mach.build.arch == $mach.arch.x86_64`
 
 ```mach
+#[noreturn]
 pub fun abort()
 ```
 

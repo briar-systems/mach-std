@@ -687,6 +687,7 @@ the directory designated for temporary files: $TMPDIR, else "/tmp"
 ### terminate
 
 ```mach
+#[noreturn]
 pub fun terminate(code: i64)
 ```
 
@@ -699,6 +700,7 @@ exit the process with the given code
 ### abort
 
 ```mach
+#[noreturn]
 pub fun abort()
 ```
 

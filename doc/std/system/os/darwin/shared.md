@@ -411,14 +411,14 @@ place. a wake reports IO_EVENT_WAKE with source 0
 ### terminate
 
 ```mach
+#[noreturn]
 pub fun terminate(code: i64)
 ```
 
 exit the process with the given code
 
 `_exit(2)`, not `exit(3)`: std registers no atexit handlers and the raw
-trap this replaces ran none. the trap after it is unreachable and kept only
-as a guard; it is not the terminator.
+trap this replaces ran none. `_exit` is declared `noreturn`, so nothing follows it.
 
 | Parameter | |
 | :--- | :--- |
@@ -427,6 +427,7 @@ as a guard; it is not the terminator.
 ### abort
 
 ```mach
+#[noreturn]
 pub fun abort()
 ```
 

@@ -1500,6 +1500,7 @@ file inside it rather than the directory itself.
 Forwards [`std.system.os.linux.shared.terminate`](shared.md#terminate).
 
 ```mach
+#[noreturn]
 pub fun terminate(code: i64)
 ```
 
@@ -1510,6 +1511,7 @@ process
 Forwards [`std.system.os.linux.shared.abort`](shared.md#abort).
 
 ```mach
+#[noreturn]
 pub fun abort()
 ```
 

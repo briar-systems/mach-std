@@ -747,6 +747,7 @@ take or release an advisory whole-file lock
 ### exit
 
 ```mach
+#[noreturn]
 pub fun exit(status: u32)
 ```
 
@@ -2036,6 +2037,7 @@ Forwards the first of these whose condition holds:
 - [`std.system.os.wasi.abort`](os/wasi.md#abort), where `$mach.build.sys == $mach.sys.wasi`
 
 ```mach
+#[noreturn]
 pub fun abort()
 ```
 
@@ -2066,36 +2068,42 @@ Declared by the first of these arms whose condition holds.
 Where `$mach.build.sys == $mach.sys.linux`:
 
 ```mach
+#[noreturn]
 pub fun panic_sink(msg: *u8, len: usize)
 ```
 
 Where `$mach.build.sys == $mach.sys.darwin`:
 
 ```mach
+#[noreturn]
 pub fun panic_sink(msg: *u8, len: usize)
 ```
 
 Where `$mach.build.sys == $mach.sys.wasi`:
 
 ```mach
+#[noreturn]
 pub fun panic_sink(msg: *u8, len: usize)
 ```
 
 Where `$mach.build.sys == $mach.sys.windows`:
 
 ```mach
+#[noreturn]
 pub fun panic_sink(msg: *u8, len: usize)
 ```
 
 Where `$mach.build.sys == $mach.sys.uefi`:
 
 ```mach
+#[noreturn]
 pub fun panic_sink(msg: *u8, len: usize)
 ```
 
 Where `$mach.build.sys == $mach.sys.freestanding`:
 
 ```mach
+#[noreturn]
 pub fun panic_sink(msg: *u8, len: usize)
 ```
 

@@ -62,36 +62,42 @@ Declared by the first of these arms whose condition holds.
 Where `$mach.build.sys == $mach.sys.linux`:
 
 ```mach
+#[noreturn]
 pub fun panic_sink(msg: *u8, len: usize)
 ```
 
 Where `$mach.build.sys == $mach.sys.darwin`:
 
 ```mach
+#[noreturn]
 pub fun panic_sink(msg: *u8, len: usize)
 ```
 
 Where `$mach.build.sys == $mach.sys.wasi`:
 
 ```mach
+#[noreturn]
 pub fun panic_sink(msg: *u8, len: usize)
 ```
 
 Where `$mach.build.sys == $mach.sys.windows`:
 
 ```mach
+#[noreturn]
 pub fun panic_sink(msg: *u8, len: usize)
 ```
 
 Where `$mach.build.sys == $mach.sys.uefi`:
 
 ```mach
+#[noreturn]
 pub fun panic_sink(msg: *u8, len: usize)
 ```
 
 Where `$mach.build.sys == $mach.sys.freestanding`:
 
 ```mach
+#[noreturn]
 pub fun panic_sink(msg: *u8, len: usize)
 ```
 
@@ -128,6 +134,7 @@ returns either way. installing nil restores the default, which only parks.
 ### panic
 
 ```mach
+#[noreturn]
 pub fun panic(msg: *u8)
 ```
 
