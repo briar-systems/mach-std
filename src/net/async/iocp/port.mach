@@ -6,7 +6,7 @@
 # acts on it. a backend's operation record starts with a Header, so one
 # address names both, and the backend hands in Hooks for what only it knows
 
-$if ($mach.build.os != $mach.os.windows) {
+$if ($mach.build.sys != $mach.sys.windows) {
     $error("std.net.async.iocp.port: requires windows target");
 }
 
@@ -27,6 +27,13 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 
+# the native OVERLAPPED a request posts with, laid out as the kernel reads it
+# ---
+# internal:      the request's status, written by the kernel
+# internal_high: bytes transferred, written by the kernel
+# offset:        low half of a file offset, zero for sockets
+# offset_high:   high half of a file offset, zero for sockets
+# event:         an event handle to signal, zero here
 pub rec NativeOverlapped {
     internal:      usize;
     internal_high: usize;
@@ -35,6 +42,10 @@ pub rec NativeOverlapped {
     event:         usize;
 }
 
+# the native WSABUF a send or receive borrows
+# ---
+# length: bytes in data
+# data:   the bytes
 pub rec NativeBuffer {
     length: u32;
     data:   *u8;
@@ -56,7 +67,7 @@ pub rec Header {
     next_free:    usize;
     resource:     usize;
     auxiliary:    usize;
-    context:      usize;
+    context:      u64;
     buffer:       NativeBuffer;
     address:      [288]u8;
     transferred:  u32;
@@ -105,6 +116,11 @@ val NATIVE_BATCH: usize = 256;
 
 pub val INVALID_SOCKET: usize = (-1)::usize;
 
+# the operation record at a table index, which must be inside the table
+# ---
+# backend: the backend
+# index:   the operation index
+# ret:     the record's Header
 pub fun header_at(backend: *Backend, index: usize) *Header {
     ret table.at(?backend.operations, index)::*Header;
 }
@@ -113,17 +129,28 @@ fun completion_at(backend: *Backend, index: usize) *types.NativeCompletion {
     ret table.at(?backend.completions, index)::*types.NativeCompletion;
 }
 
+# the core's socket record at an index
+# ---
+# backend: the backend
+# sock:    the record index
+# ret:     the record
 pub fun socket_record(backend: *Backend, sock: u32) *iocp.Socket {
     ret iocp.socket_at(?backend.core, sock);
 }
 
+# whether a caller range overlaps memory the backend owns
+# ---
+# backend: the backend
+# data:    start of the range
+# len:     bytes in the range
+# ret:     true on overlap, and also when the range or the backend is not valid
 pub fun aliases(backend: *Backend, data: *u8, len: usize) bool {
-    if (!memory.range_valid(data, len)) { ret true; }
-    if (len == 0)                       { ret false; }
-    if (!memory.range_valid(backend::*u8, $size_of(Backend)) ||
-        backend.queue == nil || backend.operations.capacity == 0) {
-        ret true;
-    }
+    if (!memory.range_valid(data, len))                       { ret true; }
+    if (len == 0)                                             { ret false; }
+    if (!memory.range_valid(backend::*u8, $size_of(Backend))) { ret true; }
+    mutex.lock(?backend.lock);
+    fin { mutex.unlock(?backend.lock); }
+    if (backend.queue == nil || backend.operations.capacity == 0) { ret true; }
     var native_bytes: usize = 0;
     if (!memory.range_scaled(NATIVE_BATCH, $size_of(windows.IoCompletion),
         ?native_bytes)) { ret true; }
@@ -136,10 +163,16 @@ pub fun aliases(backend: *Backend, data: *u8, len: usize) bool {
         memory.ranges_overlap(backend.native::*u8, native_bytes, data, len);
 }
 
+# the status for an invalid argument
+# ---
+# ret: the native EINVAL
 pub fun invalid() i64 {
     ret windows.EINVAL;
 }
 
+# clear a native request before it is posted
+# ---
+# overlapped: the request
 pub fun zero_overlapped(overlapped: *NativeOverlapped) {
     overlapped.internal      = 0;
     overlapped.internal_high = 0;
@@ -148,19 +181,25 @@ pub fun zero_overlapped(overlapped: *NativeOverlapped) {
     overlapped.event         = 0;
 }
 
+# the operation a token names, in any state but free
+# ---
+# backend: the backend
+# token:   the operation token
+# ret:     nil when the token is stale or the operation was released
 pub fun operation_for(backend: *Backend, token: types.Token) *Header {
-    if (token.index::usize >= backend.operations.capacity) { ret nil; }
+    if (table.pool_untouched(?backend.operation_pool, ?backend.operations, token.index::usize)) { ret nil; }
     val operation: *Header = header_at(backend, token.index::usize);
     if (operation.link.state == iocp.FREE || operation.generation != token.generation) { ret nil; }
     ret operation;
 }
 
 # the packet context is the overlapped's own address, which the table never moves
-fun operation_from_context(backend: *Backend, context: usize) *Header {
-    val offset: usize = $offset_of(Header, overlapped);
-    if (context < offset) { ret nil; }
-    val index: usize = table.index_of(?backend.operations, context - offset);
-    if (index == table.NO_INDEX) { ret nil; }
+fun operation_from_context(backend: *Backend, context: u64) *Header {
+    val offset:  usize = $offset_of(Header, overlapped);
+    val address: usize = context::usize;
+    if (address < offset) { ret nil; }
+    val index: usize = table.index_of(?backend.operations, address - offset);
+    if (index == table.NO_INDEX || table.pool_untouched(?backend.operation_pool, ?backend.operations, index)) { ret nil; }
     val operation: *Header = header_at(backend, index);
     if (operation.link.state == iocp.FREE) { ret nil; }
     ret operation;
@@ -172,22 +211,6 @@ fun clear_borrowed(backend: *Backend, operation: *Header) {
     backend.hooks.clear(operation);
 }
 
-# the operation table's newest chunk joins the pool, every operation free
-fun adopt_operations(backend: *Backend) {
-    var index: usize = table.chunk_start(?backend.operations, backend.operations.chunk_count - 1);
-    for (index < backend.operations.capacity) {
-        val entry: *Header = header_at(backend, index);
-        entry.link.state = iocp.FREE;
-        entry.generation = backend.operation_pool.floor;
-        entry.index      = index::u32;
-        entry.resource   = INVALID_SOCKET;
-        entry.auxiliary  = INVALID_SOCKET;
-        clear_borrowed(backend, entry);
-        index = index + 1;
-    }
-    table.pool_adopt(?backend.operation_pool, ?backend.operations);
-}
-
 # the completion table is held at least at the operation table's size,
 # reserved before the operations grow, so publishing a completion always has
 # somewhere to land. an operation index is 32 bits wide and never NONE
@@ -197,7 +220,7 @@ fun grow_operations(backend: *Backend) bool {
     val grown: usize = backend.operations.capacity + table.chunk_capacity(?backend.operations, chunk);
     if (grown > iocp.NONE::usize || !table.reserve(?backend.completions, grown) ||
         !table.grow(?backend.operations)) { ret false; }
-    adopt_operations(backend);
+    table.pool_adopt(?backend.operation_pool, ?backend.operations);
     ret true;
 }
 
@@ -214,8 +237,8 @@ pub fun trim_locked(backend: *Backend) {
     for (backend.completions.chunk_count > 1) {
         val top: usize = backend.completions.chunk_count - 1;
         if (backend.completions.capacity - table.chunk_capacity(?backend.completions, top) < keep) { brk; }
-        val released: err[allocator.Error] = table.shrink(?backend.completions);
-        if (sel released.err) { brk; }
+        val err_released: err[allocator.Error] = table.shrink(?backend.completions);
+        if (sel err_released.err) { brk; }
     }
     iocp.trim(?backend.core);
 }
@@ -228,11 +251,16 @@ pub fun unlock(backend: *Backend) {
 }
 
 # a free operation joins the socket record sock in state
-pub fun claim_locked(backend: *Backend, sock: u32, kind: runtime.Kind, resource: usize, context: usize, state: u8, token: *types.Token) *Header {
+pub fun claim_locked(backend: *Backend, sock: u32, kind: runtime.Kind, resource: usize, context: u64, state: u8, token: *types.Token) *Header {
     if (table.pool_peek(?backend.operation_pool, ?backend.operations) == table.NO_INDEX && !grow_operations(backend)) { ret nil; }
-    val index:      usize   = table.pool_take(?backend.operation_pool, ?backend.operations);
-    val operation:  *Header = header_at(backend, index);
-    var generation: u32     = operation.generation + 1;
+    var fresh:     bool    = false;
+    val index:     usize   = table.pool_take_fresh(?backend.operation_pool, ?backend.operations, ?fresh);
+    val operation: *Header = header_at(backend, index);
+    if (fresh) {
+        operation.generation = backend.operation_pool.floor;
+        operation.index      = index::u32;
+    }
+    var generation: u32 = operation.generation + 1;
     if (generation == 0) { generation = 1; }
     zero_overlapped(?operation.overlapped);
     operation.generation   = generation;
@@ -284,9 +312,20 @@ pub fun release_locked(backend: *Backend, operation: *Header) {
     if (sock != iocp.NONE) { settle_socket_locked(backend, sock); }
 }
 
+# append a completion to those the current publish makes readable
+# ---
+# backend:       the backend, locked
+# context:       the caller's context from the submission
+# kind:          the operation kind
+# bytes:         bytes moved
+# items:         packets moved by a batch operation
+# resource:      the native socket, or the accepted socket for an accept
+# status:        0, a negative native error or a STATUS_ value
+# end_of_stream: a read or readable wait saw the orderly end of the stream
+# ret:           false when the completion table is full and nothing was added
 pub fun push_completion_locked(
     backend: *Backend,
-    context: usize,
+    context: u64,
     kind: runtime.Kind,
     bytes: usize,
     items: usize,
@@ -312,7 +351,6 @@ pub fun push_completion_locked(
 # same list, so one pass settles every control the completions have room for
 fun emit_control_locked(backend: *Backend) {
     for (backend.core.ready_head != iocp.NONE && backend.ready < backend.completions.capacity) {
-        backend.core.steps = backend.core.steps + 1;
         val operation: *Header = header_at(backend, backend.core.ready_head::usize);
         push_completion_locked(backend, operation.context, operation.link.kind, 0, 0, operation.resource, operation.link.result, false);
         release_locked(backend, operation);
@@ -326,28 +364,28 @@ fun emit_control_locked(backend: *Backend) {
 #                 come from; the backend keeps a copy, so a's context must
 #                 outlive it
 # operation_size: bytes per operation record, which starts with a Header
-pub fun make(backend: *Backend, queue: *shared.IoQueue, a: *allocator.Allocator, initial: usize, source_id: u16, operation_size: usize, hooks: Hooks) i64 {
+pub fun init(backend: *Backend, queue: *shared.IoQueue, a: *allocator.Allocator, initial: usize, source_id: u16, operation_size: usize, hooks: Hooks) i64 {
     if (backend == nil || queue == nil || queue.handle == 0 || a == nil || initial == 0 || source_id == 0 || operation_size < $size_of(Header)) { ret invalid(); }
 
     backend.allocator = @a;
-    if (!table.make(?backend.operations, ?backend.allocator, operation_size, initial)) { ret windows.ENOMEM; }
-    if (!table.make(?backend.completions, ?backend.allocator, $size_of(types.NativeCompletion), initial)) {
-        table.destroy(?backend.operations);
+    if (!table.init(?backend.operations, ?backend.allocator, operation_size, initial)) { ret windows.ENOMEM; }
+    if (!table.init(?backend.completions, ?backend.allocator, $size_of(types.NativeCompletion), initial)) {
+        table.dnit(?backend.operations);
         ret windows.ENOMEM;
     }
-    if (!iocp.make(?backend.core, ?backend.allocator, $offset_of(Header, link), initial)) {
-        table.destroy(?backend.completions);
-        table.destroy(?backend.operations);
+    if (!iocp.init(?backend.core, ?backend.allocator, $offset_of(Header, link), initial)) {
+        table.dnit(?backend.completions);
+        table.dnit(?backend.operations);
         ret windows.ENOMEM;
     }
-    val batch: res[*windows.IoCompletion, allocator.Error] = allocator.allocate[windows.IoCompletion](?backend.allocator, NATIVE_BATCH);
-    if (sel batch.err) {
-        iocp.destroy(?backend.core);
-        table.destroy(?backend.completions);
-        table.destroy(?backend.operations);
+    val res_batch: res[*windows.IoCompletion, allocator.Error] = allocator.allocate[windows.IoCompletion](?backend.allocator, NATIVE_BATCH);
+    if (sel res_batch.err) {
+        iocp.dnit(?backend.core);
+        table.dnit(?backend.completions);
+        table.dnit(?backend.operations);
         ret windows.ENOMEM;
     }
-    backend.native    = batch.ok;
+    backend.native    = res_batch.ok;
     backend.queue     = queue;
     backend.source_id = source_id;
     backend.hooks     = hooks;
@@ -356,7 +394,7 @@ pub fun make(backend: *Backend, queue: *shared.IoQueue, a: *allocator.Allocator,
     backend.awaiting  = 0;
     backend.lock      = mutex.make();
     table.pool_make(?backend.operation_pool, $offset_of(Header, next_free));
-    adopt_operations(backend);
+    table.pool_adopt(?backend.operation_pool, ?backend.operations);
     ret 0;
 }
 
@@ -402,7 +440,7 @@ pub fun admit(backend: *Backend, resource: usize, opening: u64, sock: *u32) i64 
 }
 
 # a read, readiness wait or write over one borrowed buffer
-pub fun submit_buffer(backend: *Backend, resource: usize, opening: u64, buffer: *u8, length: usize, context: usize, kind: runtime.Kind, token: *types.Token) i64 {
+pub fun submit_buffer(backend: *Backend, resource: usize, opening: u64, buffer: *u8, length: usize, context: u64, kind: runtime.Kind, token: *types.Token) i64 {
     if (backend == nil || token == nil || resource == INVALID_SOCKET || (buffer == nil && length != 0) || length > 0xffffffff) { ret invalid(); }
     var sock:     u32 = iocp.NONE;
     val admitted: i64 = admit(backend, resource, opening, ?sock);
@@ -427,7 +465,8 @@ pub fun submit_buffer(backend: *Backend, resource: usize, opening: u64, buffer: 
     ret result;
 }
 
-fun submit_control(backend: *Backend, resource: usize, opening: u64, context: usize, kind: runtime.Kind, token: *types.Token) i64 {
+# join a shutdown or close to its socket as the socket's one control, and act on what it makes due
+fun submit_control(backend: *Backend, resource: usize, opening: u64, context: u64, kind: runtime.Kind, token: *types.Token) i64 {
     if (backend == nil || token == nil || resource == INVALID_SOCKET) { ret invalid(); }
     mutex.lock(?backend.lock);
     var sock:     u32 = iocp.NONE;
@@ -464,13 +503,13 @@ fun submit_control(backend: *Backend, resource: usize, opening: u64, context: us
 }
 
 # a shutdown waits for the socket's writes, and runs once none is left
-pub fun submit_shutdown_write(backend: *Backend, resource: usize, opening: u64, context: usize, token: *types.Token) i64 {
+pub fun submit_shutdown_write(backend: *Backend, resource: usize, opening: u64, context: u64, token: *types.Token) i64 {
     ret submit_control(backend, resource, opening, context, runtime.SHUTDOWN, token);
 }
 
 # a close aborts the socket's requests and completes once they have all left.
 # the record is unmapped at once, so a reused socket value attaches fresh
-pub fun submit_close(backend: *Backend, resource: usize, opening: u64, context: usize, token: *types.Token) i64 {
+pub fun submit_close(backend: *Backend, resource: usize, opening: u64, context: u64, token: *types.Token) i64 {
     ret submit_control(backend, resource, opening, context, runtime.CLOSE, token);
 }
 
@@ -527,6 +566,10 @@ pub fun detach(backend: *Backend, resource: usize, opening: u64, retire: bool) i
     }
     if (retire) {
         val acquired: u8 = iocp.acquire(?backend.core, ?backend.operations, resource, opening, ?sock);
+        if (acquired == iocp.STALE) {
+            unlock(backend);
+            ret types.STATUS_STALE;
+        }
         if (acquired == iocp.EXHAUSTED) {
             unlock(backend);
             ret windows.ENOMEM;
@@ -663,6 +706,7 @@ pub fun finish_locked(backend: *Backend, operation: *Header, status: i64, bytes:
     settle_locked(backend, operation, completed_bytes, 0, completed_resource, result, end_of_stream);
 }
 
+# settle the operation a harvested packet belongs to. a wake or a packet for no live operation is ignored
 fun consume_native_locked(backend: *Backend, native: windows.IoCompletion) {
     if ((native.events & windows.IO_EVENT_WAKE) != 0) { ret; }
     val operation: *Header = operation_from_context(backend, native.context);
@@ -690,6 +734,10 @@ fun consume_native_locked(backend: *Backend, native: windows.IoCompletion) {
     }
 }
 
+# publish the settled controls without waiting
+# ---
+# backend: the backend
+# ret:     the number of completions now readable through completion, or EINVAL
 pub fun flush(backend: *Backend) i64 {
     if (backend == nil) { ret invalid(); }
     mutex.lock(?backend.lock);
@@ -700,9 +748,18 @@ pub fun flush(backend: *Backend) i64 {
     ret ready::i64;
 }
 
+# handle one packet the runtime's shared queue delivered
+# ---
+# backend: the backend
+# context: the packet's context, an operation's overlapped address
+# events:  the native event bits
+# status:  the packet's status
+# flags:   the packet's transferred byte count
+# claimed: set true when the packet belongs to a live operation of this backend
+# ret:     the number of completions now readable through completion, or EINVAL
 pub fun dispatch(
     backend: *Backend,
-    context: usize,
+    context: u64,
     events: u32,
     status: i64,
     flags: u64,
@@ -755,6 +812,12 @@ pub fun poll(backend: *Backend, timeout_ms: i32) i64 {
     ret ready::i64;
 }
 
+# copy out one completion the last publish made readable
+# ---
+# backend: the backend
+# index:   below the count the last flush, dispatch or poll returned
+# out:     receives the completion
+# ret:     0, or EINVAL for a bad argument or an index past the count
 pub fun completion(backend: *Backend, index: usize, out: *types.NativeCompletion) i64 {
     if (backend == nil || out == nil || index >= backend.ready) { ret invalid(); }
     @out = @completion_at(backend, index);
@@ -762,7 +825,7 @@ pub fun completion(backend: *Backend, index: usize, out: *types.NativeCompletion
 }
 
 # a cancelled operation keeps the backend busy until its packet is consumed
-pub fun destroy(backend: *Backend) i64 {
+pub fun dnit(backend: *Backend) i64 {
     if (backend == nil) { ret invalid(); }
     mutex.lock(?backend.lock);
     if (backend.active != 0) {
@@ -770,9 +833,9 @@ pub fun destroy(backend: *Backend) i64 {
         ret windows.EBUSY;
     }
     allocator.deallocate[windows.IoCompletion](?backend.allocator, backend.native, NATIVE_BATCH);
-    iocp.destroy(?backend.core);
-    table.destroy(?backend.completions);
-    table.destroy(?backend.operations);
+    iocp.dnit(?backend.core);
+    table.dnit(?backend.completions);
+    table.dnit(?backend.operations);
     backend.native    = nil;
     backend.active    = 0;
     backend.ready     = 0;

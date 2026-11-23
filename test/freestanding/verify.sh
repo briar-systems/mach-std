@@ -29,28 +29,27 @@ cat > "$work/mach.toml" <<'TOML'
 [project]
 id = "freestanding_probe"
 version = "0.0.0"
-mach = "^6"
+mach = "^7"
 src = "src"
-out = "out/{target.name}/{profile.name}"
+work = "out/{target.name}/{profile.name}"
 
 [target.freestanding-x86_64]
-isa = "x86_64"
-os = "freestanding"
+arch = "x86_64"
+isa = "x86-64"
+sys = "freestanding"
 abi = "sysv64"
 of = "elf"
 
 [profile.debug]
 default = true
-opt = 0
+optimize = false
 debug = false
 simd = "scalarize"
-vectorize = false
-float_reassoc = false
 
 [artifact.probe]
 kind = "static"
 entry = "probe.mach"
-out = "lib/probe"
+out = "{project.work}/lib/probe"
 targets = ["*"]
 link = []
 need = []
@@ -66,7 +65,7 @@ probe() {
     # hard links keep dep/std a physical directory without copying std per module
     cp -al "$work/std" "$dir/dep/std"
     printf 'use m: %s;\n\npub fun probe() i64 {\n    ret 0;\n}\n' "$module" > "$dir/src/probe.mach"
-    if (cd "$dir" && "$mach" build . --emit obj) > "$work/logs/$module.log" 2>&1; then
+    if (cd "$dir" && "$mach" build . -t freestanding-x86_64 --emit obj) > "$work/logs/$module.log" 2>&1; then
         echo "$module" > "$work/logs/$module.pass"
     fi
     rm -rf "$dir"
@@ -102,10 +101,10 @@ done < "$work/actual.txt"
 while read -r module; do
     grep -qxF "$module" "$work/actual.txt" && continue
     log="$work/logs/$module.log"
-    count="$(grep -cE '^error:' "$log" || true)"
-    if [ "$count" != 1 ] || ! grep -qE '^error: .* needs ' "$log"; then
+    count="$(grep -cE '^error(\[[a-z._]+\])? ' "$log" || true)"
+    if [ "$count" != 1 ] || ! grep -qE '^error(\[[a-z._]+\])? .* needs ' "$log"; then
         echo "FAIL: $module refuses freestanding with $count diagnostics, not one naming what it needs:" >&2
-        grep -m 5 -E '^error:' "$log" | sed 's/^/    /' >&2 || true
+        grep -m 5 -E '^error(\[[a-z._]+\])? ' "$log" | sed 's/^/    /' >&2 || true
         status=1
     fi
 done < "$work/modules.txt"

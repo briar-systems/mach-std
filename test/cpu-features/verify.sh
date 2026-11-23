@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # std.system.cpu's aes, carry-less multiply and sha fields against the host.
-# sha256 picks its backend from the sha field (a unit test pins that), so this
-# is also the check that the backend choice matches the processor.
+# mach-crypto's sha256 picks its backend from the sha field (a unit test there pins
+# that), so this is also the check that the backend choice matches the processor.
 #
 # the probe program prints what std.system.cpu.features() reports and what
 # os.cpu_features reads. both must match the OS's own view of the processor:
@@ -11,10 +11,10 @@
 # on a linux host with qemu-user on the path, the x86_64 probe also runs under
 # `qemu-x86_64 -cpu max` (both present) and `-cpu qemu64` (both absent, read
 # false with no error), and the arm64 probe under `qemu-aarch64 -cpu max`. no
-# qemu aarch64 model lacks AES, so the arm64 false case is not exercised. on a
-# compiler that knows the extensions (mach 5.12.2 and later), a build that
-# selects aes and pclmul reports both under qemu64 while the probe reads them
-# absent, which is the build-time half of features().
+# qemu aarch64 model lacks AES, so the arm64 false case is not exercised. a
+# build for linux-x86_64-aes, which selects aes and pclmul, reports both under
+# qemu64 while the probe reads them absent, which is the build-time half of
+# features().
 #
 # usage: verify.sh <mach> <target>
 set -euo pipefail
@@ -22,15 +22,12 @@ set -euo pipefail
 mach="${1:-mach}"
 target="${2:-linux-x86_64}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$here/../lib/compiler.sh"
 cd "$here"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
 rm -rf dep out
-mkdir -p dep/std
-cp ../../mach.toml dep/std/mach.toml
-cp -r ../../src dep/std/src
+"$mach" dep pull . --quiet
 
 case "$target" in
     *x86_64) names=(aes pclmul sha) ;;
@@ -38,7 +35,7 @@ case "$target" in
 esac
 
 build() {
-    mach_run build . --target "$1" >/dev/null
+    "$mach" build . --target "$1" >/dev/null
     local bin
     bin="$(find "out/$1" -name 'cpu' -type f -print -quit)"
     [ -z "$bin" ] && bin="$(find "out/$1" -name 'cpu.exe' -type f -print -quit)"
@@ -74,7 +71,7 @@ os_view() {
             grep -qw aes /proc/cpuinfo && flags+=(1) || flags+=(0)
             grep -qw pclmulqdq /proc/cpuinfo && flags+=(1) || flags+=(0)
             grep -qw sha_ni /proc/cpuinfo && flags+=(1) || flags+=(0) ;;
-        linux-arm64)
+        linux-aarch64)
             grep -qw aes /proc/cpuinfo && flags+=(1) || flags+=(0)
             grep -qw pmull /proc/cpuinfo && flags+=(1) || flags+=(0)
             grep -qw sha2 /proc/cpuinfo && flags+=(1) || flags+=(0) ;;
@@ -115,34 +112,13 @@ if [ "$target" = linux-x86_64 ] && command -v qemu-x86_64 >/dev/null; then
         || fail "qemu-x86_64 -cpu qemu64 does not read aes and pclmul absent"
     echo "OK: qemu-x86_64 -cpu qemu64 reads aes=0 pclmul=0 without error"
 
-    version="$("$mach" info | sed -n '1s/^mach \([0-9]*\)\.\([0-9]*\)\.\([0-9]*\).*/\1 \2 \3/p')"
-    read -r major minor patch <<<"$version"
-    [ -n "$major" ] || fail "cannot read the compiler version"
-    if [ "$major" -gt 5 ] || { [ "$major" -eq 5 ] && { [ "$minor" -gt 12 ] || { [ "$minor" -eq 12 ] && [ "$patch" -ge 2 ]; }; }; }; then
-        # the selecting target lives in a copy, so the manifest older compilers
-        # read never names an extension they do not know
-        sel="$here/out/selected"
-        mkdir -p "$sel"
-        cp -r mach.toml src dep "$sel/"
-        cat >>"$sel/mach.toml" <<'EOF'
-
-[target.linux-x86_64-aes]
-isa = "x86_64"
-os  = "linux"
-abi = "sysv64"
-extensions = ["aes", "pclmul"]
-EOF
-        selected="$(cd "$sel" && build linux-x86_64-aes)"
-        selected="$sel/$selected"
-        [ "$(crypto qemu-x86_64 -cpu qemu64 "$selected")" = "aes=1 pclmul=1|aes=0 pclmul=0" ] \
-            || fail "a build selecting aes and pclmul does not report them under qemu64"
-        echo "OK: a build selecting aes and pclmul reports both under qemu64, where the probe reads them absent"
-    else
-        echo "SKIP: mach $major.$minor.$patch predates the aes and pclmul extensions, so no build can select them"
-    fi
+    selected="$(build linux-x86_64-aes)"
+    [ "$(crypto qemu-x86_64 -cpu qemu64 "$selected")" = "aes=1 pclmul=1|aes=0 pclmul=0" ] \
+        || fail "a build selecting aes and pclmul does not report them under qemu64"
+    echo "OK: a build selecting aes and pclmul reports both under qemu64, where the probe reads them absent"
 fi
 if [ "$target" = linux-x86_64 ] && command -v qemu-aarch64 >/dev/null; then
-    arm="$(build linux-arm64)"
+    arm="$(build linux-aarch64)"
     [ "$(crypto qemu-aarch64 -cpu max "$arm")" = "aes=1 pmull=1|aes=1 pmull=1" ] \
         || fail "qemu-aarch64 -cpu max does not report aes and pmull"
     echo "OK: qemu-aarch64 -cpu max reports aes=1 pmull=1"

@@ -2,8 +2,8 @@
 # build the darwin runtime and process probe against this checkout's std and
 # observe it from outside: exit statuses the kernel reports, stderr and stdout
 # bytes, and the argument and environment blocks a child receives. the probe
-# runs natively only, so this leg is executed by CI's macos jobs on both
-# architectures; from linux it can be cross-built with --build-only.
+# runs natively only, on a macos host of the target's architecture; from any
+# other host it can be cross-built with --build-only.
 #
 # usage: verify.sh [path-to-mach] [target] [--build-only]
 set -euo pipefail
@@ -12,22 +12,18 @@ mach="${1:-mach}"
 target="${2:-darwin-aarch64}"
 mode="${3:-}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$here/../lib/compiler.sh"
 cd "$here"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
 case "$target" in darwin-*) ;; *) fail "the darwin probe has no $target target" ;; esac
 
-rm -rf dep
-mkdir -p dep/std
-cp ../../mach.toml dep/std/mach.toml
-cp -r ../../src dep/std/src
+"$mach" dep pull . --quiet
 
 for profile in debug release; do
     echo "building the darwin probe with $mach (target $target, profile $profile)"
     rm -rf "out/$target/$profile"
-    mach_run build . --target "$target" --profile "$profile"
+    "$mach" build . --target "$target" --profile "$profile"
     exe="$(find "out/$target/$profile" -name 'darwin_probe' -type f -print -quit)"
     [ -n "$exe" ] || fail "no darwin_probe binary produced for $profile"
 done
@@ -75,8 +71,8 @@ for profile in debug release; do
     exe="$(cd "$(dirname "$(find "out/$target/$profile" -name 'darwin_probe' -type f -print -quit)")" && pwd)/darwin_probe"
     echo "== $profile: $exe"
 
-    # runtime exit: main's return value is the process status, on both entry
-    # conventions (LC_MAIN on arm64, LC_UNIXTHREAD on x86_64)
+    # runtime exit: main's return value is the process status, through whichever
+    # entry convention the image uses (LC_MAIN for a PIE, LC_UNIXTHREAD otherwise)
     for n in 0 3 200; do
         code="$(run_status "$exe" exit "$n")"
         [ "$code" = "$n" ] || fail "$profile: 'exit $n' reported status $code"

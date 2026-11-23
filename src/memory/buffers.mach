@@ -33,7 +33,9 @@
 # next hold starts over on wiped storage. secret chunks are served through
 # `SecretSource`, never through `Source`, so only a holder of a `SecretSource`
 # is welded. welded storage needs the pages capability (HAS_PAGES), so a secret
-# class or request is refused on a target without it (WELDED is false). a
+# class or request is refused on a target without it (WELDED is false), and so
+# is one whose alignment exceeds SECRET_ALIGN_MAX, the alignment welded storage
+# guarantees. a
 # bring-your-own-OS implementation gets secret classes by providing the os
 # contract's secret primitives.
 #
@@ -69,13 +71,17 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+#[testing]
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 
 $if (capability.HOSTED) {
+    #[testing]
     use std.allocator.fixed;
+    #[testing]
     use std.allocator.heap;
+    #[testing]
     use std.allocator.page;
 }
 
@@ -92,6 +98,7 @@ val SLOT_EMPTY:    u8    = 0;
 val SLOT_HELD:     u8    = 1;
 val SLOT_RETAINED: u8    = 2;
 val DEFAULT_ALIGN: usize = 16;
+val DEFAULT_SLOTS: usize = 16;
 val VIEW_NONE:     u8    = 0;
 val VIEW_BYTES:    u8    = 1;
 val VIEW_TYPED:    u8    = 2;
@@ -99,7 +106,8 @@ val VIEW_TYPED:    u8    = 2;
 # what a caller asks for
 # ---
 # bytes:  the bytes needed, served rounded up to a class or exactly by oversize
-# align:  the alignment needed, 0 for the default of 16
+# align:  the alignment needed, 0 for the default of 16, at most
+#         SECRET_ALIGN_MAX for a secret request
 # lane:   the budget lane the bytes are charged to
 # secret: whether the chunk must be secret-welded
 pub rec Request {
@@ -128,12 +136,25 @@ pub rec Chunk {
     data:  *u8;
 }
 
+# how an acquisition ended
+# ---
+# ok:      the chunk was acquired
+# blocked: a budget, the shared budget or a backing refused, see the reason
+# error:   the call was misuse and had no effect
 pub tag Status: u8 {
     ok;
     blocked;
     error;
 }
 
+# why a call was refused
+# ---
+# none:      it was not
+# budget:    the account's own lane budget, never registered for a wake-up
+# exhausted: the global budget less every reservation is gone
+# memory:    a backing or the slot metadata refused
+# misuse:    a stale ref, a foreign chunk, a held or in-flight violation, a
+#            malformed request or a concurrent entry
 pub tag Reason: u8 {
     none;
     budget;
@@ -142,6 +163,11 @@ pub tag Reason: u8 {
     misuse;
 }
 
+# the outcome of an acquisition
+# ---
+# status: how it ended
+# reason: none on success, otherwise why it was refused
+# chunk:  the chunk on success, the first of the set for acquire_n, zeroed otherwise
 pub rec Acquired {
     status: Status;
     reason: Reason;
@@ -151,7 +177,7 @@ pub rec Acquired {
 # the per-lane byte budgets an account opens with
 #
 # the count travels inside the value: `lanes` says how many of `bytes` are
-# filled, and `open_account` refuses as misuse unless it equals the pool's
+# filled, and `account_init` refuses as misuse unless it equals the pool's
 # lane count. a caller cannot supply fewer budgets than the pool reads,
 # because there is no pointer to read past. `bytes` is `MAX_LANES` long, as
 # `Account.budgets` is.
@@ -261,7 +287,8 @@ pub rec SecretSource {
 # one declared size class
 # ---
 # size:       usable bytes per chunk
-# align:      chunk alignment, 0 for the default of 16
+# align:      chunk alignment, 0 for the default of 16, at most
+#             SECRET_ALIGN_MAX for a secret class
 # secret:     whether chunks are secret-welded
 # high_water: released chunks kept for reuse, the rest go back to the backing
 pub rec ClassConfig {
@@ -328,6 +355,17 @@ rec Slot {
     link:       usize;
 }
 
+# one class's counters in a snapshot
+# ---
+# size:                usable bytes per chunk
+# live:                chunks held
+# peak:                the most chunks held at once
+# retained:            released chunks kept for reuse
+# held_bytes:          live times size
+# acquisitions:        chunks acquired
+# releases:            chunks released
+# refusals:            acquisitions refused
+# backing_allocations: chunks taken from the backing
 pub rec ClassCounters {
     size:                usize;
     live:                usize;
@@ -361,7 +399,6 @@ pub rec Snapshot {
     budget_refusals:     u64;
     backing_allocations: u64;
     release_failures:    u64;
-    steps:               u64;
 }
 
 # std's buffer source
@@ -405,7 +442,6 @@ pub rec Pool {
     backing_allocations: u64;
     # backing releases the backing refused
     release_failures: u64;
-    steps:            u64;
 }
 
 fun enter(pool: *Pool) bool {
@@ -575,15 +611,15 @@ fun trim_locked(pool: *Pool) {
 }
 
 fun plain_allocate(pool: *Pool, bytes: usize, align: usize) usize {
-    val got: res[ptr, A.Error] = A.allocate_raw(?pool.plain, bytes, align);
-    if (sel got.err) { ret 0; }
-    ret got.ok::usize;
+    val res_allocate_raw: res[ptr, A.Error] = A.allocate_raw(?pool.plain, bytes, align);
+    if (sel res_allocate_raw.err) { ret 0; }
+    ret res_allocate_raw.ok::usize;
 }
 
 # the backing keeps the memory it refused, which the pool can only report
 fun plain_release(pool: *Pool, address: usize, bytes: usize, align: usize) {
-    val released: err[A.Error] = A.deallocate_raw(?pool.plain, address::ptr, bytes, align);
-    if (sel released.err) { pool.release_failures = pool.release_failures + 1; }
+    val err_released: err[A.Error] = A.deallocate_raw(?pool.plain, address::ptr, bytes, align);
+    if (sel err_released.err) { pool.release_failures = pool.release_failures + 1; }
 }
 
 fun secret_release(pool: *Pool, index: u32, generation: u32, bytes: usize) {
@@ -607,7 +643,6 @@ fun select_class(pool: *Pool, request: Request) u16 {
     var best:  u16   = OVERSIZE;
     var i:     usize = 0;
     for (i < pool.class_count) {
-        pool.steps = pool.steps + 1;
         val cls: *ClassState = ?pool.classes[i];
         if (cls.secret == request.secret && cls.size >= request.bytes && cls.align >= align) {
             if (best == OVERSIZE || cls.size < pool.classes[best::usize].size) { best = i::u16; }
@@ -621,7 +656,7 @@ fun select_class(pool: *Pool, request: Request) u16 {
 fun request_valid(pool: *Pool, request: Request) bool {
     val align: usize = effective_align(request.align);
     ret request.bytes != 0 && request.lane::usize < pool.lanes && power_of_two(align) &&
-        align <= table.ELEMENT_ALIGN * 4096 && (!request.secret || WELDED);
+        align <= table.ELEMENT_ALIGN * 4096 && (!request.secret || align <= SECRET_ALIGN_MAX);
 }
 
 # the bytes an acquisition charges: the serving class size, or the request
@@ -803,7 +838,6 @@ fun acquire_locked(pool: *Pool, account: *Account, request: Request, register: b
             pool.classes[class_index::usize].backing = pool.classes[class_index::usize].backing + 1;
         }
     }
-    pool.steps = pool.steps + 1;
     val slot: *Slot = slot_at(pool, index);
     slot.generation = slot.generation + 1;
     if (slot.generation == 0) { slot.generation = 1; }
@@ -864,7 +898,6 @@ fun release_locked(pool: *Pool, account: *Account, chunk: Chunk, wake: bool) Rea
     if (slot == nil || slot.account != account || slot.class != chunk.class || slot.inflight != 0) {
         ret misused(pool);
     }
-    pool.steps = pool.steps + 1;
     val bytes: usize = slot.bytes;
     uncharge(pool, account, slot.lane::usize, bytes);
     account.chunks    = account.chunks - 1;
@@ -910,9 +943,10 @@ fun release_locked(pool: *Pool, account: *Account, chunk: Chunk, wake: bool) Rea
 # config: the classes and budgets, copied
 # plain:  the backing for plain chunks and slot metadata, copied, whose context
 #         must outlive the pool
-# ret:    whether the pool was made, refused when a class is secret on a target
-#         without welded storage
-pub fun make(pool: *Pool, config: Config, plain: *A.Allocator) bool {
+# ret:    whether the pool was made, refused when a secret class declares an
+#         alignment above SECRET_ALIGN_MAX, which is zero on a target without
+#         welded storage
+pub fun init(pool: *Pool, config: Config, plain: *A.Allocator) bool {
     if (pool == nil || plain == nil || config.class_count > MAX_CLASSES ||
         (config.class_count != 0 && config.classes == nil) ||
         config.lanes == 0 || config.lanes::usize > MAX_LANES) { ret false; }
@@ -921,7 +955,7 @@ pub fun make(pool: *Pool, config: Config, plain: *A.Allocator) bool {
         val c:     ClassConfig = config.classes[i];
         val align: usize       = effective_align(c.align);
         if (c.size == 0 || !power_of_two(align) || align > table.ELEMENT_ALIGN * 4096) { ret false; }
-        if (c.secret && !WELDED)                                                       { ret false; }
+        if (c.secret && align > SECRET_ALIGN_MAX)                                      { ret false; }
         i = i + 1;
     }
     var blank: Pool;
@@ -939,8 +973,8 @@ pub fun make(pool: *Pool, config: Config, plain: *A.Allocator) bool {
         i                 = i + 1;
     }
     var initial: usize = config.initial_slots;
-    if (initial == 0)                                             { initial = 16; }
-    if (!table.make(?pool.slots, plain, $size_of(Slot), initial)) { ret false; }
+    if (initial == 0)                                             { initial = DEFAULT_SLOTS; }
+    if (!table.init(?pool.slots, plain, $size_of(Slot), initial)) { ret false; }
     table.pool_make(?pool.slot_pool, $offset_of(Slot, link));
     table.pool_adopt(?pool.slot_pool, ?pool.slots);
     pool.class_count    = config.class_count;
@@ -958,7 +992,7 @@ pub fun make(pool: *Pool, config: Config, plain: *A.Allocator) bool {
 #
 # refused while any account is open, so no held chunk is ever leaked or freed
 # under its owner
-pub fun destroy(pool: *Pool) bool {
+pub fun dnit(pool: *Pool) bool {
     if (pool == nil || !pool.made || !enter(pool)) { ret false; }
     if (pool.accounts != 0) {
         misused(pool);
@@ -979,7 +1013,7 @@ pub fun destroy(pool: *Pool) bool {
         cls.retained        = 0;
         c                   = c + 1;
     }
-    table.destroy(?pool.slots);
+    table.dnit(?pool.slots);
     pool.made = false;
     leave(pool);
     ret true;
@@ -995,7 +1029,7 @@ pub fun destroy(pool: *Pool) bool {
 # ret:     none, exhausted when the reservation cannot be granted, memory when
 #          its metadata cannot be backed, or misuse, which a lane count that
 #          differs from the pool's is
-pub fun open_account(pool: *Pool, account: *Account, handle: u64, budgets: Budgets, reserve: usize) Reason {
+pub fun account_init(pool: *Pool, account: *Account, handle: u64, budgets: Budgets, reserve: usize) Reason {
     if (pool == nil || !pool.made) { ret Reason.misuse{}; }
     if (!enter(pool))              { ret Reason.misuse{}; }
     if (account == nil || budgets.lanes != pool.lanes || (account.open && account.pool == pool)) {
@@ -1020,9 +1054,9 @@ pub fun open_account(pool: *Pool, account: *Account, handle: u64, budgets: Budge
             if (pool.classes[c].size < smallest) { smallest = pool.classes[c].size; }
             c = c + 1;
         }
-        slots = (reserve + smallest - 1) / smallest;
+        slots = (reserve - 1) / smallest + 1;
     }
-    if (!ensure_slots(pool, slots_committed(pool) + slots)) {
+    if (slots > 0xfffffffe - slots_committed(pool) || !ensure_slots(pool, slots_committed(pool) + slots)) {
         trim_locked(pool);
         leave(pool);
         ret Reason.memory{};
@@ -1047,7 +1081,7 @@ pub fun open_account(pool: *Pool, account: *Account, handle: u64, budgets: Budge
 }
 
 # close an account holding no chunks, unlinking any registration
-pub fun close_account(pool: *Pool, account: *Account) Reason {
+pub fun account_dnit(pool: *Pool, account: *Account) Reason {
     if (pool == nil || !enter(pool)) { ret Reason.misuse{}; }
     if (account == nil || account.pool != pool || !account.open || account.chunks != 0) {
         val r: Reason = misused(pool);
@@ -1328,17 +1362,16 @@ pub fun snapshot(pool: *Pool, output: *Snapshot) bool {
     output.budget_refusals     = pool.budget_refusals;
     output.backing_allocations = pool.backing_allocations;
     output.release_failures    = pool.release_failures;
-    output.steps               = pool.steps;
     leave(pool);
     ret true;
 }
 
-fun pool_open_account(context: ptr, account: *Account, handle: u64, budgets: Budgets, reserve: usize) Reason {
-    ret open_account(context::*Pool, account, handle, budgets, reserve);
+fun pool_account_init(context: ptr, account: *Account, handle: u64, budgets: Budgets, reserve: usize) Reason {
+    ret account_init(context::*Pool, account, handle, budgets, reserve);
 }
 
-fun pool_close_account(context: ptr, account: *Account) Reason {
-    ret close_account(context::*Pool, account);
+fun pool_account_dnit(context: ptr, account: *Account) Reason {
+    ret account_dnit(context::*Pool, account);
 }
 
 # a request on the wrong surface: counted as misuse with no other effect
@@ -1418,8 +1451,8 @@ fun pool_measure(context: ptr, request: Request) usize {
 pub fun source(pool: *Pool) Source {
     ret Source{
         ctx:              pool::ptr,
-        fn_open_account:  pool_open_account,
-        fn_close_account: pool_close_account,
+        fn_open_account:  pool_account_init,
+        fn_close_account: pool_account_dnit,
         fn_acquire:       pool_acquire,
         fn_acquire_n:     pool_acquire_n,
         fn_release:       pool_release,
@@ -1437,8 +1470,8 @@ pub fun source(pool: *Pool) Source {
 pub fun secret_source(pool: *Pool) SecretSource {
     ret SecretSource{
         ctx:              pool::ptr,
-        fn_open_account:  pool_open_account,
-        fn_close_account: pool_close_account,
+        fn_open_account:  pool_account_init,
+        fn_close_account: pool_account_dnit,
         fn_acquire:       pool_secret_acquire,
         fn_release:       pool_secret_release,
         fn_view:          pool_secret_view,
@@ -1456,13 +1489,13 @@ pub fun secret_source(pool: *Pool) SecretSource {
 # budgets: one byte budget per lane the source declares, `budgets.lanes` equal to `source_lanes`
 # reserve: bytes reserved for the account at open
 # ret:     `none` on success, or the refusal
-pub fun source_open_account(s: *Source, account: *Account, handle: u64, budgets: Budgets, reserve: usize) Reason {
+pub fun source_account_init(s: *Source, account: *Account, handle: u64, budgets: Budgets, reserve: usize) Reason {
     if (s == nil || s.fn_open_account == nil) { ret Reason.misuse{}; }
     ret s.fn_open_account(s.ctx, account, handle, budgets, reserve);
 }
 
 # close an account, dropping any registration it holds
-pub fun source_close_account(s: *Source, account: *Account) Reason {
+pub fun source_account_dnit(s: *Source, account: *Account) Reason {
     if (s == nil || s.fn_close_account == nil) { ret Reason.misuse{}; }
     ret s.fn_close_account(s.ctx, account);
 }
@@ -1521,7 +1554,7 @@ pub fun source_ready(s: *Source, output: *u64, capacity: usize) usize {
 
 # budget lanes per account the source declares
 #
-# `source_open_account` refuses a `Budgets` whose `lanes` differs from this
+# `source_account_init` refuses a `Budgets` whose `lanes` differs from this
 # ---
 # ret: the lane count, 0 when the source declares none
 pub fun source_lanes(s: *Source) usize {
@@ -1552,14 +1585,14 @@ pub fun secret_source_measure(s: *SecretSource, request: Request) usize {
     ret s.fn_measure(s.ctx, request);
 }
 
-# open an account on a secret source, as `source_open_account`
-pub fun secret_source_open_account(s: *SecretSource, account: *Account, handle: u64, budgets: Budgets, reserve: usize) Reason {
+# open an account on a secret source, as `source_account_init`
+pub fun secret_source_account_init(s: *SecretSource, account: *Account, handle: u64, budgets: Budgets, reserve: usize) Reason {
     if (s == nil || s.fn_open_account == nil) { ret Reason.misuse{}; }
     ret s.fn_open_account(s.ctx, account, handle, budgets, reserve);
 }
 
 # close an account on a secret source
-pub fun secret_source_close_account(s: *SecretSource, account: *Account) Reason {
+pub fun secret_source_account_dnit(s: *SecretSource, account: *Account) Reason {
     if (s == nil || s.fn_close_account == nil) { ret Reason.misuse{}; }
     ret s.fn_close_account(s.ctx, account);
 }
@@ -1612,20 +1645,40 @@ pub fun arena_bytes(config: Config, chunks: *usize) res[usize, A.Error] {
     var slots: usize = 0;
     var c:     usize = 0;
     for (c < config.class_count) {
+        # a fixed arena pads every chunk up to its class alignment
+        val align: usize = effective_align(config.classes[c].align);
+        if (!power_of_two(align)) { ret res[usize, A.Error].err{A.Error.invalid{}}; }
         var bytes: usize = 0;
         var round: usize = 0;
-        if (!round_up(config.classes[c].size, table.ELEMENT_ALIGN, ?round) ||
-            !memory.range_scaled(chunks[c], round + table.ELEMENT_ALIGN, ?bytes) ||
+        if (!round_up(config.classes[c].size, align, ?round) ||
+            round > ~(0::usize) - align ||
+            !memory.range_scaled(chunks[c], round + align, ?bytes) ||
             bytes > ~(0::usize) - total) { ret res[usize, A.Error].err{A.Error.overflow{}}; }
         total = total + bytes;
         if (chunks[c] > ~(0::usize) - slots) { ret res[usize, A.Error].err{A.Error.overflow{}}; }
         slots = slots + chunks[c];
         c     = c + 1;
     }
-    # the slot table doubles, so twice the slots bounds every chunk it grows to
+    # the slot table starts at initial_slots rounded up to a power of two and
+    # doubles one chunk at a time until it covers every chunk
+    var initial: usize = config.initial_slots;
+    if (initial == 0) { initial = DEFAULT_SLOTS; }
+    var capacity:    usize = 1;
+    var table_count: usize = 1;
+    for (capacity < initial) {
+        if (capacity > ~(0::usize) / 2) { ret res[usize, A.Error].err{A.Error.overflow{}}; }
+        capacity = capacity * 2;
+    }
+    for (capacity < slots) {
+        if (capacity > ~(0::usize) / 2) { ret res[usize, A.Error].err{A.Error.overflow{}}; }
+        capacity    = capacity * 2;
+        table_count = table_count + 1;
+    }
     var meta: usize = 0;
-    if (!memory.range_scaled(slots * 2 + 32, $size_of(Slot) + table.ELEMENT_ALIGN, ?meta) ||
-        meta > ~(0::usize) - total) { ret res[usize, A.Error].err{A.Error.overflow{}}; }
+    if (!memory.range_scaled(capacity, $size_of(Slot), ?meta) ||
+        meta > ~(0::usize) - table_count * table.ELEMENT_ALIGN) { ret res[usize, A.Error].err{A.Error.overflow{}}; }
+    meta = meta + table_count * table.ELEMENT_ALIGN;
+    if (meta > ~(0::usize) - total) { ret res[usize, A.Error].err{A.Error.overflow{}}; }
     ret res[usize, A.Error].ok{total + meta};
 }
 
@@ -1636,14 +1689,19 @@ $if (capability.HAS_PAGES) {
 
     pub val WELDED: bool = true;
 
+    # the largest alignment a secret class or request may declare: every welded
+    # allocation starts on a page boundary at least this aligned
+    pub val SECRET_ALIGN_MAX: usize = secret_memory.ALIGN;
+
     fun welded_allocate(pool: *Pool, size: usize, index: *u32, generation: *u32) bool {
-        val data: *^u8 = secret_memory.allocate(size);
-        if (data == nil) { ret false; }
-        var borrow: secret_memory.Borrow;
-        val opened: err[io_error.Error] = secret_memory.borrow_open(data, size, ?borrow);
-        if (sel opened.err) {
-            val freed: err[io_error.Error] = secret_memory.deallocate(data, size);
-            if (sel freed.err) { pool.release_failures = pool.release_failures + 1; }
+        var data:     *^u8                = nil;
+        val err_made: err[io_error.Error] = secret_memory.allocate(size, ?data);
+        if (sel err_made.err) { ret false; }
+        var borrow:     secret_memory.Borrow;
+        val err_opened: err[io_error.Error] = secret_memory.borrow_acquire(data, size, ?borrow);
+        if (sel err_opened.err) {
+            val err_freed: err[io_error.Error] = secret_memory.deallocate(data, size);
+            if (sel err_freed.err) { pool.release_failures = pool.release_failures + 1; }
             ret false;
         }
         @index      = borrow.index;
@@ -1670,21 +1728,35 @@ $if (capability.HAS_PAGES) {
         if (data == nil) { ret nil; }
         var out: *T = nil;
         $if ($mach.build.arch == $mach.arch.x86_64) {
-            asm x86_64 {
+            asm x86-64 {
                 mov rax, {data}
                 mov {out}, rax
             }
         }
         $or ($mach.build.arch == $mach.arch.aarch64) {
-            asm aarch64 {
+            asm armv8-a {
                 ldr x0, {data}
                 str x0, {out}
             }
         }
         $or ($mach.build.arch == $mach.arch.riscv64) {
-            asm riscv64 {
+            asm rv64i {
                 ld t0, {data}
                 sd t0, {out}
+            }
+        }
+        $or ($mach.build.arch == $mach.arch.riscv32) {
+            asm rv32i {
+                lw t0, {data}
+                sw t0, {out}
+            }
+        }
+        $or ($mach.build.arch == $mach.arch.wasm32) {
+            asm mvp {
+                local.get {out}
+                local.get {data}
+                i32.load
+                i32.store
             }
         }
         if (!secret_memory.typed_aligned[T](out, $align_of(T))) { ret nil; }
@@ -1693,19 +1765,21 @@ $if (capability.HAS_PAGES) {
 
     # whether the borrow closed and the storage went back
     fun welded_release(index: u32, generation: u32, size: usize) bool {
-        val borrow: secret_memory.Borrow = secret_memory.Borrow{index: index, generation: generation};
-        val data:   *^u8                 = secret_memory.borrow_data(borrow);
-        val closed: err[io_error.Error]  = secret_memory.borrow_close(borrow);
-        var clean:  bool                 = !sel closed.err && data != nil;
+        val borrow:     secret_memory.Borrow = secret_memory.Borrow{index: index, generation: generation};
+        val data:       *^u8                 = secret_memory.borrow_data(borrow);
+        val err_closed: err[io_error.Error]  = secret_memory.borrow_release(borrow);
+        var clean:      bool                 = !sel err_closed.err && data != nil;
         if (data != nil) {
-            val freed: err[io_error.Error] = secret_memory.deallocate(data, size);
-            if (sel freed.err) { clean = false; }
+            val err_freed: err[io_error.Error] = secret_memory.deallocate(data, size);
+            if (sel err_freed.err) { clean = false; }
         }
         ret clean;
     }
 }
 $or {
     pub val WELDED: bool = false;
+
+    pub val SECRET_ALIGN_MAX: usize = 0;
 
     fun welded_allocate(pool: *Pool, size: usize, index: *u32, generation: *u32) bool {
         ret false;
@@ -1783,9 +1857,9 @@ $if (capability.HOSTED) {
         val c: *Counting = context::*Counting;
         if (c.refuse || (c.refuse_align != 0 && align == c.refuse_align)) { ret opt[ptr].none{}; }
         c.allocs = c.allocs + 1;
-        val got: opt[ptr] = c.inner.fn_allocate(c.inner.ctx, size, align);
-        if (sel got.some) { c.live = c.live + size; }
-        ret got;
+        val opt_fn_allocate: opt[ptr] = c.inner.fn_allocate(c.inner.ctx, size, align);
+        if (sel opt_fn_allocate.some) { c.live = c.live + size; }
+        ret opt_fn_allocate;
     }
 
     #[testing]
@@ -1805,6 +1879,7 @@ $if (capability.HOSTED) {
     # a counted bump arena over one page region, so a test's memory is bounded.
     # a reclaiming arena puts a heap between the count and the bump arena, so
     # what the pool gives back is reused
+    #[testing]
     rec Arena {
         page:    A.Allocator;
         state:   fixed.FixedState;
@@ -1819,13 +1894,13 @@ $if (capability.HOSTED) {
     }
 
     #[testing]
-    fun arena_make(arena: *Arena, bytes: usize) bool {
+    fun arena_init(arena: *Arena, bytes: usize) bool {
         page.make(?arena.page);
-        val got: res[ptr, A.Error] = A.allocate_raw(?arena.page, bytes, 16);
-        if (sel got.err) { ret false; }
-        arena.base  = got.ok;
+        val res_allocate_raw: res[ptr, A.Error] = A.allocate_raw(?arena.page, bytes, 16);
+        if (sel res_allocate_raw.err) { ret false; }
+        arena.base  = res_allocate_raw.ok;
         arena.bytes = bytes;
-        if (failed(fixed.make(?arena.count.inner, ?arena.state, got.ok::*u8, bytes))) { ret false; }
+        if (failed(fixed.make(?arena.count.inner, ?arena.state, res_allocate_raw.ok::*u8, bytes))) { ret false; }
         arena.counted = A.Allocator{
             ctx:           (?arena.count)::ptr,
             fn_allocate:   counting_allocate,
@@ -1837,19 +1912,19 @@ $if (capability.HOSTED) {
     }
 
     #[testing]
-    fun arena_reclaiming_make(arena: *Arena, bytes: usize) bool {
-        if (!arena_make(arena, bytes)) { ret false; }
+    fun arena_reclaiming_init(arena: *Arena, bytes: usize) bool {
+        if (!arena_init(arena, bytes)) { ret false; }
         arena.fixed = arena.count.inner;
         heap.allocator_source(?arena.source, ?arena.fixed);
         if (failed(heap.init(?arena.heap, ?arena.source, 0))) { ret false; }
         arena.heaped = true;
-        if (failed(heap.make(?arena.count.inner, ?arena.heap))) { ret false; }
+        if (failed(heap.allocator(?arena.count.inner, ?arena.heap))) { ret false; }
         arena.counted.retains = arena.count.inner.retains;
         ret true;
     }
 
     #[testing]
-    fun arena_free(arena: *Arena) {
+    fun arena_dnit(arena: *Arena) {
         if (arena.heaped) { heap.dnit(?arena.heap); }
         A.deallocate_raw(?arena.page, arena.base, arena.bytes, 16);
     }
@@ -1860,7 +1935,7 @@ $if (capability.HOSTED) {
     fun no_trap(context: ptr) {}
 
     #[testing]
-    fun test_config(classes: *ClassConfig, count: usize, global: usize) Config {
+    fun config(classes: *ClassConfig, count: usize, global: usize) Config {
         var config: Config;
         config.classes       = classes;
         config.class_count   = count;
@@ -1887,21 +1962,21 @@ $if (capability.HOSTED) {
 
     test buffers__measure_reports_exactly_what_acquire_charges {
         var arena: Arena;
-        if (!arena_make(?arena, 16 << 20)) { ret 1; }
-        fin { arena_free(?arena); }
+        if (!arena_init(?arena, 16 << 20)) { ret 1; }
+        fin { arena_dnit(?arena); }
         var classes: [3]ClassConfig = [3]ClassConfig{
             ClassConfig{size: 512, align: 0, secret: false, high_water: 4},
             ClassConfig{size: 4096, align: 0, secret: false, high_water: 4},
             ClassConfig{size: 16384, align: 0, secret: false, high_water: 0},
         };
         var pool: Pool;
-        if (measure(nil, ask(100)) != 0 || measure(?pool, ask(100)) != 0)       { ret 2; }
-        if (!make(?pool, test_config(?classes[0], 3, 1 << 22), ?arena.counted)) { ret 3; }
-        fin { destroy(?pool); }
+        if (measure(nil, ask(100)) != 0 || measure(?pool, ask(100)) != 0)  { ret 2; }
+        if (!init(?pool, config(?classes[0], 3, 1 << 22), ?arena.counted)) { ret 3; }
+        fin { dnit(?pool); }
         var plain:   Source = source(?pool);
         var account: Account;
-        if (!is_none(open_account(?pool, ?account, 7, budgets_of(1 << 21), 0))) { ret 4; }
-        fin { close_account(?pool, ?account); }
+        if (!is_none(account_init(?pool, ?account, 7, budgets_of(1 << 21), 0))) { ret 4; }
+        fin { account_dnit(?pool, ?account); }
         # every class boundary from both sides, one oversize by alignment and one by size
         var requests: [8]Request = [8]Request{
             ask(1), ask(512), ask(513), ask(4096), ask(4097), ask(16384), ask(16385), ask(100),
@@ -1939,19 +2014,19 @@ $if (capability.HOSTED) {
 
     test buffers__a_request_takes_the_smallest_fitting_class_and_oversize_takes_the_rest {
         var arena: Arena;
-        if (!arena_make(?arena, 16 << 20)) { ret 1; }
-        fin { arena_free(?arena); }
+        if (!arena_init(?arena, 16 << 20)) { ret 1; }
+        fin { arena_dnit(?arena); }
         var classes: [3]ClassConfig = [3]ClassConfig{
             ClassConfig{size: 512, align: 0, secret: false, high_water: 4},
             ClassConfig{size: 4096, align: 0, secret: false, high_water: 4},
             ClassConfig{size: 16384, align: 0, secret: false, high_water: 0},
         };
         var pool: Pool;
-        if (!make(?pool, test_config(?classes[0], 3, 1 << 22), ?arena.counted)) { ret 2; }
-        fin { destroy(?pool); }
+        if (!init(?pool, config(?classes[0], 3, 1 << 22), ?arena.counted)) { ret 2; }
+        fin { dnit(?pool); }
         var account: Account;
-        if (!is_none(open_account(?pool, ?account, 7, budgets_of(1 << 21), 0))) { ret 3; }
-        fin { close_account(?pool, ?account); }
+        if (!is_none(account_init(?pool, ?account, 7, budgets_of(1 << 21), 0))) { ret 3; }
+        fin { account_dnit(?pool, ?account); }
         val small: Acquired = acquire(?pool, ?account, ask(100), false);
         val mid:   Acquired = acquire(?pool, ?account, ask(600), false);
         val big:   Acquired = acquire(?pool, ?account, ask(5000), false);
@@ -1982,50 +2057,51 @@ $if (capability.HOSTED) {
 
     # the shape of mach-crypto's aes_gcm.Context: an expanded AES schedule and a
     # GHASH key held as secret arrays in nested records, beside public state
-    rec TestSchedule {
+    rec Schedule {
         round_planes: [120]^u64;
         rounds:       usize;
     }
 
-    rec TestCipher {
-        software: TestSchedule;
+    rec Cipher {
+        software: Schedule;
         backend:  u8;
         active:   bool;
     }
 
-    rec TestGhash {
+    rec Ghash {
         h:      [2]^u64;
         powers: [8][2]^u64;
     }
 
-    rec TestAeadContext {
-        cipher: TestCipher;
-        hash:   TestGhash;
+    #[testing]
+    rec AeadContext {
+        cipher: Cipher;
+        hash:   Ghash;
         state:  u8;
     }
 
     #[testing]
-    rec TestKey {
+    rec Key {
         key: [4]^u64;
     }
 
-    # TestKey's size and layout under another name, a distinct type all the same
+    # Key's size and layout under another name, a distinct type all the same
     #[testing]
-    rec TestTwinKey {
+    rec TwinKey {
         key: [4]^u64;
     }
 
     #[align(64)]
     #[testing]
-    rec TestWideKey {
+    rec WideKey {
         lanes: [8]^u64;
     }
 
     #[testing]
-    fun fill_context(context: *TestAeadContext, seed: u64) {
+    fun fill_context(context: *AeadContext, seed: u64) {
         var i: usize = 0;
         for (i < 120) {
-            val plane: u64 = seed + i;
+            val plane: u64 = seed + i::u64;
             context.cipher.software.round_planes[i] = plane;
             i                                       = i + 1;
         }
@@ -2039,104 +2115,106 @@ $if (capability.HOSTED) {
     }
 
     #[testing]
-    fun context_holds(context: *TestAeadContext, seed: u64) bool {
+    fun context_holds(context: *AeadContext, seed: u64) bool {
         var i: usize = 0;
         for (i < 120) {
-            if (context.cipher.software.round_planes[i]:>u64 != seed + i) { ret false; }
+            if (context.cipher.software.round_planes[i]:>u64 != seed + i::u64) { ret false; }
             i = i + 1;
         }
         ret context.cipher.software.rounds == 14 && context.cipher.backend == 1 && context.cipher.active &&
             context.hash.h[1]:>u64 == seed && context.hash.powers[7][1]:>u64 == seed + 7 && context.state == 1;
     }
 
-    test buffers__a_secret_chunk_holds_a_typed_secret_record_through_the_typed_view {
-        var arena: Arena;
-        if (!arena_make(?arena, 1 << 22)) { ret 1; }
-        fin { arena_free(?arena); }
-        var classes: [2]ClassConfig = [2]ClassConfig{
-            ClassConfig{size: 64, align: 0, secret: false, high_water: 1},
-            ClassConfig{size: 4096, align: 0, secret: true, high_water: 1},
-        };
-        var pool: Pool;
-        if (!make(?pool, test_config(?classes[0], 2, 1 << 20), ?arena.counted)) { ret 2; }
-        fin { destroy(?pool); }
-        var account: Account;
-        if (!is_none(open_account(?pool, ?account, 1, budgets_of(1 << 20), 0))) { ret 3; }
-        fin { close_account(?pool, ?account); }
-        val plain: Acquired = acquire(?pool, ?account, ask(64), false);
-        if (!status_ok(plain) || plain.chunk.data == nil) { ret 4; }
-        var request: Request = ask(4096);
-        request.secret = true;
-        val got: Acquired = acquire(?pool, ?account, request, false);
-        if (!status_ok(got) || got.chunk.class != 1) { ret 5; }
+    $if ($mach.build.arch != $mach.arch.wasm32) {
+        test buffers__a_secret_chunk_holds_a_typed_secret_record_through_the_typed_view {
+            var arena: Arena;
+            if (!arena_init(?arena, 1 << 22)) { ret 1; }
+            fin { arena_dnit(?arena); }
+            var classes: [2]ClassConfig = [2]ClassConfig{
+                ClassConfig{size: 64, align: 0, secret: false, high_water: 1},
+                ClassConfig{size: 4096, align: 0, secret: true, high_water: 1},
+            };
+            var pool: Pool;
+            if (!init(?pool, config(?classes[0], 2, 1 << 20), ?arena.counted)) { ret 2; }
+            fin { dnit(?pool); }
+            var account: Account;
+            if (!is_none(account_init(?pool, ?account, 1, budgets_of(1 << 20), 0))) { ret 3; }
+            fin { account_dnit(?pool, ?account); }
+            val plain: Acquired = acquire(?pool, ?account, ask(64), false);
+            if (!status_ok(plain) || plain.chunk.data == nil) { ret 4; }
+            var request: Request = ask(4096);
+            request.secret = true;
+            val got: Acquired = acquire(?pool, ?account, request, false);
+            if (!status_ok(got) || got.chunk.class != 1) { ret 5; }
 
-        # every refusal leaves the chunk unbound
-        val size: usize = $size_of(TestAeadContext);
-        val fits: usize = 4096 / size;
-        if (secret_typed[TestAeadContext](nil, got.chunk, 1) != nil)                        { ret 6; }
-        if (secret_typed[TestAeadContext](?pool, plain.chunk, 1) != nil)                    { ret 7; }
-        if (secret_typed[TestAeadContext](?pool, got.chunk, 0) != nil)                      { ret 8; }
-        if (secret_typed[TestAeadContext](?pool, got.chunk, ~(0::usize) / size + 1) != nil) { ret 9; }
-        if (secret_typed[TestAeadContext](?pool, got.chunk, fits + 1) != nil)               { ret 10; }
-        if (secret_typed[TestWideKey](?pool, got.chunk, 1) != nil)                          { ret 11; }
+            # every refusal leaves the chunk unbound
+            val size: usize = $size_of(AeadContext);
+            val fits: usize = 4096 / size;
+            if (secret_typed[AeadContext](nil, got.chunk, 1) != nil)                        { ret 6; }
+            if (secret_typed[AeadContext](?pool, plain.chunk, 1) != nil)                    { ret 7; }
+            if (secret_typed[AeadContext](?pool, got.chunk, 0) != nil)                      { ret 8; }
+            if (secret_typed[AeadContext](?pool, got.chunk, ~(0::usize) / size + 1) != nil) { ret 9; }
+            if (secret_typed[AeadContext](?pool, got.chunk, fits + 1) != nil)               { ret 10; }
+            if (secret_typed[WideKey](?pool, got.chunk, 1) != nil)                          { ret 11; }
 
-        val context: *TestAeadContext = secret_typed[TestAeadContext](?pool, got.chunk, fits);
-        if (context == nil) { ret 12; }
-        fill_context(?context[0], 3);
-        fill_context(?context[fits - 1], 5);
-        val again: *TestAeadContext = secret_typed[TestAeadContext](?pool, got.chunk, 1);
-        if (again != context || !context_holds(?again[0], 3) || !context_holds(?again[fits - 1], 5)) { ret 13; }
-        # bound to TestAeadContext: no byte view and no other type this hold
-        if (secret(?pool, got.chunk) != nil)                           { ret 14; }
-        if (secret_typed[TestKey](?pool, got.chunk, 1) != nil)         { ret 15; }
-        if (!is_none(release(?pool, ?account, got.chunk)))             { ret 16; }
-        if (secret_typed[TestAeadContext](?pool, got.chunk, 1) != nil) { ret 17; }
+            val context: *AeadContext = secret_typed[AeadContext](?pool, got.chunk, fits);
+            if (context == nil) { ret 12; }
+            fill_context(?context[0], 3);
+            fill_context(?context[fits - 1], 5);
+            val again: *AeadContext = secret_typed[AeadContext](?pool, got.chunk, 1);
+            if (again != context || !context_holds(?again[0], 3) || !context_holds(?again[fits - 1], 5)) { ret 13; }
+            # bound to AeadContext: no byte view and no other type this hold
+            if (secret(?pool, got.chunk) != nil)                       { ret 14; }
+            if (secret_typed[Key](?pool, got.chunk, 1) != nil)         { ret 15; }
+            if (!is_none(release(?pool, ?account, got.chunk)))         { ret 16; }
+            if (secret_typed[AeadContext](?pool, got.chunk, 1) != nil) { ret 17; }
 
-        # the next hold takes the retained chunk, wiped in full, padding included
-        val backed: u64      = pool.backing_allocations;
-        val next:   Acquired = acquire(?pool, ?account, request, false);
-        if (!status_ok(next) || pool.backing_allocations != backed) { ret 18; }
-        val bytes: *^u8 = secret(?pool, next.chunk);
-        if (bytes == nil) { ret 19; }
-        var i: usize = 0;
-        for (i < 4096) {
-            if (bytes[i]:>u8 != 0) { ret 20; }
-            i = i + 1;
+            # the next hold takes the retained chunk, wiped in full, padding included
+            val backed: u64      = pool.backing_allocations;
+            val next:   Acquired = acquire(?pool, ?account, request, false);
+            if (!status_ok(next) || pool.backing_allocations != backed) { ret 18; }
+            val bytes: *^u8 = secret(?pool, next.chunk);
+            if (bytes == nil) { ret 19; }
+            var i: usize = 0;
+            for (i < 4096) {
+                if (bytes[i]:>u8 != 0) { ret 20; }
+                i = i + 1;
+            }
+            # seen as bytes, the hold refuses the typed view
+            if (secret_typed[AeadContext](?pool, next.chunk, 1) != nil) { ret 21; }
+            if (!is_none(release(?pool, ?account, next.chunk)))         { ret 22; }
+
+            # an oversize secret chunk holds what its rounded bytes fit
+            request.bytes = 5000;
+            val large: Acquired = acquire(?pool, ?account, request, false);
+            if (!status_ok(large) || large.chunk.class != OVERSIZE)                    { ret 23; }
+            if (secret_typed[AeadContext](?pool, large.chunk, 5000 / size + 1) != nil) { ret 24; }
+            val wide: *AeadContext = secret_typed[AeadContext](?pool, large.chunk, 5000 / size);
+            if (wide == nil) { ret 25; }
+            fill_context(?wide[5000 / size - 1], 9);
+            if (!context_holds(?wide[5000 / size - 1], 9))       { ret 26; }
+            if (!is_none(release(?pool, ?account, large.chunk))) { ret 27; }
+            if (!is_none(release(?pool, ?account, plain.chunk))) { ret 28; }
+
+            # identity is the type, not its size: a same-size twin is another type
+            request.bytes = 4096;
+            val keyed: Acquired = acquire(?pool, ?account, request, false);
+            if (!status_ok(keyed))                                   { ret 29; }
+            if ($size_of(TwinKey) != $size_of(Key))                  { ret 30; }
+            if (secret_typed[Key](?pool, keyed.chunk, 1) == nil)     { ret 31; }
+            if (secret_typed[TwinKey](?pool, keyed.chunk, 1) != nil) { ret 32; }
+            if (secret_typed[Key](?pool, keyed.chunk, 2) == nil)     { ret 33; }
+            if (!is_none(release(?pool, ?account, keyed.chunk)))     { ret 34; }
+            ret 0;
         }
-        # seen as bytes, the hold refuses the typed view
-        if (secret_typed[TestAeadContext](?pool, next.chunk, 1) != nil) { ret 21; }
-        if (!is_none(release(?pool, ?account, next.chunk)))             { ret 22; }
-
-        # an oversize secret chunk holds what its rounded bytes fit
-        request.bytes = 5000;
-        val large: Acquired = acquire(?pool, ?account, request, false);
-        if (!status_ok(large) || large.chunk.class != OVERSIZE)                        { ret 23; }
-        if (secret_typed[TestAeadContext](?pool, large.chunk, 5000 / size + 1) != nil) { ret 24; }
-        val wide: *TestAeadContext = secret_typed[TestAeadContext](?pool, large.chunk, 5000 / size);
-        if (wide == nil) { ret 25; }
-        fill_context(?wide[5000 / size - 1], 9);
-        if (!context_holds(?wide[5000 / size - 1], 9))       { ret 26; }
-        if (!is_none(release(?pool, ?account, large.chunk))) { ret 27; }
-        if (!is_none(release(?pool, ?account, plain.chunk))) { ret 28; }
-
-        # identity is the type, not its size: a same-size twin is another type
-        request.bytes = 4096;
-        val keyed: Acquired = acquire(?pool, ?account, request, false);
-        if (!status_ok(keyed))                                       { ret 29; }
-        if ($size_of(TestTwinKey) != $size_of(TestKey))              { ret 30; }
-        if (secret_typed[TestKey](?pool, keyed.chunk, 1) == nil)     { ret 31; }
-        if (secret_typed[TestTwinKey](?pool, keyed.chunk, 1) != nil) { ret 32; }
-        if (secret_typed[TestKey](?pool, keyed.chunk, 2) == nil)     { ret 33; }
-        if (!is_none(release(?pool, ?account, keyed.chunk)))         { ret 34; }
-        ret 0;
     }
 
     # retained chunks keep their slots, so a fresh chunk after a full retain
     # must still find one (#775, from mach-tls's interop harness)
     test regression__a_fresh_chunk_after_retained_releases_takes_a_new_slot {
         var arena: Arena;
-        if (!arena_make(?arena, 1 << 22)) { ret 1; }
-        fin { arena_free(?arena); }
+        if (!arena_init(?arena, 1 << 22)) { ret 1; }
+        fin { arena_dnit(?arena); }
         var classes: [6]ClassConfig = [6]ClassConfig{
             ClassConfig{size: 512, align: 0, secret: false, high_water: 4},
             ClassConfig{size: 4096, align: 0, secret: false, high_water: 4},
@@ -2145,14 +2223,14 @@ $if (capability.HOSTED) {
             ClassConfig{size: 4096, align: 0, secret: true, high_water: 4},
             ClassConfig{size: 17408, align: 0, secret: true, high_water: 4},
         };
-        var config: Config = test_config(?classes[0], 6, 1 << 21);
+        var config: Config = config(?classes[0], 6, 1 << 21);
         config.initial_slots = 8;
         var pool: Pool;
-        if (!make(?pool, config, ?arena.counted)) { ret 2; }
-        fin { destroy(?pool); }
+        if (!init(?pool, config, ?arena.counted)) { ret 2; }
+        fin { dnit(?pool); }
         var account: Account;
-        if (!is_none(open_account(?pool, ?account, 1, budgets_of(1 << 20), 0))) { ret 3; }
-        fin { close_account(?pool, ?account); }
+        if (!is_none(account_init(?pool, ?account, 1, budgets_of(1 << 20), 0))) { ret 3; }
+        fin { account_dnit(?pool, ?account); }
         var held: [8]Chunk;
         var i:    usize = 0;
         for (i < 8) {
@@ -2187,18 +2265,18 @@ $if (capability.HOSTED) {
 
     test buffers__budget_exhausted_and_memory_refusals_are_told_apart {
         var arena: Arena;
-        if (!arena_make(?arena, 1 << 20)) { ret 1; }
-        fin { arena_free(?arena); }
+        if (!arena_init(?arena, 1 << 20)) { ret 1; }
+        fin { arena_dnit(?arena); }
         var classes: [1]ClassConfig = [1]ClassConfig{
             ClassConfig{size: 512, align: 0, secret: false, high_water: 0},
         };
         var pool: Pool;
-        if (!make(?pool, test_config(?classes[0], 1, 1024), ?arena.counted)) { ret 2; }
-        fin { destroy(?pool); }
+        if (!init(?pool, config(?classes[0], 1, 1024), ?arena.counted)) { ret 2; }
+        fin { dnit(?pool); }
         var first: Account;
         var other: Account;
-        if (!is_none(open_account(?pool, ?first, 1, budgets_of(512), 0)))  { ret 3; }
-        if (!is_none(open_account(?pool, ?other, 2, budgets_of(4096), 0))) { ret 4; }
+        if (!is_none(account_init(?pool, ?first, 1, budgets_of(512), 0)))  { ret 3; }
+        if (!is_none(account_init(?pool, ?other, 2, budgets_of(4096), 0))) { ret 4; }
         val one: Acquired = acquire(?pool, ?first, ask(1), true);
         if (!sel one.status.ok) { ret 5; }
         val over: Acquired = acquire(?pool, ?first, ask(1), true);
@@ -2214,29 +2292,116 @@ $if (capability.HOSTED) {
         if (!sel refused.status.blocked || !sel refused.reason.memory) { ret 11; }
         arena.count.refuse = false;
         var handles: [4]u64;
-        if (ready(?pool, ?handles[0], 4) != 1 || handles[0] != 2)                             { ret 12; }
-        if (!is_none(release(?pool, ?first, one.chunk)))                                      { ret 13; }
-        if (!is_none(close_account(?pool, ?first)) || !is_none(close_account(?pool, ?other))) { ret 14; }
+        if (ready(?pool, ?handles[0], 4) != 1 || handles[0] != 2)                           { ret 12; }
+        if (!is_none(release(?pool, ?first, one.chunk)))                                    { ret 13; }
+        if (!is_none(account_dnit(?pool, ?first)) || !is_none(account_dnit(?pool, ?other))) { ret 14; }
+        ret 0;
+    }
+
+    # a reservation is granted only from what the global budget has left after
+    # the other reservations and the overflow in use, holding inside it is free
+    # of the global budget and growth past it is charged, and a reservation whose
+    # slot count would pass the slot index limit is refused
+    test buffers__reservations_come_from_the_global_remainder_and_growth_past_one_is_charged {
+        var arena: Arena;
+        if (!arena_init(?arena, 1 << 20)) { ret 1; }
+        fin { arena_dnit(?arena); }
+        var classes: [1]ClassConfig = [1]ClassConfig{
+            ClassConfig{size: 512, align: 0, secret: false, high_water: 0},
+        };
+        var pool: Pool;
+        if (!init(?pool, config(?classes[0], 1, 4096), ?arena.counted)) { ret 2; }
+        fin { dnit(?pool); }
+        var reserved: Account;
+        var plain:    Account;
+        var late:     Account;
+        if (!is_none(account_init(?pool, ?reserved, 1, budgets_of(1 << 16), 2048))) { ret 3; }
+        val over_remainder: Reason = account_init(?pool, ?late, 3, budgets_of(1 << 16), 2049);
+        if (!sel over_remainder.exhausted)                                    { ret 4; }
+        if (!is_none(account_init(?pool, ?plain, 2, budgets_of(1 << 16), 0))) { ret 5; }
+        var held: [3]Chunk;
+        var i:    usize = 0;
+        for (i < 3) {
+            val got: Acquired = acquire(?pool, ?plain, ask(1), false);
+            if (!sel got.status.ok) { ret 10 + i::i32; }
+            held[i] = got.chunk;
+            i       = i + 1;
+        }
+        # 2048 left after the reservation, 1536 of it in use as overflow
+        val over_overflow: Reason = account_init(?pool, ?late, 3, budgets_of(1 << 16), 1024);
+        if (!sel over_overflow.exhausted)                                      { ret 6; }
+        if (!is_none(account_init(?pool, ?late, 3, budgets_of(1 << 16), 512))) { ret 7; }
+        var kept: [4]Chunk;
+        i = 0;
+        for (i < 4) {
+            val got: Acquired = acquire(?pool, ?reserved, ask(1), false);
+            if (!sel got.status.ok) { ret 20 + i::i32; }
+            kept[i] = got.chunk;
+            i       = i + 1;
+        }
+        val past: Acquired = acquire(?pool, ?reserved, ask(1), false);
+        if (!sel past.status.blocked || !sel past.reason.exhausted) { ret 8; }
+        i = 0;
+        for (i < 4) {
+            release(?pool, ?reserved, kept[i]);
+            i = i + 1;
+        }
+        i = 0;
+        for (i < 3) {
+            release(?pool, ?plain, held[i]);
+            i = i + 1;
+        }
+        account_dnit(?pool, ?reserved);
+        account_dnit(?pool, ?plain);
+        account_dnit(?pool, ?late);
+
+        var vast_classes: [1]ClassConfig = [1]ClassConfig{
+            ClassConfig{size: 64, align: 0, secret: false, high_water: 0},
+        };
+        var vast: Pool;
+        if (!init(?vast, config(?vast_classes[0], 1, ~(0::usize)), ?arena.counted)) { ret 30; }
+        fin { dnit(?vast); }
+        var whole:          Account;
+        val too_many_slots: Reason = account_init(?vast, ?whole, 4, budgets_of(1 << 16), ~(0::usize));
+        if (!sel too_many_slots.memory) { ret 31; }
+
+        # a retained chunk keeps its slot committed with nothing charged, so one-byte
+        # chunks reserving the whole budget would count past the slot limit
+        var unit_classes: [1]ClassConfig = [1]ClassConfig{
+            ClassConfig{size: 1, align: 0, secret: false, high_water: 1},
+        };
+        var unit: Pool;
+        if (!init(?unit, config(?unit_classes[0], 1, ~(0::usize)), ?arena.counted)) { ret 32; }
+        fin { dnit(?unit); }
+        var keeper: Account;
+        if (!is_none(account_init(?unit, ?keeper, 5, budgets_of(1 << 16), 0))) { ret 32; }
+        val kept_once: Acquired = acquire(?unit, ?keeper, ask(1), false);
+        if (!sel kept_once.status.ok)                           { ret 33; }
+        if (!is_none(release(?unit, ?keeper, kept_once.chunk))) { ret 33; }
+        account_dnit(?unit, ?keeper);
+        var every:          Account;
+        val past_the_limit: Reason = account_init(?unit, ?every, 6, budgets_of(1 << 16), ~(0::usize));
+        if (!sel past_the_limit.memory) { ret 34; }
         ret 0;
     }
 
     test buffers__an_acquire_inside_a_reservation_never_fails_on_metadata {
         var arena: Arena;
-        if (!arena_make(?arena, 1 << 20)) { ret 1; }
-        fin { arena_free(?arena); }
+        if (!arena_init(?arena, 1 << 20)) { ret 1; }
+        fin { arena_dnit(?arena); }
         # payloads align at 32 and slot metadata at 16, so metadata alone can be refused
         var classes: [1]ClassConfig = [1]ClassConfig{
             ClassConfig{size: 512, align: 32, secret: false, high_water: 0},
         };
-        var config: Config = test_config(?classes[0], 1, 1 << 16);
+        var config: Config = config(?classes[0], 1, 1 << 16);
         config.initial_slots = 1;
         var pool: Pool;
-        if (!make(?pool, config, ?arena.counted)) { ret 2; }
-        fin { destroy(?pool); }
+        if (!init(?pool, config, ?arena.counted)) { ret 2; }
+        fin { dnit(?pool); }
         var reserved: Account;
         var plain:    Account;
-        if (!is_none(open_account(?pool, ?reserved, 1, budgets_of(1 << 16), 3 * 512))) { ret 3; }
-        if (!is_none(open_account(?pool, ?plain, 2, budgets_of(1 << 16), 0)))          { ret 4; }
+        if (!is_none(account_init(?pool, ?reserved, 1, budgets_of(1 << 16), 3 * 512))) { ret 3; }
+        if (!is_none(account_init(?pool, ?plain, 2, budgets_of(1 << 16), 0)))          { ret 4; }
         arena.count.refuse_align = 16;
         var held:  [3]Chunk;
         var extra: [2]Chunk;
@@ -2264,24 +2429,24 @@ $if (capability.HOSTED) {
             i = i + 1;
         }
         release(?pool, ?plain, extra[0]);
-        close_account(?pool, ?reserved);
-        close_account(?pool, ?plain);
+        account_dnit(?pool, ?reserved);
+        account_dnit(?pool, ?plain);
         ret 0;
     }
 
     test buffers__acquire_n_gets_every_chunk_or_none {
         var arena: Arena;
-        if (!arena_make(?arena, 1 << 20)) { ret 1; }
-        fin { arena_free(?arena); }
+        if (!arena_init(?arena, 1 << 20)) { ret 1; }
+        fin { arena_dnit(?arena); }
         var classes: [1]ClassConfig = [1]ClassConfig{
             ClassConfig{size: 512, align: 0, secret: false, high_water: 8},
         };
         var pool: Pool;
-        if (!make(?pool, test_config(?classes[0], 1, 1 << 20), ?arena.counted)) { ret 2; }
-        fin { destroy(?pool); }
+        if (!init(?pool, config(?classes[0], 1, 1 << 20), ?arena.counted)) { ret 2; }
+        fin { dnit(?pool); }
         var account: Account;
-        if (!is_none(open_account(?pool, ?account, 1, budgets_of(1024), 0))) { ret 3; }
-        fin { close_account(?pool, ?account); }
+        if (!is_none(account_init(?pool, ?account, 1, budgets_of(1024), 0))) { ret 3; }
+        fin { account_dnit(?pool, ?account); }
         var requests: [3]Request = [3]Request{ask(1), ask(1), ask(1)};
         var out:      [3]Chunk;
         val refused:  Acquired   = acquire_n(?pool, ?account, ?requests[0], 3, ?out[0], false);
@@ -2298,20 +2463,20 @@ $if (capability.HOSTED) {
 
     test buffers__in_flight_and_stale_chunks_are_refused_as_misuse_and_stay_put {
         var arena: Arena;
-        if (!arena_make(?arena, 1 << 20)) { ret 1; }
-        fin { arena_free(?arena); }
+        if (!arena_init(?arena, 1 << 20)) { ret 1; }
+        fin { arena_dnit(?arena); }
         var classes: [1]ClassConfig = [1]ClassConfig{
             ClassConfig{size: 512, align: 0, secret: false, high_water: 0},
         };
-        var config: Config = test_config(?classes[0], 1, 1 << 20);
+        var config: Config = config(?classes[0], 1, 1 << 20);
         config.trap = no_trap;
         var pool: Pool;
-        if (!make(?pool, config, ?arena.counted)) { ret 2; }
-        fin { destroy(?pool); }
+        if (!init(?pool, config, ?arena.counted)) { ret 2; }
+        fin { dnit(?pool); }
         var account:  Account;
         var stranger: Account;
-        if (!is_none(open_account(?pool, ?account, 1, budgets_of(1 << 20), 0)))  { ret 3; }
-        if (!is_none(open_account(?pool, ?stranger, 2, budgets_of(1 << 20), 0))) { ret 4; }
+        if (!is_none(account_init(?pool, ?account, 1, budgets_of(1 << 20), 0)))  { ret 3; }
+        if (!is_none(account_init(?pool, ?stranger, 2, budgets_of(1 << 20), 0))) { ret 4; }
         val got: Acquired = acquire(?pool, ?account, ask(8), false);
         if (!sel got.status.ok)                                                         { ret 5; }
         if (!is_none(retain(?pool, got.chunk.ref)) || !in_flight(?pool, got.chunk.ref)) { ret 6; }
@@ -2327,56 +2492,8 @@ $if (capability.HOSTED) {
         var snap: Snapshot;
         snapshot(?pool, ?snap);
         if (snap.misuse != 5) { ret 16; }
-        close_account(?pool, ?account);
-        close_account(?pool, ?stranger);
-        ret 0;
-    }
-
-    #[testing]
-    fun count_trap(context: ptr) {
-        val hits: *usize = context::*usize;
-        @hits = @hits + 1;
-    }
-
-    test buffers__budgets_with_the_wrong_lane_count_are_refused_as_counted_misuse {
-        var arena: Arena;
-        if (!arena_make(?arena, 1 << 20)) { ret 1; }
-        fin { arena_free(?arena); }
-        var classes: [1]ClassConfig = [1]ClassConfig{
-            ClassConfig{size: 64, align: 0, secret: false, high_water: 0},
-        };
-        var hits:   usize  = 0;
-        var config: Config = test_config(?classes[0], 1, 1 << 16);
-        config.trap         = count_trap;
-        config.trap_context = (?hits)::ptr;
-        var pool: Pool;
-        if (!make(?pool, config, ?arena.counted)) { ret 2; }
-        fin { destroy(?pool); }
-        var account: Account;
-
-        var short: Budgets = budgets_of(1 << 16);
-        short.lanes = 1;
-        if (!is_misuse(open_account(?pool, ?account, 1, short, 0))) { ret 3; }
-        if (account.open || hits != 1)                              { ret 4; }
-
-        var long: Budgets = budgets_of(1 << 16);
-        long.lanes = 3;
-        if (!is_misuse(open_account(?pool, ?account, 1, long, 0))) { ret 5; }
-        if (account.open || hits != 2)                             { ret 6; }
-
-        var none: Budgets = budgets_of(1 << 16);
-        none.lanes = 0;
-        var plain: Source = source(?pool);
-        if (!is_misuse(source_open_account(?plain, ?account, 1, none, 0))) { ret 7; }
-        if (hits != 3)                                                     { ret 8; }
-
-        var snap: Snapshot;
-        snapshot(?pool, ?snap);
-        if (snap.misuse != 3 || snap.accounts != 0) { ret 9; }
-
-        if (!is_none(open_account(?pool, ?account, 1, budgets_of(1 << 16), 0))) { ret 10; }
-        if (!account.open || account.budgets[1] != 1 << 16 || hits != 3)        { ret 11; }
-        close_account(?pool, ?account);
+        account_dnit(?pool, ?account);
+        account_dnit(?pool, ?stranger);
         ret 0;
     }
 
@@ -2398,22 +2515,22 @@ $if (capability.HOSTED) {
 
     test buffers__a_concurrent_entry_is_refused_as_misuse_with_the_chunk_still_held {
         var arena: Arena;
-        if (!arena_make(?arena, 1 << 20)) { ret 1; }
-        fin { arena_free(?arena); }
+        if (!arena_init(?arena, 1 << 20)) { ret 1; }
+        fin { arena_dnit(?arena); }
         var classes: [1]ClassConfig = [1]ClassConfig{
             ClassConfig{size: 512, align: 0, secret: false, high_water: 0},
         };
         var entry:  Reentry;
-        var config: Config = test_config(?classes[0], 1, 1024);
+        var config: Config = config(?classes[0], 1, 1024);
         config.notify         = reenter;
         config.notify_context = (?entry)::ptr;
         var pool: Pool;
-        if (!make(?pool, config, ?arena.counted)) { ret 2; }
-        fin { destroy(?pool); }
+        if (!init(?pool, config, ?arena.counted)) { ret 2; }
+        fin { dnit(?pool); }
         var holder: Account;
         var waiter: Account;
-        if (!is_none(open_account(?pool, ?holder, 1, budgets_of(4096), 0))) { ret 3; }
-        if (!is_none(open_account(?pool, ?waiter, 2, budgets_of(4096), 0))) { ret 4; }
+        if (!is_none(account_init(?pool, ?holder, 1, budgets_of(4096), 0))) { ret 3; }
+        if (!is_none(account_init(?pool, ?waiter, 2, budgets_of(4096), 0))) { ret 4; }
         val one: Acquired = acquire(?pool, ?holder, ask(1), false);
         val two: Acquired = acquire(?pool, ?holder, ask(1), false);
         if (!sel one.status.ok || !sel two.status.ok)                 { ret 5; }
@@ -2430,29 +2547,29 @@ $if (capability.HOSTED) {
         snapshot(?pool, ?snap);
         if (snap.misuse != 1)                             { ret 11; }
         if (!is_none(release(?pool, ?holder, two.chunk))) { ret 12; }
-        close_account(?pool, ?holder);
-        close_account(?pool, ?waiter);
+        account_dnit(?pool, ?holder);
+        account_dnit(?pool, ?waiter);
         ret 0;
     }
 
     test buffers__one_release_wakes_exactly_the_oldest_waiter_and_allocates_nothing {
         var arena: Arena;
-        if (!arena_make(?arena, 1 << 20)) { ret 1; }
-        fin { arena_free(?arena); }
+        if (!arena_init(?arena, 1 << 20)) { ret 1; }
+        fin { arena_dnit(?arena); }
         var classes: [1]ClassConfig = [1]ClassConfig{
             ClassConfig{size: 512, align: 0, secret: false, high_water: 4},
         };
         var pool: Pool;
-        if (!make(?pool, test_config(?classes[0], 1, 512), ?arena.counted)) { ret 2; }
-        fin { destroy(?pool); }
+        if (!init(?pool, config(?classes[0], 1, 512), ?arena.counted)) { ret 2; }
+        fin { dnit(?pool); }
         var holder:  Account;
         var waiters: [16]Account;
-        if (!is_none(open_account(?pool, ?holder, 100, budgets_of(4096), 0))) { ret 3; }
+        if (!is_none(account_init(?pool, ?holder, 100, budgets_of(4096), 0))) { ret 3; }
         val held: Acquired = acquire(?pool, ?holder, ask(1), false);
         if (!sel held.status.ok) { ret 4; }
         var i: usize = 0;
         for (i < 16) {
-            if (!is_none(open_account(?pool, ?waiters[i], i::u64, budgets_of(4096), 0))) { ret 5; }
+            if (!is_none(account_init(?pool, ?waiters[i], i::u64, budgets_of(4096), 0))) { ret 5; }
             val refused: Acquired = acquire(?pool, ?waiters[i], ask(1), true);
             if (!sel refused.reason.exhausted) { ret 6; }
             # registering twice keeps one place in line
@@ -2469,210 +2586,11 @@ $if (capability.HOSTED) {
         if (ready(?pool, ?handles[0], 4) != 0)                    { ret 12; }
         i = 0;
         for (i < 16) {
-            if (!is_none(close_account(?pool, ?waiters[i]))) { ret 13; }
+            if (!is_none(account_dnit(?pool, ?waiters[i]))) { ret 13; }
             i = i + 1;
         }
         if (pool.waiters != 0) { ret 14; }
-        close_account(?pool, ?holder);
-        ret 0;
-    }
-
-    # a consumer written only against Source: two accounts share one chunk of
-    # capacity, the second is refused and registered, and the first's release
-    # wakes it
-    #[testing]
-    fun consume(s: *Source) i32 {
-        var first:  Account;
-        var second: Account;
-        if (source_lanes(s) != 2)                                              { ret 19; }
-        if (!is_none(source_open_account(s, ?first, 7, budgets_of(4096), 0)))  { ret 1; }
-        if (!is_none(source_open_account(s, ?second, 9, budgets_of(4096), 0))) { ret 2; }
-        val held: Acquired = source_acquire(s, ?first, ask(16), false);
-        if (!sel held.status.ok) { ret 3; }
-        val address: *u8 = source_data(s, held.chunk.ref);
-        if (address == nil || address != held.chunk.data) { ret 4; }
-        address[0] = 42;
-        val refused: Acquired = source_acquire(s, ?second, ask(16), true);
-        if (!sel refused.reason.exhausted)                     { ret 5; }
-        if (!is_none(source_retain(s, held.chunk.ref)))        { ret 6; }
-        if (!source_in_flight(s, held.chunk.ref))              { ret 7; }
-        if (!is_misuse(source_release(s, ?first, held.chunk))) { ret 8; }
-        if (!is_none(source_settle(s, held.chunk.ref)))        { ret 9; }
-        if (source_in_flight(s, held.chunk.ref))               { ret 10; }
-        var handles: [2]u64;
-        if (source_ready(s, ?handles[0], 2) != 0)                    { ret 11; }
-        if (!is_none(source_release(s, ?first, held.chunk)))         { ret 12; }
-        if (source_data(s, held.chunk.ref) != nil)                   { ret 13; }
-        if (source_ready(s, ?handles[0], 2) != 1 || handles[0] != 9) { ret 14; }
-        val woken: Acquired = source_acquire(s, ?second, ask(16), false);
-        if (!sel woken.status.ok)                              { ret 15; }
-        if (!is_none(source_release(s, ?second, woken.chunk))) { ret 16; }
-        if (!is_none(source_close_account(s, ?first)))         { ret 17; }
-        if (!is_none(source_close_account(s, ?second)))        { ret 18; }
-        ret 0;
-    }
-
-    # the smallest source: one 64-byte chunk and one waiter
-    rec Stub {
-        store:      [64]u8;
-        held:       bool;
-        generation: u32;
-        flight:     usize;
-        waiter:     *Account;
-        woken:      bool;
-    }
-
-    #[testing]
-    fun stub_open(context: ptr, account: *Account, handle: u64, budgets: Budgets, reserve: usize) Reason {
-        account.handle = handle;
-        account.open   = true;
-        ret Reason.none{};
-    }
-
-    #[testing]
-    fun stub_close(context: ptr, account: *Account) Reason {
-        val stub: *Stub = context::*Stub;
-        if (stub.waiter == account) { stub.waiter = nil; }
-        account.open = false;
-        ret Reason.none{};
-    }
-
-    #[testing]
-    fun stub_acquire(context: ptr, account: *Account, request: Request, register: bool) Acquired {
-        val stub: *Stub = context::*Stub;
-        var out:  Acquired;
-        if (request.bytes > 64 || request.secret) {
-            out.status = Status.error{};
-            out.reason = Reason.misuse{};
-            ret out;
-        }
-        if (stub.held) {
-            if (register) { stub.waiter = account; }
-            out.status = Status.blocked{};
-            out.reason = Reason.exhausted{};
-            ret out;
-        }
-        stub.held       = true;
-        stub.generation = stub.generation + 1;
-        out.status      = Status.ok{};
-        out.reason      = Reason.none{};
-        out.chunk       = Chunk{ref: Ref{index: 0, generation: stub.generation}, class: 0, bytes: 64, data: ?stub.store[0]};
-        ret out;
-    }
-
-    #[testing]
-    fun stub_acquire_n(context: ptr, account: *Account, requests: *Request, count: usize, out: *Chunk, register: bool) Acquired {
-        if (count != 1) {
-            var refused: Acquired;
-            refused.status = Status.blocked{};
-            refused.reason = Reason.exhausted{};
-            ret refused;
-        }
-        val got: Acquired = stub_acquire(context, account, requests[0], register);
-        if (sel got.status.ok) { out[0] = got.chunk; }
-        ret got;
-    }
-
-    #[testing]
-    fun stub_live(stub: *Stub, ref: Ref) bool {
-        ret stub.held && ref.index == 0 && ref.generation == stub.generation;
-    }
-
-    #[testing]
-    fun stub_release(context: ptr, account: *Account, chunk: Chunk) Reason {
-        val stub: *Stub = context::*Stub;
-        if (!stub_live(stub, chunk.ref) || stub.flight != 0) { ret Reason.misuse{}; }
-        stub.held = false;
-        if (stub.waiter != nil) { stub.woken = true; }
-        ret Reason.none{};
-    }
-
-    #[testing]
-    fun stub_data(context: ptr, ref: Ref) *u8 {
-        val stub: *Stub = context::*Stub;
-        if (!stub_live(stub, ref)) { ret nil; }
-        ret ?stub.store[0];
-    }
-
-    #[testing]
-    fun stub_retain(context: ptr, ref: Ref) Reason {
-        val stub: *Stub = context::*Stub;
-        if (!stub_live(stub, ref)) { ret Reason.misuse{}; }
-        stub.flight = stub.flight + 1;
-        ret Reason.none{};
-    }
-
-    #[testing]
-    fun stub_lanes(context: ptr) usize {
-        ret 2;
-    }
-
-    #[testing]
-    fun stub_settle(context: ptr, ref: Ref) Reason {
-        val stub: *Stub = context::*Stub;
-        if (!stub_live(stub, ref) || stub.flight == 0) { ret Reason.misuse{}; }
-        stub.flight = stub.flight - 1;
-        ret Reason.none{};
-    }
-
-    #[testing]
-    fun stub_in_flight(context: ptr, ref: Ref) bool {
-        val stub: *Stub = context::*Stub;
-        ret stub_live(stub, ref) && stub.flight != 0;
-    }
-
-    #[testing]
-    fun stub_ready(context: ptr, output: *u64, capacity: usize) usize {
-        val stub: *Stub = context::*Stub;
-        if (!stub.woken || stub.waiter == nil || capacity == 0) { ret 0; }
-        output[0]   = stub.waiter.handle;
-        stub.woken  = false;
-        stub.waiter = nil;
-        ret 1;
-    }
-
-    test buffers__a_consumer_runs_through_source_alone_over_a_pool_and_over_its_own_source {
-        var arena: Arena;
-        if (!arena_make(?arena, 1 << 20)) { ret 1; }
-        fin { arena_free(?arena); }
-        var classes: [1]ClassConfig = [1]ClassConfig{
-            ClassConfig{size: 64, align: 0, secret: false, high_water: 1},
-        };
-        var pool: Pool;
-        if (!make(?pool, test_config(?classes[0], 1, 64), ?arena.counted)) { ret 2; }
-        fin { destroy(?pool); }
-        var over_pool: Source = source(?pool);
-        val pooled:    i32    = consume(?over_pool);
-        if (pooled != 0) { ret 10 + pooled; }
-        # a plain source refuses a secret request as misuse
-        var account: Account;
-        if (!is_none(source_open_account(?over_pool, ?account, 1, budgets_of(64), 0))) { ret 30; }
-        var hidden: Request = ask(16);
-        hidden.secret = true;
-        val misuse_before: i64      = pool.misuse;
-        val refused:       Acquired = source_acquire(?over_pool, ?account, hidden, false);
-        if (!sel refused.reason.misuse || pool.misuse != misuse_before + 1) { ret 31; }
-        var spare: Chunk;
-        val set:   Acquired = source_acquire_n(?over_pool, ?account, ?hidden, 1, ?spare, false);
-        if (!sel set.reason.misuse)                                                    { ret 32; }
-        if (account.held != 0 || !is_none(source_close_account(?over_pool, ?account))) { ret 33; }
-        var stub: Stub;
-        var own:  Source = Source{
-            ctx:              (?stub)::ptr,
-            fn_open_account:  stub_open,
-            fn_close_account: stub_close,
-            fn_acquire:       stub_acquire,
-            fn_acquire_n:     stub_acquire_n,
-            fn_release:       stub_release,
-            fn_data:          stub_data,
-            fn_retain:        stub_retain,
-            fn_settle:        stub_settle,
-            fn_in_flight:     stub_in_flight,
-            fn_ready:         stub_ready,
-            fn_lanes:         stub_lanes,
-        };
-        val stubbed: i32 = consume(?own);
-        if (stubbed != 0) { ret 40 + stubbed; }
+        account_dnit(?pool, ?holder);
         ret 0;
     }
 
@@ -2680,8 +2598,8 @@ $if (capability.HOSTED) {
     #[testing]
     fun consume_secret(s: *SecretSource) i32 {
         var account: Account;
-        if (!is_none(secret_source_open_account(s, ?account, 5, budgets_of(4096), 0))) { ret 1; }
-        fin { secret_source_close_account(s, ?account); }
+        if (!is_none(secret_source_account_init(s, ?account, 5, budgets_of(4096), 0))) { ret 1; }
+        fin { secret_source_account_dnit(s, ?account); }
         var request: Request  = ask(64);
         val plain:   Acquired = secret_source_acquire(s, ?account, request, false);
         if (!sel plain.reason.misuse) { ret 2; }
@@ -2695,9 +2613,9 @@ $if (capability.HOSTED) {
             view[i] = 0x5a;
             i       = i + 1;
         }
-        if (secret_source_view_typed[TestKey](s, got.chunk, 1) != nil) { ret 8; }
-        if (!is_none(secret_source_release(s, ?account, got.chunk)))   { ret 5; }
-        if (secret_source_view(s, got.chunk) != nil)                   { ret 6; }
+        if (secret_source_view_typed[Key](s, got.chunk, 1) != nil)   { ret 8; }
+        if (!is_none(secret_source_release(s, ?account, got.chunk))) { ret 5; }
+        if (secret_source_view(s, got.chunk) != nil)                 { ret 6; }
         i = 0;
         for (i < 64) {
             if (view[i]:>u8 != 0) { ret 7; }
@@ -2706,28 +2624,30 @@ $if (capability.HOSTED) {
         # the same chunk again, seen as two keys through the source alone
         val typed: Acquired = secret_source_acquire(s, ?account, request, false);
         if (!sel typed.status.ok) { ret 9; }
-        val keys: *TestKey = secret_source_view_typed[TestKey](s, typed.chunk, 2);
-        if (keys == nil || secret_source_view_typed[TestKey](s, typed.chunk, 3) != nil) { ret 10; }
+        val keys: *Key = secret_source_view_typed[Key](s, typed.chunk, 2);
+        if (keys == nil || secret_source_view_typed[Key](s, typed.chunk, 3) != nil) { ret 10; }
         keys[1].key[3] = 0x77;
-        if (secret_source_view_typed[TestKey](s, typed.chunk, 2)[1].key[3]:>u64 != 0x77) { ret 11; }
-        if (secret_source_view(s, typed.chunk) != nil)                                   { ret 12; }
-        if (!is_none(secret_source_release(s, ?account, typed.chunk)))                   { ret 13; }
-        if (secret_source_view_typed[TestKey](s, typed.chunk, 2) != nil)                 { ret 14; }
-        if (keys[1].key[3]:>u64 != 0)                                                    { ret 15; }
+        if (secret_source_view_typed[Key](s, typed.chunk, 2)[1].key[3]:>u64 != 0x77) { ret 11; }
+        if (secret_source_view(s, typed.chunk) != nil)                               { ret 12; }
+        if (!is_none(secret_source_release(s, ?account, typed.chunk)))               { ret 13; }
+        if (secret_source_view_typed[Key](s, typed.chunk, 2) != nil)                 { ret 14; }
+        if (keys[1].key[3]:>u64 != 0)                                                { ret 15; }
         ret 0;
     }
 
     test buffers__a_secret_consumer_runs_through_secretsource_alone {
+        # a host that cannot lock serves secret storage only once accepted, and locking is not what this checks
+        secret_memory.accept_unlocked();
         var arena: Arena;
-        if (!arena_make(?arena, 1 << 20)) { ret 1; }
-        fin { arena_free(?arena); }
+        if (!arena_init(?arena, 1 << 20)) { ret 1; }
+        fin { arena_dnit(?arena); }
         var classes: [2]ClassConfig = [2]ClassConfig{
             ClassConfig{size: 64, align: 0, secret: false, high_water: 1},
             ClassConfig{size: 64, align: 0, secret: true, high_water: 1},
         };
         var pool: Pool;
-        if (!make(?pool, test_config(?classes[0], 2, 1 << 16), ?arena.counted)) { ret 2; }
-        fin { destroy(?pool); }
+        if (!init(?pool, config(?classes[0], 2, 1 << 16), ?arena.counted)) { ret 2; }
+        fin { dnit(?pool); }
         var secrets: SecretSource = secret_source(?pool);
         if (secret_source_lanes(?secrets) != 2) { ret 8; }
         val result: i32 = consume_secret(?secrets);
@@ -2735,99 +2655,21 @@ $if (capability.HOSTED) {
         # a plain chunk is not released through the secret surface
         var plain:   Source = source(?pool);
         var account: Account;
-        if (!is_none(source_open_account(?plain, ?account, 1, budgets_of(4096), 0))) { ret 3; }
+        if (!is_none(source_account_init(?plain, ?account, 1, budgets_of(4096), 0))) { ret 3; }
         val held: Acquired = source_acquire(?plain, ?account, ask(16), false);
         if (!sel held.status.ok)                                               { ret 4; }
         if (!is_misuse(secret_source_release(?secrets, ?account, held.chunk))) { ret 5; }
         if (!is_none(source_release(?plain, ?account, held.chunk)))            { ret 6; }
-        if (!is_none(source_close_account(?plain, ?account)))                  { ret 7; }
-        ret 0;
-    }
-
-    # a backing that refuses to take memory back is counted, and the chunk is
-    # still given up by its account (#779)
-    test buffers__a_refused_backing_release_is_counted_in_the_snapshot {
-        var arena: Arena;
-        if (!arena_make(?arena, 1 << 20)) { ret 1; }
-        fin { arena_free(?arena); }
-        var classes: [1]ClassConfig = [1]ClassConfig{
-            ClassConfig{size: 64, align: 0, secret: false, high_water: 0},
-        };
-        var pool: Pool;
-        if (!make(?pool, test_config(?classes[0], 1, 1 << 16), ?arena.counted)) { ret 2; }
-        fin { destroy(?pool); }
-        var account: Account;
-        if (!is_none(open_account(?pool, ?account, 1, budgets_of(1 << 15), 0))) { ret 3; }
-        fin { close_account(?pool, ?account); }
-        val sized: Acquired = acquire(?pool, ?account, ask(16), false);
-        val large: Acquired = acquire(?pool, ?account, ask(8192), false);
-        if (!sel sized.status.ok || !sel large.status.ok) { ret 4; }
-        var snap: Snapshot;
-        snapshot(?pool, ?snap);
-        if (snap.release_failures != 0) { ret 5; }
-        arena.count.refuse_free = true;
-        if (!is_none(release(?pool, ?account, sized.chunk)) || !is_none(release(?pool, ?account, large.chunk))) { ret 6; }
-        arena.count.refuse_free = false;
-        snapshot(?pool, ?snap);
-        if (snap.release_failures != 2 || account.held != 0 || account.chunks != 0) { ret 7; }
-        ret 0;
-    }
-
-    # a nil source or one with a member left unset refuses through its own
-    # surface instead of crashing (#778)
-    test buffers__the_source_wrappers_refuse_a_nil_or_partial_source {
-        var account: Account;
-        var handles: [1]u64;
-        var chunk:   Chunk;
-        val ref:     Ref     = Ref{index: 0, generation: 1};
-        var request: Request = ask(16);
-        var partial: Source  = Source{
-            ctx:              nil,
-            fn_open_account:  nil,
-            fn_close_account: nil,
-            fn_acquire:       nil,
-            fn_acquire_n:     nil,
-            fn_release:       nil,
-            fn_data:          nil,
-            fn_retain:        nil,
-            fn_settle:        nil,
-            fn_in_flight:     nil,
-            fn_ready:         nil,
-        };
-        var round: usize = 0;
-        for (round < 2) {
-            var s: *Source = nil;
-            if (round == 1)                                                         { s = ?partial; }
-            if (!is_misuse(source_open_account(s, ?account, 1, budgets_of(64), 0))) { ret 10; }
-            if (!is_misuse(source_close_account(s, ?account)))                      { ret 11; }
-            val one: Acquired = source_acquire(s, ?account, request, false);
-            val set: Acquired = source_acquire_n(s, ?account, ?request, 1, ?chunk, false);
-            if (!sel one.reason.misuse || !sel one.status.error)                        { ret 12; }
-            if (!sel set.reason.misuse || !sel set.status.error)                        { ret 13; }
-            if (!is_misuse(source_release(s, ?account, chunk)))                         { ret 14; }
-            if (source_data(s, ref) != nil)                                             { ret 15; }
-            if (!is_misuse(source_retain(s, ref)) || !is_misuse(source_settle(s, ref))) { ret 16; }
-            if (source_in_flight(s, ref) || source_ready(s, ?handles[0], 1) != 0)       { ret 17; }
-            if (source_lanes(s) != 0)                                                   { ret 18; }
-            round = round + 1;
-        }
-        var secret: SecretSource = SecretSource{
-            ctx: nil, fn_open_account: nil, fn_close_account: nil, fn_acquire: nil, fn_release: nil, fn_view: nil,
-        };
-        round = 0;
-        for (round < 2) {
-            var s: *SecretSource = nil;
-            if (round == 1)                                                                { s = ?secret; }
-            if (!is_misuse(secret_source_open_account(s, ?account, 1, budgets_of(64), 0))) { ret 20; }
-            if (!is_misuse(secret_source_close_account(s, ?account)))                      { ret 21; }
-            val one: Acquired = secret_source_acquire(s, ?account, request, false);
-            if (!sel one.reason.misuse || !sel one.status.error)       { ret 22; }
-            if (!is_misuse(secret_source_release(s, ?account, chunk))) { ret 23; }
-            if (secret_source_view(s, chunk) != nil)                   { ret 24; }
-            if (secret_source_lanes(s) != 0)                           { ret 25; }
-            if (secret_source_view_typed[TestKey](s, chunk, 1) != nil) { ret 26; }
-            round = round + 1;
-        }
+        # and a secret request is refused as counted misuse on the plain surface, alone or in a set
+        var hidden: Request = ask(16);
+        hidden.secret = true;
+        val misuse_before: i64      = pool.misuse;
+        val refused:       Acquired = source_acquire(?plain, ?account, hidden, false);
+        if (!sel refused.reason.misuse || pool.misuse != misuse_before + 1) { ret 9; }
+        var spare: Chunk;
+        val set:   Acquired = source_acquire_n(?plain, ?account, ?hidden, 1, ?spare, false);
+        if (!sel set.reason.misuse || account.held != 0)     { ret 10; }
+        if (!is_none(source_account_dnit(?plain, ?account))) { ret 7; }
         ret 0;
     }
 
@@ -2836,17 +2678,17 @@ $if (capability.HOSTED) {
     # chunk is refused once the table grows again
     test buffers__held_slots_survive_a_shrink_and_stale_refs_stay_refused_after_regrowth {
         var arena: Arena;
-        if (!arena_reclaiming_make(?arena, 4 << 20)) { ret 1; }
-        fin { arena_free(?arena); }
+        if (!arena_reclaiming_init(?arena, 4 << 20)) { ret 1; }
+        fin { arena_dnit(?arena); }
         var classes: [1]ClassConfig = [1]ClassConfig{
             ClassConfig{size: 64, align: 0, secret: false, high_water: 0},
         };
         var pool: Pool;
-        if (!make(?pool, test_config(?classes[0], 1, 1 << 22), ?arena.counted)) { ret 2; }
-        fin { destroy(?pool); }
+        if (!init(?pool, config(?classes[0], 1, 1 << 22), ?arena.counted)) { ret 2; }
+        fin { dnit(?pool); }
         var account: Account;
-        if (!is_none(open_account(?pool, ?account, 1, budgets_of(1 << 22), 0))) { ret 3; }
-        fin { close_account(?pool, ?account); }
+        if (!is_none(account_init(?pool, ?account, 1, budgets_of(1 << 22), 0))) { ret 3; }
+        fin { account_dnit(?pool, ?account); }
         var held: [64]Chunk;
         var i:    usize = 0;
         for (i < 64) {
@@ -2897,17 +2739,17 @@ $if (capability.HOSTED) {
     # the backing
     test buffers__retained_chunks_move_below_a_drained_peak_and_are_reused {
         var arena: Arena;
-        if (!arena_reclaiming_make(?arena, 4 << 20)) { ret 1; }
-        fin { arena_free(?arena); }
+        if (!arena_reclaiming_init(?arena, 4 << 20)) { ret 1; }
+        fin { arena_dnit(?arena); }
         var classes: [1]ClassConfig = [1]ClassConfig{
             ClassConfig{size: 64, align: 0, secret: false, high_water: 4},
         };
         var pool: Pool;
-        if (!make(?pool, test_config(?classes[0], 1, 1 << 22), ?arena.counted)) { ret 2; }
-        fin { destroy(?pool); }
+        if (!init(?pool, config(?classes[0], 1, 1 << 22), ?arena.counted)) { ret 2; }
+        fin { dnit(?pool); }
         var account: Account;
-        if (!is_none(open_account(?pool, ?account, 1, budgets_of(1 << 22), 0))) { ret 3; }
-        fin { close_account(?pool, ?account); }
+        if (!is_none(account_init(?pool, ?account, 1, budgets_of(1 << 22), 0))) { ret 3; }
+        fin { account_dnit(?pool, ?account); }
         var held: [64]Chunk;
         var i:    usize = 0;
         for (i < 64) {
@@ -2953,20 +2795,20 @@ $if (capability.HOSTED) {
     }
 
     # #878: a load crossing a slot chunk boundary back and forth keeps the empty
-    # chunk above it as slack, so only the first crossing grows the table, and
-    # the same holds for a reservation crossing it
-    test buffers__a_load_oscillating_across_a_slot_chunk_boundary_grows_the_table_once {
+    # chunk above it as slack, and the same holds for a reservation crossing it.
+    # two crossings each way: a second one would grow or trim if the first left it wrong
+    test buffers__a_load_oscillating_across_a_slot_chunk_boundary_keeps_one_chunk_of_slack {
         var arena: Arena;
-        if (!arena_reclaiming_make(?arena, 4 << 20)) { ret 1; }
-        fin { arena_free(?arena); }
+        if (!arena_reclaiming_init(?arena, 4 << 20)) { ret 1; }
+        fin { arena_dnit(?arena); }
         var classes: [1]ClassConfig = [1]ClassConfig{
             ClassConfig{size: 64, align: 0, secret: false, high_water: 0},
         };
         var pool: Pool;
-        if (!make(?pool, test_config(?classes[0], 1, 1 << 22), ?arena.counted)) { ret 2; }
-        fin { destroy(?pool); }
+        if (!init(?pool, config(?classes[0], 1, 1 << 22), ?arena.counted)) { ret 2; }
+        fin { dnit(?pool); }
         var account: Account;
-        if (!is_none(open_account(?pool, ?account, 1, budgets_of(1 << 22), 0))) { ret 3; }
+        if (!is_none(account_init(?pool, ?account, 1, budgets_of(1 << 22), 0))) { ret 3; }
         var held: [5]Chunk;
         var i:    usize = 0;
         for (i < 4) {
@@ -2976,27 +2818,20 @@ $if (capability.HOSTED) {
             i       = i + 1;
         }
         if (pool.slots.capacity != 4) { ret 5; }
-        # each crossing costs one payload allocation and nothing more
-        var allocs: usize = 0;
-        var round:  usize = 0;
-        for (round < 100) {
+        var round: usize = 0;
+        for (round < 2) {
             val got: Acquired = acquire(?pool, ?account, ask(64), false);
-            if (!status_ok(got)) { ret 6; }
-            if (round == 0)      { allocs = arena.count.allocs; }
-            or {
-                allocs = allocs + 1;
-                if (arena.count.allocs != allocs) { ret 7; }
-            }
+            if (!status_ok(got))                               { ret 6; }
             if (!is_none(release(?pool, ?account, got.chunk))) { ret 8; }
             if (pool.slots.chunk_count != 2)                   { ret 9; }
             round = round + 1;
         }
         var other: Account;
         round = 0;
-        for (round < 100) {
-            if (!is_none(open_account(?pool, ?other, 2, budgets_of(64), 64))) { ret 10; }
-            if (!is_none(close_account(?pool, ?other)))                       { ret 11; }
-            if (arena.count.allocs != allocs || pool.slots.chunk_count != 2)  { ret 12; }
+        for (round < 2) {
+            if (!is_none(account_init(?pool, ?other, 2, budgets_of(64), 64))) { ret 10; }
+            if (!is_none(account_dnit(?pool, ?other)))                        { ret 11; }
+            if (pool.slots.chunk_count != 2)                                  { ret 12; }
             round = round + 1;
         }
         i = 0;
@@ -3004,7 +2839,7 @@ $if (capability.HOSTED) {
             if (!is_none(release(?pool, ?account, held[i]))) { ret 13; }
             i = i + 1;
         }
-        if (!is_none(close_account(?pool, ?account)) || pool.slots.chunk_count != 1) { ret 14; }
+        if (!is_none(account_dnit(?pool, ?account)) || pool.slots.chunk_count != 1) { ret 14; }
         ret 0;
     }
 
@@ -3030,19 +2865,19 @@ $if (capability.HOSTED) {
     # slot is written first when a chunk takes it
     test buffers__a_reservation_s_slots_are_written_only_once_taken {
         var arena: Arena;
-        if (!arena_make(?arena, 4 << 20)) { ret 1; }
-        fin { arena_free(?arena); }
+        if (!arena_init(?arena, 4 << 20)) { ret 1; }
+        fin { arena_dnit(?arena); }
         val paint: u8 = 0xa5;
         memory.raw_fill(arena.base, paint, arena.bytes);
         var classes: [1]ClassConfig = [1]ClassConfig{
             ClassConfig{size: 64, align: 0, secret: false, high_water: 0},
         };
         var pool: Pool;
-        if (!make(?pool, test_config(?classes[0], 1, 1 << 30), ?arena.counted)) { ret 2; }
-        fin { destroy(?pool); }
+        if (!init(?pool, config(?classes[0], 1, 1 << 30), ?arena.counted)) { ret 2; }
+        fin { dnit(?pool); }
         if (slots_written(?pool, paint) != 0) { ret 3; }
         var account: Account;
-        if (!is_none(open_account(?pool, ?account, 1, budgets_of(64 * 4096), 64 * 4096))) { ret 4; }
+        if (!is_none(account_init(?pool, ?account, 1, budgets_of(64 * 4096), 64 * 4096))) { ret 4; }
         if (pool.slots.capacity < 4096)                                                   { ret 5; }
         if (slots_written(?pool, paint) != 0)                                             { ret 6; }
         var held: [3]Chunk;
@@ -3067,7 +2902,58 @@ $if (capability.HOSTED) {
             if (!is_none(release(?pool, ?account, held[i]))) { ret 10; }
             i = i + 1;
         }
-        if (!is_none(close_account(?pool, ?account))) { ret 11; }
+        if (!is_none(account_dnit(?pool, ?account))) { ret 11; }
+        ret 0;
+    }
+
+    # a fixed arena of exactly the bound holds the pool and its chunks, a config
+    # without its arrays is refused, and a class or a count whose bytes pass the
+    # top of usize is refused as overflow, not counted short
+    test arena_bytes__bounds_a_fixed_arena_and_refuses_what_overflows {
+        var classes: [2]ClassConfig = [2]ClassConfig{
+            ClassConfig{size: 100, align: 0, secret: false, high_water: 4},
+            ClassConfig{size: 512, align: 0, secret: false, high_water: 4},
+        };
+        var chunks:    [2]usize            = [2]usize{3, 2};
+        val res_bytes: res[usize, A.Error] = arena_bytes(config(?classes[0], 2, 1 << 20), ?chunks[0]);
+        if (sel res_bytes.err) { ret 1; }
+        var arena: Arena;
+        if (!arena_init(?arena, res_bytes.ok)) { ret 2; }
+        fin { arena_dnit(?arena); }
+        var pool: Pool;
+        if (!init(?pool, config(?classes[0], 2, 1 << 20), ?arena.counted)) { ret 3; }
+        fin { dnit(?pool); }
+        var account: Account;
+        if (!is_none(account_init(?pool, ?account, 1, budgets_of(1 << 20), 0))) { ret 4; }
+        var held: [5]Chunk;
+        var i:    usize = 0;
+        for (i < 5) {
+            var bytes: usize = 100;
+            if (i >= 3) { bytes = 512; }
+            val got: Acquired = acquire(?pool, ?account, ask(bytes), false);
+            if (!status_ok(got)) { ret 10 + i::i32; }
+            held[i] = got.chunk;
+            i       = i + 1;
+        }
+        i = 0;
+        for (i < 5) {
+            release(?pool, ?account, held[i]);
+            i = i + 1;
+        }
+        account_dnit(?pool, ?account);
+
+        val res_invalid: res[usize, A.Error] = arena_bytes(config(nil, 2, 1 << 20), ?chunks[0]);
+        if (!sel res_invalid.err)         { ret 5; }
+        if (!sel res_invalid.err.invalid) { ret 5; }
+        classes[1].size = ~(0::usize) - 15;
+        val res_class: res[usize, A.Error] = arena_bytes(config(?classes[0], 2, 1 << 20), ?chunks[0]);
+        if (!sel res_class.err)          { ret 6; }
+        if (!sel res_class.err.overflow) { ret 6; }
+        classes[1].size = 512;
+        chunks[1]       = ~(0::usize) / 64;
+        val res_count: res[usize, A.Error] = arena_bytes(config(?classes[0], 2, 1 << 20), ?chunks[0]);
+        if (!sel res_count.err)          { ret 7; }
+        if (!sel res_count.err.overflow) { ret 7; }
         ret 0;
     }
 }

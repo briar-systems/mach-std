@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [10.0.0] - 2026-11-23
+
+### Added
+
+- WASI Preview 1 (`wasi-wasm32`) runtime, entrypoint, `memory.grow` page allocation, plain single-threaded atomics, and capability-gated standard library surface (#1111).
+- Windows ARM64 (`windows-aarch64`) runtime and main-thread TLS teardown (#1107).
+- Linux RISC-V 32 (`linux-riscv32`) runtime and thread-local storage (#1105).
+- Freestanding runtime startup taking stack bounds from `mink`, FP/SIMD/SSE initialization across `x86_64`, `aarch64`, and `riscv64`, and timing availability publication (#1100, #1126, #1137).
+- Time of day, local date-time, and RFC 3339 reader support in `std.chrono`.
+- Per-thread TLS allocation wiped on exit and lifetime allocation counters on `std.allocator.heap` (#1109, #1133).
+- `std.terminal.is_terminal` (#899) and wide integer parsing/formatting for `u256`, `i256`, `u512`, and `i512` (#1110).
+
+### Changed
+
+- **Breaking:** Migrated the library manifest, target qualifiers, and source tree to Mach 7 (`#1005`). See `MIGRATION.md` for the full rename guide.
+- **Breaking:** Moved cryptographic hashing, DEFLATE/zlib/gzip compression, TOML, and JSON out of `std` into standalone packages.
+- **Breaking:** Unified lifecycle and cleanup names across modules and standardized callback fields with the `fn_` prefix.
+- **Breaking:** Rewrote `std.args` as a plain argument parser with help, version, reserved short options, and structured exit codes (#1150).
+- **Breaking:** Moved child process lifecycles to wait queues (requiring Linux 5.10 as the minimum kernel floor) and updated name resolution to take a cancellation scope.
+- **Breaking:** Split secret memory management across focused modules backed by locked mappings, `$zeroize` wiping, and structured allocation errors (#1019, #1115).
+- Span sources grant sizes within a requested range and heap pools track retained spans under a byte budget.
+- Faster whole-file buffered reads (#988) and constant-time borrow entry allocation (#926).
+
+### Fixed
+
+- Windows `os.sleep` uses high-resolution waitable timers to avoid 15.6 ms system clock quantization.
+- Fixed loader-hosted startup and page-size discovery (#916, #1145), naked entry/thread trampolines (#1104), Darwin Mach-O asm symbols (#1109), aarch64 SHA-256 byte-swap asm (#1141), and macOS/Windows hardware test compatibility.
+
 ## [9.5.0] - 2026-10-03
 
 ### Added

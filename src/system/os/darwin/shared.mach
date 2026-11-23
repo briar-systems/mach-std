@@ -3,13 +3,14 @@
 # contains types, constants and every OS primitive, each a call into
 # libSystem (std.system.os.darwin.libsystem): no darwin primitive issues a
 # trap, because apple promises none. arch-specific modules provide only
-# page_size and pipe.
+# pipe.
 
+use std.crypto.ct;
 use io_error: std.io.error;
 use std.sync.atomic;
 use cpu_features_: std.system.cpu.features;
-use std.system.dit;
-use identities: std.system.file_identity;
+use identities:    std.system.file_identity;
+use std.system.os.shared.Environment;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -19,7 +20,7 @@ use std.types.string.str;
 use std.types.string.str_len;
 use std.types.string.str_starts_with;
 
-$if ($mach.build.os != $mach.os.darwin) {
+$if ($mach.build.sys != $mach.sys.darwin) {
     $error("std.system.os.darwin.shared: requires darwin target");
 }
 
@@ -110,6 +111,13 @@ pub rec timespec {
     tv_nsec: i64;
 }
 
+# an open directory enumeration, which directory_init fills in place
+# ---
+# address: the cursor's own address, so a moved or foreign cursor is refused
+# active:  set from directory_init until directory_dnit
+# ended:   set once the stream reported its end
+# error:   the sticky negative errno of a failed read, 0 before one
+# stream:  the libSystem stream over a duplicate of the caller's descriptor
 pub rec DirectoryCursor {
     address: usize;
     active:  bool;
@@ -187,6 +195,7 @@ pub val ELOOP:        i64 = -62;
 pub val ENAMETOOLONG: i64 = -63;
 pub val ENOTEMPTY:    i64 = -66;
 pub val ENOTSUP:      i64 = -45;
+pub val ENOSYS:       i64 = -78;
 pub val ERANGE:       i64 = -34;
 pub val EADDRINUSE:   i64 = -48;
 pub val ENETUNREACH:  i64 = -51;
@@ -205,24 +214,19 @@ pub val EINTR_MAX_RETRIES: usize = 8;
 # exit the process with the given code
 #
 # `_exit(2)`, not `exit(3)`: std registers no atexit handlers and the raw
-# trap this replaces ran none. the trap after it is unreachable and kept only
-# as a guard; it is not the terminator.
+# trap this replaces ran none. `_exit` is declared `noreturn`, so nothing follows it.
 # ---
 # code: exit code
+#[noreturn]
 pub fun terminate(code: i64) {
     ls._exit(code::i32);
-    $if ($mach.build.arch == $mach.arch.x86_64) {
-        asm x86_64 { hlt }
-    }
-    $or ($mach.build.arch == $mach.arch.aarch64) {
-        asm aarch64 { brk 0 }
-    }
 }
 
 # abort the process immediately with exit code 255
 #
 # the process-wide SIGABRT is what a debugger or crash reporter sees; if it
 # is ignored or handled, the exit below still ends the process.
+#[noreturn]
 pub fun abort() {
     ls.kill(ls.getpid(), SIGABRT);
     terminate(255);
@@ -230,6 +234,10 @@ pub fun abort() {
 
 # memory
 
+# map anonymous read-write memory
+# ---
+# size: bytes to map
+# ret:  the mapping, or nil when size is 0 or mmap fails
 pub fun allocate(size: usize) ptr {
     if (size == 0) {
         ret nil;
@@ -239,6 +247,11 @@ pub fun allocate(size: usize) ptr {
     ret mapped;
 }
 
+# unmap memory allocate mapped
+# ---
+# p:    the mapping, nil returns 0
+# size: the size it was mapped with, 0 returns 0
+# ret:  0 on success, or negative errno
 pub fun deallocate(p: ptr, size: usize) i64 {
     if (p == nil || size == 0) {
         ret 0;
@@ -246,6 +259,37 @@ pub fun deallocate(p: ptr, size: usize) i64 {
     val result: i32 = ls.munmap(p, size);
     if (result == -1) { ret ls.fail_errno(); }
     ret result::i64;
+}
+
+# map storage for secret-welded data: span locked bytes between two
+# inaccessible guard pages, page aligned and zero-filled
+#
+# xnu has no per-mapping dump exclusion, so locking keeps the span out of swap
+# and nothing more. a refused lock is reported as one, never served unlocked
+# ---
+# span:    usable bytes, a nonzero multiple of page
+# page:    the page size
+# out:     receives the first usable byte, one page past the mapping's start
+# locking: set when the failure was the kernel refusing to lock the span
+# ret:     0, or the negative errno of the step that failed, with nothing mapped
+pub fun map_secret(span: usize, page: usize, out: *ptr, locking: *bool) i64 {
+    @locking = false;
+    val total:    usize = span + 2 * page;
+    val reserved: ptr   = ls.mmap(nil, total, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (reserved::usize == (-1)::isize::usize) { ret ls.fail_errno(); }
+    val data: ptr = (reserved::usize + page)::ptr;
+    var code: i64 = 0;
+    if (ls.mprotect(data, span, PROT_READ | PROT_WRITE) == -1) { code = ls.fail_errno(); }
+    or (ls.mlock(data, span) == -1) {
+        code     = ls.fail_errno();
+        @locking = true;
+    }
+    if (code < 0) {
+        ls.munmap(reserved, total);
+        ret code;
+    }
+    @out = data;
+    ret 0;
 }
 
 # darwin has no mremap, allocate new, copy, free old
@@ -274,10 +318,34 @@ pub fun reallocate(p: ptr, old_size: usize, new_size: usize) ptr {
     ret new_p;
 }
 
+$if ($mach.build.arch == $mach.arch.aarch64) {
+    # the size of a page, 16 KiB on apple silicon
+    pub fun page_size() usize {
+        ret 16384;
+    }
+}
+$or ($mach.build.arch == $mach.arch.x86_64) {
+    # the size of a page, 4 KiB on intel
+    pub fun page_size() usize {
+        ret 4096;
+    }
+}
+
+# the alignment map_file requires of an offset, the page size
+pub fun map_alignment() usize {
+    ret page_size();
+}
+
 # darwin has no brk, simulate with mmap reserve + mprotect commit
 var _brk_base: usize = 0;
 var _brk_end:  usize = 0;
 
+# the current end of the simulated program break
+#
+# the first call reserves HEAP_RESERVE bytes of inaccessible address space, and
+# the break starts at its base
+# ---
+# ret: the current break address, or 0 when the reservation fails
 pub fun heap_region_base() usize {
     if (_brk_base != 0) {
         ret _brk_end;
@@ -289,6 +357,14 @@ pub fun heap_region_base() usize {
     ret _brk_end;
 }
 
+# move the simulated program break up to addr
+#
+# the pages between the old and the new break are made read-write. the break
+# never moves down and never past the reserve
+# ---
+# addr: the desired break address
+# ret:  the break after the call, unchanged when addr is not above it, lies past
+#       the reserve or the commit fails, or 0 when the reserve cannot be made
 pub fun heap_region_extend(addr: usize) usize {
     if (_brk_base == 0) {
         heap_region_base();
@@ -302,37 +378,69 @@ pub fun heap_region_extend(addr: usize) usize {
     if (addr > _brk_base + os_shared.HEAP_RESERVE) {
         ret _brk_end;
     }
-    val size:   usize = addr - _brk_end;
-    val result: i32   = ls.mprotect(_brk_end::ptr, size, PROT_READ | PROT_WRITE);
+    # mprotect needs a page aligned start, so the end stays on a page boundary
+    val page:   usize = page_size();
+    val end:    usize = (addr + page - 1) & ~(page - 1);
+    val result: i32   = ls.mprotect(_brk_end::ptr, end - _brk_end, PROT_READ | PROT_WRITE);
     if (result == -1) { ret _brk_end; }
-    _brk_end = addr;
+    _brk_end = end;
     ret _brk_end;
 }
 
+# change the protection of a memory region
+# ---
+# p:    page-aligned start of the region
+# size: region size in bytes
+# prot: PROT_* bits
+# ret:  0 on success, or negative errno
 pub fun protect(p: ptr, size: usize, prot: u32) i64 {
     val result: i32 = ls.mprotect(p, size, prot::i32);
     if (result == -1) { ret ls.fail_errno(); }
     ret result::i64;
 }
 
+# lock a memory region into physical memory, keeping it out of swap
+# ---
+# p:    start of the region
+# size: region size in bytes
+# ret:  0 on success, or negative errno
 pub fun lock(p: ptr, size: usize) i64 {
     val result: i32 = ls.mlock(p, size);
     if (result == -1) { ret ls.fail_errno(); }
     ret result::i64;
 }
 
+# unlock a memory region lock locked
+# ---
+# p:    start of the region
+# size: region size in bytes
+# ret:  0 on success, or negative errno
 pub fun unlock(p: ptr, size: usize) i64 {
     val result: i32 = ls.munlock(p, size);
     if (result == -1) { ret ls.fail_errno(); }
     ret result::i64;
 }
 
+# advise the kernel how a memory region will be accessed
+# ---
+# p:      start of the region
+# size:   region size in bytes
+# advice: MADV_* value
+# ret:    0 on success, or negative errno
 pub fun advise(p: ptr, size: usize, advice: u32) i64 {
     val result: i32 = ls.madvise(p, size, advice::i32);
     if (result == -1) { ret ls.fail_errno(); }
     ret result::i64;
 }
 
+# map part of a file into memory, shared with the file
+# ---
+# fd:     file descriptor to map
+# offset: byte offset into the file, a multiple of map_alignment()
+# size:   bytes to map
+# prot:   PROT_* bits
+# ret:    the mapping, or nil when size is 0, offset is above i64 range or mmap
+#         fails
 pub fun map_file(fd: i32, offset: usize, size: usize, prot: u32) ptr {
     if (size == 0) {
         ret nil;
@@ -343,6 +451,11 @@ pub fun map_file(fd: i32, offset: usize, size: usize, prot: u32) ptr {
     ret mapped;
 }
 
+# flush a shared file mapping to its file and wait for the write
+# ---
+# p:    start of the mapped region, nil returns 0
+# size: region size in bytes, 0 returns 0
+# ret:  0 on success, or negative errno
 pub fun sync_file(p: ptr, size: usize) i64 {
     if (p == nil || size == 0) {
         ret 0;
@@ -362,6 +475,19 @@ pub fun environ() **u8 {
     ret _envp::**u8;
 }
 
+# the array a spawn or exec hands the kernel before the runtime captured one
+var _no_environment: usize = 0;
+
+# the array a spawn or exec hands the kernel: the given one, or for inherit the
+# envp the kernel gave this process, unconverted
+# ---
+# ret: the array, or nil for a nil given array, which every spawn and exec refuses
+fun exec_environment(envp: Environment) **u8 {
+    if (sel envp.given) { ret envp.given; }
+    if (_envp == 0)     { ret (?_no_environment)::**u8; }
+    ret _envp::**u8;
+}
+
 # filesystem
 #
 # every primitive below calls libSystem and rebuilds this module's outward
@@ -370,6 +496,16 @@ pub fun environ() **u8 {
 # return value has already reported failure, because a successful call does not
 # clear it; see std.system.os.darwin.libsystem.
 
+# read bytes from a descriptor
+#
+# a call EINTR interrupts is tried again, for at most EINTR_MAX_RETRIES attempts
+# in all
+# ---
+# fd:    file descriptor
+# buf:   destination buffer
+# count: most bytes to read
+# ret:   bytes read, 0 at end of file, or negative errno (EINTR once the retries
+#        run out)
 pub fun read(fd: i32, buf: *u8, count: usize) i64 {
     var retries: usize = 0;
     for (retries < EINTR_MAX_RETRIES) {
@@ -382,10 +518,40 @@ pub fun read(fd: i32, buf: *u8, count: usize) i64 {
     ret EINTR;
 }
 
+# write bytes to a descriptor
+#
+# a call EINTR interrupts is tried again, for at most EINTR_MAX_RETRIES attempts
+# in all
+# ---
+# fd:    file descriptor
+# buf:   source bytes
+# count: bytes to write
+# ret:   bytes written, or negative errno (EINTR once the retries run out)
 pub fun write(fd: i32, buf: *u8, count: usize) i64 {
     var retries: usize = 0;
     for (retries < EINTR_MAX_RETRIES) {
         val res: i64 = ls.write(fd, buf, count);
+        if (res >= 0) { ret res; }
+        val e: i64 = ls.fail_errno();
+        if (e != EINTR) { ret e; }
+        retries = retries + 1;
+    }
+    ret EINTR;
+}
+
+# write several buffers to a file descriptor in order, in one call
+#
+# a call EINTR interrupts is tried again, for at most EINTR_MAX_RETRIES attempts
+# in all
+# ---
+# fd:      file descriptor
+# vectors: the buffers, in order
+# count:   number of buffers
+# ret:     bytes written, which may stop short of the whole, or negative errno
+pub fun write_vector(fd: i32, vectors: *IoVector, count: usize) i64 {
+    var retries: usize = 0;
+    for (retries < EINTR_MAX_RETRIES) {
+        val res: i64 = ls.writev(fd, vectors, count::i32);
         if (res >= 0) { ret res; }
         val e: i64 = ls.fail_errno();
         if (e != EINTR) { ret e; }
@@ -408,6 +574,16 @@ pub fun read_at(fd: i32, buf: *u8, count: usize, offset: u64) i64 {
     ret EINTR;
 }
 
+# write bytes at a file offset without moving the descriptor offset
+#
+# a call EINTR interrupts is tried again, for at most EINTR_MAX_RETRIES attempts
+# in all
+# ---
+# fd:     file descriptor
+# buf:    source bytes
+# count:  bytes to write
+# offset: file offset to write at, above i64 range is EINVAL
+# ret:    bytes written, or negative errno (EINTR once the retries run out)
 pub fun write_at(fd: i32, buf: *u8, count: usize, offset: u64) i64 {
     if (offset > 0x7fffffffffffffff) { ret EINVAL; }
     var retries: usize = 0;
@@ -468,22 +644,40 @@ pub fun sync_fd(fd: i32) i64 {
     ret 0;
 }
 
+# set a file's permission bits through an open descriptor
+# ---
+# fd:   file descriptor
+# mode: permission bits
+# ret:  0 on success, or negative errno
 pub fun set_mode(fd: i32, mode: i32) i64 {
     if (ls.fchmod(fd, mode::u32) < 0) { ret ls.fail_errno(); }
     ret 0;
 }
 
+# set the permission bits of a path relative to a directory, without following
+# a final symlink
+# ---
+# dirfd: directory descriptor, or AT_FDCWD
+# name:  null-terminated path, nil is EINVAL
+# mode:  permission bits
+# ret:   0 on success, or negative errno
 pub fun set_mode_at(dirfd: i32, name: *u8, mode: i32) i64 {
     if (name == nil)                                                  { ret EINVAL; }
     if (ls.fchmodat(dirfd, name, mode::u32, AT_SYMLINK_NOFOLLOW) < 0) { ret ls.fail_errno(); }
     ret 0;
 }
 
+# read an open file's metadata
+# ---
+# fd:  file descriptor
+# st:  receives the metadata
+# ret: 0 on success, or negative errno
 pub fun stat(fd: i32, st: *stat_t) i64 {
     if (ls.fstat(fd, st::usize::*u8) < 0) { ret ls.fail_errno(); }
     ret 0;
 }
 
+# the struct statfs layout fstatfs fills
 rec FilesystemInfo {
     block_size:       u32;
     io_size:          i32;
@@ -504,6 +698,13 @@ rec FilesystemInfo {
     reserved:         [7]u32;
 }
 
+# the cooperative publication capabilities of the filesystem holding fd
+#
+# only a local apfs or hfs volume has any, and it has PUBLICATION_CLAIMS and
+# PUBLICATION_READ_RETAIN_REPLACE
+# ---
+# fd:  an open descriptor on the filesystem
+# ret: the PUBLICATION_* bits, 0 when none applies, or negative errno
 pub fun publication_capabilities(fd: i32) i64 {
     var info: FilesystemInfo;
     if (ls.fstatfs(fd, (?info)::*u8) < 0) { ret ls.fail_errno(); }
@@ -550,6 +751,15 @@ pub fun retain_identity_at(dirfd: i32, path: *u8, access: identities.Access, out
     ret fd::i64;
 }
 
+# the identity of the object a path relative to a directory names, without
+# following a final symlink
+#
+# the identity is observational and retains nothing
+# ---
+# dirfd: directory descriptor, or AT_FDCWD
+# path:  null-terminated path, nil is EINVAL
+# out:   receives the identity, nil is EINVAL
+# ret:   0 on success, or negative errno
 pub fun identity_at(dirfd: i32, path: *u8, out: *identities.Identity) i64 {
     if (out == nil || path == nil) { ret EINVAL; }
     var st:     stat_t;
@@ -559,6 +769,13 @@ pub fun identity_at(dirfd: i32, path: *u8, out: *identities.Identity) i64 {
     ret 0;
 }
 
+# read a path's metadata relative to a directory
+# ---
+# dirfd: directory descriptor, or AT_FDCWD
+# path:  null-terminated path
+# st:    receives the metadata
+# flags: AT_SYMLINK_NOFOLLOW to describe a final symlink itself, or 0
+# ret:   0 on success, or negative errno
 pub fun stat_path(dirfd: i32, path: *u8, st: *stat_t, flags: i32) i64 {
     if (ls.fstatat(dirfd, path, st::usize::*u8, flags) < 0) { ret ls.fail_errno(); }
     ret 0;
@@ -575,6 +792,24 @@ pub fun stat_mode(st: *stat_t) u32 {
     ret st.st_mode::u32;
 }
 
+# the birth time of a stat record
+# ---
+# st:   pointer to a filled stat_t
+# sec:  receives unix seconds
+# nsec: receives nanoseconds past sec
+# ret:  true, darwin records a birth time for every file
+pub fun stat_birth(st: *stat_t, sec: *i64, nsec: *i64) bool {
+    @sec  = st.st_birthtime;
+    @nsec = st.st_birthtime_nsec;
+    ret true;
+}
+
+# remove a name relative to a directory
+# ---
+# dirfd: directory descriptor, or AT_FDCWD
+# path:  null-terminated path
+# flags: AT_REMOVEDIR to remove an empty directory, or 0
+# ret:   0 on success, or negative errno
 pub fun unlink(dirfd: i32, path: *u8, flags: i32) i64 {
     if (ls.unlinkat(dirfd, path, flags) < 0) { ret ls.fail_errno(); }
     ret 0;
@@ -601,6 +836,13 @@ pub fun lock_fd(fd: i32, op: i32) i64 {
     ret 0;
 }
 
+# rename a path, each side relative to its own directory
+# ---
+# olddir:  source directory descriptor, or AT_FDCWD
+# oldpath: source path
+# newdir:  destination directory descriptor, or AT_FDCWD
+# newpath: destination path
+# ret:     0 on success, or negative errno
 pub fun rename(olddir: i32, oldpath: *u8, newdir: i32, newpath: *u8) i64 {
     if (ls.renameat(olddir, oldpath, newdir, newpath) < 0) { ret ls.fail_errno(); }
     ret 0;
@@ -619,6 +861,12 @@ pub fun symlink(target: *u8, linkpath: *u8) i64 {
     ret 0;
 }
 
+# create a directory relative to a directory
+# ---
+# dirfd: directory descriptor, or AT_FDCWD
+# path:  null-terminated path
+# mode:  permission bits, before the umask
+# ret:   0 on success, or negative errno
 pub fun make_dir(dirfd: i32, path: *u8, mode: i32) i64 {
     if (ls.mkdirat(dirfd, path, mode::u32) < 0) { ret ls.fail_errno(); }
     ret 0;
@@ -646,11 +894,25 @@ pub fun directory_init(out: *DirectoryCursor, fd: i32) DirectoryInitResult {
     ret DirectoryInitResult{};
 }
 
+# record code as the cursor's sticky failure
+# ---
+# ret: code
 fun directory_failure(cursor: *DirectoryCursor, code: i64) i64 {
     cursor.error = code;
     ret code;
 }
 
+# read the next entry of a directory cursor
+#
+# a failure is sticky, so every later call returns the same code. a record
+# with an empty name, a name or terminator past its extent, or a null byte
+# inside the name is EIO
+# ---
+# cursor: a cursor directory_init activated
+# out:    receives the entry, whose name is borrowed until the next cursor
+#         operation
+# ret:    1 with an entry, 0 at the end, EINVAL for a cursor that is not active,
+#         or negative errno
 pub fun directory_next(cursor: *DirectoryCursor, out: *DirectoryEntry) i64 {
     if (cursor == nil || out == nil || cursor.address != cursor::usize || !cursor.active) { ret EINVAL; }
     if (cursor.error < 0)                                                                 { ret cursor.error; }
@@ -682,7 +944,7 @@ pub fun directory_next(cursor: *DirectoryCursor, out: *DirectoryEntry) i64 {
 }
 
 # closedir consumes its stream even when the underlying close fails
-pub fun directory_close(cursor: *DirectoryCursor) i64 {
+pub fun directory_dnit(cursor: *DirectoryCursor) i64 {
     if (cursor == nil || cursor.address != cursor::usize) { ret EINVAL; }
     if (!cursor.active)                                   { ret 0; }
     val stream: ls.DirectoryStream = cursor.stream;
@@ -692,6 +954,13 @@ pub fun directory_close(cursor: *DirectoryCursor) i64 {
     ret 0;
 }
 
+# check access to a path relative to a directory
+# ---
+# dirfd: directory descriptor, or AT_FDCWD
+# path:  null-terminated path
+# mode:  R_OK, W_OK and X_OK bits, or F_OK
+# flags: AT_* flags
+# ret:   0 when accessible, or negative errno
 pub fun access(dirfd: i32, path: *u8, mode: i32, flags: i32) i64 {
     if (ls.faccessat(dirfd, path, mode, flags) < 0) { ret ls.fail_errno(); }
     ret 0;
@@ -770,22 +1039,24 @@ pub fun fork() i64 {
     ret pid::i64;
 }
 
-# create a child process through vfork(2)
+# create a child process
 #
-# the wrapper promises the fork contract only; see the libsystem module.
+# darwin vfork(2) shares the parent's stack frame until exec/exit, so a normal
+# mach wrapper returning from it overwrites the parent's return address. this
+# wrapper forwards to fork(2), matching its documented fork-only contract.
 # ---
 # ret: child PID in the parent, 0 in the child, or negative errno
 pub fun vfork() i64 {
-    val pid: i32 = ls.vfork();
-    if (pid < 0) { ret ls.fail_errno(); }
-    ret pid::i64;
+    ret fork();
 }
 
 # replace the calling process image; returns only on failure
 # ---
 # ret: negative errno
-pub fun exec(pathname: *u8, argv: **u8, envp: **u8) i64 {
-    ls.execve(pathname, argv, envp);
+pub fun exec(pathname: *u8, argv: **u8, envp: Environment) i64 {
+    val environment: **u8 = exec_environment(envp);
+    if (environment == nil) { ret EINVAL; }
+    ls.execve(pathname, argv, environment);
     ret ls.fail_errno();
 }
 
@@ -797,6 +1068,8 @@ fun send_signal(pid: i64, sig: i32) i64 {
     ret 0;
 }
 
+# decode a raw wait status, where a low byte of 0x7f under a next byte of 0x13
+# is a continue rather than a stop
 fun decode_process_status(raw: i32) os_shared.ProcessStatus {
     ret os_shared.posix_status(raw, (raw & 0x7f) == 0x7f && (raw >> 8) == 0x13);
 }
@@ -818,6 +1091,13 @@ pub fun wait(pid: i64, status: *os_shared.ProcessStatus, options: i32, rusage: *
     ret os_shared.WaitResult{error: os_shared.ProcessWaitError{code: EINTR, operation: os_shared.PROCESS_OP_WAIT}};
 }
 
+# wait for a child to change state, as wait does without resource usage
+# ---
+# pid:     the child, or -1 for any child
+# status:  receives the decoded status when a child changed state, may be nil
+# options: WNOHANG, WUNTRACED, WCONTINUED
+# ret:     the pid of the child that changed state, 0 under WNOHANG when
+#          nothing changed, or an error tagged PROCESS_OP_WAIT
 pub fun wait_pid(pid: i64, status: *os_shared.ProcessStatus, options: i32) os_shared.WaitResult {
     ret wait(pid, status, options, nil);
 }
@@ -835,8 +1115,8 @@ pub fun wait_pid(pid: i64, status: *os_shared.ProcessStatus, options: i32) os_sh
 pub fun terminate_child(pid: i64) i64 {
     if (pid <= 0) { ret EINVAL; }
 
-    var info: [128]u8;
-    if (ls.waitid(ls.P_PID, pid::u32, ?info[0], ls.WEXITED | WNOHANG | ls.WNOWAIT) < 0) {
+    var info: [16]u64;
+    if (ls.waitid(ls.P_PID, pid::u32, (?info[0])::*u8, ls.WEXITED | WNOHANG | ls.WNOWAIT) < 0) {
         ret ls.fail_errno();
     }
     ret send_signal(pid, SIGKILL);
@@ -874,6 +1154,55 @@ pub fun getpgid(pid: i64) i64 {
 pub fun terminate_group(pgid: i64) i64 {
     if (pgid <= 0) { ret EINVAL; }
     ret send_signal(-pgid, SIGTERM);
+}
+
+# forcefully stop every process in a group without reaping any of them
+#
+# the group's members get SIGKILL, which none of them can catch or ignore.
+# as with terminate_group there is no ownership probe, and members stay
+# individually waitable.
+# ---
+# pgid: process group ID (must be > 0)
+# ret:  0 on success, or negative errno
+pub fun kill_group(pgid: i64) i64 {
+    if (pgid <= 0) { ret EINVAL; }
+    ret send_signal(-pgid, SIGKILL);
+}
+
+# whether any process is left in a group, without signalling it
+#
+# kill(-pgid, 0) checks for members and delivers nothing. a member this
+# process may not signal still counts, so EPERM reads as present.
+# ---
+# pgid: process group ID (must be > 0)
+# ret:  0 while a member is left, ESRCH once none is, or another negative errno
+pub fun probe_group(pgid: i64) i64 {
+    if (pgid <= 0) { ret EINVAL; }
+    val sent: i64 = send_signal(-pgid, 0);
+    if (sent == EPERM) { ret 0; }
+    ret sent;
+}
+
+# make the end of the child `pid` a readiness event on `queue`, so the queue's
+# wait returns once the child ends: a one-shot EVFILT_PROC NOTE_EXIT filter
+# ---
+# context: the nonzero context the event carries
+# ret:     the watch, which process_unwatch releases, or negative errno (ESRCH
+#          when the child has already ended)
+pub fun process_watch(queue: *os_shared.IoQueue, pid: i64, context: u64) i64 {
+    if (queue == nil || pid <= 0 || context == 0) { ret EINVAL; }
+    var change: ls.Kevent;
+    native_kevent(?change, pid::usize, EVFILT_PROC, EV_ADD | EV_ONESHOT, NOTE_EXIT, context);
+    if (ls.kevent(queue.handle::i32, ?change, 1, nil, 0, nil) == -1) { ret ls.fail_errno(); }
+    ret pid;
+}
+
+# release a watch process_watch made, whether or not it fired
+# ---
+# ret: 0, or the negative errno
+pub fun process_unwatch(queue: *os_shared.IoQueue, watch: i64) i64 {
+    if (queue == nil || watch <= 0) { ret EINVAL; }
+    ret io_queue_delete_filter(queue, watch::usize, EVFILT_PROC);
 }
 
 # canonical process observations
@@ -925,9 +1254,9 @@ fun close_inherited_fds() {
 # ---
 # pathname: path to executable
 # argv:     null-terminated argument array
-# envp:     null-terminated environment array
+# envp:     the child's environment, given entries or inherited
 # ret:      child PID on success, or negative errno
-pub fun spawn(pathname: *u8, argv: **u8, envp: **u8) i64 {
+pub fun spawn(pathname: *u8, argv: **u8, envp: Environment) i64 {
     ret spawn_redirected(pathname, argv, envp, -1, -1, -1);
 }
 
@@ -936,9 +1265,9 @@ pub fun spawn(pathname: *u8, argv: **u8, envp: **u8) i64 {
 # ---
 # pathname: path to executable
 # argv:     null-terminated argument array
-# envp:     null-terminated environment array
+# envp:     the child's environment, given entries or inherited
 # ret:      child PID on success, or negative errno; the child's pgid equals its pid
-pub fun spawn_grouped(pathname: *u8, argv: **u8, envp: **u8) i64 {
+pub fun spawn_grouped(pathname: *u8, argv: **u8, envp: Environment) i64 {
     ret spawn_redirected_grouped(pathname, argv, envp, -1, -1, -1);
 }
 
@@ -946,10 +1275,10 @@ pub fun spawn_grouped(pathname: *u8, argv: **u8, envp: **u8) i64 {
 # ---
 # pathname: path to executable
 # argv:     null-terminated argument array
-# envp:     null-terminated environment array, or nil to inherit
+# envp:     the child's environment, given entries or inherited
 # cwd:      working directory for the child, or nil to inherit
 # ret:      child PID on success, or negative errno
-pub fun spawn_in(pathname: *u8, argv: **u8, envp: **u8, cwd: *u8) i64 {
+pub fun spawn_in(pathname: *u8, argv: **u8, envp: Environment, cwd: *u8) i64 {
     ret spawn_redirected_in(pathname, argv, envp, cwd, -1, -1, -1);
 }
 
@@ -965,12 +1294,12 @@ pub fun spawn_in(pathname: *u8, argv: **u8, envp: **u8, cwd: *u8) i64 {
 # ---
 # pathname:  path to executable
 # argv:      null-terminated argument array
-# envp:      null-terminated environment array
+# envp:      the child's environment, given entries or inherited
 # stdin_fd:  descriptor to install as the child's stdin, or -1 to inherit
 # stdout_fd: descriptor to install as the child's stdout, or -1 to inherit
 # stderr_fd: descriptor to install as the child's stderr, or -1 to inherit
 # ret:       child PID on success, or negative errno
-pub fun spawn_redirected(pathname: *u8, argv: **u8, envp: **u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) i64 {
+pub fun spawn_redirected(pathname: *u8, argv: **u8, envp: Environment, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) i64 {
     ret spawn_redirected_in(pathname, argv, envp, nil, stdin_fd, stdout_fd, stderr_fd);
 }
 
@@ -980,19 +1309,19 @@ pub fun spawn_redirected(pathname: *u8, argv: **u8, envp: **u8, stdin_fd: i32, s
 # ---
 # pathname:  path to executable
 # argv:      null-terminated argument array
-# envp:      null-terminated environment array
+# envp:      the child's environment, given entries or inherited
 # stdin_fd:  descriptor to install as the child's stdin, or -1 to inherit
 # stdout_fd: descriptor to install as the child's stdout, or -1 to inherit
 # stderr_fd: descriptor to install as the child's stderr, or -1 to inherit
 # ret:       child PID on success, or negative errno; the child's pgid equals its pid
-pub fun spawn_redirected_grouped(pathname: *u8, argv: **u8, envp: **u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) i64 {
+pub fun spawn_redirected_grouped(pathname: *u8, argv: **u8, envp: Environment, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) i64 {
     ret spawn_redirected_in_grouped(pathname, argv, envp, nil, stdin_fd, stdout_fd, stderr_fd);
 }
 
 # spawn a child with redirected streams and an explicit working directory
 #
 # `cwd` is the directory the child starts in, or nil to inherit the parent's.
-# the chdir happens in the child, after the fork/clone, so the parent's own
+# the chdir happens in the child, after the fork, so the parent's own
 # working directory is untouched. passing it here rather than prefixing a `cd`
 # onto a shell command keeps the path out of the command line, where it would
 # have to survive a quoting convention the target program may not share
@@ -1000,13 +1329,13 @@ pub fun spawn_redirected_grouped(pathname: *u8, argv: **u8, envp: **u8, stdin_fd
 # ---
 # pathname:  path to executable
 # argv:      null-terminated argument array
-# envp:      null-terminated environment array, or nil to inherit
+# envp:      the child's environment, given entries or inherited
 # cwd:       working directory for the child, or nil to inherit
 # stdin_fd:  descriptor to install as the child's stdin, or -1 to inherit
 # stdout_fd: descriptor to install as the child's stdout, or -1 to inherit
 # stderr_fd: descriptor to install as the child's stderr, or -1 to inherit
 # ret:       child PID on success, or negative errno
-pub fun spawn_redirected_in(pathname: *u8, argv: **u8, envp: **u8, cwd: *u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) i64 {
+pub fun spawn_redirected_in(pathname: *u8, argv: **u8, envp: Environment, cwd: *u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) i64 {
     ret spawn_redirected_in_impl(pathname, argv, envp, cwd, stdin_fd, stdout_fd, stderr_fd, 0);
 }
 
@@ -1020,13 +1349,13 @@ pub fun spawn_redirected_in(pathname: *u8, argv: **u8, envp: **u8, cwd: *u8, std
 # ---
 # pathname:  path to executable
 # argv:      null-terminated argument array
-# envp:      null-terminated environment array, or nil to inherit
+# envp:      the child's environment, given entries or inherited
 # cwd:       working directory for the child, or nil to inherit
 # stdin_fd:  descriptor to install as the child's stdin, or -1 to inherit
 # stdout_fd: descriptor to install as the child's stdout, or -1 to inherit
 # stderr_fd: descriptor to install as the child's stderr, or -1 to inherit
 # ret:       child PID on success, or negative errno; the child's pgid equals its pid
-pub fun spawn_redirected_in_grouped(pathname: *u8, argv: **u8, envp: **u8, cwd: *u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) i64 {
+pub fun spawn_redirected_in_grouped(pathname: *u8, argv: **u8, envp: Environment, cwd: *u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32) i64 {
     ret spawn_redirected_in_impl(pathname, argv, envp, cwd, stdin_fd, stdout_fd, stderr_fd, 1);
 }
 
@@ -1069,7 +1398,15 @@ fun spawn_redirect(fd: i32, target: i32) i64 {
     ret 0;
 }
 
-fun spawn_redirected_in_impl(pathname: *u8, argv: **u8, envp: **u8, cwd: *u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32, grouped: i32) i64 {
+# fork, redirect, change directory and exec, shared by every spawn form
+#
+# grouped nonzero makes the child the leader of a new process group, which it
+# confirms over a close-on-exec pipe before the parent returns
+# ---
+# ret: child PID on success, or negative errno
+fun spawn_redirected_in_impl(pathname: *u8, argv: **u8, envp: Environment, cwd: *u8, stdin_fd: i32, stdout_fd: i32, stderr_fd: i32, grouped: i32) i64 {
+    val environment: **u8 = exec_environment(envp);
+    if (environment == nil) { ret EINVAL; }
     var ready: [2]i32;
     if (grouped != 0) {
         if (ls.pipe(?ready[0]) < 0) { ret ls.fail_errno(); }
@@ -1104,7 +1441,7 @@ fun spawn_redirected_in_impl(pathname: *u8, argv: **u8, envp: **u8, cwd: *u8, st
         # the fork gave the child its own filesystem context, so this chdir
         # cannot move the parent's cwd.
         if (cwd != nil && ls.chdir(cwd) < 0) { ls._exit(126); }
-        exec(pathname, argv, envp);
+        exec(pathname, argv, Environment.given{environment});
         ls._exit(127);
     }
     if (grouped != 0) {
@@ -1133,11 +1470,13 @@ pub fun getpid() i64 {
 # darwin's RLIM_INFINITY is 2^63 - 1, not all ones
 val RLIM_INFINITY: u64 = 0x7fffffffffffffff;
 
+# a native rlim_t as a portable limit, RLIM_INFINITY and above as LIMIT_UNLIMITED
 fun limit_from_native(value: u64) u64 {
     if (value >= RLIM_INFINITY) { ret os_shared.LIMIT_UNLIMITED; }
     ret value;
 }
 
+# a portable limit as a native rlim_t, capped at RLIM_INFINITY
 fun limit_to_native(value: u64) u64 {
     if (value >= RLIM_INFINITY) { ret RLIM_INFINITY; }
     ret value;
@@ -1326,50 +1665,18 @@ pub fun getcwd(buf: *u8, size: usize) i64 {
 # does not crash - it creates a file with the wrong permissions. only reading
 # the mode back catches it.
 
-# build "/tmp/mach-std-415-<pid>-<tag>" into buf, returning its length
-#[testing]
-fun tmp_path(buf: *u8, tag: u8) usize {
-    val prefix: str   = "/tmp/mach-std-415-";
-    var n:      usize = 0;
-    for (n < str_len(prefix)) {
-        buf[n] = prefix[n];
-        n      = n + 1;
-    }
-    var pid: i64 = getpid();
-    if (pid < 0) { pid = 0; }
-    var digits: [24]u8;
-    var d:      usize = 0;
-    if (pid == 0) {
-        digits[0] = '0'::u8;
-        d         = 1;
-    }
-    for (pid > 0) {
-        digits[d] = ('0'::u8) + (pid % 10)::u8;
-        pid       = pid / 10;
-        d         = d + 1;
-    }
-    for (d > 0) {
-        d      = d - 1;
-        buf[n] = digits[d];
-        n      = n + 1;
-    }
-    buf[n] = '-'::u8;
-    n      = n + 1;
-    buf[n] = tag;
-    n      = n + 1;
-    buf[n] = 0;
-    ret n;
-}
-
 # O_CREAT carries `mode` in the variadic tail, and the file really gets it
 #
 # the mask is pinned to 0 for the duration so the expected mode is exact: a
 # subset assertion would still pass if the tail were dropped and openat read a
 # stale stack slot that happened to have the right bits set.
 test libsystem__open_creat_applies_the_variadic_mode {
-    var path: [64]u8;
-    tmp_path(?path[0], 'a'::u8);
-    unlink(AT_FDCWD, ?path[0], 0);
+    var scratch: os_shared.Scratch;
+    if (scratch_make(?scratch) < 0) { ret 90; }
+    fin { unlink(AT_FDCWD, os_shared.scratch_dir(?scratch), AT_REMOVEDIR); }
+    var path: os_shared.ScratchPath;
+    os_shared.scratch_path(?scratch, "a", ?path);
+    fin { unlink(AT_FDCWD, ?path[0], 0); }
 
     val saved: u32 = ls.umask(0);
     val fd:    i64 = open(AT_FDCWD, ?path[0], O_CREAT | O_RDWR, 0o741);
@@ -1392,9 +1699,12 @@ test libsystem__open_creat_applies_the_variadic_mode {
 # a successful call, so a success must never consult it: a wrapper that read
 # errno unconditionally would report the stale ENOENT on the pipe's fcntl
 test libsystem__failures_carry_errno_and_a_success_ignores_it {
-    var path: [64]u8;
-    tmp_path(?path[0], 'b'::u8);
-    unlink(AT_FDCWD, ?path[0], 0);
+    var scratch: os_shared.Scratch;
+    if (scratch_make(?scratch) < 0) { ret 90; }
+    fin { unlink(AT_FDCWD, os_shared.scratch_dir(?scratch), AT_REMOVEDIR); }
+    var path: os_shared.ScratchPath;
+    os_shared.scratch_path(?scratch, "b", ?path);
+    fin { unlink(AT_FDCWD, ?path[0], 0); }
     val first: i64 = open(AT_FDCWD, ?path[0], O_CREAT | O_EXCL | O_WRONLY, 0o600);
     if (first < 0) { ret 1; }
     close(first::i32);
@@ -1430,9 +1740,12 @@ test libsystem__fcntl_variadic_and_plain_forms_round_trip {
     close(fds[1]);
     if (rc != 0) { ret rc; }
 
-    var path: [64]u8;
-    tmp_path(?path[0], 'c'::u8);
-    unlink(AT_FDCWD, ?path[0], 0);
+    var scratch: os_shared.Scratch;
+    if (scratch_make(?scratch) < 0) { ret 90; }
+    fin { unlink(AT_FDCWD, os_shared.scratch_dir(?scratch), AT_REMOVEDIR); }
+    var path: os_shared.ScratchPath;
+    os_shared.scratch_path(?scratch, "c", ?path);
+    fin { unlink(AT_FDCWD, ?path[0], 0); }
     val fd: i64 = open(AT_FDCWD, ?path[0], O_CREAT | O_WRONLY | O_APPEND, 0o600);
     if (fd < 0) { ret 7; }
     val fl: i64 = file_flags(fd::i32);
@@ -1444,9 +1757,12 @@ test libsystem__fcntl_variadic_and_plain_forms_round_trip {
 
 # written bytes come back after a seek, and seek reports the absolute offset
 test libsystem__write_seek_read_and_stat_agree {
-    var path: [64]u8;
-    tmp_path(?path[0], 'd'::u8);
-    unlink(AT_FDCWD, ?path[0], 0);
+    var scratch: os_shared.Scratch;
+    if (scratch_make(?scratch) < 0) { ret 90; }
+    fin { unlink(AT_FDCWD, os_shared.scratch_dir(?scratch), AT_REMOVEDIR); }
+    var path: os_shared.ScratchPath;
+    os_shared.scratch_path(?scratch, "d", ?path);
+    fin { unlink(AT_FDCWD, ?path[0], 0); }
 
     val fd: i64 = open(AT_FDCWD, ?path[0], O_CREAT | O_RDWR, 0o600);
     if (fd < 0) { ret 1; }
@@ -1478,34 +1794,6 @@ test libsystem__write_seek_read_and_stat_agree {
     close(d);
     unlink(AT_FDCWD, ?path[0], 0);
     ret rc;
-}
-
-# the getcwd capacity contract. F_GETPATH takes no capacity, so a destination
-# pointed straight at it is overrun (#409): a path that does not fit is ERANGE
-# and nothing past the declared capacity is written
-test getcwd__capacity_contract {
-    val cap:  usize = 8;
-    var slab: [64]u8;
-    var i:    usize = 0;
-    for (i < 64) {
-        slab[i] = 0xAB;
-        i       = i + 1;
-    }
-    # shorter than any real absolute path, so this always takes the refusal path
-    if (getcwd(?slab[0], cap) != ERANGE) { ret 1; }
-    i = cap;
-    for (i < 64) {
-        if (slab[i] != 0xAB) { ret 2; }
-        i = i + 1;
-    }
-
-    var buf: [1024]u8;
-    val n:   i64 = getcwd(?buf[0], 1024);
-    if (n < 1)                        { ret 3; }
-    if (buf[0] != '/')                { ret 5; }
-    if (buf[n::usize] != 0)           { ret 4; }
-    if (str_len(?buf[0]) != n::usize) { ret 4; }
-    ret 0;
 }
 
 # look up an environment variable by name
@@ -1541,6 +1829,23 @@ pub fun getenv(name: *u8, buf: *u8, cap: usize) i64 {
     ret ENOENT;
 }
 
+# the directory designated for temporary files: $TMPDIR, else "/tmp"
+# ---
+# buf: destination buffer for the path
+# cap: buffer capacity in bytes
+# ret: full length of the path, so ret >= cap signals truncation
+pub fun temp_dir(buf: *u8, cap: usize) i64 {
+    ret os_shared.posix_temp_dir(getenv("TMPDIR", buf, cap), buf, cap);
+}
+
+# make a test process's own directory under temp_dir
+#[testing]
+pub fun scratch_make(scratch: *os_shared.Scratch) i64 {
+    ret os_shared.scratch_create(scratch, os_shared.ScratchHost{
+        temp_dir: temp_dir, random_fill: random_fill, make_dir: make_dir, mode: 0o700, here: AT_FDCWD, exists: EEXIST, too_long: ENAMETOOLONG
+    });
+}
+
 # threads
 #
 # pthread, not bsdthread. `bsdthread_register` published a workqueue callback
@@ -1574,9 +1879,8 @@ pub fun getenv(name: *u8, buf: *u8, cap: usize) i64 {
 #   - `thread_wake` BROADCASTS. with a shared bucket, `signal` could hand the
 #     one wakeup to a waiter on an unrelated address and lose ours.
 #   - a waiter therefore sees wakeups that are not for it. the contract already
-#     documents spurious wakeups, and the only consumer (`sync.thread.join`)
-#     re-tests its flag in a loop, which is what a condition variable requires
-#     of every caller anyway.
+#     documents spurious wakeups, and every caller re-tests its own word in a
+#     loop, which is what a condition variable requires of every caller anyway.
 #
 # the lost-wakeup race is closed by the lock discipline, not by luck: the
 # waiter re-reads the address UNDER the bucket mutex and `pthread_cond_wait`
@@ -1584,10 +1888,12 @@ pub fun getenv(name: *u8, buf: *u8, cap: usize) i64 {
 # mutex before it can broadcast. so a wake can never land in the window
 # between the waiter's test and its sleep.
 
-val WAIT_BUCKETS: usize = 64;
+val WAIT_BUCKETS:        usize = 64;
+val PTHREAD_MUTEX_WORDS: usize = ls.PTHREAD_MUTEX_BYTES / 8;
+val PTHREAD_COND_WORDS:  usize = ls.PTHREAD_COND_BYTES / 8;
 
-var wait_mutexes: [4096]u8; # WAIT_BUCKETS * PTHREAD_MUTEX_BYTES (64 * 64)
-var wait_conds:   [3072]u8; # WAIT_BUCKETS * PTHREAD_COND_BYTES  (64 * 48)
+var wait_mutexes: [512]u64; # WAIT_BUCKETS * PTHREAD_MUTEX_WORDS (64 * 8)
+var wait_conds:   [384]u64; # WAIT_BUCKETS * PTHREAD_COND_WORDS  (64 * 6)
 
 # 0 = untouched, 1 = one thread is initializing, 2 = ready
 var wait_ready: i64 = 0;
@@ -1603,8 +1909,8 @@ fun ensure_wait_tables() {
     if (atomic.cas(?wait_ready, ?expected, 1)) {
         var i: usize = 0;
         for (i < WAIT_BUCKETS) {
-            ls.pthread_mutex_init(?wait_mutexes[i * ls.PTHREAD_MUTEX_BYTES], nil);
-            ls.pthread_cond_init(?wait_conds[i * ls.PTHREAD_COND_BYTES], nil);
+            ls.pthread_mutex_init((?wait_mutexes[i * PTHREAD_MUTEX_WORDS])::*u8, nil);
+            ls.pthread_cond_init((?wait_conds[i * PTHREAD_COND_WORDS])::*u8, nil);
             i = i + 1;
         }
         atomic.store(?wait_ready, 2);
@@ -1711,6 +2017,76 @@ pub fun stack_bounds(low: *usize, high: *usize) bool {
     ret true;
 }
 
+val MH_MAGIC_64:              u32 = 0xfeedfacf;
+val LC_SEGMENT_64:            u32 = 0x19;
+val S_THREAD_LOCAL_REGULAR:   u32 = 0x11;
+val S_THREAD_LOCAL_ZEROFILL:  u32 = 0x12;
+val S_THREAD_LOCAL_VARIABLES: u32 = 0x13;
+
+# the thread-local block dyld gave the calling thread for the image std is
+# linked into, and its size
+#
+# dyld sets each thread's block up from the image's template on first use and
+# frees it at thread exit without wiping it. the block is the value of the
+# pthread key in the image's first thread-local descriptor (thunk, key,
+# offset), and it spans the image's thread-local data and zero-fill sections
+# ---
+# size: receives the block's size
+# ret:  the block, or 0 where the image has no thread-locals or the thread
+#       never touched them
+fun thread_tls_block(size: *usize) usize {
+    val anchor: fun() = thread_exit_wipe;
+    var info:   ls.DlInfo;
+    if (ls.dladdr(anchor::usize::ptr, ?info) == 0 || info.fbase == 0) { ret 0; }
+    val header: usize = info.fbase;
+    if (@(header::*u32) != MH_MAGIC_64) { ret 0; }
+    val count: u32   = @((header + 16)::*u32);
+    var cmd:   usize = header + 32;
+    var slide: usize = 0;
+    var low:   usize = ~(0::usize);
+    var high:  usize = 0;
+    var vars:  usize = 0;
+    var i:     u32   = 0;
+    for (i < count) {
+        if (@(cmd::*u32) == LC_SEGMENT_64) {
+            if (@((cmd + 40)::*u64) == 0 && @((cmd + 48)::*u64) != 0) { slide = header - @((cmd + 24)::*usize); }
+            val sections: u32   = @((cmd + 64)::*u32);
+            var section:  usize = cmd + 72;
+            var j:        u32   = 0;
+            for (j < sections) {
+                val addr: usize = @((section + 32)::*usize);
+                val span: usize = @((section + 40)::*usize);
+                val kind: u32   = @((section + 64)::*u32) & 0xff;
+                if (kind == S_THREAD_LOCAL_REGULAR || kind == S_THREAD_LOCAL_ZEROFILL) {
+                    if (addr < low)         { low = addr; }
+                    if (addr + span > high) { high = addr + span; }
+                }
+                if (kind == S_THREAD_LOCAL_VARIABLES && span >= 24 && vars == 0) { vars = addr; }
+                section = section + 80;
+                j       = j + 1;
+            }
+        }
+        cmd = cmd + (@((cmd + 4)::*u32))::usize;
+        i   = i + 1;
+    }
+    if (vars == 0 || high <= low) { ret 0; }
+    val key: usize = @((vars + slide + 8)::*usize);
+    @size = high - low;
+    ret ls.pthread_getspecific(key)::usize;
+}
+
+# wipe the calling thread's thread-local block as the thread ends
+#
+# thread-locals may hold secrets, so the whole block is zeroed with stores no
+# pass removes. nothing may read a thread-local after this
+pub fun thread_exit_wipe() {
+    var size:  usize = 0;
+    val block: usize = thread_tls_block(?size);
+    if (block != 0) { ct.zeroize_plain(block::*u8, size); }
+}
+
+# what thread_spawn hands a new thread, in a page thread_spawn allocates and
+# the thread frees once it has read it
 rec ThreadStart {
     fn_addr:          usize;
     arg_addr:         usize;
@@ -1727,6 +2103,12 @@ rec ThreadStart {
 
 val THREAD_START_SIZE: usize = 4096;
 
+# release what thread_spawn prepared when no thread was created
+# ---
+# start_mem: the start page
+# attr:      initialized thread attributes, or nil
+# failure:   the error that stopped the spawn
+# ret:       the first cleanup failure, otherwise failure
 fun abort_thread_prepare(start_mem: ptr, attr: *u8, failure: i64) i64 {
     var attr_error: i32 = 0;
     if (attr != nil) { attr_error = ls.pthread_attr_destroy(attr); }
@@ -1736,6 +2118,10 @@ fun abort_thread_prepare(start_mem: ptr, attr: *u8, failure: i64) i64 {
     ret failure;
 }
 
+# tell a thread whose setup failed to end without running its function, and
+# join it
+# ---
+# ret: pthread_join's negated error, otherwise failure
 fun abort_thread_start(thread: usize, start: *ThreadStart, failure: i64) i64 {
     atomic.store(?start.run, -1);
     thread_wake(?start.run);
@@ -1746,8 +2132,6 @@ fun abort_thread_start(thread: usize, start: *ThreadStart, failure: i64) i64 {
 
 # pthread entry with a parent-controlled setup gate
 fun thread_entry(arg: ptr) usize {
-    # DIT is per thread and pthread does not promise to copy it
-    dit.enter_thread();
     val start:       *ThreadStart = arg::usize::*ThreadStart;
     var block:       os_shared.ThreadBlock;
     var setup_error: i64          = thread_block_enter(?block);
@@ -1780,6 +2164,7 @@ fun thread_entry(arg: ptr) usize {
     deallocate(start::ptr, THREAD_START_SIZE);
 
     if (run < 0) {
+        thread_exit_wipe();
         thread_block_leave();
         atomic.store(reclaimable_addr::*i64, 1);
         thread_wake(reclaimable_addr::*i64);
@@ -1788,6 +2173,7 @@ fun thread_entry(arg: ptr) usize {
 
     val fn_ptr: fun(*u8) = fn_addr::fun(*u8);
     fn_ptr(arg_addr::*u8);
+    thread_exit_wipe();
     thread_block_leave();
 
     val state:    *i64 = state_addr::*i64;
@@ -1825,23 +2211,24 @@ pub fun thread_spawn(
     start.setup_error      = 0;
     start.diagnostic_id    = 0;
 
-    var attr: [64]u8;
-    var rc:   i32 = ls.pthread_attr_init(?attr[0]);
+    var attr:     [8]u64;
+    val attr_ptr: *u8 = (?attr[0])::*u8;
+    var rc:       i32 = ls.pthread_attr_init(attr_ptr);
     if (rc != 0) {
         ret abort_thread_prepare(start_mem, nil, -(rc::i64));
     }
-    rc = ls.pthread_attr_setstacksize(?attr[0], stack_reserve);
+    rc = ls.pthread_attr_setstacksize(attr_ptr, stack_reserve);
 
     var thread: usize = 0;
     if (rc == 0) {
         val entry: fun(ptr) usize = thread_entry;
-        rc = ls.pthread_create(?thread, ?attr[0], entry::usize, start_mem);
+        rc = ls.pthread_create(?thread, attr_ptr, entry::usize, start_mem);
     }
 
     if (rc != 0) {
-        ret abort_thread_prepare(start_mem, ?attr[0], -(rc::i64));
+        ret abort_thread_prepare(start_mem, attr_ptr, -(rc::i64));
     }
-    ls.pthread_attr_destroy(?attr[0]);
+    ls.pthread_attr_destroy(attr_ptr);
 
     for (atomic.load(?start.setup) == 0) {
         thread_wait(?start.setup, 0);
@@ -1858,18 +2245,30 @@ pub fun thread_spawn(
     ret diagnostic_id;
 }
 
+# wait for a thread thread_spawn created to end, and release its native handle
+# ---
+# native:      the handle thread_spawn stored
+# reclaimable: unused, the join is itself the teardown barrier
+# ret:         0, or pthread_join's negated error
 pub fun thread_join(native: usize, reclaimable: *i64) i64 {
     val rc: i32 = ls.pthread_join(native, nil);
     if (rc != 0) { ret -(rc::i64); }
     ret 0;
 }
 
+# hand a thread's native teardown to libpthread, so it is never joined
+# ---
+# native: the handle thread_spawn stored
+# ret:    0, or pthread_detach's negated error
 pub fun thread_detach(native: usize) i64 {
     val rc: i32 = ls.pthread_detach(native);
     if (rc != 0) { ret -(rc::i64); }
     ret 0;
 }
 
+# the calling thread's system-wide id
+# ---
+# ret: the id, or pthread_threadid_np's negated error
 pub fun thread_current_id() i64 {
     var id: u64 = 0;
     val rc: i32 = ls.pthread_threadid_np(0, ?id);
@@ -1877,6 +2276,11 @@ pub fun thread_current_id() i64 {
     ret id::i64;
 }
 
+# copy the calling thread's name into name, null-terminated
+# ---
+# name: destination buffer
+# cap:  capacity of name including the terminator, 0 is EINVAL
+# ret:  the name's length, or pthread_getname_np's negated error
 pub fun thread_current_name(name: *u8, cap: usize) i64 {
     if (cap == 0) { ret -22; }
     val rc: i32 = ls.pthread_getname_np(ls.pthread_self(), name, cap);
@@ -1884,22 +2288,6 @@ pub fun thread_current_name(name: *u8, cap: usize) i64 {
     var n: usize = 0;
     for (n < cap && name[n] != 0) { n = n + 1; }
     ret n::i64;
-}
-
-test abort_thread_prepare__releases_context_and_attributes {
-    val injected: i64 = -125;
-    val bare:     ptr = allocate(THREAD_START_SIZE);
-    if (bare == nil)                                           { ret 1; }
-    if (abort_thread_prepare(bare, nil, injected) != injected) { ret 2; }
-    val start_mem: ptr = allocate(THREAD_START_SIZE);
-    if (start_mem == nil) { ret 3; }
-    var attr: [64]u8;
-    if (ls.pthread_attr_init(?attr[0]) != 0) {
-        deallocate(start_mem, THREAD_START_SIZE);
-        ret 4;
-    }
-    if (abort_thread_prepare(start_mem, ?attr[0], injected) != injected) { ret 5; }
-    ret 0;
 }
 
 test thread_start__native_setup_failure_aborts_before_user_entry {
@@ -1925,20 +2313,21 @@ test thread_start__native_setup_failure_aborts_before_user_entry {
     start.setup_error      = 0;
     start.diagnostic_id    = 0;
 
-    var attr: [64]u8;
-    var rc:   i32 = ls.pthread_attr_init(?attr[0]);
+    var attr:     [8]u64;
+    val attr_ptr: *u8 = (?attr[0])::*u8;
+    var rc:       i32 = ls.pthread_attr_init(attr_ptr);
     if (rc != 0) {
         deallocate(start_mem, THREAD_START_SIZE);
         deallocate(owner, 4096);
         ret 1;
     }
-    rc = ls.pthread_attr_setstacksize(?attr[0], 2097152);
+    rc = ls.pthread_attr_setstacksize(attr_ptr, 2097152);
     var native: usize = 0;
     if (rc == 0) {
         val entry: fun(ptr) usize = thread_entry;
-        rc = ls.pthread_create(?native, ?attr[0], entry::usize, start_mem);
+        rc = ls.pthread_create(?native, attr_ptr, entry::usize, start_mem);
     }
-    ls.pthread_attr_destroy(?attr[0]);
+    ls.pthread_attr_destroy(attr_ptr);
     if (rc != 0) {
         deallocate(start_mem, THREAD_START_SIZE);
         deallocate(owner, 4096);
@@ -1967,8 +2356,8 @@ test thread_start__native_setup_failure_aborts_before_user_entry {
 pub fun thread_wait(addr: *i64, expected: i64) i64 {
     ensure_wait_tables();
     val b: usize = wait_bucket(addr::usize);
-    val m: *u8   = ?wait_mutexes[b * ls.PTHREAD_MUTEX_BYTES];
-    val c: *u8   = ?wait_conds[b * ls.PTHREAD_COND_BYTES];
+    val m: *u8   = (?wait_mutexes[b * PTHREAD_MUTEX_WORDS])::*u8;
+    val c: *u8   = (?wait_conds[b * PTHREAD_COND_WORDS])::*u8;
 
     var rc: i32 = ls.pthread_mutex_lock(m);
     if (rc != 0) { ret -(rc::i64); }
@@ -1992,8 +2381,8 @@ pub fun thread_wait_until(addr: *i64, expected: i64, deadline: *os_shared.Timesp
     if (deadline == nil || deadline.sec < 0 || deadline.nsec < 0 || deadline.nsec >= 1000000000) { ret EINVAL; }
     ensure_wait_tables();
     val b: usize = wait_bucket(addr::usize);
-    val m: *u8   = ?wait_mutexes[b * ls.PTHREAD_MUTEX_BYTES];
-    val c: *u8   = ?wait_conds[b * ls.PTHREAD_COND_BYTES];
+    val m: *u8   = (?wait_mutexes[b * PTHREAD_MUTEX_WORDS])::*u8;
+    val c: *u8   = (?wait_conds[b * PTHREAD_COND_WORDS])::*u8;
 
     var rc: i32 = ls.pthread_mutex_lock(m);
     if (rc != 0) { ret -(rc::i64); }
@@ -2038,8 +2427,8 @@ pub fun thread_wait_until(addr: *i64, expected: i64, deadline: *os_shared.Timesp
 pub fun thread_wake(addr: *i64) i64 {
     ensure_wait_tables();
     val b: usize = wait_bucket(addr::usize);
-    val m: *u8   = ?wait_mutexes[b * ls.PTHREAD_MUTEX_BYTES];
-    val c: *u8   = ?wait_conds[b * ls.PTHREAD_COND_BYTES];
+    val m: *u8   = (?wait_mutexes[b * PTHREAD_MUTEX_WORDS])::*u8;
+    val c: *u8   = (?wait_conds[b * PTHREAD_COND_WORDS])::*u8;
 
     var rc: i32 = ls.pthread_mutex_lock(m);
     if (rc != 0) { ret -(rc::i64); }
@@ -2063,7 +2452,7 @@ pub val IO_EVENT_WAKE:   u32 = 0x10;
 # source: the id of the source that registered the context, 0 for a wake. it
 #         sits in the padding after events, so the record stays 32 bytes
 pub rec IoCompletion {
-    context: usize;
+    context: u64;
     events:  u32;
     source:  u16;
     status:  i64;
@@ -2072,7 +2461,9 @@ pub rec IoCompletion {
 
 val EVFILT_READ:  i16 = -1;
 val EVFILT_WRITE: i16 = -2;
+val EVFILT_PROC:  i16 = -5;
 val EVFILT_USER:  i16 = -10;
+val NOTE_EXIT:    u32 = 0x80000000;
 val EV_ADD:       u16 = 0x0001;
 val EV_DELETE:    u16 = 0x0002;
 val EV_ONESHOT:   u16 = 0x0010;
@@ -2085,20 +2476,25 @@ $if ($size_of(IoCompletion) != $size_of(ls.Kevent) || $align_of(IoCompletion) < 
     $error("darwin completion storage cannot hold native events");
 }
 
-fun native_kevent(event: *ls.Kevent, ident: usize, filter: i16, flags: u16, fflags: u32, context: usize) {
-    @event = ls.Kevent{ident: ident, filter: filter, flags: flags, fflags: fflags, data: 0, udata: context::ptr};
+fun native_kevent(event: *ls.Kevent, ident: usize, filter: i16, flags: u16, fflags: u32, context: u64) {
+    @event = ls.Kevent{ident: ident, filter: filter, flags: flags, fflags: fflags, data: 0, udata: context::usize::ptr};
 }
 
+# fill a change for the queue's wake event, the user filter with ident 1
 fun user_kevent(event: *ls.Kevent, flags: u16, fflags: u32) {
     native_kevent(event, 1, EVFILT_USER, flags, fflags, 0);
 }
 
+# open a close-on-exec kqueue for queue, with the user event io_queue_wake
+# posts already registered
+# ---
+# queue: the queue to fill, its handle left invalid on failure
+# ret:   0, or negative errno
 pub fun io_queue_create(queue: *os_shared.IoQueue) i64 {
     if (queue == nil) { ret EINVAL; }
     queue.handle       = (-1)::isize::usize;
     queue.wake         = 0;
     queue.wake_pending = 0;
-    queue.wakes_posted = 0;
     val kqueue: i32 = ls.kqueue();
     if (kqueue == -1) { ret ls.fail_errno(); }
     val current: i64 = fd_flags(kqueue::i32);
@@ -2123,7 +2519,17 @@ pub fun io_queue_create(queue: *os_shared.IoQueue) i64 {
     ret 0;
 }
 
-pub fun io_queue_watch(queue: *os_shared.IoQueue, resource: usize, context: usize, events: u32) i64 {
+# register one-shot readiness interest in a descriptor
+#
+# each requested direction gets its own one-shot filter, which fires once until
+# it is armed again. registering an existing filter updates it
+# ---
+# queue:    the queue
+# resource: the descriptor
+# context:  the nonzero value its completions carry, 0 is EINVAL
+# events:   IO_EVENT_READ, IO_EVENT_WRITE or both, neither is EINVAL
+# ret:      0, or negative errno
+pub fun io_queue_watch(queue: *os_shared.IoQueue, resource: usize, context: u64, events: u32) i64 {
     if (queue == nil || context == 0 || (events & (IO_EVENT_READ | IO_EVENT_WRITE)) == 0) { ret EINVAL; }
     var changes: [2]ls.Kevent;
     var count:   usize = 0;
@@ -2154,10 +2560,14 @@ pub fun duplicate_to(from: usize, to: usize) i64 {
 # arms again a registration the caller made with io_queue_watch. kqueue's
 # EV_ADD updates an existing filter, and the kernel drops every filter when the
 # descriptor closes, so re-arming and registering are the same change
-pub fun io_queue_rearm(queue: *os_shared.IoQueue, resource: usize, context: usize, events: u32) i64 {
+pub fun io_queue_rearm(queue: *os_shared.IoQueue, resource: usize, context: u64, events: u32) i64 {
     ret io_queue_watch(queue, resource, context, events);
 }
 
+# delete one filter of a descriptor, where a filter that is not registered is
+# not an error
+# ---
+# ret: 0, or negative errno
 fun io_queue_delete_filter(queue: *os_shared.IoQueue, resource: usize, filter: i16) i64 {
     var change: ls.Kevent;
     native_kevent(?change, resource, filter, EV_DELETE, 0, 0);
@@ -2170,6 +2580,12 @@ fun io_queue_delete_filter(queue: *os_shared.IoQueue, resource: usize, filter: i
     ret 0;
 }
 
+# drop both readiness filters of a descriptor, where one that is not
+# registered is not an error
+# ---
+# queue:    the queue, nil is EINVAL
+# resource: the descriptor
+# ret:      0, or the read filter's negative errno before the write filter's
 pub fun io_queue_unwatch(queue: *os_shared.IoQueue, resource: usize) i64 {
     if (queue == nil) { ret EINVAL; }
     val read_result:  i64 = io_queue_delete_filter(queue, resource, EVFILT_READ);
@@ -2178,6 +2594,16 @@ pub fun io_queue_unwatch(queue: *os_shared.IoQueue, resource: usize) i64 {
     ret write_result;
 }
 
+# collect ready completions, waiting up to timeout_ms
+#
+# completions is also the native kevent buffer, and each record is rewritten in
+# place. a wake reports IO_EVENT_WAKE with source 0
+# ---
+# queue:       the queue
+# completions: receives the completions
+# capacity:    records completions holds, 0 or above i32 range is EINVAL
+# timeout_ms:  milliseconds to wait, negative waits indefinitely
+# ret:         completions filled, 0 on timeout, or negative errno
 pub fun io_queue_poll(queue: *os_shared.IoQueue, completions: *IoCompletion, capacity: usize, timeout_ms: i32) i64 {
     if (queue == nil || completions == nil || capacity == 0 || capacity > 0x7fffffff) { ret EINVAL; }
     var timeout:     os_shared.Timespec;
@@ -2200,7 +2626,7 @@ pub fun io_queue_poll(queue: *os_shared.IoQueue, completions: *IoCompletion, cap
         val native_flags: u16       = raw.flags;
         val fflags:       u32       = raw.fflags;
         val data:         i64       = raw.data::i64;
-        val context:      usize     = raw.udata::usize;
+        val context:      u64       = raw.udata::usize::u64;
         var events:       u32       = 0;
         var status:       i64       = data;
         if (filter == EVFILT_USER && ident == 1) {
@@ -2227,11 +2653,23 @@ pub fun io_queue_poll(queue: *os_shared.IoQueue, completions: *IoCompletion, cap
     ret result::i64;
 }
 
+# wait up to timeout_ms for one completion and discard it
+# ---
+# queue:      the queue
+# timeout_ms: milliseconds to wait, negative waits indefinitely
+# ret:        1 when a completion arrived, 0 on timeout, or negative errno
 pub fun io_queue_wait(queue: *os_shared.IoQueue, timeout_ms: i32) i64 {
     var completion: IoCompletion;
     ret io_queue_poll(queue, ?completion, 1, timeout_ms);
 }
 
+# wake a thread waiting on queue
+#
+# only the first request before a poll harvests the wake posts the event, and
+# later requests in that window return 0 having posted nothing
+# ---
+# queue: the queue
+# ret:   0, EINVAL for nil, EBADF for a closed queue, or negative errno
 pub fun io_queue_wake(queue: *os_shared.IoQueue) i64 {
     if (queue == nil)                       { ret EINVAL; }
     if (queue.handle == (-1)::isize::usize) { ret EBADF; }
@@ -2243,10 +2681,13 @@ pub fun io_queue_wake(queue: *os_shared.IoQueue) i64 {
         os_shared.io_wake_harvested(queue);
         ret ls.fail_errno();
     }
-    os_shared.io_wake_posted(queue);
     ret 0;
 }
 
+# close the kqueue behind queue, where closing a closed queue returns 0
+# ---
+# queue: the queue
+# ret:   0, EINVAL for nil, or close's negative errno
 pub fun io_queue_close(queue: *os_shared.IoQueue) i64 {
     if (queue == nil)                       { ret EINVAL; }
     if (queue.handle == (-1)::isize::usize) { ret 0; }
@@ -2265,9 +2706,9 @@ pub fun io_queue_close(queue: *os_shared.IoQueue) i64 {
 # bucket sharing in the address-keyed wait.
 
 #[testing]
-val TEST_REGION: usize = 4096;
+val REGION: usize = 4096;
 
-rec TestThread {
+rec Thread {
     state:       i64;
     reclaimable: i64;
     native:      usize;
@@ -2275,39 +2716,31 @@ rec TestThread {
 }
 
 #[testing]
-fun tt_spawn(f: fun(*u8), arg: *u8, t: *TestThread) i64 {
+fun tt_spawn(f: fun(*u8), arg: *u8, t: *Thread) i64 {
     t.state       = 0;
     t.reclaimable = 0;
     t.native      = 0;
     t.base        = 0;
-    val base: usize = allocate(TEST_REGION)::usize;
+    val base: usize = allocate(REGION)::usize;
     if (base == 0) { ret -1; }
     t.base = base;
     val r: i64 = thread_spawn(
         f, arg, ?t.state, ?t.reclaimable,
-        base::ptr, TEST_REGION, "",
+        base::ptr, REGION, "",
         2097152, 0, ?t.native,
     );
     if (r < 0) {
-        deallocate(base::ptr, TEST_REGION);
+        deallocate(base::ptr, REGION);
         t.base = 0;
     }
     ret r;
 }
 
 #[testing]
-fun tt_join(t: *TestThread) {
+fun tt_join(t: *Thread) {
     thread_join(t.native, ?t.reclaimable);
-    deallocate(t.base::ptr, TEST_REGION);
+    deallocate(t.base::ptr, REGION);
     t.base = 0;
-}
-
-#[testing]
-var tw_flag: i64 = 0;
-
-#[testing]
-fun tw_setter(arg: *u8) {
-    atomic.store(?tw_flag, 7);
 }
 
 #[testing]
@@ -2321,53 +2754,41 @@ fun tw_add100(arg: *u8) {
 # whatever follows it in the bucket table, so the check is that a guard region
 # behind a real, initialized and used object is still untouched
 test libsystem__pthread_objects_fit_their_declared_sizes {
-    var slab: [192]u8;
-    var i:    usize = 0;
+    var slab:  [24]u64;
+    val bytes: *u8   = (?slab[0])::*u8;
+    var i:     usize = 0;
     for (i < 192) {
-        slab[i] = 0xC7;
-        i       = i + 1;
+        bytes[i] = 0xC7;
+        i        = i + 1;
     }
-    if (ls.pthread_mutex_init(?slab[0], nil) != 0) { ret 1; }
-    if (ls.pthread_mutex_lock(?slab[0]) != 0)      { ret 1; }
-    if (ls.pthread_mutex_unlock(?slab[0]) != 0)    { ret 1; }
+    if (ls.pthread_mutex_init(bytes, nil) != 0) { ret 1; }
+    if (ls.pthread_mutex_lock(bytes) != 0)      { ret 1; }
+    if (ls.pthread_mutex_unlock(bytes) != 0)    { ret 1; }
     i = ls.PTHREAD_MUTEX_BYTES;
     for (i < 192) {
-        if (slab[i] != 0xC7) { ret 2; }
+        if (bytes[i] != 0xC7) { ret 2; }
         i = i + 1;
     }
 
     i = 0;
     for (i < 192) {
-        slab[i] = 0xD3;
-        i       = i + 1;
+        bytes[i] = 0xD3;
+        i        = i + 1;
     }
-    if (ls.pthread_cond_init(?slab[0], nil) != 0) { ret 3; }
-    if (ls.pthread_cond_broadcast(?slab[0]) != 0) { ret 3; }
+    if (ls.pthread_cond_init(bytes, nil) != 0) { ret 3; }
+    if (ls.pthread_cond_broadcast(bytes) != 0) { ret 3; }
     i = ls.PTHREAD_COND_BYTES;
     for (i < 192) {
-        if (slab[i] != 0xD3) { ret 4; }
+        if (bytes[i] != 0xD3) { ret 4; }
         i = i + 1;
     }
-    ret 0;
-}
-
-# join releases the portable owner after native pthread teardown
-test thread__join_runs_the_body_and_releases_its_owner {
-    atomic.store(?tw_flag, 0);
-    var t: TestThread;
-    if (tt_spawn(tw_setter, nil, ?t) < 0) { ret 1; }
-    val base: usize = t.base;
-    tt_join(?t);
-    if (atomic.load(?tw_flag) != 7) { ret 1; }
-
-    if (protect(base::ptr, TEST_REGION, PROT_READ::u32) >= 0) { ret 1; }
     ret 0;
 }
 
 # each thread gets its own userdata pointer and every one of them runs
 test thread__threads_receive_distinct_userdata {
     var slots: [4]i64;
-    var ts:    [4]TestThread;
+    var ts:    [4]Thread;
     var i:     usize = 0;
     for (i < 4) {
         slots[i] = i::i64;
@@ -2394,15 +2815,33 @@ test thread__threads_receive_distinct_userdata {
     ret 0;
 }
 
-# thread_wait does not block when the word already differs from `expected`
-#
-# the guard that keeps `join` from sleeping on an already-finished thread. a
-# wait that ignored the comparison would hang here rather than fail.
-test thread_wait__returns_when_value_differs {
-    var word: i64 = 5;
-    if (thread_wait(?word, 0) != 0) { ret 1; }
-    if (word != 5)                  { ret 1; }
-    ret 0;
+# a waiter on its own word, which it reports entering and leaving
+#[testing]
+rec WordWaiter {
+    word:    *i64;
+    entered: i64;
+    result:  i64;
+    done:    i64;
+}
+
+#[testing]
+fun tw_wait_word(arg: *u8) {
+    val w: *WordWaiter = arg::*WordWaiter;
+    atomic.store(?w.entered, 1);
+    for (atomic.load(w.word) == 0) { w.result = thread_wait(w.word, 0); }
+    atomic.store(?w.done, 1);
+}
+
+# polls a flag for 20 seconds at most, so a lost wake fails rather than hangs
+#[testing]
+fun tw_reached(flag: *i64) bool {
+    var polls: usize = 0;
+    for (atomic.load(flag) == 0) {
+        if (polls >= 20000) { ret false; }
+        sleep(1000000);
+        polls = polls + 1;
+    }
+    ret true;
 }
 
 # two waiters whose words share a bucket are both delivered
@@ -2410,7 +2849,7 @@ test thread_wait__returns_when_value_differs {
 # the buckets are a hash table over addresses, so distinct words collide. this
 # builds a genuine collision rather than assuming one, and drives both to
 # completion. a `signal` in thread_wake instead of a `broadcast` can hand the
-# single wakeup to the wrong waiter here and stall.
+# single wakeup to the wrong waiter here, which fails the test.
 test thread_wake__colliding_wait_addresses_are_both_woken {
     var slots: [256]i64;
     var i:     usize = 0;
@@ -2438,16 +2877,44 @@ test thread_wake__colliding_wait_addresses_are_both_woken {
     }
     if (!found) { ret 1; }
 
-    var ta: TestThread;
-    var tb: TestThread;
-    if (tt_spawn(tw_add100, (?slots[a])::*u8, ?ta) < 0) { ret 1; }
-    if (tt_spawn(tw_add100, (?slots[b])::*u8, ?tb) < 0) { ret 1; }
+    # both threads sleep on their colliding words, both words change, and only
+    # a's is woken: a single signal would leave one of them asleep
+    var wa: WordWaiter = WordWaiter{word: ?slots[a], entered: 0, result: 0, done: 0};
+    var wb: WordWaiter = WordWaiter{word: ?slots[b], entered: 0, result: 0, done: 0};
+    var ta: Thread;
+    var tb: Thread;
+    if (tt_spawn(tw_wait_word, (?wa)::*u8, ?ta) < 0) { ret 1; }
+    if (tt_spawn(tw_wait_word, (?wb)::*u8, ?tb) < 0) {
+        atomic.store(?slots[a], 1);
+        thread_wake(?slots[a]);
+        tt_join(?ta);
+        ret 1;
+    }
+    if (!tw_reached(?wa.entered) || !tw_reached(?wb.entered)) {
+        atomic.store(?slots[a], 1);
+        atomic.store(?slots[b], 1);
+        thread_wake(?slots[a]);
+        thread_wake(?slots[b]);
+        tt_join(?ta);
+        tt_join(?tb);
+        ret 4;
+    }
+    # give both a moment to reach the sleep; a waiter not yet asleep only weakens the check
+    sleep(50000000);
+    atomic.store(?slots[a], 1);
+    atomic.store(?slots[b], 1);
+    thread_wake(?slots[a]);
 
+    var bad: i32 = 0;
+    if (!tw_reached(?wa.done) || !tw_reached(?wb.done)) {
+        bad = 2;
+        thread_wake(?slots[b]);
+        thread_wake(?slots[a]);
+    }
     tt_join(?ta);
     tt_join(?tb);
-
-    if (slots[a] != 100) { ret 1; }
-    if (slots[b] != 100) { ret 1; }
+    if (bad != 0)                         { ret bad; }
+    if (wa.result != 0 || wb.result != 0) { ret 3; }
     ret 0;
 }
 
@@ -2487,6 +2954,12 @@ pub val SOCKADDR_IN_SIZE:      usize = 16;
 pub val SOCKADDR_IN6_SIZE:     usize = 28;
 pub val SOCKADDR_STORAGE_SIZE: usize = 128;
 
+# send bytes on a connected socket through write
+# ---
+# fd:  socket fd
+# buf: source bytes
+# len: bytes to send
+# ret: bytes sent, or negative errno
 pub fun sock_send(fd: usize, buf: *u8, len: usize) i64 {
     ret write(fd::i32, buf, len);
 }
@@ -2505,7 +2978,7 @@ pub fun local_stream_recv(fd: usize, buffer: *u8, length: usize) i64 {
     var control: ls.ControlHeader = ls.ControlHeader{};
     var vector:  ls.IoVector      = ls.IoVector{data: buffer, length: length};
     var message: ls.MessageHeader;
-    message_init(?message, nil, 0, ?vector, 1, (?control)::*u8, $size_of(ls.ControlHeader));
+    message_make(?message, nil, 0, ?vector, 1, (?control)::*u8, $size_of(ls.ControlHeader));
     val peeked: i64 = ls.recvmsg(fd::i32, ?message, ls.MSG_PEEK);
     if (peeked == -1)                                                                         { ret ls.fail_errno(); }
     if (message.control_length != 0 || (message.flags & (ls.MSG_TRUNC | ls.MSG_CTRUNC)) != 0) { ret ENOTSUP; }
@@ -2513,6 +2986,12 @@ pub fun local_stream_recv(fd: usize, buffer: *u8, length: usize) i64 {
     ret read(fd::i32, buffer, peeked::usize);
 }
 
+# write a gather list to a socket
+# ---
+# fd:      socket fd
+# vectors: the buffers, written in order, nil is EINVAL
+# count:   entries in vectors, 1 to 1024, otherwise EINVAL
+# ret:     bytes written, or negative errno
 pub fun sock_write_vector(fd: usize, vectors: *IoVector, count: usize) i64 {
     if (vectors == nil || count == 0 || count > 1024) { ret EINVAL; }
     val result: i64 = ls.writev(fd::i32, vectors, count::i32);
@@ -2520,7 +2999,7 @@ pub fun sock_write_vector(fd: usize, vectors: *IoVector, count: usize) i64 {
     ret result;
 }
 
-fun message_init(message: *ls.MessageHeader, address: *u8, address_length: u32, vectors: *IoVector, vector_count: usize, control: *u8, control_length: usize) {
+fun message_make(message: *ls.MessageHeader, address: *u8, address_length: u32, vectors: *IoVector, vector_count: usize, control: *u8, control_length: usize) {
     @message = ls.MessageHeader{
         address: address, address_length: address_length,
         vectors: vectors, vector_count: vector_count::i32,
@@ -2528,10 +3007,20 @@ fun message_init(message: *ls.MessageHeader, address: *u8, address_length: u32, 
     };
 }
 
+# send a gather list with an optional address and ancillary data
+# ---
+# fd:             socket fd
+# vectors:        the buffers, nil is EINVAL
+# vector_count:   entries in vectors, 1 to 1024, otherwise EINVAL
+# address:        destination sockaddr, or nil
+# address_length: size of address
+# control:        ancillary data, or nil
+# control_length: size of control, above u32 range is EINVAL
+# ret:            bytes sent, or negative errno
 pub fun sock_send_message(fd: usize, vectors: *IoVector, vector_count: usize, address: *u8, address_length: u32, control: *u8, control_length: usize) i64 {
     if (vectors == nil || vector_count == 0 || vector_count > 1024 || control_length > 0xffffffff) { ret EINVAL; }
     var message: ls.MessageHeader;
-    message_init(?message, address, address_length, vectors, vector_count, control, control_length);
+    message_make(?message, address, address_length, vectors, vector_count, control, control_length);
     val result: i64 = ls.sendmsg(fd::i32, ?message, 0);
     if (result == -1) { ret ls.fail_errno(); }
     ret result;
@@ -2543,7 +3032,7 @@ pub fun sock_send_message(fd: usize, vectors: *IoVector, vector_count: usize, ad
 pub fun sock_receive_message(fd: usize, vectors: *IoVector, vector_count: usize, address: *u8, address_length: *u32, control: *u8, control_length: *usize, flags: *i32) i64 {
     if (vectors == nil || vector_count == 0 || vector_count > 1024 || address_length == nil || control_length == nil || flags == nil || @control_length > 0xffffffff) { ret EINVAL; }
     var message: ls.MessageHeader;
-    message_init(?message, address, @address_length, vectors, vector_count, control, @control_length);
+    message_make(?message, address, @address_length, vectors, vector_count, control, @control_length);
     val result: i64 = ls.recvmsg(fd::i32, ?message, 0);
     if (result == -1) { ret ls.fail_errno(); }
     @address_length = message.address_length;
@@ -2552,7 +3041,8 @@ pub fun sock_receive_message(fd: usize, vectors: *IoVector, vector_count: usize,
     ret result;
 }
 
-pub fun sock_connect_status(fd: usize) i64 {
+# a connect's own failure, read from SO_ERROR, or 0 when none is recorded
+fun sock_connect_status(fd: usize) i64 {
     var code:   i32 = 0;
     var length: u32 = 4;
     val result: i64 = sock_getopt(fd, SOL_SOCKET, SO_ERROR, (?code)::*u8, ?length);
@@ -2561,10 +3051,68 @@ pub fun sock_connect_status(fd: usize) i64 {
     ret -(code::i64);
 }
 
+# what sock_connect_begin and sock_connect_poll return while the connect is in flight
+pub val CONNECT_PENDING: i64 = 1;
+
+val EINPROGRESS: i64 = -36;
+
+# switch a socket between blocking and nonblocking
+# ---
+# fd:      socket handle
+# enabled: true for nonblocking
+# ret:     0, or the native failure
+pub fun sock_set_nonblocking(fd: usize, enabled: bool) i64 {
+    val flags: i64 = file_flags(fd::i32);
+    if (flags < 0) { ret flags; }
+    var wanted: i64 = flags & ~(O_NONBLOCK::i64);
+    if (enabled)         { wanted = flags | O_NONBLOCK::i64; }
+    if (wanted == flags) { ret 0; }
+    ret set_file_flags(fd::i32, wanted::i32);
+}
+
+# start a connect on a nonblocking socket
+# ---
+# fd:      a nonblocking stream socket
+# addr:    pointer to the peer's sockaddr
+# addrlen: size of the sockaddr
+# ret:     0 once connected, CONNECT_PENDING while in flight, or negative errno
+pub fun sock_connect_begin(fd: usize, addr: *u8, addrlen: usize) i64 {
+    val code: i64 = sock_connect(fd, addr, addrlen);
+    # an interrupted nonblocking connect goes on in the background
+    if (code == EINPROGRESS || code == EINTR) { ret CONNECT_PENDING; }
+    if (code < 0)                             { ret code; }
+    ret 0;
+}
+
+# ask whether a connect sock_connect_begin started has settled, without waiting
+# ---
+# fd:  the socket sock_connect_begin returned CONNECT_PENDING for
+# ret: 0 once connected, CONNECT_PENDING while in flight, or the connect's
+#      negative errno
+pub fun sock_connect_poll(fd: usize) i64 {
+    val status: i64 = sock_connect_status(fd);
+    if (status < 0) { ret status; }
+    var peer:   [16]u64;
+    var length: u32 = 128;
+    if (sock_remote_addr(fd, (?peer[0])::*u8, ?length) < 0) { ret CONNECT_PENDING; }
+    ret 0;
+}
+
+# close a socket
+# ---
+# fd:  socket fd
+# ret: 0, or negative errno
 pub fun sock_close(fd: usize) i64 {
     ret close(fd::i32);
 }
 
+# create a blocking, close-on-exec socket
+# ---
+# domain:   AF_* family
+# typ:      SOCK_* type
+# protocol: protocol, or 0 for the default
+# out:      receives the handle, all bits one on failure
+# ret:      0, or negative errno
 pub fun sock_create(domain: i32, typ: i32, protocol: i32, out: *usize) i64 {
     ret sock_create_flags(domain, typ, protocol, false, true, out);
 }
@@ -2585,6 +3133,15 @@ fun configure_socket_flags(fd: i32, nonblocking: bool, non_inheritable: bool) i6
     ret 0;
 }
 
+# create a socket with chosen blocking and inheritance
+# ---
+# domain:          AF_* family
+# typ:             SOCK_* type
+# protocol:        protocol, or 0 for the default
+# nonblocking:     true for a nonblocking socket
+# non_inheritable: true to set close-on-exec
+# out:             receives the handle, all bits one on failure, nil is EINVAL
+# ret:             0, or negative errno
 pub fun sock_create_flags(domain: i32, typ: i32, protocol: i32, nonblocking: bool, non_inheritable: bool, out: *usize) i64 {
     if (out == nil) { ret EINVAL; }
     @out = (-1)::isize::usize;
@@ -2599,6 +3156,12 @@ pub fun sock_create_flags(domain: i32, typ: i32, protocol: i32, nonblocking: boo
     ret 0;
 }
 
+# bind a socket to a local address
+# ---
+# fd:      socket fd
+# addr:    the sockaddr
+# addrlen: size of the sockaddr, above u32 range is EINVAL
+# ret:     0, or negative errno
 pub fun sock_bind(fd: usize, addr: *u8, addrlen: usize) i64 {
     if (addrlen > 0xffffffff) { ret EINVAL; }
     val result: i32 = ls.bind(fd::i32, addr, addrlen::u32);
@@ -2606,16 +3169,37 @@ pub fun sock_bind(fd: usize, addr: *u8, addrlen: usize) i64 {
     ret result::i64;
 }
 
+# mark a socket as accepting connections
+# ---
+# fd:      socket fd
+# backlog: most pending connections to queue
+# ret:     0, or negative errno
 pub fun sock_listen(fd: usize, backlog: i32) i64 {
     val result: i32 = ls.listen(fd::i32, backlog);
     if (result == -1) { ret ls.fail_errno(); }
     ret result::i64;
 }
 
+# accept a connection as a blocking, close-on-exec socket
+# ---
+# fd:      listening socket fd
+# addr:    receives the peer address, or nil
+# addrlen: in, the capacity of addr, out, its size
+# out:     receives the handle, all bits one on failure
+# ret:     0, or negative errno
 pub fun sock_accept(fd: usize, addr: *u8, addrlen: *u32, out: *usize) i64 {
     ret sock_accept_flags(fd, addr, addrlen, false, true, out);
 }
 
+# accept a connection with chosen blocking and inheritance
+# ---
+# fd:              listening socket fd
+# addr:            receives the peer address, or nil
+# addrlen:         in, the capacity of addr, out, its size
+# nonblocking:     true for a nonblocking socket
+# non_inheritable: true to set close-on-exec
+# out:             receives the handle, all bits one on failure, nil is EINVAL
+# ret:             0, or negative errno
 pub fun sock_accept_flags(fd: usize, addr: *u8, addrlen: *u32, nonblocking: bool, non_inheritable: bool, out: *usize) i64 {
     if (out == nil) { ret EINVAL; }
     @out = (-1)::isize::usize;
@@ -2630,6 +3214,12 @@ pub fun sock_accept_flags(fd: usize, addr: *u8, addrlen: *u32, nonblocking: bool
     ret 0;
 }
 
+# connect a socket to a peer
+# ---
+# fd:      socket fd
+# addr:    the peer sockaddr
+# addrlen: size of the sockaddr, above u32 range is EINVAL
+# ret:     0, or negative errno (EINPROGRESS on a nonblocking socket)
 pub fun sock_connect(fd: usize, addr: *u8, addrlen: usize) i64 {
     if (addrlen > 0xffffffff) { ret EINVAL; }
     val result: i32 = ls.connect(fd::i32, addr, addrlen::u32);
@@ -2637,6 +3227,15 @@ pub fun sock_connect(fd: usize, addr: *u8, addrlen: usize) i64 {
     ret result::i64;
 }
 
+# send bytes to an address
+# ---
+# fd:      socket fd
+# buf:     source bytes
+# len:     bytes to send
+# flags:   MSG_* bits
+# addr:    destination sockaddr, or nil on a connected socket
+# addrlen: size of addr, above u32 range is EINVAL
+# ret:     bytes sent, or negative errno
 pub fun sock_sendto(fd: usize, buf: *u8, len: usize, flags: i32, addr: *u8, addrlen: usize) i64 {
     if (addrlen > 0xffffffff) { ret EINVAL; }
     val result: i64 = ls.sendto(fd::i32, buf, len, flags, addr, addrlen::u32);
@@ -2656,18 +3255,41 @@ pub fun sock_peek_readable(fd: usize) i64 {
     ret result;
 }
 
+# receive bytes with the sender's address
+# ---
+# fd:      socket fd
+# buf:     destination buffer
+# len:     most bytes to receive
+# flags:   MSG_* bits
+# addr:    receives the sender address, or nil
+# addrlen: in, the capacity of addr, out, its size, or nil
+# ret:     bytes received, 0 at orderly end, or negative errno
 pub fun sock_recvfrom(fd: usize, buf: *u8, len: usize, flags: i32, addr: *u8, addrlen: *u32) i64 {
     val result: i64 = ls.recvfrom(fd::i32, buf, len, flags, addr, addrlen);
     if (result == -1) { ret ls.fail_errno(); }
     ret result;
 }
 
+# shut down one or both directions of a socket
+# ---
+# fd:  socket fd
+# how: SHUT_RD, SHUT_WR or SHUT_RDWR
+# ret: 0, or negative errno
 pub fun sock_shutdown(fd: usize, how: i32) i64 {
     val result: i32 = ls.shutdown(fd::i32, how);
     if (result == -1) { ret ls.fail_errno(); }
     ret result::i64;
 }
 
+# set a socket option
+# ---
+# fd:     socket fd
+# level:  option level (SOL_SOCKET, IPPROTO_TCP, etc.)
+# opt:    option name
+# value:  the option value
+# vallen: size of value, above u32 range is EINVAL
+# ret:    0, ENOTSUP for SO_UNSUPPORTED or an option the protocol lacks, or
+#         negative errno
 pub fun sock_setopt(fd: usize, level: i32, opt: i32, value: *u8, vallen: usize) i64 {
     if (opt == SO_UNSUPPORTED) { ret ENOTSUP; }
     if (vallen > 0xffffffff)   { ret EINVAL; }
@@ -2680,6 +3302,15 @@ pub fun sock_setopt(fd: usize, level: i32, opt: i32, value: *u8, vallen: usize) 
     ret result::i64;
 }
 
+# read a socket option
+# ---
+# fd:     socket fd
+# level:  option level (SOL_SOCKET, IPPROTO_TCP, etc.)
+# opt:    option name
+# value:  receives the option value
+# vallen: in, the capacity of value, out, its size
+# ret:    0, ENOTSUP for SO_UNSUPPORTED or an option the protocol lacks, or
+#         negative errno
 pub fun sock_getopt(fd: usize, level: i32, opt: i32, value: *u8, vallen: *u32) i64 {
     if (opt == SO_UNSUPPORTED) { ret ENOTSUP; }
     val result: i32 = ls.getsockopt(fd::i32, level, opt, value, vallen);
@@ -2691,18 +3322,35 @@ pub fun sock_getopt(fd: usize, level: i32, opt: i32, value: *u8, vallen: *u32) i
     ret result::i64;
 }
 
+# read a socket's local address
+# ---
+# fd:      socket fd
+# addr:    receives the sockaddr
+# addrlen: in, the capacity of addr, out, its size
+# ret:     0, or negative errno
 pub fun sock_local_addr(fd: usize, addr: *u8, addrlen: *u32) i64 {
     val result: i32 = ls.getsockname(fd::i32, addr, addrlen);
     if (result == -1) { ret ls.fail_errno(); }
     ret result::i64;
 }
 
+# read a connected socket's peer address
+# ---
+# fd:      socket fd
+# addr:    receives the sockaddr
+# addrlen: in, the capacity of addr, out, its size
+# ret:     0, or negative errno (ENOTCONN while unconnected)
 pub fun sock_remote_addr(fd: usize, addr: *u8, addrlen: *u32) i64 {
     val result: i32 = ls.getpeername(fd::i32, addr, addrlen);
     if (result == -1) { ret ls.fail_errno(); }
     ret result::i64;
 }
 
+# whether a child process would inherit a socket
+# ---
+# fd:  socket fd
+# out: receives true when close-on-exec is clear, nil is EINVAL
+# ret: 0, or negative errno
 pub fun sock_inheritable(fd: usize, out: *bool) i64 {
     if (out == nil) { ret EINVAL; }
     val flags: i64 = fd_flags(fd::i32);
@@ -2724,11 +3372,8 @@ pub fun sock_inheritable(fd: usize, out: *bool) i64 {
 # ms:  timeout in milliseconds, or 0 for no timeout
 # ret: 0 on success, or negative errno
 pub fun sock_set_rcvtimeo(fd: usize, ms: u64) i64 {
-    var tv:   [16]u8;
-    val base: usize = (?tv[0])::usize;
-    @(base::*i64)       = (ms / 1000)::i64;
-    @((base + 8)::*i64) = ((ms % 1000) * 1000)::i64;
-    ret sock_setopt(fd, SOL_SOCKET, SO_RCVTIMEO, ?tv[0], 16);
+    var tv: [2]i64 = [2]i64{(ms / 1000)::i64, ((ms % 1000) * 1000)::i64};
+    ret sock_setopt(fd, SOL_SOCKET, SO_RCVTIMEO, (?tv[0])::*u8, 16);
 }
 
 # dns
@@ -2773,83 +3418,12 @@ pub fun clock_gettime(clock_id: i32, ts: *timespec) i64 {
     ret 0;
 }
 
-# clock tests
-#
-# a broken clock is not a clock that errors - it is a clock that returns a
-# plausible-looking number, so each check pins the clock against something
-# independent: the wall clock against a timestamp the filesystem wrote, and
-# tv_nsec against its documented range, which a tick count spilled into the
-# struct would violate
-
-# both clocks report nanoseconds in tv_nsec, not some other unit: a tick count
-# or a microsecond value dropped into this field lands outside [0, 1e9) almost
-# immediately
-test clock_gettime__tv_nsec_is_within_one_second {
-    var rt: timespec;
-    if (clock_gettime(CLOCK_REALTIME, ?rt) != 0)    { ret 1; }
-    if (rt.tv_nsec < 0 || rt.tv_nsec >= 1000000000) { ret 2; }
-    var mt: timespec;
-    if (clock_gettime(CLOCK_MONOTONIC, ?mt) != 0)   { ret 3; }
-    if (mt.tv_nsec < 0 || mt.tv_nsec >= 1000000000) { ret 4; }
-    ret 0;
-}
-
-# CLOCK_REALTIME agrees with the timestamp the filesystem just wrote and sits
-# in a plausible span of years. both numbers come from the same kernel clock by
-# different routes, so an epoch error, a unit error, or a stuck clock breaks
-# the comparison, and the span catches both being wrong the same way
-test clock_gettime__realtime_matches_the_filesystem_and_calendar {
-    var path: [64]u8;
-    tmp_path(?path[0], 'k'::u8);
-    unlink(AT_FDCWD, ?path[0], 0);
-    val fd: i64 = open(AT_FDCWD, ?path[0], O_CREAT | O_RDWR, 0o600);
-    if (fd < 0) { ret 1; }
-    var st: stat_t;
-    val sr: i64 = stat(fd::i32, ?st);
-    close(fd::i32);
-    unlink(AT_FDCWD, ?path[0], 0);
-    if (sr != 0) { ret 2; }
-
-    var now: timespec;
-    if (clock_gettime(CLOCK_REALTIME, ?now) != 0) { ret 3; }
-    var delta: i64 = now.tv_sec - st.st_mtime;
-    if (delta < 0)  { delta = -delta; }
-    if (delta > 60) { ret 4; }
-    # 2023-01-01 .. 2100-01-01
-    if (now.tv_sec < 1672531200 || now.tv_sec > 4102444800) { ret 5; }
-    ret 0;
-}
-
-# the monotonic clock never runs backwards across repeated reads
-test clock_gettime__monotonic_never_decreases {
-    var prev: timespec;
-    if (clock_gettime(CLOCK_MONOTONIC, ?prev) != 0) { ret 1; }
-
-    var i: usize = 0;
-    for (i < 200) {
-        var cur: timespec;
-        if (clock_gettime(CLOCK_MONOTONIC, ?cur) != 0)               { ret 1; }
-        if (cur.tv_sec < prev.tv_sec)                                { ret 1; }
-        if (cur.tv_sec == prev.tv_sec && cur.tv_nsec < prev.tv_nsec) { ret 1; }
-        prev = cur;
-        i    = i + 1;
-    }
-    ret 0;
-}
-
-# an unknown clock id is refused with EINVAL, not answered with a wrong number
-#
-# the error path, provoked rather than assumed. this also confirms the wrapper
-# reads errno at all: the old trap-based version reported failure through a
-# different channel entirely.
-test clock_gettime__unknown_clock_id_is_einval {
-    var ts: timespec;
-    if (clock_gettime(9999, ?ts) != EINVAL) { ret 1; }
-    ret 0;
-}
-
 # errno
 
+# a human-readable message for a negated errno
+# ---
+# code: negated errno value
+# ret:  the message, "unknown error" for a code it does not name
 pub fun error_message(code: i64) str {
     if (code == EPERM)        { ret "operation not permitted"; }
     or (code == ENOENT)       { ret "no such file or directory"; }
@@ -2880,6 +3454,7 @@ pub fun error_message(code: i64) str {
     or (code == ENAMETOOLONG) { ret "file name too long"; }
     or (code == ENOTEMPTY)    { ret "directory not empty"; }
     or (code == ENOTSUP)      { ret "operation not supported"; }
+    or (code == ENOSYS)       { ret "function not implemented"; }
     or                        { ret "unknown error"; }
 }
 
@@ -2888,16 +3463,16 @@ fun grouped_launch_probe(arg: *u8) {
     val failed: *i64 = arg::*i64;
     var argv:   [3]usize;
     argv[0] = ("/bin/sleep")::usize;
-    argv[1] = ("10")::usize;
+    argv[1] = ("3600")::usize;
     argv[2] = 0;
     var envp: [1]usize;
     envp[0] = 0;
     var i: usize = 0;
     for (i < 32) {
         var pid: i64 = 0;
-        if (i % 3 == 0) { pid = spawn_grouped("/bin/sleep", (?argv[0])::**u8, (?envp[0])::**u8); }
-        or (i % 3 == 1) { pid = spawn_redirected_grouped("/bin/sleep", (?argv[0])::**u8, (?envp[0])::**u8, -1, -1, -1); }
-        or              { pid = spawn_redirected_in_grouped("/bin/sleep", (?argv[0])::**u8, (?envp[0])::**u8, "/", -1, -1, -1); }
+        if (i % 3 == 0) { pid = spawn_grouped("/bin/sleep", (?argv[0])::**u8, Environment.given{(?envp[0])::**u8}); }
+        or (i % 3 == 1) { pid = spawn_redirected_grouped("/bin/sleep", (?argv[0])::**u8, Environment.given{(?envp[0])::**u8}, -1, -1, -1); }
+        or              { pid = spawn_redirected_in_grouped("/bin/sleep", (?argv[0])::**u8, Environment.given{(?envp[0])::**u8}, "/", -1, -1, -1); }
         if (pid < 0) {
             atomic.store(failed, 2);
             ret;
@@ -2929,7 +3504,7 @@ fun grouped_probe_descriptors() usize {
 
 test spawn_grouped__concurrent_launches_return_ready_groups_without_leaking {
     val before:   usize = grouped_probe_descriptors();
-    var workers:  [4]TestThread;
+    var workers:  [4]Thread;
     var failures: [4]i64;
     var started:  usize = 0;
     var bad:      i32   = 0;
@@ -2990,6 +3565,20 @@ test fork__child_has_its_own_pid_and_exit_code {
     ret 0;
 }
 
+# vfork promises the fork contract and returns cleanly in parent and child
+test vfork__child_has_its_own_pid_and_exit_code {
+    val first: i64 = getpid();
+    if (first <= 0) { ret 1; }
+    val pid: i64 = vfork();
+    if (pid < 0) { ret 2; }
+    if (pid == 0) {
+        if (getpid() == first) { terminate(1); }
+        terminate(9);
+    }
+    if (reap_exit_code(pid) != 9) { ret 3; }
+    ret 0;
+}
+
 # a child whose setup fails exits 127 when execve cannot find the program and
 # 126 when chdir or dup2 fail, and the parent's working directory never moves
 test spawn__child_setup_failures_exit_127_or_126 {
@@ -2999,13 +3588,13 @@ test spawn__child_setup_failures_exit_127_or_126 {
     var missing: [2]usize;
     missing[0] = ("/tmp/mach-std-415-definitely-absent/program")::usize;
     missing[1] = 0;
-    val absent: i64 = spawn("/tmp/mach-std-415-definitely-absent/program", (?missing[0])::**u8, (?envp[0])::**u8);
+    val absent: i64 = spawn("/tmp/mach-std-415-definitely-absent/program", (?missing[0])::**u8, Environment.given{(?envp[0])::**u8});
     if (absent <= 0)                   { ret 1; }
     if (reap_exit_code(absent) != 127) { ret 2; }
 
     var before: [1024]u8;
     if (getcwd(?before[0], 1024) < 1) { ret 3; }
-    val moved: i64 = spawn_in("/usr/bin/true", true_argv(?argv[0]), (?envp[0])::**u8, "/tmp/mach-std-415-definitely-absent");
+    val moved: i64 = spawn_in("/usr/bin/true", true_argv(?argv[0]), Environment.given{(?envp[0])::**u8}, "/tmp/mach-std-415-definitely-absent");
     if (moved <= 0)                   { ret 4; }
     if (reap_exit_code(moved) != 126) { ret 5; }
     var after: [1024]u8;
@@ -3021,27 +3610,9 @@ test spawn__child_setup_failures_exit_127_or_126 {
     val closed: i32 = fds[1];
     close(fds[0]);
     close(fds[1]);
-    val redirected: i64 = spawn_redirected("/usr/bin/true", true_argv(?argv[0]), (?envp[0])::**u8, -1, closed, -1);
+    val redirected: i64 = spawn_redirected("/usr/bin/true", true_argv(?argv[0]), Environment.given{(?envp[0])::**u8}, -1, closed, -1);
     if (redirected <= 0)                   { ret 9; }
     if (reap_exit_code(redirected) != 126) { ret 10; }
-    ret 0;
-}
-
-# exec itself reports the errno when it returns
-test exec__missing_program_returns_enoent {
-    val pid: i64 = fork();
-    if (pid < 0) { ret 1; }
-    if (pid == 0) {
-        var argv: [2]usize;
-        argv[0] = ("/tmp/mach-std-415-definitely-absent/program")::usize;
-        argv[1] = 0;
-        var envp: [1]usize;
-        envp[0] = 0;
-        val code: i64 = exec("/tmp/mach-std-415-definitely-absent/program", (?argv[0])::**u8, (?envp[0])::**u8);
-        if (code == ENOENT) { terminate(0); }
-        terminate(1);
-    }
-    if (reap_exit_code(pid) != 0) { ret 2; }
     ret 0;
 }
 
@@ -3069,25 +3640,39 @@ test process__foreign_and_absent_pids_are_refused {
 
 # the child sweep closes every inherited descriptor above the standard three:
 # a pipe end the parent holds open is not held by the child, so the parent's
-# read sees EOF once the child has exec'd rather than blocking on it
+# read sees EOF once the child has exec'd rather than blocking on it. the child
+# outlives the test, so the read is polled and a leaked pipe end fails it
 test spawn__child_does_not_inherit_a_parent_pipe {
     var fds: [2]i32;
     if (ls.pipe(?fds[0]) < 0) { ret 1; }
     var argv: [3]usize;
     argv[0] = ("/bin/sleep")::usize;
-    argv[1] = ("10")::usize;
+    argv[1] = ("3600")::usize;
     argv[2] = 0;
     var envp: [1]usize;
     envp[0] = 0;
-    val pid: i64 = spawn("/bin/sleep", (?argv[0])::**u8, (?envp[0])::**u8);
+    val pid: i64 = spawn("/bin/sleep", (?argv[0])::**u8, Environment.given{(?envp[0])::**u8});
     if (pid <= 0) {
         close(fds[0]);
         close(fds[1]);
         ret 2;
     }
     close(fds[1]);
-    var byte: u8;
-    val n:    i64 = read(fds[0], ?byte, 1);
+    val flags: i64 = file_flags(fds[0]);
+    if (flags < 0 || set_file_flags(fds[0], flags::i32 | O_NONBLOCK) < 0) {
+        close(fds[0]);
+        terminate_child(pid);
+        reap_exit_code(pid);
+        ret 5;
+    }
+    var byte:  u8;
+    var n:     i64   = read(fds[0], ?byte, 1);
+    var polls: usize = 0;
+    for (n == EAGAIN && polls < 20000) {
+        sleep(1000000);
+        n     = read(fds[0], ?byte, 1);
+        polls = polls + 1;
+    }
     close(fds[0]);
     val stopped: i64 = terminate_child(pid);
     reap_exit_code(pid);
@@ -3109,18 +3694,17 @@ test decode_process_status__continued_is_not_a_stop {
 # a stale errno left by an earlier failure must therefore not surface as a
 # directory error at EOF.
 test directory__stale_errno_is_not_reported_at_end {
-    var path: [64]u8;
-    tmp_path(?path[0], 'p'::u8);
-    unlink(AT_FDCWD, ?path[0], AT_REMOVEDIR);
-    if (make_dir(AT_FDCWD, ?path[0], 0o700) < 0) { ret 1; }
-    fin { unlink(AT_FDCWD, ?path[0], AT_REMOVEDIR); }
-    val opened: i64 = open(AT_FDCWD, ?path[0], O_RDONLY | O_DIRECTORY, 0);
+    var scratch: os_shared.Scratch;
+    if (scratch_make(?scratch) < 0) { ret 1; }
+    val path: *u8 = ?scratch.path[0];
+    fin { unlink(AT_FDCWD, path, AT_REMOVEDIR); }
+    val opened: i64 = open(AT_FDCWD, path, O_RDONLY | O_DIRECTORY, 0);
     if (opened < 0) { ret 2; }
     val fd: i32 = opened::i32;
     fin { close(fd); }
     var cursor: DirectoryCursor = DirectoryCursor{};
     if (directory_init(?cursor, fd).code != 0) { ret 3; }
-    fin { directory_close(?cursor); }
+    fin { directory_dnit(?cursor); }
     var entry: DirectoryEntry;
     var seen:  usize = 0;
     var next:  i64   = 1;
@@ -3133,19 +3717,18 @@ test directory__stale_errno_is_not_reported_at_end {
     if (next != 0)                          { ret 5; }
     if (seen != 2)                          { ret 6; }
     if (cursor.error != 0 || !cursor.ended) { ret 7; }
-    if (directory_close(?cursor) != 0)      { ret 8; }
+    if (directory_dnit(?cursor) != 0)       { ret 8; }
     ret 0;
 }
 
 # a closed stream is refused, and the duplicate descriptor fdopendir took is
 # released with it: the original descriptor stays usable
 test directory__close_releases_the_duplicate_and_keeps_the_caller_s_descriptor {
-    var path: [64]u8;
-    tmp_path(?path[0], 'q'::u8);
-    unlink(AT_FDCWD, ?path[0], AT_REMOVEDIR);
-    if (make_dir(AT_FDCWD, ?path[0], 0o700) < 0) { ret 1; }
-    fin { unlink(AT_FDCWD, ?path[0], AT_REMOVEDIR); }
-    val opened: i64 = open(AT_FDCWD, ?path[0], O_RDONLY | O_DIRECTORY, 0);
+    var scratch: os_shared.Scratch;
+    if (scratch_make(?scratch) < 0) { ret 1; }
+    val path: *u8 = ?scratch.path[0];
+    fin { unlink(AT_FDCWD, path, AT_REMOVEDIR); }
+    val opened: i64 = open(AT_FDCWD, path, O_RDONLY | O_DIRECTORY, 0);
     if (opened < 0) { ret 2; }
     val fd: i32 = opened::i32;
     fin { close(fd); }
@@ -3153,10 +3736,10 @@ test directory__close_releases_the_duplicate_and_keeps_the_caller_s_descriptor {
     var cursor: DirectoryCursor = DirectoryCursor{};
     if (directory_init(?cursor, fd).code != 0) { ret 3; }
     if (grouped_probe_descriptors() != before + 1) {
-        directory_close(?cursor);
+        directory_dnit(?cursor);
         ret 4;
     }
-    if (directory_close(?cursor) != 0)         { ret 5; }
+    if (directory_dnit(?cursor) != 0)          { ret 5; }
     if (grouped_probe_descriptors() != before) { ret 6; }
     var entry: DirectoryEntry;
     if (directory_next(?cursor, ?entry) != EINVAL) { ret 7; }
@@ -3191,7 +3774,7 @@ test regression__spawn_stream_redirected_to_itself_survives_exec {
     argv[1] = "-c";
     argv[2] = "read line && printf %s \"$line\"";
     argv[3] = nil;
-    val pid: i64 = spawn_redirected("/bin/sh", ?argv[0], nil, STDIN_FD, output[1], STDERR_FD);
+    val pid: i64 = spawn_redirected("/bin/sh", ?argv[0], Environment.inherit{}, STDIN_FD, output[1], STDERR_FD);
     ls.dup2(saved, STDIN_FD);
     close(saved);
     close(input[0]);

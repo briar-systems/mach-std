@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # who owns the thread pointer (#915): a static image, where std owns it, and a
-# dynamic image, where the loader owns the main thread's and C code creates
-# threads that call back into mach. every cell checks current_token on each
-# thread it runs: direct, stable, and distinct among the threads live at once.
+# dynamic image, where the loader owns the main thread's, std refuses a thread
+# with no backend installed, and C code creates threads that call back into
+# mach. every other cell checks current_token on each thread it runs: direct,
+# stable, and distinct among the threads live at once.
 #
 # usage: verify.sh [path-to-mach] [target] [runner]
 #   CC builds the C fixture for the target (default cc). under a qemu runner,
@@ -15,19 +16,17 @@ target="${2:-linux-x86_64}"
 runner="${3:-}"
 cc="${CC:-cc}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$here/../lib/compiler.sh"
 cd "$here"
 
-rm -rf dep out c/out
-mkdir -p dep/std c/out
-cp ../../mach.toml dep/std/mach.toml
-cp -R ../../src dep/std/src
+rm -rf out c/out
+mkdir -p c/out
+"$mach" dep pull . --quiet
 
 # the fixture is C, so it is built by a C compiler and linked by pthread_create's owner
 $cc -shared -fPIC -O1 -Wl,-soname,libprobe.so -o c/out/libprobe.so c/probe.c -lpthread
 
-mach_run build . -a static --target "$target" --profile debug
-mach_run build . -a dynamic --target "$target" --profile debug
+"$mach" build . -a static --target "$target-bare" --profile debug
+"$mach" build . -a dynamic --target "$target" --profile debug
 static="$(find out -name static -type f -print -quit)"
 dynamic="$(find out -name dynamic -type f -print -quit)"
 
@@ -48,7 +47,7 @@ cell() {
 }
 
 cell static            "$static"
-cell dynamic-std-threads "$dynamic" spawn
+cell spawn-refused     "$dynamic" refused
 cell loader-main       "$dynamic" main
 cell c-thread-callback "$dynamic" cthread
 exit "$failed"

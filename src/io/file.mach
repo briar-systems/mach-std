@@ -3,6 +3,7 @@
 use std.chrono.time;
 use io_error:  std.io.error;
 use io_handle: std.io.handle;
+use std.runtime.native.view.Unit;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -11,10 +12,10 @@ use std.types.path.Path;
 use std.types.result.res;
 use std.types.size.usize;
 
-$if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
+$if ($mach.build.sys == $mach.sys.linux || $mach.build.sys == $mach.sys.darwin || $mach.build.sys == $mach.sys.wasi) {
     use platform: std.io.file.posix;
 }
-$or ($mach.build.os == $mach.os.windows) {
+$or ($mach.build.sys == $mach.sys.windows) {
     use platform: std.io.file.windows;
 }
 
@@ -28,6 +29,14 @@ fun span_valid(offset: u64, length: usize) bool {
     ret offset <= MAX_FILE_OFFSET && length::u64 <= MAX_FILE_OFFSET - offset;
 }
 
+# how open_confined opens a file
+# ---
+# access:    the access the opened file grants
+# create:    create the file when it is missing
+# exclusive: refuse a file that already exists, valid only with create
+# truncate:  empty an existing file
+# directory: open a directory, valid only read-only without create or truncate
+# mode:      permission bits for a created file
 pub rec OpenOptions {
     access:    Access;
     create:    bool;
@@ -37,23 +46,51 @@ pub rec OpenOptions {
     mode:      i32;
 }
 
+# options that open an existing file read-only
+# ---
+# ret: READ_ONLY access with every flag off
 pub fun read_options() OpenOptions {
     ret OpenOptions{access: READ_ONLY, create: false, exclusive: false, truncate: false, directory: false, mode: 0};
 }
 
+# options that open a file write-only, creating it when missing
+# ---
+# mode: permission bits for a created file
+# ret:  WRITE_ONLY access with create set, not exclusive and not truncating
 pub fun write_options(mode: i32) OpenOptions {
     ret OpenOptions{access: WRITE_ONLY, create: true, exclusive: false, truncate: false, directory: false, mode: mode};
 }
 
+# a directory every confined operation resolves beneath
+#
+# opened in place by root_open and closed by root_close. it never moves while open
+# ---
+# directory:   the pinned directory handle
+# active:      operations admitted and not yet finished
+# initialized: true between a successful open and close
+# closing:     true while root_close waits for admitted work
+# lock:        guards active, initialized and closing
+# idle:        signalled when active drops to zero
 pub rec Root {
     directory:   filesystem.File;
     active:      usize;
     initialized: bool;
     closing:     bool;
     lock:        mutex.Mutex;
-    idle:        condition.Condition;
+    idle:        Idle;
 }
 
+# what the file layer provides on this target
+# ---
+# positioned_io:                      reads and writes at an offset are available
+# native_async:                       the host completes file requests asynchronously
+# bounded_workers:                    async requests run on a bounded worker adapter
+# confined_open:                      opens resolve beneath a root without escaping it
+# replacement_flush_request:          replace_confined requests a flush before renaming
+# replacement_persistence_guaranteed: a replacement is guaranteed to reach the media
+# mapping:                            files can be mapped into memory
+# watching:                           a path can be watched for changes
+# accelerated_transfer:               transfer uses a native copy path
 pub rec Capabilities {
     positioned_io:                      bool;
     native_async:                       bool;
@@ -66,6 +103,9 @@ pub rec Capabilities {
     accelerated_transfer:               bool;
 }
 
+# the file layer's capabilities on this target
+# ---
+# ret: the capabilities, the same on every target that builds this module
 pub fun capabilities() Capabilities {
     ret Capabilities{
         positioned_io:                      true,
@@ -107,20 +147,29 @@ fun options_flags(options: OpenOptions) i32 {
 # waits on its condition, so it never moves after this call succeeds
 pub fun root_open(root: *Root, path: Path) err[io_error.Error] {
     if (root == nil || path == nil) { ret err[io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_OPEN)}; }
-    val raw: i64 = platform.open_root(path::*u8);
+    ret root_opened(root, platform.open_root(path::*u8));
+}
+
+# root_open for a directory named in native units
+pub fun root_open_native(root: *Root, name: *Unit) err[io_error.Error] {
+    if (root == nil || name == nil) { ret err[io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_OPEN)}; }
+    ret root_opened(root, platform.open_root_native(name));
+}
+
+fun root_opened(root: *Root, raw: i64) err[io_error.Error] {
     if (raw < 0) { ret err[io_error.Error].err{failure(raw, io_error.OP_OPEN)}; }
-    var directory: filesystem.File                          = filesystem.File{handle: io_handle.FileHandle{value: raw::usize}};
-    val metadata:  res[filesystem.Metadata, io_error.Error] = filesystem.stat_of(directory);
-    if (sel metadata.err) {
+    var directory:    filesystem.File                          = filesystem.File{handle: io_handle.FileHandle{value: raw::usize}};
+    val res_metadata: res[filesystem.Metadata, io_error.Error] = filesystem.stat_of(directory);
+    if (sel res_metadata.err) {
         filesystem.close(?directory);
-        ret err[io_error.Error].err{metadata.err};
+        ret err[io_error.Error].err{res_metadata.err};
     }
     root.directory   = directory;
     root.active      = 0;
     root.initialized = true;
     root.closing     = false;
     root.lock        = mutex.make();
-    root.idle        = condition.make();
+    root.idle        = idle_make();
     ret err[io_error.Error].ok{};
 }
 
@@ -139,11 +188,15 @@ fun root_enter(root: *Root) bool {
 fun root_leave(root: *Root) {
     mutex.lock(?root.lock);
     root.active = root.active - 1;
-    if (root.active == 0) { condition.broadcast(?root.idle); }
+    if (root.active == 0) { idle_signal(?root.idle); }
     mutex.unlock(?root.lock);
 }
 
 # close rejects new resolution and waits for admitted handle-relative work
+# ---
+# root: the root to close
+# ret:  the directory close failure, or CLOSED when root is nil, not open or
+#       already closing
 pub fun root_close(root: *Root) err[io_error.Error] {
     if (root == nil) { ret err[io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_CLOSE)}; }
     mutex.lock(?root.lock);
@@ -152,12 +205,12 @@ pub fun root_close(root: *Root) err[io_error.Error] {
         ret err[io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_CLOSE)};
     }
     root.closing = true;
-    for (root.active != 0) { condition.wait(?root.idle, ?root.lock); }
-    val closed: err[io_error.Error] = filesystem.close(?root.directory);
+    for (root.active != 0) { idle_wait(?root.idle, ?root.lock); }
+    val err_closed: err[io_error.Error] = filesystem.close(?root.directory);
     root.initialized = false;
     root.closing     = false;
     mutex.unlock(?root.lock);
-    ret closed;
+    ret err_closed;
 }
 
 # relative components are opened one at a time from pinned directory handles
@@ -168,39 +221,87 @@ pub fun open_confined(root: *Root, path: Path, options: OpenOptions) res[filesys
     if (!root_enter(root)) { ret res[filesystem.File, io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_OPEN)}; }
     val raw: i64 = platform.open_confined(root.directory.handle.value::i32, path::*u8, options_flags(options), options.mode);
     root_leave(root);
+    ret confined_file(raw);
+}
+
+# open_confined for a relative name in native units, split into components
+# in those units
+pub fun open_confined_native(root: *Root, name: *Unit, options: OpenOptions) res[filesystem.File, io_error.Error] {
+    if (root == nil || name == nil || !options_valid(options)) {
+        ret res[filesystem.File, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_OPEN)};
+    }
+    if (!root_enter(root)) { ret res[filesystem.File, io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_OPEN)}; }
+    val raw: i64 = platform.open_confined_native(root.directory.handle.value::i32, name, options_flags(options), options.mode);
+    root_leave(root);
+    ret confined_file(raw);
+}
+
+fun confined_file(raw: i64) res[filesystem.File, io_error.Error] {
     if (raw < 0) { ret res[filesystem.File, io_error.Error].err{failure(raw, io_error.OP_OPEN)}; }
     ret res[filesystem.File, io_error.Error].ok{filesystem.File{handle: io_handle.FileHandle{value: raw::usize}}};
 }
 
 # success confirms os data and namespace flush requests, not media persistence
+#
+# both names are converted once before anything is flushed, so a name that
+# cannot be converted leaves the temporary untouched
 pub fun replace_confined(root: *Root, temporary: Path, destination: Path) err[io_error.Error] {
-    if (root == nil || temporary == nil || destination == nil || !root_enter(root)) {
-        ret err[io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_OPTION)};
+    if (root == nil || temporary == nil || destination == nil) {
+        ret err[io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_OPTION)};
     }
+    var from:      os.NativePath;
+    val converted: i64 = platform.confined_name(temporary, ?from);
+    if (converted < 0) { ret err[io_error.Error].err{failure(converted, io_error.OP_OPTION)}; }
+    var to:                    os.NativePath;
+    val destination_converted: i64 = platform.confined_name(destination, ?to);
+    if (destination_converted < 0) {
+        os.native_path_dnit(?from);
+        ret err[io_error.Error].err{failure(destination_converted, io_error.OP_OPTION)};
+    }
+    val err_replace_confined_native: err[io_error.Error] = replace_confined_native(root, from.units, to.units);
+    os.native_path_dnit(?to);
+    os.native_path_dnit(?from);
+    ret err_replace_confined_native;
+}
+
+# replace_confined for relative names in native units
+pub fun replace_confined_native(root: *Root, temporary: *Unit, destination: *Unit) err[io_error.Error] {
+    if (root == nil || temporary == nil || destination == nil) {
+        ret err[io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_OPTION)};
+    }
+    if (!root_enter(root)) { ret err[io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_OPTION)}; }
     var sync_options: OpenOptions = read_options();
     sync_options.access = WRITE_ONLY;
-    val raw: i64 = platform.open_confined(root.directory.handle.value::i32, temporary::*u8, options_flags(sync_options), 0);
+    val raw: i64 = platform.open_confined_native(root.directory.handle.value::i32, temporary, options_flags(sync_options), 0);
     if (raw < 0) {
         root_leave(root);
         ret err[io_error.Error].err{failure(raw, io_error.OP_OPEN)};
     }
-    var file:   filesystem.File     = filesystem.File{handle: io_handle.FileHandle{value: raw::usize}};
-    val synced: err[io_error.Error] = filesystem.sync(file);
-    val closed: err[io_error.Error] = filesystem.close(?file);
-    if (sel synced.err) {
+    var file:       filesystem.File     = filesystem.File{handle: io_handle.FileHandle{value: raw::usize}};
+    val err_synced: err[io_error.Error] = filesystem.sync(file);
+    val err_closed: err[io_error.Error] = filesystem.close(?file);
+    if (sel err_synced.err) {
         root_leave(root);
-        ret synced;
+        ret err_synced;
     }
-    if (sel closed.err) {
+    if (sel err_closed.err) {
         root_leave(root);
-        ret closed;
+        ret err_closed;
     }
-    val result: i64 = platform.rename_confined(root.directory.handle.value::i32, temporary::*u8, destination::*u8);
+    val result: i64 = platform.rename_confined_native(root.directory.handle.value::i32, temporary, destination);
     root_leave(root);
     if (result < 0) { ret err[io_error.Error].err{failure(result, io_error.OP_OPTION)}; }
     ret err[io_error.Error].ok{};
 }
 
+# reads at an offset without using the file position
+# ---
+# file:   the file to read
+# buffer: receives the bytes, may be nil only when length is 0
+# length: the most bytes to read
+# offset: the file offset to read from
+# ret:    bytes read, 0 at end of file, or the failure. an invalid handle,
+#         nil buffer or offset past the largest file offset is INVALID
 pub fun read_at(file: filesystem.File, buffer: *u8, length: usize, offset: u64) res[usize, io_error.Error] {
     if (!io_handle.file_is_valid(file.handle) || (buffer == nil && length != 0) || offset > MAX_FILE_OFFSET) { ret res[usize, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_READ)}; }
     val result: i64 = platform.read_at(file.handle.value::i32, buffer, length, offset);
@@ -208,6 +309,14 @@ pub fun read_at(file: filesystem.File, buffer: *u8, length: usize, offset: u64) 
     ret res[usize, io_error.Error].ok{result::usize};
 }
 
+# writes at an offset without using the file position
+# ---
+# file:   the file to write
+# buffer: the bytes to write, may be nil only when length is 0
+# length: the number of bytes to write
+# offset: the file offset to write at
+# ret:    bytes written, which may be short, or the failure. an invalid
+#         handle, nil buffer or offset past the largest file offset is INVALID
 pub fun write_at(file: filesystem.File, buffer: *u8, length: usize, offset: u64) res[usize, io_error.Error] {
     if (!io_handle.file_is_valid(file.handle) || (buffer == nil && length != 0) || offset > MAX_FILE_OFFSET) { ret res[usize, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_WRITE)}; }
     val result: i64 = platform.write_at(file.handle.value::i32, buffer, length, offset);
@@ -219,14 +328,22 @@ use std.system.capability;
 
 $if (capability.HAS_FILES && capability.HAS_PAGES) {
     use std.filesystem;
-    use std.io.file.adapter;
-    use std.sync.condition;
     use std.sync.mutex;
     use std.system.os;
+}
+$or {
+    $error("std.io.file needs the files and pages capabilities (std.system.capability.HAS_FILES, HAS_PAGES)");
+}
+
+# the background request adapter runs on threads, and a thread is what a root's
+# close waits for, so a threadless target has neither
+$if (capability.HAS_THREADS) {
+    use std.io.file.adapter;
+    use std.sync.condition;
 
     fwd adapter.Request;
     fwd adapter.Adapter;
-    fwd adapter.make;
+    fwd adapter.init;
     fwd adapter.submit_read;
     fwd adapter.submit_write;
     fwd adapter.attach_secret_scratch;
@@ -235,12 +352,41 @@ $if (capability.HAS_FILES && capability.HAS_PAGES) {
     fwd adapter.shutdown_drain;
     fwd adapter.shutdown_abort;
     fwd adapter.active;
-    fwd adapter.destroy;
+    fwd adapter.dnit;
+
+    def Idle: condition.Condition;
+
+    fun idle_make() Idle {
+        ret condition.make();
+    }
+
+    fun idle_signal(idle: *Idle) {
+        condition.broadcast(idle);
+    }
+
+    fun idle_wait(idle: *Idle, lock: *mutex.Mutex) {
+        condition.wait(idle, lock);
+    }
 }
 $or {
-    $error("std.io.file needs the files and pages capabilities (std.system.capability.HAS_FILES, HAS_PAGES)");
+    def Idle: u8;
+
+    fun idle_make() Idle {
+        ret 0;
+    }
+
+    fun idle_signal(idle: *Idle) {}
+
+    fun idle_wait(idle: *Idle, lock: *mutex.Mutex) {}
 }
 
+# a file region mapped into memory
+# ---
+# data:        the first mapped byte
+# length:      the mapped length in bytes
+# offset:      the file offset the mapping starts at
+# writable:    true when writes reach the file
+# initialized: true until mapping_close
 pub rec Mapping {
     data:        ptr;
     length:      usize;
@@ -251,8 +397,7 @@ pub rec Mapping {
 
 # mappings own their virtual region independently of the file handle
 pub fun map(file: filesystem.File, offset: u64, length: usize, writable: bool) res[Mapping, io_error.Error] {
-    var alignment: usize = os.page_size();
-    $if ($mach.build.os == $mach.os.windows) { alignment = 65536; }
+    val alignment: usize = os.map_alignment();
     if (!io_handle.file_is_valid(file.handle) || length == 0 || offset > (-1)::usize::u64 || !span_valid(offset, length) || offset::usize % alignment != 0) {
         ret res[Mapping, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_OPTION)};
     }
@@ -263,6 +408,10 @@ pub fun map(file: filesystem.File, offset: u64, length: usize, writable: bool) r
     ret res[Mapping, io_error.Error].ok{Mapping{data: data, length: length, offset: offset, writable: writable, initialized: true}};
 }
 
+# flushes a writable mapping's changes to the file
+# ---
+# mapping: the mapping to flush
+# ret:     the failure, INVALID for a nil, closed or read-only mapping
 pub fun mapping_sync(mapping: *Mapping) err[io_error.Error] {
     if (mapping == nil || !mapping.initialized || !mapping.writable) { ret err[io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_SYNC)}; }
     val result: i64 = os.sync_file(mapping.data, mapping.length);
@@ -270,6 +419,10 @@ pub fun mapping_sync(mapping: *Mapping) err[io_error.Error] {
     ret err[io_error.Error].ok{};
 }
 
+# unmaps a mapping and clears it
+# ---
+# mapping: the mapping to release
+# ret:     the failure, INVALID for a nil or closed mapping
 pub fun mapping_close(mapping: *Mapping) err[io_error.Error] {
     if (mapping == nil || !mapping.initialized) { ret err[io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_CLOSE)}; }
     val result: i64 = platform.unmap_file(mapping.data, mapping.length);
@@ -280,6 +433,11 @@ pub fun mapping_close(mapping: *Mapping) err[io_error.Error] {
     ret err[io_error.Error].ok{};
 }
 
+# what transfer copied
+# ---
+# bytes:       bytes copied
+# end_of_file: true when the source ended before length bytes were copied
+# accelerated: true when a native copy path was used
 pub rec TransferReport {
     bytes:       usize;
     end_of_file: bool;
@@ -297,15 +455,15 @@ pub fun transfer(source: filesystem.File, destination: filesystem.File, source_o
     for (transferred < length && !eof) {
         var chunk: usize = length - transferred;
         if (chunk > 16384) { chunk = 16384; }
-        val read_result: res[usize, io_error.Error] = read_at(source, (?buffer)::*u8, chunk, source_offset + transferred::u64);
-        if (sel read_result.err) { ret res[TransferReport, io_error.Error].err{read_result.err}; }
-        val read_count: usize = read_result.ok;
+        val res_read: res[usize, io_error.Error] = read_at(source, (?buffer)::*u8, chunk, source_offset + transferred::u64);
+        if (sel res_read.err) { ret res[TransferReport, io_error.Error].err{res_read.err}; }
+        val read_count: usize = res_read.ok;
         if (read_count == 0) { eof = true; }
         var written: usize = 0;
         for (written < read_count) {
-            val write_result: res[usize, io_error.Error] = write_at(destination, ((?buffer)::usize + written)::*u8, read_count - written, destination_offset + transferred::u64 + written::u64);
-            if (sel write_result.err) { ret res[TransferReport, io_error.Error].err{write_result.err}; }
-            val count: usize = write_result.ok;
+            val res_write: res[usize, io_error.Error] = write_at(destination, ((?buffer)::usize + written)::*u8, read_count - written, destination_offset + transferred::u64 + written::u64);
+            if (sel res_write.err) { ret res[TransferReport, io_error.Error].err{res_write.err}; }
+            val count: usize = res_write.ok;
             if (count == 0) { ret res[TransferReport, io_error.Error].err{io_error.make(io_error.IO, io_error.OP_WRITE)}; }
             written = written + count;
         }
@@ -314,6 +472,12 @@ pub fun transfer(source: filesystem.File, destination: filesystem.File, source_o
     ret res[TransferReport, io_error.Error].ok{TransferReport{bytes: transferred, end_of_file: eof, accelerated: false}};
 }
 
+# what watching provides on this target
+# ---
+# supported:     a path can be watched
+# recursive:     a watch covers a directory's descendants
+# native:        the host reports changes itself
+# requires_scan: changes are found only by calling watch_scan
 pub rec WatchCapabilities {
     supported:     bool;
     recursive:     bool;
@@ -321,6 +485,9 @@ pub rec WatchCapabilities {
     requires_scan: bool;
 }
 
+# watching's capabilities on this target
+# ---
+# ret: supported and scan-driven, neither recursive nor native
 pub fun watch_capabilities() WatchCapabilities {
     ret WatchCapabilities{supported: true, recursive: false, native: false, requires_scan: true};
 }
@@ -333,45 +500,75 @@ pub val WATCH_REPLACED:  WatchEvent = 3;
 pub val WATCH_MODIFIED:  WatchEvent = 4;
 pub val WATCH_METADATA:  WatchEvent = 5;
 
+# path: the UTF-8 path watch_init borrowed, nil for watch_init_native
+# name: the watched name in native units, which every scan opens
 pub rec Watch {
     root:        *Root;
     path:        Path;
+    name:        os.NativePath;
     metadata:    filesystem.Metadata;
     identity:    filesystem.Identity;
     exists:      bool;
     initialized: bool;
 }
 
-fun watch_observe(root: *Root, path: Path, metadata: *filesystem.Metadata, identity: *filesystem.Identity) res[bool, io_error.Error] {
-    val opened: res[filesystem.File, io_error.Error] = open_confined(root, path, read_options());
-    if (sel opened.err) {
-        if (opened.err.kind == io_error.NOT_FOUND) { ret res[bool, io_error.Error].ok{false}; }
-        ret res[bool, io_error.Error].err{opened.err};
+fun watch_observe(root: *Root, name: *Unit, metadata: *filesystem.Metadata, identity: *filesystem.Identity) res[bool, io_error.Error] {
+    val res_opened: res[filesystem.File, io_error.Error] = open_confined_native(root, name, read_options());
+    if (sel res_opened.err) {
+        if (res_opened.err.kind == io_error.NOT_FOUND) { ret res[bool, io_error.Error].ok{false}; }
+        ret res[bool, io_error.Error].err{res_opened.err};
     }
-    var file:       filesystem.File                          = opened.ok;
-    val observed:   res[filesystem.Metadata, io_error.Error] = filesystem.stat_of(file);
-    val identified: res[filesystem.Identity, io_error.Error] = filesystem.identity_of(file);
-    val closed:     err[io_error.Error]                      = filesystem.close(?file);
-    if (sel observed.err)   { ret res[bool, io_error.Error].err{observed.err}; }
-    if (sel closed.err)     { ret res[bool, io_error.Error].err{closed.err}; }
-    if (sel identified.err) { ret res[bool, io_error.Error].err{identified.err}; }
-    @identity = identified.ok;
-    @metadata = observed.ok;
+    var file:           filesystem.File                          = res_opened.ok;
+    val res_observed:   res[filesystem.Metadata, io_error.Error] = filesystem.stat_of(file);
+    val res_identified: res[filesystem.Identity, io_error.Error] = filesystem.identity_of(file);
+    val err_closed:     err[io_error.Error]                      = filesystem.close(?file);
+    if (sel res_observed.err)   { ret res[bool, io_error.Error].err{res_observed.err}; }
+    if (sel err_closed.err)     { ret res[bool, io_error.Error].err{err_closed.err}; }
+    if (sel res_identified.err) { ret res[bool, io_error.Error].err{res_identified.err}; }
+    @identity = res_identified.ok;
+    @metadata = res_observed.ok;
     ret res[bool, io_error.Error].ok{true};
 }
 
-# the root and path remain borrowed until watch_close
-pub fun watch_open(watch: *Watch, root: *Root, path: Path) res[bool, io_error.Error] {
+# the root and path remain borrowed until watch_dnit. the path is converted
+# once here, and every scan opens the converted name
+pub fun watch_init(watch: *Watch, root: *Root, path: Path) res[bool, io_error.Error] {
     if (watch == nil || root == nil || path == nil) {
         ret res[bool, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_OPEN)};
     }
-    var metadata: filesystem.Metadata;
-    var identity: filesystem.Identity;
-    val observed: res[bool, io_error.Error] = watch_observe(root, path, ?metadata, ?identity);
-    if (sel observed.err) { ret res[bool, io_error.Error].err{observed.err}; }
+    var name:      os.NativePath;
+    val converted: i64 = platform.confined_name(path, ?name);
+    if (converted < 0) { ret res[bool, io_error.Error].err{failure(converted, io_error.OP_OPEN)}; }
+    val res_opened: res[bool, io_error.Error] = watch_start(watch, root, name);
+    if (sel res_opened.err) {
+        os.native_path_dnit(?name);
+        ret res_opened;
+    }
+    watch.path = path;
+    ret res_opened;
+}
+
+# watch_init for a relative name in native units; the root and name remain
+# borrowed until watch_dnit
+pub fun watch_init_native(watch: *Watch, root: *Root, name: *Unit) res[bool, io_error.Error] {
+    if (watch == nil || root == nil || name == nil) {
+        ret res[bool, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_OPEN)};
+    }
+    val res_opened: res[bool, io_error.Error] = watch_start(watch, root, os.NativePath{units: name, size: 0});
+    if (sel res_opened.ok) { watch.path = nil; }
+    ret res_opened;
+}
+
+# observe once and, on success, fill the watch with the name it now holds
+fun watch_start(watch: *Watch, root: *Root, name: os.NativePath) res[bool, io_error.Error] {
+    var metadata:     filesystem.Metadata;
+    var identity:     filesystem.Identity;
+    val res_observed: res[bool, io_error.Error] = watch_observe(root, name.units, ?metadata, ?identity);
+    if (sel res_observed.err) { ret res[bool, io_error.Error].err{res_observed.err}; }
+    if (watch.initialized)    { os.native_path_dnit(?watch.name); }
     watch.root   = root;
-    watch.path   = path;
-    watch.exists = observed.ok;
+    watch.name   = name;
+    watch.exists = res_observed.ok;
     if (watch.exists) {
         watch.metadata = metadata;
         watch.identity = identity;
@@ -383,11 +580,11 @@ pub fun watch_open(watch: *Watch, root: *Root, path: Path) res[bool, io_error.Er
 # scans observe identity without pinning it between calls or detecting every intervening write
 pub fun watch_scan(watch: *Watch) res[WatchEvent, io_error.Error] {
     if (watch == nil || !watch.initialized) { ret res[WatchEvent, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_WAIT)}; }
-    var metadata: filesystem.Metadata;
-    var identity: filesystem.Identity;
-    val observed: res[bool, io_error.Error] = watch_observe(watch.root, watch.path, ?metadata, ?identity);
-    if (sel observed.err) { ret res[WatchEvent, io_error.Error].err{observed.err}; }
-    val exists: bool = observed.ok;
+    var metadata:     filesystem.Metadata;
+    var identity:     filesystem.Identity;
+    val res_observed: res[bool, io_error.Error] = watch_observe(watch.root, watch.name.units, ?metadata, ?identity);
+    if (sel res_observed.err) { ret res[WatchEvent, io_error.Error].err{res_observed.err}; }
+    val exists: bool = res_observed.ok;
     if (!watch.exists && !exists) { ret res[WatchEvent, io_error.Error].ok{WATCH_UNCHANGED}; }
     if (!watch.exists && exists) {
         watch.metadata = metadata;
@@ -408,9 +605,11 @@ pub fun watch_scan(watch: *Watch) res[WatchEvent, io_error.Error] {
     ret res[WatchEvent, io_error.Error].ok{event};
 }
 
-# releases the borrowed root and path; a watch that was never opened is INVALID
-pub fun watch_close(watch: *Watch) err[io_error.Error] {
+# releases the borrowed root and path and the converted name; a watch that
+# was never opened is INVALID
+pub fun watch_dnit(watch: *Watch) err[io_error.Error] {
     if (watch == nil || !watch.initialized) { ret err[io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_CLOSE)}; }
+    os.native_path_dnit(?watch.name);
     watch.root        = nil;
     watch.path        = nil;
     watch.exists      = false;

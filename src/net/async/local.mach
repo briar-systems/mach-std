@@ -13,9 +13,14 @@
 # (submit_read, submit_write)
 
 use std.allocator;
+#[testing]
 use std.allocator.page;
+#[testing]
 use std.allocator.testing;
+#[testing]
 use std.chrono.time;
+#[testing]
+use fs:        std.filesystem;
 use io_error:  std.io.error;
 use io_handle: std.io.handle;
 use std.io.lifecycle;
@@ -39,12 +44,14 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 
-$if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
+$if ($mach.build.sys == $mach.sys.linux || $mach.build.sys == $mach.sys.darwin) {
     use impl: std.net.async.local.unix;
 }
-$or ($mach.build.os == $mach.os.windows) {
+$or ($mach.build.sys == $mach.sys.windows) {
     use impl: std.net.async.local.windows;
+    #[testing]
     use std.sync.thread;
+    #[testing]
     use windows_os: std.system.os.windows;
 }
 $or {
@@ -66,6 +73,16 @@ val STREAM_CLOSING:          u8  = 3;
 val NONE:                    u32 = 0xffffffff;
 var next_driver_instance:    i64 = 0;
 
+# the driver's record of one runtime operation, indexed by the runtime token's index
+# ---
+# state:          free or active
+# generation:     the runtime token's generation
+# native_active:  the platform backend still holds the operation
+# native:         the platform backend's token for it
+# kind:           the operation kind
+# resource:       the native handle it acts on
+# listener_index: the listener it belongs to, NONE when none
+# stream_index:   the stream it holds in the driver, NONE when none
 rec Slot {
     state:          u8;
     generation:     u32;
@@ -77,6 +94,14 @@ rec Slot {
     stream_index:   u32;
 }
 
+# one listener the driver holds
+# ---
+# state:        one of the LISTENER_ states
+# generation:   checked against a Listener token
+# next_free:    the pool's free-list link while the entry is free
+# bind_token:   the bind operation that made it
+# listen_token: the listen operation started on it
+# value:        the native listener
 rec ListenerEntry {
     state:        u8;
     generation:   u32;
@@ -104,6 +129,11 @@ rec StreamEntry {
     value:            types.Stream;
 }
 
+# a stream token, resolved only by the driver that created it
+# ---
+# index:      the stream's entry in the driver
+# generation: the entry's generation, 0 once the stream was closed or detached
+# owner:      the instance of the driver that created it
 pub rec Stream {
     index:      u32;
     generation: u32;
@@ -117,6 +147,18 @@ pub rec Detached {
     stream: types.Stream;
 }
 
+# an asynchronous local stream driver: a runtime source over the platform backend
+# ---
+# runtime:           the runtime it is registered with, borrowed
+# source:            its source registration in the runtime
+# backend:           the platform backend
+# slots:             one slot per runtime token index routed here
+# listeners:         listener entries
+# streams:           stream entries
+# backend_destroyed: dnit has already released the backend
+# cleanup_code:      the first native failure while closing at dnit
+# instance:          this driver's process-unique number, stamped on its tokens
+# lock:              guards the tables and the backend
 pub rec Driver {
     runtime: *io_runtime.Runtime;
     source:  io_runtime.SourceToken;
@@ -136,24 +178,26 @@ pub rec Driver {
     backend_destroyed: bool;
     cleanup_code:      i64;
     instance:          u64;
-    # entries examined by stream and listener claims, for the scaling tests
-    claim_steps: u64;
-    lock:        mutex.Mutex;
+    lock:              mutex.Mutex;
 }
 
 # whether a byte range overlaps the driver, its platform backend or its
 # borrowed runtime. the contract is std.io.runtime.aliases's
 pub fun aliases(driver: *Driver, data: *u8, len: usize) bool {
-    if (!memory.range_valid(data, len)) { ret true; }
-    if (len == 0)                       { ret false; }
-    if (!memory.range_valid(driver::*u8, $size_of(Driver)) ||
-        driver.runtime == nil || driver.slots.capacity == 0 ||
-        driver.backend_destroyed) { ret true; }
-    ret memory.ranges_overlap(driver::*u8, $size_of(Driver), data, len) ||
+    if (!memory.range_valid(data, len))                     { ret true; }
+    if (len == 0)                                           { ret false; }
+    if (!memory.range_valid(driver::*u8, $size_of(Driver))) { ret true; }
+    # the locks are taken one at a time, so this nests under none of them
+    mutex.lock(?driver.lock);
+    val mine: bool = driver.runtime == nil || driver.slots.capacity == 0 ||
+        driver.backend_destroyed ||
+        memory.ranges_overlap(driver::*u8, $size_of(Driver), data, len) ||
         table.aliases(?driver.slots, data, len) ||
         table.aliases(?driver.listeners, data, len) ||
-        table.aliases(?driver.streams, data, len) ||
-        io_runtime.aliases(driver.runtime, data, len) ||
+        table.aliases(?driver.streams, data, len);
+    mutex.unlock(?driver.lock);
+    if (mine) { ret true; }
+    ret io_runtime.aliases(driver.runtime, data, len) ||
         impl.aliases(?driver.backend, data, len);
 }
 
@@ -169,53 +213,53 @@ fun stream_at(driver: *Driver, index: usize) *StreamEntry {
     ret table.at(?driver.streams, index)::*StreamEntry;
 }
 
-# set up the slot table's newest chunk, every slot free
-fun adopt_slots(driver: *Driver) {
-    val chunk: usize = driver.slots.chunk_count - 1;
-    var index: usize = table.chunk_start(?driver.slots, chunk);
-    for (index < driver.slots.capacity) {
-        val slot: *Slot = slot_at(driver, index);
-        slot.state          = SLOT_FREE;
-        slot.generation     = 0;
-        slot.native_active  = false;
-        slot.listener_index = NONE;
-        slot.stream_index   = NONE;
-        index               = index + 1;
-    }
-    driver.slot_live[chunk] = 0;
-}
-
-# the runtime owns the index space, so the driver grows to whatever it hands out
+# the runtime owns the index space, so the driver grows to whatever it hands
+# out. growth writes no slot: the driver reads a slot only for a token the
+# runtime routed to it, and slot_take writes it before any read
 fun ensure_slot(driver: *Driver, index: usize) *Slot {
     for (driver.slots.capacity <= index) {
         if (!table.grow(?driver.slots)) { ret nil; }
-        adopt_slots(driver);
+        driver.slot_live[driver.slots.chunk_count - 1] = 0;
     }
     ret slot_at(driver, index);
 }
 
-# the listener table's newest chunk joins its pool, every entry free
-fun adopt_listeners(driver: *Driver) {
-    var index: usize = table.chunk_start(?driver.listeners, driver.listeners.chunk_count - 1);
-    for (index < driver.listeners.capacity) {
-        val listener: *ListenerEntry = listener_at(driver, index);
-        listener.state      = LISTENER_FREE;
-        listener.generation = driver.listener_pool.floor;
-        index               = index + 1;
-    }
-    table.pool_adopt(?driver.listener_pool, ?driver.listeners);
+# the slot of a token the runtime just routed to this driver, now active, or
+# nil when the table cannot grow to it. the runtime hands out an index only
+# once the operation it last held, on any source, is released, so the slot is
+# free whatever its bytes hold
+fun slot_take(driver: *Driver, token: io_runtime.Token, kind: io_runtime.Kind, resource: usize) *Slot {
+    val slot: *Slot = ensure_slot(driver, token.index::usize);
+    if (slot == nil) { ret nil; }
+    val chunk: usize = table.chunk_of(?driver.slots, token.index::usize);
+    driver.slot_live[chunk] = driver.slot_live[chunk] + 1;
+    slot.state              = SLOT_ACTIVE;
+    slot.generation         = token.generation;
+    slot.native_active      = false;
+    slot.listener_index     = NONE;
+    slot.stream_index       = NONE;
+    slot.kind               = kind;
+    slot.resource           = resource;
+    ret slot;
 }
 
-# the stream table's newest chunk joins its pool, every entry free
-fun adopt_streams(driver: *Driver) {
-    var index: usize = table.chunk_start(?driver.streams, driver.streams.chunk_count - 1);
-    for (index < driver.streams.capacity) {
-        val stream: *StreamEntry = stream_at(driver, index);
-        stream.state      = STREAM_FREE;
-        stream.generation = driver.stream_pool.floor;
-        index             = index + 1;
+# the slot of a released token goes back to free
+fun slot_release(driver: *Driver, slot: *Slot, token: io_runtime.Token) {
+    slot.state          = SLOT_FREE;
+    slot.listener_index = NONE;
+    slot.stream_index   = NONE;
+    val chunk: usize = table.chunk_of(?driver.slots, token.index::usize);
+    driver.slot_live[chunk] = driver.slot_live[chunk] - 1;
+}
+
+# whether any slot is active, from the live counts, so no slot is read
+fun slots_busy(driver: *Driver) bool {
+    var chunk: usize = 0;
+    for (chunk < driver.slots.chunk_count) {
+        if (driver.slot_live[chunk] != 0) { ret true; }
+        chunk = chunk + 1;
     }
-    table.pool_adopt(?driver.stream_pool, ?driver.streams);
+    ret false;
 }
 
 # give back what a peak grew once the entries in it are free. only free
@@ -248,19 +292,20 @@ fun operation_for_kind(kind: io_runtime.Kind) io_error.Operation {
     ret io_error.OP_UNKNOWN;
 }
 
-fun token_context(token: io_runtime.Token) usize {
-    ret ((token.generation::u64 << 32) | (token.index::u64 + 1))::usize;
+# the backend context for a runtime token: the generation above the index plus one, never 0
+fun token_context(token: io_runtime.Token) u64 {
+    ret (token.generation::u64 << 32) | (token.index::u64 + 1);
 }
 
-fun context_token(context: usize, token: *io_runtime.Token) bool {
-    val raw: u64 = context::u64;
-    val low: u64 = raw & 0xffffffff;
+fun context_token(context: u64, token: *io_runtime.Token) bool {
+    val low: u64 = context & 0xffffffff;
     if (token == nil || low == 0) { ret false; }
     token.index      = (low - 1)::u32;
-    token.generation = (raw >> 32)::u32;
+    token.generation = (context >> 32)::u32;
     ret token.generation != 0;
 }
 
+# only a token the runtime routed here reaches this, so slot_take wrote the slot and the runtime keeps the frontier
 fun slot_for(driver: *Driver, token: io_runtime.Token) *Slot {
     if (token.index::usize >= driver.slots.capacity) { ret nil; }
     val slot: *Slot = slot_at(driver, token.index::usize);
@@ -269,7 +314,7 @@ fun slot_for(driver: *Driver, token: io_runtime.Token) *Slot {
 }
 
 fun listener_for(driver: *Driver, token: Listener) *ListenerEntry {
-    if (token.index::usize >= driver.listeners.capacity
+    if (table.pool_untouched(?driver.listener_pool, ?driver.listeners, token.index::usize)
         || token.generation == 0
         || token.owner != driver.instance) {
         ret nil;
@@ -279,13 +324,14 @@ fun listener_for(driver: *Driver, token: Listener) *ListenerEntry {
     ret listener;
 }
 
+# the resource a completion carries for a listener: the entry's address, read back by resource_listener
 fun listener_resource(listener: *ListenerEntry) usize {
     ret listener::usize;
 }
 
 fun resource_listener(driver: *Driver, resource: usize) *ListenerEntry {
     val index: usize = table.index_of(?driver.listeners, resource);
-    if (index == table.NO_INDEX) { ret nil; }
+    if (index == table.NO_INDEX || table.pool_untouched(?driver.listener_pool, ?driver.listeners, index)) { ret nil; }
     ret listener_at(driver, index);
 }
 
@@ -295,12 +341,17 @@ fun listener_index(driver: *Driver, listener: *ListenerEntry) u32 {
 
 # the next free listener, which stays free until listener_take commits it
 fun listener_claim(driver: *Driver) *ListenerEntry {
-    driver.claim_steps = driver.claim_steps + 1;
     if (table.pool_peek(?driver.listener_pool, ?driver.listeners) == table.NO_INDEX) {
         if (driver.listeners.capacity > 0xffffffff || !table.grow(?driver.listeners)) { ret nil; }
-        adopt_listeners(driver);
+        table.pool_adopt(?driver.listener_pool, ?driver.listeners);
     }
-    ret listener_at(driver, table.pool_peek(?driver.listener_pool, ?driver.listeners));
+    val index:    usize          = table.pool_peek(?driver.listener_pool, ?driver.listeners);
+    val listener: *ListenerEntry = listener_at(driver, index);
+    if (table.pool_untouched(?driver.listener_pool, ?driver.listeners, index)) {
+        listener.state      = LISTENER_FREE;
+        listener.generation = driver.listener_pool.floor;
+    }
+    ret listener;
 }
 
 # every change out of the free state goes through here, for the entry
@@ -322,7 +373,7 @@ fun listener_free(driver: *Driver, listener: *ListenerEntry) {
 }
 
 fun stream_for(driver: *Driver, token: Stream) *StreamEntry {
-    if (token.index::usize >= driver.streams.capacity || token.generation == 0 || token.owner != driver.instance) { ret nil; }
+    if (table.pool_untouched(?driver.stream_pool, ?driver.streams, token.index::usize) || token.generation == 0 || token.owner != driver.instance) { ret nil; }
     val stream: *StreamEntry = stream_at(driver, token.index::usize);
     if (stream.state == STREAM_FREE || stream.generation != token.generation) { ret nil; }
     ret stream;
@@ -334,12 +385,17 @@ fun stream_index(driver: *Driver, stream: *StreamEntry) u32 {
 
 # the next free stream, which stays free until stream_take commits it
 fun stream_claim(driver: *Driver) *StreamEntry {
-    driver.claim_steps = driver.claim_steps + 1;
     if (table.pool_peek(?driver.stream_pool, ?driver.streams) == table.NO_INDEX) {
         if (driver.streams.capacity > 0xffffffff || !table.grow(?driver.streams)) { ret nil; }
-        adopt_streams(driver);
+        table.pool_adopt(?driver.stream_pool, ?driver.streams);
     }
-    ret stream_at(driver, table.pool_peek(?driver.stream_pool, ?driver.streams));
+    val index:  usize        = table.pool_peek(?driver.stream_pool, ?driver.streams);
+    val stream: *StreamEntry = stream_at(driver, index);
+    if (table.pool_untouched(?driver.stream_pool, ?driver.streams, index)) {
+        stream.state      = STREAM_FREE;
+        stream.generation = driver.stream_pool.floor;
+    }
+    ret stream;
 }
 
 # every change out of the free state goes through here, for the entry
@@ -368,19 +424,21 @@ fun stream_hold(driver: *Driver, slot: *Slot, stream: *StreamEntry) {
     stream.pending    = stream.pending + 1;
 }
 
+# the resource a completion carries for a stream: the entry's address, read back by resource_stream
 fun stream_resource(stream: *StreamEntry) usize {
     ret stream::usize;
 }
 
 fun resource_stream(driver: *Driver, resource: usize) *StreamEntry {
     val index: usize = table.index_of(?driver.streams, resource);
-    if (index == table.NO_INDEX) { ret nil; }
+    if (index == table.NO_INDEX || table.pool_untouched(?driver.stream_pool, ?driver.streams, index)) { ret nil; }
     ret stream_at(driver, index);
 }
 
+# close every open stream at dnit, keeping the first native failure in cleanup_code
 fun close_all_streams_locked(driver: *Driver) {
-    var i: usize = 0;
-    for (i < driver.streams.capacity) {
+    var i: usize = table.pool_touched_from(?driver.stream_pool, ?driver.streams, 0);
+    for (i != table.NO_INDEX) {
         val stream: *StreamEntry = stream_at(driver, i);
         if (stream.state == STREAM_OPEN) {
             val code: i64 = impl.close_resource(?driver.backend, stream.value.handle);
@@ -388,7 +446,7 @@ fun close_all_streams_locked(driver: *Driver) {
             stream.value.handle = io_handle.INVALID_VALUE;
             stream_free(driver, stream);
         }
-        i = i + 1;
+        i = table.pool_touched_from(?driver.stream_pool, ?driver.streams, i + 1);
     }
 }
 
@@ -424,60 +482,38 @@ fun scope_changed(r: cancel.Transition) bool {
     ret false;
 }
 
-$if ($mach.build.os == $mach.os.windows) {
-    #[testing]
-    fun windows_test_endpoint() res[endpoint.Endpoint, io_error.Error] {
-        val prefix: *u8   = "mach-std-async-local-flags-";
-        var name:   [108]u8;
-        var length: usize = 0;
-        for (prefix[length] != 0) {
-            name[length] = prefix[length];
-            length       = length + 1;
-        }
-        var process: u64   = os.getpid()::u64;
-        var digits:  [20]u8;
-        var count:   usize = 0;
-        for (process != 0) {
-            digits[count] = '0' + (process % 10)::u8;
-            process       = process / 10;
-            count         = count + 1;
-        }
-        var i: usize = 0;
-        for (i < count) {
-            name[length] = digits[count - i - 1];
-            length       = length + 1;
-            i            = i + 1;
-        }
-        ret endpoint.filesystem_bytes(?name[0], length);
-    }
-
+$if ($mach.build.sys == $mach.sys.windows) {
     test async_local_windows__native_handles_are_nonblocking_and_non_inheritable {
         var pa: allocator.Allocator;
         page.make(?pa);
-        if (windows_os.running_under_wine()) { ret 0; }
-        val endpoint_result: res[endpoint.Endpoint, io_error.Error] = windows_test_endpoint();
-        if (sel endpoint_result.err) { ret 1; }
-        val bound:   endpoint.Endpoint = endpoint_result.ok;
+        if (windows_os.running_under_wine()) { ret 77; }
+        var scratch: os.Scratch;
+        if (os.scratch_make(?scratch) < 0) { ret 90; }
+        fin { fs.scratch_remove(?scratch); }
+        var scratch_path: os.ScratchPath;
+        val res_endpoint: res[endpoint.Endpoint, io_error.Error] = endpoint.scratch_endpoint(?scratch, "local.sock", ?scratch_path);
+        if (sel res_endpoint.err) { ret 1; }
+        val bound:   endpoint.Endpoint = res_endpoint.ok;
         var runtime: io_runtime.Runtime;
-        if (!ok_err(io_runtime.make(?runtime, ?pa, 8))) { ret 2; }
-        var driver:      Driver;
-        val make_result: err[io_error.Error] = make(?driver, ?runtime);
-        if (sel make_result.err) { ret 3; }
+        if (!ok_err(io_runtime.init(?runtime, ?pa, 8))) { ret 2; }
+        var driver:   Driver;
+        val err_make: err[io_error.Error] = init(?driver, ?runtime);
+        if (sel err_make.err) { ret 3; }
         var scope: cancel.Scope;
         if (!scope_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 4; }
-        val options:            types.BindOptions                     = local.default_bind_options();
-        val submit_bind_result: res[io_runtime.Token, io_error.Error] = submit_bind(?driver, ?scope, bound, options, 401);
-        if (sel submit_bind_result.err) { ret 5; }
-        var output: [8]io_runtime.Completion;
-        var waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, 1000);
-        if (!(sel waited.ok && waited.ok == 1)) { ret 6; }
-        val listener_result: res[Listener, io_error.Error] = bound_listener(?driver, output[0]);
-        if (sel listener_result.err) { ret 7; }
-        var listener:             Listener                              = listener_result.ok;
-        val submit_listen_result: res[io_runtime.Token, io_error.Error] = submit_listen(?driver, ?scope, ?listener, 8, 402);
-        if (sel submit_listen_result.err) { ret 8; }
-        waited = wait(?driver, ?output[0], 8, 1000);
-        if (!(sel waited.ok && waited.ok == 1)
+        val options:         types.BindOptions                     = local.default_bind_options();
+        val res_submit_bind: res[io_runtime.Token, io_error.Error] = submit_bind(?driver, ?scope, bound, options, 401);
+        if (sel res_submit_bind.err) { ret 5; }
+        var output:     [8]io_runtime.Completion;
+        var res_waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, -1);
+        if (!(sel res_waited.ok && res_waited.ok == 1)) { ret 6; }
+        val res_listener: res[Listener, io_error.Error] = bound_listener(?driver, output[0]);
+        if (sel res_listener.err) { ret 7; }
+        var listener:          Listener                              = res_listener.ok;
+        val res_submit_listen: res[io_runtime.Token, io_error.Error] = submit_listen(?driver, ?scope, ?listener, 8, 402);
+        if (sel res_submit_listen.err) { ret 8; }
+        res_waited = wait(?driver, ?output[0], 8, -1);
+        if (!(sel res_waited.ok && res_waited.ok == 1)
             || refused(listening(?driver, output[0]))) {
             ret 9;
         }
@@ -487,32 +523,29 @@ $if ($mach.build.os == $mach.os.windows) {
         }
         var server:     Stream;
         var client:     Stream;
-        var saw_server: bool  = false;
-        var saw_client: bool  = false;
-        var rounds:     usize = 0;
-        for (rounds < 8 && (!saw_server || !saw_client)) {
-            waited = wait(?driver, ?output[0], 8, 1000);
-            if (sel waited.err) { ret 11; }
-            val count: usize = waited.ok;
+        var saw_server: bool = false;
+        var saw_client: bool = false;
+        for (!saw_server || !saw_client) {
+            res_waited = wait(?driver, ?output[0], 8, -1);
+            if (sel res_waited.err) { ret 11; }
+            val count: usize = res_waited.ok;
             var i:     usize = 0;
             for (i < count) {
                 if (output[i].context == 403) {
-                    val made: res[Stream, io_error.Error] = accepted(?driver, output[i]);
-                    if (sel made.err) { ret 12; }
-                    server     = made.ok;
+                    val res_made: res[Stream, io_error.Error] = accepted(?driver, output[i]);
+                    if (sel res_made.err) { ret 12; }
+                    server     = res_made.ok;
                     saw_server = true;
                 }
                 or (output[i].context == 404) {
-                    val made: res[Stream, io_error.Error] = connected(?driver, output[i]);
-                    if (sel made.err) { ret 13; }
-                    client     = made.ok;
+                    val res_made: res[Stream, io_error.Error] = connected(?driver, output[i]);
+                    if (sel res_made.err) { ret 13; }
+                    client     = res_made.ok;
                     saw_client = true;
                 }
                 i = i + 1;
             }
-            rounds = rounds + 1;
         }
-        if (!saw_server || !saw_client) { ret 14; }
         mutex.lock(?driver.lock);
         val listener_entry: *ListenerEntry = listener_for(?driver, listener);
         val server_entry:   *StreamEntry   = stream_for(?driver, server);
@@ -557,7 +590,7 @@ $if ($mach.build.os == $mach.os.windows) {
             || os.error_kind(client_read) != io_error.WOULD_BLOCK) {
             ret 16;
         }
-        if (!scope_ok(cancel.destroy(?scope))) { ret 17; }
+        if (!scope_ok(cancel.dnit(?scope))) { ret 17; }
         var close_scope: cancel.Scope;
         if (!scope_ok(cancel.make_root(?close_scope, opt[time.Instant].none{}))
             || failed[io_runtime.Token](submit_stream_close(?driver, ?close_scope, ?server, lifecycle.ABORTIVE, 405))
@@ -566,24 +599,22 @@ $if ($mach.build.os == $mach.os.windows) {
             ret 18;
         }
         var closed: usize = 0;
-        rounds = 0;
-        for (rounds < 8 && closed < 3) {
-            waited = wait(?driver, ?output[0], 8, 1000);
-            if (sel waited.err) { ret 19; }
-            val count: usize = waited.ok;
+        for (closed < 3) {
+            res_waited = wait(?driver, ?output[0], 8, -1);
+            if (sel res_waited.err) { ret 19; }
+            val count: usize = res_waited.ok;
             var i:     usize = 0;
             for (i < count) {
                 if (output[i].has_error || output[i].kind != io_runtime.CLOSE) { ret 20; }
                 closed = closed + 1;
                 i      = i + 1;
             }
-            rounds = rounds + 1;
         }
         if (closed != 3
-            || !scope_ok(cancel.destroy(?close_scope))
-            || refused(destroy(?driver))
+            || !scope_ok(cancel.dnit(?close_scope))
+            || refused(dnit(?driver))
             || !ok_bool(io_runtime.close(?runtime))
-            || !ok_err(io_runtime.destroy(?runtime))) {
+            || !ok_err(io_runtime.dnit(?runtime))) {
             ret 21;
         }
         ret 0;
@@ -603,35 +634,40 @@ $if ($mach.build.os == $mach.os.windows) {
     }
 
     # a cancel that settles through dispatch must not wait for the thread
-    # blocked in the native wait (#787)
+    # blocked in the native wait (#787): the native lock stays held until the
+    # cancel has finished
     test async_local_windows__a_cancel_does_not_wait_for_the_native_waiter {
         var pa: allocator.Allocator;
         page.make(?pa);
-        if (windows_os.running_under_wine()) { ret 0; }
-        val endpoint_result: res[endpoint.Endpoint, io_error.Error] = windows_test_endpoint();
-        if (sel endpoint_result.err) { ret 1; }
-        val bound:   endpoint.Endpoint = endpoint_result.ok;
+        if (windows_os.running_under_wine()) { ret 77; }
+        var scratch: os.Scratch;
+        if (os.scratch_make(?scratch) < 0) { ret 90; }
+        fin { fs.scratch_remove(?scratch); }
+        var scratch_path: os.ScratchPath;
+        val res_endpoint: res[endpoint.Endpoint, io_error.Error] = endpoint.scratch_endpoint(?scratch, "local.sock", ?scratch_path);
+        if (sel res_endpoint.err) { ret 1; }
+        val bound:   endpoint.Endpoint = res_endpoint.ok;
         var runtime: io_runtime.Runtime;
-        if (!ok_err(io_runtime.make(?runtime, ?pa, 8))) { ret 2; }
-        var driver:      Driver;
-        val make_result: err[io_error.Error] = make(?driver, ?runtime);
-        if (sel make_result.err) { ret 3; }
+        if (!ok_err(io_runtime.init(?runtime, ?pa, 8))) { ret 2; }
+        var driver:   Driver;
+        val err_make: err[io_error.Error] = init(?driver, ?runtime);
+        if (sel err_make.err) { ret 3; }
         var scope: cancel.Scope;
         if (!scope_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 4; }
         var accept_scope: cancel.Scope;
         if (!scope_ok(cancel.make_root(?accept_scope, opt[time.Instant].none{}))) { ret 5; }
         val options: types.BindOptions = local.default_bind_options();
         if (failed[io_runtime.Token](submit_bind(?driver, ?scope, bound, options, 411))) { ret 6; }
-        var output: [8]io_runtime.Completion;
-        var waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, 1000);
-        if (!(sel waited.ok && waited.ok == 1)) { ret 7; }
-        val listener_result: res[Listener, io_error.Error] = bound_listener(?driver, output[0]);
-        if (sel listener_result.err) { ret 8; }
-        var listener: Listener = listener_result.ok;
+        var output:     [8]io_runtime.Completion;
+        var res_waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, -1);
+        if (!(sel res_waited.ok && res_waited.ok == 1)) { ret 7; }
+        val res_listener: res[Listener, io_error.Error] = bound_listener(?driver, output[0]);
+        if (sel res_listener.err) { ret 8; }
+        var listener: Listener = res_listener.ok;
         if (failed[io_runtime.Token](submit_listen(?driver, ?scope, ?listener, 8, 412))) { ret 9; }
-        waited = wait(?driver, ?output[0], 8, 1000);
-        if (!(sel waited.ok && waited.ok == 1) || refused(listening(?driver, output[0])))    { ret 10; }
-        if (failed[io_runtime.Token](submit_accept(?driver, ?accept_scope, ?listener, 413))) { ret 11; }
+        res_waited = wait(?driver, ?output[0], 8, -1);
+        if (!(sel res_waited.ok && res_waited.ok == 1) || refused(listening(?driver, output[0]))) { ret 10; }
+        if (failed[io_runtime.Token](submit_accept(?driver, ?accept_scope, ?listener, 413)))      { ret 11; }
         var context: NativeControlCancel = NativeControlCancel{scope: ?accept_scope, done: 0};
         mutex.lock(?runtime.native_lock);
         var worker: thread.Thread;
@@ -640,21 +676,16 @@ $if ($mach.build.os == $mach.os.windows) {
             mutex.unlock(?runtime.native_lock);
             ret 12;
         }
-        var spins: usize = 0;
-        for (atomic.load(?context.done) == 0 && spins < 100) {
-            os.sleep(10000000);
-            spins = spins + 1;
-        }
-        val finished: bool = atomic.load(?context.done) == 1;
+        for (atomic.load(?context.done) == 0) { os.sleep(10000000); }
         mutex.unlock(?runtime.native_lock);
         thread.join(?worker);
-        if (!finished) { ret 13; }
-        waited = wait(?driver, ?output[0], 8, 1000);
-        if (!(sel waited.ok && waited.ok == 1) || !output[0].has_error || output[0].error.kind != io_error.CANCELLED || output[0].context != 413) { ret 14; }
+        res_waited = wait(?driver, ?output[0], 8, -1);
+        if (!(sel res_waited.ok && res_waited.ok == 1) || !output[0].has_error || output[0].error.kind != io_error.CANCELLED || output[0].context != 413) { ret 14; }
         ret 0;
     }
 }
 
+# close a listener at dnit and remove its owned socket file. a listener with an operation pending is left alone
 fun close_listener_entry_locked(driver: *Driver, listener: *ListenerEntry) {
     if (listener == nil
         || listener.state == LISTENER_FREE
@@ -673,13 +704,14 @@ fun close_listener_entry_locked(driver: *Driver, listener: *ListenerEntry) {
 }
 
 fun close_all_listeners_locked(driver: *Driver) {
-    var i: usize = 0;
-    for (i < driver.listeners.capacity) {
+    var i: usize = table.pool_touched_from(?driver.listener_pool, ?driver.listeners, 0);
+    for (i != table.NO_INDEX) {
         close_listener_entry_locked(driver, listener_at(driver, i));
-        i = i + 1;
+        i = table.pool_touched_from(?driver.listener_pool, ?driver.listeners, i + 1);
     }
 }
 
+# resolve the count completions the backend just published
 fun publish_backend_locked(driver: *Driver, count: usize) {
     var i: usize = 0;
     for (i < count) {
@@ -692,7 +724,10 @@ fun publish_backend_locked(driver: *Driver, count: usize) {
     }
 }
 
-fun source_dispatch(context: ptr, native_context: usize, events: u32, status: i64, flags: u64) bool {
+# the runtime's dispatch hook: hand a native event to the backend, or flush it when the context is 0
+# ---
+# ret: whether the event belonged to this driver
+fun source_dispatch(context: ptr, native_context: u64, events: u32, status: i64, flags: u64) bool {
     val driver: *Driver = context::*Driver;
     mutex.lock(?driver.lock);
     var claimed: bool = false;
@@ -712,25 +747,28 @@ fun source_dispatch(context: ptr, native_context: usize, events: u32, status: i6
     ret claimed;
 }
 
+# the runtime's cancel hook: cancel the backend's operation for a token
+# ---
+# ret: 0, CANCELLATION_PENDING while the backend finishes it, or a negative native error
 fun source_cancel(context: ptr, token: io_runtime.Token, reason: io_error.Error) i64 {
     val driver:     *Driver = context::*Driver;
     val controlled: bool    = impl.CANCEL_NEEDS_NATIVE_CONTROL;
     if (controlled) {
-        val entered: err[io_error.Error] = io_runtime.begin_native_control(driver.runtime);
-        if (sel entered.err) { ret entered.err.code; }
+        val err_entered: err[io_error.Error] = io_runtime.begin_native_control(driver.runtime);
+        if (sel err_entered.err) { ret err_entered.err.code; }
     }
     mutex.lock(?driver.lock);
     val slot: *Slot = slot_for(driver, token);
     var code: i64   = 0;
     if (slot != nil && slot.native_active) {
-        var finished: opt[async_types.NativeCompletion] = opt[async_types.NativeCompletion].none{};
-        code = impl.cancel(?driver.backend, slot.native, ?finished);
+        var opt_finished: opt[async_types.NativeCompletion] = opt[async_types.NativeCompletion].none{};
+        code = impl.cancel(?driver.backend, slot.native, ?opt_finished);
         # a pending cancellation keeps the kernel's hold until its packet is published
         if (code >= 0 && code != io_runtime.CANCELLATION_PENDING) { slot.native_active = false; }
         # an operation that finished first is resolved as usual, so the runtime
         # carries its transfer, or the stream an accept took, on the cancellation
-        if (sel finished.some) {
-            if (code >= 0) { resolve_native_locked(driver, finished.some); }
+        if (sel opt_finished.some) {
+            if (code >= 0) { resolve_native_locked(driver, opt_finished.some); }
         }
     }
     mutex.unlock(?driver.lock);
@@ -738,6 +776,7 @@ fun source_cancel(context: ptr, token: io_runtime.Token, reason: io_error.Error)
     ret code;
 }
 
+# the runtime's release hook: settle the driver's state for a completion the caller has taken
 fun source_release(context: ptr, completion: *io_runtime.Completion) {
     val driver: *Driver = context::*Driver;
     mutex.lock(?driver.lock);
@@ -746,7 +785,7 @@ fun source_release(context: ptr, completion: *io_runtime.Completion) {
 }
 
 # the driver starts at the runtime's initial size and grows with it
-pub fun make(driver: *Driver, runtime: *io_runtime.Runtime) err[io_error.Error] {
+pub fun init(driver: *Driver, runtime: *io_runtime.Runtime) err[io_error.Error] {
     if (driver == nil || runtime == nil || runtime.initial == 0) {
         ret err[io_error.Error].err{invalid(io_error.OP_CREATE)};
     }
@@ -754,61 +793,65 @@ pub fun make(driver: *Driver, runtime: *io_runtime.Runtime) err[io_error.Error] 
     # the runtime owns the memory: the driver draws from the allocator the
     # runtime was made with
     driver.allocator = runtime.allocator;
-    if (!table.make(?driver.slots, ?driver.allocator, $size_of(Slot), capacity)) {
+    if (!table.init(?driver.slots, ?driver.allocator, $size_of(Slot), capacity)) {
         ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
     }
-    if (!table.make(?driver.listeners, ?driver.allocator, $size_of(ListenerEntry), capacity) ||
-        !table.make(?driver.streams, ?driver.allocator, $size_of(StreamEntry), capacity)) {
-        table.destroy(?driver.streams);
-        table.destroy(?driver.listeners);
-        table.destroy(?driver.slots);
+    if (!table.init(?driver.listeners, ?driver.allocator, $size_of(ListenerEntry), capacity) ||
+        !table.init(?driver.streams, ?driver.allocator, $size_of(StreamEntry), capacity)) {
+        table.dnit(?driver.streams);
+        table.dnit(?driver.listeners);
+        table.dnit(?driver.slots);
         ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
     }
     val instance: i64 = atomic.fetch_add(?next_driver_instance, 1) + 1;
     if (instance <= 0) {
-        table.destroy(?driver.streams);
-        table.destroy(?driver.listeners);
-        table.destroy(?driver.slots);
+        table.dnit(?driver.streams);
+        table.dnit(?driver.listeners);
+        table.dnit(?driver.slots);
         ret err[io_error.Error].err{exhausted(io_error.OP_CREATE)};
     }
-    driver.runtime  = runtime;
-    driver.instance = instance::u64;
-    adopt_slots(driver);
+    driver.runtime      = runtime;
+    driver.instance     = instance::u64;
+    driver.slot_live[0] = 0;
     table.pool_make(?driver.listener_pool, $offset_of(ListenerEntry, next_free));
     table.pool_make(?driver.stream_pool, $offset_of(StreamEntry, next_free));
-    adopt_listeners(driver);
-    adopt_streams(driver);
-    driver.claim_steps       = 0;
+    table.pool_adopt(?driver.listener_pool, ?driver.listeners);
+    table.pool_adopt(?driver.stream_pool, ?driver.streams);
     driver.backend_destroyed = false;
     driver.cleanup_code      = 0;
     driver.lock              = mutex.make();
-    val registered: res[io_runtime.SourceToken, io_error.Error] = io_runtime.register_source(
+    val res_registered: res[io_runtime.SourceToken, io_error.Error] = io_runtime.register_source(
         runtime,
         driver::ptr,
         source_dispatch,
         source_cancel,
         source_release,
     );
-    if (sel registered.err) {
-        table.destroy(?driver.streams);
-        table.destroy(?driver.listeners);
-        table.destroy(?driver.slots);
+    if (sel res_registered.err) {
+        table.dnit(?driver.streams);
+        table.dnit(?driver.listeners);
+        table.dnit(?driver.slots);
         driver.runtime = nil;
-        ret err[io_error.Error].err{registered.err};
+        ret err[io_error.Error].err{res_registered.err};
     }
-    driver.source = registered.ok;
-    val code: i64 = impl.make(?driver.backend, ?runtime.queue, ?driver.allocator, capacity, io_runtime.source_id(driver.source));
+    driver.source = res_registered.ok;
+    val code: i64 = impl.init(?driver.backend, ?runtime.queue, ?driver.allocator, capacity, io_runtime.source_id(driver.source));
     if (code < 0) {
         io_runtime.unregister_source(runtime, driver.source);
-        table.destroy(?driver.streams);
-        table.destroy(?driver.listeners);
-        table.destroy(?driver.slots);
+        table.dnit(?driver.streams);
+        table.dnit(?driver.listeners);
+        table.dnit(?driver.slots);
         driver.runtime = nil;
         ret err[io_error.Error].err{os.error(code, io_error.OP_CREATE)};
     }
     ret err[io_error.Error].ok{};
 }
 
+# submit an operation to the runtime and take its slot
+# ---
+# token: receives the runtime token
+# ret:   true with the slot taken, false when the slot table cannot grow and the
+#        operation was failed instead, or the runtime's refusal
 fun claim_locked(
     driver: *Driver,
     scope: *cancel.Scope,
@@ -827,32 +870,19 @@ fun claim_locked(
         offset:   0,
         context:  context,
     };
-    val submitted: res[io_runtime.Token, io_error.Error] = io_runtime.submit_scoped_owned(driver.runtime, driver.source, scope, operation);
-    if (sel submitted.err) {
-        ret res[bool, io_error.Error].err{submitted.err};
+    val res_submitted: res[io_runtime.Token, io_error.Error] = io_runtime.submit_scoped_owned(driver.runtime, driver.source, scope, operation);
+    if (sel res_submitted.err) {
+        ret res[bool, io_error.Error].err{res_submitted.err};
     }
-    @token = submitted.ok;
-    val slot: *Slot = ensure_slot(driver, token.index::usize);
-    if (slot == nil) {
+    @token = res_submitted.ok;
+    if (slot_take(driver, @token, kind, resource) == nil) {
         io_runtime.fail(driver.runtime, @token, exhausted(io_error.OP_SUBMIT));
         ret res[bool, io_error.Error].ok{false};
     }
-    if (slot.state != SLOT_FREE) {
-        io_runtime.fail(driver.runtime, @token, io_error.make(io_error.BUSY, io_error.OP_SUBMIT));
-        ret res[bool, io_error.Error].ok{false};
-    }
-    val chunk: usize = table.chunk_of(?driver.slots, token.index::usize);
-    driver.slot_live[chunk] = driver.slot_live[chunk] + 1;
-    slot.state              = SLOT_ACTIVE;
-    slot.generation         = token.generation;
-    slot.native_active      = false;
-    slot.listener_index     = NONE;
-    slot.stream_index       = NONE;
-    slot.kind               = kind;
-    slot.resource           = resource;
     ret res[bool, io_error.Error].ok{true};
 }
 
+# record what the backend made of a submission, or fail the operation with its refusal
 fun publish_submission(driver: *Driver, token: io_runtime.Token, native: async_types.Token, code: i64) {
     val slot: *Slot = slot_for(driver, token);
     if (slot == nil) { ret; }
@@ -865,6 +895,17 @@ fun publish_submission(driver: *Driver, token: io_runtime.Token, native: async_t
     }
 }
 
+# bind a listener to a local endpoint. the bind runs now and its completion
+# carries the result for bound_listener
+# ---
+# driver:  the driver
+# scope:   the cancel scope the operation joins
+# bound:   the endpoint to bind
+# options: how to bind
+# context: the caller's context, carried to the completion
+# ret:     the operation's token, or the refusal: INVALID for a nil argument or an
+#          unsupported endpoint, RESOURCE_EXHAUSTED when no listener entry can be
+#          made, or the runtime's refusal. a failed bind is reported in the completion
 pub fun submit_bind(
     driver: *Driver,
     scope: *cancel.Scope,
@@ -881,8 +922,8 @@ pub fun submit_bind(
         mutex.unlock(?driver.lock);
         ret res[io_runtime.Token, io_error.Error].err{exhausted(io_error.OP_BIND)};
     }
-    var token:   io_runtime.Token;
-    val claimed: res[bool, io_error.Error] = claim_locked(
+    var token:       io_runtime.Token;
+    val res_claimed: res[bool, io_error.Error] = claim_locked(
         driver,
         scope,
         io_runtime.BIND,
@@ -892,17 +933,17 @@ pub fun submit_bind(
         context,
         ?token,
     );
-    if (sel claimed.err) {
+    if (sel res_claimed.err) {
         mutex.unlock(?driver.lock);
-        ret res[io_runtime.Token, io_error.Error].err{claimed.err};
+        ret res[io_runtime.Token, io_error.Error].err{res_claimed.err};
     }
-    if (claimed.ok) {
-        val bound_result: res[types.Listener, io_error.Error] = local.bind(bound, options);
-        if (sel bound_result.err) {
-            io_runtime.fail(driver.runtime, token, bound_result.err);
+    if (res_claimed.ok) {
+        val res_bound: res[types.Listener, io_error.Error] = local.bind(bound, options);
+        if (sel res_bound.err) {
+            io_runtime.fail(driver.runtime, token, res_bound.err);
         }
-        if (sel bound_result.ok) {
-            listener.value = bound_result.ok;
+        if (sel res_bound.ok) {
+            listener.value = res_bound.ok;
             var generation: u32 = listener.generation + 1;
             if (generation == 0) { generation = 1; }
             listener.generation = generation;
@@ -918,6 +959,12 @@ pub fun submit_bind(
     ret res[io_runtime.Token, io_error.Error].ok{token};
 }
 
+# the listener a bind completion made
+# ---
+# driver:     the driver
+# completion: the bind's completion
+# ret:        the listener's token, the completion's error, INVALID for a nil driver or
+#             another kind, or CLOSED when the listener is gone
 pub fun bound_listener(driver: *Driver, completion: io_runtime.Completion) res[Listener, io_error.Error] {
     if (driver == nil || completion.kind != io_runtime.BIND || completion.has_error) {
         if (completion.has_error) { ret res[Listener, io_error.Error].err{completion.error}; }
@@ -937,6 +984,16 @@ pub fun bound_listener(driver: *Driver, completion: io_runtime.Completion) res[L
     ret res[Listener, io_error.Error].ok{value};
 }
 
+# start listening on a bound listener. the listen runs now and its completion carries the result
+# ---
+# driver:   the driver
+# scope:    the cancel scope the operation joins
+# listener: the bound listener's token
+# backlog:  the pending connection queue length, above 0
+# context:  the caller's context, carried to the completion
+# ret:      the operation's token, or the refusal: INVALID for a bad argument, CLOSED
+#           when the listener is not bound here, or the runtime's refusal. a failed
+#           listen is reported in the completion
 pub fun submit_listen(
     driver: *Driver,
     scope: *cancel.Scope,
@@ -953,8 +1010,8 @@ pub fun submit_listen(
         mutex.unlock(?driver.lock);
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_LISTEN)};
     }
-    var token:   io_runtime.Token;
-    val claimed: res[bool, io_error.Error] = claim_locked(
+    var token:       io_runtime.Token;
+    val res_claimed: res[bool, io_error.Error] = claim_locked(
         driver,
         scope,
         io_runtime.LISTEN,
@@ -964,17 +1021,17 @@ pub fun submit_listen(
         context,
         ?token,
     );
-    if (sel claimed.err) {
+    if (sel res_claimed.err) {
         mutex.unlock(?driver.lock);
-        ret res[io_runtime.Token, io_error.Error].err{claimed.err};
+        ret res[io_runtime.Token, io_error.Error].err{res_claimed.err};
     }
-    if (claimed.ok) {
-        val started: err[io_error.Error] = local.listener_start(?entry.value, backlog);
-        val slot:    *Slot               = slot_for(driver, token);
+    if (res_claimed.ok) {
+        val err_started: err[io_error.Error] = local.listener_start(?entry.value, backlog);
+        val slot:        *Slot               = slot_for(driver, token);
         slot.listener_index = listener_index(driver, entry);
         entry.listen_token  = token;
-        if (sel started.err) {
-            io_runtime.fail(driver.runtime, token, started.err);
+        if (sel err_started.err) {
+            io_runtime.fail(driver.runtime, token, err_started.err);
         }
         or {
             entry.state = LISTENER_LISTEN_PENDING;
@@ -985,6 +1042,12 @@ pub fun submit_listen(
     ret res[io_runtime.Token, io_error.Error].ok{token};
 }
 
+# whether a listen completion left its listener listening
+# ---
+# driver:     the driver
+# completion: the listen's completion
+# ret:        ok, the completion's error, INVALID for a nil driver or another kind, or
+#             CLOSED when the listener is gone or not listening
 pub fun listening(driver: *Driver, completion: io_runtime.Completion) err[io_error.Error] {
     if (driver == nil || completion.kind != io_runtime.LISTEN || completion.has_error) {
         if (completion.has_error) { ret err[io_error.Error].err{completion.error}; }
@@ -1035,6 +1098,15 @@ pub fun listener_rename(
     ret err[io_error.Error].ok{};
 }
 
+# queue an accept on a listening listener
+# ---
+# driver:   the driver
+# scope:    the cancel scope the operation joins
+# listener: the listening listener's token
+# context:  the caller's context, carried to the completion
+# ret:      the operation's token, whose completion goes to accepted, or the refusal:
+#           INVALID for a nil argument, CLOSED when the listener is not listening here,
+#           RESOURCE_EXHAUSTED when no stream entry can be made, or the runtime's refusal
 pub fun submit_accept(
     driver: *Driver,
     scope: *cancel.Scope,
@@ -1055,13 +1127,13 @@ pub fun submit_accept(
         mutex.unlock(?driver.lock);
         ret res[io_runtime.Token, io_error.Error].err{exhausted(io_error.OP_ACCEPT)};
     }
-    var token:   io_runtime.Token;
-    val claimed: res[bool, io_error.Error] = claim_locked(driver, scope, io_runtime.ACCEPT, entry.value.handle, nil, 0, context, ?token);
-    if (sel claimed.err) {
+    var token:       io_runtime.Token;
+    val res_claimed: res[bool, io_error.Error] = claim_locked(driver, scope, io_runtime.ACCEPT, entry.value.handle, nil, 0, context, ?token);
+    if (sel res_claimed.err) {
         mutex.unlock(?driver.lock);
-        ret res[io_runtime.Token, io_error.Error].err{claimed.err};
+        ret res[io_runtime.Token, io_error.Error].err{res_claimed.err};
     }
-    if (claimed.ok) {
+    if (res_claimed.ok) {
         var generation: u32 = stream.generation + 1;
         if (generation == 0) { generation = 1; }
         stream.generation = generation;
@@ -1078,6 +1150,15 @@ pub fun submit_accept(
     ret res[io_runtime.Token, io_error.Error].ok{token};
 }
 
+# create a stream socket and queue its connect to a local endpoint
+# ---
+# driver:  the driver
+# scope:   the cancel scope the operation joins
+# remote:  the endpoint to connect to
+# context: the caller's context, carried to the completion
+# ret:     the operation's token, whose completion goes to connected, or the refusal:
+#          INVALID for a bad argument, the socket creation failure, RESOURCE_EXHAUSTED
+#          when no stream entry can be made, or the runtime's refusal
 pub fun submit_connect(
     driver: *Driver,
     scope: *cancel.Scope,
@@ -1099,14 +1180,14 @@ pub fun submit_connect(
         mutex.unlock(?driver.lock);
         ret res[io_runtime.Token, io_error.Error].err{exhausted(io_error.OP_CONNECT)};
     }
-    var token:   io_runtime.Token;
-    val claimed: res[bool, io_error.Error] = claim_locked(driver, scope, io_runtime.CONNECT, resource, nil, 0, context, ?token);
-    if (sel claimed.err) {
+    var token:       io_runtime.Token;
+    val res_claimed: res[bool, io_error.Error] = claim_locked(driver, scope, io_runtime.CONNECT, resource, nil, 0, context, ?token);
+    if (sel res_claimed.err) {
         impl.close_resource(?driver.backend, resource);
         mutex.unlock(?driver.lock);
-        ret res[io_runtime.Token, io_error.Error].err{claimed.err};
+        ret res[io_runtime.Token, io_error.Error].err{res_claimed.err};
     }
-    if (claimed.ok) {
+    if (res_claimed.ok) {
         val slot:       *Slot = slot_for(driver, token);
         var generation: u32   = stream.generation + 1;
         if (generation == 0) { generation = 1; }
@@ -1127,6 +1208,7 @@ pub fun submit_connect(
     ret res[io_runtime.Token, io_error.Error].ok{token};
 }
 
+# queue a read, readiness wait or write on an open stream
 fun submit_buffer(
     driver: *Driver,
     scope: *cancel.Scope,
@@ -1145,14 +1227,14 @@ fun submit_buffer(
         mutex.unlock(?driver.lock);
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.CLOSED, operation_for_kind(kind))};
     }
-    val resource: usize                     = entry.value.handle;
-    var token:    io_runtime.Token;
-    val claimed:  res[bool, io_error.Error] = claim_locked(driver, scope, kind, resource, buffer, length, context, ?token);
-    if (sel claimed.err) {
+    val resource:    usize                     = entry.value.handle;
+    var token:       io_runtime.Token;
+    val res_claimed: res[bool, io_error.Error] = claim_locked(driver, scope, kind, resource, buffer, length, context, ?token);
+    if (sel res_claimed.err) {
         mutex.unlock(?driver.lock);
-        ret res[io_runtime.Token, io_error.Error].err{claimed.err};
+        ret res[io_runtime.Token, io_error.Error].err{res_claimed.err};
     }
-    if (claimed.ok) {
+    if (res_claimed.ok) {
         stream_hold(driver, slot_for(driver, token), entry);
         var native: async_types.Token;
         var code:   i64;
@@ -1195,6 +1277,7 @@ pub fun submit_write(driver: *Driver, scope: *cancel.Scope, stream: *Stream, buf
     ret submit_buffer(driver, scope, io_runtime.WRITE, stream, buffer, length, context);
 }
 
+# queue a write shutdown or a close on an open stream. a close zeroes the stream's token once the backend takes it
 fun submit_stream_control(
     driver: *Driver,
     scope: *cancel.Scope,
@@ -1211,14 +1294,14 @@ fun submit_stream_control(
         mutex.unlock(?driver.lock);
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.CLOSED, operation_for_kind(kind))};
     }
-    val resource: usize                     = entry.value.handle;
-    var token:    io_runtime.Token;
-    val claimed:  res[bool, io_error.Error] = claim_locked(driver, scope, kind, resource, nil, 0, context, ?token);
-    if (sel claimed.err) {
+    val resource:    usize                     = entry.value.handle;
+    var token:       io_runtime.Token;
+    val res_claimed: res[bool, io_error.Error] = claim_locked(driver, scope, kind, resource, nil, 0, context, ?token);
+    if (sel res_claimed.err) {
         mutex.unlock(?driver.lock);
-        ret res[io_runtime.Token, io_error.Error].err{claimed.err};
+        ret res[io_runtime.Token, io_error.Error].err{res_claimed.err};
     }
-    if (claimed.ok) {
+    if (res_claimed.ok) {
         stream_hold(driver, slot_for(driver, token), entry);
         var native: async_types.Token;
         var code:   i64;
@@ -1238,10 +1321,28 @@ fun submit_stream_control(
     ret res[io_runtime.Token, io_error.Error].ok{token};
 }
 
+# queue a shutdown of the stream's write side, behind the writes already queued
+# ---
+# driver:  the driver
+# scope:   the cancel scope the operation joins
+# stream:  the open stream's token
+# context: the caller's context, carried to the completion
+# ret:     the operation's token, or the refusal: INVALID for a nil argument, CLOSED
+#          when the stream is not open here, or the runtime's refusal
 pub fun submit_shutdown_write(driver: *Driver, scope: *cancel.Scope, stream: *Stream, context: usize) res[io_runtime.Token, io_error.Error] {
     ret submit_stream_control(driver, scope, stream, io_runtime.SHUTDOWN, context);
 }
 
+# close a stream the driver holds. a graceful close shuts the write side down,
+# and an abortive close cancels pending reads and closes the socket
+# ---
+# driver:  the driver
+# scope:   the cancel scope the operation joins
+# stream:  the open stream's token, zeroed once an abortive close is taken
+# mode:    GRACEFUL or ABORTIVE
+# context: the caller's context, carried to the completion
+# ret:     the operation's token, or the refusal: INVALID for a bad argument, CLOSED
+#          when the stream is not open here, or the runtime's refusal
 pub fun submit_stream_close(
     driver: *Driver,
     scope: *cancel.Scope,
@@ -1258,6 +1359,14 @@ pub fun submit_stream_close(
     ret submit_stream_control(driver, scope, stream, io_runtime.CLOSE, context);
 }
 
+# close a listener, removing its socket file when the listener owns it
+# ---
+# driver:   the driver
+# scope:    the cancel scope the operation joins
+# listener: the listener's token, zeroed once the backend takes the close
+# context:  the caller's context, carried to the completion
+# ret:      the operation's token, or the refusal: INVALID for a nil argument, CLOSED
+#           when the listener is not bound or listening here, or the runtime's refusal
 pub fun submit_listener_close(driver: *Driver, scope: *cancel.Scope, listener: *Listener, context: usize) res[io_runtime.Token, io_error.Error] {
     if (driver == nil || scope == nil || listener == nil) {
         ret res[io_runtime.Token, io_error.Error].err{invalid(io_error.OP_CLOSE)};
@@ -1268,16 +1377,16 @@ pub fun submit_listener_close(driver: *Driver, scope: *cancel.Scope, listener: *
         mutex.unlock(?driver.lock);
         ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_CLOSE)};
     }
-    val resource: usize                     = entry.value.handle;
-    val previous: u8                        = entry.state;
-    var token:    io_runtime.Token;
-    val claimed:  res[bool, io_error.Error] = claim_locked(driver, scope, io_runtime.CLOSE, resource, nil, 0, context, ?token);
-    if (sel claimed.err) {
+    val resource:    usize                     = entry.value.handle;
+    val previous:    u8                        = entry.state;
+    var token:       io_runtime.Token;
+    val res_claimed: res[bool, io_error.Error] = claim_locked(driver, scope, io_runtime.CLOSE, resource, nil, 0, context, ?token);
+    if (sel res_claimed.err) {
         mutex.unlock(?driver.lock);
-        ret res[io_runtime.Token, io_error.Error].err{claimed.err};
+        ret res[io_runtime.Token, io_error.Error].err{res_claimed.err};
     }
     var accepted: bool = false;
-    if (claimed.ok) {
+    if (res_claimed.ok) {
         val slot: *Slot = slot_for(driver, token);
         slot.listener_index = listener_index(driver, entry);
         entry.state         = LISTENER_CLOSING;
@@ -1295,6 +1404,8 @@ pub fun submit_listener_close(driver: *Driver, scope: *cancel.Scope, listener: *
     ret res[io_runtime.Token, io_error.Error].ok{token};
 }
 
+# settle the driver's entries for a completion being released: open or free the
+# stream an accept or connect made, settle a listener's state, free a closed one
 fun cleanup_locked(driver: *Driver, completion: *io_runtime.Completion) {
     val slot: *Slot = slot_for(driver, completion.token);
     if (slot == nil) { ret; }
@@ -1363,14 +1474,11 @@ fun cleanup_locked(driver: *Driver, completion: *io_runtime.Completion) {
         held.value.handle = io_handle.INVALID_VALUE;
         stream_free(driver, held);
     }
-    slot.state          = SLOT_FREE;
-    slot.listener_index = NONE;
-    slot.stream_index   = NONE;
-    val chunk: usize = table.chunk_of(?driver.slots, completion.token.index::usize);
-    driver.slot_live[chunk] = driver.slot_live[chunk] - 1;
+    slot_release(driver, slot, completion.token);
     trim_locked(driver);
 }
 
+# hand a backend completion to the runtime. an accepted socket no operation can take is closed
 fun resolve_native_locked(driver: *Driver, native: async_types.NativeCompletion) {
     var token: io_runtime.Token;
     if (!context_token(native.context, ?token)) { ret; }
@@ -1386,45 +1494,32 @@ fun resolve_native_locked(driver: *Driver, native: async_types.NativeCompletion)
         # an accept whose abort landed after it took a connection hands it
         # over on the cancellation (#927)
         if (native.kind == io_runtime.ACCEPT && native.resource != io_handle.INVALID_VALUE) {
-            val taken:  io_handle.SocketHandle = io_handle.socket(native.resource);
-            val handed: err[io_error.Error]    = io_runtime.complete_opened(driver.runtime, token, taken.value, taken.opening);
-            if (sel handed.err) { os.sock_close(native.resource); }
+            val taken:      io_handle.SocketHandle = io_handle.socket(native.resource);
+            val err_handed: err[io_error.Error]    = io_runtime.complete_opened(driver.runtime, token, taken.value, taken.opening);
+            if (sel err_handed.err) { os.sock_close(native.resource); }
         }
-        val cancelled: err[io_error.Error] = io_runtime.complete_cancellation_transfer(driver.runtime, token, native.bytes, native.items, native.end_of_stream);
-        if (sel cancelled.err) {
+        val err_cancelled: err[io_error.Error] = io_runtime.complete_cancellation_transfer(driver.runtime, token, native.bytes, native.items, native.end_of_stream);
+        if (sel err_cancelled.err) {
             panic.panic("std.net.async.local: asynchronous cancellation lost operation ownership\n");
         }
         ret;
     }
-    var resolved: err[io_error.Error];
+    var err_resolved: err[io_error.Error];
     if (native.status < 0) {
-        resolved = io_runtime.fail(driver.runtime, token, os.error(native.status, operation_for_kind(native.kind)));
+        err_resolved = io_runtime.fail(driver.runtime, token, os.error(native.status, operation_for_kind(native.kind)));
     }
     or (native.kind == io_runtime.ACCEPT) {
         # stamped so the completion says it hands a stream over, which a
         # cancellation that claimed the accept then carries
         val accepted: io_handle.SocketHandle = io_handle.socket(native.resource);
-        resolved = io_runtime.complete_opened(driver.runtime, token, accepted.value, accepted.opening);
+        err_resolved = io_runtime.complete_opened(driver.runtime, token, accepted.value, accepted.opening);
     }
     or {
-        resolved = io_runtime.complete(driver.runtime, token, native.bytes, native.resource, native.end_of_stream);
+        err_resolved = io_runtime.complete(driver.runtime, token, native.bytes, native.resource, native.end_of_stream);
     }
-    if (sel resolved.err && native.kind == io_runtime.ACCEPT && native.status >= 0 && native.resource != io_handle.INVALID_VALUE) {
+    if (sel err_resolved.err && native.kind == io_runtime.ACCEPT && native.status >= 0 && native.resource != io_handle.INVALID_VALUE) {
         os.sock_close(native.resource);
     }
-}
-
-# always 0: a cancelled read no longer discards anything, its completion
-# carries the bytes it took (see submit_read). kept only for compatibility and
-# removed in 6.0
-# ---
-# driver: ignored
-# bytes:  set to 0 when not nil
-# ret:    0
-#[deprecated("always 0: a cancelled read reports its bytes; removed in 6.0")]
-pub fun discarded_reads(driver: *Driver, bytes: *u64) u64 {
-    if (bytes != nil) { @bytes = 0; }
-    ret 0;
 }
 
 # operations cancelled on this driver whose native request has not yet
@@ -1434,7 +1529,7 @@ pub fun discarded_reads(driver: *Driver, bytes: *u64) u64 {
 # synchronously
 pub fun awaiting_cancellations(driver: *Driver) usize {
     if (driver == nil || driver.runtime == nil) { ret 0; }
-    $if ($mach.build.os == $mach.os.windows) {
+    $if ($mach.build.sys == $mach.sys.windows) {
         ret impl.awaiting_cancellations(?driver.backend);
     }
     $or {
@@ -1452,9 +1547,9 @@ pub fun wait(
     if (driver == nil || output == nil || output_capacity == 0 || timeout_ms < -1) {
         ret res[usize, io_error.Error].err{invalid(io_error.OP_WAIT)};
     }
-    val waited: res[usize, io_error.Error] = io_runtime.wait(driver.runtime, output, output_capacity, timeout_ms);
-    if (sel waited.err) { ret res[usize, io_error.Error].err{waited.err}; }
-    ret res[usize, io_error.Error].ok{waited.ok};
+    val res_waited: res[usize, io_error.Error] = io_runtime.wait(driver.runtime, output, output_capacity, timeout_ms);
+    if (sel res_waited.err) { ret res[usize, io_error.Error].err{res_waited.err}; }
+    ret res[usize, io_error.Error].ok{res_waited.ok};
 }
 
 # the stream an accept completion hands over, whether it succeeded or was
@@ -1482,6 +1577,12 @@ pub fun accepted(driver: *Driver, completion: io_runtime.Completion) res[Stream,
     ret res[Stream, io_error.Error].ok{value};
 }
 
+# the stream a connect completion opened
+# ---
+# driver:     the driver
+# completion: the connect's completion
+# ret:        the stream's token, the completion's error, INVALID for a nil driver or
+#             another kind, or CLOSED when the stream is gone
 pub fun connected(driver: *Driver, completion: io_runtime.Completion) res[Stream, io_error.Error] {
     if (driver == nil || completion.kind != io_runtime.CONNECT || completion.has_error) {
         if (completion.has_error) { ret res[Stream, io_error.Error].err{completion.error}; }
@@ -1574,6 +1675,12 @@ pub fun adopt(driver: *Driver, detached: *Detached) res[Stream, io_error.Error] 
     ret res[Stream, io_error.Error].ok{value};
 }
 
+# the credentials of the process at the other end of a stream
+# ---
+# driver: the driver
+# stream: the open stream's token
+# ret:    the identity, INVALID for a nil argument, CLOSED when the stream is not open
+#         here, or the platform's refusal
 pub fun peer_identity(driver: *Driver, stream: *Stream) res[types.PeerIdentity, io_error.Error] {
     if (driver == nil || stream == nil) { ret res[types.PeerIdentity, io_error.Error].err{invalid(io_error.OP_OPTION)}; }
     mutex.lock(?driver.lock);
@@ -1582,34 +1689,35 @@ pub fun peer_identity(driver: *Driver, stream: *Stream) res[types.PeerIdentity, 
         mutex.unlock(?driver.lock);
         ret res[types.PeerIdentity, io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_OPTION)};
     }
-    val value: res[types.PeerIdentity, io_error.Error] = local.peer_identity(?entry.value);
+    val res_value: res[types.PeerIdentity, io_error.Error] = local.peer_identity(?entry.value);
     mutex.unlock(?driver.lock);
-    ret value;
+    ret res_value;
 }
 
-pub fun destroy(driver: *Driver) err[io_error.Error] {
+# release the driver once no operation is in flight, closing every listener and stream it holds
+# ---
+# driver: the driver
+# ret:    ok, INVALID for a nil or released driver, BUSY while an operation's
+#         completion has not been released, or the first failure to close or release
+pub fun dnit(driver: *Driver) err[io_error.Error] {
     if (driver == nil || driver.runtime == nil) {
         ret err[io_error.Error].err{invalid(io_error.OP_CLOSE)};
     }
     mutex.lock(?driver.lock);
-    var i: usize = 0;
-    for (i < driver.slots.capacity) {
-        if (slot_at(driver, i).state != SLOT_FREE) {
-            mutex.unlock(?driver.lock);
-            ret err[io_error.Error].err{io_error.make(io_error.BUSY, io_error.OP_CLOSE)};
-        }
-        i = i + 1;
+    if (slots_busy(driver)) {
+        mutex.unlock(?driver.lock);
+        ret err[io_error.Error].err{io_error.make(io_error.BUSY, io_error.OP_CLOSE)};
     }
     mutex.unlock(?driver.lock);
-    val retired: res[bool, io_error.Error] = io_runtime.retire_source(driver.runtime, driver.source);
-    if (sel retired.err) {
-        ret err[io_error.Error].err{retired.err};
+    val res_retired: res[bool, io_error.Error] = io_runtime.retire_source(driver.runtime, driver.source);
+    if (sel res_retired.err) {
+        ret err[io_error.Error].err{res_retired.err};
     }
     mutex.lock(?driver.lock);
     close_all_listeners_locked(driver);
     close_all_streams_locked(driver);
     if (!driver.backend_destroyed) {
-        val code: i64 = impl.destroy(?driver.backend);
+        val code: i64 = impl.dnit(?driver.backend);
         if (code < 0) {
             mutex.unlock(?driver.lock);
             ret err[io_error.Error].err{os.error(code, io_error.OP_CLOSE)};
@@ -1617,18 +1725,18 @@ pub fun destroy(driver: *Driver) err[io_error.Error] {
         driver.backend_destroyed = true;
     }
     mutex.unlock(?driver.lock);
-    val released_source: err[io_error.Error] = io_runtime.release_source(driver.runtime, driver.source);
+    val err_released_source: err[io_error.Error] = io_runtime.release_source(driver.runtime, driver.source);
     mutex.lock(?driver.lock);
-    val slots_released:     err[allocator.Error] = table.destroy(?driver.slots);
-    val listeners_released: err[allocator.Error] = table.destroy(?driver.listeners);
-    val streams_released:   err[allocator.Error] = table.destroy(?driver.streams);
-    val cleanup_code:       i64                  = driver.cleanup_code;
+    val err_slots_released:     err[allocator.Error] = table.dnit(?driver.slots);
+    val err_listeners_released: err[allocator.Error] = table.dnit(?driver.listeners);
+    val err_streams_released:   err[allocator.Error] = table.dnit(?driver.streams);
+    val cleanup_code:           i64                  = driver.cleanup_code;
     mutex.unlock(?driver.lock);
     driver.runtime = nil;
-    if (sel released_source.err) {
-        ret err[io_error.Error].err{released_source.err};
+    if (sel err_released_source.err) {
+        ret err[io_error.Error].err{err_released_source.err};
     }
-    if (sel slots_released.err || sel listeners_released.err || sel streams_released.err) {
+    if (sel err_slots_released.err || sel err_listeners_released.err || sel err_streams_released.err) {
         ret err[io_error.Error].err{io_error.make(io_error.IO, io_error.OP_CLOSE)};
     }
     if (cleanup_code < 0) { ret err[io_error.Error].err{os.error(cleanup_code, io_error.OP_CLOSE)}; }
@@ -1643,10 +1751,10 @@ test async_local__ownership_query_includes_driver_backend_and_runtime {
     var empty:    Driver;
     if (!aliases(?empty, ?external[0], 1) ||
         !aliases((~(0::usize) - 1)::*Driver, ?external[0], 1) ||
-        !ok_err(io_runtime.make(?runtime, ?pa, 2))) { ret 1; }
+        !ok_err(io_runtime.init(?runtime, ?pa, 2))) { ret 1; }
     var partial: impl.Backend;
     partial.queue = ?runtime.queue;
-    $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
+    $if ($mach.build.sys == $mach.sys.linux || $mach.build.sys == $mach.sys.darwin) {
         partial.operations.capacity = 2;
         partial.map_capacity        = 4;
     }
@@ -1656,9 +1764,9 @@ test async_local__ownership_query_includes_driver_backend_and_runtime {
     if (!impl.aliases(?partial, ?external[0], 1) ||
         !impl.aliases((~(0::usize) - 1)::*impl.Backend,
         ?external[0], 1)) { ret 2; }
-    var driver:      Driver;
-    val make_result: err[io_error.Error] = make(?driver, ?runtime);
-    if (sel make_result.err) { ret 3; }
+    var driver:   Driver;
+    val err_make: err[io_error.Error] = init(?driver, ?runtime);
+    if (sel err_make.err) { ret 3; }
     if (!aliases(?driver, (?driver)::*u8, $size_of(Driver)) ||
         !aliases(?driver, driver.slots.chunks[0]::*u8, $size_of(Slot) * 2) ||
         !aliases(?driver, driver.listeners.chunks[0]::*u8, $size_of(ListenerEntry) * 2) ||
@@ -1669,7 +1777,7 @@ test async_local__ownership_query_includes_driver_backend_and_runtime {
         aliases(?driver, ?external[0], 8) ||
         aliases(?driver, (~(0::usize))::*u8, 1) ||
         !aliases(?driver, (~(0::usize) - 1)::*u8, 3)) { ret 4; }
-    $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
+    $if ($mach.build.sys == $mach.sys.linux || $mach.build.sys == $mach.sys.darwin) {
         if (!aliases(?driver, driver.backend.resources.chunks[0]::*u8, 1) ||
             !aliases(?driver, driver.backend.resource_map::*u8, 1) ||
             !aliases(?driver, driver.backend.native::*u8, 1) ||
@@ -1681,10 +1789,10 @@ test async_local__ownership_query_includes_driver_backend_and_runtime {
             !aliases(?driver, driver.backend.native::*u8, 1) ||
             !aliases(?driver, driver.backend.completions.chunks[0]::*u8, 1)) { ret 5; }
     }
-    if (refused(destroy(?driver)) ||
+    if (refused(dnit(?driver)) ||
         !aliases(?driver, ?external[0], 1) ||
         !ok_bool(io_runtime.close(?runtime)) ||
-        !ok_err(io_runtime.destroy(?runtime))) { ret 6; }
+        !ok_err(io_runtime.dnit(?runtime))) { ret 6; }
     ret 0;
 }
 
@@ -1696,14 +1804,14 @@ test async_local__a_refused_stream_table_growth_leaves_every_held_entry_in_place
     val t: *testing.Testing = os.allocate($size_of(testing.Testing))::*testing.Testing;
     if (t == nil) { ret 1; }
     fin { os.deallocate(t::ptr, $size_of(testing.Testing)); }
-    val tr: err[allocator.Error] = testing.make(t);
-    if (sel tr.err) { ret 1; }
+    val err_testing_made: err[allocator.Error] = testing.init(t);
+    if (sel err_testing_made.err) { ret 1; }
     fin { testing.dnit(t); }
 
     var runtime: io_runtime.Runtime;
-    if (refused(io_runtime.make(?runtime, testing.allocator_of(t), 2))) { ret 2; }
+    if (refused(io_runtime.init(?runtime, testing.allocator_of(t), 2))) { ret 2; }
     var driver: Driver;
-    if (refused(make(?driver, ?runtime))) { ret 3; }
+    if (refused(init(?driver, ?runtime))) { ret 3; }
 
     # fill the initial table, remembering where each entry lives
     var held: [2]*StreamEntry;
@@ -1738,80 +1846,81 @@ test async_local__a_refused_stream_table_growth_leaves_every_held_entry_in_place
     stream_free(?driver, third);
     stream_free(?driver, held[1]);
     stream_free(?driver, held[0]);
-    if (refused(destroy(?driver)))             { ret 10; }
-    if (!ok_bool(io_runtime.close(?runtime)))  { ret 11; }
-    if (!ok_err(io_runtime.destroy(?runtime))) { ret 11; }
-    if (testing.leaked(t))                     { ret 12; }
-    if (testing.double_free_count(t) != 0)     { ret 12; }
+    if (refused(dnit(?driver)))               { ret 10; }
+    if (!ok_bool(io_runtime.close(?runtime))) { ret 11; }
+    if (!ok_err(io_runtime.dnit(?runtime)))   { ret 11; }
+    if (testing.leaked(t))                    { ret 12; }
+    if (testing.double_free_count(t) != 0)    { ret 12; }
     ret 0;
 }
 
-# claim cost at n streams: with every entry held but a freed last one, then
-# with every entry held, after the last entry has churned
-#[testing]
-fun claim_after_churn(n: usize, freed_cost: *u64, full_cost: *u64) i32 {
-    var pa: allocator.Allocator;
-    page.make(?pa);
+# growth writes no stream, listener or slot until it is taken, and a taken
+# slot keeps the driver busy
+test async_local__growth_writes_no_entry_until_it_is_taken {
+    # the tracker is too large for the stack, so it lives on the mapper
+    val t: *testing.Testing = os.allocate($size_of(testing.Testing))::*testing.Testing;
+    if (t == nil) { ret 1; }
+    fin { os.deallocate(t::ptr, $size_of(testing.Testing)); }
+    val err_testing_made: err[allocator.Error] = testing.init(t);
+    if (sel err_testing_made.err) { ret 1; }
+    fin { testing.dnit(t); }
+
     var runtime: io_runtime.Runtime;
-    if (refused(io_runtime.make(?runtime, ?pa, 4))) { ret 1; }
+    if (refused(io_runtime.init(?runtime, testing.allocator_of(t), 2))) { ret 2; }
     var driver: Driver;
-    if (refused(make(?driver, ?runtime))) { ret 2; }
-    var i: usize = 0;
-    for (i < n) {
-        val stream: *StreamEntry = stream_claim(?driver);
-        if (stream == nil) { ret 3; }
-        stream_take(?driver, stream, STREAM_OPEN);
+    if (refused(init(?driver, ?runtime))) { ret 3; }
+    var streams:   [3]*StreamEntry;
+    var listeners: [3]*ListenerEntry;
+    var i:         usize = 0;
+    for (i < 3) {
+        streams[i] = stream_claim(?driver);
+        if (streams[i] == nil) { ret 4; }
+        stream_take(?driver, streams[i], STREAM_OPEN);
+        listeners[i] = listener_claim(?driver);
+        if (listeners[i] == nil) { ret 4; }
+        listener_take(?driver, listeners[i], LISTENER_BIND_PENDING);
         i = i + 1;
     }
-    # churn the last entry: each claim takes the oldest free entry of its chunk
-    var last:  *StreamEntry = stream_at(?driver, n - 1);
-    var round: usize        = 0;
-    for (round < 3) {
-        stream_free(?driver, last);
-        last = stream_claim(?driver);
-        if (last == nil) { ret 4; }
-        stream_take(?driver, last, STREAM_OPEN);
-        round = round + 1;
-    }
-    stream_free(?driver, last);
-    var before: u64          = driver.claim_steps;
-    val freed:  *StreamEntry = stream_claim(?driver);
-    @freed_cost = driver.claim_steps - before;
-    if (freed == nil) { ret 5; }
-    stream_take(?driver, freed, STREAM_OPEN);
-    # fill every entry, so the next claim grows the table
-    for (table.pool_peek(?driver.stream_pool, ?driver.streams) != table.NO_INDEX) {
-        stream_take(?driver, stream_claim(?driver), STREAM_OPEN);
-    }
-    before = driver.claim_steps;
-    val fresh: *StreamEntry = stream_claim(?driver);
-    @full_cost = driver.claim_steps - before;
-    if (fresh == nil) { ret 6; }
-    stream_take(?driver, fresh, STREAM_OPEN);
+    val paint: u8 = testing.POISON_NEW;
+    if (!table.pool_unwritten(?driver.stream_pool, ?driver.streams, paint))     { ret 5; }
+    if (!table.pool_unwritten(?driver.listener_pool, ?driver.listeners, paint)) { ret 6; }
+    val low:       io_runtime.Token = io_runtime.Token{index: 1, generation: 1};
+    val high:      io_runtime.Token = io_runtime.Token{index: 5, generation: 1};
+    val low_slot:  *Slot            = slot_take(?driver, low, io_runtime.READ, 0);
+    val high_slot: *Slot            = slot_take(?driver, high, io_runtime.WRITE, 0);
+    if (low_slot == nil || high_slot == nil || driver.slots.chunk_count != 3)       { ret 8; }
+    if (slot_for(?driver, low) != low_slot || slot_for(?driver, high) != high_slot) { ret 8; }
     i = 0;
-    for (i < driver.streams.capacity) {
-        stream_free(?driver, stream_at(?driver, i));
+    for (i < driver.slots.capacity) {
+        if (i != low.index::usize && i != high.index::usize) {
+            val bytes: *u8   = slot_at(?driver, i)::*u8;
+            var byte:  usize = 0;
+            for (byte < $size_of(Slot)) {
+                if (bytes[byte] != paint) { ret 9; }
+                byte = byte + 1;
+            }
+        }
         i = i + 1;
     }
-    if (refused(destroy(?driver))) { ret 7; }
-    io_runtime.close(?runtime);
-    if (refused(io_runtime.destroy(?runtime))) { ret 8; }
-    ret 0;
-}
-
-test async_local__stream_claim_cost_stays_flat_after_churn {
-    var freed:   u64 = 0;
-    var full:    u64 = 0;
-    val churned: i32 = claim_after_churn(100000, ?freed, ?full);
-    if (churned != 0)          { ret churned; }
-    if (freed > 1 || full > 1) { ret 41; }
+    val err_busy: err[io_error.Error] = dnit(?driver);
+    if (!(sel err_busy.err && err_busy.err.kind == io_error.BUSY)) { ret 10; }
+    slot_release(?driver, low_slot, low);
+    slot_release(?driver, high_slot, high);
+    if (slot_for(?driver, low) != nil) { ret 11; }
+    i = 0;
+    for (i < 3) {
+        stream_free(?driver, streams[i]);
+        listener_free(?driver, listeners[i]);
+        i = i + 1;
+    }
+    if (refused(dnit(?driver)) || !ok_bool(io_runtime.close(?runtime)) || !ok_err(io_runtime.dnit(?runtime))) { ret 7; }
     ret 0;
 }
 
 # a stream and a listener taken the way a submission takes them, with the
 # handles a caller would hold
 #[testing]
-fun test_take_pair(driver: *Driver, stream_handle: *Stream, listener_handle: *Listener) bool {
+fun take_pair(driver: *Driver, stream_handle: *Stream, listener_handle: *Listener) bool {
     val stream: *StreamEntry = stream_claim(driver);
     if (stream == nil) { ret false; }
     stream.generation = stream.generation + 1;
@@ -1826,7 +1935,7 @@ fun test_take_pair(driver: *Driver, stream_handle: *Stream, listener_handle: *Li
 }
 
 #[testing]
-fun test_free_pair(driver: *Driver, stream_handle: Stream, listener_handle: Listener) {
+fun free_pair(driver: *Driver, stream_handle: Stream, listener_handle: Listener) {
     stream_free(driver, stream_for(driver, stream_handle));
     listener_free(driver, listener_for(driver, listener_handle));
 }
@@ -1839,13 +1948,13 @@ test async_local__live_handles_survive_a_shrink_and_stale_handles_stay_refused {
     page.make(?pa);
     var runtime: io_runtime.Runtime;
     var driver:  Driver;
-    if (!ok_err(io_runtime.make(?runtime, ?pa, 4)) || !ok_err(make(?driver, ?runtime))) { ret 1; }
+    if (!ok_err(io_runtime.init(?runtime, ?pa, 4)) || !ok_err(init(?driver, ?runtime))) { ret 1; }
     mutex.lock(?driver.lock);
     var streams:   [65]Stream;
     var listeners: [65]Listener;
     var j:         usize = 0;
     for (j < 65) {
-        if (!test_take_pair(?driver, ?streams[j], ?listeners[j])) { ret 2; }
+        if (!take_pair(?driver, ?streams[j], ?listeners[j])) { ret 2; }
         j = j + 1;
     }
     val low_stream:   *StreamEntry   = stream_for(?driver, streams[0]);
@@ -1854,12 +1963,12 @@ test async_local__live_handles_survive_a_shrink_and_stale_handles_stay_refused {
     # the last pair pins the top chunks
     j = 1;
     for (j < 64) {
-        test_free_pair(?driver, streams[j], listeners[j]);
+        free_pair(?driver, streams[j], listeners[j]);
         j = j + 1;
     }
     trim_locked(?driver);
     if (driver.streams.chunk_count != chunks || driver.listeners.chunk_count != chunks) { ret 3; }
-    test_free_pair(?driver, streams[64], listeners[64]);
+    free_pair(?driver, streams[64], listeners[64]);
     trim_locked(?driver);
     # chunk 0 holds the low pair and chunk 1 stays as slack
     if (driver.streams.chunk_count != 2 || driver.listeners.chunk_count != 2)                                 { ret 4; }
@@ -1870,57 +1979,30 @@ test async_local__live_handles_survive_a_shrink_and_stale_handles_stay_refused {
     var fresh_listener: Listener;
     j = 1;
     for (j < 65) {
-        if (!test_take_pair(?driver, ?fresh_stream, ?fresh_listener)) { ret 7; }
+        if (!take_pair(?driver, ?fresh_stream, ?fresh_listener)) { ret 7; }
         j = j + 1;
     }
     if (streams[64].index::usize >= driver.streams.capacity || listeners[64].index::usize >= driver.listeners.capacity) { ret 8; }
     if (stream_for(?driver, streams[64]) != nil || listener_for(?driver, listeners[64]) != nil)                         { ret 9; }
     if (stream_for(?driver, streams[0]) != low_stream || listener_for(?driver, listeners[0]) != low_listener)           { ret 10; }
-    var i: usize = 0;
-    for (i < driver.streams.capacity) {
+    var i: usize = table.pool_touched_from(?driver.stream_pool, ?driver.streams, 0);
+    for (i != table.NO_INDEX) {
         stream_free(?driver, stream_at(?driver, i));
+        i = table.pool_touched_from(?driver.stream_pool, ?driver.streams, i + 1);
+    }
+    i = table.pool_touched_from(?driver.listener_pool, ?driver.listeners, 0);
+    for (i != table.NO_INDEX) {
         listener_free(?driver, listener_at(?driver, i));
-        i = i + 1;
+        i = table.pool_touched_from(?driver.listener_pool, ?driver.listeners, i + 1);
     }
     mutex.unlock(?driver.lock);
-    if (refused(destroy(?driver)) || !ok_bool(io_runtime.close(?runtime)) || !ok_err(io_runtime.destroy(?runtime))) { ret 11; }
+    if (refused(dnit(?driver)) || !ok_bool(io_runtime.close(?runtime)) || !ok_err(io_runtime.dnit(?runtime))) { ret 11; }
     ret 0;
 }
 
-$if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
+$if ($mach.build.sys == $mach.sys.linux || $mach.build.sys == $mach.sys.darwin) {
     #[testing]
-    fun test_endpoint() res[endpoint.Endpoint, io_error.Error] {
-        val prefix: *u8   = "/tmp/mach-std-async-local-502-";
-        var name:   [108]u8;
-        var length: usize = 0;
-        for (prefix[length] != 0) {
-            name[length] = prefix[length];
-            length       = length + 1;
-        }
-        var process: u64   = os.getpid()::u64;
-        var digits:  [20]u8;
-        var count:   usize = 0;
-        for (process != 0) {
-            digits[count] = '0' + (process % 10)::u8;
-            process       = process / 10;
-            count         = count + 1;
-        }
-        var i: usize = 0;
-        for (i < count) {
-            name[length] = digits[count - i - 1];
-            length       = length + 1;
-            i            = i + 1;
-        }
-        name[length]     = '.';
-        name[length + 1] = 's';
-        name[length + 2] = 'o';
-        name[length + 3] = 'c';
-        name[length + 4] = 'k';
-        ret endpoint.filesystem_bytes(?name[0], length + 5);
-    }
-
-    #[testing]
-    fun test_endpoint_absent(value: endpoint.Endpoint) bool {
+    fun endpoint_absent(value: endpoint.Endpoint) bool {
         var path: [108]u8;
         var i:    usize = 0;
         for (i < value.length) {
@@ -1933,7 +2015,7 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
     }
 
     #[testing]
-    fun test_endpoint_remove(value: endpoint.Endpoint) bool {
+    fun endpoint_remove(value: endpoint.Endpoint) bool {
         var path: [108]u8;
         var i:    usize = 0;
         for (i < value.length) {
@@ -1947,73 +2029,75 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
     test async_local__listener_stream_cancellation_half_close_and_cleanup {
         var pa: allocator.Allocator;
         page.make(?pa);
-        val endpoint_result: res[endpoint.Endpoint, io_error.Error] = test_endpoint();
-        if (sel endpoint_result.err) { ret 1; }
-        val bound:   endpoint.Endpoint = endpoint_result.ok;
+        var scratch: os.Scratch;
+        if (os.scratch_make(?scratch) < 0) { ret 90; }
+        fin { fs.scratch_remove(?scratch); }
+        var scratch_path: os.ScratchPath;
+        val res_endpoint: res[endpoint.Endpoint, io_error.Error] = endpoint.scratch_endpoint(?scratch, "local.sock", ?scratch_path);
+        if (sel res_endpoint.err) { ret 1; }
+        val bound:   endpoint.Endpoint = res_endpoint.ok;
         var runtime: io_runtime.Runtime;
-        if (!ok_err(io_runtime.make(?runtime, ?pa, 8))) { ret 2; }
-        var driver:      Driver;
-        val make_result: err[io_error.Error] = make(?driver, ?runtime);
-        if (sel make_result.err) {
+        if (!ok_err(io_runtime.init(?runtime, ?pa, 8))) { ret 2; }
+        var driver:   Driver;
+        val err_make: err[io_error.Error] = init(?driver, ?runtime);
+        if (sel err_make.err) {
             io_runtime.close(?runtime);
-            io_runtime.destroy(?runtime);
+            io_runtime.dnit(?runtime);
             ret 3;
         }
         var bind_options: types.BindOptions = local.default_bind_options();
         bind_options.stale = types.REMOVE_STALE_SOCKET;
         var setup_scope: cancel.Scope;
         if (!scope_ok(cancel.make_root(?setup_scope, opt[time.Instant].none{}))) { ret 4; }
-        val submit_bind_result: res[io_runtime.Token, io_error.Error] = submit_bind(?driver, ?setup_scope, bound, bind_options, 99);
-        if (sel submit_bind_result.err) { ret 4; }
-        var output:     [8]io_runtime.Completion;
-        var setup_wait: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, 1000);
-        if (!(sel setup_wait.ok && setup_wait.ok == 1)) { ret 4; }
-        val listener_result: res[Listener, io_error.Error] = bound_listener(?driver, output[0]);
-        if (sel listener_result.err) { ret 4; }
-        var listener:             Listener                              = listener_result.ok;
-        val submit_listen_result: res[io_runtime.Token, io_error.Error] = submit_listen(?driver, ?setup_scope, ?listener, 128, 100);
-        if (sel submit_listen_result.err) { ret 4; }
-        setup_wait = wait(?driver, ?output[0], 8, 1000);
-        if (!(sel setup_wait.ok && setup_wait.ok == 1)
+        val res_submit_bind: res[io_runtime.Token, io_error.Error] = submit_bind(?driver, ?setup_scope, bound, bind_options, 99);
+        if (sel res_submit_bind.err) { ret 4; }
+        var output:         [8]io_runtime.Completion;
+        var res_setup_wait: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, -1);
+        if (!(sel res_setup_wait.ok && res_setup_wait.ok == 1)) { ret 4; }
+        val res_listener: res[Listener, io_error.Error] = bound_listener(?driver, output[0]);
+        if (sel res_listener.err) { ret 4; }
+        var listener:          Listener                              = res_listener.ok;
+        val res_submit_listen: res[io_runtime.Token, io_error.Error] = submit_listen(?driver, ?setup_scope, ?listener, 128, 100);
+        if (sel res_submit_listen.err) { ret 4; }
+        res_setup_wait = wait(?driver, ?output[0], 8, -1);
+        if (!(sel res_setup_wait.ok && res_setup_wait.ok == 1)
             || refused(listening(?driver, output[0]))
-            || !scope_ok(cancel.destroy(?setup_scope))) {
+            || !scope_ok(cancel.dnit(?setup_scope))) {
             ret 4;
         }
 
         var connection_scope: cancel.Scope;
         if (!scope_ok(cancel.make_root(?connection_scope, opt[time.Instant].none{}))) { ret 5; }
-        val accept_token:  res[io_runtime.Token, io_error.Error] = submit_accept(?driver, ?connection_scope, ?listener, 101);
-        val connect_token: res[io_runtime.Token, io_error.Error] = submit_connect(?driver, ?connection_scope, bound, 102);
-        if (sel accept_token.err)  { ret 6; }
-        if (sel connect_token.err) { ret 6; }
+        val res_accept_token:  res[io_runtime.Token, io_error.Error] = submit_accept(?driver, ?connection_scope, ?listener, 101);
+        val res_connect_token: res[io_runtime.Token, io_error.Error] = submit_connect(?driver, ?connection_scope, bound, 102);
+        if (sel res_accept_token.err)  { ret 6; }
+        if (sel res_connect_token.err) { ret 6; }
         var server:      Stream;
         var client:      Stream;
-        var saw_accept:  bool  = false;
-        var saw_connect: bool  = false;
-        var rounds:      usize = 0;
-        for ((!saw_accept || !saw_connect) && rounds < 8) {
-            val waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, 1000);
-            if (sel waited.err) { ret 7; }
-            val available: usize = waited.ok;
+        var saw_accept:  bool = false;
+        var saw_connect: bool = false;
+        for (!saw_accept || !saw_connect) {
+            val res_waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, -1);
+            if (sel res_waited.err) { ret 7; }
+            val available: usize = res_waited.ok;
             var i:         usize = 0;
             for (i < available) {
                 if (output[i].context == 101) {
-                    val made: res[Stream, io_error.Error] = accepted(?driver, output[i]);
-                    if (sel made.err) { ret 8; }
-                    server     = made.ok;
+                    val res_made: res[Stream, io_error.Error] = accepted(?driver, output[i]);
+                    if (sel res_made.err) { ret 8; }
+                    server     = res_made.ok;
                     saw_accept = true;
                 }
                 or (output[i].context == 102) {
-                    val made: res[Stream, io_error.Error] = connected(?driver, output[i]);
-                    if (sel made.err) { ret 9; }
-                    client      = made.ok;
+                    val res_made: res[Stream, io_error.Error] = connected(?driver, output[i]);
+                    if (sel res_made.err) { ret 9; }
+                    client      = res_made.ok;
                     saw_connect = true;
                 }
                 i = i + 1;
             }
-            rounds = rounds + 1;
         }
-        if (!saw_accept || !saw_connect || !scope_ok(cancel.destroy(?connection_scope))) { ret 10; }
+        if (!scope_ok(cancel.dnit(?connection_scope))) { ret 10; }
 
         var transfer_scope: cancel.Scope;
         if (!scope_ok(cancel.make_root(?transfer_scope, opt[time.Instant].none{}))) { ret 11; }
@@ -2023,17 +2107,16 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
         payload[1] = 'o';
         payload[2] = 'c';
         payload[3] = 'l';
-        val read_token:  res[io_runtime.Token, io_error.Error] = submit_read(?driver, ?transfer_scope, ?server, ?input[0], 4, 103);
-        val write_token: res[io_runtime.Token, io_error.Error] = submit_write(?driver, ?transfer_scope, ?client, ?payload[0], 4, 104);
-        if (sel read_token.err)  { ret 12; }
-        if (sel write_token.err) { ret 12; }
+        val res_read_token:  res[io_runtime.Token, io_error.Error] = submit_read(?driver, ?transfer_scope, ?server, ?input[0], 4, 103);
+        val res_write_token: res[io_runtime.Token, io_error.Error] = submit_write(?driver, ?transfer_scope, ?client, ?payload[0], 4, 104);
+        if (sel res_read_token.err)  { ret 12; }
+        if (sel res_write_token.err) { ret 12; }
         var saw_read:  bool = false;
         var saw_write: bool = false;
-        rounds = 0;
-        for ((!saw_read || !saw_write) && rounds < 8) {
-            val waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, 1000);
-            if (sel waited.err) { ret 13; }
-            val available: usize = waited.ok;
+        for (!saw_read || !saw_write) {
+            val res_waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, -1);
+            if (sel res_waited.err) { ret 13; }
+            val available: usize = res_waited.ok;
             var i:         usize = 0;
             for (i < available) {
                 if (output[i].has_error) { ret 14; }
@@ -2047,9 +2130,8 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
                 }
                 i = i + 1;
             }
-            rounds = rounds + 1;
         }
-        if (!saw_read || !saw_write || input[0] != 'l' || input[1] != 'o' || input[2] != 'c' || input[3] != 'l') { ret 17; }
+        if (input[0] != 'l' || input[1] != 'o' || input[2] != 'c' || input[3] != 'l') { ret 17; }
         payload[0] = 'b';
         payload[1] = 'a';
         payload[2] = 'c';
@@ -2060,11 +2142,10 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
         }
         saw_read  = false;
         saw_write = false;
-        rounds    = 0;
-        for ((!saw_read || !saw_write) && rounds < 8) {
-            val waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, 1000);
-            if (sel waited.err) { ret 19; }
-            val available: usize = waited.ok;
+        for (!saw_read || !saw_write) {
+            val res_waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, -1);
+            if (sel res_waited.err) { ret 19; }
+            val available: usize = res_waited.ok;
             var i:         usize = 0;
             for (i < available) {
                 if (output[i].has_error || output[i].bytes != 4) { ret 20; }
@@ -2072,73 +2153,68 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
                 if (output[i].context == 112)                    { saw_write = true; }
                 i = i + 1;
             }
-            rounds = rounds + 1;
         }
-        if (!saw_read || !saw_write || input[0] != 'b' || input[1] != 'a' || input[2] != 'c' || input[3] != 'k'
-            || !scope_ok(cancel.destroy(?transfer_scope))) {
+        if (input[0] != 'b' || input[1] != 'a' || input[2] != 'c' || input[3] != 'k'
+            || !scope_ok(cancel.dnit(?transfer_scope))) {
             ret 21;
         }
 
         var cancellation_scope: cancel.Scope;
         if (!scope_ok(cancel.make_root(?cancellation_scope, opt[time.Instant].none{}))) { ret 22; }
-        val pending_accept: res[io_runtime.Token, io_error.Error] = submit_accept(?driver, ?cancellation_scope, ?listener, 105);
-        if (sel pending_accept.err)                             { ret 19; }
+        val res_pending_accept: res[io_runtime.Token, io_error.Error] = submit_accept(?driver, ?cancellation_scope, ?listener, 105);
+        if (sel res_pending_accept.err)                         { ret 19; }
         if (!scope_changed(cancel.cancel(?cancellation_scope))) { ret 19; }
-        val cancelled_wait: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, 1000);
-        if (!(sel cancelled_wait.ok && cancelled_wait.ok == 1)
+        val res_cancelled_wait: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, -1);
+        if (!(sel res_cancelled_wait.ok && res_cancelled_wait.ok == 1)
             || output[0].context != 105
             || !output[0].has_error
             || output[0].error.kind != io_error.CANCELLED
-            || !scope_ok(cancel.destroy(?cancellation_scope))) {
+            || !scope_ok(cancel.dnit(?cancellation_scope))) {
             ret 20;
         }
 
+        # the deadline is far off and expired explicitly, so it cannot pass
+        # before the accept is submitted
         var deadline_scope: cancel.Scope;
-        val started:        time.InstantClock = time.instant();
-        if (sel started.err) { ret 21; }
-        val deadline: time.Instant = time.instant_add(started.ok, 1000000);
+        val res_started:    time.InstantClock = time.instant();
+        if (sel res_started.err) { ret 21; }
+        val deadline: time.Instant = time.Instant{sec: res_started.ok.sec + 3600, nsec: res_started.ok.nsec};
         if (!scope_ok(cancel.make_root(?deadline_scope, opt[time.Instant].some{deadline}))
-            || failed[io_runtime.Token](submit_accept(?driver, ?deadline_scope, ?listener, 113))) {
+            || failed[io_runtime.Token](submit_accept(?driver, ?deadline_scope, ?listener, 113))
+            || !scope_changed(cancel.expire(?deadline_scope, deadline))) {
             ret 21;
         }
-        var deadline_wait:   res[usize, io_error.Error];
-        var deadline_count:  usize = 0;
-        var deadline_rounds: usize = 0;
-        for (deadline_count == 0 && deadline_rounds < 8) {
-            deadline_wait = wait(?driver, ?output[0], 8, 1000);
-            if (sel deadline_wait.err) { ret 22; }
-            deadline_count  = deadline_wait.ok;
-            deadline_rounds = deadline_rounds + 1;
-        }
-        if (deadline_count != 1)                        { ret 23; }
-        if (output[0].context != 113)                   { ret 24; }
-        if (!output[0].has_error)                       { ret 25; }
-        if (output[0].error.kind != io_error.TIMEOUT)   { ret 26; }
-        if (!scope_ok(cancel.destroy(?deadline_scope))) { ret 27; }
+        val res_deadline_wait: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, -1);
+        if (sel res_deadline_wait.err)                { ret 22; }
+        if (res_deadline_wait.ok != 1)                { ret 23; }
+        if (output[0].context != 113)                 { ret 24; }
+        if (!output[0].has_error)                     { ret 25; }
+        if (output[0].error.kind != io_error.TIMEOUT) { ret 26; }
+        if (!scope_ok(cancel.dnit(?deadline_scope)))  { ret 27; }
 
         var shutdown_scope: cancel.Scope;
         if (!scope_ok(cancel.make_root(?shutdown_scope, opt[time.Instant].none{}))) { ret 21; }
-        val submit_stream_close_result: res[io_runtime.Token, io_error.Error] = submit_stream_close(?driver, ?shutdown_scope, ?client, lifecycle.GRACEFUL, 106);
-        if (sel submit_stream_close_result.err) { ret 22; }
-        val shutdown_wait: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, 1000);
-        if (!(sel shutdown_wait.ok && shutdown_wait.ok == 1)
+        val res_submit_stream_close: res[io_runtime.Token, io_error.Error] = submit_stream_close(?driver, ?shutdown_scope, ?client, lifecycle.GRACEFUL, 106);
+        if (sel res_submit_stream_close.err) { ret 22; }
+        val res_shutdown_wait: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, -1);
+        if (!(sel res_shutdown_wait.ok && res_shutdown_wait.ok == 1)
             || output[0].context != 106
             || output[0].kind != io_runtime.SHUTDOWN
             || output[0].has_error
-            || !scope_ok(cancel.destroy(?shutdown_scope))) {
+            || !scope_ok(cancel.dnit(?shutdown_scope))) {
             ret 23;
         }
 
         var eof_scope: cancel.Scope;
         if (!scope_ok(cancel.make_root(?eof_scope, opt[time.Instant].none{}))) { ret 24; }
-        val submit_read_result: res[io_runtime.Token, io_error.Error] = submit_read(?driver, ?eof_scope, ?server, ?input[0], 4, 107);
-        if (sel submit_read_result.err) { ret 25; }
-        val eof_wait: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, 1000);
-        if (!(sel eof_wait.ok && eof_wait.ok == 1)
+        val res_submit_read: res[io_runtime.Token, io_error.Error] = submit_read(?driver, ?eof_scope, ?server, ?input[0], 4, 107);
+        if (sel res_submit_read.err) { ret 25; }
+        val res_eof_wait: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, -1);
+        if (!(sel res_eof_wait.ok && res_eof_wait.ok == 1)
             || output[0].context != 107
             || output[0].has_error
             || !output[0].end_of_stream
-            || !scope_ok(cancel.destroy(?eof_scope))) {
+            || !scope_ok(cancel.dnit(?eof_scope))) {
             ret 26;
         }
 
@@ -2150,24 +2226,22 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
             ret 28;
         }
         var closed: usize = 0;
-        rounds = 0;
-        for (closed < 3 && rounds < 8) {
-            val waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, 1000);
-            if (sel waited.err) { ret 29; }
-            val available: usize = waited.ok;
+        for (closed < 3) {
+            val res_waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, -1);
+            if (sel res_waited.err) { ret 29; }
+            val available: usize = res_waited.ok;
             var i:         usize = 0;
             for (i < available) {
                 if (output[i].has_error || output[i].kind != io_runtime.CLOSE) { ret 30; }
                 closed = closed + 1;
                 i      = i + 1;
             }
-            rounds = rounds + 1;
         }
-        if (closed != 3 || !scope_ok(cancel.destroy(?close_scope)) || !test_endpoint_absent(bound)) { ret 31; }
-        val destroy_result: err[io_error.Error] = destroy(?driver);
-        if (sel destroy_result.err)                { ret 32; }
-        if (!ok_bool(io_runtime.close(?runtime)))  { ret 33; }
-        if (!ok_err(io_runtime.destroy(?runtime))) { ret 34; }
+        if (closed != 3 || !scope_ok(cancel.dnit(?close_scope)) || !endpoint_absent(bound)) { ret 31; }
+        val err_destroy: err[io_error.Error] = dnit(?driver);
+        if (sel err_destroy.err)                  { ret 32; }
+        if (!ok_bool(io_runtime.close(?runtime))) { ret 33; }
+        if (!ok_err(io_runtime.dnit(?runtime)))   { ret 34; }
         ret 0;
     }
 
@@ -2178,57 +2252,61 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
     test async_local__a_cancelled_accept_hands_over_the_stream_it_already_took {
         var pa: allocator.Allocator;
         page.make(?pa);
-        val endpoint_result: res[endpoint.Endpoint, io_error.Error] = test_endpoint();
-        if (sel endpoint_result.err) { ret 1; }
-        var bound: endpoint.Endpoint = endpoint_result.ok;
+        var scratch: os.Scratch;
+        if (os.scratch_make(?scratch) < 0) { ret 90; }
+        fin { fs.scratch_remove(?scratch); }
+        var scratch_path: os.ScratchPath;
+        val res_endpoint: res[endpoint.Endpoint, io_error.Error] = endpoint.scratch_endpoint(?scratch, "local.sock", ?scratch_path);
+        if (sel res_endpoint.err) { ret 1; }
+        var bound: endpoint.Endpoint = res_endpoint.ok;
         bound.name[bound.length - 1] = 'a';
         var runtime: io_runtime.Runtime;
-        if (!ok_err(io_runtime.make(?runtime, ?pa, 8))) { ret 2; }
+        if (!ok_err(io_runtime.init(?runtime, ?pa, 8))) { ret 2; }
         var driver: Driver;
-        if (refused(make(?driver, ?runtime))) { ret 3; }
+        if (refused(init(?driver, ?runtime))) { ret 3; }
         var scope: cancel.Scope;
         if (!scope_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 4; }
         var options: types.BindOptions = local.default_bind_options();
         options.stale = types.REMOVE_STALE_SOCKET;
         var output: [8]io_runtime.Completion;
         if (failed[io_runtime.Token](submit_bind(?driver, ?scope, bound, options, 301))) { ret 5; }
-        var waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, 1000);
-        if (!(sel waited.ok && waited.ok == 1)) { ret 5; }
-        val listener_result: res[Listener, io_error.Error] = bound_listener(?driver, output[0]);
-        if (sel listener_result.err) { ret 5; }
-        var listener: Listener = listener_result.ok;
+        var res_waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 8, -1);
+        if (!(sel res_waited.ok && res_waited.ok == 1)) { ret 5; }
+        val res_listener: res[Listener, io_error.Error] = bound_listener(?driver, output[0]);
+        if (sel res_listener.err) { ret 5; }
+        var listener: Listener = res_listener.ok;
         if (failed[io_runtime.Token](submit_listen(?driver, ?scope, ?listener, 16, 302))) { ret 6; }
-        waited = wait(?driver, ?output[0], 8, 1000);
-        if (!(sel waited.ok && waited.ok == 1) || refused(listening(?driver, output[0]))) { ret 6; }
+        res_waited = wait(?driver, ?output[0], 8, -1);
+        if (!(sel res_waited.ok && res_waited.ok == 1) || refused(listening(?driver, output[0]))) { ret 6; }
         # the client connects first, so the connection waits in the backlog
         if (failed[io_runtime.Token](submit_connect(?driver, ?scope, bound, 303))) { ret 7; }
-        waited = wait(?driver, ?output[0], 8, 1000);
-        if (!(sel waited.ok && waited.ok == 1) || output[0].context != 303) { ret 7; }
-        val client_result: res[Stream, io_error.Error] = connected(?driver, output[0]);
-        if (sel client_result.err) { ret 7; }
-        var client: Stream = client_result.ok;
+        res_waited = wait(?driver, ?output[0], 8, -1);
+        if (!(sel res_waited.ok && res_waited.ok == 1) || output[0].context != 303) { ret 7; }
+        val res_client: res[Stream, io_error.Error] = connected(?driver, output[0]);
+        if (sel res_client.err) { ret 7; }
+        var client: Stream = res_client.ok;
         var child:  cancel.Scope;
         if (!scope_ok(cancel.make_child(?child, ?scope, opt[time.Instant].none{})))   { ret 8; }
         if (failed[io_runtime.Token](submit_accept(?driver, ?child, ?listener, 304))) { ret 8; }
         if (!scope_changed(cancel.cancel(?child)))                                    { ret 8; }
-        waited = wait(?driver, ?output[0], 8, 1000);
-        if (!(sel waited.ok && waited.ok == 1) || output[0].context != 304
+        res_waited = wait(?driver, ?output[0], 8, -1);
+        if (!(sel res_waited.ok && res_waited.ok == 1) || output[0].context != 304
             || !output[0].has_error || output[0].error.kind != io_error.CANCELLED) {
             ret 9;
         }
-        if (!scope_ok(cancel.destroy(?child))) { ret 10; }
-        var server: Stream;
-        val handed: res[Stream, io_error.Error] = accepted(?driver, output[0]);
-        if (sel handed.ok) {
-            server = handed.ok;
+        if (!scope_ok(cancel.dnit(?child))) { ret 10; }
+        var server:     Stream;
+        val res_handed: res[Stream, io_error.Error] = accepted(?driver, output[0]);
+        if (sel res_handed.ok) {
+            server = res_handed.ok;
         }
         or {
             if (failed[io_runtime.Token](submit_accept(?driver, ?scope, ?listener, 305))) { ret 11; }
-            waited = wait(?driver, ?output[0], 8, 1000);
-            if (!(sel waited.ok && waited.ok == 1) || output[0].context != 305) { ret 12; }
-            val taken: res[Stream, io_error.Error] = accepted(?driver, output[0]);
-            if (sel taken.err) { ret 13; }
-            server = taken.ok;
+            res_waited = wait(?driver, ?output[0], 8, -1);
+            if (!(sel res_waited.ok && res_waited.ok == 1) || output[0].context != 305) { ret 12; }
+            val res_taken: res[Stream, io_error.Error] = accepted(?driver, output[0]);
+            if (sel res_taken.err) { ret 13; }
+            server = res_taken.ok;
         }
         # the stream is live: what the client writes reaches the server
         var payload: [1]u8 = [1]u8{'k'};
@@ -2237,18 +2315,16 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
             || failed[io_runtime.Token](submit_read(?driver, ?scope, ?server, ?input[0], 1, 307))) {
             ret 14;
         }
-        var moved:  usize = 0;
-        var rounds: usize = 0;
-        for (moved < 2 && rounds < 8) {
-            waited = wait(?driver, ?output[0], 8, 1000);
-            if (sel waited.err) { ret 15; }
+        var moved: usize = 0;
+        for (moved < 2) {
+            res_waited = wait(?driver, ?output[0], 8, -1);
+            if (sel res_waited.err) { ret 15; }
             var i: usize = 0;
-            for (i < waited.ok) {
+            for (i < res_waited.ok) {
                 if (output[i].has_error || output[i].bytes != 1) { ret 16; }
                 moved = moved + 1;
                 i     = i + 1;
             }
-            rounds = rounds + 1;
         }
         if (moved != 2 || input[0] != 'k') { ret 17; }
         if (failed[io_runtime.Token](submit_stream_close(?driver, ?scope, ?client, lifecycle.ABORTIVE, 308))
@@ -2257,276 +2333,268 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
             ret 18;
         }
         var closed: usize = 0;
-        rounds = 0;
-        for (closed < 3 && rounds < 8) {
-            waited = wait(?driver, ?output[0], 8, 1000);
-            if (sel waited.err) { ret 19; }
-            closed = closed + waited.ok;
-            rounds = rounds + 1;
+        for (closed < 3) {
+            res_waited = wait(?driver, ?output[0], 8, -1);
+            if (sel res_waited.err) { ret 19; }
+            closed = closed + res_waited.ok;
         }
-        if (closed != 3 || !scope_ok(cancel.destroy(?scope)) || refused(destroy(?driver))) { ret 20; }
-        if (!ok_bool(io_runtime.close(?runtime)) || !ok_err(io_runtime.destroy(?runtime))) { ret 21; }
+        if (closed != 3 || !scope_ok(cancel.dnit(?scope)) || refused(dnit(?driver)))    { ret 20; }
+        if (!ok_bool(io_runtime.close(?runtime)) || !ok_err(io_runtime.dnit(?runtime))) { ret 21; }
         ret 0;
     }
 
     test async_local__queued_bind_and_listen_success_stay_valid_through_runtime_close {
         var pa: allocator.Allocator;
         page.make(?pa);
-        val endpoint_result: res[endpoint.Endpoint, io_error.Error] = test_endpoint();
-        if (sel endpoint_result.err) { ret 1; }
-        var first: endpoint.Endpoint = endpoint_result.ok;
+        var scratch: os.Scratch;
+        if (os.scratch_make(?scratch) < 0) { ret 90; }
+        fin { fs.scratch_remove(?scratch); }
+        var scratch_path: os.ScratchPath;
+        val res_endpoint: res[endpoint.Endpoint, io_error.Error] = endpoint.scratch_endpoint(?scratch, "local.sock", ?scratch_path);
+        if (sel res_endpoint.err) { ret 1; }
+        var first: endpoint.Endpoint = res_endpoint.ok;
         first.name[first.length - 1] = 'b';
         var runtime: io_runtime.Runtime;
-        if (!ok_err(io_runtime.make(?runtime, ?pa, 4))) { ret 2; }
-        var driver:      Driver;
-        val make_result: err[io_error.Error] = make(?driver, ?runtime);
-        if (sel make_result.err) { ret 3; }
+        if (!ok_err(io_runtime.init(?runtime, ?pa, 4))) { ret 2; }
+        var driver:   Driver;
+        val err_make: err[io_error.Error] = init(?driver, ?runtime);
+        if (sel err_make.err) { ret 3; }
         var scope: cancel.Scope;
         if (!scope_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 4; }
         var options: types.BindOptions = local.default_bind_options();
         options.stale = types.REMOVE_STALE_SOCKET;
-        val submit_bind_result: res[io_runtime.Token, io_error.Error] = submit_bind(?driver, ?scope, first, options, 201);
-        if (sel submit_bind_result.err)           { ret 5; }
+        val res_submit_bind: res[io_runtime.Token, io_error.Error] = submit_bind(?driver, ?scope, first, options, 201);
+        if (sel res_submit_bind.err)              { ret 5; }
         if (!ok_bool(io_runtime.close(?runtime))) { ret 6; }
-        var output: [4]io_runtime.Completion;
-        val waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 4, 1000);
-        if (!(sel waited.ok && waited.ok == 1)
+        var output:     [4]io_runtime.Completion;
+        val res_waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 4, -1);
+        if (!(sel res_waited.ok && res_waited.ok == 1)
             || output[0].has_error
             || output[0].kind != io_runtime.BIND
             || failed[Listener](bound_listener(?driver, output[0]))) {
             ret 7;
         }
-        if (!scope_ok(cancel.destroy(?scope)) || refused(destroy(?driver)) || !test_endpoint_absent(first))   { ret 8; }
-        if (io_runtime.snapshot(?runtime).state != lifecycle.CLOSED || !ok_err(io_runtime.destroy(?runtime))) { ret 9; }
+        if (!scope_ok(cancel.dnit(?scope)) || refused(dnit(?driver)) || !endpoint_absent(first))           { ret 8; }
+        if (io_runtime.snapshot(?runtime).state != lifecycle.CLOSED || !ok_err(io_runtime.dnit(?runtime))) { ret 9; }
 
-        var second: endpoint.Endpoint = endpoint_result.ok;
+        var second: endpoint.Endpoint = res_endpoint.ok;
         second.name[second.length - 1] = 'l';
-        if (!ok_err(io_runtime.make(?runtime, ?pa, 4))) { ret 10; }
-        val make_result2: err[io_error.Error] = make(?driver, ?runtime);
-        if (sel make_result2.err)                                          { ret 11; }
+        if (!ok_err(io_runtime.init(?runtime, ?pa, 4))) { ret 10; }
+        val err_make_result2: err[io_error.Error] = init(?driver, ?runtime);
+        if (sel err_make_result2.err)                                      { ret 11; }
         if (!scope_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 12; }
-        val submit_bind_result2: res[io_runtime.Token, io_error.Error] = submit_bind(?driver, ?scope, second, options, 202);
-        if (sel submit_bind_result2.err) { ret 13; }
-        var setup: res[usize, io_error.Error] = wait(?driver, ?output[0], 4, 1000);
-        if (!(sel setup.ok && setup.ok == 1)) { ret 14; }
-        val listener_result: res[Listener, io_error.Error] = bound_listener(?driver, output[0]);
-        if (sel listener_result.err) { ret 15; }
-        var listener:             Listener                              = listener_result.ok;
-        val submit_listen_result: res[io_runtime.Token, io_error.Error] = submit_listen(?driver, ?scope, ?listener, 8, 203);
-        if (sel submit_listen_result.err)         { ret 16; }
+        val res_submit_bind_result2: res[io_runtime.Token, io_error.Error] = submit_bind(?driver, ?scope, second, options, 202);
+        if (sel res_submit_bind_result2.err) { ret 13; }
+        var res_setup: res[usize, io_error.Error] = wait(?driver, ?output[0], 4, -1);
+        if (!(sel res_setup.ok && res_setup.ok == 1)) { ret 14; }
+        val res_listener: res[Listener, io_error.Error] = bound_listener(?driver, output[0]);
+        if (sel res_listener.err) { ret 15; }
+        var listener:          Listener                              = res_listener.ok;
+        val res_submit_listen: res[io_runtime.Token, io_error.Error] = submit_listen(?driver, ?scope, ?listener, 8, 203);
+        if (sel res_submit_listen.err)            { ret 16; }
         if (!ok_bool(io_runtime.close(?runtime))) { ret 17; }
-        setup = wait(?driver, ?output[0], 4, 1000);
-        if (!(sel setup.ok && setup.ok == 1)
+        res_setup = wait(?driver, ?output[0], 4, -1);
+        if (!(sel res_setup.ok && res_setup.ok == 1)
             || output[0].has_error
             || output[0].kind != io_runtime.LISTEN
             || refused(listening(?driver, output[0]))) {
             ret 18;
         }
-        if (!scope_ok(cancel.destroy(?scope)) || refused(destroy(?driver)) || !test_endpoint_absent(second))  { ret 19; }
-        if (io_runtime.snapshot(?runtime).state != lifecycle.CLOSED || !ok_err(io_runtime.destroy(?runtime))) { ret 20; }
+        if (!scope_ok(cancel.dnit(?scope)) || refused(dnit(?driver)) || !endpoint_absent(second))          { ret 19; }
+        if (io_runtime.snapshot(?runtime).state != lifecycle.CLOSED || !ok_err(io_runtime.dnit(?runtime))) { ret 20; }
         ret 0;
     }
 
     test async_local__stale_listener_tokens_do_not_survive_driver_recreation {
         var pa: allocator.Allocator;
         page.make(?pa);
-        val endpoint_result: res[endpoint.Endpoint, io_error.Error] = test_endpoint();
-        if (sel endpoint_result.err) { ret 1; }
-        var bound: endpoint.Endpoint = endpoint_result.ok;
+        var scratch: os.Scratch;
+        if (os.scratch_make(?scratch) < 0) { ret 90; }
+        fin { fs.scratch_remove(?scratch); }
+        var scratch_path: os.ScratchPath;
+        val res_endpoint: res[endpoint.Endpoint, io_error.Error] = endpoint.scratch_endpoint(?scratch, "local.sock", ?scratch_path);
+        if (sel res_endpoint.err) { ret 1; }
+        var bound: endpoint.Endpoint = res_endpoint.ok;
         bound.name[bound.length - 1] = 'a';
         var runtime: io_runtime.Runtime;
-        if (!ok_err(io_runtime.make(?runtime, ?pa, 4))) { ret 2; }
-        var driver:      Driver;
-        val make_result: err[io_error.Error] = make(?driver, ?runtime);
-        if (sel make_result.err) { ret 3; }
+        if (!ok_err(io_runtime.init(?runtime, ?pa, 4))) { ret 2; }
+        var driver:   Driver;
+        val err_make: err[io_error.Error] = init(?driver, ?runtime);
+        if (sel err_make.err) { ret 3; }
         var scope: cancel.Scope;
         if (!scope_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 4; }
         var options: types.BindOptions = local.default_bind_options();
         options.stale = types.REMOVE_STALE_SOCKET;
-        val submit_bind_result: res[io_runtime.Token, io_error.Error] = submit_bind(?driver, ?scope, bound, options, 301);
-        if (sel submit_bind_result.err) { ret 5; }
-        var output: [4]io_runtime.Completion;
-        var waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 4, 1000);
-        if (!(sel waited.ok && waited.ok == 1)) { ret 6; }
-        val first_result: res[Listener, io_error.Error] = bound_listener(?driver, output[0]);
-        if (sel first_result.err) { ret 7; }
-        var first:                        Listener                              = first_result.ok;
-        val stale:                        Listener                              = first;
-        val submit_listener_close_result: res[io_runtime.Token, io_error.Error] = submit_listener_close(?driver, ?scope, ?first, 302);
-        if (sel submit_listener_close_result.err) { ret 8; }
-        waited = wait(?driver, ?output[0], 4, 1000);
-        if (!(sel waited.ok && waited.ok == 1)
+        val res_submit_bind: res[io_runtime.Token, io_error.Error] = submit_bind(?driver, ?scope, bound, options, 301);
+        if (sel res_submit_bind.err) { ret 5; }
+        var output:     [4]io_runtime.Completion;
+        var res_waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 4, -1);
+        if (!(sel res_waited.ok && res_waited.ok == 1)) { ret 6; }
+        val res_first: res[Listener, io_error.Error] = bound_listener(?driver, output[0]);
+        if (sel res_first.err) { ret 7; }
+        var first:                     Listener                              = res_first.ok;
+        val stale:                     Listener                              = first;
+        val res_submit_listener_close: res[io_runtime.Token, io_error.Error] = submit_listener_close(?driver, ?scope, ?first, 302);
+        if (sel res_submit_listener_close.err) { ret 8; }
+        res_waited = wait(?driver, ?output[0], 4, -1);
+        if (!(sel res_waited.ok && res_waited.ok == 1)
             || output[0].has_error
-            || !scope_ok(cancel.destroy(?scope))
-            || refused(destroy(?driver))
+            || !scope_ok(cancel.dnit(?scope))
+            || refused(dnit(?driver))
             || !ok_bool(io_runtime.close(?runtime))
-            || !ok_err(io_runtime.destroy(?runtime))) {
+            || !ok_err(io_runtime.dnit(?runtime))) {
             ret 9;
         }
 
-        if (!ok_err(io_runtime.make(?runtime, ?pa, 4))) { ret 10; }
-        val make_result2: err[io_error.Error] = make(?driver, ?runtime);
-        if (sel make_result2.err)                                          { ret 11; }
+        if (!ok_err(io_runtime.init(?runtime, ?pa, 4))) { ret 10; }
+        val err_make_result2: err[io_error.Error] = init(?driver, ?runtime);
+        if (sel err_make_result2.err)                                      { ret 11; }
         if (!scope_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 12; }
-        val submit_bind_result2: res[io_runtime.Token, io_error.Error] = submit_bind(?driver, ?scope, bound, options, 303);
-        if (sel submit_bind_result2.err) { ret 13; }
-        waited = wait(?driver, ?output[0], 4, 1000);
-        if (!(sel waited.ok && waited.ok == 1)) { ret 14; }
-        val second_result: res[Listener, io_error.Error] = bound_listener(?driver, output[0]);
-        if (sel second_result.err) { ret 15; }
-        var second:   Listener                              = second_result.ok;
-        val rejected: res[io_runtime.Token, io_error.Error] = submit_listen(?driver, ?scope, ?stale, 8, 304);
-        if (!(sel rejected.err && rejected.err.kind == io_error.CLOSED)
+        val res_submit_bind_result2: res[io_runtime.Token, io_error.Error] = submit_bind(?driver, ?scope, bound, options, 303);
+        if (sel res_submit_bind_result2.err) { ret 13; }
+        res_waited = wait(?driver, ?output[0], 4, -1);
+        if (!(sel res_waited.ok && res_waited.ok == 1)) { ret 14; }
+        val res_second: res[Listener, io_error.Error] = bound_listener(?driver, output[0]);
+        if (sel res_second.err) { ret 15; }
+        var second:       Listener                              = res_second.ok;
+        val res_rejected: res[io_runtime.Token, io_error.Error] = submit_listen(?driver, ?scope, ?stale, 8, 304);
+        if (!(sel res_rejected.err && res_rejected.err.kind == io_error.CLOSED)
             || failed[io_runtime.Token](submit_listener_close(?driver, ?scope, ?second, 305))) {
             ret 16;
         }
-        waited = wait(?driver, ?output[0], 4, 1000);
-        if (!(sel waited.ok && waited.ok == 1)
+        res_waited = wait(?driver, ?output[0], 4, -1);
+        if (!(sel res_waited.ok && res_waited.ok == 1)
             || output[0].has_error
-            || !scope_ok(cancel.destroy(?scope))
-            || refused(destroy(?driver))
+            || !scope_ok(cancel.dnit(?scope))
+            || refused(dnit(?driver))
             || !ok_bool(io_runtime.close(?runtime))
-            || !ok_err(io_runtime.destroy(?runtime))
-            || !test_endpoint_absent(bound)) {
+            || !ok_err(io_runtime.dnit(?runtime))
+            || !endpoint_absent(bound)) {
             ret 17;
         }
         ret 0;
     }
 
+    # a managed rename is refused, before any filesystem effect, for a borrowed
+    # filesystem listener and, on linux, for an owned abstract one
     test async_local__managed_rename_requires_owned_filesystem_listener {
         var pa: allocator.Allocator;
         page.make(?pa);
-        val endpoint_result: res[endpoint.Endpoint, io_error.Error] = test_endpoint();
-        if (sel endpoint_result.err) { ret 1; }
-        var first:  endpoint.Endpoint = endpoint_result.ok;
+        var scratch: os.Scratch;
+        if (os.scratch_make(?scratch) < 0) { ret 90; }
+        fin { fs.scratch_remove(?scratch); }
+        var scratch_path: os.ScratchPath;
+        val res_endpoint: res[endpoint.Endpoint, io_error.Error] = endpoint.scratch_endpoint(?scratch, "local.sock", ?scratch_path);
+        if (sel res_endpoint.err) { ret 1; }
+        var first:  endpoint.Endpoint = res_endpoint.ok;
         var second: endpoint.Endpoint = first;
         first.name[first.length - 1]   = 'o';
         second.name[second.length - 1] = 'p';
         var runtime: io_runtime.Runtime;
-        if (!ok_err(io_runtime.make(?runtime, ?pa, 4))) { ret 2; }
-        var driver:      Driver;
-        val make_result: err[io_error.Error] = make(?driver, ?runtime);
-        if (sel make_result.err) { ret 3; }
+        if (!ok_err(io_runtime.init(?runtime, ?pa, 4))) { ret 2; }
+        var driver:   Driver;
+        val err_make: err[io_error.Error] = init(?driver, ?runtime);
+        if (sel err_make.err) { ret 3; }
         var scope: cancel.Scope;
         if (!scope_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 4; }
         var options: types.BindOptions = local.default_bind_options();
         options.stale     = types.REMOVE_STALE_SOCKET;
         options.ownership = types.BORROWED;
-        val submit_bind_result: res[io_runtime.Token, io_error.Error] = submit_bind(?driver, ?scope, first, options, 311);
-        if (sel submit_bind_result.err) { ret 5; }
-        var output: [4]io_runtime.Completion;
-        var waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 4, 1000);
-        if (!(sel waited.ok && waited.ok == 1)) { ret 6; }
-        val listener_result: res[Listener, io_error.Error] = bound_listener(?driver, output[0]);
-        if (sel listener_result.err) { ret 7; }
-        var listener: Listener            = listener_result.ok;
-        val renamed:  err[io_error.Error] = listener_rename(?driver, ?listener, second);
-        if (!(sel renamed.err && renamed.err.kind == io_error.CLOSED)
+        val res_submit_bind: res[io_runtime.Token, io_error.Error] = submit_bind(?driver, ?scope, first, options, 311);
+        if (sel res_submit_bind.err) { ret 5; }
+        var output:     [4]io_runtime.Completion;
+        var res_waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 4, -1);
+        if (!(sel res_waited.ok && res_waited.ok == 1)) { ret 6; }
+        val res_listener: res[Listener, io_error.Error] = bound_listener(?driver, output[0]);
+        if (sel res_listener.err) { ret 7; }
+        var listener:    Listener            = res_listener.ok;
+        val err_renamed: err[io_error.Error] = listener_rename(?driver, ?listener, second);
+        if (!(sel err_renamed.err && err_renamed.err.kind == io_error.CLOSED)
             || failed[io_runtime.Token](submit_listener_close(?driver, ?scope, ?listener, 312))) {
             ret 8;
         }
-        waited = wait(?driver, ?output[0], 4, 1000);
-        if (!(sel waited.ok && waited.ok == 1)
+        res_waited = wait(?driver, ?output[0], 4, -1);
+        if (!(sel res_waited.ok && res_waited.ok == 1)
             || output[0].has_error
-            || test_endpoint_absent(first)
-            || !test_endpoint_absent(second)
-            || !test_endpoint_remove(first)
-            || !scope_ok(cancel.destroy(?scope))
-            || refused(destroy(?driver))
-            || !ok_bool(io_runtime.close(?runtime))
-            || !ok_err(io_runtime.destroy(?runtime))) {
+            || endpoint_absent(first)
+            || !endpoint_absent(second)
+            || !endpoint_remove(first)) {
             ret 9;
         }
-        ret 0;
-    }
-
-    $if ($mach.build.os == $mach.os.linux) {
-        test async_local__managed_rename_rejects_abstract_listener {
-            var pa: allocator.Allocator;
-            page.make(?pa);
-            val endpoint_result: res[endpoint.Endpoint, io_error.Error] = test_endpoint();
-            if (sel endpoint_result.err) { ret 1; }
-            val replacement:     endpoint.Endpoint                      = endpoint_result.ok;
-            val abstract_result: res[endpoint.Endpoint, io_error.Error] = endpoint.abstract("mach-std-local-rename-502"::*u8, 25);
-            if (sel abstract_result.err) { ret 2; }
-            val bound:   endpoint.Endpoint = abstract_result.ok;
-            var runtime: io_runtime.Runtime;
-            if (!ok_err(io_runtime.make(?runtime, ?pa, 4))) { ret 3; }
-            var driver:      Driver;
-            val make_result: err[io_error.Error] = make(?driver, ?runtime);
-            if (sel make_result.err) { ret 4; }
-            var scope: cancel.Scope;
-            if (!scope_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 5; }
-            val options:            types.BindOptions                     = local.default_bind_options();
-            val submit_bind_result: res[io_runtime.Token, io_error.Error] = submit_bind(?driver, ?scope, bound, options, 321);
-            if (sel submit_bind_result.err) { ret 6; }
-            var output: [4]io_runtime.Completion;
-            var waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 4, 1000);
-            if (!(sel waited.ok && waited.ok == 1)) { ret 7; }
-            val listener_result: res[Listener, io_error.Error] = bound_listener(?driver, output[0]);
-            if (sel listener_result.err) { ret 8; }
-            var listener: Listener            = listener_result.ok;
-            val renamed:  err[io_error.Error] = listener_rename(?driver, ?listener, replacement);
-            if (!(sel renamed.err && renamed.err.kind == io_error.CLOSED)
-                || failed[io_runtime.Token](submit_listener_close(?driver, ?scope, ?listener, 322))) {
-                ret 9;
+        $if ($mach.build.sys == $mach.sys.linux) {
+            val res_abstract: res[endpoint.Endpoint, io_error.Error] = endpoint.abstract(os.scratch_dir(?scratch), scratch.length);
+            if (sel res_abstract.err) { ret 10; }
+            val res_abstract_bind: res[io_runtime.Token, io_error.Error] = submit_bind(?driver, ?scope, res_abstract.ok, local.default_bind_options(), 321);
+            if (sel res_abstract_bind.err) { ret 11; }
+            res_waited = wait(?driver, ?output[0], 4, -1);
+            if (!(sel res_waited.ok && res_waited.ok == 1)) { ret 12; }
+            val res_abstract_listener: res[Listener, io_error.Error] = bound_listener(?driver, output[0]);
+            if (sel res_abstract_listener.err) { ret 13; }
+            var abstract_listener: Listener            = res_abstract_listener.ok;
+            val err_abstract:      err[io_error.Error] = listener_rename(?driver, ?abstract_listener, second);
+            if (!(sel err_abstract.err && err_abstract.err.kind == io_error.CLOSED)
+                || failed[io_runtime.Token](submit_listener_close(?driver, ?scope, ?abstract_listener, 322))) {
+                ret 14;
             }
-            waited = wait(?driver, ?output[0], 4, 1000);
-            if (!(sel waited.ok && waited.ok == 1)
-                || output[0].has_error
-                || !scope_ok(cancel.destroy(?scope))
-                || refused(destroy(?driver))
-                || !ok_bool(io_runtime.close(?runtime))
-                || !ok_err(io_runtime.destroy(?runtime))) {
-                ret 10;
-            }
-            ret 0;
+            res_waited = wait(?driver, ?output[0], 4, -1);
+            if (!(sel res_waited.ok && res_waited.ok == 1) || output[0].has_error || !endpoint_absent(second)) { ret 15; }
         }
+        if (!scope_ok(cancel.dnit(?scope))
+            || refused(dnit(?driver))
+            || !ok_bool(io_runtime.close(?runtime))
+            || !ok_err(io_runtime.dnit(?runtime))) {
+            ret 16;
+        }
+        ret 0;
     }
 
     test async_local__managed_rename_cleanup_follows_runtime_close {
         var pa: allocator.Allocator;
         page.make(?pa);
-        val endpoint_result: res[endpoint.Endpoint, io_error.Error] = test_endpoint();
-        if (sel endpoint_result.err) { ret 1; }
-        var first:  endpoint.Endpoint = endpoint_result.ok;
+        var scratch: os.Scratch;
+        if (os.scratch_make(?scratch) < 0) { ret 90; }
+        fin { fs.scratch_remove(?scratch); }
+        var scratch_path: os.ScratchPath;
+        val res_endpoint: res[endpoint.Endpoint, io_error.Error] = endpoint.scratch_endpoint(?scratch, "local.sock", ?scratch_path);
+        if (sel res_endpoint.err) { ret 1; }
+        var first:  endpoint.Endpoint = res_endpoint.ok;
         var second: endpoint.Endpoint = first;
         first.name[first.length - 1]   = 'r';
         second.name[second.length - 1] = 's';
         var runtime: io_runtime.Runtime;
-        if (!ok_err(io_runtime.make(?runtime, ?pa, 4))) { ret 2; }
-        var driver:      Driver;
-        val make_result: err[io_error.Error] = make(?driver, ?runtime);
-        if (sel make_result.err) { ret 3; }
+        if (!ok_err(io_runtime.init(?runtime, ?pa, 4))) { ret 2; }
+        var driver:   Driver;
+        val err_make: err[io_error.Error] = init(?driver, ?runtime);
+        if (sel err_make.err) { ret 3; }
         var scope: cancel.Scope;
         if (!scope_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 4; }
         var options: types.BindOptions = local.default_bind_options();
         options.stale = types.REMOVE_STALE_SOCKET;
-        val submit_bind_result: res[io_runtime.Token, io_error.Error] = submit_bind(?driver, ?scope, first, options, 211);
-        if (sel submit_bind_result.err) { ret 5; }
-        var output: [4]io_runtime.Completion;
-        var waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 4, 1000);
-        if (!(sel waited.ok && waited.ok == 1)) { ret 6; }
-        val listener_result: res[Listener, io_error.Error] = bound_listener(?driver, output[0]);
-        if (sel listener_result.err) { ret 7; }
-        var listener:             Listener                              = listener_result.ok;
-        val submit_listen_result: res[io_runtime.Token, io_error.Error] = submit_listen(?driver, ?scope, ?listener, 8, 212);
-        if (sel submit_listen_result.err) { ret 8; }
-        waited = wait(?driver, ?output[0], 4, 1000);
-        if (!(sel waited.ok && waited.ok == 1)
+        val res_submit_bind: res[io_runtime.Token, io_error.Error] = submit_bind(?driver, ?scope, first, options, 211);
+        if (sel res_submit_bind.err) { ret 5; }
+        var output:     [4]io_runtime.Completion;
+        var res_waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 4, -1);
+        if (!(sel res_waited.ok && res_waited.ok == 1)) { ret 6; }
+        val res_listener: res[Listener, io_error.Error] = bound_listener(?driver, output[0]);
+        if (sel res_listener.err) { ret 7; }
+        var listener:          Listener                              = res_listener.ok;
+        val res_submit_listen: res[io_runtime.Token, io_error.Error] = submit_listen(?driver, ?scope, ?listener, 8, 212);
+        if (sel res_submit_listen.err) { ret 8; }
+        res_waited = wait(?driver, ?output[0], 4, -1);
+        if (!(sel res_waited.ok && res_waited.ok == 1)
             || refused(listening(?driver, output[0]))) {
             ret 9;
         }
-        val listener_rename_result: err[io_error.Error] = listener_rename(?driver, ?listener, second);
-        if (sel listener_rename_result.err)                               { ret 10; }
-        if (!test_endpoint_absent(first) || test_endpoint_absent(second)) { ret 11; }
-        if (!ok_bool(io_runtime.close(?runtime)))                         { ret 12; }
-        waited = wait(?driver, ?output[0], 4, 0);
-        if (!(sel waited.ok && waited.ok == 0))                             { ret 13; }
-        if (!scope_ok(cancel.destroy(?scope)) || refused(destroy(?driver))) { ret 14; }
-        if (!test_endpoint_absent(second)
+        val err_listener_rename: err[io_error.Error] = listener_rename(?driver, ?listener, second);
+        if (sel err_listener_rename.err)                        { ret 10; }
+        if (!endpoint_absent(first) || endpoint_absent(second)) { ret 11; }
+        if (!ok_bool(io_runtime.close(?runtime)))               { ret 12; }
+        res_waited = wait(?driver, ?output[0], 4, 0);
+        if (!(sel res_waited.ok && res_waited.ok == 0))               { ret 13; }
+        if (!scope_ok(cancel.dnit(?scope)) || refused(dnit(?driver))) { ret 14; }
+        if (!endpoint_absent(second)
             || io_runtime.snapshot(?runtime).state != lifecycle.CLOSED
-            || !ok_err(io_runtime.destroy(?runtime))) {
+            || !ok_err(io_runtime.dnit(?runtime))) {
             ret 15;
         }
         ret 0;
@@ -2539,26 +2607,30 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
         var counting: testing.Counting;
         var a:        allocator.Allocator;
         testing.counting_make(?counting, ?a);
-        val endpoint_result: res[endpoint.Endpoint, io_error.Error] = test_endpoint();
-        if (sel endpoint_result.err) { ret 1; }
-        val bound:   endpoint.Endpoint = endpoint_result.ok;
+        var scratch: os.Scratch;
+        if (os.scratch_make(?scratch) < 0) { ret 90; }
+        fin { fs.scratch_remove(?scratch); }
+        var scratch_path: os.ScratchPath;
+        val res_endpoint: res[endpoint.Endpoint, io_error.Error] = endpoint.scratch_endpoint(?scratch, "local.sock", ?scratch_path);
+        if (sel res_endpoint.err) { ret 1; }
+        val bound:   endpoint.Endpoint = res_endpoint.ok;
         var runtime: io_runtime.Runtime;
         var driver:  Driver;
         var scope:   cancel.Scope;
-        if (!ok_err(io_runtime.make(?runtime, ?a, 8)) || !ok_err(make(?driver, ?runtime))) { ret 2; }
+        if (!ok_err(io_runtime.init(?runtime, ?a, 8)) || !ok_err(init(?driver, ?runtime))) { ret 2; }
         if (!scope_ok(cancel.make_root(?scope, opt[time.Instant].none{})))                 { ret 2; }
         var options: types.BindOptions = local.default_bind_options();
         options.stale = types.REMOVE_STALE_SOCKET;
         if (failed[io_runtime.Token](submit_bind(?driver, ?scope, bound, options, 1))) { ret 3; }
-        var output: [256]io_runtime.Completion;
-        var waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 256, 1000);
-        if (!(sel waited.ok && waited.ok == 1)) { ret 3; }
-        val listener_result: res[Listener, io_error.Error] = bound_listener(?driver, output[0]);
-        if (sel listener_result.err) { ret 3; }
-        var listener: Listener = listener_result.ok;
+        var output:     [256]io_runtime.Completion;
+        var res_waited: res[usize, io_error.Error] = wait(?driver, ?output[0], 256, -1);
+        if (!(sel res_waited.ok && res_waited.ok == 1)) { ret 3; }
+        val res_listener: res[Listener, io_error.Error] = bound_listener(?driver, output[0]);
+        if (sel res_listener.err) { ret 3; }
+        var listener: Listener = res_listener.ok;
         if (failed[io_runtime.Token](submit_listen(?driver, ?scope, ?listener, 8, 2))) { ret 4; }
-        waited = wait(?driver, ?output[0], 256, 1000);
-        if (!(sel waited.ok && waited.ok == 1) || refused(listening(?driver, output[0]))) { ret 4; }
+        res_waited = wait(?driver, ?output[0], 256, -1);
+        if (!(sel res_waited.ok && res_waited.ok == 1) || refused(listening(?driver, output[0]))) { ret 4; }
         @idle = counting.live;
         var child: cancel.Scope;
         if (!scope_ok(cancel.make_child(?child, ?scope, opt[time.Instant].none{}))) { ret 5; }
@@ -2569,26 +2641,24 @@ $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
         }
         @peak = counting.live;
         if (!scope_changed(cancel.cancel(?child))) { ret 7; }
-        var settled:    usize = 0;
-        var idle_waits: usize = 0;
-        for (settled < n && idle_waits < 16) {
-            waited = wait(?driver, ?output[0], 256, 1000);
-            if (sel waited.err) { ret 8; }
-            if (waited.ok == 0) { idle_waits = idle_waits + 1; }
+        var settled: usize = 0;
+        for (settled < n) {
+            res_waited = wait(?driver, ?output[0], 256, -1);
+            if (sel res_waited.err) { ret 8; }
             var i: usize = 0;
-            for (i < waited.ok) {
+            for (i < res_waited.ok) {
                 if (!output[i].has_error || output[i].error.kind != io_error.CANCELLED) { ret 9; }
                 i = i + 1;
             }
-            settled = settled + waited.ok;
+            settled = settled + res_waited.ok;
         }
-        if (settled != n || !scope_ok(cancel.destroy(?child))) { ret 10; }
+        if (settled != n || !scope_ok(cancel.dnit(?child))) { ret 10; }
         @after = counting.live;
         if (failed[io_runtime.Token](submit_listener_close(?driver, ?scope, ?listener, 3))) { ret 11; }
-        waited = wait(?driver, ?output[0], 256, 1000);
-        if (!(sel waited.ok && waited.ok == 1) || output[0].has_error) { ret 11; }
-        if (!scope_ok(cancel.destroy(?scope)) || refused(destroy(?driver)) ||
-            !ok_bool(io_runtime.close(?runtime)) || !ok_err(io_runtime.destroy(?runtime))) { ret 12; }
+        res_waited = wait(?driver, ?output[0], 256, -1);
+        if (!(sel res_waited.ok && res_waited.ok == 1) || output[0].has_error) { ret 11; }
+        if (!scope_ok(cancel.dnit(?scope)) || refused(dnit(?driver)) ||
+            !ok_bool(io_runtime.close(?runtime)) || !ok_err(io_runtime.dnit(?runtime))) { ret 12; }
         if (counting.live != 0) { ret 13; }
         ret 0;
     }

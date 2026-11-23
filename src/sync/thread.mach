@@ -4,6 +4,26 @@
 # after spawn because target trampolines refer to that record, never the handle.
 # a joinable thread leaves the record for join. detach transfers it to the
 # exiting thread, which releases it after the user context has been destroyed.
+#
+# where a thread comes from
+# a static linux executable has no loader, so std creates its threads itself
+# with clone. macOS and Windows threads always come from the system (pthread_create
+# through libSystem, and CreateThread). a loader-hosted linux process is one the
+# kernel started with an interpreter, or a shared library, which is loader-hosted
+# by construction. thread-locals and any C runtime's per-thread state exist there
+# only on threads the host creates, so std never clones one. spawn goes through
+# a backend the program installs, and with none installed it returns
+# ThreadError.unsupported and starts nothing.
+#
+# a shared library, a dynamic executable or anything that links a C library on
+# linux therefore needs a backend before any std thread can start, including the
+# ones std.log, std.io.runtime and std.sync.worker_pool spawn. std names no libc
+# symbol, so a host-thread backend is a package of its own, and a program installs
+# it by depending on it and importing one of its modules, which is what puts its
+# definitions in the link. replacement is link time only, so a shared library that
+# carries std needs the backend in its own link, and no other image can supply
+# it. exactly one backend belongs in a link, and two fail it. the override is the
+# three symbols OS-CONTRACT.md specifies, and nothing checks their shapes.
 
 use io_error: std.io.error;
 use std.sync.atomic;
@@ -34,13 +54,17 @@ pub val ERROR_UNSUPPORTED: i64 = -95;
 # invalid:     a configuration outside the portable policy, or a handle that
 #              is not joinable (never spawned, already joined or detached)
 # exhausted:   the owner record could not be allocated
-# unsupported: the target refused a policy it does not implement (stack commit)
+# unsupported: the target refused a policy it does not implement (stack commit),
+#              or a loader-hosted linux process has no thread backend installed
 # native:      the target refused with its negative code, kept whole
 pub tag ThreadError: u8 { invalid; exhausted; unsupported; native: i64; }
 
 pub def Operation: err[ThreadError];
 
 # the portable status code of an error, for diagnostics that keep an i64
+# ---
+# e:   error to convert
+# ret: a negative code, the native code itself for ThreadError.native
 pub fun code(e: ThreadError) i64 {
     if (sel e.invalid)     { ret ERROR_INVALID; }
     if (sel e.exhausted)   { ret ERROR_NO_MEMORY; }
@@ -76,11 +100,30 @@ pub rec Config {
 }
 
 # initialize a thread configuration with portable defaults
+# ---
+# c: configuration to fill with the default reserve, no commit and no name
 pub fun config_default(c: *Config) {
     c.stack_reserve = DEFAULT_STACK_RESERVE;
     c.stack_commit  = 0;
     c.name          = nil;
 }
+
+# the most routines at_exit holds
+val EXIT_ROUTINES: usize = 8;
+
+# the routines at_exit registered, as addresses, the first `exit_count` of them
+var exit_routines: [8]usize;
+var exit_count:    i64;
+var exit_lock:     i64;
+
+# whether std has started a thread in this process, nonzero from the moment the
+# first one runs and never cleared. a thread-local std reads only matters on a
+# thread std started, so std reads none until this is set
+var started: usize;
+
+# whether the calling thread is one std started, which runs the exit routines
+#[thread]
+var exits_here: bool;
 
 # handle to a spawned thread
 # ---
@@ -115,8 +158,63 @@ fun owner_entry(arg: *u8) {
     val entry:        fun(*u8) = o.entry::fun(*u8);
     val user_arg:     *u8      = o.arg::*u8;
     val destroy_addr: usize    = o.destroy;
+    atomic.store_word(?started, 1);
+    exits_here = true;
     entry(user_arg);
     destroy_arg(user_arg, destroy_addr);
+    exits_run();
+}
+
+# run every registered exit routine, in the order registered
+fun exits_run() {
+    val count: i64 = atomic.load(?exit_count);
+    var i:     i64 = 0;
+    for (i < count) {
+        val address: usize = atomic.load_word(?exit_routines[i::usize]);
+        if (address != 0) {
+            val routine: fun() = address::fun();
+            routine();
+        }
+        i = i + 1;
+    }
+}
+
+# register a routine every thread std starts runs once its entry has returned and its context was
+# destroyed, after the routines registered before it, for a module that keeps per-thread state to
+# give it back. a thread std did not start never runs them (runs_at_exit). nothing takes one back
+# ---
+# f:   the routine, run on the ending thread
+# ret: false when EXIT_ROUTINES are registered already and f is not
+pub fun at_exit(f: fun()) bool {
+    for {
+        var unlocked: i64 = 0;
+        if (atomic.cas(?exit_lock, ?unlocked, 1)) { brk; }
+        atomic.spin_hint();
+    }
+    fin { atomic.store(?exit_lock, 0); }
+
+    val count: i64 = atomic.load(?exit_count);
+    if (count >= EXIT_ROUTINES::i64) { ret false; }
+    atomic.store_word(?exit_routines[count::usize], f::usize);
+    atomic.store(?exit_count, count + 1);
+    ret true;
+}
+
+# whether std has started a thread in this process, without reading a thread-local
+#
+# until it holds, no thread std started exists, so per-thread state std keeps
+# for its own threads has nothing to find. a program that never spawns, or
+# whose spawns all failed, reads no thread-local in std, which is what lets one
+# that replaced the runtime's mach_thread_setup allocate, print and exit
+pub fun any_started() bool {
+    ret atomic.load_word(?started) != 0;
+}
+
+# whether the calling thread runs the routines at_exit registers when it ends, which only a thread
+# std started does. it reads a thread-local only once any_started holds
+pub fun runs_at_exit() bool {
+    if (!any_started()) { ret false; }
+    ret exits_here;
 }
 
 fun initialize_thread(t: *Thread) {
@@ -226,6 +324,13 @@ fun spawn_impl(f: fun(*u8), arg: *u8, destroy_addr: usize, c: *Config, t: *Threa
 # spawn with borrowed caller context and explicit configuration
 #
 # arg must remain valid until the entry returns. ownership stays with the caller.
+# ---
+# f:   entry function run on the new thread with arg
+# arg: borrowed context passed to f
+# c:   creation policy, validated before anything is allocated
+# t:   handle filled in, its tid holding the failure code on refusal
+# ret: ok, invalid for a config outside the policy, exhausted, unsupported,
+#      or the native refusal
 pub fun spawn_with_config(f: fun(*u8), arg: *u8, c: *Config, t: *Thread) Operation {
     ret spawn_impl(f, arg, 0, c, t);
 }
@@ -234,11 +339,23 @@ pub fun spawn_with_config(f: fun(*u8), arg: *u8, c: *Config, t: *Thread) Operati
 #
 # destroy runs exactly once after the entry returns, including an early return.
 # if spawning fails, destroy runs before this call returns.
+# ---
+# f:       entry function run on the new thread with arg
+# arg:     owned context passed to f and then to destroy
+# destroy: releases arg
+# c:       creation policy, validated before anything is allocated
+# t:       handle filled in, its tid holding the failure code on refusal
+# ret:     as spawn_with_config
 pub fun spawn_owned_with_config(f: fun(*u8), arg: *u8, destroy: fun(*u8), c: *Config, t: *Thread) Operation {
     ret spawn_impl(f, arg, destroy::usize, c, t);
 }
 
 # spawn with borrowed caller context and default configuration
+# ---
+# f:   entry function run on the new thread with arg
+# arg: borrowed context passed to f, valid until f returns
+# t:   handle filled in
+# ret: as spawn_with_config
 pub fun spawn_with(f: fun(*u8), arg: *u8, t: *Thread) Operation {
     var c: Config;
     config_default(?c);
@@ -246,11 +363,22 @@ pub fun spawn_with(f: fun(*u8), arg: *u8, t: *Thread) Operation {
 }
 
 # spawn a zero-argument function with explicit configuration
+# ---
+# f:   entry function run on the new thread
+# c:   creation policy
+# t:   handle filled in
+# ret: as spawn_with_config
 pub fun spawn_config(f: fun(), c: *Config, t: *Thread) Operation {
     ret spawn_with_config((f::usize)::fun(*u8), nil, c, t);
 }
 
 # spawn with owned caller context and default configuration
+# ---
+# f:       entry function run on the new thread with arg
+# arg:     owned context passed to f and then to destroy
+# destroy: releases arg, run once after f returns or before a refusal returns
+# t:       handle filled in
+# ret:     as spawn_with_config
 pub fun spawn_owned(f: fun(*u8), arg: *u8, destroy: fun(*u8), t: *Thread) Operation {
     var c: Config;
     config_default(?c);
@@ -258,12 +386,17 @@ pub fun spawn_owned(f: fun(*u8), arg: *u8, destroy: fun(*u8), t: *Thread) Operat
 }
 
 # spawn a zero-argument function with default configuration
+# ---
+# f:   entry function run on the new thread
+# t:   handle filled in
+# ret: as spawn_with_config
 pub fun spawn(f: fun(), t: *Thread) Operation {
     ret spawn_with((f::usize)::fun(*u8), nil, t);
 }
 
 # join and release every library-owned resource
 # ---
+# t:   handle of a joinable thread
 # ret: ok once joined and released, invalid for a handle that is not
 #      joinable, or the target's refusal with the handle still joinable
 pub fun join(t: *Thread) Operation {
@@ -279,6 +412,7 @@ pub fun join(t: *Thread) Operation {
 
 # transfer ownership to the running or completed thread
 # ---
+# t:   handle of a joinable thread
 # ret: ok once the thread owns its record, invalid for a handle that is not
 #      joinable, or the target's refusal with the handle still joinable
 pub fun detach(t: *Thread) Operation {
@@ -302,6 +436,9 @@ pub fun detach(t: *Thread) Operation {
 }
 
 # check whether a joinable thread body has finished
+# ---
+# t:   thread handle
+# ret: true once the body finished or the handle was joined, false after detach
 pub fun is_done(t: *Thread) bool {
     if (t.done == 1)  { ret true; }
     if (t.stack == 0) { ret false; }
@@ -310,6 +447,9 @@ pub fun is_done(t: *Thread) bool {
 }
 
 # return the stable native diagnostic identifier captured at spawn
+# ---
+# t:   thread handle
+# ret: its tid, negative when the spawn failed
 pub fun diagnostic_id(t: *Thread) i64 {
     ret t.tid;
 }
@@ -368,6 +508,8 @@ pub fun cpu_set(words: *u64, capacity: usize) CpuSet {
 }
 
 # remove every CPU from the set
+# ---
+# set: set whose capacity words are all cleared
 pub fun cpu_set_clear(set: *CpuSet) {
     var i: usize = 0;
     for (i < set.capacity) {
@@ -379,6 +521,8 @@ pub fun cpu_set_clear(set: *CpuSet) {
 
 # add a CPU to the set
 # ---
+# set: set to add to
+# cpu: global CPU index
 # ret: false when the CPU does not fit the set's words
 pub fun cpu_set_add(set: *CpuSet, cpu: usize) bool {
     val word: usize = cpu / 64;
@@ -394,6 +538,10 @@ pub fun cpu_set_add(set: *CpuSet, cpu: usize) bool {
 }
 
 # whether a CPU is in the set
+# ---
+# set: set to read
+# cpu: global CPU index
+# ret: true when cpu is in the set
 pub fun cpu_set_contains(set: *CpuSet, cpu: usize) bool {
     val word: usize = cpu / 64;
     if (word >= set.count) { ret false; }
@@ -401,6 +549,9 @@ pub fun cpu_set_contains(set: *CpuSet, cpu: usize) bool {
 }
 
 # the number of CPUs in the set
+# ---
+# set: set to read
+# ret: count of set bits over the words in use
 pub fun cpu_set_size(set: *CpuSet) usize {
     var total: usize = 0;
     var i:     usize = 0;
@@ -417,6 +568,8 @@ pub fun cpu_set_size(set: *CpuSet) usize {
 
 # the n-th CPU in the set, counting from zero in ascending index order
 # ---
+# set: set to read
+# n:   zero-based position among the CPUs in the set
 # ret: the CPU index, or none when the set holds n CPUs or fewer
 pub fun cpu_set_nth(set: *CpuSet, n: usize) opt[usize] {
     var seen: usize = 0;
@@ -441,6 +594,7 @@ pub fun cpu_set_nth(set: *CpuSet, n: usize) opt[usize] {
 # a set too small for the platform's mask is refused with RANGE; size it with
 # affinity_words first. darwin has no CPU affinity and refuses with UNSUPPORTED.
 # ---
+# set: set whose words receive the mask
 # ret: ok with set.count updated, or the refusal
 pub fun current_affinity(set: *CpuSet) err[io_error.Error] {
     var used: usize = 0;
@@ -464,6 +618,7 @@ pub fun affinity_words() res[usize, io_error.Error] {
 
 # pin the calling thread to the CPUs in set
 # ---
+# set: CPUs to allow
 # ret: ok, INVALID for an empty set or CPUs the process may not use,
 #      UNSUPPORTED where the platform cannot express the set, or the refusal
 pub fun set_current_affinity(set: *CpuSet) err[io_error.Error] {
@@ -484,9 +639,9 @@ pub fun pin_current_to(cpu: usize) err[io_error.Error] {
     if (store == nil) { ret err[io_error.Error].err{io_error.make(io_error.RESOURCE_EXHAUSTED, io_error.OP_OPTION)}; }
     var set: CpuSet = cpu_set(store::*u64, words);
     cpu_set_add(?set, cpu);
-    val applied: err[io_error.Error] = set_current_affinity(?set);
+    val err_applied: err[io_error.Error] = set_current_affinity(?set);
     os.deallocate(store, bytes);
-    ret applied;
+    ret err_applied;
 }
 
 # list the CPUs the calling thread may run on, in ascending index order
@@ -499,18 +654,18 @@ pub fun pin_current_to(cpu: usize) err[io_error.Error] {
 # ret:       ok, RANGE when capacity is too small, or the refusal
 pub fun allowed_cpus(out: *usize, capacity: usize, out_count: *usize) err[io_error.Error] {
     @out_count = 0;
-    val sized: res[usize, io_error.Error] = affinity_words();
-    if (sel sized.err) { ret err[io_error.Error].err{sized.err}; }
-    val words: usize = sized.ok;
+    val res_sized: res[usize, io_error.Error] = affinity_words();
+    if (sel res_sized.err) { ret err[io_error.Error].err{res_sized.err}; }
+    val words: usize = res_sized.ok;
     if (words == 0) { ret err[io_error.Error].ok{}; }
     val bytes: usize = words * 8;
     val store: ptr   = os.allocate(bytes);
     if (store == nil) { ret err[io_error.Error].err{io_error.make(io_error.RESOURCE_EXHAUSTED, io_error.OP_READ)}; }
-    var set:  CpuSet              = cpu_set(store::*u64, words);
-    val read: err[io_error.Error] = current_affinity(?set);
-    if (sel read.err) {
+    var set:      CpuSet              = cpu_set(store::*u64, words);
+    val err_read: err[io_error.Error] = current_affinity(?set);
+    if (sel err_read.err) {
         os.deallocate(store, bytes);
-        ret read;
+        ret err_read;
     }
     val total: usize = cpu_set_size(?set);
     @out_count = total;
@@ -537,9 +692,9 @@ pub fun allowed_cpus(out: *usize, capacity: usize, out_count: *usize) err[io_err
 }
 
 #[testing]
-var test_flag:      i64 = 0;
+var flag:      i64 = 0;
 #[testing]
-var test_destroyed: i64 = 0;
+var destroyed: i64 = 0;
 
 #[testing]
 rec DiagnosticCapture {
@@ -549,8 +704,8 @@ rec DiagnosticCapture {
 }
 
 #[testing]
-fun test_worker() {
-    atomic.store(?test_flag, 1);
+fun worker() {
+    atomic.store(?flag, 1);
 }
 
 #[testing]
@@ -576,7 +731,7 @@ fun owned_early_return(arg: *u8) {
 fun owned_destroy(arg: *u8) {
     val slot: *i64 = arg::*i64;
     atomic.store(slot, atomic.load(slot) + 1);
-    atomic.fetch_add(?test_destroyed, 1);
+    atomic.fetch_add(?destroyed, 1);
 }
 
 #[testing]
@@ -617,21 +772,19 @@ fun done(r: Operation) bool {
 
 # a handle may move after spawn and still joins, and a second join is refused
 test thread__spawn_and_join_through_a_moved_handle {
-    atomic.store(?test_flag, 0);
+    atomic.store(?flag, 0);
     var original: Thread;
-    spawn(test_worker, ?original);
+    spawn(worker, ?original);
     if (original.tid < 0 || diagnostic_id(?original) != original.tid) { ret 1; }
     var t: Thread = original;
     original.stack = 0;
-    if (!done(join(?t)))                              { ret 1; }
-    if (atomic.load(?test_flag) != 1 || !is_done(?t)) { ret 1; }
-    val again: Operation = join(?t);
-    if (!sel again.err)         { ret 2; }
-    if (!sel again.err.invalid) { ret 3; }
-    ret 0;
-}
+    if (!done(join(?t)))                         { ret 1; }
+    if (atomic.load(?flag) != 1 || !is_done(?t)) { ret 1; }
+    val err_again: Operation = join(?t);
+    if (!sel err_again.err)         { ret 2; }
+    if (!sel err_again.err.invalid) { ret 3; }
 
-test thread__spawn_with_delivers_distinct_userdata {
+    # threads spawned back to back each receive their own argument
     var vals:    [4]i64;
     var threads: [4]Thread;
     var i:       usize = 0;
@@ -642,76 +795,60 @@ test thread__spawn_with_delivers_distinct_userdata {
     }
     i = 0;
     for (i < 4) {
-        if (threads[i].tid < 0 || !done(join(?threads[i]))) { ret 1; }
-        if (vals[i] != i::i64 + 100)                        { ret 1; }
+        if (threads[i].tid < 0 || !done(join(?threads[i]))) { ret 4; }
+        if (vals[i] != i::i64 + 100)                        { ret 5; }
         i = i + 1;
     }
     ret 0;
 }
 
 test thread__owned_context_is_destroyed_once_after_return {
-    atomic.store(?test_destroyed, 0);
+    atomic.store(?destroyed, 0);
     var value: i64 = 0;
     var t:     Thread;
     if (!done(spawn_owned(owned_early_return, (?value)::*u8, owned_destroy, ?t))) { ret 1; }
     if (!done(join(?t)))                                                          { ret 1; }
-    if (atomic.load(?value) != 2 || atomic.load(?test_destroyed) != 1)            { ret 1; }
+    if (atomic.load(?value) != 2 || atomic.load(?destroyed) != 1)                 { ret 1; }
     ret 0;
 }
 
 # a config the target refuses, an invalid reserve or an explicit commit,
 # destroys the owned context once and leaves no thread behind
 test thread__refused_config_destroys_owned_context_once {
-    atomic.store(?test_destroyed, 0);
+    atomic.store(?destroyed, 0);
     var value: i64 = 0;
     var c:     Config;
     config_default(?c);
     c.stack_reserve = 1;
-    var t: Thread;
-    val r: Operation = spawn_owned_with_config(owned_worker, (?value)::*u8, owned_destroy, ?c, ?t);
-    if (!sel r.err)                                                    { ret 1; }
-    if (!sel r.err.invalid || t.tid != ERROR_INVALID || t.stack != 0)  { ret 2; }
-    if (atomic.load(?value) != 1 || atomic.load(?test_destroyed) != 1) { ret 3; }
+    var t:                           Thread;
+    val err_spawn_owned_with_config: Operation = spawn_owned_with_config(owned_worker, (?value)::*u8, owned_destroy, ?c, ?t);
+    if (!sel err_spawn_owned_with_config.err)                                                   { ret 1; }
+    if (!sel err_spawn_owned_with_config.err.invalid || t.tid != ERROR_INVALID || t.stack != 0) { ret 2; }
+    if (atomic.load(?value) != 1 || atomic.load(?destroyed) != 1)                               { ret 3; }
 
     config_default(?c);
     c.stack_commit = 65536;
-    val u: Operation = spawn_owned_with_config(owned_worker, (?value)::*u8, owned_destroy, ?c, ?t);
-    if (!sel u.err)                                                    { ret 4; }
-    if (!sel u.err.unsupported)                                        { ret 5; }
+    val err_spawn_owned_with_config_owned_worker: Operation = spawn_owned_with_config(owned_worker, (?value)::*u8, owned_destroy, ?c, ?t);
+    if (!sel err_spawn_owned_with_config_owned_worker.err)             { ret 4; }
+    if (!sel err_spawn_owned_with_config_owned_worker.err.unsupported) { ret 5; }
     if (t.tid != ERROR_UNSUPPORTED || t.stack != 0)                    { ret 5; }
-    if (atomic.load(?value) != 2 || atomic.load(?test_destroyed) != 2) { ret 6; }
+    if (atomic.load(?value) != 2 || atomic.load(?destroyed) != 2)      { ret 6; }
     ret 0;
 }
 
 test thread__target_spawn_failure_destroys_owned_context_once {
-    atomic.store(?test_destroyed, 0);
+    atomic.store(?destroyed, 0);
     var value: i64 = 0;
     var c:     Config;
     config_default(?c);
-    c.stack_reserve = 1::usize << 63;
-    var t: Thread;
-    val r: Operation = spawn_owned_with_config(owned_worker, (?value)::*u8, owned_destroy, ?c, ?t);
-    if (!sel r.err)                                                    { ret 1; }
-    if (code(r.err) >= 0 || t.tid != code(r.err) || t.stack != 0)      { ret 2; }
-    if (atomic.load(?value) != 1 || atomic.load(?test_destroyed) != 1) { ret 3; }
-    ret 0;
-}
-
-test thread__injected_failure_after_owner_acquisition_destroys_context_once {
-    atomic.store(?test_destroyed, 0);
-    var value: i64 = 0;
-    val owner: ptr = os.allocate(OWNER_REGION_SIZE);
-    if (owner == nil) { ret 1; }
-    var t: Thread;
-    initialize_thread(?t);
-    val injected: ThreadError = ThreadError.native{-125};
-    val r:        Operation   = finish_spawn_failure(
-        (?value)::*u8, owned_destroy::usize, owner, ?t, injected,
-    );
-    if (!sel r.err)                                                    { ret 1; }
-    if (!sel r.err.native)                                             { ret 2; }
-    if (r.err.native != -125 || t.tid != -125 || t.stack != 0)         { ret 3; }
-    if (atomic.load(?value) != 1 || atomic.load(?test_destroyed) != 1) { ret 1; }
+    # the address space less 64 KiB, which no os maps beside the program at any width. it is a multiple of the
+    # largest page and of windows' 64 KiB granularity, so no rounding wraps it to a small request
+    c.stack_reserve = ~(0::usize) - 65535;
+    var t:                           Thread;
+    val err_spawn_owned_with_config: Operation = spawn_owned_with_config(owned_worker, (?value)::*u8, owned_destroy, ?c, ?t);
+    if (!sel err_spawn_owned_with_config.err)                                                                         { ret 1; }
+    if (code(err_spawn_owned_with_config.err) >= 0 || t.tid != code(err_spawn_owned_with_config.err) || t.stack != 0) { ret 2; }
+    if (atomic.load(?value) != 1 || atomic.load(?destroyed) != 1)                                                     { ret 3; }
     ret 0;
 }
 
@@ -739,15 +876,21 @@ test thread__custom_reserve_and_portable_name {
 }
 
 test thread__detach_transfers_resource_ownership {
-    atomic.store(?test_destroyed, 0);
+    atomic.store(?destroyed, 0);
     var value: i64 = 0;
     var t:     Thread;
     if (!done(spawn_owned(owned_worker, (?value)::*u8, owned_destroy, ?t))) { ret 1; }
     if (!done(detach(?t)) || t.stack != 0 || t.done != -1)                  { ret 1; }
-    val again: Operation = detach(?t);
-    if (!sel again.err)         { ret 2; }
-    if (!sel again.err.invalid) { ret 3; }
-    for (atomic.load(?test_destroyed) != 1) { atomic.spin_hint(); }
+    val err_again: Operation = detach(?t);
+    if (!sel err_again.err)         { ret 2; }
+    if (!sel err_again.err.invalid) { ret 3; }
+    # 20 seconds at most, so a detached owner that is never destroyed fails here
+    var polls: usize = 0;
+    for (atomic.load(?destroyed) != 1) {
+        if (polls >= 20000) { ret 4; }
+        os.sleep(1000000);
+        polls = polls + 1;
+    }
     if (atomic.load(?value) != 2) { ret 1; }
     ret 0;
 }
@@ -794,6 +937,72 @@ test thread__tokens_are_distinct_across_live_threads_and_stable_within_one {
     ret failure;
 }
 
+#[testing]
+var exit_order_seq: i64 = 0;
+#[testing]
+var exit_order_a:   i64 = 0;
+#[testing]
+var exit_order_b:   i64 = 0;
+#[testing]
+var exit_noop_hits: i64 = 0;
+
+#[testing]
+fun at_exit_record_a() {
+    atomic.store(?exit_order_a, atomic.fetch_add(?exit_order_seq, 1) + 1);
+}
+
+#[testing]
+fun at_exit_record_b() {
+    atomic.store(?exit_order_b, atomic.fetch_add(?exit_order_seq, 1) + 1);
+}
+
+#[testing]
+fun at_exit_count_noop() {
+    atomic.fetch_add(?exit_noop_hits, 1);
+}
+
+#[testing]
+fun at_exit_register_worker(arg: *u8) {
+    val ok: *i64 = arg::*i64;
+    if (at_exit(at_exit_count_noop)) { atomic.store(ok, 1); }
+}
+
+test thread__at_exit_runs_registered_routines_in_order {
+    atomic.store(?exit_order_seq, 0);
+    atomic.store(?exit_order_a, 0);
+    atomic.store(?exit_order_b, 0);
+    atomic.store(?exit_noop_hits, 0);
+
+    if (!at_exit(at_exit_record_a)) { ret 1; }
+    if (!at_exit(at_exit_record_b)) { ret 2; }
+
+    var reg_ok:      [2]i64 = [2]i64{0, 0};
+    var reg_threads: [2]Thread;
+    var i:           usize  = 0;
+    for (i < 2) {
+        if (!done(spawn_with(at_exit_register_worker, (?reg_ok[i])::*u8, ?reg_threads[i]))) { ret 3; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 2) {
+        if (!done(join(?reg_threads[i]))) { ret 4; }
+        if (atomic.load(?reg_ok[i]) != 1) { ret 5; }
+        i = i + 1;
+    }
+
+    atomic.store(?exit_order_seq, 0);
+    atomic.store(?exit_order_a, 0);
+    atomic.store(?exit_order_b, 0);
+    var t: Thread;
+    if (!done(spawn(worker, ?t))) { ret 6; }
+    if (!done(join(?t)))          { ret 7; }
+    val a_at: i64 = atomic.load(?exit_order_a);
+    val b_at: i64 = atomic.load(?exit_order_b);
+    if (a_at <= 0 || b_at <= a_at)        { ret 8; }
+    if (atomic.load(?exit_noop_hits) < 2) { ret 9; }
+    ret 0;
+}
+
 test thread__a_cpu_set_adds_finds_and_counts_cpus_in_index_order {
     var words: [4]u64;
     var set:   CpuSet = cpu_set(?words[0], 4);
@@ -802,77 +1011,62 @@ test thread__a_cpu_set_adds_finds_and_counts_cpus_in_index_order {
     if (cpu_set_add(?set, 256))                                                     { ret 3; }
     if (set.count != 3 || cpu_set_size(?set) != 3)                                  { ret 4; }
     if (!cpu_set_contains(?set, 64) || cpu_set_contains(?set, 65))                  { ret 5; }
-    val first:  opt[usize] = cpu_set_nth(?set, 0);
-    val second: opt[usize] = cpu_set_nth(?set, 1);
-    val third:  opt[usize] = cpu_set_nth(?set, 2);
-    val fourth: opt[usize] = cpu_set_nth(?set, 3);
-    if (!(sel first.some && first.some == 3))    { ret 6; }
-    if (!(sel second.some && second.some == 64)) { ret 7; }
-    if (!(sel third.some && third.some == 130))  { ret 8; }
-    if (!(sel fourth.none))                      { ret 9; }
+    val opt_first:  opt[usize] = cpu_set_nth(?set, 0);
+    val opt_second: opt[usize] = cpu_set_nth(?set, 1);
+    val opt_third:  opt[usize] = cpu_set_nth(?set, 2);
+    val opt_fourth: opt[usize] = cpu_set_nth(?set, 3);
+    if (!(sel opt_first.some && opt_first.some == 3))    { ret 6; }
+    if (!(sel opt_second.some && opt_second.some == 64)) { ret 7; }
+    if (!(sel opt_third.some && opt_third.some == 130))  { ret 8; }
+    if (!(sel opt_fourth.none))                          { ret 9; }
     ret 0;
 }
 
-$if ($mach.build.os == $mach.os.darwin) {
-    test thread__darwin_has_no_cpu_affinity {
-        var words: [4]u64;
-        var set:   CpuSet              = cpu_set(?words[0], 4);
-        val read:  err[io_error.Error] = current_affinity(?set);
-        if (!(sel read.err && read.err.kind == io_error.UNSUPPORTED)) { ret 1; }
-        val pinned: err[io_error.Error] = pin_current_to(0);
-        if (!(sel pinned.err && pinned.err.kind == io_error.UNSUPPORTED)) { ret 2; }
-        var cpus:   [8]usize;
-        var count:  usize               = 0;
-        val listed: err[io_error.Error] = allowed_cpus(?cpus[0], 8, ?count);
-        if (!(sel listed.err && listed.err.kind == io_error.UNSUPPORTED)) { ret 3; }
-        ret 0;
-    }
-}
-$or {
+$if ($mach.build.sys != $mach.sys.darwin) {
     # read the calling thread's affinity into caller storage sized for it
     #[testing]
     fun affinity_snapshot(set: *CpuSet, store: *u64, capacity: usize) bool {
         @set = cpu_set(store, capacity);
-        val read: err[io_error.Error] = current_affinity(set);
-        ret sel read.ok;
+        val err_read: err[io_error.Error] = current_affinity(set);
+        ret sel err_read.ok;
     }
 
     test thread__allowed_cpus_match_the_affinity_mask_and_each_can_be_pinned {
-        val sized: res[usize, io_error.Error] = affinity_words();
-        if (sel sized.err) { ret 1; }
-        val words: usize = sized.ok;
+        val res_sized: res[usize, io_error.Error] = affinity_words();
+        if (sel res_sized.err) { ret 1; }
+        val words: usize = res_sized.ok;
         if (words == 0 || words > 256) { ret 1; }
         var store:    [256]u64;
         var original: CpuSet;
         if (!affinity_snapshot(?original, ?store[0], words)) { ret 2; }
 
-        var cpus:   [1024]usize;
-        var count:  usize               = 0;
-        val listed: err[io_error.Error] = allowed_cpus(?cpus[0], 1024, ?count);
-        if (sel listed.err || count == 0 || count != cpu_set_size(?original)) { ret 3; }
+        var cpus:       [1024]usize;
+        var count:      usize               = 0;
+        val err_listed: err[io_error.Error] = allowed_cpus(?cpus[0], 1024, ?count);
+        if (sel err_listed.err || count == 0 || count != cpu_set_size(?original)) { ret 3; }
         var i: usize = 0;
         for (i < count) {
             if (!cpu_set_contains(?original, cpus[i])) { ret 4; }
             if (i > 0 && cpus[i] <= cpus[i - 1])       { ret 5; }
-            val nth: opt[usize] = cpu_set_nth(?original, i);
-            if (!(sel nth.some && nth.some == cpus[i])) { ret 6; }
+            val opt_nth: opt[usize] = cpu_set_nth(?original, i);
+            if (!(sel opt_nth.some && opt_nth.some == cpus[i])) { ret 6; }
             i = i + 1;
         }
 
         var pinned: bool = true;
         i = 0;
         for (i < count && i < 4) {
-            val pin: err[io_error.Error] = pin_current_to(cpus[i]);
-            if (sel pin.err) { pinned = false; }
+            val err_pin: err[io_error.Error] = pin_current_to(cpus[i]);
+            if (sel err_pin.err) { pinned = false; }
             var now_store: [256]u64;
             var now:       CpuSet;
             if (!affinity_snapshot(?now, ?now_store[0], words))              { pinned = false; }
             if (cpu_set_size(?now) != 1 || !cpu_set_contains(?now, cpus[i])) { pinned = false; }
             i = i + 1;
         }
-        val restored: err[io_error.Error] = set_current_affinity(?original);
-        if (!pinned)          { ret 7; }
-        if (sel restored.err) { ret 8; }
+        val err_restored: err[io_error.Error] = set_current_affinity(?original);
+        if (!pinned)              { ret 7; }
+        if (sel err_restored.err) { ret 8; }
         ret 0;
     }
 
@@ -881,29 +1075,29 @@ $or {
         var needed: usize = 0;
         val code:   i64   = os.thread_affinity(?one[0], 0, ?needed);
         if (os.error_kind(code) != io_error.RANGE || needed == 0) { ret 1; }
-        var cpus:   [1]usize;
-        var count:  usize               = 0;
-        val listed: err[io_error.Error] = allowed_cpus(?cpus[0], 0, ?count);
-        if (!(sel listed.err && listed.err.kind == io_error.RANGE) || count == 0) { ret 2; }
+        var cpus:       [1]usize;
+        var count:      usize               = 0;
+        val err_listed: err[io_error.Error] = allowed_cpus(?cpus[0], 0, ?count);
+        if (!(sel err_listed.err && err_listed.err.kind == io_error.RANGE) || count == 0) { ret 2; }
         ret 0;
     }
 
     test thread__pinning_to_a_cpu_the_process_cannot_use_is_invalid {
-        val sized: res[usize, io_error.Error] = affinity_words();
-        if (sel sized.err) { ret 1; }
-        val words: usize = sized.ok;
+        val res_sized: res[usize, io_error.Error] = affinity_words();
+        if (sel res_sized.err) { ret 1; }
+        val words: usize = res_sized.ok;
         if (words > 256) { ret 1; }
         var store:    [256]u64;
         var original: CpuSet;
         if (!affinity_snapshot(?original, ?store[0], words)) { ret 2; }
-        val pin:      err[io_error.Error] = pin_current_to(16000);
-        val restored: err[io_error.Error] = set_current_affinity(?original);
-        if (!(sel pin.err && pin.err.kind == io_error.INVALID)) { ret 3; }
-        if (sel restored.err)                                   { ret 4; }
+        val err_pin:      err[io_error.Error] = pin_current_to(16000);
+        val err_restored: err[io_error.Error] = set_current_affinity(?original);
+        if (!(sel err_pin.err && err_pin.err.kind == io_error.INVALID)) { ret 3; }
+        if (sel err_restored.err)                                       { ret 4; }
         var empty_words: [1]u64;
         var empty:       CpuSet              = cpu_set(?empty_words[0], 1);
-        val none:        err[io_error.Error] = set_current_affinity(?empty);
-        if (!(sel none.err && none.err.kind == io_error.INVALID)) { ret 5; }
+        val err_none:    err[io_error.Error] = set_current_affinity(?empty);
+        if (!(sel err_none.err && err_none.err.kind == io_error.INVALID)) { ret 5; }
         ret 0;
     }
 }

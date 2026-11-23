@@ -4,10 +4,10 @@
 # an operation, and how it admits a socket. everything else lives here once.
 # attached handles remain exclusively owned by the backend through completion and close.
 
-$if ($mach.build.os == $mach.os.linux) {
+$if ($mach.build.sys == $mach.sys.linux) {
     use sys: std.system.os.linux;
 }
-$or ($mach.build.os == $mach.os.darwin) {
+$or ($mach.build.sys == $mach.sys.darwin) {
     use sys: std.system.os.darwin;
 }
 $or {
@@ -15,11 +15,14 @@ $or {
 }
 
 use std.allocator;
+#[testing]
 use std.allocator.page;
+#[testing]
 use std.allocator.testing;
 use std.io.runtime;
 use std.memory;
 use std.memory.table;
+use std.net.async.retired;
 use std.net.async.types;
 use std.sync.mutex;
 use std.system.os.shared;
@@ -45,7 +48,7 @@ pub rec Operation {
     completion:     types.NativeCompletion;
     kind:           runtime.Kind;
     resource:       usize;
-    context:        usize;
+    context:        u64;
     buffer:         *u8;
     length:         usize;
     sequence:       u64;
@@ -58,6 +61,23 @@ pub rec Operation {
     pool_next: usize;
 }
 
+# one native socket the engine tracks: its queued operations and its registration
+# ---
+# state:        free or active
+# generation:   bumped on every acquire, the generation of its wire context
+# index:        its slot in the resource table
+# resource:     the native socket
+# read_head:    first queued read lane operation, NONE when empty
+# read_tail:    last queued read lane operation, NONE when empty
+# write_head:   first queued write lane operation, NONE when empty
+# write_tail:   last queued write lane operation, NONE when empty
+# close_index:  the close waiting for both lanes to drain, NONE when none
+# armed:        a native registration is armed for it
+# watched:      it holds a native registration
+# closing:      a close was submitted, so new operations are refused
+# write_closed: the write side was shut down
+# configured:   the backend set its datagram packet options on the socket
+# next_free:    the pool's free-list link while the resource is free
 pub rec Resource {
     state:        u8;
     generation:   u32;
@@ -95,6 +115,25 @@ pub rec Protocol {
     openings: bool;
 }
 
+# a readiness backend: the native queue, the tables and the finished queue
+# ---
+# queue:          the native readiness queue, borrowed from the caller
+# source_id:      the runtime source id carried in every wire context
+# protocol:       what the backend brings
+# operations:     the operation table, of protocol.operation_size records
+# resources:      the resource table
+# ready:          completions published by the last flush, dispatch or poll
+# resource_map:   open addressed map from native socket to resource index plus one
+# native:         the batch the native wait fills
+# map_capacity:   slots in resource_map, a power of two
+# live:           operations claimed and not yet released
+# resource_count: active resources
+# queued_head:    first finished operation waiting to be published
+# queued_tail:    last finished operation waiting to be published
+# queued_count:   finished operations waiting to be published
+# ready_count:    completions in ready
+# sequence:       the next submission order number
+# lock:           guards every field
 pub rec Backend {
     queue:     *shared.IoQueue;
     source_id: u16;
@@ -118,20 +157,25 @@ pub rec Backend {
     queued_count:   usize;
     ready_count:    usize;
     sequence:       u64;
-    # native registration and address calls, counted for the scaling tests
-    watches:   u64;
-    rearms:    u64;
-    unwatches: u64;
     # registrations held, zero once destroy returns
     registered: usize;
-    locates:    u64;
     lock:       mutex.Mutex;
 }
 
+# the operation record at a table index, which must be inside the table
+# ---
+# backend: the backend
+# index:   the operation index
+# ret:     the record, valid until the table shrinks past it
 pub fun operation_at(backend: *Backend, index: usize) *Operation {
     ret table.at(?backend.operations, index)::*Operation;
 }
 
+# the resource record at a table index, which must be inside the table
+# ---
+# backend: the backend
+# index:   the resource index
+# ret:     the record, valid until the table shrinks past it
 pub fun resource_at(backend: *Backend, index: usize) *Resource {
     ret table.at(?backend.resources, index)::*Resource;
 }
@@ -140,11 +184,19 @@ fun ready_at(backend: *Backend, index: usize) *types.NativeCompletion {
     ret table.at(?backend.ready, index)::*types.NativeCompletion;
 }
 
+# whether a caller range overlaps memory the backend owns
+# ---
+# backend: the backend
+# data:    start of the range
+# len:     bytes in the range
+# ret:     true on overlap, and also when the range or the backend is not valid
 pub fun aliases(backend: *Backend, data: *u8, len: usize) bool {
-    if (!memory.range_valid(data, len)) { ret true; }
-    if (len == 0)                       { ret false; }
-    if (!memory.range_valid(backend::*u8, $size_of(Backend)) ||
-        backend.queue == nil || backend.operations.capacity == 0 ||
+    if (!memory.range_valid(data, len))                       { ret true; }
+    if (len == 0)                                             { ret false; }
+    if (!memory.range_valid(backend::*u8, $size_of(Backend))) { ret true; }
+    mutex.lock(?backend.lock);
+    fin { mutex.unlock(?backend.lock); }
+    if (backend.queue == nil || backend.operations.capacity == 0 ||
         backend.map_capacity == 0) { ret true; }
     var map_bytes:    usize = 0;
     var native_bytes: usize = 0;
@@ -174,13 +226,9 @@ pub val NONE:            u32 = 0xffffffff;
 # readiness is harvested in fixed batches, so the batch is not a capacity
 val NATIVE_BATCH: usize = 256;
 
-$if ($mach.build.os == $mach.os.linux) {
-    val IN_PROGRESS: i64 = -115;
-}
-$or {
-    val IN_PROGRESS: i64 = -36;
-}
-
+# the status for an invalid argument
+# ---
+# ret: the native EINVAL
 pub fun invalid() i64 {
     ret sys.EINVAL;
 }
@@ -190,15 +238,20 @@ pub fun invalid() i64 {
 # does; the generation is what makes a stale completion detectable, and 16 bits
 # means an index must be recycled a multiple of 65535 times between a context
 # being orphaned and arriving for a stale one to pass as live
-pub fun token_context(backend: *Backend, token: types.Token) usize {
+pub fun token_context(backend: *Backend, token: types.Token) u64 {
     ret shared.io_source_context(backend.source_id, (token.index::u64 << 16) | token.generation::u64);
 }
 
-pub fun context_token(backend: *Backend, context: usize, token: *types.Token) bool {
-    val raw: u64 = context::u64;
+# decode a wire context back into the resource token it carries
+# ---
+# backend: the backend
+# context: the wire context from a native event
+# token:   receives the index and generation
+# ret:     false when the context belongs to another source, token is nil or the generation is 0
+pub fun context_token(backend: *Backend, context: u64, token: *types.Token) bool {
     if (shared.io_context_source(context) != backend.source_id || token == nil) { ret false; }
-    token.index      = ((raw >> 16) & 0xffffffff)::u32;
-    token.generation = (raw & 0xffff)::u32;
+    token.index      = ((context >> 16) & 0xffffffff)::u32;
+    token.generation = (context & 0xffff)::u32;
     ret token.generation != 0;
 }
 
@@ -210,28 +263,44 @@ fun next_wire_generation(current: u32) u32 {
     ret generation;
 }
 
+# the active operation a token names
+# ---
+# backend: the backend
+# token:   the operation token
+# ret:     nil when the token is stale, or the operation finished or was released
 #[testing]
 pub fun operation_for(backend: *Backend, token: types.Token) *Operation {
-    if (token.index::usize >= backend.operations.capacity) { ret nil; }
+    if (table.pool_untouched(?backend.operation_pool, ?backend.operations, token.index::usize)) { ret nil; }
     val operation: *Operation = operation_at(backend, token.index::usize);
     if (operation.state != SLOT_ACTIVE || operation.generation != token.generation) { ret nil; }
     ret operation;
 }
 
+# the operation a token names, active or finished and waiting to be published
+# ---
+# backend: the backend
+# token:   the operation token
+# ret:     nil when the token is stale or the operation was released
 pub fun operation_any(backend: *Backend, token: types.Token) *Operation {
-    if (token.index::usize >= backend.operations.capacity) { ret nil; }
+    if (table.pool_untouched(?backend.operation_pool, ?backend.operations, token.index::usize)) { ret nil; }
     val operation: *Operation = operation_at(backend, token.index::usize);
     if (operation.state == SLOT_FREE || operation.generation != token.generation) { ret nil; }
     ret operation;
 }
 
+# the active resource a token names
+# ---
+# backend: the backend
+# token:   the resource token, as decoded from a wire context
+# ret:     nil when the token is stale or the resource was released
 pub fun resource_for(backend: *Backend, token: types.Token) *Resource {
-    if (token.index::usize >= backend.resources.capacity) { ret nil; }
+    if (table.pool_untouched(?backend.resource_pool, ?backend.resources, token.index::usize)) { ret nil; }
     val resource: *Resource = resource_at(backend, token.index::usize);
     if (resource.state != RESOURCE_ACTIVE || resource.generation != token.generation) { ret nil; }
     ret resource;
 }
 
+# the resource map size for a resource capacity: a power of two at least twice it, 0 when it would overflow
 fun required_map_capacity(capacity: usize) usize {
     if (capacity > 0x3fffffff) { ret 0; }
     val required: usize = capacity * 2;
@@ -240,10 +309,23 @@ fun required_map_capacity(capacity: usize) usize {
     ret size;
 }
 
-fun resource_hash(resource: usize) usize {
-    ret resource * 11400714819323198485;
+# 2^w divided by the golden ratio, for a w-bit word: the fibonacci hash multiplier
+$if ($mach.build.pointer_width == 8) {
+    val GOLDEN: usize = 11400714819323198485;
+}
+$or {
+    val GOLDEN: usize = 2654435769;
 }
 
+fun resource_hash(resource: usize) usize {
+    ret resource * GOLDEN;
+}
+
+# the resource tracking a native socket
+# ---
+# backend:  the backend
+# resource: the native socket
+# ret:      nil when the backend tracks no resource for it
 pub fun resource_lookup(backend: *Backend, resource: usize) *Resource {
     var slot:    usize = resource_hash(resource) & (backend.map_capacity - 1);
     var scanned: usize = 0;
@@ -307,9 +389,9 @@ fun resize_map(backend: *Backend, capacity: usize) bool {
     val required: usize = required_map_capacity(capacity);
     if (required == 0)                    { ret false; }
     if (required == backend.map_capacity) { ret true; }
-    val got: res[*u32, allocator.Error] = allocator.allocate[u32](?backend.allocator, required);
-    if (sel got.err) { ret false; }
-    val fresh:             *u32  = got.ok;
+    val res_allocate: res[*u32, allocator.Error] = allocator.allocate[u32](?backend.allocator, required);
+    if (sel res_allocate.err) { ret false; }
+    val fresh:             *u32  = res_allocate.ok;
     val previous:          *u32  = backend.resource_map;
     val previous_capacity: usize = backend.map_capacity;
     var i:                 usize = 0;
@@ -319,8 +401,8 @@ fun resize_map(backend: *Backend, capacity: usize) bool {
     }
     backend.resource_map = fresh;
     backend.map_capacity = required;
-    i                    = 0;
-    for (i < backend.resources.capacity) {
+    i                    = table.pool_touched_from(?backend.resource_pool, ?backend.resources, 0);
+    for (i != table.NO_INDEX) {
         val entry: *Resource = resource_at(backend, i);
         if (entry.state == RESOURCE_ACTIVE && !resource_map_insert(backend, i::u32)) {
             backend.resource_map = previous;
@@ -328,26 +410,10 @@ fun resize_map(backend: *Backend, capacity: usize) bool {
             allocator.deallocate[u32](?backend.allocator, fresh, required);
             ret false;
         }
-        i = i + 1;
+        i = table.pool_touched_from(?backend.resource_pool, ?backend.resources, i + 1);
     }
     allocator.deallocate[u32](?backend.allocator, previous, previous_capacity);
     ret true;
-}
-
-# the resource table's newest chunk joins the pool, every resource free
-fun adopt_resources(backend: *Backend) {
-    var index: usize = table.chunk_start(?backend.resources, backend.resources.chunk_count - 1);
-    for (index < backend.resources.capacity) {
-        val entry: *Resource = resource_at(backend, index);
-        entry.state        = RESOURCE_FREE;
-        entry.generation   = backend.resource_pool.floor;
-        entry.index        = index::u32;
-        entry.armed        = false;
-        entry.closing      = false;
-        entry.write_closed = false;
-        index              = index + 1;
-    }
-    table.pool_adopt(?backend.resource_pool, ?backend.resources);
 }
 
 # a resource index is 32 bits wide. the map is sized for the new chunk before
@@ -358,10 +424,18 @@ fun grow_resources(backend: *Backend) bool {
     val grown: usize = backend.resources.capacity + table.chunk_capacity(?backend.resources, chunk);
     if (grown - 1 > 0xffffffff || !resize_map(backend, grown) ||
         !table.grow(?backend.resources)) { ret false; }
-    adopt_resources(backend);
+    table.pool_adopt(?backend.resource_pool, ?backend.resources);
     ret true;
 }
 
+# the resource for a native socket, created when there is none. a resource
+# under an older opening is dropped as stale first
+# ---
+# backend: the backend, locked
+# native:  the native socket
+# opening: the handle's opening, 0 for a backend whose handles carry none
+# created: set true when a new resource was made, false when an existing one is returned or the handle is refused
+# ret:     nil when the handle is older than the tracked socket or was retired, or the tables cannot grow
 pub fun resource_acquire(backend: *Backend, native: usize, opening: u64, created: *bool) *Resource {
     val existing: *Resource = resource_lookup(backend, native);
     # openings only grow, so the older of two openings is the socket that was
@@ -376,9 +450,14 @@ pub fun resource_acquire(backend: *Backend, native: usize, opening: u64, created
         ret existing;
     }
     if (table.pool_peek(?backend.resource_pool, ?backend.resources) == table.NO_INDEX && !grow_resources(backend)) { ret nil; }
-    val index:      u32       = table.pool_take(?backend.resource_pool, ?backend.resources)::u32;
-    val resource:   *Resource = resource_at(backend, index::usize);
-    val generation: u32       = next_wire_generation(resource.generation);
+    var fresh:    bool      = false;
+    val index:    u32       = table.pool_take_fresh(?backend.resource_pool, ?backend.resources, ?fresh)::u32;
+    val resource: *Resource = resource_at(backend, index::usize);
+    if (fresh) {
+        resource.generation = backend.resource_pool.floor;
+        resource.index      = index;
+    }
+    val generation: u32 = next_wire_generation(resource.generation);
     resource.state        = RESOURCE_ACTIVE;
     resource.generation   = generation;
     resource.resource     = native;
@@ -404,6 +483,10 @@ pub fun resource_acquire(backend: *Backend, native: usize, opening: u64, created
     ret resource;
 }
 
+# free a resource whose native registration is already gone, removing it from the map
+# ---
+# backend:  the backend, locked
+# resource: the active resource
 pub fun resource_release_unwatched(backend: *Backend, resource: *Resource) {
     val index: u32 = resource.index;
     set_watched(backend, resource, false);
@@ -430,7 +513,6 @@ fun resource_release(backend: *Backend, resource: *Resource) {
 # a resource removes only the registration it made itself
 fun unwatch_owned(backend: *Backend, resource: *Resource) {
     if (resource.watched) {
-        backend.unwatches = backend.unwatches + 1;
         sys.io_queue_unwatch(backend.queue, resource.resource);
     }
     set_watched(backend, resource, false);
@@ -462,30 +544,28 @@ fun grow_operations(backend: *Backend) bool {
     val grown: usize = backend.operations.capacity + table.chunk_capacity(?backend.operations, chunk);
     if (grown - 1 > 0xffffffff || !table.reserve(?backend.ready, grown) ||
         !table.grow(?backend.operations)) { ret false; }
-    adopt_operations(backend);
+    table.pool_adopt(?backend.operation_pool, ?backend.operations);
     ret true;
 }
 
-# the operation table's newest chunk joins the pool, every operation free
-fun adopt_operations(backend: *Backend) {
-    var index: usize = table.chunk_start(?backend.operations, backend.operations.chunk_count - 1);
-    for (index < backend.operations.capacity) {
-        val entry: *Operation = operation_at(backend, index);
-        entry.state      = SLOT_FREE;
-        entry.generation = backend.operation_pool.floor;
-        entry.index      = index::u32;
-        entry.previous   = NONE;
-        entry.next       = NONE;
-        index            = index + 1;
-    }
-    table.pool_adopt(?backend.operation_pool, ?backend.operations);
-}
-
-pub fun operation_claim(backend: *Backend, kind: runtime.Kind, native: usize, context: usize, token: *types.Token) *Operation {
+# claim a free operation, growing the table when none is free
+# ---
+# backend: the backend, locked
+# kind:    the operation kind
+# native:  the native socket it acts on
+# context: the caller's context, carried to the completion
+# token:   receives the operation's token
+# ret:     the claimed operation, nil when the table cannot grow
+pub fun operation_claim(backend: *Backend, kind: runtime.Kind, native: usize, context: u64, token: *types.Token) *Operation {
     if (table.pool_peek(?backend.operation_pool, ?backend.operations) == table.NO_INDEX && !grow_operations(backend)) { ret nil; }
-    val index:      u32        = table.pool_take(?backend.operation_pool, ?backend.operations)::u32;
-    val operation:  *Operation = operation_at(backend, index::usize);
-    var generation: u32        = operation.generation + 1;
+    var fresh:     bool       = false;
+    val index:     u32        = table.pool_take_fresh(?backend.operation_pool, ?backend.operations, ?fresh)::u32;
+    val operation: *Operation = operation_at(backend, index::usize);
+    if (fresh) {
+        operation.generation = backend.operation_pool.floor;
+        operation.index      = index;
+    }
+    var generation: u32 = operation.generation + 1;
     if (generation == 0) { generation = 1; }
     operation.state      = SLOT_ACTIVE;
     operation.generation = generation;
@@ -503,6 +583,10 @@ pub fun operation_claim(backend: *Backend, kind: runtime.Kind, native: usize, co
     ret operation;
 }
 
+# return an operation to the free pool
+# ---
+# backend: the backend, locked
+# index:   the operation index
 pub fun operation_release(backend: *Backend, index: u32) {
     val operation: *Operation = operation_at(backend, index::usize);
     operation.state    = SLOT_FREE;
@@ -524,8 +608,8 @@ pub fun trim_locked(backend: *Backend) {
     for (backend.ready.chunk_count > 1) {
         val top: usize = backend.ready.chunk_count - 1;
         if (backend.ready.capacity - table.chunk_capacity(?backend.ready, top) < keep) { brk; }
-        val released: err[allocator.Error] = table.shrink(?backend.ready);
-        if (sel released.err) { brk; }
+        val err_released: err[allocator.Error] = table.shrink(?backend.ready);
+        if (sel err_released.err) { brk; }
     }
     # a refused rehash keeps the larger map, which still fits
     if (table.pool_trim(?backend.resource_pool, ?backend.resources, $offset_of(Resource, generation)) != 0) {
@@ -612,10 +696,12 @@ fun queued_unlink(backend: *Backend, operation: *Operation) {
     backend.queued_count = backend.queued_count - 1;
 }
 
+# a connect in flight is the contract's CONNECT_PENDING, never this
 pub fun would_block(status: i64) bool {
-    ret status == sys.EAGAIN || status == IN_PROGRESS;
+    ret status == sys.EAGAIN;
 }
 
+# finish every queued operation on a resource with status, oldest submission first
 fun fail_resource(backend: *Backend, resource: *Resource, status: i64) {
     for (resource.read_head != NONE || resource.write_head != NONE) {
         var index: u32 = resource.read_head;
@@ -626,6 +712,9 @@ fun fail_resource(backend: *Backend, resource: *Resource, status: i64) {
     }
 }
 
+# register or rearm a resource for what its lanes wait on. with both lanes
+# empty a pending close runs. a failed registration fails the resource and
+# releases it
 fun arm_resource(backend: *Backend, resource: *Resource) {
     var events: u32 = 0;
     if (resource.read_head != NONE)  { events = events | sys.IO_EVENT_READ; }
@@ -650,12 +739,10 @@ fun arm_resource(backend: *Backend, resource: *Resource) {
     val token:  types.Token = types.Token{index: resource.index, generation: resource.generation};
     var status: i64         = 0;
     if (resource.watched) {
-        backend.rearms = backend.rearms + 1;
-        status         = sys.io_queue_rearm(backend.queue, resource.resource, token_context(backend, token), events);
+        status = sys.io_queue_rearm(backend.queue, resource.resource, token_context(backend, token), events);
     }
     or {
-        backend.watches = backend.watches + 1;
-        status          = sys.io_queue_watch(backend.queue, resource.resource, token_context(backend, token), events);
+        status = sys.io_queue_watch(backend.queue, resource.resource, token_context(backend, token), events);
     }
     # the registration vanishes only when every descriptor for the socket is
     # closed, so the socket this resource tracked was closed outside the driver
@@ -680,6 +767,7 @@ fun arm_resource(backend: *Backend, resource: *Resource) {
     resource.armed = true;
 }
 
+# try the queued operations each signalled lane allows, in order, then rearm
 fun drive_resource(backend: *Backend, resource: *Resource, events: u32) {
     val failure: bool = (events & (sys.IO_EVENT_ERROR | sys.IO_EVENT_HANGUP)) != 0;
     if ((events & sys.IO_EVENT_READ) != 0 || failure) {
@@ -701,10 +789,12 @@ fun drive_resource(backend: *Backend, resource: *Resource, events: u32) {
 # and reused, or detached
 pub fun stale(backend: *Backend, native: usize, opening: u64) bool {
     val known: *Resource = resource_lookup(backend, native);
-    ret known != nil && (opening < known.opening || (known.retired && opening == known.opening));
+    if (known != nil && opening == known.opening) { ret known.retired; }
+    if (known != nil && opening < known.opening)  { ret true; }
+    ret retired.stale(native, opening);
 }
 
-fun prepare(backend: *Backend, native: usize, opening: u64, kind: runtime.Kind, context: usize, lane: u8, token: *types.Token, resource_out: **Resource, operation_out: **Operation) i64 {
+fun prepare(backend: *Backend, native: usize, opening: u64, kind: runtime.Kind, context: u64, lane: u8, token: *types.Token, resource_out: **Resource, operation_out: **Operation) i64 {
     if (backend == nil || token == nil || resource_out == nil || operation_out == nil) { ret invalid(); }
     if (resource_lookup(backend, native) == nil) {
         val admitted: i64 = backend.protocol.admit(backend, native);
@@ -713,7 +803,8 @@ fun prepare(backend: *Backend, native: usize, opening: u64, kind: runtime.Kind, 
     if (stale(backend, native, opening)) { ret types.STATUS_STALE; }
     var created:  bool      = false;
     val resource: *Resource = resource_acquire(backend, native, opening, ?created);
-    if (resource == nil || resource.closing) { ret sys.EBADF; }
+    if (resource == nil)  { ret sys.ENOMEM; }
+    if (resource.closing) { ret sys.EBADF; }
     if (lane == LANE_WRITE && resource.write_closed && kind != runtime.CLOSE) {
         if (created) { resource_release(backend, resource); }
         ret sys.EPIPE;
@@ -734,12 +825,16 @@ fun prepare(backend: *Backend, native: usize, opening: u64, kind: runtime.Kind, 
 }
 
 # a refused submission may have dropped a stale resource, so it trims too
-pub fun begin(backend: *Backend, native: usize, opening: u64, kind: runtime.Kind, context: usize, lane: u8, token: *types.Token, resource_out: **Resource, operation_out: **Operation) i64 {
+pub fun begin(backend: *Backend, native: usize, opening: u64, kind: runtime.Kind, context: u64, lane: u8, token: *types.Token, resource_out: **Resource, operation_out: **Operation) i64 {
     val status: i64 = prepare(backend, native, opening, kind, context, lane, token, resource_out, operation_out);
     if (status < 0) { trim_locked(backend); }
     ret status;
 }
 
+# end a submission: drive the resource once, trim, unlock and wake the waiter
+# ---
+# backend:  the backend, locked on entry and unlocked on return
+# resource: the resource the submission queued on
 pub fun submission_done(backend: *Backend, resource: *Resource) {
     drive_resource(backend, resource, sys.IO_EVENT_READ | sys.IO_EVENT_WRITE);
     trim_locked(backend);
@@ -753,37 +848,37 @@ pub fun submission_done(backend: *Backend, resource: *Resource) {
 # a:        where the tables, the resource map and the completion batch come from;
 #           the backend keeps a copy, so a's context must outlive it
 # protocol: what the backend brings, kept by the engine
-pub fun make(backend: *Backend, queue: *shared.IoQueue, a: *allocator.Allocator, initial: usize, source_id: u16, protocol: Protocol) i64 {
+pub fun init(backend: *Backend, queue: *shared.IoQueue, a: *allocator.Allocator, initial: usize, source_id: u16, protocol: Protocol) i64 {
     if (backend == nil || queue == nil || a == nil || initial == 0 || source_id == 0 || protocol.operation_size < $size_of(Operation)) { ret invalid(); }
     val map_capacity: usize = required_map_capacity(initial);
     if (map_capacity == 0) { ret sys.ENOMEM; }
     backend.allocator = @a;
-    if (!table.make(?backend.operations, ?backend.allocator, protocol.operation_size, initial)) { ret sys.ENOMEM; }
-    if (!table.make(?backend.resources, ?backend.allocator, $size_of(Resource), initial) ||
-        !table.make(?backend.ready, ?backend.allocator, $size_of(types.NativeCompletion), initial)) {
-        table.destroy(?backend.ready);
-        table.destroy(?backend.resources);
-        table.destroy(?backend.operations);
+    if (!table.init(?backend.operations, ?backend.allocator, protocol.operation_size, initial)) { ret sys.ENOMEM; }
+    if (!table.init(?backend.resources, ?backend.allocator, $size_of(Resource), initial) ||
+        !table.init(?backend.ready, ?backend.allocator, $size_of(types.NativeCompletion), initial)) {
+        table.dnit(?backend.ready);
+        table.dnit(?backend.resources);
+        table.dnit(?backend.operations);
         ret sys.ENOMEM;
     }
-    val map: res[*u32, allocator.Error] = allocator.zallocate[u32](?backend.allocator, map_capacity);
-    if (sel map.err) {
-        table.destroy(?backend.ready);
-        table.destroy(?backend.resources);
-        table.destroy(?backend.operations);
+    val res_map: res[*u32, allocator.Error] = allocator.zallocate[u32](?backend.allocator, map_capacity);
+    if (sel res_map.err) {
+        table.dnit(?backend.ready);
+        table.dnit(?backend.resources);
+        table.dnit(?backend.operations);
         ret sys.ENOMEM;
     }
-    backend.resource_map = map.ok;
-    val batch: res[*sys.IoCompletion, allocator.Error] = allocator.allocate[sys.IoCompletion](?backend.allocator, NATIVE_BATCH);
-    if (sel batch.err) {
+    backend.resource_map = res_map.ok;
+    val res_batch: res[*sys.IoCompletion, allocator.Error] = allocator.allocate[sys.IoCompletion](?backend.allocator, NATIVE_BATCH);
+    if (sel res_batch.err) {
         allocator.deallocate[u32](?backend.allocator, backend.resource_map, map_capacity);
         backend.resource_map = nil;
-        table.destroy(?backend.ready);
-        table.destroy(?backend.resources);
-        table.destroy(?backend.operations);
+        table.dnit(?backend.ready);
+        table.dnit(?backend.resources);
+        table.dnit(?backend.operations);
         ret sys.ENOMEM;
     }
-    backend.native = batch.ok;
+    backend.native = res_batch.ok;
 
     backend.queue          = queue;
     backend.source_id      = source_id;
@@ -793,18 +888,14 @@ pub fun make(backend: *Backend, queue: *shared.IoQueue, a: *allocator.Allocator,
     backend.resource_count = 0;
     table.pool_make(?backend.operation_pool, $offset_of(Operation, pool_next));
     table.pool_make(?backend.resource_pool, $offset_of(Resource, next_free));
-    adopt_operations(backend);
-    adopt_resources(backend);
+    table.pool_adopt(?backend.operation_pool, ?backend.operations);
+    table.pool_adopt(?backend.resource_pool, ?backend.resources);
     backend.queued_head  = NONE;
     backend.queued_tail  = NONE;
     backend.queued_count = 0;
     backend.ready_count  = 0;
     backend.sequence     = 1;
-    backend.watches      = 0;
-    backend.rearms       = 0;
-    backend.unwatches    = 0;
     backend.registered   = 0;
-    backend.locates      = 0;
     backend.lock         = mutex.make();
     var i: usize = 0;
     for (i < map_capacity) {
@@ -814,7 +905,17 @@ pub fun make(backend: *Backend, queue: *shared.IoQueue, a: *allocator.Allocator,
     ret 0;
 }
 
-pub fun submit_read(backend: *Backend, native: usize, opening: u64, buffer: *u8, length: usize, context: usize, token: *types.Token) i64 {
+# queue a read into a borrowed buffer
+# ---
+# backend: the backend
+# native:  the native socket
+# opening: the handle's opening, 0 for a backend whose handles carry none
+# buffer:  where the bytes go, borrowed until the operation completes
+# length:  the buffer size in bytes
+# context: the caller's context, carried to the completion
+# token:   receives the operation's token
+# ret:     0 once queued, or a negative native error or STATUS_STALE
+pub fun submit_read(backend: *Backend, native: usize, opening: u64, buffer: *u8, length: usize, context: u64, token: *types.Token) i64 {
     if (backend == nil || token == nil || (buffer == nil && length != 0)) { ret invalid(); }
     mutex.lock(?backend.lock);
     var resource:  *Resource;
@@ -832,7 +933,7 @@ pub fun submit_read(backend: *Backend, native: usize, opening: u64, buffer: *u8,
 
 # wait for the stream to be readable without a buffer: the completion reports
 # end_of_stream at orderly EOF, and nothing is read
-pub fun submit_readable(backend: *Backend, native: usize, opening: u64, context: usize, token: *types.Token) i64 {
+pub fun submit_readable(backend: *Backend, native: usize, opening: u64, context: u64, token: *types.Token) i64 {
     if (backend == nil || token == nil) { ret invalid(); }
     mutex.lock(?backend.lock);
     var resource:  *Resource;
@@ -846,7 +947,17 @@ pub fun submit_readable(backend: *Backend, native: usize, opening: u64, context:
     ret 0;
 }
 
-pub fun submit_write(backend: *Backend, native: usize, opening: u64, buffer: *u8, length: usize, context: usize, token: *types.Token) i64 {
+# queue a write from a borrowed buffer
+# ---
+# backend: the backend
+# native:  the native socket
+# opening: the handle's opening, 0 for a backend whose handles carry none
+# buffer:  the bytes to send, borrowed until the operation completes
+# length:  bytes to send
+# context: the caller's context, carried to the completion
+# token:   receives the operation's token
+# ret:     0 once queued, or a negative native error or STATUS_STALE. EPIPE after a write shutdown
+pub fun submit_write(backend: *Backend, native: usize, opening: u64, buffer: *u8, length: usize, context: u64, token: *types.Token) i64 {
     if (backend == nil || token == nil || (buffer == nil && length != 0)) { ret invalid(); }
     mutex.lock(?backend.lock);
     var resource:  *Resource;
@@ -862,7 +973,15 @@ pub fun submit_write(backend: *Backend, native: usize, opening: u64, buffer: *u8
     ret 0;
 }
 
-pub fun submit_shutdown_write(backend: *Backend, native: usize, opening: u64, context: usize, token: *types.Token) i64 {
+# queue a shutdown of the write side, behind the writes already queued
+# ---
+# backend: the backend
+# native:  the native socket
+# opening: the handle's opening, 0 for a backend whose handles carry none
+# context: the caller's context, carried to the completion
+# token:   receives the operation's token
+# ret:     0 once queued, or a negative native error or STATUS_STALE
+pub fun submit_shutdown_write(backend: *Backend, native: usize, opening: u64, context: u64, token: *types.Token) i64 {
     if (backend == nil || token == nil) { ret invalid(); }
     mutex.lock(?backend.lock);
     var resource:  *Resource;
@@ -876,7 +995,16 @@ pub fun submit_shutdown_write(backend: *Backend, native: usize, opening: u64, co
     ret 0;
 }
 
-pub fun begin_close_locked(backend: *Backend, native: usize, opening: u64, context: usize, token: *types.Token, resource_out: **Resource) i64 {
+# start a close: queued reads finish cancelled and the close waits for the writes to drain
+# ---
+# backend:      the backend, locked
+# native:       the native socket
+# opening:      the handle's opening, 0 for a backend whose handles carry none
+# context:      the caller's context, carried to the completion
+# token:        receives the close operation's token
+# resource_out: receives the resource being closed
+# ret:          0 once started, or a negative native error or STATUS_STALE
+pub fun begin_close_locked(backend: *Backend, native: usize, opening: u64, context: u64, token: *types.Token, resource_out: **Resource) i64 {
     var operation: *Operation;
     val status:    i64 = begin(backend, native, opening, runtime.CLOSE, context, LANE_NONE, token, resource_out, ?operation);
     if (status < 0) { ret status; }
@@ -890,7 +1018,15 @@ pub fun begin_close_locked(backend: *Backend, native: usize, opening: u64, conte
     ret 0;
 }
 
-pub fun submit_close(backend: *Backend, native: usize, opening: u64, context: usize, token: *types.Token) i64 {
+# queue a close, which closes the native socket once its queued writes finish
+# ---
+# backend: the backend
+# native:  the native socket, owned by the backend from here
+# opening: the handle's opening, 0 for a backend whose handles carry none
+# context: the caller's context, carried to the completion
+# token:   receives the operation's token
+# ret:     0 once queued, or a negative native error or STATUS_STALE
+pub fun submit_close(backend: *Backend, native: usize, opening: u64, context: u64, token: *types.Token) i64 {
     if (backend == nil || token == nil) { ret invalid(); }
     mutex.lock(?backend.lock);
     var resource: *Resource;
@@ -965,6 +1101,10 @@ fun publish_ready(backend: *Backend) usize {
     ret count;
 }
 
+# publish the finished operations without waiting
+# ---
+# backend: the backend
+# ret:     the number of completions now readable through completion, or EINVAL
 pub fun flush(backend: *Backend) i64 {
     if (backend == nil) { ret invalid(); }
     mutex.lock(?backend.lock);
@@ -973,9 +1113,18 @@ pub fun flush(backend: *Backend) i64 {
     ret ready::i64;
 }
 
+# handle one event the runtime's shared queue delivered
+# ---
+# backend: the backend
+# context: the event's wire context
+# events:  the native readiness events
+# status:  unused by this engine
+# flags:   unused by this engine
+# claimed: set true when the context belongs to this backend
+# ret:     the number of completions now readable through completion, or EINVAL
 pub fun dispatch(
     backend: *Backend,
-    context: usize,
+    context: u64,
     events: u32,
     status: i64,
     flags: u64,
@@ -1032,13 +1181,23 @@ pub fun poll(backend: *Backend, timeout_ms: i32) i64 {
     ret ready::i64;
 }
 
+# copy out one completion the last publish made readable
+# ---
+# backend: the backend
+# index:   below the count the last flush, dispatch or poll returned
+# out:     receives the completion
+# ret:     0, or EINVAL for a bad argument or an index past the count
 pub fun completion(backend: *Backend, index: usize, out: *types.NativeCompletion) i64 {
     if (backend == nil || out == nil || index >= backend.ready_count) { ret invalid(); }
     @out = @ready_at(backend, index);
     ret 0;
 }
 
-pub fun destroy(backend: *Backend) i64 {
+# release the backend, its idle resources and their registrations
+# ---
+# backend: the backend
+# ret:     0, EBUSY while an operation is live or unpublished, EINVAL for nil
+pub fun dnit(backend: *Backend) i64 {
     if (backend == nil) { ret invalid(); }
     mutex.lock(?backend.lock);
     if (backend.live != 0 || backend.queued_count != 0) {
@@ -1046,19 +1205,19 @@ pub fun destroy(backend: *Backend) i64 {
         ret sys.EBUSY;
     }
     # sockets idle at destruction still hold their resource and registration
-    var slot: usize = 0;
-    for (slot < backend.resources.capacity) {
+    var slot: usize = table.pool_touched_from(?backend.resource_pool, ?backend.resources, 0);
+    for (slot != table.NO_INDEX) {
         val resource: *Resource = resource_at(backend, slot);
         if (resource.state == RESOURCE_ACTIVE) { resource_release(backend, resource); }
-        slot = slot + 1;
+        slot = table.pool_touched_from(?backend.resource_pool, ?backend.resources, slot + 1);
     }
     # a registration left behind could name this source id after it is reused
     if (backend.registered != 0) { panic.panic("std.net.async: destroy left a native registration behind\n"); }
     allocator.deallocate[sys.IoCompletion](?backend.allocator, backend.native, NATIVE_BATCH);
     allocator.deallocate[u32](?backend.allocator, backend.resource_map, backend.map_capacity);
-    table.destroy(?backend.ready);
-    table.destroy(?backend.resources);
-    table.destroy(?backend.operations);
+    table.dnit(?backend.ready);
+    table.dnit(?backend.resources);
+    table.dnit(?backend.operations);
     backend.native       = nil;
     backend.resource_map = nil;
     backend.map_capacity = 0;
@@ -1071,24 +1230,28 @@ pub fun destroy(backend: *Backend) i64 {
     ret 0;
 }
 
+# close a native socket
+# ---
+# resource: the native socket
+# ret:      0, or a negative native error
 pub fun socket_close(resource: usize) i64 {
     ret sys.sock_close(resource);
 }
 
 # an engine with no backend behind it, for the tests that drive its tables
 #[testing]
-fun test_attempt(backend: *Backend, resource: *Resource, operation: *Operation) bool {
+fun attempt(backend: *Backend, resource: *Resource, operation: *Operation) bool {
     ret false;
 }
 
 #[testing]
-fun test_admit(backend: *Backend, native: usize) i64 {
+fun admit(backend: *Backend, native: usize) i64 {
     ret 0;
 }
 
 #[testing]
-fun test_protocol() Protocol {
-    ret Protocol{operation_size: $size_of(Operation), attempt: test_attempt, admit: test_admit, openings: true};
+fun protocol() Protocol {
+    ret Protocol{operation_size: $size_of(Operation), attempt: attempt, admit: admit, openings: true};
 }
 
 test async_readiness__a_resource_index_past_the_old_bound_survives_the_wire {
@@ -1097,13 +1260,13 @@ test async_readiness__a_resource_index_past_the_old_bound_survives_the_wire {
     var queue: shared.IoQueue;
     if (sys.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, ?pa, 1, 7, test_protocol()) < 0) {
+    if (init(?backend, ?queue, ?pa, 1, 7, protocol()) < 0) {
         sys.io_queue_close(?queue);
         ret 2;
     }
     for (backend.resources.capacity < 70000) {
         if (!grow_resources(?backend)) {
-            destroy(?backend);
+            dnit(?backend);
             sys.io_queue_close(?queue);
             ret 3;
         }
@@ -1111,20 +1274,19 @@ test async_readiness__a_resource_index_past_the_old_bound_survives_the_wire {
     val first:   *Resource   = resource_at(?backend, 0);
     val high:    types.Token = types.Token{index: 69999, generation: 0xffff};
     var round:   types.Token;
-    val encoded: usize       = token_context(?backend, high);
+    val encoded: u64         = token_context(?backend, high);
     val decoded: bool        = context_token(?backend, encoded, ?round);
-    val foreign: usize       = ((encoded::u64) ^ (1::u64 << 48))::usize;
+    val foreign: u64         = encoded ^ (1::u64 << 48);
     var ignored: types.Token;
-    val zero:    usize       = token_context(?backend, types.Token{index: 69999, generation: 0});
+    val zero:    u64         = token_context(?backend, types.Token{index: 69999, generation: 0});
     val valid:   bool        = backend.resources.capacity >= 70000 &&
         decoded && round.index == 69999 && round.generation == 0xffff &&
         !context_token(?backend, foreign, ?ignored) &&
         !context_token(?backend, zero, ?ignored) &&
         next_wire_generation(0xffff) == 1 &&
         next_wire_generation(1) == 2 &&
-        resource_at(?backend, 0) == first &&
-        resource_at(?backend, 69999).index == 69999;
-    val destroyed: i64 = destroy(?backend);
+        resource_at(?backend, 0) == first;
+    val destroyed: i64 = dnit(?backend);
     sys.io_queue_close(?queue);
     if (!valid || destroyed < 0) { ret 4; }
     ret 0;
@@ -1133,7 +1295,7 @@ test async_readiness__a_resource_index_past_the_old_bound_survives_the_wire {
 # slots that hold something other than a live resource: tombstones, which
 # lengthen every later lookup
 #[testing]
-fun test_map_stale(backend: *Backend) usize {
+fun map_stale(backend: *Backend) usize {
     var stale: usize = 0;
     var slot:  usize = 0;
     for (slot < backend.map_capacity) {
@@ -1149,7 +1311,7 @@ fun test_map_stale(backend: *Backend) usize {
 
 # the probes a lookup of value makes before it finds value or an empty slot
 #[testing]
-fun test_map_probes(backend: *Backend, value: usize) usize {
+fun map_probes(backend: *Backend, value: usize) usize {
     var slot:   usize = resource_hash(value) & (backend.map_capacity - 1);
     var probes: usize = 1;
     for (probes <= backend.map_capacity) {
@@ -1169,13 +1331,13 @@ fun test_map_probes(backend: *Backend, value: usize) usize {
 # n resources registered and released for several rounds, then n live ones:
 # reports leftover stale slots and the longest hit and miss probe
 #[testing]
-fun test_map_churn(n: usize, stale: *usize, max_hit: *usize, max_miss: *usize) i64 {
+fun map_churn(n: usize, stale: *usize, max_hit: *usize, max_miss: *usize) i64 {
     var pa: allocator.Allocator;
     page.make(?pa);
     var queue: shared.IoQueue;
     if (sys.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, ?pa, n, 1, test_protocol()) < 0) {
+    if (init(?backend, ?queue, ?pa, n, 1, protocol()) < 0) {
         sys.io_queue_close(?queue);
         ret 2;
     }
@@ -1200,13 +1362,13 @@ fun test_map_churn(n: usize, stale: *usize, max_hit: *usize, max_miss: *usize) i
         }
         round = round + 1;
     }
-    @stale    = test_map_stale(?backend);
+    @stale    = map_stale(?backend);
     @max_hit  = 0;
     @max_miss = 0;
     var j: usize = 0;
     for (j < n) {
-        val hit:  usize = test_map_probes(?backend, base + j);
-        val miss: usize = test_map_probes(?backend, base + n + j);
+        val hit:  usize = map_probes(?backend, base + j);
+        val miss: usize = map_probes(?backend, base + n + j);
         if (hit > @max_hit)   { @max_hit = hit; }
         if (miss > @max_miss) { @max_miss = miss; }
         j = j + 1;
@@ -1218,7 +1380,7 @@ fun test_map_churn(n: usize, stale: *usize, max_hit: *usize, max_miss: *usize) i
         resource_release_unwatched(?backend, resource);
         j = j + 1;
     }
-    if (destroy(?backend) < 0) { ret 6; }
+    if (dnit(?backend) < 0) { ret 6; }
     sys.io_queue_close(?queue);
     ret 0;
 }
@@ -1231,7 +1393,7 @@ test async_readiness__resource_lookups_stay_bounded_after_churn {
         var stale:    usize = 0;
         var max_hit:  usize = 0;
         var max_miss: usize = 0;
-        val churned:  i64   = test_map_churn(sizes[i], ?stale, ?max_hit, ?max_miss);
+        val churned:  i64   = map_churn(sizes[i], ?stale, ?max_hit, ?max_miss);
         if (churned != 0)                  { ret 10 + churned::i32; }
         if (stale != 0)                    { ret 20 + i::i32; }
         if (max_hit > 32 || max_miss > 32) { ret 30 + i::i32; }
@@ -1255,19 +1417,50 @@ test async_readiness__destroy_removes_every_registration_it_holds {
         sys.close(pipe[1]);
     }
     var backend: Backend;
-    if (make(?backend, ?queue, ?pa, 8, 1, test_protocol()) < 0) { ret 3; }
+    if (init(?backend, ?queue, ?pa, 8, 1, protocol()) < 0) { ret 3; }
     var created:  bool      = false;
     val resource: *Resource = resource_acquire(?backend, pipe[0]::usize, 0, ?created);
     if (resource == nil) { ret 4; }
-    val context: usize = token_context(?backend, types.Token{index: resource.index, generation: resource.generation});
+    val context: u64 = token_context(?backend, types.Token{index: resource.index, generation: resource.generation});
     if (sys.io_queue_watch(?queue, pipe[0]::usize, context, sys.IO_EVENT_READ) < 0) { ret 5; }
     set_watched(?backend, resource, true);
-    if (backend.registered != 1)                          { ret 6; }
-    if (destroy(?backend) < 0 || backend.registered != 0) { ret 7; }
+    if (backend.registered != 1)                       { ret 6; }
+    if (dnit(?backend) < 0 || backend.registered != 0) { ret 7; }
     var byte: u8 = 1;
     if (sys.write(pipe[1], ?byte, 1) != 1) { ret 8; }
     var events: [4]sys.IoCompletion;
     if (sys.io_queue_poll(?queue, ?events[0], 4, 0) != 0) { ret 9; }
+    ret 0;
+}
+
+# growth writes no operation or resource until it is taken
+test async_readiness__growth_writes_no_element_until_it_is_taken {
+    # the tracker is too large for the stack, so it lives on the mapper
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    val res_allocate_raw: res[ptr, allocator.Error] = allocator.allocate_raw(?pa, $size_of(testing.Testing), 16);
+    if (sel res_allocate_raw.err) { ret 1; }
+    val t: *testing.Testing = res_allocate_raw.ok::*testing.Testing;
+    fin { allocator.deallocate_raw(?pa, res_allocate_raw.ok, $size_of(testing.Testing), 16); }
+    val err_testing_made: err[allocator.Error] = testing.init(t);
+    if (sel err_testing_made.err) { ret 1; }
+    fin { testing.dnit(t); }
+    var queue: shared.IoQueue;
+    if (sys.io_queue_create(?queue) < 0) { ret 2; }
+    fin { sys.io_queue_close(?queue); }
+    var backend: Backend;
+    if (init(?backend, ?queue, testing.allocator_of(t), 2, 1, protocol()) < 0) { ret 3; }
+    if (!grow_operations(?backend) || !grow_resources(?backend))               { ret 4; }
+    var created:  bool      = false;
+    val resource: *Resource = resource_acquire(?backend, 77, 0, ?created);
+    if (resource == nil) { ret 5; }
+    var token: types.Token;
+    if (operation_claim(?backend, runtime.READ, 77, 0, ?token) == nil) { ret 6; }
+    val paint: u8 = testing.POISON_NEW;
+    if (!table.pool_unwritten(?backend.operation_pool, ?backend.operations, paint)) { ret 7; }
+    if (!table.pool_unwritten(?backend.resource_pool, ?backend.resources, paint))   { ret 8; }
+    operation_release(?backend, token.index);
+    if (dnit(?backend) < 0) { ret 9; }
     ret 0;
 }
 
@@ -1280,33 +1473,33 @@ fun footprint_peak(n: usize, idle: *usize, peak: *usize, after: *usize) i64 {
     testing.counting_make(?counting, ?a);
     var pa: allocator.Allocator;
     page.make(?pa);
-    val tokens: res[*types.Token, allocator.Error] = allocator.allocate[types.Token](?pa, n);
-    if (sel tokens.err) { ret 1; }
+    val res_tokens: res[*types.Token, allocator.Error] = allocator.allocate[types.Token](?pa, n);
+    if (sel res_tokens.err) { ret 1; }
     var queue: shared.IoQueue;
     if (sys.io_queue_create(?queue) < 0) { ret 2; }
     var backend: Backend;
-    if (make(?backend, ?queue, ?a, 64, 1, test_protocol()) < 0) { ret 3; }
+    if (init(?backend, ?queue, ?a, 64, 1, protocol()) < 0) { ret 3; }
     @idle = counting.live;
     var j: usize = 0;
     for (j < n) {
         var created: bool = false;
-        if (resource_acquire(?backend, 0x100000 + j, 1, ?created) == nil)                   { ret 4; }
-        if (operation_claim(?backend, runtime.READ, 0x100000 + j, j, ?tokens.ok[j]) == nil) { ret 5; }
+        if (resource_acquire(?backend, 0x100000 + j, 1, ?created) == nil)                            { ret 4; }
+        if (operation_claim(?backend, runtime.READ, 0x100000 + j, j::u64, ?res_tokens.ok[j]) == nil) { ret 5; }
         j = j + 1;
     }
     @peak = counting.live;
     j     = 0;
     for (j < n) {
-        operation_release(?backend, tokens.ok[j].index);
+        operation_release(?backend, res_tokens.ok[j].index);
         resource_release_unwatched(?backend, resource_lookup(?backend, 0x100000 + j));
         j = j + 1;
     }
     trim_locked(?backend);
     @after = counting.live;
     if (backend.live != 0 || backend.resource_count != 0) { ret 6; }
-    if (destroy(?backend) < 0)                            { ret 7; }
+    if (dnit(?backend) < 0)                               { ret 7; }
     sys.io_queue_close(?queue);
-    allocator.deallocate[types.Token](?pa, tokens.ok, n);
+    allocator.deallocate[types.Token](?pa, res_tokens.ok, n);
     if (counting.live != 0) { ret 8; }
     ret 0;
 }
@@ -1339,7 +1532,7 @@ test async_readiness__live_entries_survive_a_shrink_and_stale_tokens_stay_refuse
     var queue: shared.IoQueue;
     if (sys.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, ?pa, 4, 1, test_protocol()) < 0) { ret 1; }
+    if (init(?backend, ?queue, ?pa, 4, 1, protocol()) < 0) { ret 1; }
     var created: bool = false;
     # a low operation and resource held across the shrink
     val low:           *Resource  = resource_acquire(?backend, 0x200000, 1, ?created);
@@ -1357,7 +1550,7 @@ test async_readiness__live_entries_survive_a_shrink_and_stale_tokens_stay_refuse
     if (backend.operations.chunk_count < 4 || backend.resources.chunk_count < 4) { ret 4; }
     val high:          types.Token = tokens[63];
     val high_resource: *Resource   = resource_lookup(?backend, 0x300000 + 63);
-    val high_context:  usize       = token_context(?backend, types.Token{index: high_resource.index, generation: high_resource.generation});
+    val high_context:  u64         = token_context(?backend, types.Token{index: high_resource.index, generation: high_resource.generation});
     # the last entry pins the top chunk, so nothing goes
     j = 0;
     for (j < 63) {
@@ -1401,7 +1594,7 @@ test async_readiness__live_entries_survive_a_shrink_and_stale_tokens_stay_refuse
     }
     operation_release(?backend, low_token.index);
     resource_release_unwatched(?backend, low);
-    if (destroy(?backend) < 0) { ret 13; }
+    if (dnit(?backend) < 0) { ret 13; }
     sys.io_queue_close(?queue);
     ret 0;
 }
@@ -1415,11 +1608,11 @@ test async_readiness__a_load_oscillating_across_a_chunk_boundary_allocates_once 
     var queue: shared.IoQueue;
     if (sys.io_queue_create(?queue) < 0) { ret 1; }
     var backend: Backend;
-    if (make(?backend, ?queue, ?a, 4, 1, test_protocol()) < 0) { ret 1; }
+    if (init(?backend, ?queue, ?a, 4, 1, protocol()) < 0) { ret 1; }
     var tokens: [5]types.Token;
     var j:      usize = 0;
     for (j < 4) {
-        if (operation_claim(?backend, runtime.READ, 1, j, ?tokens[j]) == nil) { ret 2; }
+        if (operation_claim(?backend, runtime.READ, 1, j::u64, ?tokens[j]) == nil) { ret 2; }
         j = j + 1;
     }
     var crossed: usize = 0;
@@ -1439,7 +1632,7 @@ test async_readiness__a_load_oscillating_across_a_chunk_boundary_allocates_once 
     }
     trim_locked(?backend);
     if (backend.operations.chunk_count != 1 || backend.ready.chunk_count != 1) { ret 5; }
-    if (destroy(?backend) < 0)                                                 { ret 6; }
+    if (dnit(?backend) < 0)                                                    { ret 6; }
     sys.io_queue_close(?queue);
     if (counting.live != 0) { ret 7; }
     ret 0;

@@ -12,16 +12,18 @@ set -euo pipefail
 
 mach="${1:-mach}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$here/../lib/compiler.sh"
-cd "$here"
+root="$(cd "$here/../.." && pwd)"
+work="$here/out/probe"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
-# copy the dependency inside the fixture project
-rm -rf dep
-mkdir -p dep/std
-cp ../../mach.toml dep/std/mach.toml
-cp -R ../../src dep/std/src
+# the generated cases build in a scratch copy, so the tracked project stays
+# one formatted program and never holds a case
+rm -rf "$work"
+mkdir -p "$work"
+sed "s#^path = \"../..\"#path = \"$root\"#" "$here/mach.toml" > "$work/mach.toml"
+cd "$work"
+"$mach" dep pull . --quiet
 
 emit() {
     mkdir -p src
@@ -46,7 +48,7 @@ fun main(argc: i64, argv: **u8) i64 {
     var slot: i64 = 0;
     var w: writer.Writer;
     w.ctx = (?slot)::ptr;
-    w.f_write = sink;
+    w.fn_write = sink;
 $2
     ret 0;
 }
@@ -57,7 +59,7 @@ EOF
 build() {
     rm -rf out
     set +e
-    log="$(mach_run build . --profile debug 2>&1)"
+    log="$("$mach" build . --profile debug 2>&1)"
     code=$?
     set -e
 }

@@ -17,7 +17,6 @@ profile=debug
 case "$target" in windows-*) profile=windows-opt0 ;; esac
 runner="${3:-}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$here/../lib/compiler.sh"
 cd "$here"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
@@ -36,22 +35,22 @@ decode() {
 
 # vendor this checkout's std as a physical copy: mach refuses a symlinked dep
 # root, and a probe for symlinks must not need a working symlink to set itself up.
-rm -rf dep
-mkdir -p dep/std
-cp ../../mach.toml dep/std/mach.toml
-cp -r ../../src dep/std/src
+"$mach" dep pull . --quiet
 
 echo "building the symlink probe with $mach (target $target)"
-rm -rf out work
-mach_run build . --target "$target" --profile "$profile"
+rm -rf out
+"$mach" build . --target "$target" --profile "$profile"
 exe="$(find out -name 'symlink_probe*' -type f -print -quit)"
 [ -n "$exe" ] || fail "no symlink_probe binary produced"
 exe="$(cd "$(dirname "$exe")" && pwd)/$(basename "$exe")"
 
-mkdir -p work
+# the scratch tree lives under out, which no path dependency copies: a link
+# left in the std tree would make every sibling fixture's dep pull refuse
+work="out/work"
+mkdir -p "$work"
 echo "running $exe in a scratch tree"
 set +e
-if [ -n "$runner" ]; then (cd work && "$runner" "$exe"); else (cd work && "$exe"); fi
+if [ -n "$runner" ]; then (cd "$work" && "$runner" "$exe"); else (cd "$work" && "$exe"); fi
 code=$?
 set -e
 [ "$code" -eq 0 ] || fail "$(decode "$code")"

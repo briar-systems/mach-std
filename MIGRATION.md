@@ -1,3 +1,418 @@
+# std 9.x to 10.0.0
+
+std 10.0.0 pairs with mach 7.
+
+## secret storage split by capability
+
+`std.memory.secret` held allocation, the entropy fill and positioned file transfers in one module, so importing it for an allocator demanded the entropy, files and pages capabilities. Each part now sits where its capability lives, and a caller needs only the capabilities of what it calls. The old names are gone, with no forwarding.
+
+| 9.x | 10.0.0 | needs |
+| --- | --- | --- |
+| `std.memory.secret.allocate`, `deallocate`, `allocate_typed`, `deallocate_typed`, `typed_aligned`, `accept_unlocked`, `ALIGN`, `Borrow` and `borrow_*` | unchanged, in `std.memory.secret` | pages |
+| `std.memory.secret.random_fill(data, len)` | `std.crypto.rand.fill_secret(data, len)` | entropy |
+| `std.memory.secret.read_at(file: usize, data, len, file_offset)` | `std.io.file.secret.read_at(file: io.handle.FileHandle, data, len, file_offset)` | files |
+| none | `std.io.file.secret.write_at`, the direct write the read never had | files |
+| `std.memory.secret.borrow_read_at(file: usize, borrow, ...)`, `borrow_write_at` | `std.io.file.secret.borrow_read_at(file: io.handle.FileHandle, borrow, ...)`, `borrow_write_at` | files and pages |
+
+The file transfers take the `FileHandle` (`f.handle` of a `filesystem.File`) where they took its raw value, and refuse an invalid handle as `INVALID` before the kernel is called. `std.memory.secret.borrow_span`, which resolves a span of a live borrow, is public. `filesystem.read_secret`, `read_secret_of` and `read_secret_native` need pages beside files, no longer entropy. On wasi the typed forms take a `T` with public bytes: secret storage there is fresh heap pages welded to its type, as on every other host, in place of a 16 MiB `^u8` region, and `std.system.os.wasi.welded` is gone.
+
+## bool is u1 (#1005)
+
+`std.types.bool.bool` is now `def bool: u1`, and `true` and `false` are `u1`. A `u1` is one byte holding 0 or 1, which comparisons, `&&`, `||`, `!` and `sel` produce and a condition requires. It has `&`, `|`, `^`, `==` and ordering, and no arithmetic. std builds with mach b039331 or later. `mach migrate` rewrites the alias and every `asm` head, and the compiler warns of the two forms below while the family moves. `[project] mach` is `^7`.
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `if (flags & 1)` | `if ((flags & 1) != 0)`, or hold the value in a `bool` |
+| `val n: u8 = a == b;` | `val n: u8 = (a == b)::u8;`, or declare `n` as a `bool` |
+| `total + ok` with `ok: bool` | `total + ok::usize` |
+| `v::bool` keeps the low byte of `v` | `v::bool` asks whether `v` is non-zero |
+| a `bool` field in a record an OS reads or writes | the platform's width: `i32` for windows `BOOL`, `u8` for NT `BOOLEAN` |
+| `asm x86_64`, `asm aarch64`, `asm riscv64`, `asm riscv32` | `asm x86-64`, `asm armv8-a`, `asm rv64i`, `asm rv32i` |
+
+`std.format` renders a `u1` as `0` or `1`, as it rendered a `bool` before, and `std.derive` takes a `u1` field. `std.crypto.ct`'s flags stay `^u8`: `eq`, `lt`, `gt`, `is_zero` and the `mask_*` and `select_*` over them read and write the same values. A comparison of secrets written directly is a `^u1`, so a flag taken from one is cast, as `(a == b)::^u8`.
+
+## one wipe path, $zeroize (#1019)
+
+`memory.zero[T]` wipes every `T` with a secret byte through `$zeroize`, so a wipe of a type mixing public and secret bytes now survives optimization as a wipe of a wholly secret type does. `ct.zeroize`, `ct.zeroize_plain` and the typed release in `std.memory.secret` sit on the same intrinsic, in place of the per-architecture assembly kernel. Their signatures do not change. Code holding a `*T` of any `T` can call `$zeroize(p, count)` itself, with no cast.
+
+## constant-time functions switch the timing mode themselves (#1137)
+
+std no longer turns PSTATE.DIT on at start or on each thread it spawns, and no longer reads the linker's `__mach_dit_required` cell. A `#[constant_time("soft")]` function now sets the mode on entry and clears it on return where it set it. std publishes `__mach_timing_available` before main, 1 when the processor provides DIT and the process may switch it, and the function runs without the mode where it is 0. Code that relied on DIT being on for a whole thread outside constant-time functions calls `std.crypto.ct.begin` or `std.system.dit.enable` on that thread.
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| none | `std.system.timing.mode()`, answering `AVAILABLE` or `UNAVAILABLE` from the processor alone |
+| `dit.required()`, `dit.decide`, `dit.init`, `dit.enter_thread`, `dit.SKIP`, `dit.ENABLE`, `dit.REFUSE`, `dit.REFUSAL` | removed. `dit.publish` sets the availability byte, `dit.available()` reads it |
+| `dit.enable()`, `dit.read()`, `dit.DIT_BIT` | kept, and `dit.disable()`, `dit.engage()` and `dit.PROVIDED` are new |
+
+## thread-locals and wide integers (#1109, #1110)
+
+`#[thread] var` works on every host: each thread gets its own copy of the template, and the whole block is wiped when a thread std runs ends. On aarch64 and riscv64 linux the thread's block now sits just below the thread pointer, so `thread_block()` there no longer returns the raw thread pointer. `vformat` renders `u256`, `i256`, `u512` and `i512`, and `std.text.parse` gains `parse_u128` through `parse_i512` with `_exact` forms. std builds with mach 9fc6a4ad or later, which reads the v7 decorator spellings.
+
+## std.args, a plain argument parser (#1021, #1150)
+
+`std.args` is new in 10.0.0: 9.x has no argument parser. It parses arguments against a description and judges only the user's input. A root `args.Command` has `args.Command`s nested under it to any depth, each with a slice of `*args.Flag`, so `mach dep add` is `dep` with `add` nested under it. Nothing validates the description, and a wrong description is the program's bug. std.args injects no `--help`, `-h`, `--version` or `help` command, reserves no short spelling and defines no exit codes. A program declares its own.
+
+A flag has a long spelling without its dashes, an optional short byte, a value placeholder when it takes a value, `repeat`, `negatable` for `--no-name`, and optional help text. Every flag may occur any number of times. A single read answers the last occurrence and `values` walks them all. A flag is read while a command that lists it is the one matched, so a flag shared by several commands is listed by each, by the same address. `parse(?ROOT, args.of(argc, argv))` reads from argument 1. While the command matched so far has nested commands, a word in the operand place names one of them. It refuses only an unknown flag, a missing value, an unknown command and an operand count outside the matched command's bounds, and `args.describe` writes the message.
+
+The development branch carried an earlier engine (#1113) with a `CommandSet` of `CommandSpec`s and `ActionSpec`s, `FlagSpec` rows, relations, removed spellings, exit notes and generated help. It was never released. For code written against it:
+
+| development branch before #1150 | 10.0.0 |
+| --- | --- |
+| `args.FlagSpec{name: "--out", value: "path", arity: args.ARITY_VALUE, doc: d, ...}` and an alias row `-o` | `args.Flag{long: "out", short: 'o', value: "path", repeat: false, negatable: false, help: d}` |
+| `args.ARITY_FLAG`, `args.ARITY_VALUE`, `args.ARITY_ATTACHED` | a nil or empty `value` takes no value, any other takes one. An optional attached value has no form |
+| `args.Occurs.once`, `collect`, `override` | `repeat`, which help marks. No occurrence is refused, and a single read answers the last |
+| `args.TableRef` lists, `accepted` and `docs` | `flags`, a `Slice[*args.Flag]` from `std.collections.slice`, on each command |
+| `args.CommandSet` with `program`, `version`, `title`, `footer`, `common`, `relations`, `removed` | the root `args.Command`, its `name` the program name. Shared flags are listed on each command that reads them |
+| `args.CommandSpec` and `args.ActionSpec` | `args.Command{name, aliases, help, usage, flags, commands, operand_min, operand_max, passthrough}`. `id` is gone, so dispatch on the command's address |
+| `summary`, `effect`, `grammar`, `exits`, `terminator`, `refused`, `refusal`, `constraints`, `examples` | `help` and `usage`, both optional. The rest is the program's own text |
+| `truncate_at_sep` | `passthrough`, with the arguments after `--` read by `args.rest(?p)` as a `Slice[str]` |
+| `args.Relation`, `args.Removed`, `args.Exit`, `args.PASSTHROUGH` | removed. The program checks its own combinations and names its removed spellings in its own refusal |
+| `args.HELP`, `HELP_SHORT`, `VERSION`, `BUILTIN`, `HELP_COMMAND`, `RESERVED` | removed. Declare `--help` and `--version` flags, or a `help` command, and test them after `parse` |
+| `args.EXIT_OK`, `EXIT_USER`, `EXIT_INTERNAL`, `EXIT_ENVIRONMENT`, `EXITS`, `exit_of` | removed. A program defines its own codes |
+| `args.request`, `args.Request`, `args.Page`, `args_help.answer` | removed. Read `p.refusal`, then the program's own help and version flags, then dispatch on `p.command` |
+| `args.parse(?SET, a, 1)`, `args.parse_command(?SET, ?C, a, 2)` | `args.parse(?ROOT, a)`. For a page of another command, parse the operands that name it, as `args.parse(?ROOT, args.of(argc - 1, ?argv[1]))` for `prog help <command>...` |
+| `args.Invocation`, `inv.command`, `inv.action` | `args.Parsed`, `p.command` the last command matched, `p.depth`, and `args.command_at(?p, d)` for the path |
+| `args.Refusal` cases `malformed`, `unknown_action`, `missing_action`, `unknown`, `inapplicable`, `removed`, `repeated`, `relation` | `unknown_flag`, `missing_value`, `unknown_command`, `operands`. A missing nested command is an operand count the program bounds |
+| `args.on`, `value`, `latest` as `res[_, args.Misread]` | `args.on(?p, ?F)` a `bool`, `args.value(?p, ?F)` a `str`, `args.latest(?p, ?F)` an `opt[args.Hit]`. `Misread` is gone |
+| `args.given` with implications, `args.values` as a `res` | `args.given(?p, ?F)` for an occurrence, `args.values(?p, ?F)` the walk itself |
+| `args.operand(?inv, n)` as an index | `args.operand(?p, n)` as the `opt[str]` given |
+| `Hit.flag` the canonical row and `Hit.spelled` | `Hit.flag`, the one flag either spelling names |
+| `args_help.render(?SET, ?w, page, width)` and `args_help.HelpError` | `args_help.render(?p, ?w, width)`: the usage line, help text, nested commands and flag table of the matched command, failing only on the write |
+
+A program's dispatch reduces to this:
+
+```mach
+var p: args.Parsed = args.parse(?ROOT, args.of(argc, argv));
+if (sel p.refusal.some) {
+    # write args.describe(?p, ?diag) and exit with the program's own code
+}
+if (args.given(?p, ?HELP)) {
+    # write args_help.render(?p, ?out, args_help.terminal_width())
+}
+# run p.command
+```
+
+## a heap over a backing that never reclaims keeps its spans (#883)
+
+`heap.allocator_source` reads the backing's `retains` flag once, when the source is built. Over a backing that does not reclaim, such as `allocator.fixed`, `allocator.arena` or `allocator.bump`, the source can no longer release, so the heap keeps every span it obtained and reuses it. Growing past the `init` budget again takes nothing more from the backing, where before each span handed back was lost to it. Over a reclaiming backing nothing changes.
+
+The visible difference is teardown. `dnit` on such a heap leaves `mapped_bytes` at what the heap held, because the backing never took the spans back. Code that expected `mapped_bytes(h) == 0` after `dnit` there should reclaim through the backing instead, for example by resetting the fixed buffer. Set the backing's `retains` before calling `allocator_source`.
+
+## filesystem.transaction takes its digest from the caller (#1003)
+
+`prepare` and `prepare_bytes` no longer compute a sha-256. Their `want_digest: bool` parameter becomes `digest: *hasher.Hasher`, a caller-owned running digest the transaction feeds every byte written, or `nil` for none. `transaction_has_digest`, `transaction_digest` and the `Transaction` fields `digest` and `has_digest` are removed. The transaction never finishes or stores a digest, so any hash fits, whatever its output size.
+
+`std.crypto.hash.hasher.Hasher` is `{ctx: ptr, fn_update: fun(ptr, *u8, usize)}`. The caller creates the hash state, passes a `Hasher` over it, and finishes it after `prepare` returns ok.
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `prepare_bytes(..., mode, false, options)` | `prepare_bytes(..., mode, nil, options)` |
+| `prepare_bytes(..., mode, true, options)` then `transaction_digest(t, ?out)` | `prepare_bytes(..., mode, ?hasher, options)` then finish the caller's own state |
+
+```mach
+# after
+fun feed(ctx: ptr, data: *u8, len: usize) { sha256.update(ctx::*sha256.State, data, len); }
+
+var state:  sha256.State = sha256.make();
+var hasher: hasher.Hasher = hasher.Hasher{ctx: (?state)::ptr, fn_update: feed};
+prepare_bytes(?t, ?alloc, claim, data, len, 0o644, ?hasher, options);
+sha256.final(?state, ?digest[0]);
+```
+
+## filesystem.read_dir lists every entry (#1054)
+
+`read_dir` returns `res[Vector[Listed], FsError]` in place of `res[Vector[str], FsError]`. `Listed` is `tag Listed: u8 { name: str; unspellable: NativeName; }`, with `NativeName` from `std.runtime.native.view`, one per entry, in directory order. A windows directory can hold a name with an unpaired surrogate, which has no UTF-8 spelling. Before, such a name failed the whole listing with EINVAL. Now it is listed in sequence as `unspellable`, with its name in native units, so the native forms can reach it, and the listing goes on. Only a fault of the directory itself fails the listing. On linux and darwin every entry is a `name`.
+
+Release a listing with `listed_dnit(?entries)`, which frees every name of either kind and then the vector, in place of freeing each `str` and then `vector.dnit`. `read_dir_native(a, p)` lists a directory named in native units as `Vector[NativeName]`, released with `native_names_dnit`.
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `val names: Vector[str] = read_dir(a, p).ok` | `val entries: Vector[Listed] = read_dir(a, p).ok` |
+| `names.data[i]` | `val entry: Listed = entries.data[i]` then `if (sel entry.name) { ... entry.name ... }`, with `entry.unspellable` for a name with no UTF-8 spelling |
+| `str_free(a, names.data[i])` for each, then `vector.dnit[str](?names)` | `listed_dnit(?entries)` |
+
+## the environment reads in native units and passes on only by the inherit form (#1065)
+
+Every spawn and exec, in `std.process.exec` and `std.system.os` alike, takes the child's environment as a tag in place of `envp: **u8`: `Environment` for the UTF-8 spawns and `NativeEnvironment` for the native ones. `Environment.inherit{}` hands the child this process's own environment, the native environment with no conversion: windows gives `CreateProcessW` a NULL environment and linux and darwin the envp the kernel gave the process, so a variable with no UTF-8 spelling reaches the child as it is. `Environment.given{envp}` hands it exactly the entries of a nil-terminated array, and a nil array is refused with `EINVAL`. A nil envp used to inherit on windows only, while linux and darwin handed the kernel a nil envp.
+
+`std.process.env.environ()` returning `**u8` becomes `environ(a)` returning `res[Vector[Listed], EnvError]`, the UTF-8 listing for reading and editing variables. `Listed` is `tag Listed: u8 { variable: str; unspellable: NativeName; }`, one per entry in the order the environment holds them. A windows entry with no UTF-8 spelling, which before made the whole listing nil, is listed in place as `unspellable` with its variable name in native units, which `get_native` reads. On linux and darwin every entry is a `variable`. The vector and every entry are the caller's, released with `environ_dnit(?entries)`. `EnvError` gains `unavailable` for an environment that cannot be read. `environ_native()` is the environment in native units, kept for the life of the process.
+
+`std.system.os.environ` and `std.system.os.windows.environ` are removed. `os.environ_native()` is the one capture and `os.getenv_native` reads one value in native units. `std.system.os.linux.environ` and `std.system.os.darwin.environ` remain.
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `exec.run(path, argv, nil)` | `exec.run(path, argv, exec.Environment.inherit{})` |
+| `exec.run(path, argv, env.environ())` to pass the environment on | `exec.run(path, argv, exec.Environment.inherit{})` |
+| `exec.run(path, argv, (?envp[0])::**u8)` | `exec.run(path, argv, exec.Environment.given{(?envp[0])::**u8})` |
+| none | `exec.run_native(path, argv, exec.NativeEnvironment.given{envp})`, or `.inherit{}`, which spawns from native units |
+| `os.spawn(path, argv, envp)` | `os.spawn(path, argv, os.Environment.given{envp})`, or `os.Environment.inherit{}` |
+| `val e: **u8 = env.environ()` then `e[i]` | `val entries: Vector[env.Listed] = env.environ(a).ok` then `if (sel entries.data[i].variable) { ... }`, with `.unspellable` for an entry with no UTF-8 spelling |
+| `os.environ()` | `os.environ_native()`, or `env.environ(a)` for UTF-8 |
+
+## `types.semver` is removed (#1085)
+
+`std.types.semver` is removed, with `SemverError`, `semver_parse`, the predicates and `semver_compare`. Version handling is owned by mach, in its manifest version contract (`src/manifest/version.mach`), which parses build metadata, refuses empty identifiers and leading zeros per SemVer 2.0.0, and compares numeric prerelease identifiers by length. std keeps no replacement, so code that parsed or compared versions through std should use mach's version handling or carry its own parser.
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `use std.types.semver.semver_parse;`, `semver_parse(s, a)` | removed; version handling lives in mach |
+| `use std.types.semver.semver_compare;`, `semver_is_stable`, `semver_is_prerelease`, `semver_has_build` | removed; version handling lives in mach |
+
+## `data.json` and `data.toml` move to packages (#1004)
+
+`std.data.json` and `std.data.toml` are removed. JSON reading and writing is the mach-json package and TOML reading is the mach-toml package, each with the same public names, types and behaviour the std module had. Declare the package under its key and import each module by its source path in the package, so a name is qualified by the module that declares it instead of by `json` or `toml`.
+
+```toml
+[dep.json]
+git = "https://github.com/briar-systems/mach-json"
+ref = "branch/dev"
+
+[dep.toml]
+git = "https://github.com/briar-systems/mach-toml"
+ref = "branch/dev"
+```
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `json.parse`, `json.MAX_DEPTH` | `use json.parse;` |
+| `json.Value`, `json.Kind`, the kind constants, `json.dnit`, the `json.value_*` accessors | `use json.value;` |
+| `json.value_string_decode` | `use json.decode;` |
+| `json.emit`, `json.write_value` | `use json.write;` |
+| `json.Object`, `json.Array`, the `object_*`, `array_*` and `field_*` writers, `json.value_f64`, `json.write_json_string` | `use json.ndjson;` |
+| `json.JsonError` | `use json.error;`, or `use json.error.JsonError;` |
+| `toml.parse`, `toml.parse_bytes` | `use toml.parse;` |
+| `toml.get`, the `toml.get_*` readers, `toml.table_*`, `toml.array_*` | `use toml.lookup;` |
+| `toml.Value`, `toml.Array`, `toml.Table`, `toml.Span`, the `TYPE_*` constants | `use toml.value;` |
+| `toml.dnit` | `use toml.tree;` |
+| `toml.escape`, `toml.datetime_literal`, `toml.DATETIME_LITERAL_MAX` | `use toml.write;` |
+| `toml.MAX_VALUE_DEPTH` | `use toml.expr;` |
+| `toml.TomlError` | `use toml.error;`, or `use toml.error.TomlError;` |
+
+## the cryptographic hashes, checksums and compression move to packages (#1004)
+
+The SHA-2 and Keccak hashes leave std for the mach-crypto package, and the checksums and compression leave for the mach-deflate package. Each package module has the same types and behaviour the std module had (mach-crypto's `sha512` also has a public SHA-384 `State384`, made by `make384`, which 9.x did not), and the same public names except its constructors and teardowns, which take the lifecycle names (mach#4484) listed in the second table below. Declare the package under its key and import the module by its source path in the package.
+
+```toml
+[dep.crypto]
+git = "https://github.com/briar-systems/mach-crypto"
+ref = "branch/dev"
+
+[dep.deflate]
+git = "https://github.com/briar-systems/mach-deflate"
+ref = "branch/dev"
+```
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `use std.crypto.hash.sha256;` | `use crypto.hash.sha256;` |
+| `use std.crypto.hash.sha512;` | `use crypto.hash.sha512;` |
+| `use std.crypto.hash.keccak;`, `sha3_256`, `sha3_512`, `shake128`, `shake256` | `use crypto.hash.keccak;` and the same module names under `crypto.hash` |
+| `use std.crypto.hash.crc32;`, `use std.crypto.hash.adler32;` | `use deflate.crc32;`, `use deflate.adler32;` |
+| `use std.compress.inflate;`, `deflate`, `zlib`, `gzip` | `use deflate.inflate;` and the same module names under `deflate` |
+| `use std.compress.format;`, or the `compress_format` re-export | `use deflate.format;` |
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `sha256.init` | `sha256.make` |
+| `sha256.init_secret` | `sha256.secret_init` |
+| `sha256.destroy_secret` | `sha256.secret_dnit` |
+| `sha512.init` | `sha512.make` |
+| `sha512.init_secret384`, `sha512.init_secret512` | `sha512.secret384_init`, `sha512.secret512_init` |
+| `sha512.destroy_secret384`, `sha512.destroy_secret512` | `sha512.secret384_dnit`, `sha512.secret512_dnit` |
+| `keccak.init`, `sha3_256.init`, `sha3_512.init`, `shake128.init`, `shake256.init` | `make` in the same module |
+| `crc32.init`, `adler32.init` | `crc32.make`, `adler32.make` |
+
+`std.crypto.ct`, `std.crypto.rand`, `std.crypto.hash.hasher`, `std.crypto.hash.fnv1a`, `std.crypto.hash.siphash` and `std.memory.secret` stay in std.
+
+## float conversion work storage has published types (#1089)
+
+`std.text.parse.parse_float`, `std.format.write_float` and `std.format.write_float_g` take their bignum work storage from the caller as `work: *u32`. Each row now has a published type for it, a `u32` array derived from std's own bignum counts, line slack and the row's limb and digit counts. Declare it on the stack and pass `?work[0]`. Code that hard-coded a size (4 or 5 bignums of `ieee.F64_LIMBS`, a 32-byte line) should declare the type instead, so the storage follows std when a count changes. The runtime functions `parse_float_work`, `write_float_work` and `write_float_g_work` stay for storage sized at runtime.
+
+| conversion | f16 | f32 | f64 |
+| --- | --- | --- | --- |
+| `parse.parse_float` | `parse.F16ParseWork` | `parse.F32ParseWork` | `parse.F64ParseWork` |
+| `format.write_float` | `format.F16WriteWork` | `format.F32WriteWork` | `format.F64WriteWork` |
+| `format.write_float_g` (also serves `write_float`) | `format.F16WriteGWork` | `format.F32WriteGWork` | `format.F64WriteGWork` |
+
+```mach
+# before
+var work: [5 * ieee.F64_LIMBS + (2 * ieee.F64_SIG_DIGITS + 32 + 3) / 4]u32;
+
+# after
+var work: format.F64WriteGWork;
+format.write_float_g(?w, ieee.F64, bits, 17, ?work[0]);
+```
+
+## secret storage is locked and its allocation reports why it failed (#1115, #907)
+
+Every allocation from `std.memory.secret` is now locked against paging, sits between two inaccessible guard pages and, on linux, is kept out of core dumps. A host that refuses the lock fails the allocation instead of handing out unlocked storage, so `allocate` and `allocate_typed` return an error and write the storage through an out parameter. A lock refusal carries `io_error.OP_LOCK` as its operation, with kind `RESOURCE_EXHAUSTED` (the `RLIMIT_MEMLOCK` or working-set limit) or `PERMISSION`. A zero size or count is still a successful nil.
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `val data: *^u8 = secret.allocate(size)` then `if (data == nil)` | `var data: *^u8 = nil` then `secret.allocate(size, ?data)` returns `err[io_error.Error]` |
+| `val data: *T = secret.allocate_typed[T](count)` | `var data: *T = nil` then `secret.allocate_typed[T](count, ?data)` |
+| `os.allocate_secret(size)` returns `*^u8` | `os.allocate_secret(size, ?data)` returns `os.SecretStatus{code, lock}` |
+| `os.allocate_secret_typed[T](total)` returns `*T` | `os.allocate_secret_typed[T](total, ?data)` returns `os.SecretStatus` |
+
+`filesystem.read_secret` reports a refused allocation as `FsError.io` with that error, where it reported `FsError.alloc` before.
+
+A long-running program that keeps many secrets may need a higher `RLIMIT_MEMLOCK` (linux, darwin) or a larger minimum working set (windows). A host that cannot lock at all (`os.SECRET_LOCKS` false) refuses secret storage until the program calls `secret.accept_unlocked()`. No current host is one.
+
+`buffers` secret classes and requests accept an alignment up to `buffers.SECRET_ALIGN_MAX` (4096, the alignment welded storage guarantees on every host) and `make` refuses a secret class above it. Before, alignments up to 65536 were accepted and not honoured.
+
+## lifecycle names (mach#4484)
+
+`init` and `dnit` now name only the creation and teardown of a value that owns memory, and `make` the creation of one that owns nothing. A teardown that frees a whole owning value is `dnit`, one that frees a part of it is `<part>_dnit`, and a predicate that shares its word with a constructor is `is_<word>`. Signatures do not change. Every public rename:
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `std.allocator.arena.make` | `std.allocator.arena.allocator` |
+| `std.allocator.heap.make_owned` (development branch only) | `std.allocator.heap.allocator_owned` |
+| `std.allocator.heap.make` | `std.allocator.heap.allocator` |
+| `std.allocator.testing.make` | `std.allocator.testing.init` |
+| `std.compat.sha1.init` (development branch only) | `std.compat.sha1.make` |
+| `std.crypto.hash.siphash.init` | `std.crypto.hash.siphash.make` |
+| `std.filesystem.listed_free` (development branch only) | `std.filesystem.listed_dnit` |
+| `std.filesystem.native_names_free` (development branch only) | `std.filesystem.native_names_dnit` |
+| `std.filesystem.transaction.ownership.root_destroy` | `std.filesystem.transaction.ownership.root_dnit` |
+| `std.filesystem.transaction.release_claim` | `std.filesystem.transaction.claim_dnit` |
+| `std.io.file.adapter.destroy` | `std.io.file.adapter.dnit` |
+| `std.io.file.adapter.make` | `std.io.file.adapter.init` |
+| `std.io.file.destroy` | `std.io.file.dnit` |
+| `std.io.file.make` | `std.io.file.init` |
+| `std.io.file.watch_close` | `std.io.file.watch_dnit` |
+| `std.io.file.watch_open_native` (development branch only) | `std.io.file.watch_init_native` |
+| `std.io.file.watch_open` | `std.io.file.watch_init` |
+| `std.io.runtime.destroy` | `std.io.runtime.dnit` |
+| `std.io.runtime.make` | `std.io.runtime.init` |
+| `std.log.queued_destroy` | `std.log.queued_dnit` |
+| `std.log.sink.queued_destroy` | `std.log.sink.queued_dnit` |
+| `std.memory.buffers.close_account` | `std.memory.buffers.account_dnit` |
+| `std.memory.buffers.destroy` | `std.memory.buffers.dnit` |
+| `std.memory.buffers.make` | `std.memory.buffers.init` |
+| `std.memory.buffers.open_account` | `std.memory.buffers.account_init` |
+| `std.memory.buffers.secret_source_close_account` | `std.memory.buffers.secret_source_account_dnit` |
+| `std.memory.buffers.secret_source_open_account` | `std.memory.buffers.secret_source_account_init` |
+| `std.memory.buffers.source_close_account` | `std.memory.buffers.source_account_dnit` |
+| `std.memory.buffers.source_open_account` | `std.memory.buffers.source_account_init` |
+| `std.memory.secret.borrow_close` | `std.memory.secret.borrow_release` |
+| `std.memory.secret.borrow_open` | `std.memory.secret.borrow_acquire` |
+| `std.memory.table.destroy` | `std.memory.table.dnit` |
+| `std.memory.table.make` | `std.memory.table.init` |
+| `std.net.async.destroy` | `std.net.async.dnit` |
+| `std.net.async.iocp.destroy` | `std.net.async.iocp.dnit` |
+| `std.net.async.iocp.make` | `std.net.async.iocp.init` |
+| `std.net.async.iocp.port.destroy` | `std.net.async.iocp.port.dnit` |
+| `std.net.async.iocp.port.make` | `std.net.async.iocp.port.init` |
+| `std.net.async.local.destroy` | `std.net.async.local.dnit` |
+| `std.net.async.local.make` | `std.net.async.local.init` |
+| `std.net.async.local.unix.make` | `std.net.async.local.unix.init` |
+| `std.net.async.local.windows.make` | `std.net.async.local.windows.init` |
+| `std.net.async.make` | `std.net.async.init` |
+| `std.net.async.readiness.destroy` | `std.net.async.readiness.dnit` |
+| `std.net.async.readiness.make` | `std.net.async.readiness.init` |
+| `std.net.async.unix.make` | `std.net.async.unix.init` |
+| `std.net.async.windows.make` | `std.net.async.windows.init` |
+| `std.net.resolve.destroy` | `std.net.resolve.dnit` |
+| `std.net.resolve.make_runtime_with_adapter` | `std.net.resolve.init_runtime_with_adapter` |
+| `std.net.resolve.make_runtime` | `std.net.resolve.init_runtime` |
+| `std.net.resolve.make_with_adapter` | `std.net.resolve.init_with_adapter` |
+| `std.net.resolve.make` | `std.net.resolve.init` |
+| `std.net.resolve.resolution_destroy` | `std.net.resolve.resolution_dnit` |
+| `std.net.resolve.shared.destroy` | `std.net.resolve.shared.dnit` |
+| `std.process.env.environ_free` (development branch only) | `std.process.env.environ_dnit` |
+| `std.rand.init` | `std.rand.make` |
+| `std.sync.cancel.destroy` | `std.sync.cancel.dnit` |
+| `std.sync.cancel.init_registration` | `std.sync.cancel.registration_make` |
+| `std.sync.channel.destroy` | `std.sync.channel.dnit` |
+| `std.sync.semaphore.init` | `std.sync.semaphore.make` |
+| `std.sync.worker_pool.destroy` | `std.sync.worker_pool.dnit` |
+| `std.system.os.darwin.shared.directory_close` | `std.system.os.darwin.shared.directory_dnit` |
+| `std.system.os.directory_close` | `std.system.os.directory_dnit` |
+| `std.system.os.linux.shared.directory_close` | `std.system.os.linux.shared.directory_dnit` |
+| `std.system.os.native_path_release` (development branch only) | `std.system.os.native_path_dnit` |
+| `std.system.os.release_secret_typed` | `std.system.os.free_secret_typed` |
+| `std.system.os.release_secret` | `std.system.os.free_secret` |
+| `std.system.os.secret.release_typed` | `std.system.os.secret.free_typed` |
+| `std.system.os.secret.release` | `std.system.os.secret.free` |
+| `std.system.os.wasi.preview1.directory_close` (development branch only) | `std.system.os.wasi.preview1.directory_dnit` |
+| `std.system.os.windows.shared.directory_close` | `std.system.os.windows.shared.directory_dnit` |
+| `std.types.string.owned_release` | `std.types.string.owned_dnit` |
+| `std.types.string.str_empty` | `std.types.string.str_is_empty` |
+
+The modules that re-export these, `std.system.os.linux`, `std.system.os.darwin`, `std.system.os.windows` and their per-architecture modules, carry `directory_dnit` in place of `directory_close` as well.
+
+## name lookups run under a cancellation scope
+
+Every entry that performs a lookup takes a `*std.sync.cancel.Scope`, as `process.exec.wait_within` does, and holds one contract on every platform: when the scope ends, the call returns within 10 ms (`shared.POLL_MSEC`) with the scope's reason, and holds nothing of the caller's afterwards. What the system is still doing for an abandoned lookup is the implementation's business and never reaches the caller.
+
+- linux asks its nameservers itself. Every wait, the UDP receives and the TCP retry's connect, send and receive alike, blocks for at most 10 ms before it asks the scope again. The TCP retry connects with the new `tcp.connect_within`.
+- windows calls `GetAddrInfoExW` asynchronously into a request the library owns, waits for its completion under the scope, and on the scope's end asks `GetAddrInfoExCancel` to end it and returns. The completion frees the request whenever the system delivers it.
+- darwin's `getaddrinfo` cannot be interrupted, so it runs on a helper thread that owns the request, strings and result included. The caller returns when the scope ends, and the helper frees everything when the system lets it finish. A lookup costs a thread, which may outlive the call by the system's own timeout.
+
+`conf.Config.timeout_ms` stays: it is the resolver's own policy (`options timeout:` in resolv.conf), how long one request waits before the next server is tried, and it never outlasts the scope. A lookup the scope ends reports why: `lookup.Outcome` gains `ended: cancel.Reason`, which the adapters and `std.net.dns` report as `CANCELLED`, `TIMED_OUT`, or `INVALID` (native code 3 for a destroyed scope, 4 for a nil one). The asynchronous resolver hands its adapter a scope of the operation's own, which ends when the caller's scope, a token cancellation, the runtime or the deadline ends the operation, so its workers are held to the same bound. `std.net.dns` now needs the threads and clock capabilities as well as sockets.
+
+`std.net.tcp.connect_within(ep, scope)` is new: a connect that never blocks, whose wait the scope ends within about a millisecond, on the OS contract's new `sock_connect_begin`, `sock_connect_poll` and `sock_set_nonblocking`. The readiness backends start and settle their connects on the same pair, and `std.system.os.<os>.sock_connect_status` is no longer exported.
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `dns.query(hostname, addr)`, `dns.resolve(hostname, addr)` | `dns.query(scope, hostname, addr)`, `dns.resolve(scope, hostname, addr)` |
+| `lookup.query_name(config, hostname, domain, v4, v6, answer)` | `lookup.query_name(config, scope, hostname, domain, v4, v6, answer)` |
+| `lookup.resolve_name(config, hostname, v4, v6, answer)` | `lookup.resolve_name(config, scope, hostname, v4, v6, answer)` |
+| `types.AdapterFun`: `fun(ptr, *Query, *Allocator, ResultLimits, *Resolution) Error` | `fun(ptr, *cancel.Scope, *Query, *Allocator, ResultLimits, *Resolution) Error` |
+| `linux.resolve(query, ...)`, `darwin.resolve(query, ...)`, `windows.resolve(query, ...)` | `resolve(scope, query, ...)` |
+| `linux.resolve_with_config(query, ..., config)` | `linux.resolve_with_config(scope, query, ..., config)` |
+
+## chrono.format writes a chosen fraction and refuses invalid values
+
+`std.chrono.format.rfc3339` takes a `fraction: Fraction` after the datetime, which states how the fraction of a second is written: `Fraction.shortest{}` writes the fewest digits that hold `nsec` exactly, `Fraction.digits{n}` exactly `n` digits, and `Fraction.digits_unless_whole{n}` `n` digits and none when they are all zero. 9.x wrote nine digits when `nsec` was not zero and none otherwise, which `Fraction.digits_unless_whole{9}` reproduces.
+
+`rfc3339` now returns 0 for a datetime `datetime_is_valid` refuses, a year outside [0, 9999], an offset that is not a whole number of minutes or a fraction of more than 9 digits, and `rfc3339_date` returns 0 for a date `date_is_valid` refuses or a year outside [0, 9999]. `Datetime` gains `offset_unknown`, and a datetime with it set is written with the offset `-00:00`. `rfc3339_time`, `rfc3339_local` and `read_rfc3339` are new, with `TimeOfDay` and `LocalDatetime` in `std.chrono.date`.
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `format.rfc3339(dt, buf, len)` | `format.rfc3339(dt, format.Fraction.digits_unless_whole{9}, buf, len)` for the same output |
+
+## callback fields are named fn_
+
+Every std record field that holds a function for callers to invoke is named `fn_<action>`, as `Allocator`'s already were. The rule is in CONTRIBUTING.md. Signatures do not change.
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `std.io.reader.Reader.f_read` | `std.io.reader.Reader.fn_read` |
+| `std.io.writer.Writer.f_write` | `std.io.writer.Writer.fn_write` |
+| `std.log.record.Clock.f_now` | `std.log.record.Clock.fn_now` |
+| `std.log.sink.Sink.f_publish` | `std.log.sink.Sink.fn_publish` |
+| `std.log.sink.Direct.f_write` | `std.log.sink.Direct.fn_write` |
+| `std.collections.map.MapBy.hash_fn`, `eq_fn` | `std.collections.map.MapBy.fn_hash`, `fn_eq` |
+| `std.sync.worker_pool.Task.run` | `std.sync.worker_pool.Task.fn_run` |
+| `std.net.resolve.Resolver.adapter` | `std.net.resolve.Resolver.fn_adapter` |
+
+`std.crypto.hash.hasher.Hasher`, new in 10.0.0, has `fn_update`.
+
+## an allocator backend never sees a reallocation to size 0
+
+`allocator.reallocate_raw` frees a block resized to 0 through `fn_deallocate` and returns nil, so `fn_reallocate` is never called with `new_size` 0, as `fn_allocate` is never called with size 0. The backends' own size-0 branches are gone. A backend written against 9.x may drop its branch. Code that calls a backend's `fn_reallocate` directly with `new_size` 0 calls `fn_deallocate` instead.
+
+## linux stat_t is std's record, filled from statx
+
+On linux `std.system.os.stat` and `stat_path` read through `statx` on every architecture, and `stat_t` is one std-owned record in place of each architecture's kernel layout. It keeps the `st_*` field names and gains `st_birthtime`, `st_birthtime_nsec` and `st_birthtime_known`, so `stat_birth` and `filesystem.Metadata.created` report a file's birth time where the filesystem records one. The padding fields `_pad1`, `_pad2`, `_unused4` and `_unused5` and x86_64's `pad0` and `_reserved*` are gone, and `st_nlink` and `st_blksize` are `u32` and `i32` on every architecture.
+
+## other removed public names
+
+Each of these is gone with nothing in its place, or with the replacement named.
+
+| 9.x | 10.0.0 |
+| --- | --- |
+| `std.io.file.posix.rename_confined(root, source, destination)`, `std.io.file.windows.rename_confined` | `rename_confined_native` in the same module, which takes the names in native units |
+| `std.io.file.posix.no_follow_flag()` | `O_NOFOLLOW` from `std.system.os.linux`, `std.system.os.darwin` or `std.system.os.wasi` |
+| `std.io.runtime.DESTROYED` | removed. Nothing set it. `OPEN`, `CLOSING` and `CLOSED` remain |
+| `std.net.async.discarded_reads`, `std.net.async.local.discarded_reads` | removed. They always reported 0 since a cancelled read no longer discards bytes |
+| `std.system.os.shared.io_wake_posted` and `IoQueue.wakes_posted` | removed, with the other counters of internal steps |
+| `std.memory.buffers.Pool.steps`, `Snapshot.steps`, `std.net.async.iocp.Core.steps`, `std.net.async.local.Driver.claim_steps`, `std.net.resolve.Resolver.steps`, `std.net.async.readiness.Backend.watches`, `rearms`, `unwatches` and `locates` | removed. They counted internal steps for tests that are gone |
+| `std.allocator.testing.Testing.used` | removed. The live, peak and refusal counts have their own accessors |
+
 # std 6.x to 7.0.0
 
 std 7.0.0 makes the memory behind `io.runtime` reachable (#677). A runtime takes the allocator every one of its allocations comes from, and every driver registered on it draws from the same allocator.
@@ -1065,7 +1480,7 @@ their shapes are frozen by this phase.
 | `filesystem.exists`, `is_file`, `is_dir`, `is_symlink` | `fun(p: Path) res[bool, io_error.Error]` (`ENOENT` and `ENOTDIR` are `ok{false}`) | yes |
 | `filesystem.create_dir`, `remove_file`, `remove_dir`, `rename`, `symlink` | `... err[io_error.Error]` | yes |
 | `filesystem.read_bytes` | `fun(a, p) res[Vector[u8], FsError]`; `read_string` `res[str, FsError]` (extent `size + 1`; a shrunk file is `read{eof{delivered}}`) | yes |
-| `filesystem.read_dir` | `fun(a, p) res[Vector[str], FsError]` (names owned by the caller, released whole on failure) | yes |
+| `filesystem.read_dir` | `fun(a, p) res[Vector[Listed], FsError]` (entries owned by the caller and released with `listed_free`, released whole on failure, an entry with no UTF-8 spelling listed as `unspellable`) | yes |
 | `filesystem.write_bytes` | `fun(p, data, len, mode) err[FsError]` (`write` carries the persisted prefix) | yes |
 | `filesystem.replace_bytes_atomic` | `fun(a, p, data, len, file_mode, dir_mode) err[FsError]` (`published{flush}` after the rename, every other case before it with the destination untouched) | yes |
 | `filesystem.create_dir_all`, `remove_all` | `... err[FsError]` (`remove_all` refuses roots and dot names as `removal` with `containment`) | yes |
@@ -1770,9 +2185,11 @@ syscall argument on Linux (inline asm, `{data}` operand), the libSystem
 fun` declared `*^u8`, the descriptor's handle and file pointer pinned by
 `windows.shared.positioned_begin`/`positioned_end`, the discipline the public
 `read_at` and `write_at` now share). Nothing in the boundary yields a `*u8`,
-`ptr` or integer view of a borrow, and `test/backends/verify-ir.py` keeps
-pinning that the boundary's IR materializes no `ptrtoint`/`inttoptr` and that
-the wipe precedes the native release. The table is process-wide and typed
+`ptr` or integer view of a borrow, the compiler's test corpus pins that the
+compiler refuses one (`test/refuse/secret/` in the mach repository), and
+`std.memory.secret`'s
+`release__wipes_before_success_or_failure` test pins that the wipe precedes the
+native release. The table is process-wide and typed
 (its entries hold `*^u8`, so it lives in a `secret_allocate_typed` region and
 grows by doubling under a spinlock), the way a kernel keeps the descriptor
 table and user code keeps integers.
@@ -1878,9 +2295,9 @@ fault after submission (descriptor 1000000, `EBADF`) on a write and on a read
 with the storage intact and the error precise; secret and public requests in
 one adapter with no crossing; the runtime closed under a queued secret read,
 which settles `CLOSED` with the borrow alive until the dequeue and the
-destination untouched. Negative alias: `test/secret/verify.sh` refuses
-`*^u8` to `*u8` at compile time and censuses the borrow API for any `pub fun`
-returning `*u8` or `ptr`.
+destination untouched. Negative alias: the compiler's test corpus refuses
+`*^u8` to `*u8` at compile time, and `test/secret/verify.sh` censuses the
+borrow API for any `pub fun` returning `*u8` or `ptr`.
 
 Controls (each run under the v5 compiler, source restored after): the wipe
 removed from `retire_secret_request` fails six of the eight lane tests at

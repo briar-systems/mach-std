@@ -1,25 +1,22 @@
-# Public directory cursor proof
+# Darwin directory cursor probe
 
-The native C fixture checks SDK signatures, offsets, length widths, descriptor
-flags and the actual fdopendir failure contract. Compile its object separately
-and inspect undefined symbols on each Darwin architecture before accepting the
-Mach aliases. The nominal C name array is recorded, never treated as a maximum.
-Compare field offsets and sufficient pointer alignment, not full struct sizes.
+`verify.py` checks the darwin directory cursor (`fdopendir`, `readdir`,
+`closedir`) against the host SDK. Run it on a native darwin host whose architecture matches the target, once per
+profile, or run every darwin fixture with `test/lib/darwin-fixtures.py`:
 
-The Mach fixture checks non-directory refusal, unchanged original descriptor
-flags, failed-initialization duplicate cleanup, actual held-root rename, relative
-access through a borrowed name, stale errno before readdir EOF, and exact live
-fd counts before and after ownership. Descriptor counts cover getdtablesize and
-refuse unexpected fcntl errors. Run each selection in its own scratch directory.
-Failures preserve the fixture directory for diagnosis.
+```sh
+python3 test/directory-darwin/verify.py <mach> darwin-aarch64 debug
+python3 test/directory-darwin/verify.py <mach> darwin-aarch64 release
+```
 
-Run `layout`, `errors` and `borrowed` with both native Darwin profiles, then the
-portable inline `std.system.os.directory` and filesystem allocation/removal/
-transaction regressions on all supported native hosts. The Windows inline
-capacity provider intentionally supplies records longer than the local NTFS
-component limit. It proves delivery of native variable records and documented
-capacity status handling, not creation of such names on NTFS. The Linux inline
-record test similarly separates ABI validation from filesystem creation limits.
+- `native.c` statically checks the SDK's cursor signatures, the `struct dirent`
+  offsets and widths and the descriptor flags, and prints the host's layout and the
+  `ENOTDIR` a regular file gets.
+- `directory layout` requires `DirectoryRecord` to have the SDK's offsets.
+- `directory errors` opens a cursor on a regular file: `ENOTDIR`, no cleanup error,
+  the caller's descriptor still owned and the descriptor count unchanged.
+- `directory borrowed` lists a directory renamed after the cursor opened, sees its
+  one entry once, reads end of directory twice, and closes with the descriptor count
+  back where it started.
 
-Native build/test activation belongs to the root agent. This directory contains
-fixture source only and makes no completed runtime claim.
+The probes work in the fixture's `out` directory.

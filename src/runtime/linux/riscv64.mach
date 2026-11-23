@@ -15,7 +15,8 @@
 #   2. stores them into the runtime globals
 #   3. calls _rt_init to publish envp into the OS layer
 #   4. calls user-supplied `main(argc, argv)` (a0 = argc, a1 = argv)
-#   5. exits via SYS_exit_group with main's return code (terminates all
+#   5. calls _rt_exit, which wipes the main thread's thread-locals and exits
+#      via SYS_exit_group with main's return code (terminates all
 #      threads; SYS_exit would leave non-main threads alive)
 #
 # user code must define:
@@ -28,11 +29,13 @@
 # aligned on kernel entry (the riscv lp64 process-startup invariant), so no
 # realignment is needed before the calls.
 
+use std.runtime.native.view;
 use os:        std.system.os.linux.riscv64;
 use os_shared: std.system.os.shared;
 use std.system.panic.panic;
+use std.types.size.usize;
 
-# the static-PIE self-relocation pass, linked only into a `--pie` build.
+# the self-relocation and RELRO protection of a PIE no loader started
 $if ($mach.build.pie == 1) {
     use std.runtime.linux.reloc;
 }
@@ -48,40 +51,66 @@ var _rt_envp: u64 = 0;
 # theirs from the OS layer
 var main_block: os_shared.ThreadBlock;
 
-# install the main thread's block unless an interpreter owns the thread pointer
+# set up thread-locals and the main thread's block, once before main
 #
-# whoever starts the process owns the main thread's thread pointer. with no
-# interpreter the kernel leaves it unset and std owns it. an interpreter sets it
-# to its C runtime's thread control block before the entry point, and std never
-# writes it then
-fun install_main_block() {
-    if (os.loader_present()) { ret; }
-    if (os.thread_block_enter(?main_block) < 0) {
+# a link-time default a program replaces with its own `mach_thread_setup`, and
+# std.runtime says what an empty one gives up. it reads the executable's
+# thread-local template, records whether std owns the thread pointer, and
+# installs the main thread's block where it does. whoever starts the process
+# owns the main thread's thread pointer: with no interpreter the kernel leaves
+# it unset and std owns it, and an interpreter sets it to its C runtime's thread
+# control block before the entry point, and std never writes it then
+#[weak("mach_thread_setup")]
+fun thread_setup() {
+    os.capture_tls();
+    os.capture_thread_pointer();
+    if (!os.thread_pointer_owned()) { ret; }
+    val block: *os_shared.ThreadBlock = os.main_thread_block(?main_block);
+    if (block == nil || os.thread_block_enter(block) < 0) {
         panic("std.runtime: the main thread's block could not be installed\n");
     }
 }
 
+# prepare the process before main: relocation, envp, page size, thread-locals,
+# the main thread's block
 #[symbol("_rt_init")]
 fun _rt_init() {
-    # a `--pie` build self-relocates here, before `main` and before any global pointer
-    # is read - the auxv is reached from envp, so `_start`'s raw-sp asm stays untouched
-    # (and a non-PIE build links none of this, leaving `_rt_init` byte-identical).
+    # a PIE no loader started relocates itself and protects its RELRO region here, before
+    # `main` and before any global pointer is read - the auxv is reached from envp, so
+    # `_start`'s raw-sp asm stays untouched. an image that is not a PIE runs at its link
+    # address and carries no RELRO region
     $if ($mach.build.pie == 1) {
-        reloc._rt_relocate(_rt_envp::ptr::*u64);
+        reloc._rt_relocate(_rt_envp::ptr::*usize);
     }
-    os._envp = _rt_envp;
-    # publish AT_PAGESZ into the OS layer for page_size(); runs after _envp is set
-    # and (under --pie) after relocation, so it is ordinary post-relocation code.
+    os.capture_envp(_rt_envp::usize);
+    # publish AT_PAGESZ into the OS layer for page_size(); runs after envp is published
+    # and after relocation, so it is ordinary post-relocation code.
     os.capture_pagesz();
-    # before main, so the main thread's token is valid from entry
-    install_main_block();
-    # the main thread's stack bounds, for std.runtime.stack
-    os.capture_main_stack();
+    # before main, so the main thread's token and thread-locals are valid from entry
+    thread_setup();
 }
 
+# the arguments as the kernel passed them, for std.runtime.native
+# ---
+# ret: argc and argv, which are already the native bytes
+pub fun native_args() view.Args {
+    ret view.Args{count: _rt_argc::usize, argv: _rt_argv::ptr::**view.Unit};
+}
+
+# end the process with main's return code; the single exit path after main
+#
+# the main thread's thread-locals are wiped first, as every thread's are when it ends
+#[symbol("_rt_exit")]
+fun _rt_exit(code: i64) {
+    os.thread_exit_wipe();
+    os.terminate(code);
+}
+
+# the ELF entry, the steps the module comment lists
+#[naked]
 #[symbol("_start")]
 pub fun _start() {
-    asm riscv64 {
+    asm rv64i {
         mv t0, sp            # t0 = initial stack pointer (argc at [t0])
         ld a0, 0(t0)         # argc -> a0 (1st argument to main)
         addi a1, t0, 8       # argv -> a1 (2nd argument to main)
@@ -106,8 +135,8 @@ pub fun _start() {
         ld a1, 0(t2)
         call main
 
-        # exit_group with main's return value (already in a0)
-        li a7, 94            # SYS_exit_group
-        ecall
+        # a0 is main's return value and _rt_exit's first argument
+        call _rt_exit
+        ebreak
     }
 }

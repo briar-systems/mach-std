@@ -1,6 +1,6 @@
 # windows winsock system resolver adapter
 
-$if ($mach.build.os != $mach.os.windows) {
+$if ($mach.build.sys != $mach.sys.windows) {
     $error("std.net.resolve.windows: requires windows target");
 }
 
@@ -8,23 +8,37 @@ use std.allocator;
 use std.net.ip;
 use std.net.resolve.shared;
 use std.net.resolve.types;
+use std.sync.cancel;
 use std.sync.once;
 use std.system.os;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.size.isize;
 use std.types.size.usize;
+use std.types.string.str;
 
-rec AddrInfo {
+rec AddrInfoEx {
     flags:          i32;
     family:         i32;
     socket_kind:    i32;
     protocol:       i32;
     address_length: usize;
-    canonical_name: *u8;
+    canonical_name: *u16;
     address:        *u8;
-    next:           *AddrInfo;
+    blob:           ptr;
+    blob_length:    usize;
+    provider:       ptr;
+    next:           *AddrInfoEx;
+}
+
+rec Overlapped {
+    internal:      usize;
+    internal_high: usize;
+    offset:        u32;
+    offset_high:   u32;
+    event:         isize;
 }
 
 val AI_PASSIVE:     i32 = 0x0001;
@@ -41,14 +55,31 @@ val WSANO_RECOVERY:        i32 = 11003;
 val WSANO_DATA:            i32 = 11004;
 val WSAENOBUFS:            i32 = 10055;
 
-#[library("ws2_32.dll")]
+#[library("ws2_32")]
 ext fun WSAStartup(version: u16, data: *u8) i32;
 
-#[library("ws2_32.dll")]
-ext fun getaddrinfo(node: *u8, service: *u8, hints: *AddrInfo, output: **AddrInfo) i32;
+#[library("ws2_32")]
+ext fun GetAddrInfoExW(name: *u16, service: *u16, namespace: u32, provider: ptr, hints: *AddrInfoEx, result: **AddrInfoEx,
+    timeout: ptr, overlapped: *Overlapped, completion: fun(u32, u32, *Overlapped), handle: *isize) i32;
 
-#[library("ws2_32.dll")]
-ext fun freeaddrinfo(value: *AddrInfo);
+#[library("ws2_32")]
+ext fun GetAddrInfoExCancel(handle: *isize) i32;
+
+#[library("ws2_32")]
+ext fun FreeAddrInfoExW(value: *AddrInfoEx);
+
+#[library("kernel32")]
+ext fun MultiByteToWideChar(page: u32, flags: u32, input: *u8, input_length: i32, output: *u16, capacity: i32) i32;
+
+#[library("kernel32")]
+ext fun WideCharToMultiByte(page: u32, flags: u32, input: *u16, input_length: i32, output: *u8, capacity: i32, fallback: *u8, used: *i32) i32;
+
+val NS_ALL:               u32 = 0;
+val WSA_IO_PENDING:       i32 = 997;
+val CP_UTF8:              u32 = 65001;
+val MB_ERR_INVALID_CHARS: u32 = 8;
+# NI_MAXHOST, the longest name getaddrinfo reports
+val CANONICAL_BYTES: usize = 1025;
 
 var initialized: once.Once = once.Once{state: once.PENDING, waiters: 0, error: 0};
 
@@ -90,44 +121,118 @@ fun flags(query: *types.Query) i32 {
     ret output;
 }
 
-pub fun resolve(query: *types.Query, owner: *allocator.Allocator, limits: types.ResultLimits, output: *types.Resolution) types.Error {
-    if (query == nil || owner == nil || output == nil) { ret shared.error(types.INVALID, 0); }
-    shared.clear(output, owner);
-    val started: once.Outcome = once.run(?initialized, nil, initialize);
-    if (sel started.err) {
-        if (sel started.err.failed) { ret shared.error(types.SYSTEM_FAILURE, started.err.failed); }
-        ret shared.error(types.SYSTEM_FAILURE, 0);
-    }
+# one GetAddrInfoExW call, owned by the system's completion of it and the
+# caller that waits for it, and freed with its result by the last to let go
+# ---
+# overlapped: the call's overlapped block, first so the completion's pointer
+#             is the request
+# pending:    the two references and the word the caller waits on
+# size:       the bytes the request was allocated with, its strings included
+# hints:      the call's hints
+# first:      the call's result list, written by the system, owned by the request
+# code:       the call's winsock result
+# cancel:     the handle GetAddrInfoExCancel takes
+# host:       the request's UTF-16 copy of the query's host, or nil
+# service:    the request's UTF-16 copy of the query's service, or nil
+rec Request {
+    overlapped: Overlapped;
+    pending:    shared.Pending;
+    size:       usize;
+    hints:      AddrInfoEx;
+    first:      *AddrInfoEx;
+    code:       i32;
+    cancel:     isize;
+    host:       *u16;
+    service:    *u16;
+}
 
-    var hints: AddrInfo;
-    hints.flags          = flags(query);
-    hints.family         = family(query);
-    hints.socket_kind    = socket_kind(query);
-    hints.protocol       = query.protocol;
-    hints.address_length = 0;
-    hints.canonical_name = nil;
-    hints.address        = nil;
-    hints.next           = nil;
-    var first: *AddrInfo = nil;
-    val code:  i32       = getaddrinfo(query.host, query.service, ?hints, ?first);
-    if (code != 0)    { ret failure(code); }
+# the UTF-16 units of a nul-terminated UTF-8 string with its nul, 0 for nil,
+# or -1 when it is not UTF-8
+fun wide_units(text: str) i64 {
+    if (text == nil) { ret 0; }
+    val units: i32 = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, nil, 0);
+    if (units <= 0) { ret -1; }
+    ret units::i64;
+}
+
+fun widen(text: str, at: *u16, units: i64) *u16 {
+    if (text == nil) { ret nil; }
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, at, units::i32);
+    ret at;
+}
+
+tag Made: u8 { malformed; exhausted; made: *Request; }
+
+# a request holding its own copies of everything the call reads
+fun request_make(query: *types.Query) Made {
+    val host_units:    i64 = wide_units(query.host);
+    val service_units: i64 = wide_units(query.service);
+    if (host_units < 0 || service_units < 0) { ret Made.malformed{}; }
+    val head: usize = $size_of(Request);
+    val size: usize = head + (host_units + service_units)::usize * 2;
+    val base: ptr   = os.allocate(size);
+    if (base == nil) { ret Made.exhausted{}; }
+    val request: *Request = base::usize::*Request;
+    request.overlapped.internal      = 0;
+    request.overlapped.internal_high = 0;
+    request.overlapped.offset        = 0;
+    request.overlapped.offset_high   = 0;
+    request.overlapped.event         = 0;
+    shared.pending_make(?request.pending);
+    request.size                 = size;
+    request.hints.flags          = flags(query);
+    request.hints.family         = family(query);
+    request.hints.socket_kind    = socket_kind(query);
+    request.hints.protocol       = query.protocol;
+    request.hints.address_length = 0;
+    request.hints.canonical_name = nil;
+    request.hints.address        = nil;
+    request.hints.blob           = nil;
+    request.hints.blob_length    = 0;
+    request.hints.provider       = nil;
+    request.hints.next           = nil;
+    request.first                = nil;
+    request.code                 = 0;
+    request.cancel               = 0;
+    val strings: *u16 = (base::usize + head)::*u16;
+    request.host    = widen(query.host, strings, host_units);
+    request.service = widen(query.service, (strings::usize + host_units::usize * 2)::*u16, service_units);
+    ret Made.made{request};
+}
+
+# let go of one reference, freeing the request and its result after the last
+fun request_release(request: *Request) {
+    if (!shared.pending_release(?request.pending)) { ret; }
+    if (request.first != nil)                      { FreeAddrInfoExW(request.first); }
+    os.deallocate(request::ptr, request.size);
+}
+
+# the system's completion of the call, on a thread of its own: it touches the
+# request alone
+fun completed(error: u32, bytes: u32, overlapped: *Overlapped) {
+    val request: *Request = overlapped::usize::*Request;
+    request.code = error::i32;
+    shared.pending_done(?request.pending);
+    request_release(request);
+}
+
+# the endpoints and canonical name of a completed call
+fun collected(request: *Request, limits: types.ResultLimits, output: *types.Resolution) types.Error {
+    if (request.code != 0) { ret failure(request.code); }
+    val first: *AddrInfoEx = request.first;
     if (first == nil) { ret shared.error(types.NO_NAME, WSAHOST_NOT_FOUND::i64); }
 
-    var count:   usize     = 0;
-    var current: *AddrInfo = first;
+    var count:   usize       = 0;
+    var current: *AddrInfoEx = first;
     for (current != nil) {
-        if (count == limits.max_endpoints) {
-            freeaddrinfo(first);
-            ret shared.error(types.OVERLOADED, 0);
-        }
         count   = count + 1;
         current = current.next;
     }
-    val allocated: err[types.Error] = shared.allocate_endpoints(output, count);
-    if (sel allocated.err) {
-        freeaddrinfo(first);
-        ret allocated.err;
-    }
+    # entries that differ only in socket type collapse, so only the distinct
+    # endpoints are held to the limit
+    if (count > limits.max_endpoints) { count = limits.max_endpoints; }
+    val err_allocated: err[types.Error] = shared.allocate_endpoints(output, count);
+    if (sel err_allocated.err) { ret err_allocated.err; }
 
     current = first;
     var malformed: bool = false;
@@ -136,31 +241,81 @@ pub fun resolve(query: *types.Query, owner: *allocator.Allocator, limits: types.
             var endpoint: ip.Endpoint;
             if (!ip.from_sockaddr(current.address, ?endpoint)) { malformed = true; }
             or {
-                val appended: err[types.Error] = shared.append_unique(output, endpoint);
-                if (sel appended.err) { malformed = true; }
+                val err_appended: err[types.Error] = shared.append_unique(output, endpoint);
+                if (sel err_appended.err) {
+                    shared.dnit(output);
+                    ret err_appended.err;
+                }
             }
         }
-        if (output.canonical_name == nil && current.canonical_name != nil
-            && !shared.canonical_fits(current.canonical_name, limits.max_canonical_name_bytes)) {
-            freeaddrinfo(first);
-            shared.destroy(output);
-            ret shared.error(types.OVERLOADED, 0);
-        }
         if (output.canonical_name == nil && current.canonical_name != nil) {
-            val named: err[types.Error] = shared.set_canonical(output, current.canonical_name);
-            if (sel named.err) {
-                freeaddrinfo(first);
-                shared.destroy(output);
-                ret named.err;
+            var name:  [1025]u8;
+            val bytes: i32 = WideCharToMultiByte(CP_UTF8, 0, current.canonical_name, -1, ?name[0], CANONICAL_BYTES::i32, nil, nil);
+            if (bytes <= 0) {
+                shared.dnit(output);
+                ret shared.error(types.MALFORMED, WSANO_RECOVERY::i64);
+            }
+            if (!shared.canonical_fits((?name[0])::str, limits.max_canonical_name_bytes)) {
+                shared.dnit(output);
+                ret shared.error(types.OVERLOADED, 0);
+            }
+            val err_named: err[types.Error] = shared.set_canonical(output, (?name[0])::str);
+            if (sel err_named.err) {
+                shared.dnit(output);
+                ret err_named.err;
             }
         }
         current = current.next;
     }
-    freeaddrinfo(first);
     if (output.len == 0) {
-        shared.destroy(output);
+        shared.dnit(output);
         if (malformed) { ret shared.error(types.MALFORMED, WSANO_RECOVERY::i64); }
         ret shared.error(types.NO_NAME, WSAHOST_NOT_FOUND::i64);
     }
     ret shared.error(types.NO_ERROR, 0);
+}
+
+# resolve through the system's GetAddrInfoExW, under the scope
+#
+# the call runs asynchronously, completed by the system on a thread of its own
+# into a request the library owns: copies of the query's strings, the hints, the
+# overlapped block and the result. the caller waits for it under the scope and
+# returns within shared.POLL_MSEC of the scope ending, with the scope's reason,
+# after asking GetAddrInfoExCancel to end the call. the completion that follows,
+# whenever the system delivers it, frees the request and its result, so nothing
+# of the caller's is touched after the return
+pub fun resolve(scope: *cancel.Scope, query: *types.Query, owner: *allocator.Allocator, limits: types.ResultLimits, output: *types.Resolution) types.Error {
+    if (query == nil || owner == nil || output == nil) { ret shared.error(types.INVALID, 0); }
+    shared.clear(output, owner);
+    val why: cancel.Reason = shared.scope_reason(scope);
+    if (!sel why.active) { ret shared.ended(why); }
+    val res_started: once.Outcome = once.run(?initialized, nil, initialize);
+    if (sel res_started.err) {
+        if (sel res_started.err.failed) { ret shared.error(types.SYSTEM_FAILURE, res_started.err.failed); }
+        ret shared.error(types.SYSTEM_FAILURE, 0);
+    }
+
+    val made: Made = request_make(query);
+    if (sel made.malformed) { ret shared.error(types.INVALID, WSAEINVAL::i64); }
+    if (!sel made.made)     { ret shared.error(types.OUT_OF_MEMORY, 0); }
+    val request: *Request = made.made;
+    val code:    i32      = GetAddrInfoExW(request.host, request.service, NS_ALL, nil, ?request.hints, ?request.first,
+        nil, ?request.overlapped, completed, ?request.cancel);
+    if (code != WSA_IO_PENDING) {
+        # the call finished before returning, and no completion follows it
+        request.code = code;
+        request_release(request);
+    }
+    or {
+        val waited: cancel.Reason = shared.pending_wait(?request.pending, scope);
+        if (!sel waited.active) {
+            # a handle the system never set has nothing to cancel
+            if (request.cancel != 0) { GetAddrInfoExCancel(?request.cancel); }
+            request_release(request);
+            ret shared.ended(waited);
+        }
+    }
+    val outcome: types.Error = collected(request, limits, output);
+    request_release(request);
+    ret outcome;
 }

@@ -1,0 +1,165 @@
+# thread creation in a loader-hosted process
+#
+# a thread there has to carry the initial-exec thread-locals of every module and
+# the C runtime's per-thread state, and only the host's own thread creation
+# builds those. std names no host symbol, so it reaches that creation through
+# three link-time defaults, which a backend package replaces with strong
+# definitions of the same names. the pairing is unchecked: a replacement takes
+# exactly these shapes. all three or none, as a handle only means something to
+# the backend that made it. replacement is link time only, so each image that
+# carries std and spawns has the backend in its own link. a secret never crosses
+# this seam.
+
+use std.sync.atomic;
+use std.types.size.usize;
+
+use std.system.os.linux.shared;
+
+# what a backend starts: the thread runs entry(arg) and exits with its result
+pub def Entry: fun(*u8) *u8;
+
+# start a host thread that runs entry(arg)
+# ---
+# entry:         the routine to run, which returns nil
+# arg:           its argument, passed through untouched
+# stack_reserve: the usable stack in bytes, a multiple of the page size
+# stack_commit:  the bytes to commit up front, or 0 for the host's default
+# handle:        receives what backend_join and backend_detach take
+# ret:           0, or a negative errno, ENOTSUP for a policy the host lacks
+#[weak("std_thread_backend_spawn")]
+fun backend_spawn(entry: Entry, arg: *u8, stack_reserve: usize, stack_commit: usize, handle: *usize) i64 {
+    ret shared.ENOTSUP;
+}
+
+# wait for a thread backend_spawn started to end, and release it
+# ---
+# ret: 0, or a negative errno with the thread still joinable
+#[weak("std_thread_backend_join")]
+fun backend_join(handle: usize) i64 {
+    ret shared.ENOTSUP;
+}
+
+# give up the handle of a thread backend_spawn started, which releases itself
+# ---
+# ret: 0, or a negative errno with the thread still joinable
+#[weak("std_thread_backend_detach")]
+fun backend_detach(handle: usize) i64 {
+    ret shared.ENOTSUP;
+}
+
+# what the host thread reads at start, in a page of its own that it releases
+rec Start {
+    wipe:             fun();
+    fn_addr:          usize;
+    arg_addr:         usize;
+    state_addr:       usize;
+    reclaimable_addr: usize;
+    owner_base:       usize;
+    owner_size:       usize;
+    name_addr:        usize;
+    setup:            i64;
+    run:              i64;
+    setup_error:      i64;
+    thread_id:        i64;
+}
+
+val START_SIZE: usize = 4096;
+
+# the routine every backend thread runs: the parent-gated setup, then the body
+fun thread_main(arg: *u8) *u8 {
+    val start: *Start = arg::*Start;
+    start.setup_error = shared.thread_set_name(start.name_addr::*u8);
+    start.thread_id   = shared.thread_current_id();
+    atomic.store(?start.setup, 1);
+    shared.thread_wake(?start.setup);
+    for (atomic.load(?start.run) == 0) { shared.thread_wait(?start.run, 0); }
+
+    val wipe:        fun() = start.wipe;
+    val fn_addr:     usize = start.fn_addr;
+    val arg_addr:    usize = start.arg_addr;
+    val state:       *i64  = start.state_addr::*i64;
+    val reclaimable: *i64  = start.reclaimable_addr::*i64;
+    val owner_base:  usize = start.owner_base;
+    val owner_size:  usize = start.owner_size;
+    val run:         i64   = atomic.load(?start.run);
+    shared.deallocate(arg::ptr, START_SIZE);
+
+    if (run > 0) {
+        val fn_ptr: fun(*u8) = fn_addr::fun(*u8);
+        fn_ptr(arg_addr::*u8);
+    }
+    wipe();
+
+    var expected: i64 = 0;
+    if (run < 0 || atomic.cas(state, ?expected, 1)) {
+        atomic.store(reclaimable, 1);
+        shared.thread_wake(reclaimable);
+    }
+    or {
+        shared.deallocate(owner_base::ptr, owner_size);
+    }
+    ret nil;
+}
+
+# create a thread through the backend, or refuse with its answer
+#
+# with no backend installed that answer is ENOTSUP, before anything starts. the
+# thread gets no std block, so its stack bounds are unknown, as on any thread
+# the host created
+# ---
+# wipe: wipes the calling thread's thread-local block as the thread ends
+# ret:  thread ID on success, or negative errno on failure
+pub fun thread_spawn(
+    wipe: fun(), f: fun(*u8), arg: *u8, state: *i64, reclaimable: *i64,
+    owner: ptr, owner_size: usize, name: *u8,
+    stack_reserve: usize, stack_commit: usize, native: *usize,
+) i64 {
+    val start_mem: ptr = shared.allocate(START_SIZE);
+    if (start_mem == nil) { ret shared.ENOMEM; }
+    val start: *Start = start_mem::usize::*Start;
+    start.wipe             = wipe;
+    start.fn_addr          = f::usize;
+    start.arg_addr         = arg::usize;
+    start.state_addr       = state::usize;
+    start.reclaimable_addr = reclaimable::usize;
+    start.owner_base       = owner::usize;
+    start.owner_size       = owner_size;
+    start.name_addr        = name::usize;
+    start.setup            = 0;
+    start.run              = 0;
+    start.setup_error      = 0;
+    start.thread_id        = 0;
+
+    var handle:  usize = 0;
+    val started: i64   = backend_spawn(thread_main, start_mem::*u8, stack_reserve, stack_commit, ?handle);
+    if (started < 0) {
+        shared.deallocate(start_mem, START_SIZE);
+        ret started;
+    }
+
+    for (atomic.load(?start.setup) == 0) { shared.thread_wait(?start.setup, 0); }
+    val setup_error: i64 = start.setup_error;
+    if (setup_error < 0) {
+        atomic.store(?start.run, -1);
+        shared.thread_wake(?start.run);
+        val joined: i64 = backend_join(handle);
+        if (joined < 0) { ret joined; }
+        ret setup_error;
+    }
+
+    val thread_id: i64 = start.thread_id;
+    @native = handle;
+    atomic.store(?start.run, 1);
+    shared.thread_wake(?start.run);
+    ret thread_id;
+}
+
+# wait for a thread thread_spawn made to end
+pub fun thread_join(native: usize) i64 {
+    ret backend_join(native);
+}
+
+# give up the handle of a thread thread_spawn made
+pub fun thread_detach(native: usize) i64 {
+    ret backend_detach(native);
+}

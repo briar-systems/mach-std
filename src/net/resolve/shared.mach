@@ -1,8 +1,13 @@
 # target resolver result ownership helpers
 
 use std.allocator;
+use std.chrono.duration;
+use std.chrono.time;
 use std.net.ip;
 use std.net.resolve.types;
+use std.sync.atomic;
+use std.sync.cancel;
+use std.system.os;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -12,8 +17,97 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
 
+# build a resolver error
+# ---
+# kind:        the portable error kind
+# native_code: the backend's own status, 0 when there is none
+# ret:         the error record
 pub fun error(kind: types.ErrorKind, native_code: i64) types.Error {
     ret types.Error{kind: kind, native_code: native_code};
+}
+
+# the error for a scope that ended a lookup: a destroyed or refused scope is
+# INVALID, its native code 3 or 4 after its place among cancel.Reason's cases
+pub fun ended(reason: cancel.Reason) types.Error {
+    if (sel reason.cancelled) { ret error(types.CANCELLED, 0); }
+    if (sel reason.timed_out) { ret error(types.TIMED_OUT, 0); }
+    if (sel reason.destroyed) { ret error(types.INVALID, 3); }
+    if (sel reason.invalid)   { ret error(types.INVALID, 4); }
+    ret error(types.INVALID, 0);
+}
+
+# a lookup's scope's reason with its deadline applied, invalid for a nil scope
+pub fun scope_reason(scope: *cancel.Scope) cancel.Reason {
+    if (scope == nil) { ret cancel.Reason.invalid{}; }
+    val res_now: time.InstantClock = time.instant();
+    # an unreadable clock only skips the deadline: an explicit cancel still ends the scope
+    if (sel res_now.ok) { cancel.expire(scope, res_now.ok); }
+    ret cancel.reason(scope);
+}
+
+# the longest a lookup waits before it asks its scope again, and so the bound on
+# how long a lookup outlives the end of its scope
+pub val POLL_MSEC: i64 = 10;
+
+val PENDING_RUNNING: i64 = 0;
+val PENDING_DONE:    i64 = 1;
+
+# a system lookup its caller may stop waiting for
+#
+# the caller and whatever completes the lookup (a helper thread, or the
+# system's completion callback) each hold one of two references to the request
+# that embeds this, and the last to let go frees the request with its result.
+# so a caller whose scope ends returns at once and holds nothing of the lookup,
+# and the completion touches nothing of the caller's
+# ---
+# state: RUNNING until the completion has stored its result, then DONE. the
+#        word the caller waits on
+# refs:  the references still held, 2 when made
+pub rec Pending {
+    state: i64;
+    refs:  i64;
+}
+
+# make a pending lookup running with both references held
+# ---
+# pending: the pending state to initialise
+pub fun pending_make(pending: *Pending) {
+    pending.state = PENDING_RUNNING;
+    pending.refs  = 2;
+}
+
+# wait for the completion under a scope, asking the scope at least every POLL_MSEC
+# ---
+# ret: active once the completion has stored its result, or the reason the
+#      scope ended first, invalid for a nil scope
+pub fun pending_wait(pending: *Pending, scope: *cancel.Scope) cancel.Reason {
+    for {
+        if (atomic.load(?pending.state) == PENDING_DONE) { ret cancel.Reason.active{}; }
+        val why: cancel.Reason = scope_reason(scope);
+        if (!sel why.active) { ret why; }
+        val res_now: time.InstantClock = time.instant();
+        if (sel res_now.err) {
+            os.sleep(POLL_MSEC * duration.MILLISECOND);
+            cnt;
+        }
+        val until:    time.Instant = time.instant_add(res_now.ok, POLL_MSEC * duration.MILLISECOND);
+        var deadline: os.Timespec  = os.Timespec{sec: until.sec, nsec: until.nsec};
+        os.thread_wait_until(?pending.state, PENDING_RUNNING, ?deadline);
+    }
+    ret cancel.Reason.active{};
+}
+
+# publish that the completion has stored its result, waking a waiting caller
+pub fun pending_done(pending: *Pending) {
+    atomic.store(?pending.state, PENDING_DONE);
+    os.thread_wake(?pending.state);
+}
+
+# let go of one reference
+# ---
+# ret: true for the last, whose holder frees the request and any result in it
+pub fun pending_release(pending: *Pending) bool {
+    ret atomic.fetch_sub(?pending.refs, 1) == 1;
 }
 
 fun refused(kind: types.ErrorKind, native_code: i64) err[types.Error] {
@@ -27,6 +121,12 @@ fun allocation_refused(failure: allocator.Error) err[types.Error] {
     ret refused(types.OUT_OF_MEMORY, 0);
 }
 
+# empty a resolution without freeing anything and give it an owner
+#
+# whatever storage the resolution held before is forgotten, not released
+# ---
+# output: the resolution to reset
+# owner:  the allocator later storage is taken from and released to
 pub fun clear(output: *types.Resolution, owner: *allocator.Allocator) {
     output.endpoints          = nil;
     output.len                = 0;
@@ -40,14 +140,14 @@ pub fun clear(output: *types.Resolution, owner: *allocator.Allocator) {
 # release the resolution's storage; both buffers are attempted, the first
 # refusal is reported, and a buffer whose release was refused stays owned by
 # the resolution so the caller can retry
-pub fun destroy(output: *types.Resolution) err[types.Error] {
+pub fun dnit(output: *types.Resolution) err[types.Error] {
     if (output == nil || output.allocator == nil) { ret refused(types.INVALID, 0); }
-    var first:       err[types.Error] = err[types.Error].ok{};
+    var err_first:   err[types.Error] = err[types.Error].ok{};
     var refused_any: bool             = false;
     if (output.endpoints != nil && output.endpoint_capacity != 0) {
-        val endpoints_freed: err[allocator.Error] = allocator.deallocate[ip.Endpoint](output.allocator, output.endpoints, output.endpoint_capacity);
-        if (sel endpoints_freed.err) {
-            first       = allocation_refused(endpoints_freed.err);
+        val err_endpoints_freed: err[allocator.Error] = allocator.deallocate[ip.Endpoint](output.allocator, output.endpoints, output.endpoint_capacity);
+        if (sel err_endpoints_freed.err) {
+            err_first   = allocation_refused(err_endpoints_freed.err);
             refused_any = true;
         }
         or {
@@ -62,9 +162,9 @@ pub fun destroy(output: *types.Resolution) err[types.Error] {
         output.len               = 0;
     }
     if (output.canonical_name != nil && output.canonical_capacity != 0) {
-        val name_freed: err[allocator.Error] = allocator.deallocate[u8](output.allocator, output.canonical_name, output.canonical_capacity);
-        if (sel name_freed.err) {
-            if (!refused_any) { first = allocation_refused(name_freed.err); }
+        val err_name_freed: err[allocator.Error] = allocator.deallocate[u8](output.allocator, output.canonical_name, output.canonical_capacity);
+        if (sel err_name_freed.err) {
+            if (!refused_any) { err_first = allocation_refused(err_name_freed.err); }
         }
         or {
             output.canonical_name     = nil;
@@ -77,14 +177,22 @@ pub fun destroy(output: *types.Resolution) err[types.Error] {
         output.canonical_length   = 0;
         output.canonical_capacity = 0;
     }
-    ret first;
+    ret err_first;
 }
 
+# allocate endpoint storage for a resolution from its allocator
+#
+# the resolution's previous endpoint storage is not released
+# ---
+# output:   the resolution, which owns the new storage
+# capacity: endpoints to allocate room for
+# ret:      ok, INVALID for a nil resolution, nil allocator or zero capacity,
+#           or the allocator refusal
 pub fun allocate_endpoints(output: *types.Resolution, capacity: usize) err[types.Error] {
     if (output == nil || output.allocator == nil || capacity == 0) { ret refused(types.INVALID, 0); }
-    val allocated: res[*ip.Endpoint, allocator.Error] = allocator.allocate[ip.Endpoint](output.allocator, capacity);
-    if (sel allocated.err) { ret allocation_refused(allocated.err); }
-    output.endpoints         = allocated.ok;
+    val res_allocated: res[*ip.Endpoint, allocator.Error] = allocator.allocate[ip.Endpoint](output.allocator, capacity);
+    if (sel res_allocated.err) { ret allocation_refused(res_allocated.err); }
+    output.endpoints         = res_allocated.ok;
     output.endpoint_capacity = capacity;
     output.len               = 0;
     ret err[types.Error].ok{};
@@ -107,6 +215,11 @@ fun endpoint_equal(a: ip.Endpoint, b: ip.Endpoint) bool {
     ret true;
 }
 
+# check a resolution's fields are consistent with each other
+# ---
+# output: the resolution to check
+# ret:    true when it has an allocator, its length fits its endpoint
+#         storage and any canonical name is nul-terminated within its capacity
 pub fun valid(output: *types.Resolution) bool {
     if (output == nil || output.allocator == nil)   { ret false; }
     if (output.len > output.endpoint_capacity)      { ret false; }
@@ -121,6 +234,11 @@ pub fun valid(output: *types.Resolution) bool {
     ret true;
 }
 
+# check a valid resolution's storage stays within the caller's limits
+# ---
+# output: the resolution to check
+# limits: the endpoint and canonical name capacities allowed
+# ret:    true when the resolution is valid and both capacities fit
 pub fun within_limits(output: *types.Resolution, limits: types.ResultLimits) bool {
     if (!valid(output) || output.endpoint_capacity > limits.max_endpoints) { ret false; }
     if (output.canonical_capacity > limits.max_canonical_name_bytes)       { ret false; }
@@ -153,25 +271,34 @@ pub fun deduplicate(output: *types.Resolution) err[types.Error] {
 # duplicate is a success that stores nothing, a full result is OVERLOADED
 pub fun append_unique(output: *types.Resolution, endpoint: ip.Endpoint) err[types.Error] {
     if (output == nil || output.endpoints == nil) { ret refused(types.INVALID, 0); }
-    if (output.len >= output.endpoint_capacity)   { ret refused(types.OVERLOADED, 0); }
     var i: usize = 0;
     for (i < output.len) {
         if (endpoint_equal(output.endpoints[i], endpoint)) { ret err[types.Error].ok{}; }
         i = i + 1;
     }
+    if (output.len >= output.endpoint_capacity) { ret refused(types.OVERLOADED, 0); }
     output.endpoints[output.len] = endpoint;
     output.len                   = output.len + 1;
     ret err[types.Error].ok{};
 }
 
+# copy name into newly allocated canonical name storage of the resolution
+#
+# a canonical name the resolution held before is not released
+# ---
+# output: the resolution, which owns the copy
+# name:   the nul-terminated canonical name
+# ret:    ok, INVALID for a nil resolution, nil allocator or nil name,
+#         OVERLOADED when the length leaves no room for the terminator, or the
+#         allocator refusal
 pub fun set_canonical(output: *types.Resolution, name: str) err[types.Error] {
     if (output == nil || output.allocator == nil || name == nil) { ret refused(types.INVALID, 0); }
     val length: usize = str_len(name);
     if (length == ~(0::usize)) { ret refused(types.OVERLOADED, 0); }
-    val capacity:  usize                     = length + 1;
-    val allocated: res[*u8, allocator.Error] = allocator.allocate[u8](output.allocator, capacity);
-    if (sel allocated.err) { ret allocation_refused(allocated.err); }
-    output.canonical_name     = allocated.ok;
+    val capacity:      usize                     = length + 1;
+    val res_allocated: res[*u8, allocator.Error] = allocator.allocate[u8](output.allocator, capacity);
+    if (sel res_allocated.err) { ret allocation_refused(res_allocated.err); }
+    output.canonical_name     = res_allocated.ok;
     output.canonical_length   = length;
     output.canonical_capacity = capacity;
     var i: usize = 0;
@@ -183,6 +310,31 @@ pub fun set_canonical(output: *types.Resolution, name: str) err[types.Error] {
     ret err[types.Error].ok{};
 }
 
+fun lower(byte: u8) u8 {
+    if (byte >= 'A' && byte <= 'Z') { ret byte + 32; }
+    ret byte;
+}
+
+# an RFC 6761 localhost name: `localhost` or any name under `.localhost`,
+# case-insensitively, with an optional trailing dot
+pub fun is_localhost(hostname: str) bool {
+    var length: usize = str_len(hostname);
+    if (length != 0 && hostname[length - 1] == '.') { length = length - 1; }
+    if (length < 9)                                 { ret false; }
+    val suffix: usize = length - 9;
+    var i:      usize = 0;
+    for (i < 9) {
+        if (lower(hostname[suffix + i]) != "localhost"[i]) { ret false; }
+        i = i + 1;
+    }
+    ret length == 9 || hostname[suffix - 1] == '.';
+}
+
+# check name, terminator included, fits within max_bytes
+# ---
+# name:      the nul-terminated name, nil counting as fitting
+# max_bytes: the byte budget
+# ret:       true when a terminator appears within the first max_bytes bytes
 pub fun canonical_fits(name: str, max_bytes: usize) bool {
     if (name == nil) { ret true; }
     var length: usize = 0;
@@ -193,7 +345,10 @@ pub fun canonical_fits(name: str, max_bytes: usize) bool {
     ret false;
 }
 
+#[testing]
 use std.allocator.testing;
+#[testing]
+use std.types.option.opt;
 
 # test predicate: `sel` takes a place, so an inline call is tested through this
 #[testing]
@@ -201,49 +356,104 @@ fun accepted(r: err[types.Error]) bool {
     ret sel r.ok;
 }
 
+# forwards to inner, and refuses every release while refuse is set
+#[testing]
+rec ReleaseRefusal {
+    inner:  *allocator.Allocator;
+    refuse: bool;
+}
+
+#[testing]
+fun refusal_allocate(context: ptr, size: usize, align: usize) opt[ptr] {
+    val r: *ReleaseRefusal = context::*ReleaseRefusal;
+    ret r.inner.fn_allocate(r.inner.ctx, size, align);
+}
+
+#[testing]
+fun refusal_reallocate(context: ptr, p: ptr, old: usize, size: usize, align: usize) opt[ptr] {
+    val r: *ReleaseRefusal = context::*ReleaseRefusal;
+    ret r.inner.fn_reallocate(r.inner.ctx, p, old, size, align);
+}
+
+#[testing]
+fun refusal_deallocate(context: ptr, p: ptr, size: usize, align: usize) i64 {
+    val r: *ReleaseRefusal = context::*ReleaseRefusal;
+    if (r.refuse) { ret -5; }
+    ret r.inner.fn_deallocate(r.inner.ctx, p, size, align);
+}
+
 test resolve_shared__acquisitions_report_the_allocator_refusal_and_release_keeps_what_was_refused {
-    var tracking: testing.Testing;
-    val tracked:  err[allocator.Error] = testing.make(?tracking);
-    if (sel tracked.err) { ret 1; }
+    var tracking:    testing.Testing;
+    val err_tracked: err[allocator.Error] = testing.init(?tracking);
+    if (sel err_tracked.err) { ret 1; }
     fin { testing.dnit(?tracking); }
+    var refusal: ReleaseRefusal      = ReleaseRefusal{inner: ?tracking.a, refuse: false};
+    var owner:   allocator.Allocator = allocator.Allocator{
+        ctx:           (?refusal)::ptr,
+        fn_allocate:   refusal_allocate,
+        fn_reallocate: refusal_reallocate,
+        fn_deallocate: refusal_deallocate,
+        retains:       false,
+    };
     var output: types.Resolution;
-    clear(?output, ?tracking.a);
+    clear(?output, ?owner);
 
     testing.fail_at_ordinal(?tracking, testing.attempt_count(?tracking) + 1);
-    val refused_endpoints: err[types.Error] = allocate_endpoints(?output, 2);
-    if (!sel refused_endpoints.err)                                                                         { ret 2; }
-    if (refused_endpoints.err.kind != types.OUT_OF_MEMORY || output.endpoints != nil || tracking.live != 0) { ret 3; }
+    val err_refused_endpoints: err[types.Error] = allocate_endpoints(?output, 2);
+    if (!sel err_refused_endpoints.err)                                                                         { ret 2; }
+    if (err_refused_endpoints.err.kind != types.OUT_OF_MEMORY || output.endpoints != nil || tracking.live != 0) { ret 3; }
     testing.clear_failure(?tracking);
     if (!accepted(allocate_endpoints(?output, 2))) { ret 4; }
-    val invalid: err[types.Error] = allocate_endpoints(?output, 0);
-    if (!sel invalid.err)                  { ret 5; }
-    if (invalid.err.kind != types.INVALID) { ret 6; }
+    val err_invalid: err[types.Error] = allocate_endpoints(?output, 0);
+    if (!sel err_invalid.err)                  { ret 5; }
+    if (err_invalid.err.kind != types.INVALID) { ret 6; }
 
     val ep: ip.Endpoint = ip.endpoint(127, 0, 0, 1, 53);
     if (!accepted(append_unique(?output, ep)))                                               { ret 7; }
     if (!accepted(append_unique(?output, ep)) || output.len != 1)                            { ret 8; }
     if (!accepted(append_unique(?output, ip.endpoint(127, 0, 0, 2, 53))) || output.len != 2) { ret 9; }
-    val full: err[types.Error] = append_unique(?output, ip.endpoint(127, 0, 0, 3, 53));
-    if (!sel full.err)                                        { ret 10; }
-    if (full.err.kind != types.OVERLOADED || output.len != 2) { ret 11; }
+    val err_full: err[types.Error] = append_unique(?output, ip.endpoint(127, 0, 0, 3, 53));
+    if (!sel err_full.err)                                        { ret 10; }
+    if (err_full.err.kind != types.OVERLOADED || output.len != 2) { ret 11; }
 
     testing.fail_at_ordinal(?tracking, testing.attempt_count(?tracking) + 1);
-    val refused_name: err[types.Error] = set_canonical(?output, "example");
-    if (!sel refused_name.err)                                                        { ret 12; }
-    if (refused_name.err.kind != types.OUT_OF_MEMORY || output.canonical_name != nil) { ret 13; }
+    val err_refused_name: err[types.Error] = set_canonical(?output, "example");
+    if (!sel err_refused_name.err)                                                        { ret 12; }
+    if (err_refused_name.err.kind != types.OUT_OF_MEMORY || output.canonical_name != nil) { ret 13; }
     testing.clear_failure(?tracking);
     if (!accepted(set_canonical(?output, "example")) || output.canonical_length != 7) { ret 14; }
     if (tracking.live != 2)                                                           { ret 15; }
 
-    if (!accepted(deduplicate(?output)) || output.len != 2)                            { ret 16; }
-    if (!accepted(destroy(?output)))                                                   { ret 17; }
+    if (!accepted(deduplicate(?output)) || output.len != 2) { ret 16; }
+    # a refused release keeps both buffers with the resolution for a retry
+    refusal.refuse = true;
+    val err_kept: err[types.Error] = dnit(?output);
+    refusal.refuse = false;
+    if (!sel err_kept.err)                                                             { ret 22; }
+    if (err_kept.err.kind != types.SYSTEM_FAILURE)                                     { ret 22; }
+    if (output.endpoints == nil || output.canonical_name == nil || tracking.live != 2) { ret 23; }
+    if (!accepted(dnit(?output)))                                                      { ret 17; }
     if (output.endpoints != nil || output.canonical_name != nil || tracking.live != 0) { ret 18; }
-    val nothing: err[types.Error] = destroy(?output);
-    if (!sel nothing.ok) { ret 19; }
+    val err_nothing: err[types.Error] = dnit(?output);
+    if (!sel err_nothing.ok) { ret 19; }
     var unowned: types.Resolution;
     clear(?unowned, nil);
-    val unowned_destroy: err[types.Error] = destroy(?unowned);
-    if (!sel unowned_destroy.err)                  { ret 20; }
-    if (unowned_destroy.err.kind != types.INVALID) { ret 21; }
+    val err_unowned_destroy: err[types.Error] = dnit(?unowned);
+    if (!sel err_unowned_destroy.err)                  { ret 20; }
+    if (err_unowned_destroy.err.kind != types.INVALID) { ret 21; }
+    ret 0;
+}
+
+test resolve_shared__localhost_names {
+    if (!is_localhost("localhost"))        { ret 1; }
+    if (!is_localhost("LOCALHOST."))       { ret 2; }
+    if (!is_localhost("web.localhost"))    { ret 3; }
+    if (is_localhost("not-localhost"))     { ret 4; }
+    if (is_localhost("localhost.example")) { ret 5; }
+    # a short name borrowed from inside a longer text owns none of the bytes
+    # before it, with or without its trailing dot
+    val framed: str = ".localhost.";
+    if (is_localhost(?framed[3]))  { ret 6; }
+    if (is_localhost(?framed[11])) { ret 7; }
     ret 0;
 }

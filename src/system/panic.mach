@@ -1,4 +1,5 @@
-# low-level panic: write message to stderr and terminate
+# low-level panic: write message to stderr and terminate, or on bare metal hand it to
+# the program's sink and park the core
 #
 # self-contained module with no dependency on std.system.os, so the
 # os layer and the runtime can panic without a circular import chain.
@@ -19,9 +20,16 @@
 # The property this buys is that an OS with no arm has no `panic_sink` and therefore CANNOT
 # BUILD, rather than inheriting another platform's syscalls. Deleting the windows arm and
 # building for windows demonstrates it. The trailing `$error` names that case explicitly
-# when comptime reaches it first; either way the failure is at compile time. It is
-# prospective, not currently reachable - linux, darwin and windows all have arms, and a
-# freestanding project links no std - and it exists so the NEXT operating system trips it.
+# when comptime reaches it first; either way the failure is at compile time. linux,
+# darwin, wasi, windows, uefi and freestanding have arms. spirv reaches the `$error`, as a
+# shader has no write target and no process to end.
+#
+# THE FREESTANDING ARM HAS NO WRITE TARGET of its own, so the program installs one with
+# `install` and the arm parks the core after it, or parks at once when none is installed. a
+# wasm module has no core to park, so it traps instead.
+# The hook is set at run time rather than overridden at link time because a sink usually
+# drives a device the program brings up itself, so a panic before that point must park
+# rather than call into a device that is not ready yet.
 #
 # THE WRITE AND THE TERMINATOR MOVE TOGETHER, in one `panic_sink` per platform. Splitting
 # them is what made the windows breakage look survivable: fixing only the terminator would
@@ -39,7 +47,7 @@ use std.types.size.usize;
 # keep them in step with this.
 pub val PANIC_EXIT: u32 = 255;
 
-$if ($mach.build.os == $mach.os.linux) {
+$if ($mach.build.sys == $mach.sys.linux) {
     # write(2, msg, len) then exit_group(255)
     #
     # exit_group rather than exit so every thread of the process ends - a panic on a
@@ -48,9 +56,11 @@ $if ($mach.build.os == $mach.os.linux) {
     # ---
     # msg: message bytes
     # len: message length
+    #[noreturn]
     pub fun panic_sink(msg: *u8, len: usize) {
         $if ($mach.build.arch == $mach.arch.x86_64) {
-            asm x86_64 {
+            #[noreturn]
+            asm x86-64 {
                 mov eax, 1        # SYS_write
                 mov edi, 2        # fd = stderr
                 mov rsi, {msg}
@@ -63,24 +73,40 @@ $if ($mach.build.os == $mach.os.linux) {
             }
         }
         $or ($mach.build.arch == $mach.arch.aarch64) {
-            asm aarch64 {
-                mov x8, 64    # SYS_write (linux aarch64)
-                mov x0, 2     # fd = stderr
+            #[noreturn]
+            asm armv8-a {
+                mov x8, 64    // SYS_write (linux aarch64)
+                mov x0, 2     // fd = stderr
                 ldr x1, {msg}
                 ldr x2, {len}
                 svc 0
-                mov x8, 94    # SYS_exit_group
-                mov x0, 255   # PANIC_EXIT
+                mov x8, 94    // SYS_exit_group
+                mov x0, 255   // PANIC_EXIT
                 svc 0
                 brk 0
             }
         }
         $or ($mach.build.arch == $mach.arch.riscv64) {
-            asm riscv64 {
+            #[noreturn]
+            asm rv64i {
                 li a7, 64     # SYS_write (linux riscv64)
                 li a0, 2      # fd = stderr
                 ld a1, {msg}
                 ld a2, {len}
+                ecall
+                li a7, 94     # SYS_exit_group
+                li a0, 255    # PANIC_EXIT
+                ecall
+                ebreak
+            }
+        }
+        $or ($mach.build.arch == $mach.arch.riscv32) {
+            #[noreturn]
+            asm rv32i {
+                li a7, 64     # SYS_write (linux riscv32)
+                li a0, 2      # fd = stderr
+                lw a1, {msg}
+                lw a2, {len}
                 ecall
                 li a7, 94     # SYS_exit_group
                 li a0, 255    # PANIC_EXIT
@@ -93,7 +119,7 @@ $if ($mach.build.os == $mach.os.linux) {
         }
     }
 }
-$or ($mach.build.os == $mach.os.darwin) {
+$or ($mach.build.sys == $mach.sys.darwin) {
     # write(2) to stderr then _exit(2), both through libSystem
     #
     # apple promises no syscall numbers, so the darwin arm calls the two public
@@ -107,20 +133,48 @@ $or ($mach.build.os == $mach.os.darwin) {
     # the process the way linux's `exit_group` does. It does not return, so no
     # trailing guard is needed. No inline asm and no arch gate: libSystem is the
     # interface on both darwin architectures.
-    #[library("libSystem")]
+    #[library("libsystem")]
     ext fun write(p0: i32, p1: *u8, p2: usize) isize;
-    #[library("libSystem")]
+    #[library("libsystem")]
+    #[noreturn]
     ext fun _exit(p0: i32);
 
+    # write(2, msg, len) then _exit(255)
     # ---
     # msg: message bytes
     # len: message length
+    #[noreturn]
     pub fun panic_sink(msg: *u8, len: usize) {
         write(2, msg, len);
         _exit(PANIC_EXIT::i32);
     }
 }
-$or ($mach.build.os == $mach.os.windows) {
+$or ($mach.build.sys == $mach.sys.wasi) {
+    # fd_write to descriptor 2 then proc_exit(255), through imports the host resolves
+    #
+    # the iovec and the two imports sit in this arm for the reason the windows ones do.
+    rec PanicIovec {
+        buf: *u8;
+        len: usize;
+    }
+
+    ext fun fd_write(fd: i32, iovs: *PanicIovec, count: usize, done: *usize) i32;
+    #[noreturn]
+    ext fun proc_exit(code: u32);
+
+    # fd_write to descriptor 2 then proc_exit(255)
+    # ---
+    # msg: message bytes
+    # len: message length
+    #[noreturn]
+    pub fun panic_sink(msg: *u8, len: usize) {
+        var v:    PanicIovec = PanicIovec{buf: msg, len: len};
+        var done: usize      = 0;
+        fd_write(2, ?v, 1, ?done);
+        proc_exit(PANIC_EXIT);
+    }
+}
+$or ($mach.build.sys == $mach.sys.windows) {
     # windows has no stable syscall interface, so the panic path calls the documented
     # kernel32 entry points. These are EXTERN declarations, not module imports: they add
     # no mach dependency, and the only mach symbol this arm needs - `isize` - comes from
@@ -130,11 +184,12 @@ $or ($mach.build.os == $mach.os.windows) {
     # They sit inside this arm because an `ext fun` is linked wherever it is declared: at
     # module scope these three would appear in every linux and darwin link as undefined
     # symbols.
-    #[library("kernel32.dll")]
+    #[library("kernel32")]
     ext fun GetStdHandle(p0: u32) isize;
-    #[library("kernel32.dll")]
+    #[library("kernel32")]
     ext fun WriteFile(p0: isize, p1: *u8, p2: u32, p3: *u32, p4: ptr) i32;
-    #[library("kernel32.dll")]
+    #[library("kernel32")]
+    #[noreturn]
     ext fun ExitProcess(p0: u32);
 
     # stderr's handle id; `STD_ERROR_HANDLE` is (DWORD)-12
@@ -149,19 +204,132 @@ $or ($mach.build.os == $mach.os.windows) {
     # ---
     # msg: message bytes
     # len: message length
+    #[noreturn]
     pub fun panic_sink(msg: *u8, len: usize) {
         var written: u32 = 0;
         WriteFile(GetStdHandle(STD_ERROR_HANDLE), msg, len::u32, ?written, nil);
         ExitProcess(PANIC_EXIT);
     }
 }
+$or ($mach.build.sys == $mach.sys.uefi) {
+    # the console's text output and boot services, reached through the system table the
+    # entry kept. these are mach imports rather than externs because the firmware publishes
+    # no symbols, and neither module imports this one.
+    use std.runtime.uefi.image_handle;
+    use std.runtime.uefi.system_table;
+    use std.system.uefi.ABORTED;
+    use std.system.uefi.SimpleTextOutputProtocol;
+    use std.system.uefi.SystemTable;
+
+    # write the message to the standard error console, then Exit the image with EFI_ABORTED
+    #
+    # output_string takes nul-terminated UCS-2, so the bytes are widened through a small
+    # buffer one chunk at a time. Exit on this image's own handle does not return, and since
+    # a call through the boot services table states no `noreturn`, a bare loop after it says so.
+    # ---
+    # msg: message bytes
+    # len: message length
+    #[noreturn]
+    pub fun panic_sink(msg: *u8, len: usize) {
+        val table:  *SystemTable              = system_table();
+        val out:    *SimpleTextOutputProtocol = table.std_err;
+        var buffer: [128]u16;
+        var done:   usize                     = 0;
+        for (done < len) {
+            var count: usize = 0;
+            for (count < 127 && done + count < len) {
+                buffer[count] = msg[done + count]::u16;
+                count         = count + 1;
+            }
+            buffer[count] = 0;
+            out.output_string(out, ?buffer[0]);
+            done = done + count;
+        }
+        table.boot_services.exit(image_handle(), ABORTED, 0, nil);
+        for {}
+    }
+}
+$or ($mach.build.sys == $mach.sys.freestanding) {
+    # the sink the program installed, or nil for none
+    var installed: fun(*u8, usize);
+
+    # install the program's panic sink
+    #
+    # bare metal has no write target std could know, so the program says where a
+    # message goes: a uart, a framebuffer, a debug port. the sink is called with
+    # the message and the core is parked when it returns, so a panic never
+    # returns either way. installing nil restores the default, which only parks.
+    # ---
+    # sink: called with the message bytes and their length
+    pub fun install(sink: fun(*u8, usize)) {
+        installed = sink;
+    }
+
+    # hand the message to the installed sink, then park the core
+    # ---
+    # msg: message bytes
+    # len: message length
+    #[noreturn]
+    pub fun panic_sink(msg: *u8, len: usize) {
+        if (installed != nil) { installed(msg, len); }
+        park();
+    }
+
+    # stop the core for good, waking only to wait again
+    #[noreturn]
+    fun park() {
+        $if ($mach.build.arch == $mach.arch.x86_64) {
+            #[noreturn]
+            asm x86-64 {
+            1:
+                hlt
+                jmp 1b
+            }
+        }
+        $or ($mach.build.arch == $mach.arch.aarch64) {
+            #[noreturn]
+            asm armv8-a {
+            1:
+                wfi
+                b 1b
+            }
+        }
+        $or ($mach.build.arch == $mach.arch.riscv64) {
+            #[noreturn]
+            asm rv64i {
+            1:
+                .word 0x10500073 :: writes()    # wfi
+                j 1b
+            }
+        }
+        $or ($mach.build.arch == $mach.arch.riscv32) {
+            #[noreturn]
+            asm rv32i {
+            1:
+                .word 0x10500073 :: writes()    # wfi
+                j 1b
+            }
+        }
+        $or ($mach.build.arch == $mach.arch.wasm32) {
+            # a wasm module has no core to park, so it traps, which ends the call its host made
+            #[noreturn]
+            asm mvp {
+                unreachable
+            }
+        }
+        $or {
+            $error("std.system.panic: unsupported freestanding architecture");
+        }
+    }
+}
 $or {
-    $error("std.system.panic needs a linux, darwin or windows target");
+    $error("std.system.panic needs a linux, darwin, wasi, windows, uefi or freestanding target");
 }
 
 # write a null-terminated message to stderr and abort
 # ---
 # msg: pointer to null-terminated error message
+#[noreturn]
 pub fun panic(msg: *u8) {
     var len: usize = 0;
     for (msg[len] != 0) { len = len + 1; }

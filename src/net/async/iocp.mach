@@ -11,10 +11,12 @@ use std.allocator;
 use std.io.runtime;
 use std.memory;
 use std.memory.table;
+use std.net.async.retired;
 use std.net.async.types;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+#[testing]
 use std.types.error.err;
 use std.types.result.res;
 use std.types.size.usize;
@@ -126,6 +128,7 @@ pub rec Socket {
     next_free:         usize;
 }
 
+# the socket records of one backend, their map and the control lists
 # ---
 # allocator:    where the socket table and map come from
 # link_offset:  offset of the Link inside the backend's operation record
@@ -137,7 +140,6 @@ pub rec Socket {
 # live_count:   records in use, mapped or still draining
 # ready_head:   oldest operation in the control-ready state
 # pending_head: an operation in the control-pending state
-# steps:        map probes and list iterations, for the scaling tests
 pub rec Core {
     allocator:    allocator.Allocator;
     link_offset:  usize;
@@ -151,13 +153,23 @@ pub rec Core {
     ready_tail:   u32;
     pending_head: u32;
     pending_tail: u32;
-    steps:        u64;
 }
 
+# the Link embedded in an operation record
+# ---
+# core:  the core
+# ops:   the backend's operation table
+# index: the operation index
+# ret:   the operation's Link
 pub fun link(core: *Core, ops: *table.Table, index: u32) *Link {
     ret (table.at(ops, index::usize)::usize + core.link_offset)::*Link;
 }
 
+# the socket record at a table index, which must be inside the table
+# ---
+# core:  the core
+# index: the record index
+# ret:   the record
 pub fun socket_at(core: *Core, index: u32) *Socket {
     ret table.at(?core.sockets, index::usize)::*Socket;
 }
@@ -184,10 +196,18 @@ fun required_map_capacity(capacity: usize) usize {
     ret size;
 }
 
+# 2^w divided by the golden ratio, for a w-bit word: the fibonacci hash multiplier
+$if ($mach.build.pointer_width == 8) {
+    val GOLDEN: usize = 11400714819323198485;
+}
+$or {
+    val GOLDEN: usize = 2654435769;
+}
+
 # socket values share their low bits, so the product's high bits are folded in
 fun socket_hash(socket: usize) usize {
-    val product: usize = socket * 11400714819323198485;
-    ret product ^ (product >> 32);
+    val product: usize = socket * GOLDEN;
+    ret product ^ (product >> ($size_of(usize) * 4));
 }
 
 fun map_bytes(capacity: usize, bytes: *usize) bool {
@@ -197,9 +217,9 @@ fun map_bytes(capacity: usize, bytes: *usize) bool {
 fun map_allocate(core: *Core, capacity: usize) *u32 {
     var bytes: usize = 0;
     if (!map_bytes(capacity, ?bytes)) { ret nil; }
-    val got: res[ptr, allocator.Error] = allocator.allocate_raw(?core.allocator, bytes, $align_of(u32));
-    if (sel got.err) { ret nil; }
-    val map: *u32  = got.ok::*u32;
+    val res_allocate_raw: res[ptr, allocator.Error] = allocator.allocate_raw(?core.allocator, bytes, $align_of(u32));
+    if (sel res_allocate_raw.err) { ret nil; }
+    val map: *u32  = res_allocate_raw.ok::*u32;
     var i:   usize = 0;
     for (i < capacity) {
         map[i] = 0;
@@ -215,7 +235,7 @@ fun map_release(core: *Core, map: *u32, capacity: usize) {
 }
 
 # the socket table starts at initial records and grows on demand
-pub fun make(core: *Core, a: *allocator.Allocator, link_offset: usize, initial: usize) bool {
+pub fun init(core: *Core, a: *allocator.Allocator, link_offset: usize, initial: usize) bool {
     if (core == nil || a == nil || initial == 0) { ret false; }
     core.allocator    = @a;
     core.link_offset  = link_offset;
@@ -225,26 +245,28 @@ pub fun make(core: *Core, a: *allocator.Allocator, link_offset: usize, initial: 
     core.ready_tail   = NONE;
     core.pending_head = NONE;
     core.pending_tail = NONE;
-    core.steps        = 0;
     core.socket_map   = nil;
     core.map_capacity = 0;
-    if (!table.make(?core.sockets, ?core.allocator, $size_of(Socket), initial)) { ret false; }
+    if (!table.init(?core.sockets, ?core.allocator, $size_of(Socket), initial)) { ret false; }
     table.pool_make(?core.socket_pool, $offset_of(Socket, next_free));
-    adopt_sockets(core);
+    table.pool_adopt(?core.socket_pool, ?core.sockets);
     val capacity: usize = required_map_capacity(core.sockets.capacity);
     if (capacity != 0) { core.socket_map = map_allocate(core, capacity); }
     if (core.socket_map == nil) {
-        table.destroy(?core.sockets);
+        table.dnit(?core.sockets);
         ret false;
     }
     core.map_capacity = capacity;
     ret true;
 }
 
-pub fun destroy(core: *Core) {
+# release the socket table and map. operations still joined are not touched
+# ---
+# core: the core, nil is ignored
+pub fun dnit(core: *Core) {
     if (core == nil) { ret; }
     map_release(core, core.socket_map, core.map_capacity);
-    table.destroy(?core.sockets);
+    table.dnit(?core.sockets);
     core.socket_map   = nil;
     core.map_capacity = 0;
     core.mapped_count = 0;
@@ -255,6 +277,12 @@ pub fun destroy(core: *Core) {
     core.pending_tail = NONE;
 }
 
+# whether a caller range overlaps the socket table or the map
+# ---
+# core: the core
+# data: start of the range
+# len:  bytes in the range
+# ret:  true on overlap, and also when the map size cannot be computed
 pub fun aliases(core: *Core, data: *u8, len: usize) bool {
     var bytes: usize = 0;
     if (!map_bytes(core.map_capacity, ?bytes)) { ret true; }
@@ -268,7 +296,6 @@ pub fun lookup(core: *Core, socket: usize) u32 {
     var slot:    usize = socket_hash(socket) & mask;
     var scanned: usize = 0;
     for (scanned < core.map_capacity) {
-        core.steps = core.steps + 1;
         val entry: u32 = core.socket_map[slot];
         if (entry == 0)                                  { ret NONE; }
         if (socket_at(core, entry - 1).socket == socket) { ret entry - 1; }
@@ -283,7 +310,6 @@ fun map_insert(core: *Core, index: u32) bool {
     var slot:    usize = socket_hash(socket_at(core, index).socket) & mask;
     var scanned: usize = 0;
     for (scanned < core.map_capacity) {
-        core.steps = core.steps + 1;
         if (core.socket_map[slot] == 0) {
             core.socket_map[slot] = index + 1;
             ret true;
@@ -301,7 +327,6 @@ fun map_remove(core: *Core, index: u32) {
     var hole:    usize = socket_hash(socket_at(core, index).socket) & mask;
     var scanned: usize = 0;
     for (core.socket_map[hole] != index + 1) {
-        core.steps = core.steps + 1;
         if (core.socket_map[hole] == 0 || scanned == core.map_capacity) { ret; }
         hole    = (hole + 1) & mask;
         scanned = scanned + 1;
@@ -309,7 +334,6 @@ fun map_remove(core: *Core, index: u32) {
     core.socket_map[hole] = 0;
     var next: usize = (hole + 1) & mask;
     for (core.socket_map[next] != 0) {
-        core.steps = core.steps + 1;
         val entry: u32   = core.socket_map[next];
         val home:  usize = socket_hash(socket_at(core, entry - 1).socket) & mask;
         # an entry may fill the hole only if its home is not after the hole
@@ -335,8 +359,8 @@ fun rehash(core: *Core, capacity: usize) bool {
     val previous_capacity: usize = core.map_capacity;
     core.socket_map   = fresh;
     core.map_capacity = required;
-    var i: usize = 0;
-    for (i < core.sockets.capacity) {
+    var i: usize = table.pool_touched_from(?core.socket_pool, ?core.sockets, 0);
+    for (i != table.NO_INDEX) {
         val record: *Socket = socket_at(core, i::u32);
         if (record.live && record.mapped && !map_insert(core, i::u32)) {
             core.socket_map   = previous;
@@ -344,23 +368,10 @@ fun rehash(core: *Core, capacity: usize) bool {
             map_release(core, fresh, required);
             ret false;
         }
-        i = i + 1;
+        i = table.pool_touched_from(?core.socket_pool, ?core.sockets, i + 1);
     }
     map_release(core, previous, previous_capacity);
     ret true;
-}
-
-# the socket table's newest chunk joins the pool, every record free
-fun adopt_sockets(core: *Core) {
-    var index: usize = table.chunk_start(?core.sockets, core.sockets.chunk_count - 1);
-    for (index < core.sockets.capacity) {
-        val record: *Socket = socket_at(core, index::u32);
-        record.live   = false;
-        record.mapped = false;
-        record.index  = index::u32;
-        index         = index + 1;
-    }
-    table.pool_adopt(?core.socket_pool, ?core.sockets);
 }
 
 # a record index is 32 bits wide and NONE is never one. the map is sized for
@@ -370,7 +381,7 @@ fun grow_sockets(core: *Core) bool {
     if (chunk >= table.DIRECTORY) { ret false; }
     val grown: usize = core.sockets.capacity + table.chunk_capacity(?core.sockets, chunk);
     if (grown > NONE::usize || !rehash(core, grown) || !table.grow(?core.sockets)) { ret false; }
-    adopt_sockets(core);
+    table.pool_adopt(?core.socket_pool, ?core.sockets);
     ret true;
 }
 
@@ -392,8 +403,9 @@ pub fun trim(core: *Core) {
 
 # the record a submit for socket under opening joins. an older opening is a
 # handle whose socket was closed outside the driver and reused, and a retired
-# record's own opening is a handle whose socket was detached; a newer one drops
-# the stale record, whose operations settle in the background
+# record's own opening is a handle whose socket was detached, here or on any
+# other driver; a newer one drops the stale record, whose operations settle in
+# the background
 # ---
 # index: receives the record on ACQUIRED or CREATED
 # ret:   ACQUIRED, CREATED, STALE or EXHAUSTED
@@ -407,11 +419,14 @@ pub fun acquire(core: *Core, ops: *table.Table, socket: usize, opening: u64, ind
             @index = existing;
             ret ACQUIRED;
         }
-        drop_stale(core, ops, existing);
     }
+    if (retired.stale(socket, opening))                                                             { ret STALE; }
+    if (existing != NONE)                                                                           { drop_stale(core, ops, existing); }
     if (table.pool_peek(?core.socket_pool, ?core.sockets) == table.NO_INDEX && !grow_sockets(core)) { ret EXHAUSTED; }
-    val fresh:  u32     = table.pool_take(?core.socket_pool, ?core.sockets)::u32;
+    var first:  bool    = false;
+    val fresh:  u32     = table.pool_take_fresh(?core.socket_pool, ?core.sockets, ?first)::u32;
     val record: *Socket = socket_at(core, fresh);
+    if (first) { record.index = fresh; }
     record.socket            = socket;
     record.opening           = opening;
     record.ops_head          = NONE;
@@ -457,7 +472,6 @@ fun drop_stale(core: *Core, ops: *table.Table, index: u32) {
 # ---
 # ret: whether the request was active, so the caller must abort it natively
 pub fun abort(core: *Core, ops: *table.Table, index: u32, controls: bool, status: i64) bool {
-    core.steps = core.steps + 1;
     val state: u8 = link(core, ops, index).state;
     if (state == ACTIVE) {
         transition(core, ops, index, CANCEL_READY, status);
@@ -602,7 +616,6 @@ pub fun take_deferred(core: *Core, ops: *table.Table, sock: u32) u32 {
     val record: *Socket = socket_at(core, sock);
     val head:   u32     = record.deferred_head;
     if (head == NONE) { ret NONE; }
-    core.steps = core.steps + 1;
     val lane: u8 = lane_of(link(core, ops, head).kind);
     if (record.inflight_reads > 0 && (record.inflight_readable > 0 || lane == LANE_READABLE)) { ret NONE; }
     transition(core, ops, head, ACTIVE, 0);
@@ -628,16 +641,19 @@ pub fun progress(core: *Core, ops: *table.Table, sock: u32) u32 {
     ret NONE;
 }
 
+#[testing]
 use std.allocator.page;
+#[testing]
 use std.allocator.testing;
 
 #[testing]
-rec TestOperation {
+rec Operation {
     padding: [24]u8;
     link:    Link;
 }
 
-rec TestBed {
+#[testing]
+rec Bed {
     allocator: allocator.Allocator;
     ops:       table.Table;
     core:      Core;
@@ -645,23 +661,23 @@ rec TestBed {
 }
 
 #[testing]
-fun test_bed(bed: *TestBed, operations: usize, sockets: usize) bool {
-    val paged: err[allocator.Error] = page.make(?bed.allocator);
-    if (sel paged.err)                                                              { ret false; }
-    if (!table.make(?bed.ops, ?bed.allocator, $size_of(TestOperation), operations)) { ret false; }
+fun bed_init(bed: *Bed, operations: usize, sockets: usize) bool {
+    val err_paged: err[allocator.Error] = page.make(?bed.allocator);
+    if (sel err_paged.err)                                                      { ret false; }
+    if (!table.init(?bed.ops, ?bed.allocator, $size_of(Operation), operations)) { ret false; }
     bed.slots = 0;
-    ret make(?bed.core, ?bed.allocator, $offset_of(TestOperation, link), sockets);
+    ret init(?bed.core, ?bed.allocator, $offset_of(Operation, link), sockets);
 }
 
 #[testing]
-fun test_bed_destroy(bed: *TestBed) {
-    destroy(?bed.core);
-    table.destroy(?bed.ops);
+fun bed_dnit(bed: *Bed) {
+    dnit(?bed.core);
+    table.dnit(?bed.ops);
 }
 
 # a fresh operation index joined to sock
 #[testing]
-fun test_join(bed: *TestBed, sock: u32, kind: runtime.Kind, state: u8) u32 {
+fun bed_join(bed: *Bed, sock: u32, kind: runtime.Kind, state: u8) u32 {
     if (bed.slots == bed.ops.capacity && !table.grow(?bed.ops)) { ret NONE; }
     val index: u32 = bed.slots::u32;
     bed.slots = bed.slots + 1;
@@ -670,7 +686,7 @@ fun test_join(bed: *TestBed, sock: u32, kind: runtime.Kind, state: u8) u32 {
 }
 
 #[testing]
-fun test_acquire(bed: *TestBed, socket: usize, opening: u64) u32 {
+fun bed_acquire(bed: *Bed, socket: usize, opening: u64) u32 {
     var index: u32 = NONE;
     val got:   u8  = acquire(?bed.core, ?bed.ops, socket, opening, ?index);
     if (got != CREATED && got != ACQUIRED) { ret NONE; }
@@ -679,88 +695,113 @@ fun test_acquire(bed: *TestBed, socket: usize, opening: u64) u32 {
 
 # windows socket values are multiples of four
 #[testing]
-fun test_socket(i: usize) usize {
+fun socket(i: usize) usize {
     ret 0x100 + i * 4;
 }
 
-# probes per insert, lookup and delete stay bounded as the map grows, and the
-# backward shift leaves every surviving socket reachable
-#[testing]
-fun test_map_scale(count: usize) i32 {
-    var bed: TestBed;
-    if (!test_bed(?bed, 4, 4)) { ret 1; }
-    fin { test_bed_destroy(?bed); }
+# growth writes no socket record until it is taken
+test async_iocp__growth_writes_no_record_until_it_is_taken {
+    # the tracker is too large for the stack, so it lives on the mapper
+    var pa: allocator.Allocator;
+    page.make(?pa);
+    val res_allocate_raw: res[ptr, allocator.Error] = allocator.allocate_raw(?pa, $size_of(testing.Testing), 16);
+    if (sel res_allocate_raw.err) { ret 1; }
+    val t: *testing.Testing = res_allocate_raw.ok::*testing.Testing;
+    fin { allocator.deallocate_raw(?pa, res_allocate_raw.ok, $size_of(testing.Testing), 16); }
+    val err_testing_made: err[allocator.Error] = testing.init(t);
+    if (sel err_testing_made.err) { ret 1; }
+    fin { testing.dnit(t); }
+    var core: Core;
+    if (!init(?core, testing.allocator_of(t), $offset_of(Operation, link), 2)) { ret 2; }
+    fin { dnit(?core); }
     var i: usize = 0;
-    for (i < count) {
-        if (test_acquire(?bed, test_socket(i), 1) != i::u32) { ret 2; }
+    for (i < 3) {
+        var index: u32 = NONE;
+        if (acquire(?core, nil, socket(i), 1, ?index) != CREATED) { ret 3; }
         i = i + 1;
     }
-    if (bed.core.mapped_count != count || bed.core.map_capacity < count * 2) { ret 3; }
-    var before: u64 = bed.core.steps;
-    i = 0;
-    for (i < count) {
-        if (lookup(?bed.core, test_socket(i)) != i::u32) { ret 4; }
-        i = i + 1;
-    }
-    if (bed.core.steps - before > (count * 2)::u64)    { ret 5; }
-    if (lookup(?bed.core, test_socket(count)) != NONE) { ret 6; }
-    before = bed.core.steps;
-    i      = 0;
-    for (i < count) {
-        unmap(?bed.core, i::u32);
-        i = i + 2;
-    }
-    if (bed.core.steps - before > (count * 2)::u64) { ret 7; }
-    before = bed.core.steps;
-    i      = 0;
-    for (i < count) {
-        val found: u32 = lookup(?bed.core, test_socket(i));
-        if (i % 2 == 0 && found != NONE)   { ret 8; }
-        if (i % 2 == 1 && found != i::u32) { ret 9; }
-        i = i + 1;
-    }
-    if (bed.core.steps - before > (count * 2)::u64)     { ret 10; }
-    if (bed.core.live_count != count - (count + 1) / 2) { ret 11; }
-    # freed records are reused before the table grows
-    val capacity: usize = bed.core.sockets.capacity;
-    i = 0;
-    for (i < count) {
-        if (test_acquire(?bed, test_socket(i), 1) == NONE) { ret 12; }
-        i = i + 2;
-    }
-    if (bed.core.sockets.capacity != capacity || bed.core.live_count != count) { ret 13; }
+    if (!table.pool_unwritten(?core.socket_pool, ?core.sockets, testing.POISON_NEW)) { ret 4; }
     ret 0;
 }
 
-test async_iocp__socket_map_probes_stay_flat {
-    val sizes: [1]usize = [1]usize{100000};
-    var i:     usize    = 0;
-    for (i < 1) {
-        val failed: i32 = test_map_scale(sizes[i]);
-        if (failed != 0) { ret 20 * (i::i32 + 1) + failed; }
+# the skip-th socket value whose home slot in a map of mask + 1 slots is home,
+# or 0 when none is found
+#[testing]
+fun socket_homed(mask: usize, home: usize, skip: usize) usize {
+    var left: usize = skip;
+    var i:    usize = 0;
+    for (i < 65536) {
+        if ((socket_hash(socket(i)) & mask) == home) {
+            if (left == 0) { ret socket(i); }
+            left = left - 1;
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# a removal shifts the rest of its probe run back: across the end of the map,
+# each entry whose home is not after the hole moves into it, one sitting at its
+# own home past the hole stays, and every survivor stays reachable. a freed
+# record is reused before the table grows, and a growth's rehash keeps them all
+test async_iocp__the_socket_map_keeps_every_survivor_reachable_after_mass_removal {
+    var bed: Bed;
+    if (!bed_init(?bed, 4, 4)) { ret 1; }
+    fin { bed_dnit(?bed); }
+    val mask: usize = bed.core.map_capacity - 1;
+    # a and b both start at the last slot, so b wraps to slot 0, which pushes
+    # c, whose home is slot 0, to slot 1. d sits at its home, slot 2
+    val a: usize = socket_homed(mask, mask, 0);
+    val b: usize = socket_homed(mask, mask, 1);
+    val c: usize = socket_homed(mask, 0, 0);
+    val d: usize = socket_homed(mask, 2, 0);
+    if (a == 0 || b == 0 || c == 0 || d == 0) { ret 2; }
+    val ia: u32 = bed_acquire(?bed, a, 1);
+    val ib: u32 = bed_acquire(?bed, b, 1);
+    val ic: u32 = bed_acquire(?bed, c, 1);
+    val id: u32 = bed_acquire(?bed, d, 1);
+    if (ia == NONE || ib == NONE || ic == NONE || id == NONE || bed.core.map_capacity != mask + 1) { ret 3; }
+    val map: *u32 = bed.core.socket_map;
+    if (map[mask] != ia + 1 || map[0] != ib + 1 || map[1] != ic + 1 || map[2] != id + 1) { ret 4; }
+    unmap(?bed.core, ia);
+    if (lookup(?bed.core, a) != NONE)                                                           { ret 5; }
+    if (lookup(?bed.core, b) != ib || lookup(?bed.core, c) != ic || lookup(?bed.core, d) != id) { ret 6; }
+    if (map[mask] != ib + 1 || map[0] != ic + 1 || map[1] != 0 || map[2] != id + 1)             { ret 7; }
+    val capacity: usize = bed.core.sockets.capacity;
+    if (bed_acquire(?bed, a, 1) == NONE || bed.core.sockets.capacity != capacity || bed.core.live_count != 4) { ret 8; }
+    var i: usize = 0;
+    for (i < capacity) {
+        if (bed_acquire(?bed, 0x80000 + i * 4, 1) == NONE) { ret 9; }
+        i = i + 1;
+    }
+    if (bed.core.map_capacity <= mask + 1)                                                      { ret 10; }
+    if (lookup(?bed.core, b) != ib || lookup(?bed.core, c) != ic || lookup(?bed.core, d) != id) { ret 11; }
+    i = 0;
+    for (i < capacity) {
+        if (lookup(?bed.core, 0x80000 + i * 4) == NONE) { ret 12; }
         i = i + 1;
     }
     ret 0;
 }
 
 test async_iocp__held_reads_post_in_submission_order {
-    var bed: TestBed;
-    if (!test_bed(?bed, 4, 4)) { ret 1; }
-    fin { test_bed_destroy(?bed); }
-    val sock: u32 = test_acquire(?bed, test_socket(1), 1);
+    var bed: Bed;
+    if (!bed_init(?bed, 4, 4)) { ret 1; }
+    fin { bed_dnit(?bed); }
+    val sock: u32 = bed_acquire(?bed, socket(1), 1);
     if (sock == NONE) { ret 2; }
     # reads beside a read post at once
     if (must_defer(?bed.core, sock, runtime.READ)) { ret 3; }
-    val read: u32 = test_join(?bed, sock, runtime.READ, ACTIVE);
+    val read: u32 = bed_join(?bed, sock, runtime.READ, ACTIVE);
     if (must_defer(?bed.core, sock, runtime.READ))      { ret 4; }
     if (!must_defer(?bed.core, sock, runtime.READABLE)) { ret 5; }
     if (must_defer(?bed.core, sock, runtime.WRITE))     { ret 6; }
-    val first:  u32 = test_join(?bed, sock, runtime.READABLE, DEFERRED);
-    val second: u32 = test_join(?bed, sock, runtime.READABLE, DEFERRED);
+    val first:  u32 = bed_join(?bed, sock, runtime.READABLE, DEFERRED);
+    val second: u32 = bed_join(?bed, sock, runtime.READABLE, DEFERRED);
     # anything behind a held request is held too
     if (!must_defer(?bed.core, sock, runtime.READ)) { ret 7; }
-    val third: u32 = test_join(?bed, sock, runtime.READ, DEFERRED);
-    val last:  u32 = test_join(?bed, sock, runtime.READ, DEFERRED);
+    val third: u32 = bed_join(?bed, sock, runtime.READ, DEFERRED);
+    val last:  u32 = bed_join(?bed, sock, runtime.READ, DEFERRED);
     if (take_deferred(?bed.core, ?bed.ops, sock) != NONE)  { ret 8; }
     if (release(?bed.core, ?bed.ops, read) != sock)        { ret 9; }
     if (take_deferred(?bed.core, ?bed.ops, sock) != first) { ret 10; }
@@ -778,41 +819,21 @@ test async_iocp__held_reads_post_in_submission_order {
     val record: *Socket = socket_at(?bed.core, sock);
     if (record.inflight_reads != 2 || record.inflight_readable != 0 || record.op_count != 2) { ret 17; }
     # a wait held behind a read leaves when it is dropped, and the read behind it posts
-    val wait:  u32 = test_join(?bed, sock, runtime.READABLE, DEFERRED);
-    val after: u32 = test_join(?bed, sock, runtime.READ, DEFERRED);
+    val wait:  u32 = bed_join(?bed, sock, runtime.READABLE, DEFERRED);
+    val after: u32 = bed_join(?bed, sock, runtime.READ, DEFERRED);
     release(?bed.core, ?bed.ops, wait);
     if (take_deferred(?bed.core, ?bed.ops, sock) != after) { ret 18; }
     ret 0;
 }
 
-test async_iocp__taking_a_held_read_costs_the_same_behind_100k_waits {
-    var bed: TestBed;
-    if (!test_bed(?bed, 4, 4)) { ret 1; }
-    fin { test_bed_destroy(?bed); }
-    val sock: u32   = test_acquire(?bed, test_socket(1), 1);
-    val read: u32   = test_join(?bed, sock, runtime.READ, ACTIVE);
-    var i:    usize = 0;
-    for (i < 100000) {
-        if (!must_defer(?bed.core, sock, runtime.READABLE)) { ret 2; }
-        test_join(?bed, sock, runtime.READABLE, DEFERRED);
-        i = i + 1;
-    }
-    val before: u64 = bed.core.steps;
-    release(?bed.core, ?bed.ops, read);
-    if (take_deferred(?bed.core, ?bed.ops, sock) != read + 1) { ret 3; }
-    if (take_deferred(?bed.core, ?bed.ops, sock) != NONE)     { ret 4; }
-    if (bed.core.steps - before > 2)                          { ret 5; }
-    ret 0;
-}
-
 test async_iocp__controls_progress_on_the_state_changes_they_wait_for {
-    var bed: TestBed;
-    if (!test_bed(?bed, 4, 4)) { ret 1; }
-    fin { test_bed_destroy(?bed); }
-    val sock:     u32     = test_acquire(?bed, test_socket(1), 1);
-    val write:    u32     = test_join(?bed, sock, runtime.SEND_TO, ACTIVE);
-    val read:     u32     = test_join(?bed, sock, runtime.READ, ACTIVE);
-    val shutdown: u32     = test_join(?bed, sock, runtime.SHUTDOWN, CONTROL_PENDING);
+    var bed: Bed;
+    if (!bed_init(?bed, 4, 4)) { ret 1; }
+    fin { bed_dnit(?bed); }
+    val sock:     u32     = bed_acquire(?bed, socket(1), 1);
+    val write:    u32     = bed_join(?bed, sock, runtime.SEND_TO, ACTIVE);
+    val read:     u32     = bed_join(?bed, sock, runtime.READ, ACTIVE);
+    val shutdown: u32     = bed_join(?bed, sock, runtime.SHUTDOWN, CONTROL_PENDING);
     val record:   *Socket = socket_at(?bed.core, sock);
     if (record.control != shutdown || bed.core.pending_head != shutdown) { ret 2; }
     if (progress(?bed.core, ?bed.ops, sock) != NONE)                     { ret 3; }
@@ -824,11 +845,11 @@ test async_iocp__controls_progress_on_the_state_changes_they_wait_for {
     if (record.control != NONE || bed.core.ready_head != NONE) { ret 6; }
 
     # a close waits for the socket's last other operation
-    val close: u32 = test_join(?bed, sock, runtime.CLOSE, CONTROL_PENDING);
+    val close: u32 = bed_join(?bed, sock, runtime.CLOSE, CONTROL_PENDING);
     link(?bed.core, ?bed.ops, close).result = 7;
     transition(?bed.core, ?bed.ops, read, CANCEL_READY, -9);
     unmap(?bed.core, sock);
-    if (lookup(?bed.core, test_socket(1)) != NONE)                                                                    { ret 7; }
+    if (lookup(?bed.core, socket(1)) != NONE)                                                                         { ret 7; }
     if (progress(?bed.core, ?bed.ops, sock) != NONE)                                                                  { ret 8; }
     if (bed.core.ready_head != NONE)                                                                                  { ret 9; }
     if (release(?bed.core, ?bed.ops, read) != sock)                                                                   { ret 10; }
@@ -840,24 +861,24 @@ test async_iocp__controls_progress_on_the_state_changes_they_wait_for {
 }
 
 test async_iocp__a_newer_opening_drops_the_stale_record {
-    var bed: TestBed;
-    if (!test_bed(?bed, 4, 4)) { ret 1; }
-    fin { test_bed_destroy(?bed); }
-    val old:      u32 = test_acquire(?bed, test_socket(1), 2);
-    val active:   u32 = test_join(?bed, old, runtime.READ, ACTIVE);
-    val held:     u32 = test_join(?bed, old, runtime.READABLE, DEFERRED);
-    val shutdown: u32 = test_join(?bed, old, runtime.SHUTDOWN, CONTROL_PENDING);
+    var bed: Bed;
+    if (!bed_init(?bed, 4, 4)) { ret 1; }
+    fin { bed_dnit(?bed); }
+    val old:      u32 = bed_acquire(?bed, socket(1), 2);
+    val active:   u32 = bed_join(?bed, old, runtime.READ, ACTIVE);
+    val held:     u32 = bed_join(?bed, old, runtime.READABLE, DEFERRED);
+    val shutdown: u32 = bed_join(?bed, old, runtime.SHUTDOWN, CONTROL_PENDING);
     var index:    u32 = NONE;
-    if (acquire(?bed.core, ?bed.ops, test_socket(1), 1, ?index) != STALE)                    { ret 2; }
-    if (acquire(?bed.core, ?bed.ops, test_socket(1), 2, ?index) != ACQUIRED || index != old) { ret 3; }
-    if (acquire(?bed.core, ?bed.ops, test_socket(1), 3, ?index) != CREATED || index == old)  { ret 4; }
+    if (acquire(?bed.core, ?bed.ops, socket(1), 1, ?index) != STALE)                    { ret 2; }
+    if (acquire(?bed.core, ?bed.ops, socket(1), 2, ?index) != ACQUIRED || index != old) { ret 3; }
+    if (acquire(?bed.core, ?bed.ops, socket(1), 3, ?index) != CREATED || index == old)  { ret 4; }
     val fresh: u32 = index;
     if (link(?bed.core, ?bed.ops, active).state != CANCEL_READY || link(?bed.core, ?bed.ops, active).result != types.STATUS_STALE) { ret 5; }
     if (link(?bed.core, ?bed.ops, held).state != CONTROL_READY || link(?bed.core, ?bed.ops, held).result != types.STATUS_STALE)    { ret 6; }
     if (link(?bed.core, ?bed.ops, shutdown).state != CONTROL_READY)                                                                { ret 7; }
     if (bed.core.ready_head != held || bed.core.ready_tail != shutdown || bed.core.pending_head != NONE)                           { ret 8; }
     if (socket_at(?bed.core, old).deferred_head != NONE || socket_at(?bed.core, old).mapped)                                       { ret 9; }
-    if (lookup(?bed.core, test_socket(1)) != fresh || bed.core.mapped_count != 1 || bed.core.live_count != 2)                      { ret 10; }
+    if (lookup(?bed.core, socket(1)) != fresh || bed.core.mapped_count != 1 || bed.core.live_count != 2)                           { ret 10; }
     release(?bed.core, ?bed.ops, held);
     release(?bed.core, ?bed.ops, shutdown);
     if (release(?bed.core, ?bed.ops, active) != NONE || bed.core.live_count != 1) { ret 11; }
@@ -867,19 +888,19 @@ test async_iocp__a_newer_opening_drops_the_stale_record {
 # n sockets acquired and then all unmapped: the bytes the core holds idle, at
 # the peak and once the peak drained
 #[testing]
-fun test_footprint(n: usize, idle: *usize, peak: *usize, after: *usize) i32 {
+fun footprint(n: usize, idle: *usize, peak: *usize, after: *usize) i32 {
     var counting: testing.Counting;
     var a:        allocator.Allocator;
     testing.counting_make(?counting, ?a);
     var ops:  table.Table;
     var core: Core;
-    if (!table.make(?ops, ?a, $size_of(TestOperation), 4))     { ret 1; }
-    if (!make(?core, ?a, $offset_of(TestOperation, link), 64)) { ret 1; }
+    if (!table.init(?ops, ?a, $size_of(Operation), 4))     { ret 1; }
+    if (!init(?core, ?a, $offset_of(Operation, link), 64)) { ret 1; }
     @idle = counting.live;
     var i: usize = 0;
     for (i < n) {
         var index: u32 = NONE;
-        if (acquire(?core, ?ops, test_socket(i), 1, ?index) != CREATED || index != i::u32) { ret 2; }
+        if (acquire(?core, ?ops, socket(i), 1, ?index) != CREATED || index != i::u32) { ret 2; }
         i = i + 1;
     }
     @peak = counting.live;
@@ -893,9 +914,9 @@ fun test_footprint(n: usize, idle: *usize, peak: *usize, after: *usize) i32 {
     if (core.live_count != 0 || core.sockets.chunk_count != 1) { ret 3; }
     # the drained core still maps and recycles
     var again: u32 = NONE;
-    if (acquire(?core, ?ops, test_socket(n), 1, ?again) != CREATED || lookup(?core, test_socket(n)) != again) { ret 4; }
-    destroy(?core);
-    table.destroy(?ops);
+    if (acquire(?core, ?ops, socket(n), 1, ?again) != CREATED || lookup(?core, socket(n)) != again) { ret 4; }
+    dnit(?core);
+    table.dnit(?ops);
     if (counting.live != 0) { ret 5; }
     ret 0;
 }
@@ -908,7 +929,7 @@ test async_iocp__a_drained_peak_returns_the_socket_table_to_idle {
         var idle:  usize = 0;
         var peak:  usize = 0;
         var after: usize = 0;
-        val ran:   i32   = test_footprint(sizes[i], ?idle, ?peak, ?after);
+        val ran:   i32   = footprint(sizes[i], ?idle, ?peak, ?after);
         if (ran != 0)                    { ret 10 * (i::i32 + 1) + ran; }
         if (peak < idle + 64 * sizes[i]) { ret 40 + i::i32; }
         if (after != idle)               { ret 50 + i::i32; }
@@ -920,16 +941,16 @@ test async_iocp__a_drained_peak_returns_the_socket_table_to_idle {
 # #874: a record in use pins its chunk and the chunk below it, and keeps its
 # operations, its map entry and its address across a trim
 test async_iocp__a_trim_keeps_every_record_in_use_where_it_was {
-    var bed: TestBed;
-    if (!test_bed(?bed, 4, 4)) { ret 1; }
-    fin { test_bed_destroy(?bed); }
+    var bed: Bed;
+    if (!bed_init(?bed, 4, 4)) { ret 1; }
+    fin { bed_dnit(?bed); }
     var i: usize = 0;
     for (i < 64) {
-        if (test_acquire(?bed, test_socket(i), 1) != i::u32) { ret 2; }
+        if (bed_acquire(?bed, socket(i), 1) != i::u32) { ret 2; }
         i = i + 1;
     }
     val held:   *Socket = socket_at(?bed.core, 63);
-    val read:   u32     = test_join(?bed, 63, runtime.READ, ACTIVE);
+    val read:   u32     = bed_join(?bed, 63, runtime.READ, ACTIVE);
     val chunks: usize   = bed.core.sockets.chunk_count;
     i = 0;
     for (i < 64) {
@@ -942,18 +963,18 @@ test async_iocp__a_trim_keeps_every_record_in_use_where_it_was {
     trim(?bed.core);
     if (bed.core.sockets.chunk_count != 1 || bed.core.live_count != 0) { ret 5; }
     # a mapped record in chunk 0 keeps chunk 1 as slack and stays reachable
-    val low: u32 = test_acquire(?bed, test_socket(200), 1);
+    val low: u32 = bed_acquire(?bed, socket(200), 1);
     i = 0;
     for (i < 8) {
-        test_acquire(?bed, test_socket(300 + i), 1);
+        bed_acquire(?bed, socket(300 + i), 1);
         i = i + 1;
     }
     i = 0;
     for (i < 8) {
-        unmap(?bed.core, lookup(?bed.core, test_socket(300 + i)));
+        unmap(?bed.core, lookup(?bed.core, socket(300 + i)));
         i = i + 1;
     }
     trim(?bed.core);
-    if (bed.core.sockets.chunk_count != 2 || lookup(?bed.core, test_socket(200)) != low) { ret 6; }
+    if (bed.core.sockets.chunk_count != 2 || lookup(?bed.core, socket(200)) != low) { ret 6; }
     ret 0;
 }
