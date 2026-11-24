@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [10.0.1] - 2026-11-23
+
+### Fixed
+
+- Windows `std.system.os.windows.shared.lock` and `map_secret` grow the process working set via `SetProcessWorkingSetSize` under synchronization when `VirtualLock` hits `ERROR_WORKING_SET_QUOTA`, allowing secret allocations past Windows' 200 KiB default minimum working set without falling back to unlocked memory, and `win32_error` maps `ERROR_WORKING_SET_QUOTA` and `ERROR_NO_SYSTEM_RESOURCES` to `ENOMEM` (#1157).
+
 ## [10.0.0] - 2026-11-23
 
 ### Added
