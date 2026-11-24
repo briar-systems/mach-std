@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [10.1.1] - 2026-11-24
+
+### Fixed
+
+- `std.memory.buffers` ensures slot table capacity for `slots_committed` on fresh acquires inside an account reservation (evicting a retained chunk if metadata allocation fails), preventing slot exhaustion and allocate/free spin loops when retained chunks fill the initial table (#1163).
+
 ## [10.1.0] - 2026-11-24
 
 ### Added
