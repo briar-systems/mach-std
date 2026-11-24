@@ -616,6 +616,29 @@ fun lower_retained(pool: *Pool) usize {
     ret moved;
 }
 
+# drop one retained chunk from any class and return its slot to the free pool.
+# used only when an acquire inside a reservation cannot grow the slot table
+fun evict_retained(pool: *Pool) bool {
+    var c: usize = 0;
+    for (c < pool.class_count) {
+        val cls: *ClassState = ?pool.classes[c];
+        if (cls.retained_head != NONE) {
+            val index: u32   = cls.retained_head;
+            val slot:  *Slot = slot_at(pool, index);
+            cls.retained_head   = slot.next;
+            cls.retained        = cls.retained - 1;
+            pool.slots_retained = pool.slots_retained - 1;
+            val home: usize = table.chunk_of(?pool.slots, index::usize);
+            pool.retained_in[home] = pool.retained_in[home] - 1;
+            slot_release(pool, slot, cls.size, cls.align);
+            put_slot(pool, index);
+            ret true;
+        }
+        c = c + 1;
+    }
+    ret false;
+}
+
 # give back what a peak grew, at the end of every entry that may have freed a
 # slot or a reservation. a chunk goes once it and the chunk below it hold
 # nothing and no reservation needs them. retained chunks pinning the top
@@ -917,11 +940,20 @@ fun acquire_locked(pool: *Pool, account: *Account, request: Request, register: b
         slab_slot              = kept.slab_slot;
     }
     or {
-        # a retained chunk brings its own slot, a fresh one needs one more
-        if (!inside && !ensure_slots(pool, slots_committed(pool) + 1)) {
-            pool.refusals = pool.refusals + 1;
-            if (register) { register_waiter(pool, account); }
-            ret refusal(Status.blocked{}, Reason.memory{});
+        # a retained chunk brings its own slot, a fresh one needs one more.
+        # retained chunks released inside a reservation grow slots_committed
+        # without allocating in release, so an inside acquire grows the table
+        # here or, if metadata allocation fails, evicts a retained chunk to
+        # reclaim its reserved slot (#1163)
+        var demand: usize = slots_committed(pool);
+        if (!inside) { demand = demand + 1; }
+        if (!ensure_slots(pool, demand)) {
+            if (!inside || (pool.slots_in_use + pool.slots_retained >= pool.slots.capacity
+                && !evict_retained(pool))) {
+                pool.refusals = pool.refusals + 1;
+                if (register) { register_waiter(pool, account); }
+                ret refusal(Status.blocked{}, Reason.memory{});
+            }
         }
         var backed: bool = false;
         if (secret_chunk) {
@@ -2411,6 +2443,108 @@ $if (capability.HOSTED) {
         if (!sel refused.reason.memory)                                         { ret 9; }
         if (arena.count.allocs != allocs + 1 || arena.count.frees != frees + 1) { ret 10; }
         if (account.held != 0 || account.chunks != 0 || pool.slots_in_use != 0) { ret 11; }
+        ret 0;
+    }
+
+    # retained chunks released inside a reservation grow slots_committed past
+    # capacity; a fresh acquire of another class inside the reservation must
+    # grow the table rather than running out of slots (#1163)
+    test regression__retained_chunks_inside_reservation_grow_slot_table {
+        var arena: Arena;
+        if (!arena_init(?arena, 1 << 22)) { ret 1; }
+        fin { arena_dnit(?arena); }
+        var classes: [3]ClassConfig = [3]ClassConfig{
+            ClassConfig{size: 512, align: 0, secret: false, high_water: 8},
+            ClassConfig{size: 4096, align: 0, secret: false, high_water: 8},
+            ClassConfig{size: 16384, align: 0, secret: false, high_water: 8},
+        };
+        var config: Config = config(?classes[0], 3, 1 << 21);
+        config.initial_slots = 8;
+        var pool: Pool;
+        if (!init(?pool, config, ?arena.counted)) { ret 2; }
+        fin { dnit(?pool); }
+        var account: Account;
+        # reserve = 8 * 512 -> 8 reserved_slots, matching initial_slots exactly
+        if (!is_none(account_init(?pool, ?account, 1, budgets_of(1 << 20), 8 * 512))) { ret 3; }
+        fin { account_dnit(?pool, ?account); }
+        var held: [8]Chunk;
+        var i:    usize = 0;
+        for (i < 8) {
+            val got: Acquired = acquire(?pool, ?account, ask(100), false);
+            if (!sel got.status.ok) { ret 4; }
+            held[i] = got.chunk;
+            i       = i + 1;
+        }
+        i = 0;
+        for (i < 8) {
+            if (!is_none(release(?pool, ?account, held[i]))) { ret 5; }
+            i = i + 1;
+        }
+        # all 8 initial slots are now held by retained class-0 chunks while
+        # account.chunks == 0 < account.reserved_slots
+        if (pool.slots_retained != 8 || pool.slots_reserved != 8) { ret 6; }
+        val fresh: Acquired = acquire(?pool, ?account, ask(10000), false);
+        if (!sel fresh.status.ok || fresh.chunk.class != 2)  { ret 7; }
+        if (pool.slots_retained != 8)                        { ret 8; }
+        if (!is_none(release(?pool, ?account, fresh.chunk))) { ret 9; }
+        ret 0;
+    }
+
+    # under metadata OOM, an acquire inside a reservation evicts a retained
+    # chunk to reclaim its reserved slot rather than failing on metadata (#1163)
+    test regression__retained_chunks_inside_reservation_evict_under_metadata_oom {
+        var arena: Arena;
+        if (!arena_init(?arena, 1 << 22)) { ret 1; }
+        fin { arena_dnit(?arena); }
+        # payloads align at 32 and slot metadata at 16, so metadata alone can be refused
+        var classes: [2]ClassConfig = [2]ClassConfig{
+            ClassConfig{size: 512, align: 32, secret: false, high_water: 4},
+            ClassConfig{size: 4096, align: 32, secret: false, high_water: 4},
+        };
+        var config: Config = config(?classes[0], 2, 1 << 20);
+        config.initial_slots = 4;
+        var pool: Pool;
+        if (!init(?pool, config, ?arena.counted)) { ret 2; }
+        fin { dnit(?pool); }
+        var reserved: Account;
+        var plain:    Account;
+        if (!is_none(account_init(?pool, ?reserved, 1, budgets_of(1 << 18), 4 * 512))) { ret 3; }
+        if (!is_none(account_init(?pool, ?plain, 2, budgets_of(1 << 18), 0)))          { ret 4; }
+        # fill all 4 slots with retained class-0 chunks
+        var held: [4]Chunk;
+        var i:    usize = 0;
+        for (i < 4) {
+            val got: Acquired = acquire(?pool, ?reserved, ask(100), false);
+            if (!sel got.status.ok) { ret 5; }
+            held[i] = got.chunk;
+            i       = i + 1;
+        }
+        i = 0;
+        for (i < 4) {
+            if (!is_none(release(?pool, ?reserved, held[i]))) { ret 6; }
+            i = i + 1;
+        }
+        if (pool.slots_retained != 4) { ret 7; }
+        arena.count.refuse_align = 16;
+        # a non-reserved account cannot steal reserved slots when metadata cannot grow
+        val denied: Acquired = acquire(?pool, ?plain, ask(1000), false);
+        if (!sel denied.reason.memory) { ret 8; }
+        # the reserved account still gets all 4 chunks of class 1 by evicting retained slots
+        i = 0;
+        for (i < 4) {
+            val got: Acquired = acquire(?pool, ?reserved, ask(1000), false);
+            if (!sel got.status.ok || got.chunk.class != 1) { ret 10 + i::i32; }
+            held[i] = got.chunk;
+            i       = i + 1;
+        }
+        arena.count.refuse_align = 0;
+        i                        = 0;
+        for (i < 4) {
+            if (!is_none(release(?pool, ?reserved, held[i]))) { ret 20 + i::i32; }
+            i = i + 1;
+        }
+        if (!is_none(account_dnit(?pool, ?reserved))) { ret 30; }
+        if (!is_none(account_dnit(?pool, ?plain)))    { ret 31; }
         ret 0;
     }
 
