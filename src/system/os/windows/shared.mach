@@ -175,6 +175,8 @@ val ERROR_CONNECTION_ABORTED:     u32 = 1236;
 val ERROR_OPERATION_ABORTED:      u32 = 995;
 val ERROR_IO_PENDING:             u32 = 997;
 val ERROR_NOT_FOUND:              u32 = 1168;
+val ERROR_NO_SYSTEM_RESOURCES:    u32 = 1450;
+val ERROR_WORKING_SET_QUOTA:      u32 = 1453;
 val ERROR_NOT_A_REPARSE_POINT:    u32 = 4390;
 
 val TERMINATE_CHILD_EXIT_CODE: u32 = 137;
@@ -302,6 +304,12 @@ ext fun VirtualProtect(p0: ptr, p1: usize, p2: u32, p3: *u32) i32;
 ext fun VirtualLock(p0: ptr, p1: usize) i32;
 #[library("kernel32")]
 ext fun VirtualUnlock(p0: ptr, p1: usize) i32;
+#[library("kernel32")]
+ext fun GetCurrentProcess() isize;
+#[library("kernel32")]
+ext fun GetProcessWorkingSetSize(p0: isize, p1: *usize, p2: *usize) i32;
+#[library("kernel32")]
+ext fun SetProcessWorkingSetSize(p0: isize, p1: usize, p2: usize) i32;
 #[library("kernel32")]
 ext fun GetProcessHeap() isize;
 #[library("kernel32")]
@@ -1242,22 +1250,23 @@ fun win32_error(err: u32) i64 {
     or (err == ERROR_ALREADY_EXISTS || err == ERROR_FILE_EXISTS)       { ret EEXIST; }
     or (err == ERROR_INVALID_HANDLE || err == ERROR_INVALID_PARAMETER) { ret EINVAL; }
     or (err == ERROR_NO_UNICODE_TRANSLATION)                           { ret EINVAL; }
-    or (err == ERROR_NOT_ENOUGH_MEMORY || err == ERROR_OUTOFMEMORY)    { ret ENOMEM; }
-    or (err == ERROR_FILENAME_EXCED_RANGE)                             { ret ENAMETOOLONG; }
-    or (err == ERROR_DIR_NOT_EMPTY)                                    { ret ENOTEMPTY; }
-    or (err == ERROR_DISK_FULL || err == ERROR_HANDLE_DISK_FULL)       { ret ENOSPC; }
-    or (err == ERROR_BROKEN_PIPE)                                      { ret EPIPE; }
-    or (err == ERROR_NETNAME_DELETED)                                  { ret ECONNRESET; }
-    or (err == ERROR_CONNECTION_REFUSED)                               { ret ECONNREFUSED; }
-    or (err == ERROR_CONNECTION_ABORTED)                               { ret ECONNABORTED; }
-    or (err == ERROR_OPERATION_ABORTED)                                { ret ECANCELED; }
-    or (err == ERROR_DIRECTORY)                                        { ret ENOTDIR; }
-    or (err == ERROR_TOO_MANY_OPEN_FILES)                              { ret EMFILE; }
-    or (err == ERROR_BUSY)                                             { ret EBUSY; }
-    or (err == ERROR_CANT_RESOLVE_FILENAME)                            { ret ELOOP; }
-    or (err == ERROR_WRITE_PROTECT)                                    { ret EROFS; }
-    or (err == ERROR_NOT_SUPPORTED)                                    { ret ENOTSUP; }
-    or                                                                 { ret EIO; }
+    or (err == ERROR_NOT_ENOUGH_MEMORY || err == ERROR_OUTOFMEMORY ||
+        err == ERROR_NO_SYSTEM_RESOURCES || err == ERROR_WORKING_SET_QUOTA) { ret ENOMEM; }
+    or (err == ERROR_FILENAME_EXCED_RANGE)                       { ret ENAMETOOLONG; }
+    or (err == ERROR_DIR_NOT_EMPTY)                              { ret ENOTEMPTY; }
+    or (err == ERROR_DISK_FULL || err == ERROR_HANDLE_DISK_FULL) { ret ENOSPC; }
+    or (err == ERROR_BROKEN_PIPE)                                { ret EPIPE; }
+    or (err == ERROR_NETNAME_DELETED)                            { ret ECONNRESET; }
+    or (err == ERROR_CONNECTION_REFUSED)                         { ret ECONNREFUSED; }
+    or (err == ERROR_CONNECTION_ABORTED)                         { ret ECONNABORTED; }
+    or (err == ERROR_OPERATION_ABORTED)                          { ret ECANCELED; }
+    or (err == ERROR_DIRECTORY)                                  { ret ENOTDIR; }
+    or (err == ERROR_TOO_MANY_OPEN_FILES)                        { ret EMFILE; }
+    or (err == ERROR_BUSY)                                       { ret EBUSY; }
+    or (err == ERROR_CANT_RESOLVE_FILENAME)                      { ret ELOOP; }
+    or (err == ERROR_WRITE_PROTECT)                              { ret EROFS; }
+    or (err == ERROR_NOT_SUPPORTED)                              { ret ENOTSUP; }
+    or                                                           { ret EIO; }
 }
 
 fun wsa_error(err: i32) i64 {
@@ -1379,8 +1388,8 @@ pub fun deallocate(p: ptr, size: usize) i64 {
 # uncommitted guard pages, page aligned and zero-filled
 #
 # VirtualLock keeps the span resident within the process's minimum working
-# set, the windows counterpart of RLIMIT_MEMLOCK. a refused lock is reported
-# as one, never served unlocked
+# set, growing it when needed, and a refused lock is reported as one, never
+# served unlocked
 # ---
 # span:    usable bytes, a nonzero multiple of page
 # page:    the page size
@@ -1395,9 +1404,9 @@ pub fun map_secret(span: usize, page: usize, out: *ptr, locking: *bool) i64 {
     val data: ptr = (reserved::usize + page)::ptr;
     var code: i64 = 0;
     if (VirtualAlloc(data, span, MEM_COMMIT, PAGE_READWRITE) == nil) { code = last_error(); }
-    or (VirtualLock(data, span) == 0) {
-        code     = last_error();
-        @locking = true;
+    or {
+        code = lock(data, span);
+        if (code < 0) { @locking = true; }
     }
     if (code < 0) {
         VirtualFree(reserved, 0, MEM_RELEASE);
@@ -1499,12 +1508,79 @@ pub fun protect(p: ptr, size: usize, prot: u32) i64 {
     ret last_error();
 }
 
-# keep a range of pages resident with VirtualLock
+var _working_set_lock: i64 = 0;
+
+fun working_set_spin_lock() {
+    var expected: i64 = 0;
+    for (!atomic.cas(?_working_set_lock, ?expected, 1)) {
+        expected = 0;
+    }
+}
+
+fun working_set_spin_unlock() {
+    atomic.store(?_working_set_lock, 0);
+}
+
+fun locked_page_span(p: ptr, size: usize, out: *usize) bool {
+    if (size == 0) { ret false; }
+    val page:      usize = page_size();
+    val offset:    usize = p::usize & (page - 1);
+    val max_usize: usize = ~(0::usize);
+    if (size > max_usize - offset) { ret false; }
+    val raw: usize = offset + size;
+    if (raw > max_usize - (page - 1)) { ret false; }
+    @out = (raw + (page - 1)) & ~(page - 1);
+    ret true;
+}
+
+# keep a range of pages resident with VirtualLock, growing the process working
+# set when the default quota is reached
 # ---
 # ret: 0, or a negative native code
 pub fun lock(p: ptr, size: usize) i64 {
     if (VirtualLock(p, size) != 0) { ret 0; }
-    ret last_error();
+    var err:  u32   = GetLastError();
+    var span: usize = 0;
+    if (err != ERROR_WORKING_SET_QUOTA || !locked_page_span(p, size, ?span)) {
+        ret win32_error(err);
+    }
+    # windows leaves at least 8 pages of minimum working set headroom for its own locks
+    val headroom: usize = 8 * page_size();
+    # keep both working-set bounds below ~(0::usize), which SetProcessWorkingSetSize treats as empty-working-set
+    val max_limit: usize = ~(0::usize) - 1;
+    if (span > max_limit - headroom) { ret win32_error(err); }
+    val extra: usize = span + headroom;
+
+    working_set_spin_lock();
+    if (VirtualLock(p, size) != 0) {
+        working_set_spin_unlock();
+        ret 0;
+    }
+    err = GetLastError();
+    if (err == ERROR_WORKING_SET_QUOTA) {
+        val process: isize = GetCurrentProcess();
+        var min_ws:  usize = 0;
+        var max_ws:  usize = 0;
+        if (GetProcessWorkingSetSize(process, ?min_ws, ?max_ws) != 0) {
+            if (min_ws <= max_limit - extra) {
+                val new_min: usize = min_ws + extra;
+                var new_max: usize = max_limit;
+                if (max_ws <= max_limit - extra) { new_max = max_ws + extra; }
+                if (new_max < new_min)           { new_max = new_min; }
+                if (SetProcessWorkingSetSize(process, new_min, new_max) != 0 &&
+                    VirtualLock(p, size) != 0) {
+                    working_set_spin_unlock();
+                    ret 0;
+                }
+                err = GetLastError();
+            }
+        }
+        or {
+            err = GetLastError();
+        }
+    }
+    working_set_spin_unlock();
+    ret win32_error(err);
 }
 
 # release a range lock took
