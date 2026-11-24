@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [10.1.0] - 2026-11-24
+
+### Added
+
+- `std.process.limits.MemoryLimit` and `std.process.limits.locked_memory()` backed by `std.system.os.locked_memory_limit` to read the process locked-memory limit (`RLIMIT_MEMLOCK` on Linux and Darwin, `ENOTSUP` on Windows and WASI) (#1160).
+
+### Changed
+
+- `std.memory.buffers` packs small secret buffer classes (`stride <= 2048`) into shared 4 KiB locked slabs instead of locking one page per chunk (#1159).
+
 ## [10.0.1] - 2026-11-23
 
 ### Fixed

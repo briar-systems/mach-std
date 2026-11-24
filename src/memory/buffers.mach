@@ -93,15 +93,17 @@ pub val MAX_CLASSES: usize = 32;
 pub val MAX_LANES:   usize = 8;
 pub val OVERSIZE:    u16   = 0xffff;
 
-val NONE:          u32   = 0xffffffff;
-val SLOT_EMPTY:    u8    = 0;
-val SLOT_HELD:     u8    = 1;
-val SLOT_RETAINED: u8    = 2;
-val DEFAULT_ALIGN: usize = 16;
-val DEFAULT_SLOTS: usize = 16;
-val VIEW_NONE:     u8    = 0;
-val VIEW_BYTES:    u8    = 1;
-val VIEW_TYPED:    u8    = 2;
+val NONE:                  u32   = 0xffffffff;
+val SLOT_EMPTY:            u8    = 0;
+val SLOT_HELD:             u8    = 1;
+val SLOT_RETAINED:         u8    = 2;
+val DEFAULT_ALIGN:         usize = 16;
+val DEFAULT_SLOTS:         usize = 16;
+val SECRET_SLAB_BYTES:     usize = 4096;
+val SECRET_SLAB_MAX_SLOTS: usize = 64;
+val VIEW_NONE:             u8    = 0;
+val VIEW_BYTES:            u8    = 1;
+val VIEW_TYPED:            u8    = 2;
 
 # what a caller asks for
 # ---
@@ -321,11 +323,25 @@ pub rec Config {
     trap_context:   ptr;
 }
 
+rec SecretSlab {
+    welded:     u32;
+    welded_gen: u32;
+    free_mask:  u64;
+    live:       u8;
+    next:       *SecretSlab;
+    prev:       *SecretSlab;
+}
+
 rec ClassState {
     size:          usize;
     align:         usize;
     secret:        bool;
     high_water:    usize;
+    slab_stride:   usize;
+    slab_slots:    u8;
+    slab_bytes:    usize;
+    slabs:         *SecretSlab;
+    slab_count:    usize;
     retained_head: u32;
     retained:      usize;
     live:          usize;
@@ -337,22 +353,25 @@ rec ClassState {
 }
 
 rec Slot {
-    generation: u32;
-    next:       u32;
-    inflight:   u32;
-    class:      u16;
-    lane:       u8;
-    state:      u8;
-    secret:     bool;
-    align:      usize;
-    bytes:      usize;
-    address:    usize;
-    welded:     u32;
-    welded_gen: u32;
-    view:       u8;
-    view_kind:  u64;
-    account:    *Account;
-    link:       usize;
+    generation:  u32;
+    next:        u32;
+    inflight:    u32;
+    class:       u16;
+    lane:        u8;
+    state:       u8;
+    secret:      bool;
+    align:       usize;
+    bytes:       usize;
+    address:     usize;
+    welded:      u32;
+    welded_gen:  u32;
+    slab:        *SecretSlab;
+    slab_offset: usize;
+    slab_slot:   u8;
+    view:        u8;
+    view_kind:   u64;
+    account:     *Account;
+    link:        usize;
 }
 
 # one class's counters in a snapshot
@@ -529,13 +548,16 @@ fun take_slot(pool: *Pool) u32 {
 
 fun put_slot(pool: *Pool, index: u32) {
     val slot: *Slot = slot_at(pool, index);
-    slot.state      = SLOT_EMPTY;
-    slot.account    = nil;
-    slot.address    = 0;
-    slot.welded     = 0;
-    slot.welded_gen = 0;
-    slot.inflight   = 0;
-    slot.next       = NONE;
+    slot.state       = SLOT_EMPTY;
+    slot.account     = nil;
+    slot.address     = 0;
+    slot.welded      = 0;
+    slot.welded_gen  = 0;
+    slot.slab        = nil;
+    slot.slab_offset = 0;
+    slot.slab_slot   = 0;
+    slot.inflight    = 0;
+    slot.next        = NONE;
     table.pool_put(?pool.slot_pool, ?pool.slots, index::usize);
 }
 
@@ -566,16 +588,19 @@ fun lower_retained(pool: *Pool) usize {
                 kept = take_slot(pool);
                 val old:  *Slot = slot_at(pool, cursor);
                 val slot: *Slot = slot_at(pool, kept);
-                slot.state      = SLOT_RETAINED;
-                slot.class      = old.class;
-                slot.lane       = old.lane;
-                slot.secret     = old.secret;
-                slot.align      = old.align;
-                slot.bytes      = old.bytes;
-                slot.address    = old.address;
-                slot.welded     = old.welded;
-                slot.welded_gen = old.welded_gen;
-                slot.next       = old.next;
+                slot.state       = SLOT_RETAINED;
+                slot.class       = old.class;
+                slot.lane        = old.lane;
+                slot.secret      = old.secret;
+                slot.align       = old.align;
+                slot.bytes       = old.bytes;
+                slot.address     = old.address;
+                slot.welded      = old.welded;
+                slot.welded_gen  = old.welded_gen;
+                slot.slab        = old.slab;
+                slot.slab_offset = old.slab_offset;
+                slot.slab_slot   = old.slab_slot;
+                slot.next        = old.next;
                 if (prev == NONE) { cls.retained_head = kept; }
                 or                { slot_at(pool, prev).next = kept; }
                 pool.retained_in[from] = pool.retained_in[from] - 1;
@@ -622,13 +647,98 @@ fun plain_release(pool: *Pool, address: usize, bytes: usize, align: usize) {
     if (sel err_released.err) { pool.release_failures = pool.release_failures + 1; }
 }
 
+fun secret_slab_mask(slots: u8) u64 {
+    if (slots >= 64) { ret ~(0u64); }
+    ret (1u64 << slots::u64) - 1u64;
+}
+
+fun first_free_bit(mask: u64) u8 {
+    var bit: u8  = 0;
+    var m:   u64 = mask;
+    for ((m & 1u64) == 0u64) {
+        m   = m >> 1u64;
+        bit = bit + 1;
+    }
+    ret bit;
+}
+
+fun slab_unlink(cls: *ClassState, slab: *SecretSlab) {
+    if (slab.prev != nil) { slab.prev.next = slab.next; }
+    or                    { cls.slabs = slab.next; }
+    if (slab.next != nil) { slab.next.prev = slab.prev; }
+    slab.next = nil;
+    slab.prev = nil;
+}
+
+fun slab_link_head(cls: *ClassState, slab: *SecretSlab) {
+    slab.prev = nil;
+    slab.next = cls.slabs;
+    if (cls.slabs != nil) { cls.slabs.prev = slab; }
+    cls.slabs = slab;
+}
+
+fun slab_acquire(pool: *Pool, cls: *ClassState, out_slab: **SecretSlab, out_slot: *u8) bool {
+    var cursor: *SecretSlab = cls.slabs;
+    for (cursor != nil) {
+        if (cursor.free_mask != 0u64) {
+            val bit: u8 = first_free_bit(cursor.free_mask);
+            cursor.free_mask = cursor.free_mask & ~(1u64 << bit::u64);
+            cursor.live      = cursor.live + 1;
+            @out_slab        = cursor;
+            @out_slot        = bit;
+            ret true;
+        }
+        cursor = cursor.next;
+    }
+    val res_node: res[*SecretSlab, A.Error] = A.zallocate[SecretSlab](?pool.plain, 1);
+    if (sel res_node.err) { ret false; }
+    val slab: *SecretSlab = res_node.ok;
+    if (!welded_allocate(pool, cls.slab_bytes, ?slab.welded, ?slab.welded_gen)) {
+        val err_freed: err[A.Error] = A.deallocate[SecretSlab](?pool.plain, slab, 1);
+        if (sel err_freed.err) { pool.release_failures = pool.release_failures + 1; }
+        ret false;
+    }
+    slab.free_mask = secret_slab_mask(cls.slab_slots) & ~1u64;
+    slab.live      = 1;
+    slab_link_head(cls, slab);
+    cls.slab_count = cls.slab_count + 1;
+    @out_slab      = slab;
+    @out_slot      = 0;
+    ret true;
+}
+
+fun slab_release(pool: *Pool, cls: *ClassState, slab: *SecretSlab, slot_bit: u8) {
+    slab.free_mask = slab.free_mask | (1u64 << slot_bit::u64);
+    slab.live      = slab.live - 1;
+    if (slab.live == 0) {
+        slab_unlink(cls, slab);
+        cls.slab_count = cls.slab_count - 1;
+        secret_release(pool, slab.welded, slab.welded_gen, cls.slab_bytes);
+        val err_freed: err[A.Error] = A.deallocate[SecretSlab](?pool.plain, slab, 1);
+        if (sel err_freed.err) { pool.release_failures = pool.release_failures + 1; }
+        ret;
+    }
+    if (slab != cls.slabs) {
+        slab_unlink(cls, slab);
+        slab_link_head(cls, slab);
+    }
+}
+
 fun secret_release(pool: *Pool, index: u32, generation: u32, bytes: usize) {
     if (!welded_release(index, generation, bytes)) { pool.release_failures = pool.release_failures + 1; }
 }
 
 fun slot_release(pool: *Pool, slot: *Slot, bytes: usize, align: usize) {
     if (slot.secret) {
-        secret_release(pool, slot.welded, slot.welded_gen, bytes);
+        if (slot.slab != nil) {
+            slab_release(pool, ?pool.classes[slot.class::usize], slot.slab, slot.slab_slot);
+            slot.slab        = nil;
+            slot.slab_offset = 0;
+            slot.slab_slot   = 0;
+        }
+        or {
+            secret_release(pool, slot.welded, slot.welded_gen, bytes);
+        }
         slot.welded     = 0;
         slot.welded_gen = 0;
         ret;
@@ -783,10 +893,13 @@ fun acquire_locked(pool: *Pool, account: *Account, request: Request, register: b
         secret_chunk = pool.classes[class_index::usize].secret;
         chunk_align  = pool.classes[class_index::usize].align;
     }
-    var index:   u32   = NONE;
-    var address: usize = 0;
-    var welded:  u32   = 0;
-    var wgen:    u32   = 0;
+    var index:       u32         = NONE;
+    var address:     usize       = 0;
+    var welded:      u32         = 0;
+    var wgen:        u32         = 0;
+    var slab:        *SecretSlab = nil;
+    var slab_offset: usize       = 0;
+    var slab_slot:   u8          = 0;
     if (class_index != OVERSIZE && pool.classes[class_index::usize].retained_head != NONE) {
         val cls: *ClassState = ?pool.classes[class_index::usize];
         index = cls.retained_head;
@@ -799,6 +912,9 @@ fun acquire_locked(pool: *Pool, account: *Account, request: Request, register: b
         address                = kept.address;
         welded                 = kept.welded;
         wgen                   = kept.welded_gen;
+        slab                   = kept.slab;
+        slab_offset            = kept.slab_offset;
+        slab_slot              = kept.slab_slot;
     }
     or {
         # a retained chunk brings its own slot, a fresh one needs one more
@@ -809,7 +925,18 @@ fun acquire_locked(pool: *Pool, account: *Account, request: Request, register: b
         }
         var backed: bool = false;
         if (secret_chunk) {
-            backed = welded_allocate(pool, bytes, ?welded, ?wgen);
+            if (class_index != OVERSIZE && pool.classes[class_index::usize].slab_stride != 0) {
+                val cls: *ClassState = ?pool.classes[class_index::usize];
+                if (slab_acquire(pool, cls, ?slab, ?slab_slot)) {
+                    welded      = slab.welded;
+                    wgen        = slab.welded_gen;
+                    slab_offset = slab_slot::usize * cls.slab_stride;
+                    backed      = true;
+                }
+            }
+            or {
+                backed = welded_allocate(pool, bytes, ?welded, ?wgen);
+            }
         }
         or {
             address = plain_allocate(pool, bytes, chunk_align);
@@ -820,8 +947,15 @@ fun acquire_locked(pool: *Pool, account: *Account, request: Request, register: b
             # the demand above keeps a slot free, but a missing one is still a
             # refusal that gives the backing back, never a write through nil
             if (index == NONE) {
-                if (secret_chunk) { secret_release(pool, welded, wgen, bytes); }
-                or                { plain_release(pool, address, bytes, chunk_align); }
+                if (secret_chunk) {
+                    if (slab != nil) {
+                        slab_release(pool, ?pool.classes[class_index::usize], slab, slab_slot);
+                    }
+                    or {
+                        secret_release(pool, welded, wgen, bytes);
+                    }
+                }
+                or { plain_release(pool, address, bytes, chunk_align); }
                 backed = false;
             }
         }
@@ -841,20 +975,23 @@ fun acquire_locked(pool: *Pool, account: *Account, request: Request, register: b
     val slot: *Slot = slot_at(pool, index);
     slot.generation = slot.generation + 1;
     if (slot.generation == 0) { slot.generation = 1; }
-    slot.state      = SLOT_HELD;
-    slot.class      = class_index;
-    slot.lane       = request.lane;
-    slot.bytes      = bytes;
-    slot.address    = address;
-    slot.welded     = welded;
-    slot.welded_gen = wgen;
-    slot.align      = chunk_align;
-    slot.account    = account;
-    slot.inflight   = 0;
-    slot.next       = NONE;
-    slot.secret     = secret_chunk;
-    slot.view       = VIEW_NONE;
-    slot.view_kind  = 0;
+    slot.state       = SLOT_HELD;
+    slot.class       = class_index;
+    slot.lane        = request.lane;
+    slot.bytes       = bytes;
+    slot.address     = address;
+    slot.welded      = welded;
+    slot.welded_gen  = wgen;
+    slot.slab        = slab;
+    slot.slab_offset = slab_offset;
+    slot.slab_slot   = slab_slot;
+    slot.align       = chunk_align;
+    slot.account     = account;
+    slot.inflight    = 0;
+    slot.next        = NONE;
+    slot.secret      = secret_chunk;
+    slot.view        = VIEW_NONE;
+    slot.view_kind   = 0;
     charge(pool, account, lane, bytes);
     account.chunks = account.chunks + 1;
     if (!inside) { pool.slots_in_use = pool.slots_in_use + 1; }
@@ -918,7 +1055,7 @@ fun release_locked(pool: *Pool, account: *Account, chunk: Chunk, wake: bool) Rea
         val cls: *ClassState = ?pool.classes[slot.class::usize];
         cls.live     = cls.live - 1;
         cls.releases = cls.releases + 1;
-        if (cls.secret) { welded_wipe(slot.welded, slot.welded_gen, cls.size); }
+        if (cls.secret) { welded_wipe(slot.welded, slot.welded_gen, slot.slab_offset, cls.size); }
         if (cls.retained < cls.high_water) {
             slot.state          = SLOT_RETAINED;
             slot.next           = cls.retained_head;
@@ -970,7 +1107,19 @@ pub fun init(pool: *Pool, config: Config, plain: *A.Allocator) bool {
         cls.secret        = c.secret;
         cls.high_water    = c.high_water;
         cls.retained_head = NONE;
-        i                 = i + 1;
+        if (c.secret && WELDED) {
+            var stride: usize = 0;
+            if (round_up(cls.size, cls.align, ?stride) && stride <= SECRET_SLAB_BYTES / 2) {
+                var count: usize = SECRET_SLAB_BYTES / stride;
+                if (count > SECRET_SLAB_MAX_SLOTS) { count = SECRET_SLAB_MAX_SLOTS; }
+                if (count >= 2) {
+                    cls.slab_stride = stride;
+                    cls.slab_slots  = count::u8;
+                    cls.slab_bytes  = count * stride;
+                }
+            }
+        }
+        i = i + 1;
     }
     var initial: usize = config.initial_slots;
     if (initial == 0)                                             { initial = DEFAULT_SLOTS; }
@@ -1170,7 +1319,7 @@ pub fun secret(pool: *Pool, chunk: Chunk) *^u8 {
     val slot: *Slot = held_slot(pool, chunk.ref);
     var view: *^u8  = nil;
     if (slot != nil && slot.secret && slot.view != VIEW_TYPED) {
-        view = welded_view(slot.welded, slot.welded_gen);
+        view = welded_view(slot.welded, slot.welded_gen, slot.slab_offset);
         if (view != nil) { slot.view = VIEW_BYTES; }
     }
     leave(pool);
@@ -1202,7 +1351,7 @@ pub fun secret_bind(pool: *Pool, chunk: Chunk, shape: Shape) *^u8 {
     var view: *^u8  = nil;
     if (slot != nil && slot.secret && slot.view != VIEW_BYTES && shape_fits(slot, shape) &&
         (slot.view == VIEW_NONE || slot.view_kind == shape.kind)) {
-        view = welded_view(slot.welded, slot.welded_gen);
+        view = welded_view(slot.welded, slot.welded_gen, slot.slab_offset);
         if (view != nil && !welded_aligned(view, shape.align)) { view = nil; }
         if (view != nil) {
             slot.view      = VIEW_TYPED;
@@ -1709,12 +1858,14 @@ $if (capability.HAS_PAGES) {
         ret true;
     }
 
-    fun welded_view(index: u32, generation: u32) *^u8 {
-        ret secret_memory.borrow_data(secret_memory.Borrow{index: index, generation: generation});
+    fun welded_view(index: u32, generation: u32, offset: usize) *^u8 {
+        val base: *^u8 = secret_memory.borrow_data(secret_memory.Borrow{index: index, generation: generation});
+        if (base == nil) { ret nil; }
+        ret ?base[offset];
     }
 
-    fun welded_wipe(index: u32, generation: u32, size: usize) {
-        secret_memory.borrow_wipe(secret_memory.Borrow{index: index, generation: generation}, 0, size);
+    fun welded_wipe(index: u32, generation: u32, offset: usize, size: usize) {
+        secret_memory.borrow_wipe(secret_memory.Borrow{index: index, generation: generation}, offset, size);
     }
 
     fun welded_aligned(data: *^u8, alignment: usize) bool {
@@ -1785,11 +1936,11 @@ $or {
         ret false;
     }
 
-    fun welded_view(index: u32, generation: u32) *^u8 {
+    fun welded_view(index: u32, generation: u32, offset: usize) *^u8 {
         ret nil;
     }
 
-    fun welded_wipe(index: u32, generation: u32, size: usize) {}
+    fun welded_wipe(index: u32, generation: u32, offset: usize, size: usize) {}
 
     fun welded_aligned(data: *^u8, alignment: usize) bool {
         ret false;
@@ -2954,6 +3105,91 @@ $if (capability.HOSTED) {
         val res_count: res[usize, A.Error] = arena_bytes(config(?classes[0], 2, 1 << 20), ?chunks[0]);
         if (!sel res_count.err)          { ret 7; }
         if (!sel res_count.err.overflow) { ret 7; }
+        ret 0;
+    }
+
+    #[testing]
+    rec SecretSlotRecord {
+        tag: u64;
+        key: [32]^u8;
+    }
+
+    test buffers__small_secret_class_packs_into_shared_locked_slabs {
+        $if (!WELDED) { ret 77; }
+        var backing: A.Allocator;
+        val made:    err[A.Error] = page.make(?backing);
+        if (sel made.err) { ret 1; }
+        var classes: [2]ClassConfig = [2]ClassConfig{
+            ClassConfig{size: 256, align: 16, secret: true, high_water: 0},
+            ClassConfig{size: 4096, align: 16, secret: true, high_water: 0},
+        };
+        var pool: Pool;
+        if (!init(?pool, config(?classes[0], 2, 1 << 20), ?backing)) { ret 2; }
+        fin { dnit(?pool); }
+        if (pool.classes[0].slab_slots != 16 || pool.classes[0].slab_stride != 256) { ret 3; }
+        if (pool.classes[1].slab_stride != 0)                                       { ret 4; }
+
+        var account: Account;
+        if (!is_none(account_init(?pool, ?account, 1, budgets_of(1 << 20), 0))) { ret 5; }
+        val req: Request = Request{bytes: 256, align: 16, lane: 0, secret: true};
+
+        # 16 chunks of 256 bytes pack into one 4 KiB locked slab
+        var held: [17]Chunk;
+        var i:    usize = 0;
+        for (i < 16) {
+            val got: Acquired = acquire(?pool, ?account, req, false);
+            if (!status_ok(got)) { ret 6; }
+            held[i] = got.chunk;
+            val view: *^u8 = secret(?pool, held[i]);
+            if (view == nil) { ret 7; }
+            var j: usize = 0;
+            for (j < 256) {
+                if ((view[j]:>u8) != 0) { ret 8; }
+                view[j] = (i + 1)::u8;
+                j       = j + 1;
+            }
+            i = i + 1;
+        }
+        if (pool.classes[0].slab_count != 1) { ret 9; }
+
+        # a 17th chunk opens a second slab and works with typed views
+        val extra: Acquired = acquire(?pool, ?account, req, false);
+        if (!status_ok(extra) || pool.classes[0].slab_count != 2) { ret 10; }
+        held[16] = extra.chunk;
+        val typed: *SecretSlotRecord = secret_typed[SecretSlotRecord](?pool, held[16], 1);
+        if (typed == nil || typed.tag != 0) { ret 11; }
+        typed.tag    = 0x12345678;
+        typed.key[0] = 0xab;
+
+        # releasing one slot wipes it without disturbing sibling slots in the same slab
+        if (!is_none(release(?pool, ?account, held[0]))) { ret 12; }
+        i = 1;
+        for (i < 16) {
+            val view: *^u8 = secret(?pool, held[i]);
+            if (view == nil || (view[0]:>u8) != (i + 1)::u8 || (view[255]:>u8) != (i + 1)::u8) { ret 13; }
+            i = i + 1;
+        }
+
+        # re-acquiring reuses the freed slot in slab 0 and sees wiped zeros
+        val reused: Acquired = acquire(?pool, ?account, req, false);
+        if (!status_ok(reused) || pool.classes[0].slab_count != 2) { ret 14; }
+        held[0] = reused.chunk;
+        val rview: *^u8 = secret(?pool, held[0]);
+        if (rview == nil || (rview[0]:>u8) != 0 || (rview[255]:>u8) != 0) { ret 15; }
+
+        # releasing the entire first slab reclaims it immediately
+        i = 0;
+        for (i < 16) {
+            if (!is_none(release(?pool, ?account, held[i]))) { ret 16; }
+            i = i + 1;
+        }
+        if (pool.classes[0].slab_count != 1)                       { ret 17; }
+        if (typed.tag != 0x12345678 || (typed.key[0]:>u8) != 0xab) { ret 18; }
+
+        # releasing the final chunk reclaims the second slab too
+        if (!is_none(release(?pool, ?account, held[16]))) { ret 19; }
+        if (pool.classes[0].slab_count != 0)              { ret 20; }
+        if (!is_none(account_dnit(?pool, ?account)))      { ret 21; }
         ret 0;
     }
 }
