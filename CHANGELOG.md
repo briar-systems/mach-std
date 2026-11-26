@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- On wasi, `std.system.os.wasi` reads the arguments and the environment on their first use, each once under a gate on `std.sync.atomic`'s word operations, where only `std.runtime`'s `_start` read them. A module its host calls through its exports has no `_start`, so its `getenv` answered `ENOENT` for every name and its argument count was 0. `_start` still reads both before `main` (#1167).
+
 ## [10.1.1] - 2026-11-24
 
 ### Fixed
