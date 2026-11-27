@@ -24,6 +24,7 @@ use std.types.string.str;
 use std.types.string.str_len;
 use std.types.string.str_starts_with;
 
+use std.sync.atomic;
 use identities: std.system.file_identity;
 use os_shared:  std.system.os.shared;
 use std.system.os.wasi.shared;
@@ -819,55 +820,122 @@ pub fun getcwd(buf: *u8, size: usize) i64 {
 }
 
 # one block holding count + 1 pointers and then the strings they point into
-fun capture(count: usize, size: usize, out: ***u8, strings: **u8) bool {
+# ---
+# ret: the block's size in bytes, or 0 when it could not be allocated
+fun capture(count: usize, size: usize, out: ***u8, strings: **u8) usize {
     val pointers: usize = (count + 1) * $size_of(*u8);
-    val block:    ptr   = shared.allocate(pointers + size + 1);
-    if (block == nil) { ret false; }
+    val bytes:    usize = pointers + size + 1;
+    val block:    ptr   = shared.allocate(bytes);
+    if (block == nil) { ret 0; }
     @out     = block::**u8;
     @strings = (block::usize + pointers)::*u8;
-    ret true;
+    ret bytes;
 }
 
-var argument_count:  usize = 0;
-var argument_values: **u8  = nil;
-var environment:     **u8  = nil;
+# the states of a read from the host that runs once: none yet, one under way, and over, with the
+# host's answer or with its refusal
+val UNREAD:  usize = 0;
+val READING: usize = 1;
+val READ:    usize = 2;
+val REFUSED: usize = 3;
 
-# take the arguments and the environment from the host, before main
+# the arguments and the environment, each read from the host on its first use and nil until a
+# read the host answered. a module its host starts at `_start` reads both before main, and one its
+# host calls through its exports reads each when an export first asks for it
+var arguments_state:   usize = UNREAD;
+var argument_count:    usize = 0;
+var argument_values:   **u8  = nil;
+var environment_state: usize = UNREAD;
+var environment:       **u8  = nil;
+
+# whether the host answered the read `state` guards, which the first caller makes with `read`
+# while any other waits until it is over. the state moves under std.sync.atomic's word
+# operations, so the read stays once when the environment runs threads, as the preview does not
+fun answered(state: *usize, read: fun() bool) bool {
+    if (atomic.load_word(state) < READ) {
+        var expected: usize = UNREAD;
+        if (atomic.cas_word(state, ?expected, READING)) {
+            var over: usize = REFUSED;
+            if (read()) { over = READ; }
+            atomic.store_word(state, over);
+        }
+        for (atomic.load_word(state) == READING) { atomic.spin_hint(); }
+    }
+    ret atomic.load_word(state) == READ;
+}
+
+# take the arguments from the host into one block
 # ---
-# ret: whether they were read
-pub fun capture_process() bool {
+# ret: whether the host answered
+fun read_arguments() bool {
     var count:   usize = 0;
     var size:    usize = 0;
+    var values:  **u8  = nil;
     var strings: *u8   = nil;
-    if (args_sizes_get(?count, ?size) != 0 || !capture(count, size, ?argument_values, ?strings)) { ret false; }
-    if (args_get(argument_values, strings) != 0)                                                 { ret false; }
-    argument_values[count] = nil;
-    argument_count         = count;
-
-    if (environ_sizes_get(?count, ?size) != 0 || !capture(count, size, ?environment, ?strings)) { ret false; }
-    if (environ_get(environment, strings) != 0)                                                 { ret false; }
-    environment[count] = nil;
+    if (args_sizes_get(?count, ?size) != 0) { ret false; }
+    val bytes: usize = capture(count, size, ?values, ?strings);
+    if (bytes == 0) { ret false; }
+    if (args_get(values, strings) != 0) {
+        shared.deallocate(values::ptr, bytes);
+        ret false;
+    }
+    values[count]   = nil;
+    argument_values = values;
+    argument_count  = count;
     ret true;
 }
 
-# the program's arguments capture_process read
+# take the environment from the host into one block
 # ---
-# ret: a nil-terminated array of nul-terminated arguments, nil before capture
+# ret: whether the host answered
+fun read_environment() bool {
+    var count:   usize = 0;
+    var size:    usize = 0;
+    var entries: **u8  = nil;
+    var strings: *u8   = nil;
+    if (environ_sizes_get(?count, ?size) != 0) { ret false; }
+    val bytes: usize = capture(count, size, ?entries, ?strings);
+    if (bytes == 0) { ret false; }
+    if (environ_get(entries, strings) != 0) {
+        shared.deallocate(entries::ptr, bytes);
+        ret false;
+    }
+    entries[count] = nil;
+    environment    = entries;
+    ret true;
+}
+
+# take the arguments and the environment from the host before main, where any reader would
+# otherwise take each on its first use
+# ---
+# ret: whether the host answered both
+pub fun capture_process() bool {
+    val arguments_answered:   bool = answered(?arguments_state, read_arguments);
+    val environment_answered: bool = answered(?environment_state, read_environment);
+    ret arguments_answered && environment_answered;
+}
+
+# the program's arguments
+# ---
+# ret: a nil-terminated array of nul-terminated arguments, nil when the host refused them
 pub fun arguments() **u8 {
+    if (!answered(?arguments_state, read_arguments)) { ret nil; }
     ret argument_values;
 }
 
-# how many arguments capture_process read
+# how many arguments the program has
 # ---
-# ret: the argument count, 0 before capture
+# ret: the argument count, 0 when the host refused them
 pub fun argument_total() usize {
+    if (!answered(?arguments_state, read_arguments)) { ret 0; }
     ret argument_count;
 }
 
-# the environment capture_process read
+# the program's environment
 # ---
-# ret: a nil-terminated array of NAME=value entries, nil before capture
+# ret: a nil-terminated array of NAME=value entries, nil when the host refused it
 pub fun environ() **u8 {
+    if (!answered(?environment_state, read_environment)) { ret nil; }
     ret environment;
 }
 
@@ -881,7 +949,7 @@ pub fun environ() **u8 {
 # cap:  buffer capacity in bytes
 # ret:  full length of the value, or ENOENT when the variable is unset
 pub fun getenv(name: *u8, buf: *u8, cap: usize) i64 {
-    if (environment == nil) { ret shared.ENOENT; }
+    if (!answered(?environment_state, read_environment)) { ret shared.ENOENT; }
     val name_len: usize = str_len(name);
     var i:        usize = 0;
     for (environment[i] != nil) {
