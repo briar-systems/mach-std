@@ -7,8 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [10.2.0] - 2026-11-27
+
+### Added
+
+- `std.filesystem.open_append` and `open_append_native` open a file for appending, creating it where it does not exist, as `create` opens one for writing, and `append_bytes` and `append_bytes_native` write a buffer to its end, as `write_bytes` writes a whole file. Every target honours the append (#1166).
+- `std.system.capability.HAS_TERMINAL` says whether the target has terminal control, false on wasi. `std.terminal` gates on it and names it in its refusal, so a consumer that gates its use of the module has a flag to gate on (#1175).
+- `std.system.os.windows.handle_identity` takes the identity of a raw handle the caller opened itself, and `std.system.file_identity.lasting` and `std.filesystem.identity_lasting` tell whether an identity names its file for as long as the file exists (#1169).
+
+### Changed
+
+- `std.format` erases each argument where the pack unrolls, instanced once per argument type in place of once per pack shape, and `printf`, `eprintf`, `printlnf` and `eprintlnf` in `std.print` each make one pack instance in place of a chain of three. The public surface and the output of `std.format` and `std.print` are unchanged byte for byte, and a pack instance compiles to a fraction of its former code: a 12-argument `printlnf` goes from 3086 lines of optimized IR to 249, plus one eraser of under 20 lines for each distinct argument type, shared by every pack shape (#1171).
+
 ### Fixed
 
+- On windows, a file on a volume with no stable file id, such as FAT or exFAT, has an identity, where taking it failed with an invalid argument. Its identity is the volume serial and 64-bit file index, of the new kind `WINDOWS_ENTRY`, which names a directory entry and is the one kind `lasting` answers false for. NTFS and ReFS keep the 128-bit `WINDOWS_LOCAL` form (#1169).
 - On wasi, `std.system.os.wasi` reads the arguments and the environment on their first use, each once under a gate on `std.sync.atomic`'s word operations, where only `std.runtime`'s `_start` read them. A module its host calls through its exports has no `_start`, so its `getenv` answered `ENOENT` for every name and its argument count was 0. `_start` still reads both before `main` (#1167).
 
 ## [10.1.1] - 2026-11-24
