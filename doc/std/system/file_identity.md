@@ -18,13 +18,16 @@ Source: [`src/system/file_identity.mach`](../../../src/system/file_identity.mach
 | On `Identity` | |
 | :--- | :--- |
 | [`equal`](#equal) | compare two identities byte for byte |
+| [`lasting`](#lasting) | whether an identity names its file for as long as the file exists |
 | [`encode`](#encode) | failure leaves the output untouched |
 | [`decode`](#decode) | only the complete current representation is accepted |
 | [`native`](#native) | build an identity from a backend's volume and file numbers |
 
 | Constants | |
 | :--- | :--- |
-| [`LINUX_LOCAL`](#constants), [`DARWIN_LOCAL`](#constants), [`WINDOWS_LOCAL`](#constants), [`WASI_LOCAL`](#constants), [`TEXT_CAPACITY`](#constants) | |
+| [`LINUX_LOCAL`](#constants), [`DARWIN_LOCAL`](#constants), [`WINDOWS_LOCAL`](#constants), [`WASI_LOCAL`](#constants) | |
+| [`WINDOWS_ENTRY`](#constants) | a windows volume with no stable file id, such as fat or exfat: the volume serial and the 64-bit file index, which names the file's directory entry |
+| [`TEXT_CAPACITY`](#constants) | |
 
 ---
 
@@ -53,7 +56,7 @@ opaque to filesystem callers, native producers initialize every byte
 
 byte 0 is the backend, bytes 1 to 16 are zero, bytes 17 to 24 hold the
 volume and 25 to 32 the file number, little-endian. bytes 33 to 40 are zero
-except on windows, where they may be nonzero
+except for WINDOWS_LOCAL, whose file id is 128 bits
 
 | Field | Type | |
 | :--- | :--- | :--- |
@@ -72,6 +75,25 @@ compare two identities byte for byte
 | `a` | first identity |
 | `b` | second identity |
 | **returns** | true when both are well formed and identical |
+
+### lasting
+
+```mach
+pub fun lasting(value: Identity) bool
+```
+
+whether an identity names its file for as long as the file exists
+
+a WINDOWS_ENTRY identity names a directory entry: two entries that exist at
+once differ, but a file's entry can move when the file is renamed or its
+directory is reorganized, and a freed entry is reused by the next file made
+there. it compares soundly only between observations taken while the file
+stays open and unrenamed, never across a close or once stored for later
+
+| Parameter | |
+| :--- | :--- |
+| `value` | a well-formed identity |
+| **returns** | false for WINDOWS_ENTRY, true for every other backend |
 
 ### encode
 
@@ -127,5 +149,6 @@ build an identity from a backend's volume and file numbers
 | `DARWIN_LOCAL` | `u8` | `2` |  |
 | `WINDOWS_LOCAL` | `u8` | `3` |  |
 | `WASI_LOCAL` | `u8` | `4` |  |
+| `WINDOWS_ENTRY` | `u8` | `5` | a windows volume with no stable file id, such as fat or exfat: the volume serial and the 64-bit file index, which names the file's directory entry |
 | `TEXT_CAPACITY` | `usize` | `83` |  |
 

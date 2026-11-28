@@ -127,7 +127,7 @@ Uses types from [`std.io.error`](../io/error.md), [`std.system.file_identity`](f
 | [`getenv`](#getenv) | |
 | [`getenv_native`](#getenv_native) | getenv(name, buf, cap) in the host's native units, cap and the length counted in units, so a value with no UTF-8 spelling is still read |
 | [`environ_native`](#environ_native) | the environment as the host holds it: a nil-terminated array of nul-terminated NAME=value entries in native units, captured once and kept for the life of the process, or nil when it cannot be read |
-| [`WNOHANG`](#wnohang), [`wait`](#wait), [`wait_pid`](#wait_pid), [`ProcessStatus`](#processstatus), [`FileLimit`](#filelimit), [`LIMIT_UNLIMITED`](#limit_unlimited), [`open_file_limit`](#open_file_limit), [`set_open_file_limit`](#set_open_file_limit), [`ProcessWaitError`](#processwaiterror), [`WaitResult`](#waitresult), [`PROCESS_OP_WAIT`](#process_op_wait), [`PROCESS_OP_STATUS`](#process_op_status), [`PROCESS_OP_CLOSE`](#process_op_close), [`PROCESS_OP_SPAWN`](#process_op_spawn), [`PROCESS_OP_READ`](#process_op_read), [`PROCESS_OP_PIPE`](#process_op_pipe), [`PROCESS_OP_TERMINATE`](#process_op_terminate), [`PROCESS_EXITED`](#process_exited), [`PROCESS_SIGNALED`](#process_signaled), [`PROCESS_STOPPED`](#process_stopped), [`PROCESS_CONTINUED`](#process_continued) | |
+| [`WNOHANG`](#wnohang), [`wait`](#wait), [`wait_pid`](#wait_pid), [`ProcessStatus`](#processstatus), [`FileLimit`](#filelimit), [`MemoryLimit`](#memorylimit), [`LIMIT_UNLIMITED`](#limit_unlimited), [`open_file_limit`](#open_file_limit), [`set_open_file_limit`](#set_open_file_limit), [`locked_memory_limit`](#locked_memory_limit), [`ProcessWaitError`](#processwaiterror), [`WaitResult`](#waitresult), [`PROCESS_OP_WAIT`](#process_op_wait), [`PROCESS_OP_STATUS`](#process_op_status), [`PROCESS_OP_CLOSE`](#process_op_close), [`PROCESS_OP_SPAWN`](#process_op_spawn), [`PROCESS_OP_READ`](#process_op_read), [`PROCESS_OP_PIPE`](#process_op_pipe), [`PROCESS_OP_TERMINATE`](#process_op_terminate), [`PROCESS_EXITED`](#process_exited), [`PROCESS_SIGNALED`](#process_signaled), [`PROCESS_STOPPED`](#process_stopped), [`PROCESS_CONTINUED`](#process_continued) | |
 | [`io_queue_create`](#io_queue_create) | completion wait queue |
 | [`io_queue_wait`](#io_queue_wait) | completion wait queue |
 | [`io_queue_wake`](#io_queue_wake) | completion wait queue |
@@ -2705,6 +2705,25 @@ the open-file limit. soft is the limit in force, hard its ceiling for an
 unprivileged raise, and ceiling the highest soft value this process may set,
 which the implementation fills and a set ignores
 
+### MemoryLimit
+
+Forwards the first of these whose condition holds:
+
+- [`std.system.os.linux.MemoryLimit`](os/linux.md#memorylimit), where `$mach.build.sys == $mach.sys.linux`
+- [`std.system.os.darwin.MemoryLimit`](os/darwin.md#memorylimit), where `$mach.build.sys == $mach.sys.darwin`
+- [`std.system.os.windows.MemoryLimit`](os/windows.md#memorylimit), where `$mach.build.sys == $mach.sys.windows`
+- [`std.system.os.wasi.MemoryLimit`](os/wasi.md#memorylimit), where `$mach.build.sys == $mach.sys.wasi`
+
+```mach
+pub rec MemoryLimit {
+    soft: u64;
+    hard: u64;
+}
+```
+
+the locked-memory limit in bytes. soft is the limit in force and hard its
+ceiling for an unprivileged raise
+
 ### LIMIT_UNLIMITED
 
 Forwards the first of these whose condition holds:
@@ -2781,6 +2800,36 @@ pub fun set_open_file_limit(limit: FileLimit) i64
 ```
 
 set this process's open-file limit. ceiling is ignored
+
+### locked_memory_limit
+
+Forwards the first of these whose condition holds, and they differ.
+
+Where `$mach.build.sys == $mach.sys.linux`: [`std.system.os.linux.locked_memory_limit`](os/linux.md#locked_memory_limit).
+
+```mach
+pub fun locked_memory_limit(out: *std.system.os.shared.MemoryLimit) i64
+```
+
+Where `$mach.build.sys == $mach.sys.darwin`: [`std.system.os.darwin.locked_memory_limit`](os/darwin.md#locked_memory_limit).
+
+```mach
+pub fun locked_memory_limit(out: *std.system.os.shared.MemoryLimit) i64
+```
+
+Where `$mach.build.sys == $mach.sys.windows`: [`std.system.os.windows.locked_memory_limit`](os/windows.md#locked_memory_limit).
+
+```mach
+pub fun locked_memory_limit(out: *std.system.os.shared.MemoryLimit) i64
+```
+
+Where `$mach.build.sys == $mach.sys.wasi`: [`std.system.os.wasi.locked_memory_limit`](os/wasi.md#locked_memory_limit).
+
+```mach
+pub fun locked_memory_limit(out: *MemoryLimit) i64
+```
+
+read this process's locked-memory limit in bytes
 
 ### ProcessWaitError
 

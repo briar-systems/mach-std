@@ -317,9 +317,9 @@ the native code behind a terminal failure
 
 Forwards the first of these whose condition holds:
 
-- [`std.terminal.linux.is_terminal`](terminal/linux.md#is_terminal), where `capability.HAS_FILES` and `$mach.build.sys == $mach.sys.linux`
-- [`std.terminal.darwin.is_terminal`](terminal/darwin.md#is_terminal), where `capability.HAS_FILES` and `$mach.build.sys == $mach.sys.darwin`
-- [`std.terminal.windows.is_terminal`](terminal/windows.md#is_terminal), where `capability.HAS_FILES` and `$mach.build.sys == $mach.sys.windows`
+- [`std.terminal.linux.is_terminal`](terminal/linux.md#is_terminal), where `capability.HAS_TERMINAL` and `$mach.build.sys == $mach.sys.linux`
+- [`std.terminal.darwin.is_terminal`](terminal/darwin.md#is_terminal), where `capability.HAS_TERMINAL` and `$mach.build.sys == $mach.sys.darwin`
+- [`std.terminal.windows.is_terminal`](terminal/windows.md#is_terminal), where `capability.HAS_TERMINAL` and `$mach.build.sys == $mach.sys.windows`
 
 ```mach
 pub fun is_terminal(fd: usize) bool
@@ -334,9 +334,9 @@ console handle, so a pty that is not a console reads false
 
 Forwards the first of these whose condition holds:
 
-- [`std.terminal.linux.enable_raw`](terminal/linux.md#enable_raw), where `capability.HAS_FILES` and `$mach.build.sys == $mach.sys.linux`
-- [`std.terminal.darwin.enable_raw`](terminal/darwin.md#enable_raw), where `capability.HAS_FILES` and `$mach.build.sys == $mach.sys.darwin`
-- [`std.terminal.windows.enable_raw`](terminal/windows.md#enable_raw), where `capability.HAS_FILES` and `$mach.build.sys == $mach.sys.windows`
+- [`std.terminal.linux.enable_raw`](terminal/linux.md#enable_raw), where `capability.HAS_TERMINAL` and `$mach.build.sys == $mach.sys.linux`
+- [`std.terminal.darwin.enable_raw`](terminal/darwin.md#enable_raw), where `capability.HAS_TERMINAL` and `$mach.build.sys == $mach.sys.darwin`
+- [`std.terminal.windows.enable_raw`](terminal/windows.md#enable_raw), where `capability.HAS_TERMINAL` and `$mach.build.sys == $mach.sys.windows`
 
 ```mach
 pub fun enable_raw() std.terminal.error.Operation
@@ -348,9 +348,9 @@ mode control (per-os backend)
 
 Forwards the first of these whose condition holds:
 
-- [`std.terminal.linux.disable_raw`](terminal/linux.md#disable_raw), where `capability.HAS_FILES` and `$mach.build.sys == $mach.sys.linux`
-- [`std.terminal.darwin.disable_raw`](terminal/darwin.md#disable_raw), where `capability.HAS_FILES` and `$mach.build.sys == $mach.sys.darwin`
-- [`std.terminal.windows.disable_raw`](terminal/windows.md#disable_raw), where `capability.HAS_FILES` and `$mach.build.sys == $mach.sys.windows`
+- [`std.terminal.linux.disable_raw`](terminal/linux.md#disable_raw), where `capability.HAS_TERMINAL` and `$mach.build.sys == $mach.sys.linux`
+- [`std.terminal.darwin.disable_raw`](terminal/darwin.md#disable_raw), where `capability.HAS_TERMINAL` and `$mach.build.sys == $mach.sys.darwin`
+- [`std.terminal.windows.disable_raw`](terminal/windows.md#disable_raw), where `capability.HAS_TERMINAL` and `$mach.build.sys == $mach.sys.windows`
 
 ```mach
 pub fun disable_raw() std.terminal.error.Operation
@@ -366,9 +366,9 @@ terminal comes back even if the caller returns early or panics.
 
 Forwards the first of these whose condition holds:
 
-- [`std.terminal.linux.is_raw`](terminal/linux.md#is_raw), where `capability.HAS_FILES` and `$mach.build.sys == $mach.sys.linux`
-- [`std.terminal.darwin.is_raw`](terminal/darwin.md#is_raw), where `capability.HAS_FILES` and `$mach.build.sys == $mach.sys.darwin`
-- [`std.terminal.windows.is_raw`](terminal/windows.md#is_raw), where `capability.HAS_FILES` and `$mach.build.sys == $mach.sys.windows`
+- [`std.terminal.linux.is_raw`](terminal/linux.md#is_raw), where `capability.HAS_TERMINAL` and `$mach.build.sys == $mach.sys.linux`
+- [`std.terminal.darwin.is_raw`](terminal/darwin.md#is_raw), where `capability.HAS_TERMINAL` and `$mach.build.sys == $mach.sys.darwin`
+- [`std.terminal.windows.is_raw`](terminal/windows.md#is_raw), where `capability.HAS_TERMINAL` and `$mach.build.sys == $mach.sys.windows`
 
 ```mach
 pub fun is_raw() bool

@@ -221,7 +221,8 @@ Uses types from [`std.system.os.shared`](../shared.md).
 | [`PTHREAD_CREATE_DETACHED`](#constants) | |
 | [`P_PID`](#constants) | waitid selectors and options (\<sys/wait.h>) |
 | [`WEXITED`](#constants), [`WNOWAIT`](#constants) | |
-| [`RLIMIT_NOFILE`](#constants) | resource limits (\<sys/resource.h>); `rlim_t` is u64 on LP64 |
+| [`RLIMIT_MEMLOCK`](#constants) | resource limits (\<sys/resource.h>); `rlim_t` is u64 on LP64 |
+| [`RLIMIT_NOFILE`](#constants) | |
 
 | Forwards | |
 | :--- | :--- |
@@ -1992,7 +1993,8 @@ create a kernel event queue
 | `P_PID` | `i32` | `1` | waitid selectors and options (\<sys/wait.h>) |
 | `WEXITED` | `i32` | `0x4` |  |
 | `WNOWAIT` | `i32` | `0x20` |  |
-| `RLIMIT_NOFILE` | `i32` | `8` | resource limits (\<sys/resource.h>); `rlim_t` is u64 on LP64 |
+| `RLIMIT_MEMLOCK` | `i32` | `6` | resource limits (\<sys/resource.h>); `rlim_t` is u64 on LP64 |
+| `RLIMIT_NOFILE` | `i32` | `8` |  |
 
 ## Forwards
 

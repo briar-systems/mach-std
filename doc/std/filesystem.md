@@ -45,6 +45,8 @@ Uses types from [`std.allocator`](allocator.md), [`std.filesystem.removal`](file
 | [`open_native`](#open_native) | open a file for reading by a name in native units |
 | [`create`](#create) | create or truncate a file for writing |
 | [`create_native`](#create_native) | create or truncate a file for writing by a name in native units |
+| [`open_append`](#open_append) | open a file for writing at its end, creating it when missing |
+| [`open_append_native`](#open_append_native) | open_append for a name in native units |
 | [`close`](#close) | close an open file; the handle is invalid afterwards whatever the outcome |
 | [`sync`](#sync) | flush an open file's data and metadata to its backing storage |
 | [`read`](#read) | read up to len bytes into buf |
@@ -65,6 +67,8 @@ Uses types from [`std.allocator`](allocator.md), [`std.filesystem.removal`](file
 | [`read_string_native`](#read_string_native) | read_string for a name in native units |
 | [`write_bytes`](#write_bytes) | write bytes to a file, creating or truncating it |
 | [`write_bytes_native`](#write_bytes_native) | write_bytes for a name in native units |
+| [`append_bytes`](#append_bytes) | append bytes to the end of a file, creating it when missing |
+| [`append_bytes_native`](#append_bytes_native) | append_bytes for a name in native units |
 | [`replace_bytes_atomic`](#replace_bytes_atomic) | replace a file with complete bytes through a durable sibling temporary |
 | [`replace_bytes_atomic_native`](#replace_bytes_atomic_native) | replace_bytes_atomic for a name in native units |
 | [`read_dir`](#read_dir) | list the entries of a directory, excluding "." and ".." |
@@ -114,6 +118,7 @@ Uses types from [`std.allocator`](allocator.md), [`std.filesystem.removal`](file
 | Functions | |
 | :--- | :--- |
 | [`identity_equal`](#identity_equal) | check whether two identity observations name the same file |
+| [`identity_lasting`](#identity_lasting) | whether an identity names its file for as long as the file exists, false where the volume identifies only a directory entry (fat and exfat on windows), which holds only while the file stays open and unrenamed |
 | [`identity_link`](#identity_link) | the final symlink itself is observed and unsupported domains remain explicit |
 | [`identity_link_native`](#identity_link_native) | identity_link for a name in native units |
 | [`exists`](#exists) | check whether a path exists (as any entry, including a broken symlink) |
@@ -214,6 +219,31 @@ create or truncate a file for writing by a name in native units
 | `name` | nul-terminated name in native units |
 | `mode` | permission bits for a newly created file |
 | **returns** | the open file, or the native refusal |
+
+### open_append
+
+```mach
+pub fun open_append(p: Path, mode: i32) res[File, std.io.error.Error]
+```
+
+open a file for writing at its end, creating it when missing
+
+every write lands at the file's end at the moment of the write, whatever
+other writers did since
+
+| Parameter | |
+| :--- | :--- |
+| `p` | file path |
+| `mode` | permission bits for a newly created file |
+| **returns** | the open file, or the native refusal |
+
+### open_append_native
+
+```mach
+pub fun open_append_native(name: *Unit, mode: i32) res[File, std.io.error.Error]
+```
+
+open_append for a name in native units
 
 ### close
 
@@ -484,6 +514,34 @@ pub fun write_bytes_native(name: *Unit, data: *u8, len: usize, mode: i32) err[Fs
 ```
 
 write_bytes for a name in native units
+
+### append_bytes
+
+```mach
+pub fun append_bytes(p: Path, data: *u8, len: usize, mode: i32) err[FsError]
+```
+
+append bytes to the end of a file, creating it when missing
+
+composes io.write_all over the file's Writer, as write_bytes does. a write
+failure carries the persisted prefix; a close failure after a complete write
+is reported as io.
+
+| Parameter | |
+| :--- | :--- |
+| `p` | file path |
+| `data` | bytes to append |
+| `len` | number of bytes |
+| `mode` | permission bits for a newly created file |
+| **returns** | ok, or why the bytes are not all in the file |
+
+### append_bytes_native
+
+```mach
+pub fun append_bytes_native(name: *Unit, data: *u8, len: usize, mode: i32) err[FsError]
+```
+
+append_bytes for a name in native units
 
 ### replace_bytes_atomic
 
@@ -928,6 +986,21 @@ check whether two identity observations name the same file
 | `b` | second identity |
 | **returns** | true when both identities are well formed and every byte matches |
 
+### identity_lasting
+
+```mach
+pub fun identity_lasting(value: Identity) bool
+```
+
+whether an identity names its file for as long as the file exists, false
+where the volume identifies only a directory entry (fat and exfat on
+windows), which holds only while the file stays open and unrenamed
+
+| Parameter | |
+| :--- | :--- |
+| `value` | the identity |
+| **returns** | true when it outlives the observation that took it |
+
 ### identity_link
 
 ```mach
@@ -1179,7 +1252,7 @@ opaque to filesystem callers, native producers initialize every byte
 
 byte 0 is the backend, bytes 1 to 16 are zero, bytes 17 to 24 hold the
 volume and 25 to 32 the file number, little-endian. bytes 33 to 40 are zero
-except on windows, where they may be nonzero
+except for WINDOWS_LOCAL, whose file id is 128 bits
 
 ### IoVector
 

@@ -200,6 +200,9 @@ pub fun borrow_copy(destination: Borrow, destination_offset: usize, source: Borr
 
 copy between two borrows without either pointer leaving the boundary
 
+the two spans may be of one borrow and may overlap, so the copy is the
+overlap-safe one
+
 | Parameter | |
 | :--- | :--- |
 | **returns** | ok, CLOSED for a dead handle, INVALID for a span outside either borrow |

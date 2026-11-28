@@ -52,7 +52,7 @@ Uses types from [`std.allocator`](allocator.md), [`std.io.writer`](io/writer.md)
 
 | On `FormatError` | |
 | :--- | :--- |
-| [`vformat`](#vformat) | format a comptime-variadic pack into a writer (v1.7 packs) |
+| [`vformat`](#vformat) | format a comptime-variadic pack into a writer |
 | [`format`](#format) | format a comptime-variadic pack into a writer |
 | [`sprint`](#sprint) | format a comptime-variadic pack into a freshly allocated string |
 
@@ -118,16 +118,16 @@ every way a format can fail beyond the writer's own outcome
 pub fun vformat(w: *std.io.writer.Writer, fmt: str, va: ...) res[usize, FormatError]
 ```
 
-format a comptime-variadic pack into a writer (v1.7 packs)
+format a comptime-variadic pack into a writer
 
 holes are type-directed `{}` matched to args in order: signed/unsigned int ->
 decimal, str -> text, ptr -> 0xHEX, f64/f32/f16 -> shortest round-trip decimal
 at its own width. specs:
 `{:x}`/`{:X}` hex, `{:b}` binary, `{:c}` low-byte char, `{:N}`/`{:0N}` minimum
 width (right-align), `{:<N}` left-align. `{{` and `}}` are literal-brace
-escapes. the arg sequence is comptime-unrolled and monomorphized per call, so
-an argument of a type with no rendering is a compile error; the format scan
-stays at runtime.
+escapes. each argument is erased to an Arg where the pack is unrolled, so an
+argument of a type with no rendering is a compile error, and the format scan
+runs in one function shared by every pack shape.
 
 | Parameter | |
 | :--- | :--- |
@@ -602,12 +602,11 @@ pub fun write_value(w: *std.io.writer.Writer, va: ...) res[usize, WriteError]
 write values in their default rendering, the `{}` of vformat without a
 format string
 
-the same type-directed dispatch as vformat's holes: signed/unsigned integers
+the same type-directed rendering as vformat's holes: signed/unsigned integers
 in decimal, str as text, ptr as 0x-hex, each float width as its own shortest
 round-trippable decimal. each value of the pack is rendered in order with
-nothing between them; the common call passes one. a type vformat would
-refuse at runtime is refused here at instantiation, since the pack's types
-are known.
+nothing between them; the common call passes one. a type with no rendering
+is refused at instantiation, since the pack's types are known.
 
 | Parameter | |
 | :--- | :--- |

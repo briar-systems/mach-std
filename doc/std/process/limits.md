@@ -17,10 +17,11 @@ Uses types from [`std.io.error`](../io/error.md), [`std.system.os`](../system/os
 | [`open_files`](#open_files) | read the open-file limit |
 | [`set_open_files`](#set_open_files) | set the open-file limit |
 | [`raise_open_files`](#raise_open_files) | raise the soft open-file limit as far as this process may, leaving the hard limit unchanged |
+| [`locked_memory`](#locked_memory) | read the locked-memory limit in bytes |
 
 | Forwards | |
 | :--- | :--- |
-| [`FileLimit`](#filelimit), [`LIMIT_UNLIMITED`](#limit_unlimited) | |
+| [`FileLimit`](#filelimit), [`MemoryLimit`](#memorylimit), [`LIMIT_UNLIMITED`](#limit_unlimited) | |
 
 ---
 
@@ -67,6 +68,18 @@ limit unchanged
 | :--- | :--- |
 | **returns** | the limit now in force, or the failure |
 
+### locked_memory
+
+```mach
+pub fun locked_memory() res[std.system.os.MemoryLimit, std.io.error.Error]
+```
+
+read the locked-memory limit in bytes
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | the soft and hard limits in force, or the failure. UNSUPPORTED where the platform has no per-process lock limit |
+
 ## Forwards
 
 ### FileLimit
@@ -84,6 +97,20 @@ pub rec FileLimit {
 the open-file limit. soft is the limit in force, hard its ceiling for an
 unprivileged raise, and ceiling the highest soft value this process may set,
 which the implementation fills and a set ignores
+
+### MemoryLimit
+
+Forwards [`std.system.os.MemoryLimit`](../system/os.md#memorylimit).
+
+```mach
+pub rec MemoryLimit {
+    soft: u64;
+    hard: u64;
+}
+```
+
+the locked-memory limit in bytes. soft is the limit in force and hard its
+ceiling for an unprivileged raise
 
 ### LIMIT_UNLIMITED
 
