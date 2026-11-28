@@ -21,6 +21,7 @@ Source: [`src/system/os/shared.mach`](../../../../src/system/os/shared.mach)
 | [`ProcessStatus`](#processstatus) | `rec` | one observed change in a child's state |
 | [`ProcessWaitError`](#processwaiterror) | `rec` | why a process wait or the release of a child's handle failed |
 | [`FileLimit`](#filelimit) | `rec` | the open-file limit |
+| [`MemoryLimit`](#memorylimit) | `rec` | the locked-memory limit in bytes |
 | [`WaitResult`](#waitresult) | `rec` | pid is positive for an observation, zero for no event or an error |
 | [`EnvironmentOf`](#environmentof) | `tag` | the environment a spawn or exec hands its child, its entries in units T |
 | [`Environment`](#environment) | `def` | the environment of a UTF-8 spawn, its entries in UTF-8 |
@@ -277,6 +278,18 @@ pub rec FileLimit {
 the open-file limit. soft is the limit in force, hard its ceiling for an
 unprivileged raise, and ceiling the highest soft value this process may set,
 which the implementation fills and a set ignores
+
+## MemoryLimit
+
+```mach
+pub rec MemoryLimit {
+    soft: u64;
+    hard: u64;
+}
+```
+
+the locked-memory limit in bytes. soft is the limit in force and hard its
+ceiling for an unprivileged raise
 
 ## WaitResult
 

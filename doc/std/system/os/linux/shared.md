@@ -146,6 +146,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`getpid`](#getpid) | return the current process ID |
 | [`open_file_limit`](#open_file_limit) | read this process's open-file limit |
 | [`set_open_file_limit`](#set_open_file_limit) | set this process's open-file limit |
+| [`locked_memory_limit`](#locked_memory_limit) | read this process's locked-memory limit in bytes |
 | [`pipe`](#pipe) | create a unidirectional pipe |
 | [`ignore_sigpipe`](#ignore_sigpipe) | ignore SIGPIPE for this process |
 | [`sleep`](#sleep) | suspend execution for the given number of nanoseconds |
@@ -234,7 +235,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | :--- | :--- |
 | [`DirectoryEntry`](#directoryentry), [`DirectoryInitResult`](#directoryinitresult) | |
 | [`ProcessStatus`](#processstatus) | canonical process observations |
-| [`FileLimit`](#filelimit), [`LIMIT_UNLIMITED`](#limit_unlimited), [`ProcessWaitError`](#processwaiterror), [`WaitResult`](#waitresult), [`PROCESS_OP_WAIT`](#process_op_wait), [`PROCESS_OP_STATUS`](#process_op_status), [`PROCESS_OP_CLOSE`](#process_op_close), [`PROCESS_OP_SPAWN`](#process_op_spawn), [`PROCESS_OP_READ`](#process_op_read), [`PROCESS_OP_PIPE`](#process_op_pipe), [`PROCESS_OP_TERMINATE`](#process_op_terminate), [`PROCESS_EXITED`](#process_exited), [`PROCESS_SIGNALED`](#process_signaled), [`PROCESS_STOPPED`](#process_stopped), [`PROCESS_CONTINUED`](#process_continued), [`IoVector`](#iovector) | |
+| [`FileLimit`](#filelimit), [`MemoryLimit`](#memorylimit), [`LIMIT_UNLIMITED`](#limit_unlimited), [`ProcessWaitError`](#processwaiterror), [`WaitResult`](#waitresult), [`PROCESS_OP_WAIT`](#process_op_wait), [`PROCESS_OP_STATUS`](#process_op_status), [`PROCESS_OP_CLOSE`](#process_op_close), [`PROCESS_OP_SPAWN`](#process_op_spawn), [`PROCESS_OP_READ`](#process_op_read), [`PROCESS_OP_PIPE`](#process_op_pipe), [`PROCESS_OP_TERMINATE`](#process_op_terminate), [`PROCESS_EXITED`](#process_exited), [`PROCESS_SIGNALED`](#process_signaled), [`PROCESS_STOPPED`](#process_stopped), [`PROCESS_CONTINUED`](#process_continued), [`IoVector`](#iovector) | |
 
 ---
 
@@ -1897,6 +1898,19 @@ set this process's open-file limit. ceiling is ignored
 | `limit` | the soft and hard limits to set |
 | **returns** | 0, or a negative native code |
 
+### locked_memory_limit
+
+```mach
+pub fun locked_memory_limit(out: *std.system.os.shared.MemoryLimit) i64
+```
+
+read this process's locked-memory limit in bytes
+
+| Parameter | |
+| :--- | :--- |
+| `out` | filled with the limit in force |
+| **returns** | 0, or a negative native code |
+
 ### pipe
 
 ```mach
@@ -2876,6 +2890,20 @@ pub rec FileLimit {
 the open-file limit. soft is the limit in force, hard its ceiling for an
 unprivileged raise, and ceiling the highest soft value this process may set,
 which the implementation fills and a set ignores
+
+### MemoryLimit
+
+Forwards [`std.system.os.shared.MemoryLimit`](../shared.md#memorylimit).
+
+```mach
+pub rec MemoryLimit {
+    soft: u64;
+    hard: u64;
+}
+```
+
+the locked-memory limit in bytes. soft is the limit in force and hard its
+ceiling for an unprivileged raise
 
 ### LIMIT_UNLIMITED
 

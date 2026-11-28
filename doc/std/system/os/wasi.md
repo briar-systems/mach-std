@@ -23,7 +23,7 @@ Source: [`src/system/os/wasi.mach`](../../../../src/system/os/wasi.mach)
 | [`read`](#read) | files |
 | [`write`](#write), [`write_vector`](#write_vector), [`read_at`](#read_at), [`write_at`](#write_at), [`open`](#open), [`open_native`](#open_native), [`close`](#close), [`sync_fd`](#sync_fd), [`stat`](#stat), [`set_mode`](#set_mode), [`set_mode_at`](#set_mode_at), [`set_mode_at_native`](#set_mode_at_native), [`file_identity`](#file_identity), [`identity_at`](#identity_at), [`identity_at_native`](#identity_at_native), [`retain_identity_at`](#retain_identity_at), [`retain_identity_at_native`](#retain_identity_at_native), [`publication_capabilities`](#publication_capabilities), [`stat_path`](#stat_path), [`stat_path_native`](#stat_path_native), [`stat_mode`](#stat_mode), [`stat_birth`](#stat_birth), [`unlink`](#unlink), [`unlink_native`](#unlink_native), [`rename`](#rename), [`rename_native`](#rename_native), [`symlink`](#symlink), [`symlink_native`](#symlink_native), [`make_dir`](#make_dir), [`make_dir_native`](#make_dir_native), [`directory_init`](#directory_init), [`directory_next`](#directory_next), [`directory_dnit`](#directory_dnit), [`access`](#access), [`access_native`](#access_native), [`seek`](#seek), [`lock_fd`](#lock_fd), [`pipe`](#pipe), [`getcwd`](#getcwd), [`getcwd_native`](#getcwd_native) | |
 | [`capture_process`](#capture_process) | process |
-| [`arguments`](#arguments), [`argument_total`](#argument_total), [`terminate`](#terminate), [`abort`](#abort), [`terminate_child`](#terminate_child), [`spawn`](#spawn), [`spawn_in`](#spawn_in), [`spawn_redirected`](#spawn_redirected), [`spawn_redirected_in`](#spawn_redirected_in), [`spawn_native`](#spawn_native), [`spawn_in_native`](#spawn_in_native), [`spawn_redirected_native`](#spawn_redirected_native), [`spawn_redirected_in_native`](#spawn_redirected_in_native), [`getpid`](#getpid), [`ignore_sigpipe`](#ignore_sigpipe), [`getenv`](#getenv), [`environ`](#environ), [`getenv_native`](#getenv_native), [`environ_native`](#environ_native), [`temp_dir`](#temp_dir), [`wait`](#wait), [`wait_pid`](#wait_pid), [`ProcessStatus`](#processstatus), [`FileLimit`](#filelimit), [`LIMIT_UNLIMITED`](#limit_unlimited), [`open_file_limit`](#open_file_limit), [`set_open_file_limit`](#set_open_file_limit), [`ProcessWaitError`](#processwaiterror), [`WaitResult`](#waitresult), [`PROCESS_OP_WAIT`](#process_op_wait), [`PROCESS_OP_STATUS`](#process_op_status), [`PROCESS_OP_CLOSE`](#process_op_close), [`PROCESS_OP_SPAWN`](#process_op_spawn), [`PROCESS_OP_READ`](#process_op_read), [`PROCESS_OP_PIPE`](#process_op_pipe), [`PROCESS_OP_TERMINATE`](#process_op_terminate), [`PROCESS_EXITED`](#process_exited), [`PROCESS_SIGNALED`](#process_signaled), [`PROCESS_STOPPED`](#process_stopped), [`PROCESS_CONTINUED`](#process_continued) | |
+| [`arguments`](#arguments), [`argument_total`](#argument_total), [`terminate`](#terminate), [`abort`](#abort), [`terminate_child`](#terminate_child), [`spawn`](#spawn), [`spawn_in`](#spawn_in), [`spawn_redirected`](#spawn_redirected), [`spawn_redirected_in`](#spawn_redirected_in), [`spawn_native`](#spawn_native), [`spawn_in_native`](#spawn_in_native), [`spawn_redirected_native`](#spawn_redirected_native), [`spawn_redirected_in_native`](#spawn_redirected_in_native), [`getpid`](#getpid), [`ignore_sigpipe`](#ignore_sigpipe), [`getenv`](#getenv), [`environ`](#environ), [`getenv_native`](#getenv_native), [`environ_native`](#environ_native), [`temp_dir`](#temp_dir), [`wait`](#wait), [`wait_pid`](#wait_pid), [`ProcessStatus`](#processstatus), [`FileLimit`](#filelimit), [`MemoryLimit`](#memorylimit), [`LIMIT_UNLIMITED`](#limit_unlimited), [`open_file_limit`](#open_file_limit), [`set_open_file_limit`](#set_open_file_limit), [`locked_memory_limit`](#locked_memory_limit), [`ProcessWaitError`](#processwaiterror), [`WaitResult`](#waitresult), [`PROCESS_OP_WAIT`](#process_op_wait), [`PROCESS_OP_STATUS`](#process_op_status), [`PROCESS_OP_CLOSE`](#process_op_close), [`PROCESS_OP_SPAWN`](#process_op_spawn), [`PROCESS_OP_READ`](#process_op_read), [`PROCESS_OP_PIPE`](#process_op_pipe), [`PROCESS_OP_TERMINATE`](#process_op_terminate), [`PROCESS_EXITED`](#process_exited), [`PROCESS_SIGNALED`](#process_signaled), [`PROCESS_STOPPED`](#process_stopped), [`PROCESS_CONTINUED`](#process_continued) | |
 | [`sleep`](#sleep) | time and entropy |
 | [`clock_gettime`](#clock_gettime), [`random_fill`](#random_fill) | |
 | [`stack_bounds`](#stack_bounds) | core |
@@ -1160,7 +1160,7 @@ Forwards [`std.system.os.wasi.preview1.arguments`](wasi/preview1.md#arguments), 
 pub fun arguments() **u8
 ```
 
-the program's arguments capture_process read
+the program's arguments
 
 ### argument_total
 
@@ -1170,7 +1170,7 @@ Forwards [`std.system.os.wasi.preview1.argument_total`](wasi/preview1.md#argumen
 pub fun argument_total() usize
 ```
 
-how many arguments capture_process read
+how many arguments the program has
 
 ### terminate
 
@@ -1325,7 +1325,7 @@ Forwards [`std.system.os.wasi.preview1.environ`](wasi/preview1.md#environ), only
 pub fun environ() **u8
 ```
 
-the environment capture_process read
+the program's environment
 
 ### getenv_native
 
@@ -1348,7 +1348,7 @@ Forwards [`std.system.os.wasi.preview1.environ`](wasi/preview1.md#environ), only
 pub fun environ() **u8
 ```
 
-the environment capture_process read
+the program's environment
 
 ### temp_dir
 
@@ -1411,6 +1411,20 @@ the open-file limit. soft is the limit in force, hard its ceiling for an
 unprivileged raise, and ceiling the highest soft value this process may set,
 which the implementation fills and a set ignores
 
+### MemoryLimit
+
+Forwards [`std.system.os.wasi.preview1.MemoryLimit`](wasi/preview1.md#memorylimit), only where `$mach.build.sys == $mach.sys.wasi`.
+
+```mach
+pub rec MemoryLimit {
+    soft: u64;
+    hard: u64;
+}
+```
+
+the locked-memory limit in bytes. soft is the limit in force and hard its
+ceiling for an unprivileged raise
+
 ### LIMIT_UNLIMITED
 
 Forwards [`std.system.os.wasi.preview1.LIMIT_UNLIMITED`](wasi/preview1.md#limit_unlimited), only where `$mach.build.sys == $mach.sys.wasi`.
@@ -1440,6 +1454,16 @@ pub fun set_open_file_limit(limit: FileLimit) i64
 ```
 
 the preview states no open-file limit, so setting it always fails
+
+### locked_memory_limit
+
+Forwards [`std.system.os.wasi.preview1.locked_memory_limit`](wasi/preview1.md#locked_memory_limit), only where `$mach.build.sys == $mach.sys.wasi`.
+
+```mach
+pub fun locked_memory_limit(out: *MemoryLimit) i64
+```
+
+the preview states no locked-memory limit, so reading it always fails
 
 ### ProcessWaitError
 

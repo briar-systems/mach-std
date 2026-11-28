@@ -74,10 +74,10 @@ Uses types from [`std.system.file_identity`](../../file_identity.md), [`std.syst
 | [`map_file`](#map_file) | the preview cannot map files, so this always fails |
 | [`sync_file`](#sync_file) | the preview cannot map files, so there is no mapping to flush |
 | [`getcwd`](#getcwd) | the preview has one directory the program starts in, the root |
-| [`capture_process`](#capture_process) | take the arguments and the environment from the host, before main |
-| [`arguments`](#arguments) | the program's arguments capture_process read |
-| [`argument_total`](#argument_total) | how many arguments capture_process read |
-| [`environ`](#environ) | the environment capture_process read |
+| [`capture_process`](#capture_process) | take the arguments and the environment from the host before main, where any reader would otherwise take each on its first use |
+| [`arguments`](#arguments) | the program's arguments |
+| [`argument_total`](#argument_total) | how many arguments the program has |
+| [`environ`](#environ) | the program's environment |
 | [`getenv`](#getenv) | look up an environment variable by name |
 | [`temp_dir`](#temp_dir) | the directory designated for temporary files: $TMPDIR, else "/tmp" |
 | [`terminate`](#terminate) | exit the process with the given code |
@@ -93,13 +93,14 @@ Uses types from [`std.system.file_identity`](../../file_identity.md), [`std.syst
 | [`ignore_sigpipe`](#ignore_sigpipe) | the preview delivers no signals, so there is nothing to ignore |
 | [`open_file_limit`](#open_file_limit) | the preview states no open-file limit, so reading it always fails |
 | [`set_open_file_limit`](#set_open_file_limit) | the preview states no open-file limit, so setting it always fails |
+| [`locked_memory_limit`](#locked_memory_limit) | the preview states no locked-memory limit, so reading it always fails |
 | [`random_fill`](#random_fill) | fill a buffer with cryptographic random bytes from the host |
 | [`sleep`](#sleep) | block the one thread for nsec nanoseconds |
 | [`stack_bounds`](#stack_bounds) | linear memory holds its stack with no bound the module can read |
 
 | Forwards | |
 | :--- | :--- |
-| [`DirectoryEntry`](#directoryentry), [`DirectoryInitResult`](#directoryinitresult), [`ProcessStatus`](#processstatus), [`FileLimit`](#filelimit), [`LIMIT_UNLIMITED`](#limit_unlimited), [`ProcessWaitError`](#processwaiterror), [`WaitResult`](#waitresult), [`Environment`](#environment), [`PROCESS_OP_WAIT`](#process_op_wait), [`PROCESS_OP_STATUS`](#process_op_status), [`PROCESS_OP_CLOSE`](#process_op_close), [`PROCESS_OP_SPAWN`](#process_op_spawn), [`PROCESS_OP_READ`](#process_op_read), [`PROCESS_OP_PIPE`](#process_op_pipe), [`PROCESS_OP_TERMINATE`](#process_op_terminate), [`PROCESS_EXITED`](#process_exited), [`PROCESS_SIGNALED`](#process_signaled), [`PROCESS_STOPPED`](#process_stopped), [`PROCESS_CONTINUED`](#process_continued) | |
+| [`DirectoryEntry`](#directoryentry), [`DirectoryInitResult`](#directoryinitresult), [`ProcessStatus`](#processstatus), [`FileLimit`](#filelimit), [`MemoryLimit`](#memorylimit), [`LIMIT_UNLIMITED`](#limit_unlimited), [`ProcessWaitError`](#processwaiterror), [`WaitResult`](#waitresult), [`Environment`](#environment), [`PROCESS_OP_WAIT`](#process_op_wait), [`PROCESS_OP_STATUS`](#process_op_status), [`PROCESS_OP_CLOSE`](#process_op_close), [`PROCESS_OP_SPAWN`](#process_op_spawn), [`PROCESS_OP_READ`](#process_op_read), [`PROCESS_OP_PIPE`](#process_op_pipe), [`PROCESS_OP_TERMINATE`](#process_op_terminate), [`PROCESS_EXITED`](#process_exited), [`PROCESS_SIGNALED`](#process_signaled), [`PROCESS_STOPPED`](#process_stopped), [`PROCESS_CONTINUED`](#process_continued) | |
 
 ---
 
@@ -610,11 +611,12 @@ the preview has one directory the program starts in, the root
 pub fun capture_process() bool
 ```
 
-take the arguments and the environment from the host, before main
+take the arguments and the environment from the host before main, where any reader would
+otherwise take each on its first use
 
 | Parameter | |
 | :--- | :--- |
-| **returns** | whether they were read |
+| **returns** | whether the host answered both |
 
 ### arguments
 
@@ -622,11 +624,11 @@ take the arguments and the environment from the host, before main
 pub fun arguments() **u8
 ```
 
-the program's arguments capture_process read
+the program's arguments
 
 | Parameter | |
 | :--- | :--- |
-| **returns** | a nil-terminated array of nul-terminated arguments, nil before capture |
+| **returns** | a nil-terminated array of nul-terminated arguments, nil when the host refused them |
 
 ### argument_total
 
@@ -634,11 +636,11 @@ the program's arguments capture_process read
 pub fun argument_total() usize
 ```
 
-how many arguments capture_process read
+how many arguments the program has
 
 | Parameter | |
 | :--- | :--- |
-| **returns** | the argument count, 0 before capture |
+| **returns** | the argument count, 0 when the host refused them |
 
 ### environ
 
@@ -646,11 +648,11 @@ how many arguments capture_process read
 pub fun environ() **u8
 ```
 
-the environment capture_process read
+the program's environment
 
 | Parameter | |
 | :--- | :--- |
-| **returns** | a nil-terminated array of NAME=value entries, nil before capture |
+| **returns** | a nil-terminated array of NAME=value entries, nil when the host refused it |
 
 ### getenv
 
@@ -834,6 +836,18 @@ the preview states no open-file limit, so setting it always fails
 | :--- | :--- |
 | **returns** | ENOTSUP |
 
+### locked_memory_limit
+
+```mach
+pub fun locked_memory_limit(out: *MemoryLimit) i64
+```
+
+the preview states no locked-memory limit, so reading it always fails
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | ENOTSUP |
+
 ### random_fill
 
 ```mach
@@ -923,6 +937,20 @@ pub rec FileLimit {
 the open-file limit. soft is the limit in force, hard its ceiling for an
 unprivileged raise, and ceiling the highest soft value this process may set,
 which the implementation fills and a set ignores
+
+### MemoryLimit
+
+Forwards [`std.system.os.shared.MemoryLimit`](../shared.md#memorylimit).
+
+```mach
+pub rec MemoryLimit {
+    soft: u64;
+    hard: u64;
+}
+```
+
+the locked-memory limit in bytes. soft is the limit in force and hard its
+ceiling for an unprivileged raise
 
 ### LIMIT_UNLIMITED
 

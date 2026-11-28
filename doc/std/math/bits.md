@@ -23,6 +23,7 @@ Source: [`src/math/bits.mach`](../../../src/math/bits.mach)
 ### popcount
 
 ```mach
+#[intrinsic("mirl", "ir", "popcnt")]
 pub fun popcount(v: u64) u64
 ```
 
@@ -36,6 +37,7 @@ count the number of set bits (Hamming weight)
 ### clz
 
 ```mach
+#[intrinsic("mirl", "ir", "clz")]
 pub fun clz(v: u64) u64
 ```
 
@@ -51,6 +53,7 @@ returns 64 if v is 0.
 ### ctz
 
 ```mach
+#[intrinsic("mirl", "ir", "ctz")]
 pub fun ctz(v: u64) u64
 ```
 
@@ -94,6 +97,7 @@ rotate bits right by n positions
 ### byte_swap
 
 ```mach
+#[intrinsic("mirl", "ir", "bswap")]
 pub fun byte_swap(v: u64) u64
 ```
 

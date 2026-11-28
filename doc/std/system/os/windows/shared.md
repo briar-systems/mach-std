@@ -59,7 +59,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`heap_region_base`](#heap_region_base) | the current end of the heap region, reserving the region on first use |
 | [`heap_region_extend`](#heap_region_extend) | commit the heap region up to addr |
 | [`protect`](#protect) | change the protection of a range of pages |
-| [`lock`](#lock) | keep a range of pages resident with VirtualLock |
+| [`lock`](#lock) | keep a range of pages resident with VirtualLock, growing the process working set when the default quota is reached |
 | [`unlock`](#unlock) | release a range lock took |
 | [`advise`](#advise) | accept a memory usage hint, which windows does not act on |
 | [`page_size`](#page_size) | the page size, a fixed 4096 |
@@ -96,7 +96,8 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`set_mode`](#set_mode) | an owner-only mode is enforced with a protected dacl granting only the current user, who also becomes the owner |
 | [`set_mode_at`](#set_mode_at) | the same mapping as set_mode, for the object named relative to dirfd |
 | [`set_mode_at_native`](#set_mode_at_native) | set_mode_at for a nul-terminated UTF-16 name, the units unchanged |
-| [`file_identity`](#file_identity) | the identity of the object fd holds, from its volume and file id |
+| [`handle_identity`](#handle_identity) | the identity of the object a native handle holds |
+| [`file_identity`](#file_identity) | the identity of the object fd holds, as handle_identity takes it |
 | [`retain_identity_at`](#retain_identity_at) | retain_identity_at_native for a UTF-8 path, converted once |
 | [`retain_identity_at_native`](#retain_identity_at_native) | retain_identity_at for a nul-terminated UTF-16 name, the units unchanged |
 | [`identity_at`](#identity_at) | identity_at_native for a UTF-8 path, converted once |
@@ -141,6 +142,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 | [`getpid`](#getpid) | return the current process ID |
 | [`open_file_limit`](#open_file_limit) | windows has no settable per-process descriptor limit: handles are bounded by kernel memory, so neither query nor set has a faithful answer |
 | [`set_open_file_limit`](#set_open_file_limit) | windows has no settable descriptor limit |
+| [`locked_memory_limit`](#locked_memory_limit) | windows bounds VirtualLock by process working set rather than a fixed rlimit |
 | [`ignore_sigpipe`](#ignore_sigpipe) | ignore SIGPIPE for this process |
 | [`pipe`](#pipe) | create a unidirectional pipe |
 | [`sleep`](#sleep) | suspend execution for the given number of nanoseconds |
@@ -227,7 +229,7 @@ Uses types from [`std.system.cpu.features`](../../cpu/features.md), [`std.system
 
 | Forwards | |
 | :--- | :--- |
-| [`DirectoryEntry`](#directoryentry), [`NativeEntry`](#nativeentry), [`DirectoryInitResult`](#directoryinitresult), [`ProcessStatus`](#processstatus), [`FileLimit`](#filelimit), [`LIMIT_UNLIMITED`](#limit_unlimited), [`ProcessWaitError`](#processwaiterror), [`WaitResult`](#waitresult), [`PROCESS_EXITED`](#process_exited), [`PROCESS_SIGNALED`](#process_signaled), [`PROCESS_STOPPED`](#process_stopped), [`PROCESS_CONTINUED`](#process_continued), [`PROCESS_OP_WAIT`](#process_op_wait), [`PROCESS_OP_STATUS`](#process_op_status), [`PROCESS_OP_CLOSE`](#process_op_close), [`PROCESS_OP_SPAWN`](#process_op_spawn), [`PROCESS_OP_READ`](#process_op_read), [`PROCESS_OP_PIPE`](#process_op_pipe), [`PROCESS_OP_TERMINATE`](#process_op_terminate) | |
+| [`DirectoryEntry`](#directoryentry), [`NativeEntry`](#nativeentry), [`DirectoryInitResult`](#directoryinitresult), [`ProcessStatus`](#processstatus), [`FileLimit`](#filelimit), [`MemoryLimit`](#memorylimit), [`LIMIT_UNLIMITED`](#limit_unlimited), [`ProcessWaitError`](#processwaiterror), [`WaitResult`](#waitresult), [`PROCESS_EXITED`](#process_exited), [`PROCESS_SIGNALED`](#process_signaled), [`PROCESS_STOPPED`](#process_stopped), [`PROCESS_CONTINUED`](#process_continued), [`PROCESS_OP_WAIT`](#process_op_wait), [`PROCESS_OP_STATUS`](#process_op_status), [`PROCESS_OP_CLOSE`](#process_op_close), [`PROCESS_OP_SPAWN`](#process_op_spawn), [`PROCESS_OP_READ`](#process_op_read), [`PROCESS_OP_PIPE`](#process_op_pipe), [`PROCESS_OP_TERMINATE`](#process_op_terminate) | |
 
 ---
 
@@ -530,8 +532,8 @@ map storage for secret-welded data: span locked bytes between two reserved,
 uncommitted guard pages, page aligned and zero-filled
 
 VirtualLock keeps the span resident within the process's minimum working
-set, the windows counterpart of RLIMIT_MEMLOCK. a refused lock is reported
-as one, never served unlocked
+set, growing it when needed, and a refused lock is reported as one, never
+served unlocked
 
 | Parameter | |
 | :--- | :--- |
@@ -602,7 +604,8 @@ change the protection of a range of pages
 pub fun lock(p: ptr, size: usize) i64
 ```
 
-keep a range of pages resident with VirtualLock
+keep a range of pages resident with VirtualLock, growing the process working
+set when the default quota is reached
 
 | Parameter | |
 | :--- | :--- |
@@ -1029,13 +1032,30 @@ pub fun set_mode_at_native(dirfd: i32, name: *u16, mode: i32) i64
 
 set_mode_at for a nul-terminated UTF-16 name, the units unchanged
 
+### handle_identity
+
+```mach
+pub fun handle_identity(handle: isize, out: *std.system.file_identity.Identity) i64
+```
+
+the identity of the object a native handle holds. a volume that opens files
+by id gives its stable file id (WINDOWS_LOCAL). any other local volume, such
+as fat or exfat, gives its 64-bit file index, which names the directory entry
+rather than the file (WINDOWS_ENTRY, see file_identity.lasting)
+
+| Parameter | |
+| :--- | :--- |
+| `handle` | an open native handle, borrowed |
+| `out` | filled on success |
+| **returns** | 0, ENOTSUP on a remote volume, or a negative native code |
+
 ### file_identity
 
 ```mach
 pub fun file_identity(fd: i32, out: *std.system.file_identity.Identity) i64
 ```
 
-the identity of the object fd holds, from its volume and file id
+the identity of the object fd holds, as handle_identity takes it
 
 | Parameter | |
 | :--- | :--- |
@@ -1635,6 +1655,18 @@ pub fun set_open_file_limit(limit: std.system.os.shared.FileLimit) i64
 ```
 
 windows has no settable descriptor limit
+
+| Parameter | |
+| :--- | :--- |
+| **returns** | always ENOTSUP |
+
+### locked_memory_limit
+
+```mach
+pub fun locked_memory_limit(out: *std.system.os.shared.MemoryLimit) i64
+```
+
+windows bounds VirtualLock by process working set rather than a fixed rlimit
 
 | Parameter | |
 | :--- | :--- |
@@ -2771,6 +2803,20 @@ pub rec FileLimit {
 the open-file limit. soft is the limit in force, hard its ceiling for an
 unprivileged raise, and ceiling the highest soft value this process may set,
 which the implementation fills and a set ignores
+
+### MemoryLimit
+
+Forwards [`std.system.os.shared.MemoryLimit`](../shared.md#memorylimit).
+
+```mach
+pub rec MemoryLimit {
+    soft: u64;
+    hard: u64;
+}
+```
+
+the locked-memory limit in bytes. soft is the limit in force and hard its
+ceiling for an unprivileged raise
 
 ### LIMIT_UNLIMITED
 
