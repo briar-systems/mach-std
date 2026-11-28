@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [10.3.0] - 2026-11-28
+
+### Changed
+
+- **Breaking:** std requires mach 7.3 (`mach = "^7.3"`) and no longer builds with mach 7.0 through 7.2. `std.math.bits` `popcount`, `clz`, `ctz` and `byte_swap` are mirl's own operations, `#[intrinsic("mirl", "ir", ...)]`, which mach 7.3 is the first to compile. Each call is the target's instruction where it has one, as `popcnt`, `lzcnt`, `tzcnt` and `bswap` on x86_64 with those extensions, `cnt`, `clz`, `rbit` and `rev` on aarch64 and `cpop`, `clz`, `ctz` and `rev8` on riscv64 with `zbb`, and mirl's expansion where it has none. `clz(0)` and `ctz(0)` still answer 64 (#1170).
+- `std.crypto.ct.copy_bytes` and `move_bytes` move 16-byte chunks on x86_64 and aarch64 under `#[constant_time("soft")]`, so `memory.copy` and `move` on `^` data run at the speed of the public kernel, about 15 times faster than the byte loop at 4 KiB. Every load and store stays at a public offset from a public base and every branch decides on the length or the two addresses, which the build proves. riscv64 and wasm32 keep the byte loop, and `std.memory.secret`'s own `copy_secret` folds into `ct.copy_bytes` (#1180).
+- `std.format` and `std.print` refuse a `^` argument saying it has no rendering, since output is a public place, and to write `x:>T` at the argument to declassify it (#1182).
+
+### Fixed
+
+- `std.memory.secret`'s `borrow_copy` gives the right bytes when its two spans overlap, where its forward byte loop smeared an overlapping copy upward. It now moves through the overlap-safe `ct.move_bytes` (#1180).
+
 ## [10.2.0] - 2026-11-27
 
 ### Added
