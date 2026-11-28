@@ -1490,7 +1490,7 @@ opaque to filesystem callers, native producers initialize every byte
 
 byte 0 is the backend, bytes 1 to 16 are zero, bytes 17 to 24 hold the
 volume and 25 to 32 the file number, little-endian. bytes 33 to 40 are zero
-except on windows, where they may be nonzero
+except for WINDOWS_LOCAL, whose file id is 128 bits
 
 ### METADATA_ONLY
 

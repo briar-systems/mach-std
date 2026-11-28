@@ -355,7 +355,7 @@ Otherwise: [`std.input`](../input.md).
 
 Forwards the first of these whose condition holds, and they differ.
 
-Where `$mach.build.sys != $mach.sys.wasi`: [`std.terminal`](../terminal.md).
+Where `capability.HAS_TERMINAL`: [`std.terminal`](../terminal.md).
 
 ### runtime
 

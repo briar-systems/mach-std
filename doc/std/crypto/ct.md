@@ -481,9 +481,12 @@ pub fun copy_bytes(dst: *^u8, src: *^u8, n: usize)
 
 copy secret bytes without declassifying them
 
-the loop runs on the public length and the stores go to public addresses, so
-the running time depends on nothing but `n`. the regions must not overlap,
-`move_bytes` is the overlap-safe copy.
+the regions must not overlap, `move_bytes` is the overlap-safe copy. the
+running time depends on `n` and the two addresses alone: every load and store
+is at a public offset from a public base, every loop runs on `n`, and the
+`constant_time` contract has the build prove that no secret reaches a branch,
+an address or a variable-time instruction. see the kernels below for how the
+bytes are moved.
 
 | Parameter | |
 | :--- | :--- |
@@ -501,7 +504,8 @@ pub fun move_bytes(dst: *^u8, src: *^u8, n: usize)
 copy secret bytes between regions that may overlap
 
 the direction is picked from the two public addresses alone: forward when the
-destination starts below the source, backward otherwise.
+destination starts below the source, backward otherwise. see the kernels below
+for why each direction is safe for its case.
 
 | Parameter | |
 | :--- | :--- |
